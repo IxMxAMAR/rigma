@@ -3,12 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tarfile
+import time
 import zipfile
 from importlib import resources
 from pathlib import Path
 
 import httpx
+from huggingface_hub import hf_hub_download
+
+from .models import GgufFile, RunPlan
 
 
 def rigma_home() -> Path:
@@ -73,3 +78,59 @@ def ensure_engine(backend: str, os_name: str) -> Path:
     if not found:
         raise RuntimeError(f"{exe.name} not found in downloaded engine assets")
     return found
+
+
+def ensure_model(gguf: GgufFile) -> Path:
+    local_dir = rigma_home() / "models"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    return Path(hf_hub_download(repo_id=gguf.repo, filename=gguf.file,
+                                local_dir=str(local_dir)))
+
+
+class ServerProcess:
+    def __init__(self, proc: subprocess.Popen, port: int, log_path: Path):
+        self.proc, self.port, self.log_path = proc, port, log_path
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def is_healthy(self) -> bool:
+        try:
+            return httpx.get(f"{self.url}/health", timeout=3).status_code == 200
+        except Exception:
+            return False
+
+    def stop(self) -> None:
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
+                  timeout: float = 300.0,
+                  extra_args: list[str] | None = None) -> ServerProcess:
+    logs = rigma_home() / "logs"
+    sessions = rigma_home() / "sessions"
+    logs.mkdir(parents=True, exist_ok=True)
+    sessions.mkdir(parents=True, exist_ok=True)
+    log_path = logs / f"server-{port}.log"
+    argv = [str(exe), *(extra_args or []),
+            *plan.server_args(str(model_path), port),
+            "--slot-save-path", str(sessions)]
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
+        proc = subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT)
+    sp = ServerProcess(proc, port, log_path)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        if sp.is_healthy():
+            return sp
+        time.sleep(0.5)
+    sp.stop()
+    tail = "".join(log_path.read_text(encoding="utf-8",
+                                      errors="replace").splitlines(True)[-40:])
+    raise RuntimeError(f"llama-server failed to become healthy on :{port}\n{tail}")
