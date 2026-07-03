@@ -61,9 +61,16 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        model: str = typer.Option(None, "--model"),
        yes: bool = typer.Option(False, "--yes", "-y"),
        dry_run: bool = typer.Option(False, "--dry-run"),
-       port: int = typer.Option(11500, "--port")):
+       port: int = typer.Option(11500, "--port"),
+       turbo: bool = typer.Option(False, "--turbo",
+                                  help="Max-speed download (may saturate your connection)")):
     """Probe -> resolve -> download -> serve."""
+    import os
+
     from . import runtime  # local import: keeps --dry-run path light
+
+    if turbo:
+        os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "16"
 
     reg = Registry.load()
     p = _profile(reg)

@@ -81,6 +81,10 @@ def ensure_engine(backend: str, os_name: str) -> Path:
 
 
 def ensure_model(gguf: GgufFile) -> Path:
+    # Polite by default: HF's xet backend opens ~16 parallel range requests,
+    # which saturates home connections (gaming packet loss). 4 keeps the line
+    # usable; power users override via the env var or `rigma up --turbo`.
+    os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "4")
     local_dir = rigma_home() / "models"
     local_dir.mkdir(parents=True, exist_ok=True)
     return Path(hf_hub_download(repo_id=gguf.repo, filename=gguf.file,
