@@ -1,0 +1,10 @@
+{
+  "model": "qwen3.6-35b-a3b", "quant": "UD-Q3_K_XL", "backend": "vulkan",
+  "flags": {"ctx": 16384, "ngl": 99, "n_cpu_moe": 8, "flash_attn": true,
+            "cache_type_k": "q8_0", "cache_type_v": "q8_0"},
+  "budget": {"vram_mb": 15200, "ram_mb": 4500},
+  "expected": {"tg_tps": [22, 32], "pp_tps": [150, 400]},
+  "verified": {"by": "IxMxAMAR", "date": "2026-07-03"},
+  "notes": "Smaller ctx than the coding combo keeps more experts on-GPU for faster general chat.",
+  "sources": ["https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF"]
+}

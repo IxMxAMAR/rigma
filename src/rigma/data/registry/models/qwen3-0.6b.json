@@ -1,0 +1,9 @@
+{
+  "slug": "qwen3-0.6b", "family": "qwen3", "kind": "dense",
+  "n_layers": 28, "full_attn_layers": 28, "kv_heads": 8, "head_dim": 128,
+  "native_ctx": 32768,
+  "ggufs": [{"repo": "unsloth/Qwen3-0.6B-GGUF", "file": "Qwen3-0.6B-Q8_0.gguf",
+             "bytes": 639447744, "quant": "Q8_0"}],
+  "license": "apache-2.0", "use_cases": ["general"],
+  "sources": ["https://huggingface.co/unsloth/Qwen3-0.6B-GGUF"]
+}

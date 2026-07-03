@@ -1,0 +1,11 @@
+{
+  "model": "qwen3.6-35b-a3b", "quant": "UD-Q3_K_XL", "backend": "vulkan",
+  "flags": {"ctx": 32768, "ngl": 99, "n_cpu_moe": 10, "flash_attn": true,
+            "cache_type_k": "q8_0", "cache_type_v": "q8_0"},
+  "budget": {"vram_mb": 15200, "ram_mb": 5500},
+  "expected": {"tg_tps": [20, 30], "pp_tps": [150, 400]},
+  "verified": {"by": "IxMxAMAR", "date": "2026-07-03"},
+  "notes": "Vulkan ~20-29% faster than ROCm on RDNA4; TurboQuant forks excluded (crash >65K ctx on this card).",
+  "sources": ["https://digtvbg.com/blog/llama-server-vulkan-rdna4-vllm-rocm-benchmark/",
+              "https://github.com/ggml-org/llama.cpp/issues/23098"]
+}

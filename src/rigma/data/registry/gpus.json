@@ -1,0 +1,16 @@
+[
+  {"match": "RX 9070", "vendor": "amd", "arch": "rdna4",
+   "backends_windows": ["vulkan", "rocm"], "backends_linux": ["vulkan", "rocm"]},
+  {"match": "RX 7900", "vendor": "amd", "arch": "rdna3",
+   "backends_windows": ["vulkan", "rocm"], "backends_linux": ["vulkan", "rocm"]},
+  {"match": "RX 6", "vendor": "amd", "arch": "rdna2",
+   "backends_windows": ["vulkan"], "backends_linux": ["vulkan", "rocm"]},
+  {"match": "RTX 50", "vendor": "nvidia", "arch": "blackwell",
+   "backends_windows": ["cuda", "vulkan"], "backends_linux": ["cuda", "vulkan"]},
+  {"match": "RTX 40", "vendor": "nvidia", "arch": "ada",
+   "backends_windows": ["cuda", "vulkan"], "backends_linux": ["cuda", "vulkan"]},
+  {"match": "RTX 30", "vendor": "nvidia", "arch": "ampere",
+   "backends_windows": ["cuda", "vulkan"], "backends_linux": ["cuda", "vulkan"]},
+  {"match": "GTX 10", "vendor": "nvidia", "arch": "pascal",
+   "backends_windows": ["cuda", "vulkan"], "backends_linux": ["cuda", "vulkan"]}
+]
