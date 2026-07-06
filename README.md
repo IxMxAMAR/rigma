@@ -29,7 +29,7 @@ Pre-alpha (M1). Verified combos:
 
 | Hardware | Model | Backend | Result |
 |---|---|---|---|
-| RX 9070 XT 16GB + 16GB RAM (Windows) | Qwen3.6-35B-A3B UD-Q3_K_XL, ctx 32K, n_cpu_moe 10 | Vulkan (llama.cpp b9867) | pending first full run |
+| RX 9070 XT 16GB + 16GB RAM (Windows) | Qwen3.6-35B-A3B UD-Q3_K_XL, ctx 32K, n_cpu_moe 10 | Vulkan (llama.cpp b9867) | **verified 2026-07-06**: 57.1 t/s gen, 689 t/s prefill @ 4K prompt |
 
 Design: `docs/superpowers/specs/2026-07-03-rigma-design.md`. License: Apache-2.0.
 RAG integration (via [Raggity](https://github.com/IxMxAMAR/raggity), AGPL-3.0, separate process) lands in M4.
