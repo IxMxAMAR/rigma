@@ -70,6 +70,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     from . import runtime  # local import: keeps --dry-run path light
 
     if turbo:
+        os.environ["HF_HUB_DISABLE_XET"] = "0"
         os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "16"
 
     reg = Registry.load()
