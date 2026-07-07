@@ -15,13 +15,27 @@ shows the arithmetic and sources.
 ## Quickstart (pre-alpha)
 
 ```powershell
-git clone https://github.com/IxMxAMAR/rigma && cd rigma
-pip install -e .
-rigma up            # probe -> resolve -> download -> serve at http://127.0.0.1:11500/v1
+pip install rigma
+rigma up            # probes your machine, downloads the best model, opens the chat UI
 ```
 
-Commands: `rigma doctor` (what Rigma sees), `rigma plan --explain` (what it would run and why),
-`rigma models` (what fits your machine), `rigma up --use-case coding` (serve).
+That's it — a browser tab opens with a chat connected to your tuned local model, and any
+OpenAI-compatible tool can use `http://127.0.0.1:11500/v1`.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `rigma up` | Start everything; opens the chat UI in your browser |
+| `rigma chat` | Chat with the running model in the terminal |
+| `rigma status` | What's running, where |
+| `rigma stop` | Stop the model server and UI |
+| `rigma models` | What fits your machine |
+| `rigma plan --explain` | What `up` would run, with the math |
+| `rigma doctor` | What Rigma detects on this machine |
+
+`rigma up` flags: `--use-case coding` · `--model SLUG` · `--port 11500` · `--no-browser` ·
+`--turbo` (fast download, may hog your bandwidth) · `--yes` · `--dry-run`
 
 ## Status
 
