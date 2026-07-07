@@ -42,7 +42,7 @@ def test_proxy_get_and_streaming_post(upstream):
     assert r.status_code == 200 and r.json()["object"] == "list"
     r = client.post("/v1/chat/completions", json={"x": 1})
     assert r.status_code == 200
-    assert 'data: {"x": 1}' in r.text and "[DONE]" in r.text
+    assert 'data: {"x":1}' in r.text and "[DONE]" in r.text
 
 
 def test_root_serves_html(upstream):
