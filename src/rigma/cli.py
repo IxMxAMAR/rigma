@@ -57,6 +57,54 @@ def models():
         typer.echo(f"{slug:24} {spec.kind:5} {fit}")
 
 
+def _stream_chat(port: int, history: list[dict]) -> str:
+    import json as _json
+
+    import httpx
+
+    text = ""
+    with httpx.stream("POST", f"http://127.0.0.1:{port}/v1/chat/completions",
+                      json={"messages": history, "stream": True},
+                      timeout=600) as r:
+        for line in r.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                delta = _json.loads(payload)["choices"][0]["delta"].get("content")
+            except Exception:
+                continue
+            if delta:
+                text += delta
+                typer.echo(delta, nl=False)
+    typer.echo("")
+    return text
+
+
+@app.command()
+def chat():
+    """Chat with the running model in this terminal."""
+    from . import state as st
+    s = st.server_running()
+    if s is None:
+        typer.echo("not running — start with: rigma up")
+        raise typer.Exit(1)
+    typer.echo(f"{s['model']} ({s['quant']}) — exit with 'exit' or Ctrl+C")
+    history: list[dict] = []
+    while True:
+        try:
+            q = typer.prompt("you")
+        except (typer.Abort, EOFError):
+            break
+        if q.strip().lower() in ("exit", "quit"):
+            break
+        history.append({"role": "user", "content": q})
+        reply = _stream_chat(s["public_port"], history)
+        history.append({"role": "assistant", "content": reply})
+
+
 @app.command()
 def status():
     """Is Rigma running, and what is it serving?"""

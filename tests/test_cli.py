@@ -43,6 +43,12 @@ def test_up_dry_run(monkeypatch):
     assert "--n-cpu-moe 10" in res.output and "-fa on" in res.output
 
 
+def test_chat_requires_running_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    res = runner.invoke(cli.app, ["chat"])
+    assert res.exit_code == 1 and "not running" in res.output.lower()
+
+
 def test_up_refuses_double_start(tmp_path, monkeypatch):
     import os
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
