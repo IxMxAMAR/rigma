@@ -24,6 +24,18 @@ def test_plan_explain(monkeypatch):
     assert "UD-Q3_K_XL" in res.output and "combo:" in res.output
 
 
+def test_status_not_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    res = runner.invoke(cli.app, ["status"])
+    assert res.exit_code == 0 and "not running" in res.output.lower()
+
+
+def test_stop_when_not_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    res = runner.invoke(cli.app, ["stop"])
+    assert res.exit_code == 0 and "not running" in res.output.lower()
+
+
 def test_up_dry_run(monkeypatch):
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
     res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run"])

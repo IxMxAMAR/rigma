@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import platform
+import time
 
 import typer
 
@@ -54,6 +55,36 @@ def models():
         except Exception:
             fit = "does not fit"
         typer.echo(f"{slug:24} {spec.kind:5} {fit}")
+
+
+@app.command()
+def status():
+    """Is Rigma running, and what is it serving?"""
+    from . import state as st
+    s = st.server_running()
+    if s is None:
+        typer.echo("not running  (start with: rigma up)")
+        raise typer.Exit(0)
+    up_min = (time.time() - s["started_at"]) / 60
+    typer.echo(f"running: {s['model']} ({s['quant']})  up {up_min:.0f} min")
+    typer.echo(f"chat UI:  http://127.0.0.1:{s['public_port']}")
+    typer.echo(f"OpenAI:   http://127.0.0.1:{s['public_port']}/v1")
+    typer.echo("stop with: rigma stop")
+
+
+@app.command()
+def stop():
+    """Stop the running model server and UI."""
+    from . import state as st
+    s = st.read_state()
+    if s is None:
+        typer.echo("not running")
+        raise typer.Exit(0)
+    for key in ("engine_pid", "ui_pid"):
+        if st.pid_alive(int(s.get(key, -1))):
+            st.kill_pid(int(s[key]))
+    st.clear_state()
+    typer.echo("stopped")
 
 
 @app.command()
