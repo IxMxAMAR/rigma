@@ -52,6 +52,13 @@ def test_root_serves_html(upstream):
     assert "<html" in r.text.lower() or "<!doctype" in r.text.lower()
 
 
+def test_root_serves_real_chat_ui(upstream):
+    client = TestClient(build_app(upstream_port=upstream))
+    body = client.get("/").text
+    assert "chat/completions" in body  # real page, not fallback
+    assert "api/status" in body
+
+
 def test_api_status_not_running(upstream, tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     client = TestClient(build_app(upstream_port=upstream))
