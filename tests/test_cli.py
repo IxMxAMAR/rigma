@@ -41,3 +41,13 @@ def test_up_dry_run(monkeypatch):
     res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run"])
     assert res.exit_code == 0
     assert "--n-cpu-moe 10" in res.output and "-fa on" in res.output
+
+
+def test_up_refuses_double_start(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import state as st
+    st.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    res = runner.invoke(cli.app, ["up", "--use-case", "coding"])
+    assert res.exit_code == 1 and "already running" in res.output.lower()

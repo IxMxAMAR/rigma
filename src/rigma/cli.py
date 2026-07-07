@@ -93,13 +93,19 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        yes: bool = typer.Option(False, "--yes", "-y"),
        dry_run: bool = typer.Option(False, "--dry-run"),
        port: int = typer.Option(11500, "--port"),
+       no_browser: bool = typer.Option(False, "--no-browser"),
        turbo: bool = typer.Option(False, "--turbo",
                                   help="Max-speed download (may saturate your connection)")):
-    """Probe -> resolve -> download -> serve."""
+    """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
+    import webbrowser
 
-    from . import runtime  # local import: keeps --dry-run path light
+    from . import runtime, serve
+    from . import state as st
 
+    if st.server_running():
+        typer.echo("already running — see: rigma status   (or: rigma stop)")
+        raise typer.Exit(1)
     if turbo:
         os.environ["HF_HUB_DISABLE_XET"] = "0"
         os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "16"
@@ -109,10 +115,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     rp = resolve(p, reg, use_case=use_case, model_override=model)
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
-    argv_preview = rp.server_args("<model>", port)
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
                f"({rp.origin})")
-    typer.echo("argv: llama-server " + " ".join(argv_preview))
+    typer.echo("argv: llama-server " + " ".join(rp.server_args("<model>", port - 1)))
     if dry_run:
         raise typer.Exit(0)
     if not yes:
@@ -121,10 +126,16 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     exe = runtime.ensure_engine(rp.backend, os_name)
     model_path = runtime.ensure_model(rp.gguf)
     typer.echo("starting llama-server (first load can take minutes)...")
-    sp = runtime.launch_server(exe, rp, model_path, port=port)
-    typer.echo(f"ready: OpenAI-compatible endpoint at {sp.url}/v1")
-    typer.echo("Ctrl+C to stop.")
+    sp = runtime.launch_server(exe, rp, model_path, port=port - 1)
+    st.write_state(rp.model_slug, rp.gguf.quant, port,
+                   engine_pid=sp.proc.pid, ui_pid=os.getpid())
+    typer.echo(f"chat UI:  http://127.0.0.1:{port}")
+    typer.echo(f"OpenAI:   http://127.0.0.1:{port}/v1")
+    typer.echo("stop:     Ctrl+C here, or `rigma stop` from any terminal")
+    if not no_browser:
+        webbrowser.open(f"http://127.0.0.1:{port}")
     try:
-        sp.proc.wait()
-    except KeyboardInterrupt:
+        serve.run_ui(port, port - 1)
+    finally:
         sp.stop()
+        st.clear_state()
