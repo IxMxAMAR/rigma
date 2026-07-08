@@ -34,13 +34,16 @@ OpenAI-compatible tool can use `http://127.0.0.1:11500/v1`.
 | `rigma plan --explain` | What `up` would run, with the math |
 | `rigma doctor` | What Rigma detects on this machine |
 | `rigma update` | Pull the latest [community combo registry](https://github.com/IxMxAMAR/rigma-registry) |
+| `rigma bench` | Measure real speed; `--evidence FILE` exports registry-format proof |
 
 `rigma up` flags: `--use-case coding` · `--model SLUG` · `--port 11500` · `--no-browser` ·
 `--turbo` (fast download, may hog your bandwidth) · `--yes` · `--dry-run`
 
 ## Status
 
-Pre-alpha (M2). Combos come in two grades: **verified** (benchmarked on real hardware,
+Pre-alpha (M5). `rigma bench` records machine-local calibration that outranks registry
+combos on your machine, and a failed launch automatically falls back (smaller quant →
+CPU floor) with each step explained. Combos come in two grades: **verified** (benchmarked on real hardware,
 evidence attached) and **provisional** (research-seeded fit math — run one and PR your
 numbers to [rigma-registry](https://github.com/IxMxAMAR/rigma-registry)). Verified so far:
 
