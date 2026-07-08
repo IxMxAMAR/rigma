@@ -17,6 +17,19 @@ def _profile(reg: Registry):
 
 
 @app.command()
+def update():
+    """Fetch the latest community combo registry from GitHub."""
+    from .registry import update_registry
+
+    before = Registry.load()
+    dest = update_registry()
+    after = Registry.load()
+    typer.echo(f"registry updated -> {dest}")
+    typer.echo(f"models {len(before.models)} -> {len(after.models)}; "
+               f"combos {len(before.combos)} -> {len(after.combos)}")
+
+
+@app.command()
 def doctor():
     """Print detected hardware and registry status."""
     reg = Registry.load()

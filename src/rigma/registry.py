@@ -1,11 +1,48 @@
 from __future__ import annotations
 
+import io
 import json
 import os
+import shutil
+import zipfile
 from importlib import resources
 from pathlib import Path
 
+import httpx
+
 from .models import Combo, ModelSpec
+
+DEFAULT_REGISTRY_ZIP = (
+    "https://codeload.github.com/IxMxAMAR/rigma-registry/zip/refs/heads/master")
+
+
+def _fetch_bytes(url: str) -> bytes:
+    r = httpx.get(url, follow_redirects=True, timeout=120)
+    r.raise_for_status()
+    return r.content
+
+
+def _registry_cache_dir() -> Path:
+    from .runtime import rigma_home
+    return rigma_home() / "registry"
+
+
+def update_registry(url: str = DEFAULT_REGISTRY_ZIP) -> Path:
+    dest = _registry_cache_dir()
+    tmp = dest.with_suffix(".tmp")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    with zipfile.ZipFile(io.BytesIO(_fetch_bytes(url))) as z:
+        z.extractall(tmp)
+    inner = next(p for p in tmp.iterdir() if p.is_dir())
+    if not (inner / "gpus.json").exists():
+        shutil.rmtree(tmp)
+        raise RuntimeError("downloaded registry is missing gpus.json")
+    if dest.exists():
+        shutil.rmtree(dest)
+    inner.rename(dest)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return dest
 
 
 class Registry:
@@ -17,6 +54,10 @@ class Registry:
     def load(cls, path: Path | None = None) -> "Registry":
         if path is None and os.environ.get("RIGMA_REGISTRY_DIR"):
             path = Path(os.environ["RIGMA_REGISTRY_DIR"])
+        if path is None:
+            cache = _registry_cache_dir()
+            if (cache / "gpus.json").exists():
+                path = cache
         if path is None:
             path = Path(str(resources.files("rigma").joinpath("data/registry")))
         gpus = json.loads((path / "gpus.json").read_text(encoding="utf-8"))
