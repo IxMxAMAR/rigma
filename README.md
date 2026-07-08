@@ -33,13 +33,16 @@ OpenAI-compatible tool can use `http://127.0.0.1:11500/v1`.
 | `rigma models` | What fits your machine |
 | `rigma plan --explain` | What `up` would run, with the math |
 | `rigma doctor` | What Rigma detects on this machine |
+| `rigma update` | Pull the latest [community combo registry](https://github.com/IxMxAMAR/rigma-registry) |
 
 `rigma up` flags: `--use-case coding` · `--model SLUG` · `--port 11500` · `--no-browser` ·
 `--turbo` (fast download, may hog your bandwidth) · `--yes` · `--dry-run`
 
 ## Status
 
-Pre-alpha (M1). Verified combos:
+Pre-alpha (M2). Combos come in two grades: **verified** (benchmarked on real hardware,
+evidence attached) and **provisional** (research-seeded fit math — run one and PR your
+numbers to [rigma-registry](https://github.com/IxMxAMAR/rigma-registry)). Verified so far:
 
 | Hardware | Model | Backend | Result |
 |---|---|---|---|
