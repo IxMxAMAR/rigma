@@ -226,10 +226,27 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     if not yes:
         typer.confirm(
             f"download engine + model ({rp.gguf.bytes / 2**30:.1f} GB)?", abort=True)
-    exe = runtime.ensure_engine(rp.backend, os_name)
-    model_path = runtime.ensure_model(rp.gguf)
-    typer.echo("starting llama-server (first load can take minutes)...")
-    sp = runtime.launch_server(exe, rp, model_path, port=port - 1)
+    from .resolve import fallback_plans
+    candidates = [rp, *fallback_plans(rp, reg, p)]
+    sp = None
+    for i, cand in enumerate(candidates):
+        try:
+            exe = runtime.ensure_engine(cand.backend, os_name)
+            model_path = runtime.ensure_model(cand.gguf)
+            typer.echo(f"starting llama-server: {cand.model_slug} "
+                       f"{cand.gguf.quant} (first load can take minutes)...")
+            sp = runtime.launch_server(exe, cand, model_path, port=port - 1)
+            rp = cand
+            break
+        except RuntimeError as e:
+            typer.echo(str(e).splitlines()[0])
+            if i + 1 < len(candidates):
+                nxt = candidates[i + 1]
+                typer.echo(f"falling back -> {nxt.model_slug} {nxt.gguf.quant} "
+                           f"({nxt.origin})")
+    if sp is None:
+        typer.echo("all fallbacks failed — see logs in ~/.rigma/logs/")
+        raise typer.Exit(1)
     st.write_state(rp.model_slug, rp.gguf.quant, port,
                    engine_pid=sp.proc.pid, ui_pid=os.getpid(),
                    backend=rp.backend)

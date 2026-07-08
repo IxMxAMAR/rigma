@@ -88,6 +88,34 @@ def _calculate(profile: HardwareProfile, registry: Registry,
     return None
 
 
+def fallback_plans(plan: RunPlan, registry: Registry,
+                   profile: HardwareProfile) -> list[RunPlan]:
+    out: list[RunPlan] = []
+    spec = registry.models.get(plan.model_slug)
+    if spec is not None:
+        smaller = [g for g in spec.ggufs if g.bytes < plan.gguf.bytes]
+        for gguf in smaller:  # registry order: largest first
+            explain = [f"fallback: {plan.gguf.quant} failed to launch"]
+            ctx = plan.flags.ctx
+            flags = None
+            while ctx >= CTX_FLOOR and flags is None:
+                flags = fit_gguf(spec, gguf, profile, ctx, explain)
+                if flags is None:
+                    ctx //= 2
+            if flags is not None:
+                out.append(_apply_calibration(RunPlan(
+                    model_slug=spec.slug, gguf=gguf, backend=plan.backend,
+                    flags=flags, origin="fallback", explain=explain)))
+    floor_spec = min(registry.models.values(), key=lambda m: m.ggufs[-1].bytes)
+    if (floor_spec.slug, floor_spec.ggufs[-1].quant) != (plan.model_slug,
+                                                         plan.gguf.quant):
+        out.append(RunPlan(
+            model_slug=floor_spec.slug, gguf=floor_spec.ggufs[-1], backend="cpu",
+            flags=ComboFlags(ctx=CTX_FLOOR, ngl=0), origin="fallback:floor",
+            explain=["fallback floor: smallest model on CPU"]))
+    return out
+
+
 def resolve(profile: HardwareProfile, registry: Registry,
             use_case: str = "general", model_override: str | None = None) -> RunPlan:
     if not registry.models:
