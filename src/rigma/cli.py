@@ -10,6 +10,69 @@ from .registry import Registry
 from .resolve import resolve
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+rag_app = typer.Typer(no_args_is_help=True)
+app.add_typer(rag_app, name="rag",
+              help="Chat with your documents (Raggity sidecar).")
+
+
+@rag_app.command("add")
+def rag_add(path: str = typer.Argument(..., help="Folder or file to index")):
+    """Add a folder to the knowledge base and index it."""
+    from pathlib import Path as _P
+
+    from . import rag as _rag
+
+    if not _P(path).exists():
+        typer.echo(f"path does not exist: {path}")
+        raise typer.Exit(1)
+    srcs = _rag.add_source(path)
+    typer.echo(f"sources: {len(srcs)}")
+    if _rag.raggity_cmd() is None:
+        typer.echo("raggity not installed — pip install raggity[server]")
+        raise typer.Exit(1)
+    typer.echo(_rag.ingest().strip())
+
+
+@rag_app.command("ask")
+def rag_ask(question: str = typer.Argument(...)):
+    """Ask a question grounded in your indexed documents."""
+    from . import rag as _rag
+    from . import state as st
+
+    if st.server_running() is None:
+        typer.echo("model not running — start it first: rigma up")
+        raise typer.Exit(1)
+    _rag.ensure_sidecar()
+    a = _rag.ask(question)
+    prefix = ("(abstained — not enough evidence in your documents)\n"
+              if a.get("abstained") else "")
+    typer.echo(prefix + a.get("answer", ""))
+    cites = a.get("citations") or []
+    if cites:
+        typer.echo(f"[{len(cites)} citation(s)]")
+
+
+@rag_app.command("status")
+def rag_status():
+    """Sidecar health and indexed sources."""
+    from . import rag as _rag
+
+    h = _rag.sidecar_health()
+    if h is None:
+        typer.echo("rag sidecar: not running")
+    else:
+        typer.echo(f"rag sidecar: ok (raggity {h.get('version')}, "
+                   f"{h.get('documents')} chunks)")
+    for s in _rag.load_sources():
+        typer.echo(f"  source: {s}")
+
+
+@rag_app.command("stop")
+def rag_stop():
+    """Stop the RAG sidecar."""
+    from . import rag as _rag
+
+    typer.echo("stopped" if _rag.stop_sidecar() else "not running")
 
 
 def _profile(reg: Registry):
@@ -186,6 +249,8 @@ def stop():
     for key in ("engine_pid", "ui_pid"):
         if st.pid_alive(int(s.get(key, -1))):
             st.kill_pid(int(s[key]))
+    from . import rag as _rag
+    _rag.stop_sidecar()
     st.clear_state()
     typer.echo("stopped")
 
