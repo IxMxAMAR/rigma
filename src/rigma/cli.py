@@ -134,6 +134,48 @@ def status():
 
 
 @app.command()
+def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
+          gen_tokens: int = typer.Option(128, "--gen-tokens"),
+          evidence: str = typer.Option(None, "--evidence",
+                                       help="Write registry-format evidence JSON here")):
+    """Measure real prefill/generation speed of the running server."""
+    import datetime
+    import json as _json
+    from pathlib import Path
+
+    from . import state as st
+    from .bench import run_bench, save_calibration, verdict
+
+    s = st.server_running()
+    if s is None:
+        typer.echo("not running — start with: rigma up")
+        raise typer.Exit(1)
+    typer.echo(f"benchmarking {s['model']} ({s['quant']}) ...")
+    r = run_bench(s["public_port"], prompt_tokens, gen_tokens)
+    typer.echo(f"prefill: {r.pp_tps:.0f} t/s   gen: {r.tg_tps:.1f} t/s "
+               f"({r.prompt_tokens}-token prompt)")
+    reg = Registry.load()
+    combo_expected = None
+    for c in reg.combos.values():
+        if c.model == s["model"] and c.quant == s["quant"] and c.expected:
+            combo_expected = c.expected
+            break
+    typer.echo(verdict(r, combo_expected))
+    key = f"{s['model']}:{s['quant']}:{s.get('backend', 'unknown')}"
+    save_calibration(key, r.model_dump())
+    typer.echo("recorded to ~/.rigma/calibration.json")
+    if evidence:
+        from .runtime import _engines_manifest
+        payload = {"combo": f"{s['model']} {s['quant']}",
+                   "date": datetime.date.today().isoformat(),
+                   "llamacpp": _engines_manifest()["version"],
+                   "os": platform.system().lower(),
+                   "measured": r.model_dump()}
+        Path(evidence).write_text(_json.dumps(payload, indent=2), encoding="utf-8")
+        typer.echo(f"evidence written -> {evidence}")
+
+
+@app.command()
 def stop():
     """Stop the running model server and UI."""
     from . import state as st
@@ -189,7 +231,8 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     typer.echo("starting llama-server (first load can take minutes)...")
     sp = runtime.launch_server(exe, rp, model_path, port=port - 1)
     st.write_state(rp.model_slug, rp.gguf.quant, port,
-                   engine_pid=sp.proc.pid, ui_pid=os.getpid())
+                   engine_pid=sp.proc.pid, ui_pid=os.getpid(),
+                   backend=rp.backend)
     typer.echo(f"chat UI:  http://127.0.0.1:{port}")
     typer.echo(f"OpenAI:   http://127.0.0.1:{port}/v1")
     typer.echo("stop:     Ctrl+C here, or `rigma stop` from any terminal")
