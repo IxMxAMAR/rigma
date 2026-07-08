@@ -17,6 +17,18 @@ class ResolveError(RuntimeError):
     pass
 
 
+def _apply_calibration(plan: RunPlan) -> RunPlan:
+    from .bench import load_calibration
+    key = f"{plan.model_slug}:{plan.gguf.quant}:{plan.backend}"
+    entry = load_calibration().get(key)
+    if entry and entry.get("flags"):
+        plan.flags = plan.flags.model_copy(update=entry["flags"])
+        plan.origin += "+calibrated"
+        plan.explain.append(f"calibration override applied: {entry['flags']} "
+                            f"(measured {entry.get('date', '?')})")
+    return plan
+
+
 def kv_bytes_per_token(spec: ModelSpec, k: str, v: str) -> float:
     per_side = spec.full_attn_layers * spec.kv_heads * spec.head_dim
     return per_side * CACHE_BYTES[k] + per_side * CACHE_BYTES[v]
@@ -89,18 +101,20 @@ def resolve(profile: HardwareProfile, registry: Registry,
             spec = registry.models[combo.model]
             gguf = next(g for g in spec.ggufs if g.quant == combo.quant)
             kind = "class" if rel.startswith("_class/") else "combo"
-            return RunPlan(model_slug=combo.model, gguf=gguf, backend=combo.backend,
-                           flags=combo.flags, origin=f"{kind}:{rel}",
-                           explain=[f"registry match: {rel}"] + combo.sources)
+            return _apply_calibration(RunPlan(
+                model_slug=combo.model, gguf=gguf, backend=combo.backend,
+                flags=combo.flags, origin=f"{kind}:{rel}",
+                explain=[f"registry match: {rel}"] + combo.sources))
     if model_override:
         registry = Registry(registry.gpus,
                             {model_override: registry.models[model_override]},
                             registry.combos)
     plan = _calculate(profile, registry, use_case)
     if plan:
-        return plan
+        return _apply_calibration(plan)
     # absolute floor: smallest model, smallest quant, CPU
     spec = min(registry.models.values(), key=lambda m: m.ggufs[-1].bytes)
-    return RunPlan(model_slug=spec.slug, gguf=spec.ggufs[-1], backend="cpu",
-                   flags=ComboFlags(ctx=CTX_FLOOR, ngl=0), origin="calculator",
-                   explain=["floor: nothing larger fits"])
+    return _apply_calibration(RunPlan(
+        model_slug=spec.slug, gguf=spec.ggufs[-1], backend="cpu",
+        flags=ComboFlags(ctx=CTX_FLOOR, ngl=0), origin="calculator",
+        explain=["floor: nothing larger fits"]))
