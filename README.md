@@ -35,6 +35,8 @@ OpenAI-compatible tool can use `http://127.0.0.1:11500/v1`.
 | `rigma doctor` | What Rigma detects on this machine |
 | `rigma update` | Pull the latest [community combo registry](https://github.com/IxMxAMAR/rigma-registry) |
 | `rigma bench` | Measure real speed; `--evidence FILE` exports registry-format proof |
+| `rigma rag add PATH` | Index a folder into your local knowledge base ([Raggity](https://github.com/IxMxAMAR/raggity) sidecar) |
+| `rigma rag ask "..."` | Answer grounded in your documents, with citations, via your tuned model |
 
 `rigma up` flags: `--use-case coding` · `--model SLUG` · `--port 11500` · `--no-browser` ·
 `--turbo` (fast download, may hog your bandwidth) · `--yes` · `--dry-run`
@@ -51,5 +53,11 @@ numbers to [rigma-registry](https://github.com/IxMxAMAR/rigma-registry)). Verifi
 |---|---|---|---|
 | RX 9070 XT 16GB + 16GB RAM (Windows) | Qwen3.6-35B-A3B UD-Q3_K_XL, ctx 32K, n_cpu_moe 10 | Vulkan (llama.cpp b9867) | **verified 2026-07-06**: 57.1 t/s gen, 689 t/s prefill @ 4K prompt |
 
+## RAG (chat with your documents)
+
+Rigma pairs with [Raggity](https://github.com/IxMxAMAR/raggity) (AGPL-3.0, runs as a separate
+low-RAM process — ~300 MB) for grounded, cited answers from your own files through your tuned
+local model: `pip install raggity[server]`, then `rigma rag add <folder>` and
+`rigma rag ask "..."`. If raggity isn't on PATH, point `RIGMA_RAGGITY_CMD` at it.
+
 Design: `docs/superpowers/specs/2026-07-03-rigma-design.md`. License: Apache-2.0.
-RAG integration (via [Raggity](https://github.com/IxMxAMAR/raggity), AGPL-3.0, separate process) lands in M4.
