@@ -57,7 +57,8 @@ def rag_status():
     """Sidecar health and indexed sources."""
     from . import rag as _rag
 
-    h = _rag.sidecar_health()
+    port = _rag.recorded_sidecar_port()
+    h = _rag.sidecar_health(port) if port else None
     if h is None:
         typer.echo("rag sidecar: not running")
     else:

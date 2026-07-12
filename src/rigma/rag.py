@@ -72,6 +72,14 @@ def add_source(path: str) -> list[str]:
     return srcs
 
 
+def recorded_sidecar_port() -> int | None:
+    try:
+        info = json.loads((rag_dir() / "sidecar.json").read_text(encoding="utf-8"))
+        return int(info["port"])
+    except Exception:
+        return None
+
+
 def sidecar_health(port: int = RAG_PORT) -> dict | None:
     try:
         r = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=3)
