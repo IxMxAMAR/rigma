@@ -15,7 +15,10 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_add_source_persists_and_renders_toml(home):
+def test_add_source_persists_and_renders_toml(home, monkeypatch):
+    (home / "docs").mkdir()
+    (home / "kb").mkdir()
+    monkeypatch.chdir(home)
     rag.add_source("docs")
     srcs = rag.add_source(str(home / "kb"))
     assert len(srcs) == 2 and all(Path(s).is_absolute() for s in srcs)
@@ -24,6 +27,9 @@ def test_add_source_persists_and_renders_toml(home):
     assert 'profile = "low-ram"' in toml_text
     assert 'backend = "external"' in toml_text
     assert "http://127.0.0.1:11500/v1" in toml_text
+    # raggity's [sources] schema: include = [glob patterns], forward slashes
+    assert "include = [" in toml_text and "/**/*" in toml_text
+    assert "paths = [" not in toml_text
 
 
 def test_raggity_cmd_none_when_absent(home, monkeypatch):
