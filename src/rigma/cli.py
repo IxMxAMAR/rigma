@@ -352,7 +352,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         raise typer.Exit(1)
     st.write_state(rp.model_slug, rp.gguf.quant, port,
                    engine_pid=sp.proc.pid, ui_pid=os.getpid(),
-                   backend=rp.backend)
+                   backend=rp.backend, use_case=use_case)
     typer.echo(f"chat UI:  http://127.0.0.1:{port}")
     typer.echo(f"OpenAI:   http://127.0.0.1:{port}/v1")
     typer.echo("stop:     Ctrl+C here, or `rigma stop` from any terminal")

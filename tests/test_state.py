@@ -20,3 +20,10 @@ def test_stale_state_is_cleared(tmp_path, monkeypatch):
     state.write_state("m", "q", 11500, engine_pid=999999, ui_pid=999999)
     assert state.server_running() is None
     assert state.read_state() is None  # stale file removed
+
+
+def test_state_records_use_case(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=os.getpid(),
+                      ui_pid=os.getpid(), use_case="creative")
+    assert state.read_state()["use_case"] == "creative"

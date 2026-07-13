@@ -14,12 +14,13 @@ def state_path() -> Path:
 
 
 def write_state(model_slug: str, quant: str, public_port: int,
-                engine_pid: int, ui_pid: int, backend: str = "unknown") -> None:
+                engine_pid: int, ui_pid: int, backend: str = "unknown",
+                use_case: str = "general") -> None:
     state_path().parent.mkdir(parents=True, exist_ok=True)
     state_path().write_text(json.dumps({
         "model": model_slug, "quant": quant, "public_port": public_port,
         "engine_pid": engine_pid, "ui_pid": ui_pid, "backend": backend,
-        "started_at": time.time(),
+        "use_case": use_case, "started_at": time.time(),
     }, indent=2), encoding="utf-8")
 
 
