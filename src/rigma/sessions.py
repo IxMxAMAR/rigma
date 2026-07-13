@@ -61,3 +61,9 @@ def list_sessions() -> list[dict]:
                     "use_rag": bool(s.get("use_rag")),
                     "message_count": len(s.get("messages", []))})
     return sorted(out, key=lambda s: s["updated_at"], reverse=True)
+
+
+def build_messages(session: dict, default_prompt: str = "") -> list[dict]:
+    prompt = session.get("system_prompt") or default_prompt
+    head = [{"role": "system", "content": prompt}] if prompt else []
+    return head + list(session.get("messages", []))

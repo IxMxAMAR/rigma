@@ -37,3 +37,21 @@ def test_list_sessions_newest_first_skips_corrupt(tmp_path, monkeypatch):
     assert [s["title"] for s in out] == ["second", "first"]
     assert out[0]["message_count"] == 1 and "messages" not in out[0]
     assert a["id"] in [s["id"] for s in out]
+
+
+def test_build_messages_session_prompt_wins():
+    s = {"system_prompt": "be a pirate", "messages": [{"role": "user", "content": "hi"}]}
+    out = sessions.build_messages(s, default_prompt="be boring")
+    assert out[0] == {"role": "system", "content": "be a pirate"}
+    assert out[1]["content"] == "hi" and len(out) == 2
+
+
+def test_build_messages_falls_back_to_default():
+    s = {"system_prompt": "", "messages": []}
+    out = sessions.build_messages(s, default_prompt="be helpful")
+    assert out == [{"role": "system", "content": "be helpful"}]
+
+
+def test_build_messages_no_prompt_at_all():
+    s = {"system_prompt": "", "messages": [{"role": "user", "content": "hi"}]}
+    assert sessions.build_messages(s) == [{"role": "user", "content": "hi"}]
