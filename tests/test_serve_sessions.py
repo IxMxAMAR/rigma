@@ -44,3 +44,51 @@ def test_missing_session_is_404(client):
     assert client.post("/api/sessions/nope", json={}).status_code == 404
     assert client.post("/api/sessions/nope").status_code == 404
     assert client.delete("/api/sessions/nope").status_code == 404
+
+
+def test_chat_turn_injects_prompt_streams_and_persists(tmp_path, monkeypatch,
+                                                       oai_upstream):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=oai_upstream.port,
+                             default_prompt="DEFAULT"))
+    s = c.post("/api/sessions", json={}).json()
+    r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi"})
+    assert r.status_code == 200
+    assert '"delta": "Hel"' in r.text and "[DONE]" in r.text
+    sent = oai_upstream.last()["messages"]
+    assert sent[0] == {"role": "system", "content": "DEFAULT"}
+    assert sent[1] == {"role": "user", "content": "hi"}
+    got = c.get(f"/api/sessions/{s['id']}").json()
+    assert got["title"] == "hi"
+    assert got["messages"] == [{"role": "user", "content": "hi"},
+                               {"role": "assistant", "content": "Hello"}]
+
+
+def test_chat_turn_null_message_regenerates(tmp_path, monkeypatch, oai_upstream):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    c.post(f"/api/sessions/{s['id']}",
+           json={"messages": [{"role": "user", "content": "again"}]})
+    c.post(f"/api/sessions/{s['id']}/chat", json={"message": None})
+    got = c.get(f"/api/sessions/{s['id']}").json()
+    assert [m["role"] for m in got["messages"]] == ["user", "assistant"]
+
+
+def test_chat_turn_upstream_down_yields_error_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=1, default_prompt=""))  # nothing listens
+    s = c.post("/api/sessions", json={}).json()
+    r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi"})
+    assert r.status_code == 200  # errors travel inside the stream
+    assert "event: error" in r.text and "[DONE]" in r.text
+    got = c.get(f"/api/sessions/{s['id']}").json()
+    assert [m["role"] for m in got["messages"]] == ["user"]  # no assistant saved
+
+
+def test_chat_turn_empty_session_400(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=1, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    assert c.post(f"/api/sessions/{s['id']}/chat",
+                  json={"message": None}).status_code == 400
