@@ -6,6 +6,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from . import sessions
 from . import state as st
 
 _FALLBACK_HTML = "<!doctype html><html><body><h1>Rigma</h1></body></html>"
@@ -20,10 +21,18 @@ def _chat_html() -> str:
         return _FALLBACK_HTML
 
 
-def build_app(upstream_port: int) -> FastAPI:
+def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
     app = FastAPI(title="rigma", docs_url=None, redoc_url=None)
     base = f"http://127.0.0.1:{upstream_port}"
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
+
+    def _default_prompt() -> str:
+        if default_prompt is not None:
+            return default_prompt
+        try:
+            return sessions.default_prompt()
+        except Exception:
+            return ""
 
     @app.get("/", response_class=HTMLResponse)
     async def root():
@@ -38,7 +47,42 @@ def build_app(upstream_port: int) -> FastAPI:
         s = st.server_running()
         if s is None:
             return JSONResponse({"error": "not running"}, status_code=404)
-        return {k: s[k] for k in ("model", "quant", "public_port", "started_at")}
+        return {**{k: s[k] for k in ("model", "quant", "public_port", "started_at")},
+                "default_system_prompt": _default_prompt()}
+
+    @app.get("/api/sessions")
+    async def list_sessions():
+        return sessions.list_sessions()
+
+    @app.post("/api/sessions")
+    async def create_session(body: dict | None = None):
+        body = body or {}
+        return sessions.create(title=body.get("title", "New chat"),
+                               system_prompt=body.get("system_prompt", ""))
+
+    @app.get("/api/sessions/{sid}")
+    async def get_session(sid: str):
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        return s
+
+    @app.post("/api/sessions/{sid}")
+    async def update_session(sid: str, body: dict):
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        for k in sessions.MUTABLE_FIELDS:
+            if k in body:
+                s[k] = body[k]
+        sessions.save(s)
+        return s
+
+    @app.delete("/api/sessions/{sid}")
+    async def delete_session(sid: str):
+        if not sessions.delete(sid):
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        return {"ok": True}
 
     @app.api_route("/v1/{path:path}",
                    methods=["GET", "POST", "OPTIONS", "DELETE"])
