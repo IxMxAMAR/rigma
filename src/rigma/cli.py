@@ -192,15 +192,28 @@ def _stream_chat(port: int, history: list[dict]) -> str:
 
 
 @app.command()
-def chat():
+def chat(session: str = typer.Option(None, "--session",
+                                     help="Resume a session by id (ids shown in the UI)")):
     """Chat with the running model in this terminal."""
+    from . import sessions
     from . import state as st
     s = st.server_running()
     if s is None:
         typer.echo("not running — start with: rigma up")
         raise typer.Exit(1)
-    typer.echo(f"{s['model']} ({s['quant']}) — exit with 'exit' or Ctrl+C")
-    history: list[dict] = []
+    if session:
+        sess = sessions.load(session)
+        if sess is None:
+            typer.echo(f"no such session: {session}")
+            raise typer.Exit(1)
+    else:
+        sess = sessions.create()
+    try:
+        default = sessions.default_prompt()
+    except Exception:
+        default = ""
+    typer.echo(f"{s['model']} ({s['quant']}) — session {sess['id']} — "
+               f"exit with 'exit' or Ctrl+C")
     while True:
         try:
             q = typer.prompt("you")
@@ -208,9 +221,13 @@ def chat():
             break
         if q.strip().lower() in ("exit", "quit"):
             break
-        history.append({"role": "user", "content": q})
-        reply = _stream_chat(s["public_port"], history)
-        history.append({"role": "assistant", "content": reply})
+        sess["messages"].append({"role": "user", "content": q})
+        if sess.get("title") == "New chat":
+            sess["title"] = q[:40]
+        reply = _stream_chat(s["public_port"],
+                             sessions.build_messages(sess, default))
+        sess["messages"].append({"role": "assistant", "content": reply})
+        sessions.save(sess)
 
 
 @app.command()
