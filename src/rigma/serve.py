@@ -93,7 +93,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
 
     async def _llm_turn(s: dict):
         msgs = sessions.build_messages(s, _default_prompt())
-        text = ""
+        text, failed, resp = "", False, None
         try:
             req = client.build_request("POST", "/v1/chat/completions",
                                        json={"messages": msgs, "stream": True})
@@ -112,10 +112,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
                 if delta:
                     text += delta
                     yield _sse({"delta": delta})
-            await resp.aclose()
         except Exception as e:
+            failed = True
             yield _sse({"message": f"model unreachable: {e}"}, event="error")
-        if text:
+        finally:
+            if resp is not None:
+                await resp.aclose()
+        if text and not failed:
             s["messages"].append({"role": "assistant", "content": text})
             sessions.save(s)
         yield b"data: [DONE]\n\n"
