@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from importlib import resources
 
@@ -32,6 +33,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
     app = FastAPI(title="rigma", docs_url=None, redoc_url=None)
     base = f"http://127.0.0.1:{upstream_port}"
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
+    ingest_state = {"busy": False, "error": ""}
 
     def _default_prompt() -> str:
         if default_prompt is not None:
@@ -123,6 +125,58 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
             sessions.save(s)
         yield b"data: [DONE]\n\n"
 
+    @app.get("/api/rag/status")
+    async def rag_status():
+        from . import rag
+        port = rag.recorded_sidecar_port()
+        health = rag.sidecar_health(port) if port else None
+        return {"running": health is not None, "health": health,
+                "sources": rag.load_sources(),
+                "indexing": ingest_state["busy"], "error": ingest_state["error"]}
+
+    @app.post("/api/rag/sources")
+    async def rag_add_source(body: dict):
+        from pathlib import Path
+        from . import rag
+        path = str(body.get("path", "")).strip()
+        if not path or not Path(path).exists():
+            return JSONResponse({"error": f"path does not exist: {path}"},
+                                status_code=400)
+        srcs = rag.add_source(path)
+
+        async def _ingest():
+            ingest_state["busy"], ingest_state["error"] = True, ""
+            try:
+                await asyncio.to_thread(rag.ingest)
+            except Exception as e:
+                ingest_state["error"] = str(e)
+            finally:
+                ingest_state["busy"] = False
+
+        asyncio.get_running_loop().create_task(_ingest())
+        return JSONResponse({"sources": srcs, "indexing": True}, status_code=202)
+
+    async def _rag_turn(s: dict):
+        from . import rag
+        q = s["messages"][-1]["content"]
+        try:
+            await asyncio.to_thread(rag.ensure_sidecar)
+            a = await asyncio.to_thread(rag.ask, q)
+        except Exception as e:
+            yield _sse({"message": f"documents unavailable: {e}"}, event="error")
+            yield b"data: [DONE]\n\n"
+            return
+        text = a.get("answer", "")
+        if a.get("abstained"):
+            text = "(abstained — not enough evidence in your documents)\n" + text
+        yield _sse({"delta": text})
+        cites = a.get("citations") or []
+        if cites:
+            yield _sse({"citations": cites}, event="citations")
+        s["messages"].append({"role": "assistant", "content": text})
+        sessions.save(s)
+        yield b"data: [DONE]\n\n"
+
     @app.post("/api/sessions/{sid}/chat")
     async def chat_turn(sid: str, body: dict):
         s = sessions.load(sid)
@@ -137,7 +191,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
         if not s["messages"]:
             return JSONResponse({"error": "session has no messages"},
                                 status_code=400)
-        return StreamingResponse(_llm_turn(s), media_type="text/event-stream",
+        gen = _rag_turn(s) if s.get("use_rag") else _llm_turn(s)
+        return StreamingResponse(gen, media_type="text/event-stream",
                                  headers=_NO_STORE)
 
     @app.api_route("/v1/{path:path}",
