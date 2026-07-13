@@ -27,7 +27,11 @@ def build_app(upstream_port: int) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def root():
-        return _chat_html()
+        # no-store: llama-server's own webui once bound this port on a user
+        # machine and the browser kept serving its cached SPA long after —
+        # never let any UI (ours included) outlive its server via cache.
+        return HTMLResponse(_chat_html(),
+                            headers={"Cache-Control": "no-store"})
 
     @app.get("/api/status")
     async def status():

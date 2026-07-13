@@ -10,6 +10,37 @@ from .registry import Registry
 from .resolve import resolve
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+
+
+@app.callback(invoke_without_command=True)
+def _main(ctx: typer.Context,
+          version: bool = typer.Option(False, "--version",
+                                       help="Print rigma version and exit")):
+    if version:
+        from . import __version__
+        typer.echo(f"rigma {__version__}")
+        raise typer.Exit(0)
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit(0)
+
+
+def _port_holder(port: int) -> str:
+    import socket
+    with socket.socket() as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return ""
+        except OSError:
+            pass
+    try:
+        import psutil
+        for c in psutil.net_connections(kind="tcp"):
+            if c.laddr and c.laddr.port == port and c.status == "LISTEN" and c.pid:
+                return f" (held by pid {c.pid}: {psutil.Process(c.pid).name()})"
+    except Exception:
+        pass
+    return " (holder unknown)"
 rag_app = typer.Typer(no_args_is_help=True)
 app.add_typer(rag_app, name="rag",
               help="Chat with your documents (Raggity sidecar).")
@@ -289,6 +320,12 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     typer.echo("argv: llama-server " + " ".join(rp.server_args("<model>", port - 1)))
     if dry_run:
         raise typer.Exit(0)
+    for needed in (port, port - 1):
+        holder = _port_holder(needed)
+        if holder:
+            typer.echo(f"port {needed} is already in use{holder} — "
+                       f"free it or pass a different --port")
+            raise typer.Exit(1)
     if not yes:
         typer.confirm(
             f"download engine + model ({rp.gguf.bytes / 2**30:.1f} GB)?", abort=True)
