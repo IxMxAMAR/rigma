@@ -119,8 +119,12 @@ class RunPlan(BaseModel):
     explain: list[str] = Field(default_factory=list)
 
     def server_args(self, model_path: str, port: int) -> list[str]:
+        # --parallel 1: Rigma serves one user. llama-server defaults to 4
+        # slots, each allocating a full ctx of KV cache — 4x the memory the
+        # resolver budgeted, which silently overflows VRAM into system RAM.
         args = ["-m", model_path, "--port", str(port), "--host", "127.0.0.1",
-                "-ngl", str(self.flags.ngl), "-c", str(self.flags.ctx)]
+                "-ngl", str(self.flags.ngl), "-c", str(self.flags.ctx),
+                "--parallel", "1"]
         if self.flags.n_cpu_moe > 0:
             args += ["--n-cpu-moe", str(self.flags.n_cpu_moe)]
         if self.flags.flash_attn:

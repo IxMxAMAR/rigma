@@ -47,7 +47,8 @@ def test_server_args_full():
     assert args[:2] == ["-m", "C:/m.gguf"]
     s = " ".join(args)
     for chunk in ("--port 11500", "-ngl 99", "-c 32768", "--n-cpu-moe 10",
-                  "-fa on", "--cache-type-k q8_0", "--cache-type-v q8_0"):
+                  "-fa on", "--cache-type-k q8_0", "--cache-type-v q8_0",
+                  "--parallel 1"):  # single-user: 1 slot, not llama's default 4
         assert chunk in s
     bare = RunPlan(model_slug="x", gguf=plan.gguf, backend="vulkan",
                    flags=ComboFlags(ctx=8192), origin="calculator")
