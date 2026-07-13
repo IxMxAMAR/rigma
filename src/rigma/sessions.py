@@ -67,3 +67,13 @@ def build_messages(session: dict, default_prompt: str = "") -> list[dict]:
     prompt = session.get("system_prompt") or default_prompt
     head = [{"role": "system", "content": prompt}] if prompt else []
     return head + list(session.get("messages", []))
+
+
+def default_prompt(registry=None) -> str:
+    """Registry default system prompt for the running use-case ('' if none)."""
+    from . import state as st
+    from .registry import Registry
+    s = st.read_state() or {}
+    reg = registry if registry is not None else Registry.load()
+    uc = reg.use_cases.get(s.get("use_case", "general"))
+    return uc.system_prompt if uc else ""

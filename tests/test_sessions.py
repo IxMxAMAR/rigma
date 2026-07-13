@@ -1,4 +1,8 @@
-from rigma import sessions
+import os
+
+from rigma import sessions, state
+from rigma.models import UseCase
+from rigma.registry import Registry
 
 
 def test_create_save_load_roundtrip(tmp_path, monkeypatch):
@@ -55,3 +59,28 @@ def test_build_messages_falls_back_to_default():
 def test_build_messages_no_prompt_at_all():
     s = {"system_prompt": "", "messages": [{"role": "user", "content": "hi"}]}
     assert sessions.build_messages(s) == [{"role": "user", "content": "hi"}]
+
+
+def _fake_reg(**prompts):
+    return Registry([], {}, {}, {k: UseCase(name=k, system_prompt=v)
+                                 for k, v in prompts.items()})
+
+
+def test_default_prompt_from_state_use_case(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=os.getpid(),
+                      ui_pid=os.getpid(), use_case="creative")
+    reg = _fake_reg(general="G", creative="C")
+    assert sessions.default_prompt(reg) == "C"
+
+
+def test_default_prompt_no_state_falls_to_general(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    assert sessions.default_prompt(_fake_reg(general="G")) == "G"
+
+
+def test_default_prompt_unknown_use_case_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=os.getpid(),
+                      ui_pid=os.getpid(), use_case="exotic")
+    assert sessions.default_prompt(_fake_reg(general="G")) == ""
