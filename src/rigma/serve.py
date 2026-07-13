@@ -68,7 +68,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
         return s
 
     @app.post("/api/sessions/{sid}")
-    async def update_session(sid: str, body: dict):
+    async def update_session(sid: str, body: dict | None = None):
+        body = body or {}
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)

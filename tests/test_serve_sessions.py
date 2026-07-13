@@ -22,6 +22,8 @@ def test_session_crud_cycle(client):
                             "id": "EVIL"}).json()
     assert upd["system_prompt"] == "be brief" and upd["use_rag"] is True
     assert upd["id"] == s["id"]  # immutable fields ignored
+    noop = client.post(f"/api/sessions/{s['id']}")
+    assert noop.status_code == 200 and noop.json()["title"] == "t"
     assert client.delete(f"/api/sessions/{s['id']}").status_code == 200
     assert client.get(f"/api/sessions/{s['id']}").status_code == 404
 
@@ -40,4 +42,5 @@ def test_update_truncates_messages(client):
 def test_missing_session_is_404(client):
     assert client.get("/api/sessions/nope").status_code == 404
     assert client.post("/api/sessions/nope", json={}).status_code == 404
+    assert client.post("/api/sessions/nope").status_code == 404
     assert client.delete("/api/sessions/nope").status_code == 404
