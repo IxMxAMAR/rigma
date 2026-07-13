@@ -17,3 +17,19 @@ def test_find_combo_exact_then_class():
     cls = r.find_combo("nvidia", "unknown-card-16g", 16, 16, "general")
     assert cls and cls[1].startswith("_class/")
     assert r.find_combo("amd", "nope", 999, 999, "general") is None
+
+
+def test_bundled_use_case_prompts_load():
+    r = Registry.load()
+    assert {"general", "creative", "coding"} <= set(r.use_cases)
+    assert len(r.use_cases["creative"].system_prompt) > 50
+
+
+def test_missing_use_cases_dir_is_empty(tmp_path):
+    import shutil
+    from importlib import resources
+    src = str(resources.files("rigma").joinpath("data/registry"))
+    shutil.copytree(src, tmp_path / "reg")
+    shutil.rmtree(tmp_path / "reg" / "use_cases")
+    r = Registry.load(tmp_path / "reg")
+    assert r.use_cases == {}

@@ -67,6 +67,12 @@ class GgufFile(BaseModel):
     sha256: str | None = None
 
 
+class UseCase(BaseModel):
+    name: str
+    system_prompt: str
+    description: str = ""
+
+
 class ModelSpec(BaseModel):
     slug: str
     family: str

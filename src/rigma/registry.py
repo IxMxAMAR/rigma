@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 
-from .models import Combo, ModelSpec
+from .models import Combo, ModelSpec, UseCase
 
 DEFAULT_REGISTRY_ZIP = (
     "https://codeload.github.com/IxMxAMAR/rigma-registry/zip/refs/heads/master")
@@ -47,8 +47,10 @@ def update_registry(url: str = DEFAULT_REGISTRY_ZIP) -> Path:
 
 class Registry:
     def __init__(self, gpus: list[dict], models: dict[str, ModelSpec],
-                 combos: dict[str, Combo]):
+                 combos: dict[str, Combo],
+                 use_cases: dict[str, UseCase] | None = None):
         self.gpus, self.models, self.combos = gpus, models, combos
+        self.use_cases = use_cases or {}
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Registry":
@@ -69,7 +71,13 @@ class Registry:
         for f in sorted((path / "combos").rglob("*.json")):
             rel = f.relative_to(path / "combos").as_posix()
             combos[rel] = Combo.model_validate_json(f.read_text(encoding="utf-8"))
-        return cls(gpus, models, combos)
+        use_cases = {}
+        uc_dir = path / "use_cases"
+        if uc_dir.is_dir():
+            for f in sorted(uc_dir.glob("*.json")):
+                uc = UseCase.model_validate_json(f.read_text(encoding="utf-8"))
+                use_cases[uc.name] = uc
+        return cls(gpus, models, combos, use_cases)
 
     def find_combo(self, vendor: str, gpu_slug: str, vram_gb: int, ram_gb: int,
                    use_case: str) -> tuple[Combo, str] | None:
