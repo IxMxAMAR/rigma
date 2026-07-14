@@ -118,7 +118,7 @@ header .tps { color:var(--amber); min-width:9ch; margin-left:auto;
 .msg .body { white-space:normal; }
 .user { background:var(--bg2); border-radius:var(--r) var(--r) 4px var(--r);
         padding:11px 16px; white-space:pre-wrap; max-width:560px;
-        margin-left:auto; margin-right:calc((100% - 760px)/2); width:fit-content; }
+        margin-left:auto; margin-right:max(0px, calc((100% - 760px)/2)); width:fit-content; }
 .bot { padding:6px 2px 2px; }
 .bot.error .body { color:var(--dim); font-style:italic; }
 .bot.streaming .body::after { content:"▍"; color:var(--amber);
@@ -152,7 +152,7 @@ header .tps { color:var(--amber); min-width:9ch; margin-left:auto;
            opacity:0; transition:opacity .15s var(--ease); }
 .msg:hover + .actions, .actions:hover, .actions:focus-within { opacity:1; }
 .actions.for-user { justify-content:flex-end;
-           padding-right:calc((100% - 760px)/2); }
+           padding-right:max(0px, calc((100% - 760px)/2)); }
 .actions button { color:var(--faint); font:11.5px var(--mono);
            padding:3px 10px; border-radius:999px;
            transition:color .12s var(--ease), background .12s var(--ease); }

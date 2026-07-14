@@ -296,6 +296,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if not s["messages"]:
             return JSONResponse({"error": "session has no messages"},
                                 status_code=400)
+        if body.get("continue") and s.get("use_rag"):
+            return JSONResponse(
+                {"error": "continue is not available for grounded chats"},
+                status_code=400)
         gen = (_rag_turn(s) if s.get("use_rag")
                else _llm_turn(s, cont=bool(body.get("continue"))))
         return StreamingResponse(gen, media_type="text/event-stream",

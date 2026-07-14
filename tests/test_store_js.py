@@ -42,3 +42,8 @@ def test_done_and_multiple_frames():
     out = parse(src)
     assert [e["event"] for e in out["events"]] == ["", "error", ""]
     assert out["events"][2]["data"] == "[DONE]" and out["rest"] == ""
+
+
+def test_crlf_frames():
+    out = parse('event: meta\r\ndata: {"ctx": 1}\r\n\r\n')
+    assert out["events"] == [{"event": "meta", "data": '{"ctx": 1}'}]

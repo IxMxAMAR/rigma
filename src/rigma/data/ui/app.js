@@ -17,7 +17,7 @@ async function loadStatus() {
     const s = await api("GET", "/api/status");
     $("model").textContent = s.model + " (" + s.quant + ")";
     defaultPrompt = s.default_system_prompt || "";
-    if (s.ctx) lastMeta = Object.assign({ctx: s.ctx}, lastMeta || {});
+    if (s.ctx) lastMeta = Object.assign({}, lastMeta, {ctx: s.ctx});
   } catch { $("model").textContent = "server not running"; }
   renderSysBar();
 }
@@ -37,9 +37,13 @@ async function loadPresets() {
 }
 $("preset-pick").addEventListener("change", async (e) => {
   if (!current) { e.target.value = ""; return; }
-  current = await api("POST", "/api/sessions/" + current.id,
-                      {preset_id: e.target.value});
-  renderSysBar();
+  try {
+    current = await api("POST", "/api/sessions/" + current.id,
+                        {preset_id: e.target.value});
+    renderSysBar();
+  } catch {
+    e.target.value = (current && current.preset_id) || "";
+  }
 });
 
 /* ---------- session rail ---------- */
@@ -102,6 +106,8 @@ async function renderRail() {
 
 async function newChat() {
   current = await api("POST", "/api/sessions", {});
+  lastMeta = lastMeta ? {ctx: lastMeta.ctx} : null;
+  $("ctx-bar").classList.remove("live");
   renderAll();
   input.focus();
 }
@@ -109,6 +115,8 @@ async function newChat() {
 async function openSession(id) {
   current = await api("GET", "/api/sessions/" + id);
   document.body.classList.remove("rail-open");
+  lastMeta = lastMeta ? {ctx: lastMeta.ctx} : null;
+  $("ctx-bar").classList.remove("live");
   renderAll();
   input.focus();
 }
@@ -116,7 +124,7 @@ async function openSession(id) {
 async function refreshSession() {
   if (!current) return;
   try { current = await api("GET", "/api/sessions/" + current.id); }
-  catch { current = null; }
+  catch {}
 }
 
 /* ---------- transcript ---------- */
@@ -185,7 +193,8 @@ function addActions(el, m, idx, isLast) {
   }
   if (m.role === "assistant" && isLast) {
     row.appendChild(actionBtn("regenerate", regenerate));
-    row.appendChild(actionBtn("continue", continueTurn));
+    if (!(current && current.use_rag))
+      row.appendChild(actionBtn("continue", continueTurn));
   }
   log.appendChild(row);
 }
@@ -271,9 +280,10 @@ async function flipVariant(idx, dir) {
   const msgs = current.messages.slice();
   const m = Object.assign({}, msgs[idx]);
   const pool = [m.content].concat(m.variants || []);  // all takes, current first
-  const i = ((dir % pool.length) + pool.length) % pool.length;
-  m.content = pool[i];
-  m.variants = pool.filter((_, j) => j !== i);
+  const rot = dir > 0 ? pool.slice(1).concat([pool[0]])
+                      : [pool[pool.length - 1]].concat(pool.slice(0, -1));
+  m.content = rot[0];
+  m.variants = rot.slice(1);
   msgs[idx] = m;
   await saveMessages(msgs);
   renderMessages();
@@ -301,7 +311,6 @@ function setStreaming(on) {
 function chatTurn(message, opts) {
   if (!current || streaming) return;
   setStreaming(true);
-  stopped = false;
   if (message !== null) addMsg("user", message);
   const bot = addMsg("bot", "");
   bot.classList.add("streaming");
@@ -309,6 +318,7 @@ function chatTurn(message, opts) {
   const t0 = performance.now();
   let ntok = 0, text = "", cites = null, errored = false;
   body.innerHTML = '<span class="pending">thinking…</span>';
+  log.style.scrollBehavior = "auto";
   const pendingTimer = setInterval(() => {
     const p = body.querySelector(".pending");
     if (p) p.textContent =
@@ -341,6 +351,15 @@ function chatTurn(message, opts) {
       clearInterval(pendingTimer);
       bot.classList.remove("streaming");
       turn = null;
+      const pv = pendingVariant;      // consume exactly once, every path
+      pendingVariant = null;
+      const restorePv = async () => {
+        try {
+          await saveMessages(current.messages.slice().concat([
+            {role: "assistant", content: pv.content, variants: pv.variants || []},
+          ]));
+        } catch {}
+      };
       if (aborted && text) {
         // user stopped mid-generation: keep what they got
         const msgs = current.messages.slice();
@@ -352,21 +371,33 @@ function chatTurn(message, opts) {
         } else {
           if (message !== null)
             msgs.push({role: "user", content: message});
-          msgs.push({role: "assistant", content: text});
+          const asst = {role: "assistant", content: text};
+          if (pv)
+            asst.variants = (pv.variants || []).concat([pv.content]).filter(Boolean);
+          msgs.push(asst);
         }
         try { await saveMessages(msgs); } catch {}
+      } else if (aborted && !text && pv) {
+        // user stopped a regenerate before any token arrived: restore the old reply
+        await restorePv();
+      } else if (!aborted && errored && pv) {
+        // generation errored after a regenerate: restore the replaced reply
+        await restorePv();
       }
       setStreaming(false);
       await refreshSession();
+      log.style.scrollBehavior = "";
       // errors aren't persisted server-side — a re-render would erase the
       // error bubble, so keep the DOM as-is and only refresh the rail
       if (!errored) {
         renderMessages();
         if (cites && cites.length) addCitations(cites);
-        if (pendingVariant) {
-          const merge = pendingVariant;
-          pendingVariant = null;
-          await mergeVariants(merge);
+        if (!aborted && pv) await mergeVariants(pv);
+        if (aborted) {
+          const mark = document.createElement("div");
+          mark.className = "cites";
+          mark.textContent = "⏹ stopped";
+          log.appendChild(mark);
         }
       }
       renderRail();
@@ -411,7 +442,8 @@ async function mergeVariants(old) {
   const last = msgs[msgs.length - 1];
   if (!last || last.role !== "assistant") return;
   msgs[msgs.length - 1] = Object.assign({}, last, {
-    variants: (old.variants || []).concat([old.content]).filter(Boolean),
+    variants: (last.variants || []).concat(old.variants || [], [old.content])
+      .filter(Boolean),
   });
   try {
     await saveMessages(msgs);

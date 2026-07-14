@@ -93,3 +93,14 @@ def test_rag_chat_turn_malformed_reply_is_error_event(client):
     assert "event: error" in r.text and "[DONE]" in r.text
     got = client.get(f"/api/sessions/{s['id']}").json()
     assert [m["role"] for m in got["messages"]] == ["user"]
+
+
+def test_rag_continue_rejected(client):
+    s = client.post("/api/sessions", json={}).json()
+    client.post(f"/api/sessions/{s['id']}", json={"use_rag": True})
+    client.post(f"/api/sessions/{s['id']}",
+                json={"messages": [{"role": "user", "content": "q"},
+                                   {"role": "assistant", "content": "a"}]})
+    r = client.post(f"/api/sessions/{s['id']}/chat",
+                    json={"message": None, "continue": True})
+    assert r.status_code == 400 and "grounded" in r.json()["error"]

@@ -18,6 +18,7 @@ async function api(method, path, body) {
 // Pure SSE frame parser: complete events out, unconsumed tail back.
 // No DOM, no fetch — node-testable (tests/test_store_js.py).
 function sseParse(buffer) {
+  buffer = buffer.replace(/\r\n/g, "\n");
   const events = [];
   let rest = buffer;
   for (;;) {
@@ -28,7 +29,7 @@ function sseParse(buffer) {
     let event = "", data = "";
     for (const ln of frame.split("\n")) {
       if (ln.startsWith("event: ")) event = ln.slice(7).trim();
-      else if (ln.startsWith("data: ")) data += ln.slice(6);
+      else if (ln.startsWith("data: ")) data += (data ? "\n" : "") + ln.slice(6);
     }
     if (data) events.push({event, data});
   }
@@ -46,7 +47,10 @@ function streamTurn(sessionId, payload, handlers) {
         method: "POST", headers: {"content-type": "application/json"},
         body: JSON.stringify(payload), signal: ctl.signal,
       });
-      if (!r.ok) throw new Error("server replied " + r.status);
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        throw new Error(e.error || ("server replied " + r.status));
+      }
       const reader = r.body.getReader(), dec = new TextDecoder();
       for (;;) {
         const {done, value} = await reader.read();
