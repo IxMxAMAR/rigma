@@ -18,10 +18,10 @@ function renderMarkdown(src) {
   let html = "", i = 0;
   while (i < lines.length) {
     const ln = lines[i];
-    const fence = ln.match(/^```([\w+-]*)\s*$/);
+    const fence = ln.match(/^```+\s*([\w+-]*)/);
     if (fence) {                       // unclosed fence renders what it has
       const buf = [];
-      for (i++; i < lines.length && !/^```\s*$/.test(lines[i]); i++)
+      for (i++; i < lines.length && !/^```+\s*$/.test(lines[i]); i++)
         buf.push(lines[i]);
       i++;
       html += '<pre data-lang="' + fence[1] + '"><code>' + buf.join("\n") +
@@ -63,6 +63,7 @@ function renderMarkdown(src) {
            !/^(```|#{1,4}\s|\s*[-*]\s|\s*\d+\.\s|\s*&gt;)/.test(lines[i])) {
       buf.push(lines[i]); i++;
     }
+    if (!buf.length) { buf.push(lines[i]); i++; }   // never stall the scanner
     html += "<p>" + mdInline(buf.join("<br>")) + "</p>";
   }
   return html;

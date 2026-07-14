@@ -58,7 +58,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
     @app.get("/ui/{name}")
     async def ui_asset(name: str):
         if name not in _UI_FILES:
-            return JSONResponse({"error": "not found"}, status_code=404)
+            return JSONResponse({"error": "not found"}, status_code=404,
+                                headers=_NO_STORE)
         return Response(_ui_file(name), media_type=_UI_FILES[name],
                         headers=_NO_STORE)
 

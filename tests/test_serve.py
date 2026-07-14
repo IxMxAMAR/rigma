@@ -65,8 +65,11 @@ def test_ui_assets_allowlist(upstream):
     assert r.headers["cache-control"] == "no-store"
     r = client.get("/ui/md.js")
     assert r.status_code == 200 and "javascript" in r.headers["content-type"]
-    assert client.get("/ui/../serve.py").status_code == 404
-    assert client.get("/ui/evil.js").status_code == 404
+    assert r.headers["cache-control"] == "no-store"
+    r = client.get("/ui/evil.js")
+    assert r.status_code == 404 and r.json() == {"error": "not found"}
+    r = client.get("/ui/..%2Fserve.py")
+    assert r.status_code == 404
 
 
 def test_api_status_not_running(upstream, tmp_path, monkeypatch):
