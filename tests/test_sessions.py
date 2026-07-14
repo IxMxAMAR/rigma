@@ -116,3 +116,30 @@ def test_effective_params_session_over_preset():
     assert sessions.effective_params({}, None) == {}
     junk = {"params": {"temperature": 99.0, "top_p": 0.5}}
     assert sessions.effective_params(junk, None) == {"top_p": 0.5}
+
+
+def test_build_messages_preset_layer():
+    s = {"system_prompt": "", "messages": []}
+    p = {"system_prompt": "PRESET"}
+    assert sessions.build_messages(s, "DEFAULT", p)[0]["content"] == "PRESET"
+    s2 = {"system_prompt": "MINE", "messages": []}
+    assert sessions.build_messages(s2, "DEFAULT", p)[0]["content"] == "MINE"
+    assert sessions.build_messages(s, "DEFAULT")[0]["content"] == "DEFAULT"
+
+
+def test_build_messages_notes_second_system_message():
+    s = {"system_prompt": "SYS", "notes": "The dragon is named Ember.",
+         "messages": [{"role": "user", "content": "hi"}]}
+    out = sessions.build_messages(s)
+    assert out[0] == {"role": "system", "content": "SYS"}
+    assert out[1]["role"] == "system"
+    assert out[1]["content"].startswith("Story notes (authoritative):")
+    assert "Ember" in out[1]["content"] and out[2]["content"] == "hi"
+
+
+def test_build_messages_sanitizes_to_role_content():
+    s = {"system_prompt": "", "messages": [
+        {"role": "assistant", "content": "pick me",
+         "variants": ["other take"], "secret": True}]}
+    out = sessions.build_messages(s)
+    assert out == [{"role": "assistant", "content": "pick me"}]

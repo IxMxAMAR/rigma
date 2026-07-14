@@ -71,10 +71,19 @@ def list_sessions() -> list[dict]:
     return sorted(out, key=lambda s: s["updated_at"], reverse=True)
 
 
-def build_messages(session: dict, default_prompt: str = "") -> list[dict]:
-    prompt = session.get("system_prompt") or default_prompt
+def build_messages(session: dict, default_prompt: str = "",
+                   preset: dict | None = None) -> list[dict]:
+    prompt = (session.get("system_prompt")
+              or (preset or {}).get("system_prompt", "")
+              or default_prompt)
     head = [{"role": "system", "content": prompt}] if prompt else []
-    return head + list(session.get("messages", []))
+    notes = session.get("notes", "")
+    if notes:
+        head.append({"role": "system",
+                     "content": "Story notes (authoritative):\n" + notes})
+    # sanitize: variants/metadata must never reach the model
+    return head + [{"role": m.get("role", "user"), "content": m.get("content", "")}
+                   for m in session.get("messages", [])]
 
 
 def default_prompt(registry=None) -> str:
