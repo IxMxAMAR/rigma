@@ -112,6 +112,29 @@ with sync_playwright() as pw:
     check("branch created + opened",
           "(branch)" in (page.locator(".chat-item.active .title").first.text_content() or ""))
 
+
+    # ---- Phase 4: engine chip, server tab, fit advisor ----
+    check("engine chip rendered", page.locator("#engine-chip").is_visible())
+    page.click("#engine-chip")
+    page.wait_for_timeout(600)
+    check("server tab opens from chip",
+          "verdict" in (page.locator("#drawer-body").text_content() or ""))
+    check("log tail rendered",
+          len((page.locator("pre.srv-log").text_content() or "")) > 0)
+    page.click("#drawer-close")
+
+    # fit advisor on ctx overflow
+    page.click("#new-chat")
+    page.wait_for_timeout(300)
+    page.fill("#in", "OVERFLOW please")
+    page.press("#in", "Enter")
+    page.wait_for_selector(".advisor", timeout=8000)
+    check("fit advisor appears on ctx overflow",
+          "fit advisor" in (page.locator(".advisor").text_content() or ""))
+    check("error bubble preserved with advisor",
+          "exceeds the available context size"
+          in (page.locator(".bot.error").last.text_content() or ""))
+
     check("no console/page errors at end", not console_errors)
     page.screenshot(path=SHOT, full_page=False)
     b.close()

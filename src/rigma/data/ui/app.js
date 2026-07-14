@@ -350,6 +350,8 @@ function chatTurn(message, opts) {
       errored = true;
       bot.classList.add("error");
       body.textContent = d.message;
+      if (/exceeds the available context size/i.test(d.message || ""))
+        showFitAdvisor();   // actionable remedy, right where it hurt
     },
     citations(c) { cites = c; },
     meta(d) {
@@ -555,6 +557,73 @@ $("add-source").onsubmit = async (e) => {
   } catch (err) { $("docs-status").textContent = err.message; }
 };
 
+/* ---------- engine room chip + fit advisor + switch ---------- */
+let engineInfo = null;
+async function pollEngine() {
+  try { engineInfo = await api("GET", "/api/server"); }
+  catch { engineInfo = null; }
+  const dot = $("engine-dot"), label = $("engine-label");
+  if (!engineInfo) { dot.className = "dot"; label.textContent = "engine"; return; }
+  const lowRam = engineInfo.ram_free_mb < 1536;
+  if (engineInfo.verdict === "degraded") {
+    dot.className = "dot bad";
+    label.textContent = "decode degraded";
+  } else if (lowRam) {
+    dot.className = "dot warn";
+    label.textContent = "low RAM";
+  } else if (engineInfo.verdict === "healthy") {
+    dot.className = "dot on";
+    label.textContent = "engine ok";
+  } else {
+    dot.className = "dot";
+    label.textContent = "engine";
+  }
+}
+$("engine-chip").onclick = () => toggleDrawer("server");
+setInterval(pollEngine, 15000);
+
+async function showFitAdvisor() {
+  let opts = [];
+  try { opts = await api("GET", "/api/server/switch-options"); } catch {}
+  const box = document.createElement("div");
+  box.className = "advisor";
+  const label = document.createElement("span");
+  label.textContent = "fit advisor:";
+  box.appendChild(label);
+  if (!opts.length) {
+    const t = document.createElement("span");
+    t.className = "dim";
+    t.textContent = " no alternative models on disk — shorten the prompt, " +
+                    "start a new chat, or download a bigger-context model";
+    box.appendChild(t);
+  }
+  for (const o of opts.slice(0, 2)) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = "switch to " + o.model + " (" + o.reason + ")";
+    b.onclick = () => doSwitch(o.model);
+    box.appendChild(b);
+  }
+  log.appendChild(box);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function doSwitch(model) {
+  if (streaming) return;
+  if (!confirm("Switch model to " + model +
+               "? The current model will be stopped.")) return;
+  $("switching").hidden = false;
+  try {
+    await api("POST", "/api/server/switch", {model});
+    await loadStatus();
+    await pollEngine();
+  } catch (err) {
+    alert("Switch failed: " + err.message);
+  } finally {
+    $("switching").hidden = true;
+  }
+}
+
 /* ---------- rail toggle (mobile) ---------- */
 $("rail-toggle").onclick = () => document.body.classList.toggle("rail-open");
 $("rail-scrim").onclick = () => document.body.classList.remove("rail-open");
@@ -595,4 +664,5 @@ function renderAll() {
   if (list.length) { await openSession(list[0].id); }
   else { renderAll(); }
   refreshDocs();
+  pollEngine();
 })();

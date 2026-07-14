@@ -38,6 +38,9 @@
   <header>
     <button id="rail-toggle" type="button" aria-label="Toggle chat list">☰</button>
     <span class="spec" id="model">connecting…</span>
+    <button id="engine-chip" type="button" title="Engine room">
+      <span class="dot" id="engine-dot"></span><span id="engine-label">engine</span>
+    </button>
     <span class="tps" id="tps"></span>
     <button id="gear" type="button" aria-label="Settings">⚙</button>
   </header>
@@ -71,11 +74,13 @@
     <nav id="drawer-tabs">
       <button type="button" data-tab="chat" class="active">Chat</button>
       <button type="button" data-tab="presets">Presets</button>
+      <button type="button" data-tab="server">Server</button>
     </nav>
     <button id="drawer-close" type="button" aria-label="Close settings">✕</button>
   </div>
   <div id="drawer-body"></div>
 </aside>
+<div id="switching" hidden><div>switching model…</div></div>
 <script src="/ui/md.js"></script>
 <script src="/ui/store.js"></script>
 <script src="/ui/app.js"></script>

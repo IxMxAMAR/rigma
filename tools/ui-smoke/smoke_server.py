@@ -17,7 +17,19 @@ state.write_state("smoke-model", "Q0", 18500, engine_pid=os.getpid(),
 class FakeUpstream(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
-        self.rfile.read(n)
+        req = self.rfile.read(n)
+        if b"OVERFLOW" in req:
+            body = json.dumps({"error": {
+                "code": 400, "type": "exceed_context_size_error",
+                "message": "request (9999 tokens) exceeds the available "
+                           "context size (4096 tokens), try increasing it"}}
+                ).encode()
+            self.send_response(400)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()

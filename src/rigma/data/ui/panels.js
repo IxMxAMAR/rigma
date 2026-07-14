@@ -29,6 +29,7 @@ function openTab(name) {
     b.classList.toggle("active", b.dataset.tab === name);
   if (name === "chat") renderChatTab();
   else if (name === "presets") renderPresetsTab();
+  else if (name === "server") renderServerTab();
 }
 $("drawer-close").onclick = () => { $("drawer").hidden = true; };
 $("gear").onclick = () => toggleDrawer();
@@ -180,6 +181,73 @@ function renderPresetForm(p) {
   back.onclick = renderPresetsTab;
   acts.appendChild(back);
   box.appendChild(acts);
+}
+
+/* ---------- server tab: engine room ---------- */
+async function renderServerTab() {
+  const box = $("drawer-body");
+  box.innerHTML = "";
+  box.appendChild(el("h3", "", "Engine"));
+  let info = null;
+  try { info = await api("GET", "/api/server"); } catch {}
+  if (!info) {
+    box.appendChild(el("p", "dim", "Server not running."));
+    return;
+  }
+  const rows = [
+    ["model", info.model + " (" + info.quant + ")"],
+    ["backend", info.backend + "  ·  llama.cpp " + (info.engine_version || "?")],
+    ["use case", info.use_case || "general"],
+    ["context", (info.ctx || 0).toLocaleString() + " tokens"],
+    ["uptime", Math.round((Date.now() / 1000 - info.started_at) / 60) + " min"],
+    ["RAM free", (info.ram_free_mb / 1024).toFixed(1) + " / " +
+                 (info.ram_total_mb / 1024).toFixed(1) + " GB"],
+    ["decode", (info.last_tg ? info.last_tg.toFixed(1) + " tok/s" : "—") +
+               (info.expected_tg ? "  (expected ~" +
+                info.expected_tg.toFixed(1) + ")" : "")],
+    ["verdict", info.verdict],
+  ];
+  const tbl = el("div", "srv-rows");
+  for (const [k, v] of rows) {
+    const r = el("div", "srv-row");
+    r.appendChild(el("span", "k", k));
+    r.appendChild(el("span", "v" + (k === "verdict" ? " " + info.verdict : ""),
+                     String(v)));
+    tbl.appendChild(r);
+  }
+  box.appendChild(tbl);
+
+  box.appendChild(el("h3", "", "Switch model (downloaded only)"));
+  let opts = [];
+  try { opts = await api("GET", "/api/server/switch-options"); } catch {}
+  if (!opts.length) {
+    box.appendChild(el("p", "dim",
+      "No alternative models on disk. Download via: rigma up --model <slug>"));
+  }
+  const acts = el("div", "drawer-acts");
+  for (const o of opts) {
+    const b = el("button", "act", o.model + " — " + o.reason);
+    b.onclick = () => doSwitch(o.model);
+    acts.appendChild(b);
+  }
+  box.appendChild(acts);
+
+  box.appendChild(el("h3", "", "Engine log"));
+  const pre = el("pre", "srv-log", "loading…");
+  const load = async () => {
+    try {
+      const r = await fetch("/api/server/log?lines=200");
+      pre.textContent = (await r.text()) || "(empty)";
+      pre.scrollTop = pre.scrollHeight;
+    } catch { pre.textContent = "(log unavailable)"; }
+  };
+  const refresh = el("button", "act", "Refresh log");
+  refresh.onclick = load;
+  box.appendChild(pre);
+  const acts2 = el("div", "drawer-acts");
+  acts2.appendChild(refresh);
+  box.appendChild(acts2);
+  load();
 }
 
 /* ---------- rail search ---------- */
