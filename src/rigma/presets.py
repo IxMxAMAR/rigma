@@ -37,6 +37,8 @@ def create(name: str, system_prompt: str, greeting: str = "",
 
 
 def save(preset: dict) -> None:
+    if is_builtin(preset["id"]):
+        raise ValueError("builtin presets are read-only")
     preset["updated_at"] = time.time()
     p = _path(preset["id"])
     tmp = p.with_suffix(".json.tmp")

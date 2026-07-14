@@ -51,3 +51,11 @@ def test_resolve_builtin_and_file(tmp_path, monkeypatch):
 def test_is_builtin():
     assert presets.is_builtin("usecase:general") is True
     assert presets.is_builtin("a1b2c3d4e5f6") is False
+
+
+def test_save_rejects_builtin_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="read-only"):
+        presets.save({"id": "usecase:general", "name": "hax"})
+    assert list(presets.presets_dir().glob("*")) == []  # nothing written, no ADS orphan
