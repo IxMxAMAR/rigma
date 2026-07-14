@@ -1,23 +1,15 @@
 "use strict";
+/* app.js — chat core. Server-authoritative: state here is a thin cache;
+   every mutation goes through the API (store.js) and re-renders from truth. */
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("in"), form = $("f"), send = $("send"),
-      tps = $("tps"), railEl = $("rail");
+      tps = $("tps");
 let current = null;        // full session object, server-authoritative
 let defaultPrompt = "";
+let presetList = [];
 let streaming = false;
-
-async function api(method, path, body) {
-  const r = await fetch(path, {
-    method,
-    headers: body !== undefined ? {"content-type": "application/json"} : undefined,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  if (!r.ok) {
-    const e = await r.json().catch(() => ({}));
-    throw new Error(e.error || ("server replied " + r.status));
-  }
-  return r.json();
-}
+let turn = null;           // {abort} handle for the in-flight stream
+let lastMeta = null;
 
 /* ---------- header status ---------- */
 async function loadStatus() {
@@ -25,9 +17,30 @@ async function loadStatus() {
     const s = await api("GET", "/api/status");
     $("model").textContent = s.model + " (" + s.quant + ")";
     defaultPrompt = s.default_system_prompt || "";
+    if (s.ctx) lastMeta = Object.assign({ctx: s.ctx}, lastMeta || {});
   } catch { $("model").textContent = "server not running"; }
   renderSysBar();
 }
+
+/* ---------- presets ---------- */
+async function loadPresets() {
+  try { presetList = await api("GET", "/api/presets"); } catch { presetList = []; }
+  const pick = $("preset-pick");
+  pick.innerHTML = '<option value="">no preset</option>';
+  for (const p of presetList) {
+    const o = document.createElement("option");
+    o.value = p.id;
+    o.textContent = p.name;
+    pick.appendChild(o);
+  }
+  if (current) pick.value = current.preset_id || "";
+}
+$("preset-pick").addEventListener("change", async (e) => {
+  if (!current) { e.target.value = ""; return; }
+  current = await api("POST", "/api/sessions/" + current.id,
+                      {preset_id: e.target.value});
+  renderSysBar();
+});
 
 /* ---------- session rail ---------- */
 async function renderRail() {
@@ -107,6 +120,23 @@ async function refreshSession() {
 }
 
 /* ---------- transcript ---------- */
+function decorateCode(body) {
+  for (const pre of body.querySelectorAll("pre")) {
+    if (pre.querySelector(".code-copy")) continue;
+    const b = document.createElement("button");
+    b.className = "code-copy";
+    b.type = "button";
+    b.textContent = "copy";
+    b.onclick = async () => {
+      const code = pre.querySelector("code");
+      await navigator.clipboard.writeText(code ? code.textContent : "");
+      b.textContent = "copied";
+      setTimeout(() => { b.textContent = "copy"; }, 1200);
+    };
+    pre.appendChild(b);
+  }
+}
+
 function addMsg(cls, content) {
   const e = $("empty");
   if (e) e.remove();
@@ -117,6 +147,7 @@ function addMsg(cls, content) {
     const b = document.createElement("div");
     b.className = "body";
     b.innerHTML = renderMarkdown(content);
+    decorateCode(b);
     d.appendChild(b);
   }
   log.appendChild(d);
@@ -124,46 +155,53 @@ function addMsg(cls, content) {
   return d;
 }
 
-function addActions(el, opts) {   // opts: {copy, regen, edit}
+function actionBtn(label, fn, cls) {
+  const b = document.createElement("button");
+  b.type = "button";
+  if (cls) b.className = cls;
+  b.textContent = label;
+  b.onclick = fn;
+  return b;
+}
+
+function addActions(el, m, idx, isLast) {
   const row = document.createElement("div");
-  row.className = "actions";
-  if (opts.copy) {
-    const copy = document.createElement("button");
-    copy.textContent = "copy";
-    copy.onclick = async () => {
-      await navigator.clipboard.writeText(el.dataset.raw || "");
-      copy.textContent = "copied";
-      setTimeout(() => { copy.textContent = "copy"; }, 1200);
-    };
-    row.appendChild(copy);
+  row.className = "actions" + (m.role === "user" ? " for-user" : "");
+  row.appendChild(actionBtn("copy", async (e) => {
+    await navigator.clipboard.writeText(m.content || "");
+    e.target.textContent = "copied";
+    setTimeout(() => { e.target.textContent = "copy"; }, 1200);
+  }));
+  row.appendChild(actionBtn("edit", () => editMessage(el, m, idx)));
+  row.appendChild(actionBtn("delete", () => deleteMessage(idx)));
+  if (m.role === "assistant" && Array.isArray(m.variants) && m.variants.length) {
+    row.appendChild(actionBtn("◀", () => flipVariant(idx, -1), "flip"));
+    const n = document.createElement("span");
+    n.className = "flip";
+    n.style.font = "11.5px var(--mono)";
+    n.textContent = (m.variants.length + 1) + " takes";
+    row.appendChild(n);
+    row.appendChild(actionBtn("▶", () => flipVariant(idx, 1), "flip"));
   }
-  if (opts.regen) {
-    const regen = document.createElement("button");
-    regen.textContent = "regenerate";
-    regen.onclick = regenerate;
-    row.appendChild(regen);
+  if (m.role === "assistant" && isLast) {
+    row.appendChild(actionBtn("regenerate", regenerate));
+    row.appendChild(actionBtn("continue", continueTurn));
   }
-  if (opts.edit) {
-    const edit = document.createElement("button");
-    edit.textContent = "edit";
-    edit.onclick = editLast;
-    row.appendChild(edit);
-  }
-  if (row.children.length) log.appendChild(row);
+  log.appendChild(row);
 }
 
 function addCitations(cites) {
   const box = document.createElement("div");
   box.className = "cites";
-  const btn = document.createElement("button");
-  btn.textContent = "▸ " + cites.length + " citation" + (cites.length > 1 ? "s" : "");
+  const btn = actionBtn("▸ " + cites.length + " citation" +
+                        (cites.length > 1 ? "s" : ""),
+                        () => box.classList.toggle("open"));
   const ul = document.createElement("ul");
   for (const c of cites) {
     const li = document.createElement("li");
     li.textContent = typeof c === "string" ? c : (c.source || JSON.stringify(c));
     ul.appendChild(li);
   }
-  btn.onclick = () => box.classList.toggle("open");
   box.append(btn, ul);
   log.appendChild(box);
 }
@@ -182,147 +220,232 @@ function renderMessages() {
   const msgs = current.messages;
   msgs.forEach((m, idx) => {
     const el = addMsg(m.role === "user" ? "user" : "bot", m.content);
-    el.dataset.raw = m.content;
-    const last = idx === msgs.length - 1;
-    if (m.role === "assistant")
-      addActions(el, {copy: true, regen: last});
-    else if (last)               // trailing user msg (e.g. after an error)
-      addActions(el, {edit: true});
+    addActions(el, m, idx, idx === msgs.length - 1);
   });
   log.scrollTop = log.scrollHeight;
 }
 
+/* ---------- message-level operations ---------- */
+async function saveMessages(msgs) {
+  current = await api("POST", "/api/sessions/" + current.id, {messages: msgs});
+}
+
+function editMessage(el, m, idx) {
+  if (streaming) return;
+  const ta = document.createElement("textarea");
+  ta.className = "edit";
+  ta.value = m.content || "";
+  el.replaceChildren(ta);
+  ta.focus();
+  ta.onkeydown = async (ev) => {
+    if (ev.key === "Escape") { renderMessages(); return; }
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      const v = ta.value.trim();
+      if (!v) { renderMessages(); return; }
+      const msgs = current.messages.slice();
+      msgs[idx] = Object.assign({}, msgs[idx], {content: v});
+      if (m.role === "user") {
+        await saveMessages(msgs.slice(0, idx + 1));  // edits invalidate downstream
+        renderMessages();
+        chatTurn(null);
+      } else {
+        await saveMessages(msgs);
+        renderMessages();
+      }
+    }
+  };
+  ta.onblur = () => { if (document.body.contains(ta)) renderMessages(); };
+}
+
+async function deleteMessage(idx) {
+  if (streaming || !current) return;
+  const msgs = current.messages.slice();
+  msgs.splice(idx, 1);
+  await saveMessages(msgs);
+  renderMessages();
+}
+
+async function flipVariant(idx, dir) {
+  if (streaming || !current) return;
+  const msgs = current.messages.slice();
+  const m = Object.assign({}, msgs[idx]);
+  const pool = [m.content].concat(m.variants || []);  // all takes, current first
+  const i = ((dir % pool.length) + pool.length) % pool.length;
+  m.content = pool[i];
+  m.variants = pool.filter((_, j) => j !== i);
+  msgs[idx] = m;
+  await saveMessages(msgs);
+  renderMessages();
+}
+
+/* ---------- context meter ---------- */
+function renderCtxBar() {
+  const bar = $("ctx-bar"), fill = $("ctx-fill");
+  if (!lastMeta || !lastMeta.ctx || !lastMeta.prompt_tokens) return;
+  const frac = Math.min(1, lastMeta.prompt_tokens / lastMeta.ctx);
+  bar.classList.add("live");
+  bar.title = lastMeta.prompt_tokens.toLocaleString() + " / " +
+              lastMeta.ctx.toLocaleString() + " tokens";
+  fill.style.width = (frac * 100).toFixed(1) + "%";
+  fill.className = frac > 0.9 ? "hot" : frac > 0.75 ? "warn" : "";
+}
+
 /* ---------- chat turn ---------- */
-async function chatTurn(message) {
+function setStreaming(on) {
+  streaming = on;
+  send.textContent = on ? "Stop" : "Send";
+  send.classList.toggle("stop", on);
+}
+
+function chatTurn(message, opts) {
   if (!current || streaming) return;
-  streaming = true;
-  send.disabled = true;
+  setStreaming(true);
+  stopped = false;
   if (message !== null) addMsg("user", message);
   const bot = addMsg("bot", "");
   bot.classList.add("streaming");
   const body = bot.querySelector(".body");
   const t0 = performance.now();
   let ntok = 0, text = "", cites = null, errored = false;
-  // visible waiting state until the first delta — long prompts prefill for
-  // a long time and looked like a dead chat without this
   body.innerHTML = '<span class="pending">thinking…</span>';
   const pendingTimer = setInterval(() => {
     const p = body.querySelector(".pending");
     if (p) p.textContent =
       "thinking… " + Math.round((performance.now() - t0) / 1000) + "s";
   }, 1000);
-  try {
-    const r = await fetch("/api/sessions/" + current.id + "/chat", {
-      method: "POST", headers: {"content-type": "application/json"},
-      body: JSON.stringify({message}),
-    });
-    if (!r.ok) throw new Error("server replied " + r.status);
-    const reader = r.body.getReader(), dec = new TextDecoder();
-    let buf = "", event = "";
-    for (;;) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      for (const ln of lines) {
-        if (ln.startsWith("event: ")) { event = ln.slice(7).trim(); continue; }
-        if (!ln.startsWith("data: ")) continue;
-        const payload = ln.slice(6).trim();
-        if (payload === "[DONE]") { event = ""; continue; }
-        let d;
-        try { d = JSON.parse(payload); } catch { event = ""; continue; }
-        if (event === "error") {
-          errored = true;
-          bot.classList.add("error");
-          body.textContent = d.message;  // server messages are actionable as-is
-        } else if (event === "citations") {
-          cites = d.citations;
-        } else if (d.delta) {
-          text += d.delta;
-          ntok++;
-          body.innerHTML = renderMarkdown(text);
-          log.scrollTop = log.scrollHeight;
-          tps.textContent =
-            (ntok / ((performance.now() - t0) / 1000)).toFixed(1) + " tok/s";
+  const payload = Object.assign({message}, opts || {});
+  turn = streamTurn(current.id, payload, {
+    delta(d) {
+      text += d;
+      ntok++;
+      body.innerHTML = renderMarkdown(text);
+      decorateCode(body);
+      log.scrollTop = log.scrollHeight;
+      tps.textContent =
+        (ntok / ((performance.now() - t0) / 1000)).toFixed(1) + " tok/s";
+    },
+    error(d) {
+      errored = true;
+      bot.classList.add("error");
+      body.textContent = d.message;
+    },
+    citations(c) { cites = c; },
+    meta(d) {
+      lastMeta = d;
+      if (d.predicted_per_second)
+        tps.textContent = d.predicted_per_second.toFixed(1) + " tok/s";
+      renderCtxBar();
+    },
+    async done(aborted) {
+      clearInterval(pendingTimer);
+      bot.classList.remove("streaming");
+      turn = null;
+      if (aborted && text) {
+        // user stopped mid-generation: keep what they got
+        const msgs = current.messages.slice();
+        const cont = payload["continue"];
+        const last = msgs[msgs.length - 1];
+        if (cont && last && last.role === "assistant") {
+          msgs[msgs.length - 1] =
+            Object.assign({}, last, {content: (last.content || "") + text});
+        } else {
+          if (message !== null)
+            msgs.push({role: "user", content: message});
+          msgs.push({role: "assistant", content: text});
         }
-        event = "";
+        try { await saveMessages(msgs); } catch {}
       }
-    }
-  } catch (err) {
-    errored = true;
-    bot.classList.add("error");
-    body.textContent = "Couldn't reach the model: " + err.message +
-      " — check `rigma status` in a terminal.";
-  } finally {
-    clearInterval(pendingTimer);
-    bot.classList.remove("streaming");
-    streaming = false;
-    send.disabled = false;
-    await refreshSession();   // server truth: title, persisted messages
-    // errors aren't persisted server-side — a re-render would erase the
-    // error bubble, so keep the DOM as-is and only refresh the rail
-    if (!errored) {
-      renderMessages();
-      if (cites && cites.length) addCitations(cites);  // re-render drops non-message DOM
-    }
-    renderRail();
-    input.focus();
-  }
+      setStreaming(false);
+      await refreshSession();
+      // errors aren't persisted server-side — a re-render would erase the
+      // error bubble, so keep the DOM as-is and only refresh the rail
+      if (!errored) {
+        renderMessages();
+        if (cites && cites.length) addCitations(cites);
+        if (pendingVariant) {
+          const merge = pendingVariant;
+          pendingVariant = null;
+          await mergeVariants(merge);
+        }
+      }
+      renderRail();
+      input.focus();
+    },
+  });
 }
+
+function stopTurn() {
+  if (turn) turn.abort();
+}
+
+function continueTurn() {
+  chatTurn(null, {"continue": true});
+}
+
+/* ---------- regenerate with variants ---------- */
+let pendingVariant = null;   // {content, variants} of the replaced reply
 
 async function regenerate() {
   if (!current || streaming) return;
-  streaming = true;
-  send.disabled = true;
+  setStreaming(true);
   const msgs = current.messages.slice();
-  while (msgs.length && msgs[msgs.length - 1].role === "assistant") msgs.pop();
-  if (!msgs.length) { streaming = false; send.disabled = false; return; }
+  let old = null;
+  while (msgs.length && msgs[msgs.length - 1].role === "assistant")
+    old = msgs.pop();
+  if (!msgs.length) { setStreaming(false); return; }
   try {
-    current = await api("POST", "/api/sessions/" + current.id, {messages: msgs});
+    await saveMessages(msgs);
     renderMessages();
+    if (old) pendingVariant = {content: old.content,
+                               variants: old.variants || []};
   } finally {
-    streaming = false;          // released synchronously before chatTurn re-locks
-    send.disabled = false;
+    setStreaming(false);        // released synchronously before chatTurn re-locks
   }
   chatTurn(null);
 }
 
-async function editLast() {
-  if (!current || streaming) return;
-  streaming = true;
-  send.disabled = true;
+async function mergeVariants(old) {
+  // after a regenerate completes, fold the replaced reply into variants
+  const msgs = current.messages.slice();
+  const last = msgs[msgs.length - 1];
+  if (!last || last.role !== "assistant") return;
+  msgs[msgs.length - 1] = Object.assign({}, last, {
+    variants: (old.variants || []).concat([old.content]).filter(Boolean),
+  });
   try {
-    const msgs = current.messages.slice();
-    while (msgs.length && msgs[msgs.length - 1].role === "assistant") msgs.pop();
-    const last = msgs.pop();
-    if (!last) return;
-    current = await api("POST", "/api/sessions/" + current.id, {messages: msgs});
+    await saveMessages(msgs);
     renderMessages();
-    input.value = last.content;
-  } finally {
-    streaming = false;
-    send.disabled = false;
-    input.focus();
-  }
+  } catch {}
 }
 
-/* ---------- system prompt bar ---------- */
+/* ---------- system prompt + notes bars ---------- */
 function renderSysBar() {
   const active = current && current.system_prompt;
+  const preset = current && current.preset_id
+    ? presetList.find((p) => p.id === current.preset_id) : null;
   $("sys-preview").textContent = active ? current.system_prompt
-    : (defaultPrompt ? "default: " + defaultPrompt : "no system prompt");
+    : preset ? "preset: " + preset.name
+    : defaultPrompt ? "default: " + defaultPrompt : "no system prompt";
   $("sys-edit").value = active ? current.system_prompt : "";
-  $("sys-edit").placeholder = defaultPrompt
-    ? "Blank = use-case default (shown above)" : "System prompt for this chat";
+  $("sys-edit").placeholder = preset || defaultPrompt
+    ? "Blank = preset/default (shown above)" : "System prompt for this chat";
+  $("preset-pick").value = (current && current.preset_id) || "";
+  $("notes-edit").value = (current && current.notes) || "";
+  $("notes-toggle").style.color =
+    current && current.notes ? "var(--moss)" : "";
 }
-$("sys-toggle").onclick = () => {
-  const ed = $("sys-edit");
-  ed.hidden = !ed.hidden;
-  $("sys-toggle").textContent = ed.hidden ? "sys ▸" : "sys ▾";
-  $("sys-toggle").setAttribute("aria-expanded", String(!ed.hidden));
-  if (!ed.hidden) ed.focus();
-};
+function wireToggle(btnId, areaId, label) {
+  $(btnId).onclick = () => {
+    const ed = $(areaId);
+    ed.hidden = !ed.hidden;
+    $(btnId).textContent = label + (ed.hidden ? " ▸" : " ▾");
+    $(btnId).setAttribute("aria-expanded", String(!ed.hidden));
+    if (!ed.hidden) ed.focus();
+  };
+}
+wireToggle("sys-toggle", "sys-edit", "sys");
+wireToggle("notes-toggle", "notes-edit", "notes");
 $("sys-edit").addEventListener("blur", async () => {
   if (!current) return;
   const v = $("sys-edit").value.trim();
@@ -330,11 +453,20 @@ $("sys-edit").addEventListener("blur", async () => {
   current = await api("POST", "/api/sessions/" + current.id, {system_prompt: v});
   renderSysBar();
 });
-$("sys-edit").addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { e.preventDefault(); $("sys-edit").blur(); $("sys-toggle").click(); }
+$("notes-edit").addEventListener("blur", async () => {
+  if (!current) return;
+  const v = $("notes-edit").value.trim();
+  if (v === (current.notes || "")) return;
+  current = await api("POST", "/api/sessions/" + current.id, {notes: v});
+  renderSysBar();
 });
+for (const id of ["sys-edit", "notes-edit"]) {
+  $(id).addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); $(id).blur(); }
+  });
+}
 
-/* ---------- RAG toggle + docs panel ---------- */
+/* ---------- RAG toggle + docs panel (rail) ---------- */
 $("use-rag").addEventListener("change", async (e) => {
   if (!current) { e.target.checked = false; return; }
   current = await api("POST", "/api/sessions/" + current.id,
@@ -390,15 +522,15 @@ input.addEventListener("keydown", (e) => {
 });
 form.onsubmit = async (e) => {
   e.preventDefault();
+  if (streaming) { stopTurn(); return; }   // Send morphs into Stop mid-turn
   const q = input.value.trim();
-  if (!q || streaming) return;
+  if (!q) return;
   input.value = "";
   if (!current) {
-    streaming = true;
-    send.disabled = true;
+    setStreaming(true);
     try { current = await api("POST", "/api/sessions", {}); }
     catch (err) { input.value = q; return; }
-    finally { streaming = false; send.disabled = false; }
+    finally { setStreaming(false); }
   }
   chatTurn(q);
 };
@@ -409,11 +541,13 @@ function renderAll() {
   renderMessages();
   renderRail();
   renderSysBar();
+  renderCtxBar();
   $("use-rag").checked = !!(current && current.use_rag);
   document.body.classList.toggle("rag-on", !!(current && current.use_rag));
 }
 (async function boot() {
   await loadStatus();
+  await loadPresets();
   const list = await api("GET", "/api/sessions").catch(() => []);
   if (list.length) { await openSession(list[0].id); }
   else { renderAll(); }

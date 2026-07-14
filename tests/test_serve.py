@@ -56,6 +56,7 @@ def test_root_serves_real_chat_ui(upstream):
     client = TestClient(build_app(upstream_port=upstream))
     body = client.get("/").text
     assert "/ui/app.js" in body and "/ui/style.css" in body and "/ui/md.js" in body
+    assert "/ui/store.js" in body
 
 
 def test_ui_assets_allowlist(upstream):
@@ -83,3 +84,6 @@ def test_app_js_served_and_targets_session_api(upstream):
     body = client.get("/ui/app.js").text
     assert "/api/sessions" in body and "renderMarkdown" in body
     assert "/v1/chat/completions" not in body  # UI talks session API only
+    store = client.get("/ui/store.js").text
+    assert "/api/sessions/" in store and "sseParse" in store
+    assert "/v1/chat/completions" not in store

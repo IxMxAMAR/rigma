@@ -18,6 +18,8 @@
       <span class="dot" id="rag-dot" aria-hidden="true"></span>my documents
     </button>
     <div id="docs-body" hidden>
+      <label class="rag-switch" title="Answer this chat from your indexed documents">
+        <input type="checkbox" id="use-rag">use in this chat</label>
       <ul id="source-list"></ul>
       <form id="add-source">
         <input id="source-path" placeholder="C:\path\to\folder" spellcheck="false"
@@ -34,26 +36,34 @@
     <button id="rail-toggle" type="button" aria-label="Toggle chat list">☰</button>
     <span class="spec" id="model">connecting…</span>
     <span class="tps" id="tps"></span>
-    <label class="rag-switch" title="Answer from your indexed documents">
-      <input type="checkbox" id="use-rag">use my documents</label>
   </header>
   <div id="sys-bar">
     <button id="sys-toggle" type="button" aria-expanded="false">sys ▸</button>
     <span id="sys-preview" class="dim"></span>
+    <select id="preset-pick" aria-label="Preset for this chat">
+      <option value="">no preset</option>
+    </select>
+    <button id="notes-toggle" type="button" aria-expanded="false">notes ▸</button>
   </div>
   <textarea id="sys-edit" hidden spellcheck="false" rows="4"
     placeholder="System prompt for this chat"></textarea>
+  <textarea id="notes-edit" hidden spellcheck="false" rows="4"
+    placeholder="Story notes — always in context, authoritative"></textarea>
   <div id="log">
     <div class="empty" id="empty"><b>Talk to your model.</b>
       Runs on your GPU. Nothing leaves this machine.</div>
   </div>
-  <form id="f">
-    <textarea id="in" placeholder="Ask anything — Enter to send, Shift+Enter for a new line"
-      autofocus></textarea>
-    <button class="send" id="send" type="submit">Send</button>
-  </form>
+  <div id="composer">
+    <div id="ctx-bar" title=""><div id="ctx-fill"></div></div>
+    <form id="f">
+      <textarea id="in" placeholder="Ask anything — Enter to send, Shift+Enter for a new line"
+        autofocus></textarea>
+      <button class="send" id="send" type="submit">Send</button>
+    </form>
+  </div>
 </main>
 <script src="/ui/md.js"></script>
+<script src="/ui/store.js"></script>
 <script src="/ui/app.js"></script>
 </body>
 </html>

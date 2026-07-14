@@ -33,6 +33,7 @@ async def _upstream_error(resp) -> str:
 
 
 _UI_FILES = {"app.js": "text/javascript", "md.js": "text/javascript",
+             "store.js": "text/javascript", "panels.js": "text/javascript",
              "style.css": "text/css"}
 
 

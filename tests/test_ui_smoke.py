@@ -14,7 +14,7 @@ def test_full_ui_conversation_flow(tmp_path, monkeypatch, oai_upstream):
     assert c.get("/api/status").status_code == 404
     assert c.get("/api/sessions").json() == []
     assert c.get("/").status_code == 200
-    for asset in ("style.css", "md.js", "app.js"):
+    for asset in ("style.css", "md.js", "store.js", "app.js"):
         assert c.get(f"/ui/{asset}").status_code == 200
 
     # new chat -> first message -> title set, both roles persisted
