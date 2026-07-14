@@ -109,3 +109,29 @@ def test_perform_switch_same_model_rejected(tmp_path, monkeypatch):
                       ui_pid=os.getpid(), backend="vulkan")
     with pytest.raises(RuntimeError, match="already running"):
         server_ops.perform_switch("small-model", registry=reg, profile=profile)
+
+
+def test_switch_options_falls_back_to_on_disk_quant(tmp_path, monkeypatch):
+    """Resolver prefers a quant that isn't downloaded -> offer the one that is.
+
+    Live repro 2026-07-14: under RAM pressure the resolver picked qwen
+    UD-Q2_K_XL while only UD-Q3_K_XL was on disk; the advisor showed
+    'no alternative models' despite a usable 32K-ctx model locally."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    small = GgufFile(repo="r", file="dual-small.gguf", bytes=10, quant="Q2")
+    big = GgufFile(repo="r", file="dual-big.gguf", bytes=20, quant="Q3")
+    spec = ModelSpec(slug="dual-model", family="f", kind="dense", n_layers=2,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=32768, ggufs=[big, small],
+                     cache_type_policy=CachePolicy())
+    reg = Registry([], {"dual-model": spec}, {})
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=16000, backends=["vulkan"])
+    profile = HardwareProfile(gpus=[gpu], ram_mb=16000, ram_free_mb=8000,
+                              cpu=CpuInfo(cores=8), os="windows",
+                              disk_free_gb=100.0)
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "dual-big.gguf").write_text("x")  # ONLY Q3 on disk
+    s = {"model": "other-model", "use_case": "general"}
+    opts = server_ops.switch_options(s, registry=reg, profile=profile)
+    assert [o["quant"] for o in opts] == ["Q3"]
+    assert "Q3 on disk" in opts[0]["reason"]

@@ -64,7 +64,11 @@ def _resolve_for(slug: str, state: dict, registry, profile):
 
 
 def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
-    """Alternative plans limited to models already on disk (no downloads)."""
+    """Alternative plans limited to models already on disk (no downloads).
+
+    Resolves each model against ONLY its on-disk quants — the resolver may
+    prefer a quant that was never downloaded (e.g. under RAM pressure), and
+    filtering on that preference hid genuinely usable local models."""
     from .probe import probe_hardware
     from .registry import Registry
     reg = registry if registry is not None else Registry.load()
@@ -73,15 +77,24 @@ def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
     for slug in sorted(reg.models):
         if slug == state.get("model"):
             continue
+        spec = reg.models[slug]
+        on_disk = [g for g in spec.ggufs if _model_on_disk(g)]
+        if not on_disk:
+            continue
+        trimmed = Registry(reg.gpus,
+                           {**reg.models,
+                            slug: spec.model_copy(update={"ggufs": on_disk})},
+                           reg.combos, reg.use_cases)
         try:
-            rp, _, _ = _resolve_for(slug, state, reg, p)
+            rp, _, _ = _resolve_for(slug, state, trimmed, p)
         except Exception:
             continue
         if rp.model_slug != slug or not _model_on_disk(rp.gguf):
             continue
         out.append({"model": rp.model_slug, "quant": rp.gguf.quant,
                     "ctx": rp.flags.ctx, "backend": rp.backend,
-                    "reason": f"{max(1, rp.flags.ctx // 1024)}K context, on disk"})
+                    "reason": f"{max(1, rp.flags.ctx // 1024)}K context, "
+                              f"{rp.gguf.quant} on disk"})
     out.sort(key=lambda o: -o["ctx"])
     return out
 

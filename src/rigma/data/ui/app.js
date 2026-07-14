@@ -604,8 +604,10 @@ async function showFitAdvisor() {
   if (!opts.length) {
     const t = document.createElement("span");
     t.className = "dim";
-    t.textContent = " no alternative models on disk — shorten the prompt, " +
-                    "start a new chat, or download a bigger-context model";
+    t.textContent = " no downloaded model fits a bigger context right now — " +
+      "trim/delete old messages, branch from an earlier point, start a new " +
+      "chat, or free RAM and retry (max_tokens only caps one reply — it " +
+      "can't grow the window)";
     box.appendChild(t);
   }
   for (const o of opts.slice(0, 2)) {

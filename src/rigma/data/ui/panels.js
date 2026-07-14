@@ -56,9 +56,20 @@ function renderChatTab() {
     "Blank = engine default (or the preset's value). Applied per request.");
   box.appendChild(hint);
   const params = Object.assign({}, current.params || {});
-  for (const [key, lo, hi, step] of PARAM_DEFS) {
+  for (const [key, lo, hiDef, step] of PARAM_DEFS) {
+    let hi = hiDef;
     const row = el("div", "param-row");
-    row.appendChild(el("label", "", key));
+    const lbl = el("label", "", key);
+    if (key === "max_tokens") {
+      // per-reply cap, NOT the context window — and it can never exceed it
+      const ctx = (typeof engineInfo === "object" && engineInfo && engineInfo.ctx)
+        || (lastMeta && lastMeta.ctx) || 0;
+      if (ctx) hi = ctx;
+      lbl.title = "Cap on ONE reply's length. The context window (" +
+        (ctx ? ctx.toLocaleString() + " tokens" : "engine-fixed") +
+        ") is set at engine launch and includes the whole conversation.";
+    }
+    row.appendChild(lbl);
     const range = el("input");
     range.type = "range";
     range.min = lo; range.max = hi; range.step = step;
