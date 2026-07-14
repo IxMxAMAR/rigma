@@ -14,7 +14,7 @@ def test_chat_persists_to_session_store(tmp_path, monkeypatch):
     state.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
     seen = {}
 
-    def fake_stream(port, history):
+    def fake_stream(port, history, params=None):
         seen["history"] = history
         return "pong"
 
@@ -72,3 +72,26 @@ def test_chat_resuming_rag_session_prints_ungrounded_notice(tmp_path, monkeypatc
         r = runner.invoke(app, ["chat", "--session", sess["id"]], input="exit\n")
     assert r.exit_code == 0
     assert "ungrounded" in r.output
+
+
+def test_chat_uses_preset_prompt_and_params(tmp_path, monkeypatch):
+    from rigma import presets
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    p = presets.create("hot", "PRESET-PROMPT", params={"temperature": 1.3})
+    sess = sessions.create()
+    sess["preset_id"] = p["id"]
+    sessions.save(sess)
+    seen = {}
+
+    def fake_stream(port, history, params=None):
+        seen["history"], seen["params"] = history, params
+        return "pong"
+
+    with patch("rigma.cli._stream_chat", fake_stream), \
+         patch("rigma.sessions.default_prompt", return_value=""):
+        r = runner.invoke(app, ["chat", "--session", sess["id"]],
+                          input="ping\nexit\n")
+    assert r.exit_code == 0
+    assert seen["history"][0] == {"role": "system", "content": "PRESET-PROMPT"}
+    assert seen["params"] == {"temperature": 1.3}

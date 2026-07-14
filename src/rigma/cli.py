@@ -165,14 +165,14 @@ def models():
         typer.echo(f"{slug:24} {spec.kind:5} {fit}")
 
 
-def _stream_chat(port: int, history: list[dict]) -> str:
+def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> str:
     import json as _json
 
     import httpx
 
     text = ""
     with httpx.stream("POST", f"http://127.0.0.1:{port}/v1/chat/completions",
-                      json={"messages": history, "stream": True},
+                      json={"messages": history, "stream": True, **(params or {})},
                       timeout=600) as r:
         for line in r.iter_lines():
             if not line.startswith("data: "):
@@ -217,6 +217,12 @@ def chat(session: str = typer.Option(None, "--session",
         default = sessions.default_prompt()
     except Exception:
         default = ""
+    preset = None
+    try:
+        from . import presets as _presets
+        preset = _presets.resolve(sess.get("preset_id", ""))
+    except Exception:
+        pass
     typer.echo(f"{s['model']} ({s['quant']}) — session {sess['id']} — "
                f"exit with 'exit' or Ctrl+C")
     while True:
@@ -232,7 +238,8 @@ def chat(session: str = typer.Option(None, "--session",
         sessions.save(sess)
         try:
             reply = _stream_chat(s["public_port"],
-                                 sessions.build_messages(sess, default))
+                                 sessions.build_messages(sess, default, preset),
+                                 sessions.effective_params(sess, preset))
         except Exception as e:
             typer.echo(f"\nmodel unreachable: {e} — check `rigma status`")
             continue
