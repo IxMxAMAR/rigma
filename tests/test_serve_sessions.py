@@ -1,3 +1,4 @@
+import json
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -135,3 +136,67 @@ def test_chat_turn_midstream_failure_discards_partial(tmp_path, monkeypatch):
         assert [m["role"] for m in got["messages"]] == ["user"]  # nothing saved
     finally:
         srv.shutdown()
+
+
+class _RejectingUpstream(BaseHTTPRequestHandler):
+    """Rejects every request the way llama-server rejects an over-ctx prompt."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        body = json.dumps({"error": {
+            "code": 400, "type": "exceed_context_size_error",
+            "message": "request (4992 tokens) exceeds the available context "
+                       "size (4096 tokens), try increasing it"}}).encode()
+        self.send_response(400)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class _MidStreamErrorObject(BaseHTTPRequestHandler):
+    """200 stream whose first data line is an error object, not a delta."""
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        err = {"error": {"message": "slot unavailable"}}
+        self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+def _turn_against(handler_cls, tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    srv = HTTPServer(("127.0.0.1", 0), handler_cls)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        c = TestClient(build_app(upstream_port=srv.server_address[1],
+                                 default_prompt=""))
+        s = c.post("/api/sessions", json={}).json()
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi"})
+        saved = c.get(f"/api/sessions/{s['id']}").json()
+        return r, saved
+    finally:
+        srv.shutdown()
+
+
+def test_chat_turn_upstream_http_error_surfaces_message(tmp_path, monkeypatch):
+    r, saved = _turn_against(_RejectingUpstream, tmp_path, monkeypatch)
+    assert "event: error" in r.text and "[DONE]" in r.text
+    assert "exceeds the available context size" in r.text
+    assert [m["role"] for m in saved["messages"]] == ["user"]  # nothing saved
+
+
+def test_chat_turn_instream_error_object_surfaces(tmp_path, monkeypatch):
+    r, saved = _turn_against(_MidStreamErrorObject, tmp_path, monkeypatch)
+    assert "event: error" in r.text and "slot unavailable" in r.text
+    assert [m["role"] for m in saved["messages"]] == ["user"]

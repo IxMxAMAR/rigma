@@ -39,6 +39,8 @@ def test_up_walks_ladder_on_launch_failure(tmp_path, monkeypatch):
         return probe_hardware(gpu_table, raw_gpus=RAW)
 
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    # hermetic against a live rigma on this machine: skip the port preflight
+    monkeypatch.setattr(cli, "_port_holder", lambda port: "")
     from rigma import runtime
     monkeypatch.setattr(runtime, "ensure_engine",
                         lambda backend, os_name: Path("llama-server.exe"))

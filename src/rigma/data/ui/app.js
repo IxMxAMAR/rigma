@@ -203,6 +203,14 @@ async function chatTurn(message) {
   const body = bot.querySelector(".body");
   const t0 = performance.now();
   let ntok = 0, text = "", cites = null, errored = false;
+  // visible waiting state until the first delta — long prompts prefill for
+  // a long time and looked like a dead chat without this
+  body.innerHTML = '<span class="pending">thinking…</span>';
+  const pendingTimer = setInterval(() => {
+    const p = body.querySelector(".pending");
+    if (p) p.textContent =
+      "thinking… " + Math.round((performance.now() - t0) / 1000) + "s";
+  }, 1000);
   try {
     const r = await fetch("/api/sessions/" + current.id + "/chat", {
       method: "POST", headers: {"content-type": "application/json"},
@@ -227,8 +235,7 @@ async function chatTurn(message) {
         if (event === "error") {
           errored = true;
           bot.classList.add("error");
-          body.textContent = d.message +
-            " — check `rigma status` in a terminal.";
+          body.textContent = d.message;  // server messages are actionable as-is
         } else if (event === "citations") {
           cites = d.citations;
         } else if (d.delta) {
@@ -248,6 +255,7 @@ async function chatTurn(message) {
     body.textContent = "Couldn't reach the model: " + err.message +
       " — check `rigma status` in a terminal.";
   } finally {
+    clearInterval(pendingTimer);
     bot.classList.remove("streaming");
     streaming = false;
     send.disabled = false;

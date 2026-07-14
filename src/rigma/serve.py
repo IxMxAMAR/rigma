@@ -21,6 +21,16 @@ def _sse(data: dict, event: str = "") -> bytes:
     return (head + "data: " + json.dumps(data) + "\n\n").encode()
 
 
+async def _upstream_error(resp) -> str:
+    body = await resp.aread()
+    try:
+        err = json.loads(body)["error"]
+        return err["message"] if isinstance(err, dict) else str(err)
+    except Exception:
+        return (body.decode(errors="replace")[:200]
+                or f"upstream HTTP {resp.status_code}")
+
+
 _UI_FILES = {"app.js": "text/javascript", "md.js": "text/javascript",
              "style.css": "text/css"}
 
@@ -113,6 +123,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
             req = client.build_request("POST", "/v1/chat/completions",
                                        json={"messages": msgs, "stream": True})
             resp = await client.send(req, stream=True)
+            if resp.status_code != 200:
+                # llama-server rejects some requests outright (e.g. prompt
+                # exceeds ctx) with a JSON error body, not an exception —
+                # surface its message or the turn silently vanishes
+                raise RuntimeError(await _upstream_error(resp))
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -120,8 +135,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
                 if payload == "[DONE]":
                     break
                 try:
-                    delta = (json.loads(payload)["choices"][0]["delta"]
-                             .get("content"))
+                    obj = json.loads(payload)
+                except Exception:
+                    continue
+                if "error" in obj:
+                    err = obj["error"]
+                    raise RuntimeError(err.get("message", "upstream error")
+                                       if isinstance(err, dict) else str(err))
+                try:
+                    delta = obj["choices"][0]["delta"].get("content")
                 except Exception:
                     delta = None
                 if delta:
@@ -129,7 +151,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
                     yield _sse({"delta": delta})
         except Exception as e:
             failed = True
-            yield _sse({"message": f"model unreachable: {e}"}, event="error")
+            yield _sse({"message": str(e) or "model unreachable"}, event="error")
         finally:
             if resp is not None:
                 await resp.aclose()

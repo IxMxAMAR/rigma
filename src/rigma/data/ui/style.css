@@ -98,6 +98,7 @@ body.rag-on .rag-switch { color:var(--moss); }
         white-space:pre-wrap; }
 .bot { border:1px solid transparent; }
 .bot.error .body { color:var(--dim); font-style:italic; }
+.body .pending { font:italic 12px var(--mono); color:var(--dim); }
 .bot.streaming .body::after { content:"▍"; color:var(--amber);
         animation:blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity:0; } }
