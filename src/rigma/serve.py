@@ -186,6 +186,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
         text = a.get("answer", "")
         if a.get("abstained"):
             text = "(abstained — not enough evidence in your documents)\n" + text
+        if not text:
+            yield _sse({"message": "documents returned an empty answer"},
+                       event="error")
+            yield b"data: [DONE]\n\n"
+            return
         yield _sse({"delta": text})
         cites = a.get("citations") or []
         if cites:

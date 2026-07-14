@@ -36,6 +36,7 @@ button { font:inherit; cursor:pointer; }
 .chat-item .del { visibility:hidden; background:none; border:0;
                   color:var(--dim); padding:0 2px; }
 .chat-item:hover .del { visibility:visible; }
+.chat-item:focus-within .del { visibility:visible; }
 .chat-item .del:hover { color:var(--fg); }
 .rail-empty { color:var(--dim); padding:10px 10px; }
 

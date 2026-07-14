@@ -242,7 +242,6 @@ async function chatTurn(message) {
         event = "";
       }
     }
-    if (cites && cites.length) addCitations(cites);
   } catch (err) {
     errored = true;
     bot.classList.add("error");
@@ -255,7 +254,10 @@ async function chatTurn(message) {
     await refreshSession();   // server truth: title, persisted messages
     // errors aren't persisted server-side — a re-render would erase the
     // error bubble, so keep the DOM as-is and only refresh the rail
-    if (!errored) renderMessages();
+    if (!errored) {
+      renderMessages();
+      if (cites && cites.length) addCitations(cites);  // re-render drops non-message DOM
+    }
     renderRail();
     input.focus();
   }

@@ -36,3 +36,39 @@ def test_chat_unknown_session_exits(tmp_path, monkeypatch):
     state.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
     r = runner.invoke(app, ["chat", "--session", "nope"])
     assert r.exit_code == 1 and "no such session" in r.output
+
+
+def test_chat_exiting_immediately_leaves_no_sessions(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    r = runner.invoke(app, ["chat"], input="exit\n")
+    assert r.exit_code == 0
+    assert sessions.list_sessions() == []
+
+
+def test_chat_survives_connection_drop_and_continues(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    with patch("rigma.cli._stream_chat", side_effect=RuntimeError("boom")), \
+         patch("rigma.sessions.default_prompt", return_value="DEFAULT"):
+        r = runner.invoke(app, ["chat"], input="ping\nexit\n")
+    assert r.exit_code == 0
+    assert "model unreachable" in r.output
+    stored = sessions.list_sessions()
+    assert len(stored) == 1
+    sess = sessions.load(stored[0]["id"])
+    assert len(sess["messages"]) == 1
+    assert sess["messages"][0] == {"role": "user", "content": "ping"}
+
+
+def test_chat_resuming_rag_session_prints_ungrounded_notice(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    sess = sessions.create()
+    sess["use_rag"] = True
+    sessions.save(sess)
+    with patch("rigma.cli._stream_chat", return_value="pong"), \
+         patch("rigma.sessions.default_prompt", return_value="DEFAULT"):
+        r = runner.invoke(app, ["chat", "--session", sess["id"]], input="exit\n")
+    assert r.exit_code == 0
+    assert "ungrounded" in r.output

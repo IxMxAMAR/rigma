@@ -16,6 +16,7 @@ def test_create_save_load_roundtrip(tmp_path, monkeypatch):
     got = sessions.load(s["id"])
     assert got["messages"] == [{"role": "user", "content": "hi"}]
     assert got["updated_at"] >= got["created_at"]
+    assert list(sessions.chats_dir().glob("*.tmp")) == []
 
 
 def test_load_missing_returns_none(tmp_path, monkeypatch):

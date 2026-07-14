@@ -31,8 +31,10 @@ def create(title: str = "New chat", system_prompt: str = "") -> dict:
 
 def save(session: dict) -> None:
     session["updated_at"] = time.time()
-    _path(session["id"]).write_text(json.dumps(session, indent=2),
-                                    encoding="utf-8")
+    p = _path(session["id"])
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(session, indent=2), encoding="utf-8")
+    tmp.replace(p)   # atomic on same volume - no torn session files
 
 
 def load(session_id: str) -> dict | None:

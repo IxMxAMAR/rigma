@@ -201,6 +201,7 @@ def chat(session: str = typer.Option(None, "--session",
     if s is None:
         typer.echo("not running — start with: rigma up")
         raise typer.Exit(1)
+    created = False
     if session:
         sess = sessions.load(session)
         if sess is None:
@@ -208,6 +209,10 @@ def chat(session: str = typer.Option(None, "--session",
             raise typer.Exit(1)
     else:
         sess = sessions.create()
+        created = True
+    if sess.get("use_rag"):
+        typer.echo("note: this session has 'use my documents' on — terminal "
+                   "chat replies are ungrounded (use `rigma rag ask`)")
     try:
         default = sessions.default_prompt()
     except Exception:
@@ -224,10 +229,17 @@ def chat(session: str = typer.Option(None, "--session",
         sess["messages"].append({"role": "user", "content": q})
         if sess.get("title") == "New chat":
             sess["title"] = q[:40]
-        reply = _stream_chat(s["public_port"],
-                             sessions.build_messages(sess, default))
+        sessions.save(sess)
+        try:
+            reply = _stream_chat(s["public_port"],
+                                 sessions.build_messages(sess, default))
+        except Exception as e:
+            typer.echo(f"\nmodel unreachable: {e} — check `rigma status`")
+            continue
         sess["messages"].append({"role": "assistant", "content": reply})
         sessions.save(sess)
+    if created and not sess["messages"]:
+        sessions.delete(sess["id"])
 
 
 @app.command()
