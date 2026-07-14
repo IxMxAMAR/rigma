@@ -8,6 +8,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from . import presets
 from . import sessions
 from . import state as st
 
@@ -43,7 +44,7 @@ def _ui_file(name: str) -> str:
         return _FALLBACK_HTML if name == "index.html" else ""
 
 
-def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
+def build_app(upstream_port: int, default_prompt: str | None = None, registry=None) -> FastAPI:
     app = FastAPI(title="rigma", docs_url=None, redoc_url=None)
     base = f"http://127.0.0.1:{upstream_port}"
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
@@ -114,6 +115,39 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
     async def delete_session(sid: str):
         if not sessions.delete(sid):
             return JSONResponse({"error": "no such session"}, status_code=404)
+        return {"ok": True}
+
+    @app.get("/api/presets")
+    async def list_presets():
+        return presets.list_presets(registry)
+
+    @app.post("/api/presets")
+    async def create_preset(body: dict | None = None):
+        body = body or {}
+        return presets.create(name=body.get("name", "New preset"),
+                              system_prompt=body.get("system_prompt", ""),
+                              greeting=body.get("greeting", ""),
+                              params=body.get("params"))
+
+    @app.post("/api/presets/{pid}")
+    async def update_preset(pid: str, body: dict | None = None):
+        if presets.is_builtin(pid):
+            return JSONResponse({"error": "builtin preset"}, status_code=403)
+        p = presets.load(pid)
+        if p is None:
+            return JSONResponse({"error": "no such preset"}, status_code=404)
+        for k in presets.MUTABLE_FIELDS:
+            if k in (body or {}):
+                p[k] = body[k]
+        presets.save(p)
+        return p
+
+    @app.delete("/api/presets/{pid}")
+    async def delete_preset(pid: str):
+        if presets.is_builtin(pid):
+            return JSONResponse({"error": "builtin preset"}, status_code=403)
+        if not presets.delete(pid):
+            return JSONResponse({"error": "no such preset"}, status_code=404)
         return {"ok": True}
 
     async def _llm_turn(s: dict):
