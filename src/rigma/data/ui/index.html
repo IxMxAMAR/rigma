@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rigma</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<aside id="rail">
+  <div class="rail-head">
+    <span class="wordmark">rigma</span>
+    <button id="new-chat" type="button">+ new</button>
+  </div>
+  <nav id="chat-list" aria-label="Chats"></nav>
+  <section id="docs-panel">
+    <button id="docs-toggle" type="button" aria-expanded="false">
+      <span class="dot" id="rag-dot" aria-hidden="true"></span>my documents
+    </button>
+    <div id="docs-body" hidden>
+      <ul id="source-list"></ul>
+      <form id="add-source">
+        <input id="source-path" placeholder="C:\path\to\folder" spellcheck="false"
+               aria-label="Folder to index">
+        <button type="submit">Add</button>
+      </form>
+      <div id="docs-status" class="dim" role="status"></div>
+    </div>
+  </section>
+</aside>
+<div id="rail-scrim" hidden></div>
+<main>
+  <header>
+    <button id="rail-toggle" type="button" aria-label="Toggle chat list">☰</button>
+    <span class="spec" id="model">connecting…</span>
+    <span class="tps" id="tps"></span>
+    <label class="rag-switch" title="Answer from your indexed documents">
+      <input type="checkbox" id="use-rag">use my documents</label>
+  </header>
+  <div id="sys-bar">
+    <button id="sys-toggle" type="button" aria-expanded="false">sys ▸</button>
+    <span id="sys-preview" class="dim"></span>
+  </div>
+  <textarea id="sys-edit" hidden spellcheck="false" rows="4"
+    placeholder="System prompt for this chat"></textarea>
+  <div id="log">
+    <div class="empty" id="empty"><b>Talk to your model.</b>
+      Runs on your GPU. Nothing leaves this machine.</div>
+  </div>
+  <form id="f">
+    <textarea id="in" placeholder="Ask anything — Enter to send, Shift+Enter for a new line"
+      autofocus></textarea>
+    <button class="send" id="send" type="submit">Send</button>
+  </form>
+</main>
+<script src="/ui/md.js"></script>
+<script src="/ui/app.js"></script>
+</body>
+</html>

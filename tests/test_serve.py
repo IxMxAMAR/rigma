@@ -55,8 +55,18 @@ def test_root_serves_html(upstream):
 def test_root_serves_real_chat_ui(upstream):
     client = TestClient(build_app(upstream_port=upstream))
     body = client.get("/").text
-    assert "chat/completions" in body  # real page, not fallback
-    assert "api/status" in body
+    assert "/ui/app.js" in body and "/ui/style.css" in body and "/ui/md.js" in body
+
+
+def test_ui_assets_allowlist(upstream):
+    client = TestClient(build_app(upstream_port=upstream))
+    r = client.get("/ui/style.css")
+    assert r.status_code == 200 and "text/css" in r.headers["content-type"]
+    assert r.headers["cache-control"] == "no-store"
+    r = client.get("/ui/md.js")
+    assert r.status_code == 200 and "javascript" in r.headers["content-type"]
+    assert client.get("/ui/../serve.py").status_code == 404
+    assert client.get("/ui/evil.js").status_code == 404
 
 
 def test_api_status_not_running(upstream, tmp_path, monkeypatch):

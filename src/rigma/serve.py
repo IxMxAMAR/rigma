@@ -21,12 +21,16 @@ def _sse(data: dict, event: str = "") -> bytes:
     return (head + "data: " + json.dumps(data) + "\n\n").encode()
 
 
-def _chat_html() -> str:
+_UI_FILES = {"app.js": "text/javascript", "md.js": "text/javascript",
+             "style.css": "text/css"}
+
+
+def _ui_file(name: str) -> str:
     try:
-        return resources.files("rigma").joinpath("data/ui/chat.html").read_text(
+        return resources.files("rigma").joinpath(f"data/ui/{name}").read_text(
             encoding="utf-8")
     except Exception:
-        return _FALLBACK_HTML
+        return _FALLBACK_HTML if name == "index.html" else ""
 
 
 def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
@@ -49,7 +53,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
         # no-store: llama-server's own webui once bound this port on a user
         # machine and the browser kept serving its cached SPA long after —
         # never let any UI (ours included) outlive its server via cache.
-        return HTMLResponse(_chat_html(), headers=_NO_STORE)
+        return HTMLResponse(_ui_file("index.html"), headers=_NO_STORE)
+
+    @app.get("/ui/{name}")
+    async def ui_asset(name: str):
+        if name not in _UI_FILES:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return Response(_ui_file(name), media_type=_UI_FILES[name],
+                        headers=_NO_STORE)
 
     @app.get("/api/status")
     async def status():
