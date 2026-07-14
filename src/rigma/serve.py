@@ -52,6 +52,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
     ingest_state = {"busy": False, "error": ""}
     ingest_tasks: set = set()
+    telemetry = {"tg": None}   # last observed decode speed, for the verdict
 
     def _default_prompt() -> str:
         if default_prompt is not None:
@@ -237,6 +238,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 meta["prompt_tokens"] = usage["prompt_tokens"]
             if timings.get("predicted_per_second"):
                 meta["predicted_per_second"] = timings["predicted_per_second"]
+                telemetry["tg"] = timings["predicted_per_second"]
             if len(meta) > 1 or meta["ctx"]:
                 yield _sse(meta, event="meta")
         if text and not failed:
@@ -247,6 +249,50 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 s["messages"].append({"role": "assistant", "content": text})
             sessions.save(s)
         yield b"data: [DONE]\n\n"
+
+    @app.get("/api/server")
+    async def server_info():
+        from . import server_ops
+        s = st.server_running()
+        if s is None:
+            return JSONResponse({"error": "not running"}, status_code=404)
+        exp = server_ops.expected_tg(s["model"], s["quant"],
+                                     s.get("backend", "unknown"))
+        info = {k: s.get(k) for k in ("model", "quant", "backend", "use_case",
+                                      "ctx", "started_at", "public_port")}
+        info.update(server_ops.ram_snapshot())
+        info["engine_version"] = server_ops.engine_version()
+        info["last_tg"] = telemetry["tg"]
+        info["expected_tg"] = exp
+        info["verdict"] = server_ops.verdict(telemetry["tg"], exp)
+        return info
+
+    @app.get("/api/server/log")
+    async def server_log(lines: int = 200):
+        from . import server_ops
+        return Response(server_ops.log_tail(lines), media_type="text/plain",
+                        headers=_NO_STORE)
+
+    @app.get("/api/server/switch-options")
+    async def server_switch_options():
+        from . import server_ops
+        s = st.server_running()
+        if s is None:
+            return JSONResponse({"error": "not running"}, status_code=404)
+        return await asyncio.to_thread(server_ops.switch_options, s, registry)
+
+    @app.post("/api/server/switch")
+    async def server_switch(body: dict | None = None):
+        from . import server_ops
+        model = str((body or {}).get("model", "")).strip()
+        if not model:
+            return JSONResponse({"error": "model required"}, status_code=400)
+        try:
+            new_state = await asyncio.to_thread(server_ops.perform_switch,
+                                                model, registry)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+        return new_state
 
     @app.get("/api/rag/status")
     async def rag_status():
