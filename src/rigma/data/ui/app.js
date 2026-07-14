@@ -182,6 +182,7 @@ function addActions(el, m, idx, isLast) {
   }));
   row.appendChild(actionBtn("edit", () => editMessage(el, m, idx)));
   row.appendChild(actionBtn("delete", () => deleteMessage(idx)));
+  row.appendChild(actionBtn("branch", () => branchFrom(idx)));
   if (m.role === "assistant" && Array.isArray(m.variants) && m.variants.length) {
     row.appendChild(actionBtn("◀", () => flipVariant(idx, -1), "flip"));
     const n = document.createElement("span");
@@ -273,6 +274,16 @@ async function deleteMessage(idx) {
   msgs.splice(idx, 1);
   await saveMessages(msgs);
   renderMessages();
+}
+
+async function branchFrom(idx) {
+  // fork the chat at this message: duplicate, truncate the copy, open it
+  if (streaming || !current) return;
+  const d = await api("POST", "/api/sessions/" + current.id + "/duplicate");
+  await api("POST", "/api/sessions/" + d.id,
+            {messages: d.messages.slice(0, idx + 1),
+             title: (current.title || "chat") + " (branch)"});
+  await openSession(d.id);
 }
 
 async function flipVariant(idx, dir) {

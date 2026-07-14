@@ -28,6 +28,10 @@ with sync_playwright() as pw:
     check("boot: preset picker populated",
           page.locator("#preset-pick option").count() >= 4)  # none + 3 builtins
 
+    # always exercise a FRESH chat (the server may carry prior-run state)
+    page.click("#new-chat")
+    page.wait_for_timeout(300)
+
     # send a message end-to-end
     page.fill("#in", "tell me a story")
     page.press("#in", "Enter")
@@ -78,6 +82,35 @@ with sync_playwright() as pw:
     # docs panel holds the RAG toggle now
     page.click("#docs-toggle")
     check("rag toggle lives in docs panel", page.locator("#use-rag").is_visible())
+
+
+    # ---- Phase 3: drawer, params, presets manager, search, branch ----
+    page.click("#gear")
+    check("drawer opens on gear", page.locator("#drawer").is_visible())
+    check("param sliders present", page.locator(".param-row").count() == 5)
+    page.fill(".param-row input.val >> nth=0", "1.2")   # temperature number box
+    page.wait_for_timeout(700)                            # debounce + save
+    sess = page.evaluate("current && current.params")
+    check("param persisted to session", sess and abs(sess.get("temperature", 0) - 1.2) < 1e-6)
+    page.click("#drawer-tabs button[data-tab=presets]")
+    check("presets manager lists built-ins",
+          page.locator(".preset-row.builtin").count() >= 3)
+    page.click("#drawer-close")
+
+    # search
+    page.fill("#rail-search", "tell me")
+    page.wait_for_timeout(600)
+    check("search finds the chat", page.locator(".chat-item .snippet").count() >= 1)
+    page.fill("#rail-search", "")
+    page.wait_for_timeout(500)
+
+    # branch from first message
+    n_before = page.locator(".chat-item").count()
+    page.hover(".msg >> nth=0")
+    page.locator(".actions button", has_text="branch").first.click()
+    page.wait_for_timeout(800)
+    check("branch created + opened",
+          "(branch)" in (page.locator(".chat-item.active .title").first.text_content() or ""))
 
     check("no console/page errors at end", not console_errors)
     page.screenshot(path=SHOT, full_page=False)
