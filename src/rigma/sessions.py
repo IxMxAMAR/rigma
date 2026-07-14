@@ -7,7 +7,12 @@ from pathlib import Path
 
 from .runtime import rigma_home
 
-MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages")
+MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
+                  "preset_id", "params", "notes")
+
+PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
+                "min_p": (0.0, 1.0), "repeat_penalty": (0.5, 2.0),
+                "max_tokens": (1, 32768)}
 
 
 def chats_dir() -> Path:
@@ -24,6 +29,7 @@ def create(title: str = "New chat", system_prompt: str = "") -> dict:
     now = time.time()
     session = {"id": secrets.token_hex(6), "title": title,
                "system_prompt": system_prompt, "use_rag": False,
+               "preset_id": "", "params": {}, "notes": "",
                "created_at": now, "updated_at": now, "messages": []}
     save(session)
     return session
@@ -79,3 +85,36 @@ def default_prompt(registry=None) -> str:
     reg = registry if registry is not None else Registry.load()
     uc = reg.use_cases.get(s.get("use_case", "general"))
     return uc.system_prompt if uc else ""
+
+
+def validate_params(raw: dict) -> dict:
+    """Whitelisted, range-checked sampler params. Raises ValueError('<field>: ...')."""
+    out = {}
+    for key, value in (raw or {}).items():
+        if key not in PARAM_RANGES:
+            continue
+        lo, hi = PARAM_RANGES[key]
+        try:
+            value = int(value) if key == "max_tokens" else float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key}: not a number") from None
+        if not lo <= value <= hi:
+            raise ValueError(f"{key}: must be between {lo} and {hi}")
+        out[key] = value
+    return out
+
+
+def _safe_params(raw: dict) -> dict:
+    out = {}
+    for key, value in (raw or {}).items():
+        try:
+            out.update(validate_params({key: value}))
+        except ValueError:
+            continue  # stored junk never blocks a chat turn
+    return out
+
+
+def effective_params(session: dict, preset: dict | None = None) -> dict:
+    merged = _safe_params((preset or {}).get("params", {}))
+    merged.update(_safe_params(session.get("params", {})))
+    return merged

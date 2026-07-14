@@ -44,7 +44,8 @@ def _ui_file(name: str) -> str:
         return _FALLBACK_HTML if name == "index.html" else ""
 
 
-def build_app(upstream_port: int, default_prompt: str | None = None, registry=None) -> FastAPI:
+def build_app(upstream_port: int, default_prompt: str | None = None,
+              registry=None) -> FastAPI:
     app = FastAPI(title="rigma", docs_url=None, redoc_url=None)
     base = f"http://127.0.0.1:{upstream_port}"
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
@@ -102,6 +103,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None, registry=No
     @app.post("/api/sessions/{sid}")
     async def update_session(sid: str, body: dict | None = None):
         body = body or {}
+        if "params" in body:
+            try:
+                body["params"] = sessions.validate_params(body["params"])
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)

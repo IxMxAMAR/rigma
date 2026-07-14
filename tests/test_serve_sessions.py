@@ -200,3 +200,16 @@ def test_chat_turn_instream_error_object_surfaces(tmp_path, monkeypatch):
     r, saved = _turn_against(_MidStreamErrorObject, tmp_path, monkeypatch)
     assert "event: error" in r.text and "slot unavailable" in r.text
     assert [m["role"] for m in saved["messages"]] == ["user"]
+
+
+def test_update_rejects_bad_params(client):
+    s = client.post("/api/sessions", json={}).json()
+    r = client.post(f"/api/sessions/{s['id']}",
+                    json={"params": {"temperature": 9.0}})
+    assert r.status_code == 400 and "temperature" in r.json()["error"]
+    ok = client.post(f"/api/sessions/{s['id']}",
+                     json={"params": {"temperature": 0.7},
+                           "preset_id": "usecase:general", "notes": "N"})
+    assert ok.json()["params"] == {"temperature": 0.7}
+    assert ok.json()["preset_id"] == "usecase:general"
+    assert ok.json()["notes"] == "N"

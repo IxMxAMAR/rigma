@@ -87,3 +87,30 @@ def test_default_prompt_unknown_use_case_is_empty(tmp_path, monkeypatch):
     state.write_state("m", "q", 11500, engine_pid=os.getpid(),
                       ui_pid=os.getpid(), use_case="exotic")
     assert sessions.default_prompt(_fake_reg(general="G")) == ""
+
+
+def test_create_has_cockpit_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    s = sessions.create()
+    assert s["preset_id"] == "" and s["params"] == {} and s["notes"] == ""
+
+
+def test_validate_params_whitelists_and_ranges():
+    ok = sessions.validate_params({"temperature": 1.2, "max_tokens": 512,
+                                   "bogus": 1})
+    assert ok == {"temperature": 1.2, "max_tokens": 512}
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="temperature"):
+        sessions.validate_params({"temperature": 9.0})
+    with _pytest.raises(ValueError, match="max_tokens"):
+        sessions.validate_params({"max_tokens": 0})
+
+
+def test_effective_params_session_over_preset():
+    sess = {"params": {"temperature": 0.3}}
+    preset = {"params": {"temperature": 1.5, "top_p": 0.9}}
+    assert sessions.effective_params(sess, preset) == {"temperature": 0.3,
+                                                       "top_p": 0.9}
+    assert sessions.effective_params({}, None) == {}
+    junk = {"params": {"temperature": 99.0, "top_p": 0.5}}
+    assert sessions.effective_params(junk, None) == {"top_p": 0.5}
