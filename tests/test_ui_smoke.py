@@ -45,3 +45,25 @@ def test_full_ui_conversation_flow(tmp_path, monkeypatch, oai_upstream):
     lst = c.get("/api/sessions").json()
     assert lst[0]["title"] == "story" and lst[0]["use_rag"] is True
     assert lst[0]["message_count"] == 4
+
+
+def test_preset_settings_flow(tmp_path, monkeypatch, oai_upstream):
+    """The request sequence the Phase-2 UI will perform for presets/settings."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt="D"))
+
+    p = c.post("/api/presets", json={"name": "Noir", "system_prompt": "NOIR",
+                                     "params": {"temperature": 1.2}}).json()
+    assert [x["id"] for x in c.get("/api/presets").json()].count(p["id"]) == 1
+
+    s = c.post("/api/sessions", json={}).json()
+    c.post(f"/api/sessions/{s['id']}",
+           json={"preset_id": p["id"], "notes": "Ember the dragon",
+                 "params": {"temperature": 0.5}})
+    r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "write"})
+    assert "[DONE]" in r.text
+    sent = oai_upstream.last()
+    assert sent["temperature"] == 0.5
+    assert sent["messages"][0]["content"] == "NOIR"
+    assert sent["messages"][1]["content"].startswith("Story notes")
+    assert sent["messages"][2] == {"role": "user", "content": "write"}
