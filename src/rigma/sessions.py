@@ -129,3 +129,55 @@ def effective_params(session: dict, preset: dict | None = None) -> dict:
     merged = _safe_params((preset or {}).get("params", {}))
     merged.update(_safe_params(session.get("params", {})))
     return merged
+
+
+def search(query: str) -> list[dict]:
+    """Summaries (+ first matching snippet) for sessions whose title or
+    message bodies contain the query, case-insensitively."""
+    q = query.strip().lower()
+    if not q:
+        return []
+    out = []
+    for summary in list_sessions():
+        s = load(summary["id"])
+        if s is None:
+            continue
+        snippet = ""
+        if q in s.get("title", "").lower():
+            snippet = s.get("title", "")
+        else:
+            for m in s.get("messages", []):
+                content = m.get("content", "")
+                pos = content.lower().find(q)
+                if pos != -1:
+                    lo = max(0, pos - 40)
+                    snippet = content[lo:pos + len(q) + 60].strip()
+                    break
+        if snippet:
+            out.append({**summary, "snippet": snippet})
+    return out
+
+
+def duplicate(session_id: str) -> dict | None:
+    src = load(session_id)
+    if src is None:
+        return None
+    now = time.time()
+    dup = json.loads(json.dumps(src))  # deep copy - variants etc. detached
+    dup["id"] = secrets.token_hex(6)
+    dup["title"] = (src.get("title") or "chat") + " (copy)"
+    dup["created_at"] = now
+    save(dup)
+    return dup
+
+
+def export_markdown(session: dict) -> str:
+    lines = ["# " + (session.get("title") or "chat"), ""]
+    if session.get("system_prompt"):
+        lines += ["> " + session["system_prompt"].replace("\n", "\n> "), ""]
+    if session.get("notes"):
+        lines += ["> Story notes: " + session["notes"].replace("\n", "\n> "), ""]
+    for m in session.get("messages", []):
+        who = "**You:**" if m.get("role") == "user" else "**Model:**"
+        lines += [who, "", m.get("content", ""), ""]
+    return "\n".join(lines)

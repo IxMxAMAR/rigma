@@ -304,3 +304,25 @@ def test_chat_turn_continue_without_trailing_assistant_appends(tmp_path,
     assert "[DONE]" in r.text
     got = c.get(f"/api/sessions/{s['id']}").json()
     assert [m["role"] for m in got["messages"]] == ["user", "assistant"]
+
+
+def test_search_export_duplicate_routes(client):
+    s = client.post("/api/sessions", json={"title": "dragon tale"}).json()
+    client.post(f"/api/sessions/{s['id']}",
+                json={"messages": [{"role": "user", "content": "fire"},
+                                   {"role": "assistant", "content": "smoke"}]})
+    hits = client.get("/api/sessions/search?q=dragon").json()
+    assert len(hits) == 1 and hits[0]["id"] == s["id"] and hits[0]["snippet"]
+    assert client.get("/api/sessions/search?q=").json() == []
+
+    md = client.get(f"/api/sessions/{s['id']}/export?fmt=md")
+    assert md.status_code == 200 and md.text.startswith("# dragon tale")
+    assert "attachment" in md.headers["content-disposition"]
+    js = client.get(f"/api/sessions/{s['id']}/export?fmt=json")
+    assert js.json()["id"] == s["id"]
+    assert client.get(f"/api/sessions/{s['id']}/export?fmt=evil").status_code == 400
+    assert client.get("/api/sessions/nope/export?fmt=md").status_code == 404
+
+    d = client.post(f"/api/sessions/{s['id']}/duplicate").json()
+    assert d["title"] == "dragon tale (copy)" and len(d["messages"]) == 2
+    assert client.post("/api/sessions/nope/duplicate").status_code == 404

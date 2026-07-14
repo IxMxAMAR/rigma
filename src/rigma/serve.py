@@ -95,12 +95,39 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return sessions.create(title=body.get("title", "New chat"),
                                system_prompt=body.get("system_prompt", ""))
 
+    @app.get("/api/sessions/search")
+    async def search_sessions(q: str = ""):
+        return sessions.search(q)
+
     @app.get("/api/sessions/{sid}")
     async def get_session(sid: str):
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
         return s
+
+    @app.get("/api/sessions/{sid}/export")
+    async def export_session(sid: str, fmt: str = "md"):
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        stem = "".join(ch for ch in (s.get("title") or "chat")
+                       if ch.isalnum() or ch in " -_").strip() or "chat"
+        if fmt == "md":
+            return Response(sessions.export_markdown(s), media_type="text/markdown",
+                            headers={"Content-Disposition":
+                                     f'attachment; filename="{stem}.md"'})
+        if fmt == "json":
+            return JSONResponse(s, headers={"Content-Disposition":
+                                            f'attachment; filename="{stem}.json"'})
+        return JSONResponse({"error": f"unknown format: {fmt}"}, status_code=400)
+
+    @app.post("/api/sessions/{sid}/duplicate")
+    async def duplicate_session(sid: str):
+        d = sessions.duplicate(sid)
+        if d is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        return d
 
     @app.post("/api/sessions/{sid}")
     async def update_session(sid: str, body: dict | None = None):

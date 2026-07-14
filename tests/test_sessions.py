@@ -157,3 +157,45 @@ def test_build_messages_missing_keys_default_sanely():
     out = sessions.build_messages(s)
     assert out == [{"role": "user", "content": ""},
                    {"role": "user", "content": "only content"}]
+
+
+def test_search_titles_and_bodies(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    a = sessions.create(title="dragon tale")
+    b = sessions.create(title="other")
+    b["messages"] = [{"role": "user", "content": "the DRAGON returns"}]
+    sessions.save(b)
+    sessions.create(title="unrelated")
+    hits = sessions.search("dragon")
+    ids = {h["id"] for h in hits}
+    assert ids == {a["id"], b["id"]}
+    hit_b = next(h for h in hits if h["id"] == b["id"])
+    assert "DRAGON" in hit_b["snippet"] and "messages" not in hit_b
+    assert sessions.search("") == []
+
+
+def test_duplicate_deep_copy(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    s = sessions.create(title="orig")
+    s["messages"] = [{"role": "user", "content": "hi"},
+                     {"role": "assistant", "content": "yo", "variants": ["v"]}]
+    s["notes"] = "N"
+    sessions.save(s)
+    d = sessions.duplicate(s["id"])
+    assert d["id"] != s["id"] and d["title"] == "orig (copy)"
+    assert d["messages"] == s["messages"] and d["notes"] == "N"
+    d["messages"][0]["content"] = "mutated"
+    assert sessions.load(s["id"])["messages"][0]["content"] == "hi"  # deep
+    assert sessions.duplicate("nope") is None
+
+
+def test_export_markdown(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    s = sessions.create(title="tale", system_prompt="be a bard")
+    s["messages"] = [{"role": "user", "content": "sing"},
+                     {"role": "assistant", "content": "la la"}]
+    sessions.save(s)
+    md = sessions.export_markdown(sessions.load(s["id"]))
+    assert md.startswith("# tale")
+    assert "> be a bard" in md
+    assert "**You:**\n\nsing" in md and "**Model:**\n\nla la" in md
