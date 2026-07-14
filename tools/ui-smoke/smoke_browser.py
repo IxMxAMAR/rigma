@@ -135,6 +135,19 @@ with sync_playwright() as pw:
           "exceeds the available context size"
           in (page.locator(".bot.error").last.text_content() or ""))
 
+    # drawer must not cross-write params after a session switch (P3 critical)
+    page.click("#gear")
+    page.wait_for_timeout(300)
+    page.fill(".param-row input.val >> nth=0", "3.7")
+    page.click("#new-chat")
+    page.wait_for_timeout(400)
+    page.fill(".param-row input.val >> nth=1", "0.4")   # stale editor nudge
+    page.wait_for_timeout(700)
+    fresh = page.evaluate("current && current.params")
+    check("stale drawer cannot cross-write params",
+          not fresh or "temperature" not in (fresh or {}))
+    page.click("#drawer-close")
+
     check("no console/page errors at end", not console_errors)
     page.screenshot(path=SHOT, full_page=False)
     b.close()

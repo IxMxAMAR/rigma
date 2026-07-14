@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from importlib import resources
 
 import httpx
@@ -53,6 +54,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     ingest_state = {"busy": False, "error": ""}
     ingest_tasks: set = set()
     telemetry = {"tg": None}   # last observed decode speed, for the verdict
+    switch_lock = threading.Lock()
 
     def _default_prompt() -> str:
         if default_prompt is not None:
@@ -112,15 +114,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
-        stem = "".join(ch for ch in (s.get("title") or "chat")
-                       if ch.isalnum() or ch in " -_").strip() or "chat"
+        from urllib.parse import quote
+        raw = s.get("title") or "chat"
+        stem = "".join(ch for ch in raw if ch.isascii()
+                       and (ch.isalnum() or ch in " -_")).strip() or "chat"
+        ext = ".md" if fmt == "md" else ".json"
+        disp = (f'attachment; filename="{stem}{ext}"; '
+                f"filename*=UTF-8''{quote(raw)}{ext}")
         if fmt == "md":
             return Response(sessions.export_markdown(s), media_type="text/markdown",
-                            headers={"Content-Disposition":
-                                     f'attachment; filename="{stem}.md"'})
+                            headers={"Content-Disposition": disp})
         if fmt == "json":
-            return JSONResponse(s, headers={"Content-Disposition":
-                                            f'attachment; filename="{stem}.json"'})
+            return JSONResponse(s, headers={"Content-Disposition": disp})
         return JSONResponse({"error": f"unknown format: {fmt}"}, status_code=400)
 
     @app.post("/api/sessions/{sid}/duplicate")
@@ -287,11 +292,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         model = str((body or {}).get("model", "")).strip()
         if not model:
             return JSONResponse({"error": "model required"}, status_code=400)
+        if not switch_lock.acquire(blocking=False):
+            return JSONResponse({"error": "a switch is already in progress"},
+                                status_code=409)
         try:
             new_state = await asyncio.to_thread(server_ops.perform_switch,
                                                 model, registry)
+            telemetry["tg"] = None
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)
+        finally:
+            switch_lock.release()
         return new_state
 
     @app.get("/api/rag/status")

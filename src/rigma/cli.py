@@ -397,5 +397,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     try:
         serve.run_ui(port, port - 1)
     finally:
-        sp.stop()
+        s_end = st.read_state()
+        if s_end and st.pid_alive(int(s_end.get("engine_pid", -1))):
+            st.kill_pid(int(s_end["engine_pid"]))   # engine may have been switched
+        try:
+            sp.stop()
+        except Exception:
+            pass
         st.clear_state()

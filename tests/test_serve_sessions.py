@@ -326,3 +326,11 @@ def test_search_export_duplicate_routes(client):
     d = client.post(f"/api/sessions/{s['id']}/duplicate").json()
     assert d["title"] == "dragon tale (copy)" and len(d["messages"]) == 2
     assert client.post("/api/sessions/nope/duplicate").status_code == 404
+
+
+def test_export_nonascii_title(client):
+    s = client.post("/api/sessions", json={"title": "攻略チャット🐉"}).json()
+    r = client.get(f"/api/sessions/{s['id']}/export?fmt=md")
+    assert r.status_code == 200
+    cd = r.headers["content-disposition"]
+    assert 'filename="chat.md"' in cd and "filename*=UTF-8''" in cd

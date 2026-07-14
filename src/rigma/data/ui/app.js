@@ -109,6 +109,7 @@ async function newChat() {
   lastMeta = lastMeta ? {ctx: lastMeta.ctx} : null;
   $("ctx-bar").classList.remove("live");
   renderAll();
+  if (typeof refreshDrawer === "function") refreshDrawer();
   input.focus();
 }
 
@@ -118,6 +119,7 @@ async function openSession(id) {
   lastMeta = lastMeta ? {ctx: lastMeta.ctx} : null;
   $("ctx-bar").classList.remove("live");
   renderAll();
+  if (typeof refreshDrawer === "function") refreshDrawer();
   input.focus();
 }
 
@@ -279,10 +281,17 @@ async function deleteMessage(idx) {
 async function branchFrom(idx) {
   // fork the chat at this message: duplicate, truncate the copy, open it
   if (streaming || !current) return;
-  const d = await api("POST", "/api/sessions/" + current.id + "/duplicate");
-  await api("POST", "/api/sessions/" + d.id,
-            {messages: d.messages.slice(0, idx + 1),
-             title: (current.title || "chat") + " (branch)"});
+  let d = null;
+  try { d = await api("POST", "/api/sessions/" + current.id + "/duplicate"); }
+  catch { return; }
+  try {
+    await api("POST", "/api/sessions/" + d.id,
+              {messages: d.messages.slice(0, idx + 1),
+               title: (current.title || "chat") + " (branch)"});
+  } catch {
+    await api("DELETE", "/api/sessions/" + d.id).catch(() => {});
+    return;
+  }
   await openSession(d.id);
 }
 
@@ -585,6 +594,8 @@ setInterval(pollEngine, 15000);
 async function showFitAdvisor() {
   let opts = [];
   try { opts = await api("GET", "/api/server/switch-options"); } catch {}
+  const cur = (engineInfo && engineInfo.ctx) || (lastMeta && lastMeta.ctx) || 0;
+  if (cur) opts = opts.filter((o) => o.ctx > cur);
   const box = document.createElement("div");
   box.className = "advisor";
   const label = document.createElement("span");

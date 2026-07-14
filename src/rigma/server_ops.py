@@ -97,6 +97,8 @@ def perform_switch(model: str, registry=None, profile=None) -> dict:
     s = st.read_state()
     if s is None:
         raise RuntimeError("not running")
+    if model == s.get("model"):
+        raise RuntimeError(f"{model} is already running")
     rp, _, _ = _resolve_for(model, s, registry, profile)
     if rp.model_slug != model:
         raise RuntimeError(f"{model} does not fit this machine")

@@ -100,3 +100,12 @@ def test_perform_switch_happy_and_failure(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="boom"):
         server_ops.perform_switch("small-model", registry=reg, profile=profile)
     assert state.read_state() is None  # failed switch clears stale state
+
+
+def test_perform_switch_same_model_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    reg, profile = _fake_world(tmp_path)
+    state.write_state("small-model", "Q4", 18500, engine_pid=os.getpid(),
+                      ui_pid=os.getpid(), backend="vulkan")
+    with pytest.raises(RuntimeError, match="already running"):
+        server_ops.perform_switch("small-model", registry=reg, profile=profile)

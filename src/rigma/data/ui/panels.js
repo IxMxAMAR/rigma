@@ -24,12 +24,17 @@ function toggleDrawer(tab) {
   d.hidden = false;
   openTab(tab || "chat");
 }
+let activeTab = "chat";
 function openTab(name) {
+  activeTab = name;
   for (const b of document.querySelectorAll("#drawer-tabs button"))
     b.classList.toggle("active", b.dataset.tab === name);
   if (name === "chat") renderChatTab();
   else if (name === "presets") renderPresetsTab();
   else if (name === "server") renderServerTab();
+}
+function refreshDrawer() {
+  if (!$("drawer").hidden) openTab(activeTab);
 }
 $("drawer-close").onclick = () => { $("drawer").hidden = true; };
 $("gear").onclick = () => toggleDrawer();
@@ -45,6 +50,7 @@ function renderChatTab() {
   const box = $("drawer-body");
   box.innerHTML = "";
   if (!current) { box.appendChild(el("p", "dim", "Open a chat first.")); return; }
+  const sid = current.id;
   box.appendChild(el("h3", "", "Sampling — this chat"));
   const hint = el("p", "dim",
     "Blank = engine default (or the preset's value). Applied per request.");
@@ -67,9 +73,9 @@ function renderChatTab() {
     const push = () => {
       clearTimeout(paramTimer);
       paramTimer = setTimeout(async () => {
+        if (!current || current.id !== sid) return;   // stale editor: never cross-write
         try {
-          current = await api("POST", "/api/sessions/" + current.id,
-                              {params});
+          current = await api("POST", "/api/sessions/" + sid, {params});
         } catch (err) { hint.textContent = err.message; }
       }, 350);
     };
@@ -89,12 +95,12 @@ function renderChatTab() {
   box.appendChild(el("h3", "", "This chat"));
   const acts = el("div", "drawer-acts");
   const exMd = el("a", "act", "Export markdown");
-  exMd.href = "/api/sessions/" + current.id + "/export?fmt=md";
+  exMd.href = "/api/sessions/" + sid + "/export?fmt=md";
   const exJs = el("a", "act", "Export JSON");
-  exJs.href = "/api/sessions/" + current.id + "/export?fmt=json";
+  exJs.href = "/api/sessions/" + sid + "/export?fmt=json";
   const dup = el("button", "act", "Duplicate chat");
   dup.onclick = async () => {
-    const d = await api("POST", "/api/sessions/" + current.id + "/duplicate");
+    const d = await api("POST", "/api/sessions/" + sid + "/duplicate");
     $("drawer").hidden = true;
     await openSession(d.id);
   };
