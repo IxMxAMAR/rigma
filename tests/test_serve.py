@@ -76,3 +76,10 @@ def test_api_status_not_running(upstream, tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     client = TestClient(build_app(upstream_port=upstream))
     assert client.get("/api/status").status_code == 404
+
+
+def test_app_js_served_and_targets_session_api(upstream):
+    client = TestClient(build_app(upstream_port=upstream))
+    body = client.get("/ui/app.js").text
+    assert "/api/sessions" in body and "renderMarkdown" in body
+    assert "/v1/chat/completions" not in body  # UI talks session API only
