@@ -69,8 +69,10 @@ async function renderRail() {
       title.contentEditable = "true";
       title.focus();
       document.getSelection().selectAllChildren(title);
+      let cancelled = false;
       const commit = async () => {
         title.contentEditable = "false";
+        if (cancelled) { title.textContent = s.title || "(untitled)"; return; }
         const t = title.textContent.trim() || "(untitled)";
         await api("POST", "/api/sessions/" + s.id, {title: t});
         renderRail();
@@ -78,7 +80,7 @@ async function renderRail() {
       title.onblur = commit;
       title.onkeydown = (ev) => {
         if (ev.key === "Enter") { ev.preventDefault(); title.blur(); }
-        if (ev.key === "Escape") { title.textContent = s.title; title.blur(); }
+        if (ev.key === "Escape") { cancelled = true; title.blur(); }
       };
     };
     nav.appendChild(item);
@@ -261,24 +263,38 @@ async function chatTurn(message) {
 
 async function regenerate() {
   if (!current || streaming) return;
+  streaming = true;
+  send.disabled = true;
   const msgs = current.messages.slice();
   while (msgs.length && msgs[msgs.length - 1].role === "assistant") msgs.pop();
-  if (!msgs.length) return;
-  current = await api("POST", "/api/sessions/" + current.id, {messages: msgs});
-  renderMessages();
+  if (!msgs.length) { streaming = false; send.disabled = false; return; }
+  try {
+    current = await api("POST", "/api/sessions/" + current.id, {messages: msgs});
+    renderMessages();
+  } finally {
+    streaming = false;          // released synchronously before chatTurn re-locks
+    send.disabled = false;
+  }
   chatTurn(null);
 }
 
 async function editLast() {
   if (!current || streaming) return;
-  const msgs = current.messages.slice();
-  while (msgs.length && msgs[msgs.length - 1].role === "assistant") msgs.pop();
-  const last = msgs.pop();
-  if (!last) return;
-  current = await api("POST", "/api/sessions/" + current.id, {messages: msgs});
-  renderMessages();
-  input.value = last.content;
-  input.focus();
+  streaming = true;
+  send.disabled = true;
+  try {
+    const msgs = current.messages.slice();
+    while (msgs.length && msgs[msgs.length - 1].role === "assistant") msgs.pop();
+    const last = msgs.pop();
+    if (!last) return;
+    current = await api("POST", "/api/sessions/" + current.id, {messages: msgs});
+    renderMessages();
+    input.value = last.content;
+  } finally {
+    streaming = false;
+    send.disabled = false;
+    input.focus();
+  }
 }
 
 /* ---------- system prompt bar ---------- */
@@ -366,8 +382,14 @@ form.onsubmit = async (e) => {
   e.preventDefault();
   const q = input.value.trim();
   if (!q || streaming) return;
-  if (!current) current = await api("POST", "/api/sessions", {});
   input.value = "";
+  if (!current) {
+    streaming = true;
+    send.disabled = true;
+    try { current = await api("POST", "/api/sessions", {}); }
+    catch (err) { input.value = q; return; }
+    finally { streaming = false; send.disabled = false; }
+  }
   chatTurn(q);
 };
 $("new-chat").onclick = newChat;

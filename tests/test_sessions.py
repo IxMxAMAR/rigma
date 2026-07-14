@@ -1,4 +1,5 @@
 import os
+import time
 
 from rigma import sessions, state
 from rigma.models import UseCase
@@ -33,6 +34,7 @@ def test_delete(tmp_path, monkeypatch):
 def test_list_sessions_newest_first_skips_corrupt(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     a = sessions.create(title="first")
+    time.sleep(0.02)
     b = sessions.create(title="second")
     b["messages"].append({"role": "user", "content": "x"})
     sessions.save(b)  # save() touches updated_at -> b is newest
