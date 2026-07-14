@@ -22,12 +22,18 @@ rigma up            # probes your machine, downloads the best model, opens the c
 That's it — a browser tab opens with a chat connected to your tuned local model, and any
 OpenAI-compatible tool can use `http://127.0.0.1:11500/v1`.
 
+Chats persist server-side across restarts — the browser UI lists past sessions in a rail,
+renders markdown (fenced code, copy button), and supports regenerate / edit-last. Each
+session carries its own system prompt (registry ships sensible defaults per use case —
+general, creative, coding — so creative-writing models stay in character from the first
+message) and a per-session "use my documents" RAG toggle with inline citations.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `rigma up` | Start everything; opens the chat UI in your browser |
-| `rigma chat` | Chat with the running model in the terminal |
+| `rigma chat` | Chat with the running model in the terminal; `--session <id>` resumes a session started in the browser UI |
 | `rigma status` | What's running, where |
 | `rigma stop` | Stop the model server and UI |
 | `rigma models` | What fits your machine |
