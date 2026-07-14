@@ -34,6 +34,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
     base = f"http://127.0.0.1:{upstream_port}"
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
     ingest_state = {"busy": False, "error": ""}
+    ingest_tasks: set = set()
 
     def _default_prompt() -> str:
         if default_prompt is not None:
@@ -143,9 +144,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
             return JSONResponse({"error": f"path does not exist: {path}"},
                                 status_code=400)
         srcs = rag.add_source(path)
+        ingest_state["busy"], ingest_state["error"] = True, ""
 
         async def _ingest():
-            ingest_state["busy"], ingest_state["error"] = True, ""
             try:
                 await asyncio.to_thread(rag.ingest)
             except Exception as e:
@@ -153,7 +154,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
             finally:
                 ingest_state["busy"] = False
 
-        asyncio.get_running_loop().create_task(_ingest())
+        task = asyncio.get_running_loop().create_task(_ingest())
+        ingest_tasks.add(task)          # asyncio keeps only a weak ref
+        task.add_done_callback(ingest_tasks.discard)
         return JSONResponse({"sources": srcs, "indexing": True}, status_code=202)
 
     async def _rag_turn(s: dict):
@@ -162,6 +165,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None) -> FastAPI:
         try:
             await asyncio.to_thread(rag.ensure_sidecar)
             a = await asyncio.to_thread(rag.ask, q)
+            if not isinstance(a, dict):
+                raise RuntimeError(f"unexpected sidecar reply: {type(a).__name__}")
         except Exception as e:
             yield _sse({"message": f"documents unavailable: {e}"}, event="error")
             yield b"data: [DONE]\n\n"

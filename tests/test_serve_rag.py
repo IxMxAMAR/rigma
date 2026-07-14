@@ -70,3 +70,14 @@ def test_rag_chat_turn_sidecar_failure_is_error_event(client):
     with patch("rigma.rag.ensure_sidecar", side_effect=RuntimeError("boom")):
         r = client.post(f"/api/sessions/{s['id']}/chat", json={"message": "q"})
     assert "event: error" in r.text and "[DONE]" in r.text
+
+
+def test_rag_chat_turn_malformed_reply_is_error_event(client):
+    s = client.post("/api/sessions", json={}).json()
+    client.post(f"/api/sessions/{s['id']}", json={"use_rag": True})
+    with patch("rigma.rag.ensure_sidecar", return_value={}), \
+         patch("rigma.rag.ask", return_value=None):
+        r = client.post(f"/api/sessions/{s['id']}/chat", json={"message": "q"})
+    assert "event: error" in r.text and "[DONE]" in r.text
+    got = client.get(f"/api/sessions/{s['id']}").json()
+    assert [m["role"] for m in got["messages"]] == ["user"]
