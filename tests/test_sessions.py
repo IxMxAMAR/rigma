@@ -104,6 +104,8 @@ def test_validate_params_whitelists_and_ranges():
         sessions.validate_params({"temperature": 9.0})
     with _pytest.raises(ValueError, match="max_tokens"):
         sessions.validate_params({"max_tokens": 0})
+    with _pytest.raises(ValueError, match="max_tokens"):
+        sessions.validate_params({"max_tokens": True})
 
 
 def test_effective_params_session_over_preset():

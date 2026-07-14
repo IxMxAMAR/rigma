@@ -94,6 +94,8 @@ def validate_params(raw: dict) -> dict:
         if key not in PARAM_RANGES:
             continue
         lo, hi = PARAM_RANGES[key]
+        if isinstance(value, bool):
+            raise ValueError(f"{key}: not a number")
         try:
             value = int(value) if key == "max_tokens" else float(value)
         except (TypeError, ValueError):
