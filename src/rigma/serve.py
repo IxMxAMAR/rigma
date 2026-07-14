@@ -81,6 +81,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if s is None:
             return JSONResponse({"error": "not running"}, status_code=404)
         return {**{k: s[k] for k in ("model", "quant", "public_port", "started_at")},
+                "ctx": s.get("ctx", 0),
                 "default_system_prompt": _default_prompt()}
 
     @app.get("/api/sessions")
@@ -157,11 +158,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return {"ok": True}
 
     async def _llm_turn(s: dict):
-        msgs = sessions.build_messages(s, _default_prompt())
+        preset = presets.resolve(s.get("preset_id", ""), registry) \
+            if s.get("preset_id") else None
+        msgs = sessions.build_messages(s, _default_prompt(), preset)
+        body = {"messages": msgs, "stream": True,
+                "stream_options": {"include_usage": True}}
+        body.update(sessions.effective_params(s, preset))
         text, failed, resp = "", False, None
+        usage, timings = {}, {}
         try:
-            req = client.build_request("POST", "/v1/chat/completions",
-                                       json={"messages": msgs, "stream": True})
+            req = client.build_request("POST", "/v1/chat/completions", json=body)
             resp = await client.send(req, stream=True)
             if resp.status_code != 200:
                 # llama-server rejects some requests outright (e.g. prompt
@@ -182,6 +188,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     err = obj["error"]
                     raise RuntimeError(err.get("message", "upstream error")
                                        if isinstance(err, dict) else str(err))
+                usage = obj.get("usage") or usage
+                timings = obj.get("timings") or timings
                 try:
                     delta = obj["choices"][0]["delta"].get("content")
                 except Exception:
@@ -195,6 +203,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         finally:
             if resp is not None:
                 await resp.aclose()
+        if not failed:
+            meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}
+            if usage.get("prompt_tokens"):
+                meta["prompt_tokens"] = usage["prompt_tokens"]
+            if timings.get("predicted_per_second"):
+                meta["predicted_per_second"] = timings["predicted_per_second"]
+            if len(meta) > 1 or meta["ctx"]:
+                yield _sse(meta, event="meta")
         if text and not failed:
             s["messages"].append({"role": "assistant", "content": text})
             sessions.save(s)

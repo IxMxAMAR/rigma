@@ -27,3 +27,10 @@ def test_state_records_use_case(tmp_path, monkeypatch):
     state.write_state("m", "q", 11500, engine_pid=os.getpid(),
                       ui_pid=os.getpid(), use_case="creative")
     assert state.read_state()["use_case"] == "creative"
+
+
+def test_state_records_ctx(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=os.getpid(),
+                      ui_pid=os.getpid(), ctx=4096)
+    assert state.read_state()["ctx"] == 4096

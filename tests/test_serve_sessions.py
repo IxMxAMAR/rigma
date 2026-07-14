@@ -202,6 +202,63 @@ def test_chat_turn_instream_error_object_surfaces(tmp_path, monkeypatch):
     assert [m["role"] for m in saved["messages"]] == ["user"]
 
 
+class _UsageUpstream(BaseHTTPRequestHandler):
+    """Streams one delta, then a final usage/timings chunk, then [DONE]."""
+    last_body = None
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        _UsageUpstream.last_body = json.loads(self.rfile.read(n))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        chunk = {"choices": [{"delta": {"content": "Hi"}}]}
+        self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+        tail = {"choices": [], "usage": {"prompt_tokens": 2244},
+                "timings": {"predicted_per_second": 15.5}}
+        self.wfile.write(b"data: " + json.dumps(tail).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+def test_chat_turn_sends_params_and_emits_meta(tmp_path, monkeypatch):
+    import os as _os
+    from rigma import presets, state
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("m", "q", 11500, engine_pid=_os.getpid(),
+                      ui_pid=_os.getpid(), ctx=4096)
+    srv = HTTPServer(("127.0.0.1", 0), _UsageUpstream)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        c = TestClient(build_app(upstream_port=srv.server_address[1],
+                                 default_prompt=""))
+        p = presets.create("hot", "PROMPT", params={"top_p": 0.8})
+        s = c.post("/api/sessions", json={}).json()
+        c.post(f"/api/sessions/{s['id']}",
+               json={"preset_id": p["id"], "params": {"temperature": 0.4}})
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "go"})
+        sent = _UsageUpstream.last_body
+        assert sent["temperature"] == 0.4 and sent["top_p"] == 0.8
+        assert sent["stream_options"] == {"include_usage": True}
+        assert sent["messages"][0] == {"role": "system", "content": "PROMPT"}
+        assert "event: meta" in r.text
+        assert '"prompt_tokens": 2244' in r.text and '"ctx": 4096' in r.text
+        assert "15.5" in r.text and "[DONE]" in r.text
+    finally:
+        srv.shutdown()
+
+
+def test_chat_turn_no_meta_on_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=1, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi"})
+    assert "event: error" in r.text and "event: meta" not in r.text
+
+
 def test_update_rejects_bad_params(client):
     s = client.post("/api/sessions", json={}).json()
     r = client.post(f"/api/sessions/{s['id']}",
