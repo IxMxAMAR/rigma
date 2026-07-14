@@ -91,10 +91,13 @@ def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
             continue
         if rp.model_slug != slug or not _model_on_disk(rp.gguf):
             continue
+        reason = (f"{max(1, rp.flags.ctx // 1024)}K context, "
+                  f"{rp.gguf.quant} on disk")
+        if rp.backend == "cpu":
+            reason += " — CPU fallback, will be slow (free RAM for GPU)"
         out.append({"model": rp.model_slug, "quant": rp.gguf.quant,
                     "ctx": rp.flags.ctx, "backend": rp.backend,
-                    "reason": f"{max(1, rp.flags.ctx // 1024)}K context, "
-                              f"{rp.gguf.quant} on disk"})
+                    "reason": reason})
     out.sort(key=lambda o: -o["ctx"])
     return out
 
