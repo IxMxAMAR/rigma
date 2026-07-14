@@ -157,7 +157,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": "no such preset"}, status_code=404)
         return {"ok": True}
 
-    async def _llm_turn(s: dict):
+    async def _llm_turn(s: dict, cont: bool = False):
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
         msgs = sessions.build_messages(s, _default_prompt(), preset)
@@ -212,7 +212,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             if len(meta) > 1 or meta["ctx"]:
                 yield _sse(meta, event="meta")
         if text and not failed:
-            s["messages"].append({"role": "assistant", "content": text})
+            last = s["messages"][-1] if s["messages"] else None
+            if cont and last and last.get("role") == "assistant":
+                last["content"] = last.get("content", "") + text
+            else:
+                s["messages"].append({"role": "assistant", "content": text})
             sessions.save(s)
         yield b"data: [DONE]\n\n"
 
@@ -291,7 +295,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if not s["messages"]:
             return JSONResponse({"error": "session has no messages"},
                                 status_code=400)
-        gen = _rag_turn(s) if s.get("use_rag") else _llm_turn(s)
+        gen = (_rag_turn(s) if s.get("use_rag")
+               else _llm_turn(s, cont=bool(body.get("continue"))))
         return StreamingResponse(gen, media_type="text/event-stream",
                                  headers=_NO_STORE)
 

@@ -270,3 +270,37 @@ def test_update_rejects_bad_params(client):
     assert ok.json()["params"] == {"temperature": 0.7}
     assert ok.json()["preset_id"] == "usecase:general"
     assert ok.json()["notes"] == "N"
+
+
+def test_chat_turn_continue_extends_trailing_assistant(tmp_path, monkeypatch,
+                                                       oai_upstream):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    c.post(f"/api/sessions/{s['id']}",
+           json={"messages": [{"role": "user", "content": "story"},
+                              {"role": "assistant", "content": "Once upon",
+                               "variants": ["draft"]}]})
+    r = c.post(f"/api/sessions/{s['id']}/chat",
+               json={"message": None, "continue": True})
+    assert "[DONE]" in r.text
+    got = c.get(f"/api/sessions/{s['id']}").json()
+    msgs = got["messages"]
+    assert len(msgs) == 2  # extended, not appended
+    assert msgs[1]["content"] == "Once uponHello"  # upstream streams "Hel"+"lo"
+    assert msgs[1]["variants"] == ["draft"]  # metadata preserved
+    sent = oai_upstream.last()["messages"]
+    assert sent[-1] == {"role": "assistant", "content": "Once upon"}
+
+
+def test_chat_turn_continue_without_trailing_assistant_appends(tmp_path,
+                                                               monkeypatch,
+                                                               oai_upstream):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    r = c.post(f"/api/sessions/{s['id']}/chat",
+               json={"message": "hi", "continue": True})
+    assert "[DONE]" in r.text
+    got = c.get(f"/api/sessions/{s['id']}").json()
+    assert [m["role"] for m in got["messages"]] == ["user", "assistant"]
