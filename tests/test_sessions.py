@@ -143,3 +143,17 @@ def test_build_messages_sanitizes_to_role_content():
          "variants": ["other take"], "secret": True}]}
     out = sessions.build_messages(s)
     assert out == [{"role": "assistant", "content": "pick me"}]
+
+
+def test_build_messages_notes_alone_is_sole_system_message():
+    s = {"system_prompt": "", "notes": "N", "messages": []}
+    out = sessions.build_messages(s)
+    assert len(out) == 1 and out[0]["role"] == "system"
+    assert out[0]["content"] == "Story notes (authoritative):\nN"
+
+
+def test_build_messages_missing_keys_default_sanely():
+    s = {"messages": [{}, {"content": "only content"}]}
+    out = sessions.build_messages(s)
+    assert out == [{"role": "user", "content": ""},
+                   {"role": "user", "content": "only content"}]
