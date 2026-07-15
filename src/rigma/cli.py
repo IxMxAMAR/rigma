@@ -330,11 +330,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        dry_run: bool = typer.Option(False, "--dry-run"),
        port: int = typer.Option(11500, "--port"),
        no_browser: bool = typer.Option(False, "--no-browser"),
-       polite: bool = typer.Option(False, "--polite",
-                                   help="Single-stream download (won't saturate "
-                                        "the connection, e.g. while gaming)"),
-       turbo: bool = typer.Option(False, "--turbo", hidden=True,
-                                  help="Deprecated: full speed is the default")):
+       ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
     import webbrowser
@@ -371,7 +367,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     for i, cand in enumerate(candidates):
         try:
             exe = runtime.ensure_engine(cand.backend, os_name)
-            model_path = runtime.ensure_model(cand.gguf, polite=polite)
+            model_path = runtime.ensure_model(cand.gguf)
             typer.echo(f"starting llama-server: {cand.model_slug} "
                        f"{cand.gguf.quant} (first load can take minutes)...")
             sp = runtime.launch_server(exe, cand, model_path, port=port - 1)

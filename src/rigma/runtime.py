@@ -80,18 +80,13 @@ def ensure_engine(backend: str, os_name: str) -> Path:
     return found
 
 
-def ensure_model(gguf: GgufFile, polite: bool = False) -> Path:
-    # Full speed by default (owner decision 2026-07-14: throttling punished
-    # every download and didn't even fix gaming packet loss — the right move
-    # while gaming is to not download at all, or pass --polite).
-    # polite=True: classic single-stream downloader — resumes deterministically
-    # and won't saturate the connection.
-    if polite:
-        os.environ["HF_HUB_DISABLE_XET"] = "1"
-        os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "4")
-    else:
-        os.environ.setdefault("HF_HUB_DISABLE_XET", "0")
-        os.environ.setdefault("HF_XET_NUM_CONCURRENT_RANGE_GETS", "16")
+def ensure_model(gguf: GgufFile) -> Path:
+    # Classic downloader, unthrottled (owner decision 2026-07-14: no artificial
+    # speed caps, ever — while gaming the right move is to not download, not to
+    # throttle). xet stays off: it hung mid-download on Windows twice
+    # (2026-07-06, 2026-07-14); classic runs at line rate on HF's CDN and
+    # resumes deterministically. Explicit HF_* env vars always win (setdefault).
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     local_dir = rigma_home() / "models"
     local_dir.mkdir(parents=True, exist_ok=True)
     return Path(hf_hub_download(repo_id=gguf.repo, filename=gguf.file,

@@ -17,34 +17,23 @@ def _capture(tmp_path, monkeypatch):
     return seen
 
 
-def test_ensure_model_defaults_to_full_speed(tmp_path, monkeypatch):
-    # Owner decision 2026-07-14: throttled-by-default punished every download
-    # and didn't fix gaming packet loss. Full speed is the default now.
+def test_default_is_classic_and_uncapped(tmp_path, monkeypatch):
+    # Owner decision 2026-07-14: no artificial speed caps. Classic downloader
+    # because xet hung mid-download on Windows twice (2026-07-06, 2026-07-14).
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.delenv("HF_XET_NUM_CONCURRENT_RANGE_GETS", raising=False)
     monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
     seen = _capture(tmp_path, monkeypatch)
     from rigma.models import GgufFile
     runtime.ensure_model(GgufFile(repo="r/x", file="m.gguf", bytes=1, quant="Q8_0"))
-    assert seen["xet_off"] == "0" and seen["conc"] == "16"
-
-
-def test_polite_flag_single_stream(tmp_path, monkeypatch):
-    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
-    monkeypatch.delenv("HF_XET_NUM_CONCURRENT_RANGE_GETS", raising=False)
-    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
-    seen = _capture(tmp_path, monkeypatch)
-    from rigma.models import GgufFile
-    runtime.ensure_model(GgufFile(repo="r/x", file="m.gguf", bytes=1, quant="Q8_0"),
-                         polite=True)
-    assert seen["xet_off"] == "1"  # classic downloader: deterministic resume
+    assert seen["xet_off"] == "1"     # classic: line-rate, deterministic resume
+    assert seen["conc"] is None       # and NO concurrency throttle env
 
 
 def test_explicit_env_still_wins(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
-    monkeypatch.setenv("HF_HUB_DISABLE_XET", "1")
-    monkeypatch.setenv("HF_XET_NUM_CONCURRENT_RANGE_GETS", "2")
+    monkeypatch.setenv("HF_HUB_DISABLE_XET", "0")   # user opts back into xet
     seen = _capture(tmp_path, monkeypatch)
     from rigma.models import GgufFile
     runtime.ensure_model(GgufFile(repo="r/x", file="m.gguf", bytes=1, quant="Q8_0"))
-    assert seen["xet_off"] == "1" and seen["conc"] == "2"  # user env respected
+    assert seen["xet_off"] == "0"
