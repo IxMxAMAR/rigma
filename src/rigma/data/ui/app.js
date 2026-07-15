@@ -589,6 +589,8 @@ async function pollEngine() {
   }
 }
 $("engine-chip").onclick = () => toggleDrawer("server");
+$("model").onclick = () => toggleDrawer("server");   // model name = switcher door
+$("model").title = "Model & engine — click to switch (Server tab)";
 setInterval(pollEngine, 15000);
 
 async function showFitAdvisor() {
