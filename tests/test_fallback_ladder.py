@@ -32,11 +32,9 @@ def test_up_walks_ladder_on_launch_failure(tmp_path, monkeypatch):
     import rigma.cli as cli
 
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
-    RAW = [{"vendor_id": 0x1002, "name": "AMD Radeon RX 9070 XT", "vram_mb": 16368}]
 
     def _fake_probe(gpu_table, raw_gpus=None):
-        from rigma.probe import probe_hardware
-        return probe_hardware(gpu_table, raw_gpus=RAW)
+        return _profile()   # canonical 16GB box - real RAM must never leak in
 
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
     # hermetic against a live rigma on this machine: skip the port preflight
@@ -45,7 +43,7 @@ def test_up_walks_ladder_on_launch_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "ensure_engine",
                         lambda backend, os_name: Path("llama-server.exe"))
     monkeypatch.setattr(runtime, "ensure_model",
-                        lambda gguf: Path(gguf.file))
+                        lambda gguf, **kw: Path(gguf.file))
     attempts = []
 
     def flaky_launch(exe, plan, model_path, port=11500, timeout=300.0,

@@ -7,8 +7,16 @@ RAW = [{"vendor_id": 0x1002, "name": "AMD Radeon RX 9070 XT", "vram_mb": 16368}]
 
 
 def _fake_probe(gpu_table, raw_gpus=None):
-    from rigma.probe import probe_hardware
-    return probe_hardware(gpu_table, raw_gpus=RAW)
+    # Fully canonical profile — REAL probe reads this machine's RAM, and a
+    # hardware upgrade (16->32GB, 2026-07-14) changed combo resolution and
+    # broke these tests. Never let real hardware leak into assertions.
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    gpu = GpuInfo(vendor="amd", name="AMD Radeon RX 9070 XT", vram_mb=16368,
+                  arch="rdna4", slug="amd-radeon-rx-9070-xt-16g",
+                  backends=["vulkan", "rocm"])
+    return HardwareProfile(gpus=[gpu], ram_mb=16234, ram_free_mb=9100,
+                           cpu=CpuInfo(cores=16), os="windows",
+                           disk_free_gb=400.0)
 
 
 def test_doctor(monkeypatch):
