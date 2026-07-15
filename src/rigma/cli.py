@@ -330,8 +330,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        dry_run: bool = typer.Option(False, "--dry-run"),
        port: int = typer.Option(11500, "--port"),
        no_browser: bool = typer.Option(False, "--no-browser"),
-       turbo: bool = typer.Option(False, "--turbo",
-                                  help="Max-speed download (may saturate your connection)")):
+       polite: bool = typer.Option(False, "--polite",
+                                   help="Single-stream download (won't saturate "
+                                        "the connection, e.g. while gaming)"),
+       turbo: bool = typer.Option(False, "--turbo", hidden=True,
+                                  help="Deprecated: full speed is the default")):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
     import webbrowser
@@ -342,9 +345,6 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     if st.server_running():
         typer.echo("already running — see: rigma status   (or: rigma stop)")
         raise typer.Exit(1)
-    if turbo:
-        os.environ["HF_HUB_DISABLE_XET"] = "0"
-        os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = "16"
 
     reg = Registry.load()
     p = _profile(reg)
@@ -371,7 +371,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     for i, cand in enumerate(candidates):
         try:
             exe = runtime.ensure_engine(cand.backend, os_name)
-            model_path = runtime.ensure_model(cand.gguf)
+            model_path = runtime.ensure_model(cand.gguf, polite=polite)
             typer.echo(f"starting llama-server: {cand.model_slug} "
                        f"{cand.gguf.quant} (first load can take minutes)...")
             sp = runtime.launch_server(exe, cand, model_path, port=port - 1)
