@@ -674,6 +674,11 @@ async function pollEngine() {
   catch { engineInfo = null; }
   const dot = $("engine-dot"), label = $("engine-label");
   if (!engineInfo) { dot.className = "dot"; label.textContent = "engine"; return; }
+  if (engineInfo.unloaded) {
+    dot.className = "dot warn";
+    label.textContent = "unloaded";
+    return;
+  }
   const lowRam = engineInfo.ram_free_mb < 1536;
   if (engineInfo.verdict === "degraded") {
     dot.className = "dot bad";

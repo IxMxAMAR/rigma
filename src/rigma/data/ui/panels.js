@@ -270,6 +270,38 @@ async function renderServerTab() {
   }
   box.appendChild(tbl);
 
+  box.appendChild(el("h3", "", "Engine memory"));
+  const memActs = el("div", "drawer-acts");
+  if (info.unloaded) {
+    box.appendChild(el("p", "dim",
+      "Engine unloaded — VRAM/RAM are free. Chats will error until a " +
+      "model is loaded."));
+    const loadBtn = el("button", "act", "Load " + info.model + " again");
+    loadBtn.onclick = async () => {
+      const ov = $("switching");
+      ov.firstElementChild.textContent = "loading " + info.model + "…";
+      ov.hidden = false;
+      try { await api("POST", "/api/server/load"); }
+      catch (e) { alert(e.message); }
+      ov.hidden = true;
+      pollEngine();
+      renderServerTab();
+    };
+    memActs.appendChild(loadBtn);
+  } else {
+    const unloadBtn = el("button", "act", "Unload engine — free VRAM/RAM");
+    unloadBtn.title = "Stops llama-server but keeps this UI running; " +
+      "reload here or run any model from the Models tab";
+    unloadBtn.onclick = async () => {
+      try { await api("POST", "/api/server/unload"); }
+      catch (e) { alert(e.message); }
+      pollEngine();
+      renderServerTab();
+    };
+    memActs.appendChild(unloadBtn);
+  }
+  box.appendChild(memActs);
+
   box.appendChild(el("h3", "", "Switch model (downloaded only)"));
   let opts = [];
   try { opts = await api("GET", "/api/server/switch-options"); } catch {}
@@ -410,6 +442,87 @@ async function renderModelsTab() {
   pathRow.append(pathIn, pathBtn);
   box.appendChild(pathRow);
   box.appendChild(zStatus);
+
+  // Hugging Face browser: search anything, fit-check before download
+  box.appendChild(el("h3", "", "Find models on Hugging Face"));
+  const hfRow = el("div", "path-row");
+  const hfIn = el("input");
+  hfIn.placeholder = "Search all gguf models on Hugging Face…";
+  const hfBtn = el("button", "act", "Search");
+  hfRow.append(hfIn, hfBtn);
+  box.appendChild(hfRow);
+  const hfBox = el("div", "hf-results");
+  box.appendChild(hfBox);
+  const hfDetail = async (repo) => {
+    hfBox.innerHTML = "";
+    hfBox.appendChild(el("p", "dim",
+      "reading " + repo + "'s header remotely (a few MB, not the model)…"));
+    let d = null;
+    try { d = await api("GET", "/api/hf/repo?id=" + encodeURIComponent(repo)); }
+    catch (e) { hfBox.innerHTML = ""; hfBox.appendChild(el("p", "drop-status err", e.message)); return; }
+    hfBox.innerHTML = "";
+    const card = el("div", "model-card");
+    const head = el("div", "mc-head");
+    head.appendChild(el("span", "mc-name", d.name));
+    for (const c of d.capabilities || [])
+      head.appendChild(el("span", "cap " + c, c === "thinking" ? "think" : c));
+    card.appendChild(head);
+    card.appendChild(el("div", "mc-sub", repo + " · " + d.kind + " · ctx "
+      + (d.native_ctx || 0).toLocaleString()
+      + (d.mmproj ? " · mmproj included" : "")
+      + (d.split_skipped ? " · " + d.split_skipped + " split files skipped" : "")));
+    for (const q of d.ggufs) {
+      const row = el("div", "quant-row");
+      row.appendChild(el("span", "q", q.quant));
+      row.appendChild(el("span", "sz", fmtGB(q.bytes)));
+      const fit = q.fit && q.fit.ok
+        ? el("span", "fit ok", "fits — ~" + Math.round(q.fit.ctx / 1024) + "K ctx")
+        : el("span", "fit no", "too big for this machine");
+      row.appendChild(fit);
+      card.appendChild(row);
+    }
+    const acts = el("div", "drawer-acts");
+    if (d.already) {
+      acts.appendChild(el("span", "dim", "already in your library"));
+    } else {
+      const add = el("button", "act", "Add to library");
+      add.onclick = async () => {
+        add.disabled = true;
+        try {
+          await api("POST", "/api/hf/add", {repo});
+          renderModelsTab();   // new card appears; download quants from it
+        } catch (e) { add.disabled = false; alert(e.message); }
+      };
+      acts.appendChild(add);
+    }
+    const back = el("button", "act", "Back to results");
+    back.onclick = () => doSearch();
+    acts.appendChild(back);
+    card.appendChild(acts);
+    hfBox.appendChild(card);
+  };
+  const doSearch = async () => {
+    const q = hfIn.value.trim();
+    if (!q) { hfBox.innerHTML = ""; return; }
+    hfBox.innerHTML = "";
+    hfBox.appendChild(el("p", "dim", "searching…"));
+    let rows = [];
+    try { rows = await api("GET", "/api/hf/search?q=" + encodeURIComponent(q)); }
+    catch (e) { hfBox.innerHTML = ""; hfBox.appendChild(el("p", "drop-status err", e.message)); return; }
+    hfBox.innerHTML = "";
+    if (!rows.length) { hfBox.appendChild(el("p", "dim", "no gguf models found")); return; }
+    for (const r of rows) {
+      const b = el("button", "hf-row");
+      b.type = "button";
+      b.appendChild(el("span", "repo", r.repo));
+      b.appendChild(el("span", "meta", "↓ " + (r.downloads || 0).toLocaleString()
+        + (r.likes ? "  ♥ " + r.likes : "")));
+      b.onclick = () => hfDetail(r.repo);
+      hfBox.appendChild(b);
+    }
+  };
+  hfBtn.onclick = doSearch;
+  hfIn.onkeydown = (e) => { if (e.key === "Enter") doSearch(); };
 
   // model cards
   box.appendChild(el("h3", "", "Models"));

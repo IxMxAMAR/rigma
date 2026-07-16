@@ -8,10 +8,53 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 os.environ["RIGMA_HOME"] = tempfile.mkdtemp(prefix="rigma-smoke-")
 
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
 from rigma import state  # noqa: E402
 
-state.write_state("qwen3.6-35b-a3b", "Q0", 18500, engine_pid=os.getpid(),
+# a real (dummy) engine process so Unload has something to genuinely kill
+_engine = subprocess.Popen([sys.executable, "-c",
+                            "import time; time.sleep(600)"])
+state.write_state("qwen3.6-35b-a3b", "Q0", 18500, engine_pid=_engine.pid,
                   ui_pid=os.getpid(), use_case="creative", ctx=4096)
+
+# offline stand-ins for the Hugging Face browser
+import rigma.hf_browse as hf_browse  # noqa: E402
+
+hf_browse.search = lambda q, limit=12: [
+    {"repo": "cool/WebTune-GGUF", "downloads": 153994, "likes": 56,
+     "updated": "2026-07-01"}]
+hf_browse.inspect_repo = lambda rid, registry=None: {
+    "repo": rid, "name": "web-tune-7b", "family": "llama", "kind": "dense",
+    "native_ctx": 131072, "capabilities": ["tools", "vision"],
+    "already": False, "mmproj": {"file": "mmproj-F16.gguf",
+                                 "bytes": 800 * 2**20},
+    "split_skipped": 1,
+    "ggufs": [
+        {"file": "WebTune-Q4_K_M.gguf", "quant": "Q4_K_M",
+         "bytes": 4 * 2**30, "fit": {"ok": True, "ctx": 131072,
+                                     "n_cpu_moe": 0}},
+        {"file": "WebTune-Q8_0.gguf", "quant": "Q8_0", "bytes": 30 * 2**30,
+         "fit": {"ok": False}},
+    ]}
+
+
+def _fake_add(rid, registry=None):
+    from rigma.hangar import _write_spec
+    from rigma.models import GgufFile, ModelSpec
+    spec = ModelSpec(slug="web-tune-7b", family="llama", kind="dense",
+                     n_layers=32, full_attn_layers=32, kv_heads=8,
+                     head_dim=128, native_ctx=131072,
+                     ggufs=[GgufFile(repo=rid, file="WebTune-Q4_K_M.gguf",
+                                     bytes=4 * 2**30, quant="Q4_K_M")],
+                     use_cases=["general"], capabilities=["tools", "vision"],
+                     custom=True)
+    _write_spec(spec)
+    return spec
+
+
+hf_browse.add_model = _fake_add
 
 
 class FakeUpstream(BaseHTTPRequestHandler):

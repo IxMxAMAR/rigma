@@ -156,3 +156,63 @@ def test_model_default_params_reach_upstream_but_session_wins(home, tmp_path,
     client.post(f"/api/sessions/{sid}/chat", json={"message": "again"})
     assert _Echo.last_body["temperature"] == 1.2          # session wins
     assert _Echo.last_body["dry_multiplier"] == 0.8       # default persists
+
+
+def test_unload_then_load_roundtrip(home, upstream, monkeypatch):
+    """Unload frees the engine but keeps state (UI alive); load relaunches."""
+    import os
+
+    from rigma import server_ops
+    from rigma import state as st
+    st.write_state("m", "Q4", 11500, engine_pid=999999999,
+                   ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    killed = []
+    monkeypatch.setattr(st, "kill_pid", lambda pid: killed.append(pid))
+    client = TestClient(build_app(upstream_port=upstream))
+    r = client.post("/api/server/unload")
+    assert r.status_code == 200 and r.json()["unloaded"] is True
+    assert killed == [999999999]
+    assert st.server_running() is not None          # UI pid keeps state alive
+    r = client.get("/api/status")
+    assert r.status_code == 200 and r.json()["unloaded"] is True
+    r = client.post("/api/server/unload")           # double unload -> 409
+    assert r.status_code == 409
+    # load relaunches via perform_switch; stub it to observe the call
+    monkeypatch.setattr(server_ops, "perform_switch",
+                        lambda model, reg=None, prof=None: {"model": model,
+                                                            "ok": True})
+    r = client.post("/api/server/load")
+    assert r.status_code == 200 and r.json()["model"] == "m"
+
+
+def test_unloaded_chat_gets_honest_error_event(home, upstream, monkeypatch):
+    import os
+
+    from rigma import state as st
+    st.write_state("m", "Q4", 11500, engine_pid=-1, ui_pid=os.getpid(),
+                   unloaded=True)
+    # upstream port that nothing listens on -> ConnectError
+    client = TestClient(build_app(upstream_port=1))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    assert r.status_code == 200
+    assert "event: error" in r.text and "unloaded" in r.text
+
+
+def test_hf_endpoints_delegate_and_map_errors(home, upstream, monkeypatch):
+    from rigma import hf_browse
+    from rigma.hangar import HangarError
+    monkeypatch.setattr(hf_browse, "search",
+                        lambda q, limit=12: [{"repo": "a/b", "downloads": 1,
+                                              "likes": 0, "updated": ""}])
+    monkeypatch.setattr(hf_browse, "inspect_repo",
+                        lambda rid, reg=None: {"repo": rid, "ggufs": []})
+    monkeypatch.setattr(hf_browse, "add_model", lambda rid, reg=None: (_ for _ in ()).throw(
+        HangarError("that repo is gated — accept its license")))
+    client = TestClient(build_app(upstream_port=upstream))
+    assert client.get("/api/hf/search?q=x").json()[0]["repo"] == "a/b"
+    assert client.get("/api/hf/search?q=").json() == []
+    assert client.get("/api/hf/repo?id=a/b").json()["repo"] == "a/b"
+    r = client.post("/api/hf/add", json={"repo": "a/b"})
+    assert r.status_code == 400 and "gated" in r.json()["error"]
+    assert client.post("/api/hf/add", json={}).status_code == 400

@@ -113,7 +113,7 @@ def perform_switch(model: str, registry=None, profile=None) -> dict:
     s = st.read_state()
     if s is None:
         raise RuntimeError("not running")
-    if model == s.get("model"):
+    if model == s.get("model") and not s.get("unloaded"):
         raise RuntimeError(f"{model} is already running")
     from .registry import Registry
     reg_full = registry if registry is not None else Registry.load()
@@ -159,3 +159,32 @@ def perform_switch(model: str, registry=None, profile=None) -> dict:
                    backend=rp.backend, use_case=s.get("use_case", "general"),
                    ctx=rp.flags.ctx)
     return st.read_state()
+
+
+def perform_unload() -> dict:
+    """Stop the engine to free VRAM/RAM; the UI and state stay up so the
+    model can be reloaded (or another one launched) with one click."""
+    from . import state as st
+    s = st.read_state()
+    if s is None:
+        raise RuntimeError("not running")
+    if s.get("unloaded"):
+        raise RuntimeError("engine is already unloaded")
+    st.kill_pid(int(s.get("engine_pid", -1)))
+    st.write_state(s["model"], s["quant"], int(s["public_port"]),
+                   engine_pid=-1, ui_pid=int(s.get("ui_pid", os.getpid())),
+                   backend=s.get("backend", "unknown"),
+                   use_case=s.get("use_case", "general"),
+                   ctx=int(s.get("ctx", 0)), unloaded=True)
+    return st.read_state()
+
+
+def perform_load(registry=None, profile=None) -> dict:
+    """Relaunch the model recorded in an unloaded state."""
+    from . import state as st
+    s = st.read_state()
+    if s is None:
+        raise RuntimeError("not running")
+    if not s.get("unloaded"):
+        raise RuntimeError(f"{s['model']} is already loaded")
+    return perform_switch(s["model"], registry, profile)
