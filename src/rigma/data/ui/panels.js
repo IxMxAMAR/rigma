@@ -5,6 +5,7 @@
 const PARAM_DEFS = [
   ["temperature", 0, 4, 0.05],
   ["top_p", 0, 1, 0.01],
+  ["top_k", 0, 200, 1],
   ["min_p", 0, 1, 0.01],
   ["repeat_penalty", 0.5, 2, 0.01],
   ["max_tokens", 1, 32768, 1],
@@ -18,7 +19,7 @@ const PARAM_DEFS_ADV = [
   ["xtc_threshold", 0, 0.5, 0.01],
   ["top_n_sigma", -1, 5, 0.1],
 ];
-const INT_PARAMS = ["max_tokens", "dry_allowed_length"];
+const INT_PARAMS = ["max_tokens", "dry_allowed_length", "top_k", "seed"];
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -30,15 +31,20 @@ function el(tag, cls, text) {
 /* ---------- drawer shell ---------- */
 function toggleDrawer(tab) {
   const d = $("drawer");
-  if (!d.hidden && !tab) { d.hidden = true; return; }
+  if (!d.hidden && !tab) { d.hidden = true; $("drawer-scrim").hidden = true;
+                           return; }
   d.hidden = false;
+  $("drawer-scrim").hidden = false;
   openTab(tab || "chat");
 }
 let activeTab = "chat";
 function openTab(name) {
   activeTab = name;
-  for (const b of document.querySelectorAll("#drawer-tabs button"))
-    b.classList.toggle("active", b.dataset.tab === name);
+  for (const b of document.querySelectorAll("#drawer-tabs button")) {
+    const on = b.dataset.tab === name;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  }
   if (name === "chat") renderChatTab();
   else if (name === "presets") renderPresetsTab();
   else if (name === "models") renderModelsTab();
@@ -47,10 +53,13 @@ function openTab(name) {
 function refreshDrawer() {
   if (!$("drawer").hidden) openTab(activeTab);
 }
-$("drawer-close").onclick = () => { $("drawer").hidden = true; };
+function closeDrawer() { $("drawer").hidden = true;
+                        $("drawer-scrim").hidden = true; }
+$("drawer-close").onclick = closeDrawer;
+$("drawer-scrim").onclick = closeDrawer;
 $("gear").onclick = () => toggleDrawer();
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("drawer").hidden) $("drawer").hidden = true;
+  if (e.key === "Escape" && !$("drawer").hidden) closeDrawer();
 });
 for (const b of document.querySelectorAll("#drawer-tabs button"))
   b.onclick = () => openTab(b.dataset.tab);
@@ -106,9 +115,11 @@ function renderChatTab() {
                                          : parseFloat(range.value); push(); };
     num.oninput = () => {
       if (num.value === "") { delete params[key]; push(); return; }
+      const val = INT_PARAMS.includes(key) ? parseInt(num.value, 10)
+                                           : parseFloat(num.value);
+      if (Number.isNaN(val)) return;   // "-" / "." mid-type: don't send NaN
       range.value = num.value;
-      params[key] = INT_PARAMS.includes(key) ? parseInt(num.value, 10)
-                                         : parseFloat(num.value); push();
+      params[key] = val; push();
     };
     clear.onclick = () => { num.value = ""; delete params[key]; push(); };
     row.append(range, num, clear);
@@ -133,7 +144,7 @@ function renderChatTab() {
   box.appendChild(dg);
   const macts = el("div", "drawer-acts");
   const compactBtn = el("button", "act", "Compact now (keep last 6)");
-  compactBtn.onclick = () => { $("drawer").hidden = true; compactChat(6); };
+  compactBtn.onclick = () => { closeDrawer(); compactChat(6); };
   macts.appendChild(compactBtn);
   box.appendChild(macts);
 
@@ -146,7 +157,7 @@ function renderChatTab() {
   const dup = el("button", "act", "Duplicate chat");
   dup.onclick = async () => {
     const d = await api("POST", "/api/sessions/" + sid + "/duplicate");
-    $("drawer").hidden = true;
+    closeDrawer();
     await openSession(d.id);
   };
   acts.append(exMd, exJs, dup);
@@ -382,7 +393,8 @@ function uploadGguf(file, attachTo, onProg) {
       + encodeURIComponent(file.name)
       + (attachTo ? "&attach_to=" + encodeURIComponent(attachTo) : ""));
     x.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProg) onProg(e.loaded / e.total);
+      if (e.lengthComputable && e.total > 0 && onProg)
+        onProg(e.loaded / e.total);   // e.total==0 -> Infinity, guard it
     };
     x.onload = () => {
       let j = {};
@@ -535,7 +547,9 @@ async function renderModelsTab() {
         add.disabled = true;
         try {
           await api("POST", "/api/hf/add", {repo});
-          renderModelsTab();   // new card appears; download quants from it
+          // keep the detail card in view (don't nuke the user's browse state);
+          // just mark it added — the model now appears in the list below too
+          add.textContent = "Added ✓";
         } catch (e) { add.disabled = false; alert(e.message); }
       };
       acts.appendChild(add);
@@ -693,15 +707,17 @@ function renderCapsEditor(m) {
 }
 
 /* ---------- rail search ---------- */
-let searchTimer = null;
+let searchTimer = null, railSearchGen = 0;
 $("rail-search").addEventListener("input", () => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(async () => {
+    const g = ++railSearchGen;   // out-of-order responses must not clobber
     const q = $("rail-search").value.trim();
     if (!q) { renderRail(); return; }
     let hits = [];
     try { hits = await api("GET", "/api/sessions/search?q="
                                   + encodeURIComponent(q)); } catch {}
+    if (g !== railSearchGen) return;
     const nav = $("chat-list");
     nav.innerHTML = "";
     if (!hits.length) {
