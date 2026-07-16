@@ -78,7 +78,8 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         grown = fit_gguf(spec, gguf, profile, ctx, explain)
         if grown is None:
             break
-        explain.append(f"grow-to-fit: ctx {best.ctx} -> {ctx}")
+        explain.append(f"grow-to-fit: ctx {best.ctx} -> {ctx} "
+                       f"(n_cpu_moe {best.n_cpu_moe} -> {grown.n_cpu_moe})")
         best = grown
         ctx *= 2
     return best
@@ -100,7 +101,9 @@ def _calculate(profile: HardwareProfile, registry: Registry,
                            "agent tool calling will not work")
 
     def total_b(m: ModelSpec) -> float:
-        return m.moe.total_b if m.moe else m.n_layers
+        # capability proxy = largest gguf size. n_layers was WRONG here: an 8B
+        # with 36 layers outranked the 35B MoE (regression caught 2026-07-16)
+        return max(g.bytes for g in m.ggufs)
 
     for spec in sorted(pool, key=total_b, reverse=True):
         for gguf in spec.ggufs:  # registry order: largest quant first
@@ -162,6 +165,10 @@ def resolve(profile: HardwareProfile, registry: Registry,
                 flags=combo.flags, origin=f"{kind}:{rel}",
                 explain=[f"registry match: {rel}"] + combo.sources))
     if model_override:
+        if model_override not in registry.models:
+            raise ResolveError(
+                f"unknown model: {model_override} — run `rigma update` "
+                f"(your cached registry may predate it)")
         registry = Registry(registry.gpus,
                             {model_override: registry.models[model_override]},
                             registry.combos)

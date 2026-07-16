@@ -150,6 +150,12 @@ function decorateCode(body) {
   }
 }
 
+function textOf(content) {
+  if (typeof content === "string") return content;
+  return (content || []).filter((p) => p && p.type === "text")
+    .map((p) => p.text || "").join("\n");
+}
+
 function renderUserContent(el, content) {
   if (typeof content === "string") { el.textContent = content; return; }
   for (const p of content || []) {
@@ -217,7 +223,7 @@ function addActions(el, m, idx, isLast) {
   const row = document.createElement("div");
   row.className = "actions" + (m.role === "user" ? " for-user" : "");
   row.appendChild(actionBtn("copy", async (e) => {
-    await navigator.clipboard.writeText(m.content || "");
+    await navigator.clipboard.writeText(textOf(m.content) || "");
     e.target.textContent = "copied";
     setTimeout(() => { e.target.textContent = "copy"; }, 1200);
   }));
@@ -286,7 +292,7 @@ function editMessage(el, m, idx) {
   if (streaming) return;
   const ta = document.createElement("textarea");
   ta.className = "edit";
-  ta.value = m.content || "";
+  ta.value = textOf(m.content) || "";
   el.replaceChildren(ta);
   ta.focus();
   ta.onkeydown = async (ev) => {
@@ -296,7 +302,10 @@ function editMessage(el, m, idx) {
       const v = ta.value.trim();
       if (!v) { renderMessages(); return; }
       const msgs = current.messages.slice();
-      msgs[idx] = Object.assign({}, msgs[idx], {content: v});
+      const imgs = Array.isArray(m.content)
+        ? m.content.filter((p) => p && p.type === "image_url") : [];
+      msgs[idx] = Object.assign({}, msgs[idx], {content:
+        imgs.length ? [{type: "text", text: v}].concat(imgs) : v});
       if (m.role === "user") {
         await saveMessages(msgs.slice(0, idx + 1));  // edits invalidate downstream
         renderMessages();
@@ -352,7 +361,10 @@ async function flipVariant(idx, dir) {
 /* ---------- context meter + compact ---------- */
 function renderCtxBar() {
   const bar = $("ctx-bar"), fill = $("ctx-fill");
-  if (!lastMeta || !lastMeta.ctx || !lastMeta.prompt_tokens) return;
+  if (!lastMeta || !lastMeta.ctx || !lastMeta.prompt_tokens) {
+    $("ctx-compact").hidden = true;
+    return;
+  }
   const frac = Math.min(1, lastMeta.prompt_tokens / lastMeta.ctx);
   bar.classList.add("live");
   bar.title = lastMeta.prompt_tokens.toLocaleString() + " / " +

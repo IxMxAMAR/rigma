@@ -475,17 +475,14 @@ def test_effort_field_and_request_layer(tmp_path, monkeypatch, oai_upstream):
     c.post(f"/api/sessions/{s['id']}", json={"effort": "on"})
     c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi2"})
     sent = oai_upstream.last()
-    assert sent["reasoning_effort"] == "high"
-    assert "chat_template_kwargs" not in sent
+    # b9867 has no reasoning_effort parser - enable_thinking is the real lever
+    assert sent["chat_template_kwargs"] == {"enable_thinking": True}
+    assert "reasoning_effort" not in sent
 
 
 def test_vision_message_rejected_without_vision_capability(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
-    import os as _os
-    from rigma import state
-    state.write_state("m", "q", 11500, engine_pid=_os.getpid(),
-                      ui_pid=_os.getpid())
-    c = TestClient(build_app(upstream_port=1, default_prompt=""))
+    c = _text_only_registry_client(tmp_path, 1)
     s = c.post("/api/sessions", json={}).json()
     parts = [{"type": "text", "text": "see"},
              {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
@@ -524,3 +521,50 @@ def test_vision_message_accepted_with_capability(tmp_path, monkeypatch,
     got = c.get(f"/api/sessions/{s['id']}").json()
     assert got["title"] == "what is this diagram"
     assert got["messages"][0]["content"] == parts
+
+
+def test_vision_unknown_capabilities_passes_through(tmp_path, monkeypatch,
+                                                    oai_upstream):
+    """Stale registry cache must NOT block a possibly-vision model."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    import os as _os
+    from rigma import state
+    state.write_state("mystery-model", "q", 11500, engine_pid=_os.getpid(),
+                      ui_pid=_os.getpid())
+    c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    parts = [{"type": "text", "text": "see"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+    r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": parts})
+    assert r.status_code == 200 and "[DONE]" in r.text
+
+
+def _text_only_registry_client(tmp_path, upstream_port):
+    import os as _os
+    from rigma import state
+    from rigma.models import CachePolicy, GgufFile, ModelSpec
+    from rigma.registry import Registry
+    state.write_state("txt", "q", 11500, engine_pid=_os.getpid(),
+                      ui_pid=_os.getpid())
+    spec = ModelSpec(slug="txt", family="f", kind="dense", n_layers=2,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=8192, capabilities=[],
+                     ggufs=[GgufFile(repo="r", file="t.gguf", bytes=1,
+                                     quant="Q4")],
+                     cache_type_policy=CachePolicy())
+    reg = Registry([], {"txt": spec}, {})
+    return TestClient(build_app(upstream_port=upstream_port,
+                                default_prompt="", registry=reg))
+
+
+def test_vision_historical_images_blocked_on_text_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = _text_only_registry_client(tmp_path, 1)
+    s = c.post("/api/sessions", json={}).json()
+    c.post(f"/api/sessions/{s['id']}", json={"messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": "old"},
+            {"type": "image_url", "image_url": {"url": "data:x"}}]},
+        {"role": "assistant", "content": "saw it"}]})
+    r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "and now?"})
+    assert r.status_code == 400 and "delete the image" in r.json()["error"]

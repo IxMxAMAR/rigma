@@ -175,7 +175,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
-        keep = max(0, int((body or {}).get("keep", 6)))
+        try:
+            keep = max(0, int((body or {}).get("keep", 6)))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "keep: must be an integer"},
+                                status_code=400)
         msgs = s.get("messages", [])
         old = msgs[:-keep] if keep else list(msgs)
         recent = msgs[-keep:] if keep else []
@@ -186,8 +190,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             parts.append("Previous summary:\n" + s["digest"])
         for m in old:
             content = m.get("content", "")
-            if not isinstance(content, str):
-                content = "[non-text content]"
+            if not isinstance(content, str):   # vision parts: keep the text
+                content = " ".join(
+                    p.get("text", "") if p.get("type") == "text" else "[image]"
+                    for p in content if isinstance(p, dict))
             parts.append(f"{m.get('role', 'user')}: {content}")
         try:
             resp = await client.post(
@@ -260,7 +266,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # Qwen-style template switch; engines that ignore it are unharmed
             body["chat_template_kwargs"] = {"enable_thinking": False}
         elif effort == "on":
-            body["reasoning_effort"] = "high"
+            body["chat_template_kwargs"] = {"enable_thinking": True}
         text, thinking, failed, resp = "", "", False, None
         usage, timings = {}, {}
         try:
@@ -415,6 +421,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def _rag_turn(s: dict):
         from . import rag
         q = s["messages"][-1]["content"]
+        if isinstance(q, list):   # vision parts -> text only for the sidecar
+            q = " ".join(p.get("text", "") for p in q
+                         if isinstance(p, dict) and p.get("type") == "text")
         try:
             await asyncio.to_thread(rag.ensure_sidecar)
             a = await asyncio.to_thread(rag.ask, q)
@@ -446,22 +455,30 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
         message = body.get("message")
-        has_image = (isinstance(message, list) and
-                     any(isinstance(p, dict) and p.get("type") == "image_url"
-                         for p in message))
+
+        def _has_img(content):
+            return (isinstance(content, list) and
+                    any(isinstance(p, dict) and p.get("type") == "image_url"
+                        for p in content))
+
+        has_image = _has_img(message) or any(
+            _has_img(m.get("content")) for m in s.get("messages", []))
         if has_image:
-            caps: list = []
+            caps = None   # None = capabilities unknown (stale cache etc.)
             try:
                 from .registry import Registry
                 reg = registry if registry is not None else Registry.load()
                 caps = reg.models[(st.read_state() or {}).get("model", "")
                                   ].capabilities
             except Exception:
-                pass
-            if "vision" not in caps:
+                caps = None
+            # only block when we POSITIVELY know the model lacks vision;
+            # unknown -> pass through and let the engine answer honestly
+            if caps is not None and "vision" not in caps:
                 return JSONResponse(
                     {"error": "this model can't see images — switch to a "
-                              "vision-capable model (⚙ → Server)"},
+                              "vision-capable model (⚙ → Server) or "
+                              "delete the image message"},
                     status_code=400)
         if message:
             s["messages"].append({"role": "user", "content": message})

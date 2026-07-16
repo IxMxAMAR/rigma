@@ -108,3 +108,33 @@ def test_coding_prefers_tools_capable_models():
     reg2 = Registry([], {k: v.model_copy(update={"use_cases": ["general"]})
                          for k, v in reg.models.items()}, {})
     assert resolve(p, reg2, use_case="general").model_slug == "big-plain"
+
+
+def test_size_ranking_uses_gguf_bytes_not_layers():
+    """Critical regression 2026-07-16: 8B vision model (36 layers) outranked
+    the 35B MoE (total_b 35.0) because dense size proxy was n_layers."""
+    from rigma.probe import probe_hardware
+    from rigma.registry import Registry
+    from rigma.resolve import resolve
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    reg = Registry.load()  # bundled: qwen3.6-35b + qwen3-vl-8b + qwen3-0.6b
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=16368, arch="rdna4",
+                  slug="none", backends=["vulkan"])
+    p = HardwareProfile(gpus=[gpu], ram_mb=32768, ram_free_mb=20000,
+                        cpu=CpuInfo(cores=16), os="windows", disk_free_gb=400.0)
+    assert probe_hardware  # imported for parity; profile built manually
+    plan = resolve(p, reg, use_case="general")
+    assert plan.model_slug == "qwen3.6-35b-a3b"   # flagship outranks 8B VL
+
+
+def test_unknown_model_override_clean_error():
+    from rigma.registry import Registry
+    from rigma.resolve import ResolveError, resolve
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    reg = Registry.load()
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=16368, backends=["vulkan"])
+    p = HardwareProfile(gpus=[gpu], ram_mb=32768, ram_free_mb=20000,
+                        cpu=CpuInfo(cores=16), os="windows", disk_free_gb=400.0)
+    import pytest as _p
+    with _p.raises(ResolveError, match="unknown model"):
+        resolve(p, reg, model_override="not-a-model")
