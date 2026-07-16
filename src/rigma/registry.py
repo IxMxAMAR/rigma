@@ -27,6 +27,13 @@ def _registry_cache_dir() -> Path:
     return rigma_home() / "registry"
 
 
+def _custom_dir() -> Path:
+    """Hangar's custom-model specs (seam: tests isolate the user's real
+    installs here without touching the registry cache)."""
+    from .runtime import rigma_home
+    return rigma_home() / "custom" / "models"
+
+
 def update_registry(url: str = DEFAULT_REGISTRY_ZIP) -> Path:
     dest = _registry_cache_dir()
     tmp = dest.with_suffix(".tmp")
@@ -68,8 +75,7 @@ class Registry:
             spec = ModelSpec.model_validate_json(f.read_text(encoding="utf-8"))
             models[spec.slug] = spec
         # user-installed models (Hangar); registry wins slug collisions
-        from .runtime import rigma_home
-        custom = rigma_home() / "custom" / "models"
+        custom = _custom_dir()
         if custom.is_dir():
             for f in sorted(custom.glob("*.json")):
                 try:
