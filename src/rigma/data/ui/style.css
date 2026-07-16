@@ -14,8 +14,10 @@
 }
 * { box-sizing:border-box; margin:0; }
 body { background:var(--bg0); color:var(--fg); height:100vh; height:100dvh;
-       display:flex; font:15.5px/1.65 var(--sans); }
-button { font:inherit; cursor:pointer; color:inherit; background:none; border:0; }
+       display:flex; font:15.5px/1.65 var(--sans);
+       -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+button { font:inherit; cursor:pointer; color:inherit; background:none; border:0;
+         user-select:none; -webkit-user-select:none; }
 :focus-visible { outline:2px solid var(--amber); outline-offset:2px;
                  border-radius:4px; }
 ::selection { background:var(--amber-soft); }
@@ -351,3 +353,56 @@ header .spec:hover { background:var(--bg2); color:var(--fg); }
   line-height:1; padding:0; }
 .msg-img { max-width:280px; max-height:220px; border-radius:var(--r-sm);
   display:block; margin-top:6px; }
+
+/* ---------- models tab: the hangar ---------- */
+.disk-gauge { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;
+  background:var(--bg2); border-radius:var(--r-sm); padding:8px 14px;
+  font-variant-numeric:tabular-nums; }
+.disk-gauge .k { color:var(--faint); font-size:11px; text-transform:uppercase;
+  letter-spacing:.1em; }
+.disk-gauge .v { color:var(--fg); margin-right:8px; }
+.drop-zone { border:1.5px dashed var(--line); border-radius:var(--r);
+  padding:18px 16px; text-align:center; color:var(--dim);
+  transition:border-color .15s var(--ease), background .15s var(--ease); }
+.drop-zone.over { border-color:var(--amber); background:var(--amber-soft); }
+.drop-zone .big { color:var(--fg); font-weight:600; margin-bottom:4px; }
+.drop-status { min-height:1.3em; font-variant-numeric:tabular-nums; }
+.drop-status.ok { color:var(--moss); }
+.drop-status.err { color:var(--red); }
+.path-row { display:flex; gap:8px; }
+.path-row input { flex:1; min-width:0; }
+.path-row .act { flex:none; color:var(--dim); background:var(--bg2);
+  border-radius:999px; padding:6px 16px; }
+.path-row .act:hover { color:var(--fg); background:var(--bg3); }
+.model-card { background:var(--bg2); border-radius:var(--r); padding:12px 14px;
+  display:flex; flex-direction:column; gap:7px; }
+.model-card.running { box-shadow:inset 2px 0 0 var(--moss); }
+.mc-head { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.mc-name { color:var(--fg); font-weight:600; overflow-wrap:anywhere; }
+.mc-sub { color:var(--faint); font-size:11.5px; }
+.badge { color:var(--faint); font-size:10px; text-transform:uppercase;
+  letter-spacing:.1em; background:var(--bg3); border-radius:999px;
+  padding:2px 9px; }
+.badge.live { color:var(--moss); background:var(--moss-soft); }
+.cap { font-size:10px; text-transform:uppercase; letter-spacing:.08em;
+  border-radius:999px; padding:2px 9px; color:var(--dim);
+  background:var(--bg3); }
+.cap.vision { color:var(--amber); background:var(--amber-soft); }
+.quant-row { display:flex; gap:9px; align-items:center;
+  font-variant-numeric:tabular-nums; }
+.quant-row .q { color:var(--fg); min-width:11ch; }
+.quant-row .sz { color:var(--faint); }
+.quant-row .err { color:var(--red); font-size:11px; overflow-wrap:anywhere; }
+.quant-row .act.mini { margin-left:auto; padding:3px 12px; font-size:11.5px;
+  color:var(--dim); background:var(--bg3); border-radius:999px; }
+.quant-row .act.mini:hover { color:var(--fg); }
+.quant-row .clear { margin-left:auto; color:var(--faint); padding:2px 8px;
+  border-radius:999px; }
+.quant-row .clear:hover { color:var(--red); background:var(--bg3); }
+.pull-bar { flex:1; height:4px; background:var(--bg3); border-radius:2px;
+  overflow:hidden; }
+.pull-bar .fill { display:block; height:100%; background:var(--amber);
+  border-radius:2px; transition:width .4s var(--ease); }
+.cap-row { display:flex; gap:8px; align-items:center; color:var(--fg);
+  cursor:pointer; }
+.cap-row input { width:auto; accent-color:var(--amber); }

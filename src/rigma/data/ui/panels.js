@@ -41,6 +41,7 @@ function openTab(name) {
     b.classList.toggle("active", b.dataset.tab === name);
   if (name === "chat") renderChatTab();
   else if (name === "presets") renderPresetsTab();
+  else if (name === "models") renderModelsTab();
   else if (name === "server") renderServerTab();
 }
 function refreshDrawer() {
@@ -300,6 +301,224 @@ async function renderServerTab() {
   acts2.appendChild(refresh);
   box.appendChild(acts2);
   load();
+}
+
+/* ---------- models tab: the hangar ---------- */
+function fmtGB(bytes) { return (bytes / 2 ** 30).toFixed(1) + " GB"; }
+
+function uploadGguf(file, attachTo, onProg) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open("POST", "/api/models/upload?filename="
+      + encodeURIComponent(file.name)
+      + (attachTo ? "&attach_to=" + encodeURIComponent(attachTo) : ""));
+    x.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProg) onProg(e.loaded / e.total);
+    };
+    x.onload = () => {
+      let j = {};
+      try { j = JSON.parse(x.responseText); } catch {}
+      if (x.status === 200) resolve(j);
+      else reject(new Error(j.error || ("upload failed (HTTP " + x.status + ")")));
+    };
+    x.onerror = () => reject(new Error("upload failed — server unreachable"));
+    x.send(file);
+  });
+}
+
+let modelsPollTimer = null;
+async function renderModelsTab() {
+  clearTimeout(modelsPollTimer);
+  const box = $("drawer-body");
+  box.innerHTML = "";
+  let data = null;
+  try { data = await api("GET", "/api/models"); } catch (e) {
+    box.appendChild(el("p", "dim", e.message));
+    return;
+  }
+  if (activeTab !== "models" || $("drawer").hidden) return;  // stale render
+
+  // disk gauge
+  const gauge = el("div", "disk-gauge");
+  gauge.appendChild(el("span", "k", "models on disk"));
+  gauge.appendChild(el("span", "v", data.disk.models_gb + " GB"));
+  gauge.appendChild(el("span", "k", "disk free"));
+  gauge.appendChild(el("span", "v", data.disk.free_gb + " GB"));
+  gauge.title = data.disk.dir;
+  box.appendChild(gauge);
+
+  // install zone: drop a .gguf, or install from a local path (moved, not copied)
+  box.appendChild(el("h3", "", "Install a model"));
+  const zone = el("div", "drop-zone");
+  zone.appendChild(el("div", "big", "Drop a .gguf here"));
+  zone.appendChild(el("div", "dim",
+    "Fine-tunes welcome — Rigma reads the file's own header to size it. " +
+    "For a vision projector (mmproj-*.gguf), install its model first."));
+  const zStatus = el("div", "drop-status");   // shared by drop + path installs
+  const doInstall = async (run) => {
+    try {
+      const j = await run();
+      zStatus.textContent = "installed: " + j.slug;
+      zStatus.className = "drop-status ok";
+      renderModelsTab();
+    } catch (e) {
+      zStatus.textContent = e.message;
+      zStatus.className = "drop-status err";
+    }
+  };
+  zone.ondragover = (e) => { e.preventDefault(); zone.classList.add("over"); };
+  zone.ondragleave = () => zone.classList.remove("over");
+  zone.ondrop = (e) => {
+    e.preventDefault();
+    zone.classList.remove("over");
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!f) return;
+    let attach = "";
+    if (/mmproj/i.test(f.name)) {
+      const customs = data.models.filter((m) => m.custom).map((m) => m.slug);
+      if (!customs.length) {
+        zStatus.textContent = "that's a vision projector — install its model first";
+        zStatus.className = "drop-status err";
+        return;
+      }
+      attach = prompt("Attach this projector to which custom model?\n"
+                      + customs.join("\n"), customs[0]) || "";
+      if (!attach) return;
+    }
+    doInstall(() => uploadGguf(f, attach, (p) => {
+      zStatus.textContent = "uploading " + f.name + " — "
+        + Math.round(p * 100) + "%";
+      zStatus.className = "drop-status";
+    }));
+  };
+  box.appendChild(zone);
+  const pathRow = el("div", "path-row");
+  const pathIn = el("input");
+  pathIn.placeholder = "…or paste a file path (file is MOVED into Rigma's folder)";
+  const pathBtn = el("button", "act", "Install");
+  pathBtn.onclick = () => {
+    const p = pathIn.value.trim();
+    if (p) doInstall(() => api("POST", "/api/models/install", {path: p}));
+  };
+  pathIn.onkeydown = (e) => { if (e.key === "Enter") pathBtn.onclick(); };
+  pathRow.append(pathIn, pathBtn);
+  box.appendChild(pathRow);
+  box.appendChild(zStatus);
+
+  // model cards
+  box.appendChild(el("h3", "", "Models"));
+  let anyPulling = false;
+  for (const m of data.models) {
+    const card = el("div", "model-card" + (m.running ? " running" : ""));
+    const head = el("div", "mc-head");
+    head.appendChild(el("span", "mc-name", m.slug));
+    if (m.running) head.appendChild(el("span", "badge live", "RUNNING"));
+    if (m.custom) head.appendChild(el("span", "badge", "custom"));
+    for (const c of m.capabilities || [])
+      head.appendChild(el("span", "cap " + c, c === "thinking" ? "think" : c));
+    card.appendChild(head);
+    card.appendChild(el("div", "mc-sub", m.family + " · " + m.kind + " · ctx "
+      + (m.native_ctx || 0).toLocaleString()
+      + (m.mmproj ? " · mmproj " + (m.mmproj.on_disk ? "on disk" : "not downloaded") : "")));
+    const onDisk = m.quants.some((q) => q.on_disk);
+    for (const q of m.quants) {
+      const row = el("div", "quant-row");
+      row.appendChild(el("span", "dot" + (q.on_disk ? " on" : "")));
+      row.appendChild(el("span", "q", q.quant));
+      row.appendChild(el("span", "sz", fmtGB(q.bytes)));
+      if (q.pull && q.pull.status === "downloading") {
+        anyPulling = true;
+        const pct = q.pull.total ? Math.round(100 * (q.pull.done || 0) / q.pull.total) : 0;
+        const bar = el("span", "pull-bar");
+        bar.appendChild(el("span", "fill")).style.width = pct + "%";
+        row.appendChild(bar);
+        row.appendChild(el("span", "sz", pct + "%"));
+      } else if (q.pull && q.pull.status === "error") {
+        const err = el("span", "err", q.pull.error || "download failed");
+        row.appendChild(err);
+      } else if (!q.on_disk && !m.custom) {
+        const dl = el("button", "act mini", "Download");
+        dl.onclick = async () => {
+          dl.disabled = true;
+          try { await api("POST", "/api/models/" + m.slug + "/pull", {file: q.file}); }
+          catch (e) { alert(e.message); }
+          renderModelsTab();
+        };
+        row.appendChild(dl);
+      } else if (q.on_disk) {
+        const del = el("button", "clear", "✕");
+        del.title = "Delete " + q.file + " from disk";
+        del.setAttribute("aria-label", del.title);
+        del.onclick = async () => {
+          if (!confirm("Delete " + q.file + " (" + fmtGB(q.bytes) + ") from disk?")) return;
+          try {
+            await api("DELETE", "/api/models/" + m.slug + "/files/"
+                      + encodeURIComponent(q.file));
+          } catch (e) { alert(e.message); }
+          renderModelsTab();
+        };
+        row.appendChild(del);
+      }
+      card.appendChild(row);
+    }
+    const acts = el("div", "drawer-acts");
+    if (!m.running && onDisk) {
+      const run = el("button", "act", "Run this model");
+      run.onclick = () => doSwitch(m.slug);
+      acts.appendChild(run);
+    }
+    if (m.custom) {
+      const caps = el("button", "act", "Edit capabilities");
+      caps.onclick = () => renderCapsEditor(m);
+      acts.appendChild(caps);
+      const rm = el("button", "act danger", "Remove");
+      rm.onclick = async () => {
+        if (!confirm("Remove " + m.slug + " and delete its files from disk?")) return;
+        try { await api("DELETE", "/api/models/" + m.slug); }
+        catch (e) { alert(e.message); }
+        renderModelsTab();
+      };
+      acts.appendChild(rm);
+    }
+    if (acts.childNodes.length) card.appendChild(acts);
+    box.appendChild(card);
+  }
+  if (anyPulling)
+    modelsPollTimer = setTimeout(() => {
+      if (activeTab === "models" && !$("drawer").hidden) renderModelsTab();
+    }, 1500);
+}
+
+function renderCapsEditor(m) {
+  const box = $("drawer-body");
+  box.innerHTML = "";
+  box.appendChild(el("h3", "", m.slug + " — capabilities"));
+  box.appendChild(el("p", "dim",
+    "Header-derived guesses; correct them if the model card says otherwise. " +
+    "Vision needs an attached mmproj."));
+  const picked = new Set(m.capabilities || []);
+  for (const c of ["tools", "thinking", "vision"]) {
+    const row = el("label", "cap-row");
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.checked = picked.has(c);
+    cb.onchange = () => { cb.checked ? picked.add(c) : picked.delete(c); };
+    row.append(cb, document.createTextNode(" " + c));
+    box.appendChild(row);
+  }
+  const acts = el("div", "drawer-acts");
+  const save = el("button", "act", "Save");
+  save.onclick = async () => {
+    try {
+      await api("PATCH", "/api/models/" + m.slug,
+                {capabilities: [...picked]});
+      renderModelsTab();
+    } catch (e) { alert(e.message); }
+  };
+  const back = el("button", "act", "Back");
+  back.onclick = renderModelsTab;
+  acts.append(save, back);
+  box.appendChild(acts);
 }
 
 /* ---------- rail search ---------- */

@@ -184,17 +184,86 @@ with sync_playwright() as pw:
     check("compact kept 6 + wrote digest",
           remaining == 6 and bool(digest))
 
-    # image attach chip (no vision model in smoke -> server must 400 politely)
-    ok400 = page.evaluate("""async () => {
+    # image to the (vision-capable) smoke model passes the guard: engine answers
+    okimg = page.evaluate("""async () => {
       const parts = [{type: "text", text: "see"},
                      {type: "image_url", image_url: {url: "data:image/png;base64,AA"}}];
       const r = await fetch("/api/sessions/" + current.id + "/chat", {
         method: "POST", headers: {"content-type": "application/json"},
         body: JSON.stringify({message: parts})});
       return r.status; }""")
-    check("image to non-vision model politely 400s", ok400 == 400)
-    # the 400 above was deliberate; drop its console echo before the final gate
-    console_errors[:] = [e for e in console_errors if "400" not in e]
+    check("image to vision-capable model passes guard", okimg == 200)
+
+
+    # ---- Hangar: models tab, drag-drop install, caps, remove ----
+    import base64
+    import struct
+
+    def _s(bs):
+        return struct.pack("<Q", len(bs)) + bs
+    kvs = [
+        _s(b"general.architecture") + struct.pack("<I", 8) + _s(b"qwen3"),
+        _s(b"general.name") + struct.pack("<I", 8) + _s(b"Smoke Drop 1B"),
+        _s(b"qwen3.block_count") + struct.pack("<II", 4, 4),
+        _s(b"qwen3.context_length") + struct.pack("<II", 4, 8192),
+        _s(b"qwen3.embedding_length") + struct.pack("<II", 4, 512),
+        _s(b"qwen3.attention.head_count") + struct.pack("<II", 4, 8),
+        _s(b"qwen3.attention.head_count_kv") + struct.pack("<II", 4, 2),
+    ]
+    gguf64 = base64.b64encode(
+        b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
+        + struct.pack("<Q", len(kvs)) + b"".join(kvs) + b"\x00" * 128).decode()
+
+    page.click("#gear")
+    page.wait_for_timeout(300)
+    page.click("#drawer-tabs button[data-tab=models]")
+    page.wait_for_timeout(900)
+    check("models tab: disk gauge", page.locator(".disk-gauge").is_visible())
+    check("models tab: drop zone", page.locator(".drop-zone").is_visible())
+    check("models tab: registry cards listed",
+          page.locator(".model-card").count() >= 3)
+    running_card = page.locator(".model-card.running")
+    check("models tab: running model badged",
+          "qwen3.6-35b-a3b" in (running_card.text_content() or ""))
+    check("models tab: vision cap chip on running model",
+          running_card.locator(".cap.vision").count() == 1)
+
+    # drag-drop a synthetic gguf onto the zone (full upload->install->rerender)
+    page.evaluate("""async (b64) => {
+      const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const f = new File([bin], "SmokeDrop-Q4_0.gguf");
+      const dt = new DataTransfer();
+      dt.items.add(f);
+      const zone = document.querySelector(".drop-zone");
+      zone.dispatchEvent(new DragEvent("drop",
+        {bubbles: true, dataTransfer: dt}));
+    }""", gguf64)
+    page.wait_for_timeout(1500)
+    check("hangar: dropped gguf installed",
+          page.locator(".model-card", has_text="smoke-drop-1b").count() == 1)
+    dropped = page.locator(".model-card", has_text="smoke-drop-1b")
+    check("hangar: custom badge + on-disk dot",
+          dropped.locator(".badge", has_text="custom").count() == 1
+          and dropped.locator(".dot.on").count() == 1)
+
+    # capability editor round-trip
+    dropped.locator("button", has_text="Edit capabilities").click()
+    page.wait_for_timeout(300)
+    page.locator(".cap-row", has_text="tools").locator("input").check()
+    page.locator("#drawer-body button", has_text="Save").click()
+    page.wait_for_timeout(900)
+    check("hangar: capability saved",
+          page.locator(".model-card", has_text="smoke-drop-1b")
+              .locator(".cap", has_text="tools").count() == 1)
+
+    # remove it again (keeps reruns clean); confirm dialog auto-accepted
+    page.on("dialog", lambda d: d.accept())
+    page.locator(".model-card", has_text="smoke-drop-1b") \
+        .locator("button", has_text="Remove").click()
+    page.wait_for_timeout(900)
+    check("hangar: custom model removed",
+          page.locator(".model-card", has_text="smoke-drop-1b").count() == 0)
+    page.click("#drawer-close")
 
     check("no console/page errors at end", not console_errors)
     page.screenshot(path=SHOT, full_page=False)
