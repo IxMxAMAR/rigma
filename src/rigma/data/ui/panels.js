@@ -281,6 +281,31 @@ async function renderServerTab() {
   }
   box.appendChild(tbl);
 
+  try {
+    const s = await api("GET", "/api/server/stats");
+    if (s.total_turns) {
+      box.appendChild(el("h3", "", "Lifetime"));
+      const od = el("div", "odometer");
+      const stat = (n, k) => {
+        const c = el("div");
+        c.appendChild(el("span", "n", n.toLocaleString()));
+        c.appendChild(el("span", "k", k));
+        od.appendChild(c);
+      };
+      stat(s.total_tokens || 0, "tokens generated");
+      stat(s.total_turns || 0, "replies");
+      const top = Object.entries(s.by_model || {})
+        .sort((a, b) => b[1] - a[1])[0];
+      if (top) {
+        const c = el("div");
+        c.appendChild(el("span", "n", top[0]));
+        c.appendChild(el("span", "k", "most used"));
+        od.appendChild(c);
+      }
+      box.appendChild(od);
+    }
+  } catch {}
+
   box.appendChild(el("h3", "", "Context size"));
   box.appendChild(el("p", "dim",
     "Relaunches the engine at the new size — bigger context costs " +
