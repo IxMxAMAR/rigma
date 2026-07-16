@@ -477,3 +477,50 @@ def test_effort_field_and_request_layer(tmp_path, monkeypatch, oai_upstream):
     sent = oai_upstream.last()
     assert sent["reasoning_effort"] == "high"
     assert "chat_template_kwargs" not in sent
+
+
+def test_vision_message_rejected_without_vision_capability(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    import os as _os
+    from rigma import state
+    state.write_state("m", "q", 11500, engine_pid=_os.getpid(),
+                      ui_pid=_os.getpid())
+    c = TestClient(build_app(upstream_port=1, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    parts = [{"type": "text", "text": "see"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+    r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": parts})
+    assert r.status_code == 400
+    assert "can't see images" in r.json()["error"]
+    got = c.get(f"/api/sessions/{s['id']}").json()
+    assert got["messages"] == []  # nothing persisted
+
+
+def test_vision_message_accepted_with_capability(tmp_path, monkeypatch,
+                                                 oai_upstream):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    import os as _os
+    from rigma import state
+    from rigma.models import CachePolicy, GgufFile, ModelSpec, UseCase  # noqa: F401
+    from rigma.registry import Registry
+    state.write_state("viz", "q", 11500, engine_pid=_os.getpid(),
+                      ui_pid=_os.getpid())
+    spec = ModelSpec(slug="viz", family="f", kind="dense", n_layers=2,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=8192, capabilities=["vision"],
+                     ggufs=[GgufFile(repo="r", file="v.gguf", bytes=1,
+                                     quant="Q4")],
+                     cache_type_policy=CachePolicy())
+    reg = Registry([], {"viz": spec}, {})
+    c = TestClient(build_app(upstream_port=oai_upstream.port,
+                             default_prompt="", registry=reg))
+    s = c.post("/api/sessions", json={}).json()
+    parts = [{"type": "text", "text": "what is this diagram"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+    r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": parts})
+    assert r.status_code == 200 and "[DONE]" in r.text
+    sent = oai_upstream.last()["messages"]
+    assert sent[-1]["content"] == parts
+    got = c.get(f"/api/sessions/{s['id']}").json()
+    assert got["title"] == "what is this diagram"
+    assert got["messages"][0]["content"] == parts

@@ -446,10 +446,30 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
         message = body.get("message")
+        has_image = (isinstance(message, list) and
+                     any(isinstance(p, dict) and p.get("type") == "image_url"
+                         for p in message))
+        if has_image:
+            caps: list = []
+            try:
+                from .registry import Registry
+                reg = registry if registry is not None else Registry.load()
+                caps = reg.models[(st.read_state() or {}).get("model", "")
+                                  ].capabilities
+            except Exception:
+                pass
+            if "vision" not in caps:
+                return JSONResponse(
+                    {"error": "this model can't see images — switch to a "
+                              "vision-capable model (⚙ → Server)"},
+                    status_code=400)
         if message:
             s["messages"].append({"role": "user", "content": message})
             if s.get("title") == "New chat":
-                s["title"] = message[:40]
+                title = message if isinstance(message, str) else next(
+                    (p.get("text", "") for p in message
+                     if isinstance(p, dict) and p.get("type") == "text"), "chat")
+                s["title"] = str(title)[:40]
             sessions.save(s)
         if not s["messages"]:
             return JSONResponse({"error": "session has no messages"},

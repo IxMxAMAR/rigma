@@ -68,7 +68,10 @@
       <button id="ctx-compact" type="button" hidden
               title="Summarize older turns to reclaim context">compact</button>
     </div>
+    <div id="img-chips" hidden></div>
     <form id="f">
+      <button id="attach" type="button" title="Attach image (or paste one)">+</button>
+      <input id="img-file" type="file" accept="image/*" multiple hidden>
       <textarea id="in" placeholder="Ask anything — Enter to send, Shift+Enter for a new line"
         autofocus></textarea>
       <button class="send" id="send" type="submit">Send</button>

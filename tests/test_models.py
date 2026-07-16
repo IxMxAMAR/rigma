@@ -69,3 +69,20 @@ def test_server_args_reasoning_flag():
                     backend="vulkan",
                     flags=ComboFlags(ctx=4096), origin="test")
     assert "--reasoning" not in plan2.server_args("model.gguf", 11499)
+
+
+def test_modelspec_optional_mmproj():
+    from rigma.models import GgufFile, ModelSpec
+    spec = ModelSpec(slug="v", family="f", kind="dense", n_layers=2,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=8192,
+                     ggufs=[GgufFile(repo="r", file="m.gguf", bytes=1, quant="Q4")],
+                     mmproj=GgufFile(repo="r", file="mmproj.gguf", bytes=1,
+                                     quant="F16"))
+    assert spec.mmproj.file == "mmproj.gguf"
+    spec2 = ModelSpec(slug="t", family="f", kind="dense", n_layers=2,
+                      full_attn_layers=2, kv_heads=2, head_dim=64,
+                      native_ctx=8192,
+                      ggufs=[GgufFile(repo="r", file="m.gguf", bytes=1,
+                                      quant="Q4")])
+    assert spec2.mmproj is None

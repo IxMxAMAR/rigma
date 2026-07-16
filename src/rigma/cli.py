@@ -383,9 +383,15 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         try:
             exe = runtime.ensure_engine(cand.backend, os_name)
             model_path = runtime.ensure_model(cand.gguf)
+            extra = []
+            spec_c = reg.models.get(cand.model_slug)
+            if spec_c is not None and spec_c.mmproj is not None:
+                mm_path = runtime.ensure_model(spec_c.mmproj)
+                extra = ["--mmproj", str(mm_path)]
             typer.echo(f"starting llama-server: {cand.model_slug} "
                        f"{cand.gguf.quant} (first load can take minutes)...")
-            sp = runtime.launch_server(exe, cand, model_path, port=port - 1)
+            sp = runtime.launch_server(exe, cand, model_path, port=port - 1,
+                                       extra_args=extra or None)
             rp = cand
             break
         except RuntimeError as e:

@@ -215,3 +215,23 @@ def test_build_messages_injects_digest_after_notes():
 def test_mutable_fields_has_digest_not_archive():
     assert "digest" in sessions.MUTABLE_FIELDS
     assert "archive" not in sessions.MUTABLE_FIELDS
+
+
+def test_build_messages_preserves_content_parts():
+    parts = [{"type": "text", "text": "what is this?"},
+             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}}]
+    s = {"system_prompt": "", "messages": [
+        {"role": "user", "content": parts, "extra_key": True}]}
+    out = sessions.build_messages(s)
+    assert out == [{"role": "user", "content": parts}]  # parts verbatim, extras stripped
+
+
+def test_export_markdown_image_placeholder(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    s = sessions.create(title="v")
+    s["messages"] = [{"role": "user", "content": [
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": "data:..."}}]}]
+    sessions.save(s)
+    md = sessions.export_markdown(sessions.load(s["id"]))
+    assert "look" in md and "[image]" in md and "data:" not in md

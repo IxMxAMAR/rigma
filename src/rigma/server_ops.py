@@ -121,6 +121,15 @@ def perform_switch(model: str, registry=None, profile=None) -> dict:
     if not _model_on_disk(rp.gguf):
         raise RuntimeError(
             f"{model} is not downloaded — run: rigma up --model {model}")
+    from .registry import Registry
+    reg_full = registry if registry is not None else Registry.load()
+    mm = getattr(reg_full.models.get(model), "mmproj", None)
+    if mm is not None and not _model_on_disk(mm):
+        raise RuntimeError(
+            f"{model}'s vision projector is not downloaded — "
+            f"run: rigma up --model {model}")
+    extra = (["--mmproj", str(rigma_home() / "models" / mm.file)]
+             if mm is not None else None)
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     exe = runtime.ensure_engine(rp.backend, os_name)
@@ -128,7 +137,8 @@ def perform_switch(model: str, registry=None, profile=None) -> dict:
     st.kill_pid(int(s.get("engine_pid", -1)))
     try:
         sp = runtime.launch_server(exe, rp, model_path,
-                                   port=int(s["public_port"]) - 1)
+                                   port=int(s["public_port"]) - 1,
+                                   extra_args=extra)
     except Exception:
         st.clear_state()  # old engine is gone; don't advertise a dead server
         raise

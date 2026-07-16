@@ -150,12 +150,29 @@ function decorateCode(body) {
   }
 }
 
+function renderUserContent(el, content) {
+  if (typeof content === "string") { el.textContent = content; return; }
+  for (const p of content || []) {
+    if (p.type === "text") {
+      const t = document.createElement("div");
+      t.textContent = p.text || "";
+      el.appendChild(t);
+    } else if (p.type === "image_url") {
+      const im = document.createElement("img");
+      im.className = "msg-img";
+      im.src = (p.image_url || {}).url || "";
+      im.alt = "attached image";
+      el.appendChild(im);
+    }
+  }
+}
+
 function addMsg(cls, content, thinking) {
   const e = $("empty");
   if (e) e.remove();
   const d = document.createElement("div");
   d.className = "msg " + cls;
-  if (cls === "user") { d.textContent = content; }
+  if (cls === "user") { renderUserContent(d, content); }
   else {
     if (thinking) d.appendChild(makeThinkBlock(thinking, true));
     const b = document.createElement("div");
@@ -715,7 +732,61 @@ async function doSwitch(model) {
 $("rail-toggle").onclick = () => document.body.classList.toggle("rail-open");
 $("rail-scrim").onclick = () => document.body.classList.remove("rail-open");
 
-/* ---------- composer ---------- */
+/* ---------- composer + images ---------- */
+let pendingImages = [];
+
+function downscaleImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 1344 / Math.max(img.width, img.height));
+      const cv = document.createElement("canvas");
+      cv.width = Math.round(img.width * scale);
+      cv.height = Math.round(img.height * scale);
+      cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+      URL.revokeObjectURL(img.src);
+      resolve(cv.toDataURL("image/jpeg", 0.85));
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+function renderImgChips() {
+  const box = $("img-chips");
+  box.innerHTML = "";
+  box.hidden = !pendingImages.length;
+  pendingImages.forEach((url, i) => {
+    const chip = document.createElement("span");
+    chip.className = "img-chip";
+    const im = document.createElement("img");
+    im.src = url;
+    const x = document.createElement("button");
+    x.type = "button";
+    x.textContent = "✕";
+    x.onclick = () => { pendingImages.splice(i, 1); renderImgChips(); };
+    chip.append(im, x);
+    box.appendChild(chip);
+  });
+}
+
+async function addImageFiles(files) {
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    try { pendingImages.push(await downscaleImage(f)); } catch {}
+  }
+  renderImgChips();
+}
+$("attach").onclick = () => $("img-file").click();
+$("img-file").addEventListener("change", (e) => {
+  addImageFiles([...e.target.files]);
+  e.target.value = "";
+});
+input.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData || {}).files || []];
+  if (files.length) { e.preventDefault(); addImageFiles(files); }
+});
+
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
 });
@@ -723,15 +794,21 @@ form.onsubmit = async (e) => {
   e.preventDefault();
   if (streaming) { stopTurn(); return; }   // Send morphs into Stop mid-turn
   const q = input.value.trim();
-  if (!q) return;
+  if (!q && !pendingImages.length) return;
+  const message = pendingImages.length
+    ? [{type: "text", text: q || "Describe this image."}].concat(
+        pendingImages.map((u) => ({type: "image_url", image_url: {url: u}})))
+    : q;
   input.value = "";
+  pendingImages = [];
+  renderImgChips();
   if (!current) {
     setStreaming(true);
     try { current = await api("POST", "/api/sessions", {}); }
     catch (err) { input.value = q; return; }
     finally { setStreaming(false); }
   }
-  chatTurn(q);
+  chatTurn(message);
 };
 $("new-chat").onclick = newChat;
 

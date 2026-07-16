@@ -88,6 +88,7 @@ class ModelSpec(BaseModel):
     license: str = ""
     use_cases: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)  # tools|vision|thinking
+    mmproj: GgufFile | None = None    # multimodal projector (vision models)
     sources: list[str] = Field(default_factory=list)
 
 

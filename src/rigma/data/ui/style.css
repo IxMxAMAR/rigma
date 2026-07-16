@@ -337,3 +337,17 @@ header .spec:hover { background:var(--bg2); color:var(--fg); }
 #effort-toggle { color:var(--dim); padding:3px 8px; border-radius:999px;
   transition:color .15s var(--ease); }
 #effort-toggle:hover { color:var(--amber); background:var(--bg2); }
+
+/* ---------- image attach ---------- */
+#attach { color:var(--dim); font-size:19px; padding:0 6px 0 0;
+  align-self:center; border-radius:999px; }
+#attach:hover { color:var(--amber); }
+#img-chips { max-width:760px; margin:0 auto 8px; display:flex; gap:8px;
+  flex-wrap:wrap; }
+.img-chip { position:relative; }
+.img-chip img { height:56px; border-radius:var(--r-sm); display:block; }
+.img-chip button { position:absolute; top:-6px; right:-6px; background:var(--bg3);
+  color:var(--fg); border-radius:50%; width:18px; height:18px; font-size:10px;
+  line-height:1; padding:0; }
+.msg-img { max-width:280px; max-height:220px; border-radius:var(--r-sm);
+  display:block; margin-top:6px; }

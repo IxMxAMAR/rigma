@@ -185,5 +185,10 @@ def export_markdown(session: dict) -> str:
         lines += ["> Story notes: " + session["notes"].replace("\n", "\n> "), ""]
     for m in session.get("messages", []):
         who = "**You:**" if m.get("role") == "user" else "**Model:**"
-        lines += [who, "", m.get("content", ""), ""]
+        content = m.get("content", "")
+        if isinstance(content, list):   # vision content-parts
+            content = "\n".join(
+                p.get("text", "") if p.get("type") == "text" else "[image]"
+                for p in content if isinstance(p, dict))
+        lines += [who, "", content, ""]
     return "\n".join(lines)
