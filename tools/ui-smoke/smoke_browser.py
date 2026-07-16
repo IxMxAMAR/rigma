@@ -87,7 +87,8 @@ with sync_playwright() as pw:
     # ---- Phase 3: drawer, params, presets manager, search, branch ----
     page.click("#gear")
     check("drawer opens on gear", page.locator("#drawer").is_visible())
-    check("param sliders present", page.locator(".param-row").count() == 5)
+    check("param sliders present (5 core + 6 advanced)",
+          page.locator(".param-row").count() == 11)
     page.fill(".param-row input.val >> nth=0", "1.2")   # temperature number box
     page.wait_for_timeout(700)                            # debounce + save
     sess = page.evaluate("current && current.params")
@@ -147,6 +148,53 @@ with sync_playwright() as pw:
     check("stale drawer cannot cross-write params",
           not fresh or "temperature" not in (fresh or {}))
     page.click("#drawer-close")
+
+
+    # ---- Forge: think block, effort chip, compact, advanced samplers ----
+    page.click("#new-chat")
+    page.wait_for_timeout(300)
+    page.fill("#in", "THINK about this")
+    page.press("#in", "Enter")
+    page.wait_for_selector(".think", timeout=8000)
+    page.wait_for_timeout(1500)
+    check("think block rendered", page.locator(".think").count() >= 1)
+    check("think collapses when reply starts",
+          "closed" in (page.locator(".think").last.get_attribute("class") or ""))
+    check("effort chip visible (thinking-capable model)",
+          page.locator("#effort-toggle").is_visible())
+    page.click("#effort-toggle")
+    page.wait_for_timeout(400)
+    eff = page.evaluate("current && current.effort")
+    check("effort cycles to off", eff == "off")
+
+    # compact via drawer (needs >6 messages -> seed via API)
+    seed = page.evaluate("""async () => {
+      const msgs = [];
+      for (let i = 0; i < 12; i++)
+        msgs.push({role: i % 2 ? "assistant" : "user", content: "turn " + i});
+      await api("POST", "/api/sessions/" + current.id, {messages: msgs});
+      return true; }""")
+    check("seeded 12 turns", bool(seed))
+    page.click("#gear")
+    page.wait_for_timeout(400)
+    page.locator("#drawer-body button", has_text="Compact now").click()
+    page.wait_for_timeout(2500)
+    remaining = page.evaluate("current && current.messages.length")
+    digest = page.evaluate("current && current.digest")
+    check("compact kept 6 + wrote digest",
+          remaining == 6 and bool(digest))
+
+    # image attach chip (no vision model in smoke -> server must 400 politely)
+    ok400 = page.evaluate("""async () => {
+      const parts = [{type: "text", text: "see"},
+                     {type: "image_url", image_url: {url: "data:image/png;base64,AA"}}];
+      const r = await fetch("/api/sessions/" + current.id + "/chat", {
+        method: "POST", headers: {"content-type": "application/json"},
+        body: JSON.stringify({message: parts})});
+      return r.status; }""")
+    check("image to non-vision model politely 400s", ok400 == 400)
+    # the 400 above was deliberate; drop its console echo before the final gate
+    console_errors[:] = [e for e in console_errors if "400" not in e]
 
     check("no console/page errors at end", not console_errors)
     page.screenshot(path=SHOT, full_page=False)

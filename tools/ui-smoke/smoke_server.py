@@ -10,7 +10,7 @@ os.environ["RIGMA_HOME"] = tempfile.mkdtemp(prefix="rigma-smoke-")
 
 from rigma import state  # noqa: E402
 
-state.write_state("smoke-model", "Q0", 18500, engine_pid=os.getpid(),
+state.write_state("qwen3.6-35b-a3b", "Q0", 18500, engine_pid=os.getpid(),
                   ui_pid=os.getpid(), use_case="creative", ctx=4096)
 
 
@@ -30,9 +30,26 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if b'"stream": false' in req or b'"stream":false' in req:
+            body = json.dumps({"choices": [{"message": {
+                "role": "assistant",
+                "content": "Digest: twelve turns of testing."}}]}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
+        if b"THINK" in req:
+            for tok in ("pondering ", "deeply"):
+                chunk = {"choices": [{"delta": {"reasoning_content": tok}}]}
+                self.wfile.write(b"data: " + json.dumps(chunk).encode()
+                                 + b"\n\n")
+                self.wfile.flush()
+                time.sleep(0.1)
         for tok in ("Hello", " from", " the", " **smoke**", " test."):
             chunk = {"choices": [{"delta": {"content": tok}}]}
             self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")

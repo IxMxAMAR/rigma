@@ -1,0 +1,25 @@
+{
+ "slug": "qwen3-vl-8b",
+ "family": "qwen3-vl",
+ "kind": "dense",
+ "n_layers": 36,
+ "full_attn_layers": 36,
+ "kv_heads": 8,
+ "head_dim": 128,
+ "native_ctx": 32768,
+ "ggufs": [
+  {"repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+   "file": "Qwen3VL-8B-Instruct-Q8_0.gguf",
+   "bytes": 8709519456, "quant": "Q8_0"},
+  {"repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+   "file": "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+   "bytes": 5027784800, "quant": "Q4_K_M"}
+ ],
+ "mmproj": {"repo": "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+            "file": "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+            "bytes": 752289728, "quant": "Q8_0"},
+ "use_cases": ["general", "coding"],
+ "capabilities": ["vision", "tools", "thinking"],
+ "notes": "provisional: seeded 2026-07-16 from HF API file data (official Qwen repo, sizes exact). Arch numbers = Qwen3-8B config; native_ctx kept at the conservative 32768 pending verification (VL claims up to 256K).",
+ "sources": ["https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF"]
+}
