@@ -80,6 +80,30 @@ window.renderMessages = function () {
   });
 };
 
+/* ---------- repo packer: dump a code folder into the prompt ---------- */
+async function attachCodeFolder() {
+  const folder = prompt("Path to a code folder — Rigma packs its text files "
+                        + "(respecting .gitignore-style skips) into the prompt:");
+  if (!folder || !folder.trim()) return;
+  const note = $("in");
+  const was = note.value;
+  note.value = "packing " + folder.trim() + "…";
+  note.disabled = true;
+  try {
+    const r = await api("POST", "/api/workspace/pack", {folder: folder.trim()});
+    note.value = r.content + "\n\n" + was;
+    const warn = r.truncated ? " (truncated to fit)" : "";
+    $("in").placeholder = r.file_count + " files, " +
+      Math.round(r.chars / 1000) + "K chars packed" + warn;
+  } catch (e) {
+    note.value = was;
+    alert("Couldn't pack folder: " + e.message);
+  } finally {
+    note.disabled = false;
+    note.focus();
+  }
+}
+
 /* ---------- command palette (Ctrl/Cmd+K) ---------- */
 let palItems = [], palIdx = 0;
 function paletteActions() {
@@ -99,6 +123,7 @@ function paletteActions() {
       document.body.classList.toggle("rag-on", current.use_rag);
       $("use-rag").checked = current.use_rag; refreshDocs();
     }},
+    {label: "Attach a code folder to the prompt", run: attachCodeFolder},
   ];
   return acts;
 }

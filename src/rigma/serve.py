@@ -541,6 +541,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             switch_lock.release()
         return s
 
+    @app.post("/api/workspace/pack")
+    async def workspace_pack(body: dict):
+        from . import workspace
+        folder = str(body.get("folder", "")).strip().strip('"')
+        if not folder:
+            return JSONResponse({"error": "folder required"}, status_code=400)
+        try:
+            return await asyncio.to_thread(workspace.pack_folder, folder)
+        except workspace.WorkspaceError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
     # ---- Hugging Face browser (Bazaar) --------------------------------------
 
     @app.get("/api/hf/search")
