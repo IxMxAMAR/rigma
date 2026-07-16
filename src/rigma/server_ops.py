@@ -53,12 +53,35 @@ def _model_on_disk(gguf) -> bool:
     return (rigma_home() / "models" / gguf.file).exists()
 
 
+def _free_current(profile, state: dict, reg):
+    """A copy of `profile` with the CURRENTLY-running model's memory added
+    back — perform_switch/ctx-change kill that engine before launching, so
+    fitting against live (starved) free memory is wrong. Without this, a
+    ctx change on the running model probes against its own occupied VRAM/RAM
+    and reports an absurdly small ceiling (live repro 2026-07-18: 35B ctx
+    change said 'tops out at 8,192' while it was running fine at 32K)."""
+    if not state:
+        return profile
+    spec = reg.models.get(state.get("model", ""))
+    if spec is None or not spec.ggufs:
+        return profile
+    freed_mb = max(g.bytes for g in spec.ggufs) / 2**20
+    if spec.mmproj:
+        freed_mb += spec.mmproj.bytes / 2**20
+    gpus = [g.model_copy(update={"vram_mb": g.vram_mb + int(freed_mb)})
+            if i == 0 else g for i, g in enumerate(profile.gpus)]
+    return profile.model_copy(update={
+        "gpus": gpus,
+        "ram_free_mb": profile.ram_free_mb + int(freed_mb)})
+
+
 def _resolve_for(slug: str, state: dict, registry, profile):
     from .probe import probe_hardware
     from .registry import Registry
     from .resolve import resolve
     reg = registry if registry is not None else Registry.load()
     p = profile if profile is not None else probe_hardware(reg.gpus)
+    p = _free_current(p, state, reg)   # count the outgoing engine as freed
     return resolve(p, reg, use_case=state.get("use_case", "general"),
                    model_override=slug), reg, p
 
