@@ -35,8 +35,12 @@ def kv_bytes_per_token(spec: ModelSpec, k: str, v: str) -> float:
 
 
 def _budgets(profile: HardwareProfile) -> tuple[float, float]:
-    gpu = profile.primary_gpu
-    vram = (gpu.vram_mb if gpu else 0) - VRAM_RESERVE_MB[profile.os] - COMPUTE_BUFFER_MB
+    # llama.cpp splits tensors across all GPUs, so budget the SUM of their
+    # VRAM (reserving per-card overhead), not just the primary
+    gpus = profile.gpus or []
+    total_vram = sum(g.vram_mb for g in gpus)
+    reserve = VRAM_RESERVE_MB[profile.os] * max(1, len(gpus)) + COMPUTE_BUFFER_MB
+    vram = total_vram - reserve
     return max(vram, 0), max(profile.ram_free_mb - RAM_RESERVE_MB, 0)
 
 
@@ -55,7 +59,24 @@ def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     if spec.moe is None:
         if file_mb + mm_mb + kv_mb <= usable_vram:
             return ComboFlags(ctx=ctx, cache_type_k=k, cache_type_v=v)
-        return None
+        # partial offload: keep as many layers on the GPU as fit, spill the
+        # rest to system RAM. A 24B dense model on 16GB runs at ~15 t/s this
+        # way instead of returning "doesn't fit" and dropping to CPU/a smaller
+        # model. mmproj + kv must stay on the GPU, so they eat the VRAM budget.
+        if spec.n_layers <= 0:
+            return None
+        per_layer = file_mb / spec.n_layers
+        gpu_room = usable_vram - mm_mb - kv_mb
+        n_gpu = int(gpu_room // per_layer) if per_layer else 0
+        if n_gpu <= 0:
+            return None                      # not even one layer + kv fits
+        n_gpu = min(n_gpu, spec.n_layers)
+        spilled = (spec.n_layers - n_gpu) * per_layer
+        if spilled > usable_ram:
+            return None
+        explain.append(f"dense partial offload: {n_gpu}/{spec.n_layers} layers "
+                       f"on GPU ({spilled:.0f}MB to RAM)")
+        return ComboFlags(ctx=ctx, ngl=n_gpu, cache_type_k=k, cache_type_v=v)
     expert_mb = file_mb * spec.moe.expert_weight_fraction
     per_layer = expert_mb / spec.n_layers
     need_off = max(0.0, file_mb + mm_mb + kv_mb - usable_vram)
@@ -82,6 +103,12 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         grown = fit_gguf(spec, gguf, profile, ctx, explain)
         if grown is None:
             break
+        # never trade decode speed for context: stop if the larger window
+        # forces more CPU offload (MoE) or fewer GPU layers (dense)
+        if grown.n_cpu_moe > best.n_cpu_moe or grown.ngl < best.ngl:
+            explain.append(f"grow-to-fit: stop at ctx {best.ctx} "
+                           f"(ctx {ctx} would force more offload)")
+            break
         explain.append(f"grow-to-fit: ctx {best.ctx} -> {ctx} "
                        f"(n_cpu_moe {best.n_cpu_moe} -> {grown.n_cpu_moe})")
         best = grown
@@ -107,7 +134,7 @@ def _calculate(profile: HardwareProfile, registry: Registry,
     def total_b(m: ModelSpec) -> float:
         # capability proxy = largest gguf size. n_layers was WRONG here: an 8B
         # with 36 layers outranked the 35B MoE (regression caught 2026-07-16)
-        return max(g.bytes for g in m.ggufs)
+        return max((g.bytes for g in m.ggufs), default=0)
 
     for spec in sorted(pool, key=total_b, reverse=True):
         for gguf in spec.ggufs:  # registry order: largest quant first

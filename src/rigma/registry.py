@@ -45,9 +45,22 @@ def update_registry(url: str = DEFAULT_REGISTRY_ZIP) -> Path:
     if not (inner / "gpus.json").exists():
         shutil.rmtree(tmp)
         raise RuntimeError("downloaded registry is missing gpus.json")
+    # swap-in via backup: on Windows rmtree(dest) often fails on a locked file,
+    # leaving the registry half-deleted. Move the old aside first, put the new
+    # in place, then delete the old (best-effort).
+    backup = dest.with_suffix(".old")
+    if backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
     if dest.exists():
-        shutil.rmtree(dest)
-    inner.rename(dest)
+        dest.rename(backup)
+    try:
+        inner.rename(dest)
+    except OSError:
+        if backup.exists():        # restore the old registry on failure
+            backup.rename(dest)
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
     shutil.rmtree(tmp, ignore_errors=True)
     return dest
 

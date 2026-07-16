@@ -19,7 +19,8 @@ def test_classify_unknown_falls_back():
     g = classify_gpu({"vendor_id": 0x10DE, "name": "GeForce FUTURE 9999",
                       "vram_mb": 32768}, GPU_TABLE, "linux")
     assert g.vendor == "nvidia" and g.arch == "unknown"
-    assert g.backends == ["vulkan"]  # safe default when unmatched
+    # unknown NVIDIA still prefers CUDA — Vulkan-only left big perf on the table
+    assert g.backends == ["cuda", "vulkan"]
 
 
 def test_probe_with_injected_gpus():

@@ -54,11 +54,9 @@ def test_chat_survives_connection_drop_and_continues(tmp_path, monkeypatch):
         r = runner.invoke(app, ["chat"], input="ping\nexit\n")
     assert r.exit_code == 0
     assert "model unreachable" in r.output
-    stored = sessions.list_sessions()
-    assert len(stored) == 1
-    sess = sessions.load(stored[0]["id"])
-    assert len(sess["messages"]) == 1
-    assert sess["messages"][0] == {"role": "user", "content": "ping"}
+    # the unanswered user turn is dropped (a dangling user msg breaks strict
+    # chat templates); the now-empty freshly-created session is cleaned up
+    assert sessions.list_sessions() == []
 
 
 def test_chat_resuming_rag_session_prints_ungrounded_notice(tmp_path, monkeypatch):
