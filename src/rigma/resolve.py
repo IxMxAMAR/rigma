@@ -45,16 +45,20 @@ def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     usable_vram, usable_ram = _budgets(profile)
     k, v = spec.cache_type_policy.k, spec.cache_type_policy.v
     file_mb = gguf.bytes / 2**20
+    # vision projector loads alongside the weights and can't be offloaded;
+    # it counts against VRAM but not the MoE expert math below
+    mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
     kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20
     explain.append(f"{gguf.quant}@ctx{ctx}: file={file_mb:.0f}MB kv={kv_mb:.0f}MB "
-                   f"vs vram={usable_vram:.0f}MB ram={usable_ram:.0f}MB")
+                   + (f"mmproj={mm_mb:.0f}MB " if mm_mb else "")
+                   + f"vs vram={usable_vram:.0f}MB ram={usable_ram:.0f}MB")
     if spec.moe is None:
-        if file_mb + kv_mb <= usable_vram:
+        if file_mb + mm_mb + kv_mb <= usable_vram:
             return ComboFlags(ctx=ctx, cache_type_k=k, cache_type_v=v)
         return None
     expert_mb = file_mb * spec.moe.expert_weight_fraction
     per_layer = expert_mb / spec.n_layers
-    need_off = max(0.0, file_mb + kv_mb - usable_vram)
+    need_off = max(0.0, file_mb + mm_mb + kv_mb - usable_vram)
     n_off = math.ceil(need_off / per_layer) if need_off else 0
     if n_off <= spec.n_layers and n_off * per_layer <= usable_ram:
         return ComboFlags(ctx=ctx, n_cpu_moe=n_off, cache_type_k=k, cache_type_v=v)

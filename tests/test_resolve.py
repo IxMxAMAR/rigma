@@ -144,3 +144,25 @@ def test_unknown_model_override_clean_error():
     import pytest as _p
     with _p.raises(ResolveError, match="unknown model"):
         resolve(p, reg, model_override="not-a-model")
+
+
+def test_fit_budgets_mmproj_vram():
+    """Native-vision finding 2026-07-17: Qwen3.6-35B ships a ~900MB mmproj in
+    the same repo. launch passes --mmproj but fit_gguf never budgeted it —
+    at grow-to-fit-maxed ctx that unbudgeted projector is an OOM."""
+    from rigma.models import CachePolicy, GgufFile, ModelSpec
+    from rigma.resolve import _budgets, fit_gguf, kv_bytes_per_token
+    p = _profile()
+    usable_vram, _ = _budgets(p)
+    file_bytes = 0  # placeholder until sized below (lambda reads it lazily)
+    mk = lambda mm: ModelSpec(  # noqa: E731
+        slug="v", family="f", kind="dense", n_layers=8, full_attn_layers=8,
+        kv_heads=2, head_dim=64, native_ctx=32768,
+        ggufs=[GgufFile(repo="r", file="v.gguf", bytes=file_bytes, quant="Q4")],
+        mmproj=mm, use_cases=["general"], cache_type_policy=CachePolicy())
+    kv_mb = 4096 * kv_bytes_per_token(mk(None), "f16", "f16") / 2**20
+    # file sized to leave only ~200MB headroom at ctx 4096
+    file_bytes = int((usable_vram - kv_mb - 200) * 2**20)
+    assert fit_gguf(mk(None), mk(None).ggufs[0], p, 4096, []) is not None
+    mm = GgufFile(repo="r", file="mm.gguf", bytes=900 * 2**20, quant="F16")
+    assert fit_gguf(mk(mm), mk(mm).ggufs[0], p, 4096, []) is None

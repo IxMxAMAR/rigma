@@ -37,6 +37,12 @@
    "quant": "UD-Q2_K_XL"
   }
  ],
+ "mmproj": {
+  "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+  "file": "mmproj-F16.gguf",
+  "bytes": 899283680,
+  "quant": "F16"
+ },
  "license": "apache-2.0",
  "use_cases": [
   "coding",
@@ -48,6 +54,7 @@
   "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF"
  ],
  "capabilities": [
+  "vision",
   "tools",
   "thinking"
  ]
