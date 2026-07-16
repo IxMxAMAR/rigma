@@ -102,8 +102,10 @@ def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
     return out
 
 
-def perform_switch(model: str, registry=None, profile=None) -> dict:
-    """Stop the running engine and launch `model` in its place.
+def perform_switch(model: str, registry=None, profile=None,
+                   ctx: int | None = None) -> dict:
+    """Stop the running engine and launch `model` in its place; with `ctx`,
+    relaunch (same model allowed) at a requested context size.
 
     Raises RuntimeError with a user-facing message on any failure; a failure
     after the old engine died clears state (one requested plan, one honest
@@ -113,7 +115,7 @@ def perform_switch(model: str, registry=None, profile=None) -> dict:
     s = st.read_state()
     if s is None:
         raise RuntimeError("not running")
-    if model == s.get("model") and not s.get("unloaded"):
+    if model == s.get("model") and not s.get("unloaded") and ctx is None:
         raise RuntimeError(f"{model} is already running")
     from .registry import Registry
     reg_full = registry if registry is not None else Registry.load()
@@ -131,9 +133,23 @@ def perform_switch(model: str, registry=None, profile=None) -> dict:
                        {**reg_full.models,
                         model: spec_full.model_copy(update={"ggufs": on_disk})},
                        reg_full.combos, reg_full.use_cases)
-    rp, _, _ = _resolve_for(model, s, trimmed, profile)
+    rp, _, p = _resolve_for(model, s, trimmed, profile)
     if rp.model_slug != model or not _model_on_disk(rp.gguf):
         raise RuntimeError(f"{model} does not fit this machine right now")
+    if ctx is not None:
+        # honest relaunch at a requested context: real fit math, not hope.
+        # rp.flags.ctx is the calculator's grow-to-fit maximum for this quant.
+        from .resolve import fit_gguf
+        want = max(2048, min(int(ctx), spec_full.native_ctx))
+        flags = fit_gguf(spec_full, rp.gguf, p, want, [])
+        if flags is None:
+            raise RuntimeError(
+                f"ctx {want:,} doesn't fit — {model} ({rp.gguf.quant}) tops "
+                f"out around {rp.flags.ctx:,} on this machine")
+        rp.flags = rp.flags.model_copy(update={
+            "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe,
+            "cache_type_k": flags.cache_type_k,
+            "cache_type_v": flags.cache_type_v})
     mm = getattr(reg_full.models.get(model), "mmproj", None)
     if mm is not None and not _model_on_disk(mm):
         raise RuntimeError(

@@ -63,6 +63,47 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     ingest_tasks: set = set()
     telemetry = {"tg": None}   # last observed decode speed, for the verdict
     switch_lock = threading.Lock()
+    activity = {"last": 0.0}   # last inference request, for idle auto-unload
+
+    def _now() -> float:
+        import time
+        return time.time()
+
+    def _bump_stats(timings: dict) -> None:
+        """Lifetime odometer: total tokens + turns, persisted to ~/.rigma."""
+        n = timings.get("predicted_n") or 0
+        if not n:
+            return
+        try:
+            f = st.rigma_home() / "stats.json"
+            cur = {}
+            if f.exists():
+                cur = json.loads(f.read_text(encoding="utf-8"))
+            cur["total_tokens"] = int(cur.get("total_tokens", 0)) + int(n)
+            cur["total_turns"] = int(cur.get("total_turns", 0)) + 1
+            model = (st.read_state() or {}).get("model", "")
+            by = cur.setdefault("by_model", {})
+            by[model] = int(by.get(model, 0)) + int(n)
+            tmp = f.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cur), encoding="utf-8")
+            tmp.replace(f)
+        except Exception:
+            pass   # stats are best-effort; never break a turn
+
+    async def _ensure_loaded() -> None:
+        """Auto-reload the engine if it was idle-unloaded (Ollama parity)."""
+        s = st.read_state()
+        if s is None or not s.get("unloaded"):
+            return
+        from . import server_ops
+        if not switch_lock.acquire(blocking=False):
+            return
+        try:
+            await asyncio.to_thread(server_ops.perform_load, registry)
+        except Exception:
+            pass
+        finally:
+            switch_lock.release()
 
     def _default_prompt() -> str:
         if default_prompt is not None:
@@ -116,7 +157,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.get("/api/sessions")
     async def list_sessions():
-        return sessions.list_sessions()
+        # file scans block the loop with many/large chats — thread them
+        return await asyncio.to_thread(sessions.list_sessions)
 
     @app.post("/api/sessions")
     async def create_session(body: dict | None = None):
@@ -126,7 +168,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.get("/api/sessions/search")
     async def search_sessions(q: str = ""):
-        return sessions.search(q)
+        return await asyncio.to_thread(sessions.search, q)
 
     @app.get("/api/sessions/{sid}")
     async def get_session(sid: str):
@@ -270,6 +312,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
         msgs = sessions.build_messages(s, _default_prompt(), preset)
+        prefill = (s.get("prefill", "") or "").strip() if not cont else ""
+        if prefill:
+            # steer the reply's opening — llama-server continues from a
+            # trailing assistant message as a prefix
+            msgs = msgs + [{"role": "assistant", "content": prefill}]
         body = {"messages": msgs, "stream": True,
                 "stream_options": {"include_usage": True}}
         body.update(sessions.effective_params(s, preset, _model_defaults()))
@@ -281,6 +328,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             body["chat_template_kwargs"] = {"enable_thinking": True}
         text, thinking, failed, resp = "", "", False, None
         usage, timings = {}, {}
+        if prefill:
+            yield _sse({"delta": prefill})   # show the steered opening
         try:
             req = client.build_request("POST", "/v1/chat/completions", json=body)
             resp = await client.send(req, stream=True)
@@ -339,17 +388,35 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             if len(meta) > 1 or meta["ctx"]:
                 yield _sse(meta, event="meta")
         if text and not failed:
+            # reload before saving: a minutes-long generation must not
+            # clobber title/param/notes edits that landed meanwhile (TOCTOU).
+            # Messages stay OUR snapshot + this turn — the turn owns them.
+            fresh = sessions.load(s["id"])
+            if fresh is not None:
+                for k in ("title", "system_prompt", "params", "notes",
+                          "digest", "preset_id", "effort", "use_rag",
+                          "authors_note", "authors_note_depth", "archive"):
+                    s[k] = fresh.get(k, s.get(k))
+            if prefill:
+                s["prefill"] = ""   # consumed once, like a variant
             last = s["messages"][-1] if s["messages"] else None
             if cont and last and last.get("role") == "assistant":
                 last["content"] = last.get("content", "") + text
                 if thinking:
                     last["thinking"] = last.get("thinking", "") + thinking
             else:
-                msg = {"role": "assistant", "content": text}
+                msg = {"role": "assistant", "content": prefill + text}
                 if thinking:
                     msg["thinking"] = thinking
+                if timings.get("predicted_per_second"):
+                    msg["stats"] = {
+                        "tps": round(timings["predicted_per_second"], 1),
+                        "tokens": timings.get("predicted_n"),
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "model": (st.read_state() or {}).get("model", "")}
                 s["messages"].append(msg)
             sessions.save(s)
+            _bump_stats(timings)
         yield b"data: [DONE]\n\n"
 
     @app.get("/api/server")
@@ -370,6 +437,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         info["verdict"] = server_ops.verdict(telemetry["tg"], exp)
         info["openai_base"] = f"http://127.0.0.1:{s['public_port']}/v1"
         return info
+
+    @app.get("/api/server/stats")
+    async def server_stats():
+        try:
+            f = st.rigma_home() / "stats.json"
+            data = json.loads(f.read_text(encoding="utf-8")) if f.exists() \
+                else {}
+        except Exception:
+            data = {}
+        return {"total_tokens": data.get("total_tokens", 0),
+                "total_turns": data.get("total_turns", 0),
+                "by_model": data.get("by_model", {})}
 
     @app.get("/api/server/log")
     async def server_log(lines: int = 200):
@@ -397,6 +476,34 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         try:
             new_state = await asyncio.to_thread(server_ops.perform_switch,
                                                 model, registry)
+            telemetry["tg"] = None
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+        finally:
+            switch_lock.release()
+        return new_state
+
+    @app.post("/api/server/ctx")
+    async def server_ctx(body: dict):
+        """Relaunch the running model at a requested context size (owner
+        finding 2026-07-18: combos launch at 32K and the UI had no way up)."""
+        from . import server_ops
+        try:
+            want = int(body.get("ctx", 0))
+        except (TypeError, ValueError):
+            want = 0
+        if want < 2048:
+            return JSONResponse({"error": "ctx must be at least 2048"},
+                                status_code=400)
+        s = st.read_state()
+        if s is None:
+            return JSONResponse({"error": "not running"}, status_code=404)
+        if not switch_lock.acquire(blocking=False):
+            return JSONResponse({"error": "a switch is already in progress"},
+                                status_code=409)
+        try:
+            new_state = await asyncio.to_thread(
+                server_ops.perform_switch, s["model"], registry, None, want)
             telemetry["tg"] = None
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)
@@ -513,7 +620,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         try:
             with open(tmp, "wb") as f:
                 async for chunk in request.stream():
-                    f.write(chunk)
+                    await asyncio.to_thread(f.write, chunk)   # GBs: don't block
             os.replace(tmp, staged)
             spec = await asyncio.to_thread(hangar.install_model, staged,
                                            attach_to or None)
@@ -599,6 +706,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if isinstance(q, list):   # vision parts -> text only for the sidecar
             q = " ".join(p.get("text", "") for p in q
                          if isinstance(p, dict) and p.get("type") == "text")
+        yield _sse({"delta": ""}, event="think")   # keep-alive: retrieval is slow
         try:
             await asyncio.to_thread(rag.ensure_sidecar)
             a = await asyncio.to_thread(rag.ask, q)
@@ -626,6 +734,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.post("/api/sessions/{sid}/chat")
     async def chat_turn(sid: str, body: dict):
+        activity["last"] = _now()   # keep-alive
+        await _ensure_loaded()      # reload if idle-unloaded
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
@@ -675,9 +785,36 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return StreamingResponse(gen, media_type="text/event-stream",
                                  headers=_NO_STORE)
 
+    @app.on_event("startup")
+    async def _keepalive_task():
+        import os
+        mins = float(os.environ.get("RIGMA_KEEP_ALIVE_MIN", "0") or 0)
+        if mins <= 0:
+            return   # opt-in: 0 disables idle auto-unload
+
+        async def _loop():
+            from . import server_ops
+            while True:
+                await asyncio.sleep(30)
+                s = st.read_state()
+                if not s or s.get("unloaded"):
+                    continue
+                if activity["last"] and _now() - activity["last"] > mins * 60:
+                    if switch_lock.acquire(blocking=False):
+                        try:
+                            await asyncio.to_thread(server_ops.perform_unload)
+                            telemetry["tg"] = None
+                        except Exception:
+                            pass
+                        finally:
+                            switch_lock.release()
+        asyncio.create_task(_loop())
+
     @app.api_route("/v1/{path:path}",
                    methods=["GET", "POST", "OPTIONS", "DELETE"])
     async def proxy(request: Request, path: str):
+        activity["last"] = _now()   # keep-alive: external agents count too
+        await _ensure_loaded()      # auto-reload if idle-unloaded
         headers = {k: v for k, v in request.headers.items()
                    if k.lower() not in _HOP_HEADERS}
         upstream = client.build_request(
@@ -685,6 +822,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             content=await request.body())
         resp = await client.send(upstream, stream=True)
         media = resp.headers.get("content-type", "application/json")
+        # pass upstream headers through (ratelimit, cors, etc.); drop hop-by-hop
+        out_headers = {k: v for k, v in resp.headers.items()
+                       if k.lower() not in _HOP_HEADERS
+                       and k.lower() != "content-type"}
         if "text/event-stream" in media:
             async def gen():
                 try:
@@ -693,11 +834,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 finally:
                     await resp.aclose()
             return StreamingResponse(gen(), status_code=resp.status_code,
-                                     media_type=media)
+                                     media_type=media, headers=out_headers)
         body = await resp.aread()
         await resp.aclose()
         return Response(content=body, status_code=resp.status_code,
-                        media_type=media)
+                        media_type=media, headers=out_headers)
 
     return app
 

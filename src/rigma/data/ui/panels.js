@@ -270,6 +270,43 @@ async function renderServerTab() {
   }
   box.appendChild(tbl);
 
+  box.appendChild(el("h3", "", "Context size"));
+  box.appendChild(el("p", "dim",
+    "Relaunches the engine at the new size — bigger context costs " +
+    "VRAM/RAM, and the fit math keeps it honest."));
+  const ctxRow = el("div", "ctx-presets");
+  const applyCtx = async (want) => {
+    const ov = $("switching");
+    ov.firstElementChild.textContent = "resizing context to "
+      + want.toLocaleString() + "…";
+    ov.hidden = false;
+    try { await api("POST", "/api/server/ctx", {ctx: want}); }
+    catch (e) { alert(e.message); }
+    ov.hidden = true;
+    pollEngine();
+    renderServerTab();
+  };
+  for (const k of [8192, 16384, 32768, 65536, 131072, 262144]) {
+    const b = el("button", "act mini"
+      + (info.ctx === k ? " current" : ""), (k / 1024) + "K");
+    if (info.ctx === k) b.disabled = true;
+    b.onclick = () => applyCtx(k);
+    ctxRow.appendChild(b);
+  }
+  const ctxIn = el("input");
+  ctxIn.type = "number";
+  ctxIn.placeholder = "custom";
+  ctxIn.min = 2048;
+  ctxIn.step = 1024;
+  const ctxGo = el("button", "act mini", "Apply");
+  ctxGo.onclick = () => {
+    const v = parseInt(ctxIn.value, 10);
+    if (v >= 2048) applyCtx(v);
+  };
+  ctxIn.onkeydown = (e) => { if (e.key === "Enter") ctxGo.onclick(); };
+  ctxRow.append(ctxIn, ctxGo);
+  box.appendChild(ctxRow);
+
   box.appendChild(el("h3", "", "Engine memory"));
   const memActs = el("div", "drawer-acts");
   if (info.unloaded) {

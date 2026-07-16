@@ -8,18 +8,31 @@ from pathlib import Path
 from .runtime import rigma_home
 
 MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
-                  "preset_id", "params", "notes", "digest", "effort")
+                  "preset_id", "params", "notes", "digest", "effort",
+                  "authors_note", "authors_note_depth", "prefill")
 EFFORT_LEVELS = ("", "off", "auto", "on")
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
                 "min_p": (0.0, 1.0), "repeat_penalty": (0.5, 2.0),
-                "max_tokens": (1, 32768),
+                "max_tokens": (1, 262144), "top_k": (0, 200),
+                "seed": (-1, 2**31 - 1),
+                "frequency_penalty": (-2.0, 2.0),
+                "presence_penalty": (-2.0, 2.0),
                 # modern anti-repetition samplers (llama-server per-request)
                 "dry_multiplier": (0.0, 2.0), "dry_base": (1.0, 4.0),
                 "dry_allowed_length": (1, 10),
                 "xtc_probability": (0.0, 1.0), "xtc_threshold": (0.0, 0.5),
                 "top_n_sigma": (-1.0, 5.0)}
-_INT_PARAMS = ("max_tokens", "dry_allowed_length")
+_INT_PARAMS = ("max_tokens", "dry_allowed_length", "seed", "top_k")
+_MAX_STOPS = 4
+
+# every field a session is guaranteed to carry — load() backfills these so
+# v0.5.x session files survive an upgrade instead of KeyError-ing the app
+_SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
+                     "use_rag": False, "preset_id": "", "params": {},
+                     "notes": "", "digest": "", "effort": "", "archive": [],
+                     "authors_note": "", "authors_note_depth": 3,
+                     "prefill": "", "messages": []}
 
 
 def chats_dir() -> Path:
@@ -34,11 +47,10 @@ def _path(session_id: str) -> Path:
 
 def create(title: str = "New chat", system_prompt: str = "") -> dict:
     now = time.time()
-    session = {"id": secrets.token_hex(6), "title": title,
-               "system_prompt": system_prompt, "use_rag": False,
-               "preset_id": "", "params": {}, "notes": "", "digest": "",
-               "effort": "", "archive": [],
-               "created_at": now, "updated_at": now, "messages": []}
+    session = {**json.loads(json.dumps(_SESSION_DEFAULTS)),
+               "id": secrets.token_hex(6), "title": title,
+               "system_prompt": system_prompt,
+               "created_at": now, "updated_at": now}
     save(session)
     return session
 
@@ -46,16 +58,22 @@ def create(title: str = "New chat", system_prompt: str = "") -> dict:
 def save(session: dict) -> None:
     session["updated_at"] = time.time()
     p = _path(session["id"])
-    tmp = p.with_suffix(".json.tmp")
+    # unique tmp name: concurrent saves of the same session (turn finishing
+    # while a param edit lands from a thread) must not tear each other's file
+    tmp = p.with_suffix(f".{secrets.token_hex(4)}.tmp")
     tmp.write_text(json.dumps(session, indent=2), encoding="utf-8")
     tmp.replace(p)   # atomic on same volume - no torn session files
 
 
 def load(session_id: str) -> dict | None:
     try:
-        return json.loads(_path(session_id).read_text(encoding="utf-8"))
+        raw = json.loads(_path(session_id).read_text(encoding="utf-8"))
     except Exception:
         return None
+    # migration: sessions written by older Rigma versions lack newer fields
+    for k, v in _SESSION_DEFAULTS.items():
+        raw.setdefault(k, json.loads(json.dumps(v)))
+    return raw
 
 
 def delete(session_id: str) -> bool:
@@ -94,8 +112,19 @@ def build_messages(session: dict, default_prompt: str = "",
         head.append({"role": "system",
                      "content": "Earlier conversation (compacted):\n" + digest})
     # sanitize: variants/metadata must never reach the model
-    return head + [{"role": m.get("role", "user"), "content": m.get("content", "")}
-                   for m in session.get("messages", [])]
+    msgs = [{"role": m.get("role", "user"), "content": m.get("content", "")}
+            for m in session.get("messages", [])]
+    an = session.get("authors_note", "")
+    if an:
+        # depth-targeted injection: N messages from the end beats the system
+        # prompt for steering prose (recency bias is real)
+        try:
+            depth = max(0, int(session.get("authors_note_depth", 3)))
+        except (TypeError, ValueError):
+            depth = 3
+        msgs.insert(max(0, len(msgs) - depth),
+                    {"role": "system", "content": f"[Author's note: {an}]"})
+    return head + msgs
 
 
 def default_prompt(registry=None) -> str:
@@ -112,6 +141,15 @@ def validate_params(raw: dict) -> dict:
     """Whitelisted, range-checked sampler params. Raises ValueError('<field>: ...')."""
     out = {}
     for key, value in (raw or {}).items():
+        if key == "stop":
+            if not isinstance(value, list) or len(value) > _MAX_STOPS or \
+                    not all(isinstance(x, str) and 0 < len(x) <= 64
+                            for x in value):
+                raise ValueError(
+                    f"stop: up to {_MAX_STOPS} non-empty strings, 64 chars max")
+            if value:
+                out["stop"] = value
+            continue
         if key not in PARAM_RANGES:
             continue
         lo, hi = PARAM_RANGES[key]
@@ -202,5 +240,9 @@ def export_markdown(session: dict) -> str:
             content = "\n".join(
                 p.get("text", "") if p.get("type") == "text" else "[image]"
                 for p in content if isinstance(p, dict))
-        lines += [who, "", content, ""]
+        lines += [who, ""]
+        if m.get("thinking"):
+            lines += ["<details><summary>thinking</summary>", "",
+                      m["thinking"], "", "</details>", ""]
+        lines += [content, ""]
     return "\n".join(lines)

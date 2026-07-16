@@ -407,6 +407,16 @@ header .spec:hover { background:var(--bg2); color:var(--fg); }
   cursor:pointer; }
 .cap-row input { width:auto; accent-color:var(--amber); }
 
+/* ---------- context-size control ---------- */
+.ctx-presets { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.ctx-presets .act.mini { color:var(--dim); background:var(--bg2);
+  border-radius:999px; padding:4px 13px; font-variant-numeric:tabular-nums; }
+.ctx-presets .act.mini:hover { color:var(--fg); background:var(--bg3); }
+.ctx-presets .act.mini.current { color:var(--amber);
+  background:var(--amber-soft); cursor:default; }
+.ctx-presets input { width:96px; flex:none; padding:5px 10px;
+  font-variant-numeric:tabular-nums; }
+
 /* ---------- hugging face browser (bazaar) ---------- */
 .hf-results { display:flex; flex-direction:column; gap:4px; }
 .hf-row { display:flex; justify-content:space-between; gap:10px;
