@@ -66,6 +66,24 @@ def _backend(profile: HardwareProfile) -> str:
     return gpu.backends[0] if gpu and gpu.backends else "cpu"
 
 
+def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
+              flags: ComboFlags, explain: list[str]) -> ComboFlags:
+    """Calculator plans only: double ctx while it still fits, up to native.
+
+    CTX_DEFAULT is a starting probe, not a ceiling (owner finding 2026-07-16:
+    the old cap silently wasted VRAM that could hold 4-8x more context)."""
+    best = flags
+    ctx = best.ctx * 2
+    while ctx <= spec.native_ctx:
+        grown = fit_gguf(spec, gguf, profile, ctx, explain)
+        if grown is None:
+            break
+        explain.append(f"grow-to-fit: ctx {best.ctx} -> {ctx}")
+        best = grown
+        ctx *= 2
+    return best
+
+
 def _calculate(profile: HardwareProfile, registry: Registry,
                use_case: str) -> RunPlan | None:
     explain: list[str] = []
@@ -81,6 +99,7 @@ def _calculate(profile: HardwareProfile, registry: Registry,
             while ctx >= CTX_FLOOR:
                 flags = fit_gguf(spec, gguf, profile, ctx, explain)
                 if flags:
+                    flags = _grow_ctx(spec, gguf, profile, flags, explain)
                     return RunPlan(model_slug=spec.slug, gguf=gguf,
                                    backend=_backend(profile), flags=flags,
                                    origin="calculator", explain=explain)

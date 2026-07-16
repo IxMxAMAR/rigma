@@ -330,6 +330,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        dry_run: bool = typer.Option(False, "--dry-run"),
        port: int = typer.Option(11500, "--port"),
        no_browser: bool = typer.Option(False, "--no-browser"),
+       ctx: int = typer.Option(None, "--ctx",
+                               help="Context size override (clamped to the "
+                                    "model's native window)"),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
@@ -345,6 +348,10 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     reg = Registry.load()
     p = _profile(reg)
     rp = resolve(p, reg, use_case=use_case, model_override=model)
+    if ctx is not None:
+        native = reg.models[rp.model_slug].native_ctx
+        rp.flags = rp.flags.model_copy(update={"ctx": max(1024, min(ctx, native))})
+        rp.origin += "+ctx-override"
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "

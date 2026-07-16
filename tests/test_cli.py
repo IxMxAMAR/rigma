@@ -66,3 +66,15 @@ def test_up_refuses_double_start(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
     res = runner.invoke(cli.app, ["up", "--use-case", "coding"])
     assert res.exit_code == 1 and "already running" in res.output.lower()
+
+
+def test_up_ctx_override_and_clamp(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+                                  "--ctx", "4096"])
+    assert res.exit_code == 0 and "-c 4096" in res.output
+    assert "+ctx-override" in res.output
+    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+                                  "--ctx", "99999999"])
+    assert res.exit_code == 0 and "-c 262144" in res.output  # qwen native cap
