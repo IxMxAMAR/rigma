@@ -45,7 +45,16 @@ def _source_globs() -> list[str]:
     return globs
 
 
-def write_rag_config(llm_base_url: str = "http://127.0.0.1:11500/v1") -> Path:
+def _llm_base_url() -> str:
+    """Point the sidecar at whatever port Rigma actually launched on, not a
+    hardcoded 11500 (breaks `rigma up --port 8080`)."""
+    from . import state as st
+    s = st.read_state() or {}
+    return f"http://127.0.0.1:{s.get('public_port', 11500)}/v1"
+
+
+def write_rag_config(llm_base_url: str | None = None) -> Path:
+    llm_base_url = llm_base_url or _llm_base_url()
     include = ", ".join(json.dumps(g) for g in _source_globs())
     index_path = (rag_dir() / "index").as_posix()
     text = (

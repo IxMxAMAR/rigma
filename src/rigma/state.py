@@ -48,14 +48,22 @@ def server_running() -> dict | None:
     s = read_state()
     if s is None:
         return None
+    ui_alive = pid_alive(int(s.get("ui_pid", -1)))
     if s.get("unloaded"):
         # engine deliberately stopped to free VRAM/RAM; the UI process is
         # the thing that must still be alive
-        if not pid_alive(int(s.get("ui_pid", -1))):
+        if not ui_alive:
             clear_state()
             return None
         return s
-    if not pid_alive(int(s.get("engine_pid", -1))):
+    engine_alive = pid_alive(int(s.get("engine_pid", -1)))
+    if not ui_alive and engine_alive:
+        # terminal closed → UI died but llama-server lingers. Left alone this
+        # locks the user out ("already running" with a dead UI). Reap it.
+        kill_pid(int(s["engine_pid"]))
+        clear_state()
+        return None
+    if not engine_alive:
         clear_state()
         return None
     return s

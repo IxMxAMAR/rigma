@@ -162,12 +162,19 @@ def perform_switch(model: str, registry=None, profile=None,
     exe = runtime.ensure_engine(rp.backend, os_name)
     model_path = rigma_home() / "models" / rp.gguf.file
     st.kill_pid(int(s.get("engine_pid", -1)))
+    _await_port_free(int(s["public_port"]) - 1)   # Windows TIME_WAIT grace
     try:
         sp = runtime.launch_server(exe, rp, model_path,
                                    port=int(s["public_port"]) - 1,
                                    extra_args=extra)
     except Exception:
-        st.clear_state()  # old engine is gone; don't advertise a dead server
+        # old engine is gone but the UI is still up — record an unloaded
+        # state (not clear) so the UI stays manageable and can retry a load
+        st.write_state(s["model"], s["quant"], int(s["public_port"]),
+                       engine_pid=-1, ui_pid=int(s.get("ui_pid", os.getpid())),
+                       backend=s.get("backend", "unknown"),
+                       use_case=s.get("use_case", "general"),
+                       ctx=int(s.get("ctx", 0)), unloaded=True)
         raise
     st.write_state(rp.model_slug, rp.gguf.quant, int(s["public_port"]),
                    engine_pid=sp.proc.pid,
@@ -175,6 +182,21 @@ def perform_switch(model: str, registry=None, profile=None,
                    backend=rp.backend, use_case=s.get("use_case", "general"),
                    ctx=rp.flags.ctx)
     return st.read_state()
+
+
+def _await_port_free(port: int, tries: int = 10, delay: float = 0.3) -> None:
+    """After killing the old engine, its port lingers in TIME_WAIT briefly on
+    Windows; wait for it to free before relaunching to avoid a bind crash."""
+    import socket
+    import time
+    for _ in range(tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+            sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sk.bind(("127.0.0.1", port))
+                return
+            except OSError:
+                time.sleep(delay)
 
 
 def perform_unload() -> dict:
