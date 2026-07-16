@@ -92,19 +92,32 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             pass   # stats are best-effort; never break a turn
 
     async def _ensure_loaded() -> None:
-        """Auto-reload the engine if it was idle-unloaded (Ollama parity)."""
-        s = st.read_state()
-        if s is None or not s.get("unloaded"):
-            return
+        """Auto-reload the engine if it was idle-unloaded (Ollama parity).
+
+        Waits out an in-progress unload/switch instead of racing a request
+        straight into a dying engine — the lock is only ever held for the
+        seconds of a kill/launch."""
         from . import server_ops
-        if not switch_lock.acquire(blocking=False):
-            return
-        try:
-            await asyncio.to_thread(server_ops.perform_load, registry)
-        except Exception:
-            pass
-        finally:
-            switch_lock.release()
+        for _ in range(60):        # up to ~30s: covers a graceful kill + relaunch
+            s = st.read_state()
+            if s is None:
+                return
+            if not s.get("unloaded"):
+                # a concurrent op may still hold the lock mid-relaunch; wait
+                if switch_lock.acquire(blocking=False):
+                    switch_lock.release()
+                    return
+                await asyncio.sleep(0.5)
+                continue
+            if switch_lock.acquire(blocking=False):
+                try:
+                    await asyncio.to_thread(server_ops.perform_load, registry)
+                except Exception:
+                    pass   # reload failed; the turn will surface its own error
+                finally:
+                    switch_lock.release()
+                return
+            await asyncio.sleep(0.5)   # someone else is switching; let them
 
     def _default_prompt() -> str:
         if default_prompt is not None:
@@ -393,11 +406,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # clobber title/param/notes edits that landed meanwhile (TOCTOU).
             # Messages stay OUR snapshot + this turn — the turn owns them.
             fresh = sessions.load(s["id"])
-            if fresh is not None:
-                for k in ("title", "system_prompt", "params", "notes",
-                          "digest", "preset_id", "effort", "use_rag",
-                          "authors_note", "authors_note_depth", "archive"):
-                    s[k] = fresh.get(k, s.get(k))
+            if fresh is None:
+                # the session was deleted mid-generation — discard the turn,
+                # never resurrect the file the user just removed
+                yield b"data: [DONE]\n\n"
+                return
+            for k in ("title", "system_prompt", "params", "notes",
+                      "digest", "preset_id", "effort", "use_rag",
+                      "authors_note", "authors_note_depth", "archive"):
+                s[k] = fresh.get(k, s.get(k))
             if prefill:
                 s["prefill"] = ""   # consumed once, like a variant
             last = s["messages"][-1] if s["messages"] else None
@@ -740,6 +757,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         cites = a.get("citations") or []
         if cites:
             yield _sse({"citations": cites}, event="citations")
+        if sessions.load(s["id"]) is None:   # deleted mid-retrieval: discard
+            yield b"data: [DONE]\n\n"
+            return
         s["messages"].append({"role": "assistant", "content": text})
         sessions.save(s)
         yield b"data: [DONE]\n\n"

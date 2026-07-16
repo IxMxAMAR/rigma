@@ -194,11 +194,12 @@ document.addEventListener("keydown", (e) => {
 // SillyTavern V2/V3 cards embed a base64 JSON in a PNG 'chara' tEXt chunk.
 function readPngText(buf) {
   const dv = new DataView(buf);
-  if (dv.getUint32(0) !== 0x89504e47) return null;   // PNG signature
+  if (dv.byteLength < 8 || dv.getUint32(0) !== 0x89504e47) return null;
   let off = 8;
   const out = {};
-  while (off < dv.byteLength) {
+  while (off + 12 <= dv.byteLength) {   // need length(4)+type(4)+crc(4)
     const len = dv.getUint32(off);
+    if (len < 0 || off + 12 + len > dv.byteLength) break;   // truncated chunk
     const type = String.fromCharCode(dv.getUint8(off + 4), dv.getUint8(off + 5),
                                      dv.getUint8(off + 6), dv.getUint8(off + 7));
     if (type === "tEXt") {
@@ -215,7 +216,8 @@ function readPngText(buf) {
   return out;
 }
 function decodeCharacterCard(buf) {
-  const chunks = readPngText(buf);
+  let chunks;
+  try { chunks = readPngText(buf); } catch { return null; }
   if (!chunks) return null;
   const raw = chunks.chara || chunks.ccv3;
   if (!raw) return null;
@@ -231,8 +233,9 @@ function decodeCharacterCard(buf) {
           greeting: d.first_mes || ""};
 }
 async function importCharacterCard(file) {
-  const buf = await file.arrayBuffer();
-  const card = decodeCharacterCard(buf);
+  let card = null;
+  try { card = decodeCharacterCard(await file.arrayBuffer()); }
+  catch { card = null; }
   if (!card) { alert("That PNG isn't a character card (no embedded persona)."); return; }
   try {
     await api("POST", "/api/presets",

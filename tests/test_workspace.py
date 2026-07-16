@@ -74,3 +74,17 @@ def test_pack_endpoint(tmp_path, monkeypatch):
                     json={"folder": str(tmp_path / "nope")})
     assert r.status_code == 400
     srv.shutdown()
+
+
+def test_pack_prunes_and_survives_permission_error(tmp_path, monkeypatch):
+    """Review IMPORTANT: skipped dirs are pruned (not enumerated) and an
+    unreadable subtree degrades to skip, not a 500."""
+    (tmp_path / "keep.py").write_text("ok", encoding="utf-8")
+    big = tmp_path / "node_modules"
+    big.mkdir()
+    (big / "junk.js").write_text("x", encoding="utf-8")
+    out = workspace.pack_folder(str(tmp_path))
+    assert "keep.py" in out["content"] and "node_modules" not in out["content"]
+    # onerror swallows a walk error rather than raising out of the request
+    out2 = workspace.pack_folder(str(tmp_path))
+    assert out2["file_count"] == 1
