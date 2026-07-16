@@ -104,3 +104,21 @@ def test_flash_attn_tristate_and_bool_coercion():
                        origin="t")
         args = plan.server_args("m.gguf", 1)
         assert args[args.index("-fa") + 1] == mode
+
+
+def test_spec_decode_and_cache_reuse_args():
+    from rigma.models import ComboFlags, GgufFile, RunPlan
+    plan = RunPlan(model_slug="m",
+                   gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                   backend="vulkan",
+                   flags=ComboFlags(ctx=1024, spec_type="draft-mtp",
+                                    spec_n_max=4), origin="t")
+    args = plan.server_args("m.gguf", 1)
+    assert args[args.index("--spec-type") + 1] == "draft-mtp"
+    assert args[args.index("--spec-draft-n-max") + 1] == "4"
+    assert args[args.index("--cache-reuse") + 1] == "256"
+    plain = RunPlan(model_slug="m",
+                    gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                    backend="vulkan", flags=ComboFlags(ctx=1024), origin="t")
+    a2 = plain.server_args("m.gguf", 1)
+    assert "--spec-type" not in a2 and "--cache-reuse" in a2

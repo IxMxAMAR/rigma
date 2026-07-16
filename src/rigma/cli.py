@@ -337,6 +337,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                                      help="Reasoning/thinking: on|off|auto"),
        fa: str = typer.Option(None, "--fa",
                               help="FlashAttention: on|off|auto"),
+       spec: str = typer.Option(None, "--spec",
+                                help="Speculative decoding: none|draft-mtp|"
+                                     "ngram-simple|... (engine-supported)"),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
@@ -368,6 +371,15 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             raise typer.Exit(2)
         rp.flags = rp.flags.model_copy(update={"flash_attn": fa})
         rp.origin += "+fa-override"
+    if spec is not None:
+        allowed = ("none", "draft-simple", "draft-eagle3", "draft-mtp",
+                   "draft-dflash", "ngram-simple", "ngram-map-k",
+                   "ngram-map-k4v", "ngram-mod", "ngram-cache")
+        if spec not in allowed:
+            typer.echo(f"--spec must be one of: {', '.join(allowed)}")
+            raise typer.Exit(2)
+        rp.flags = rp.flags.model_copy(update={"spec_type": spec})
+        rp.origin += "+spec-override"
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "

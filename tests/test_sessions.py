@@ -235,3 +235,24 @@ def test_export_markdown_image_placeholder(tmp_path, monkeypatch):
     sessions.save(s)
     md = sessions.export_markdown(sessions.load(s["id"]))
     assert "look" in md and "[image]" in md and "data:" not in md
+
+
+def test_extended_sampler_whitelist():
+    ok = sessions.validate_params({
+        "dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2,
+        "xtc_probability": 0.5, "xtc_threshold": 0.1, "top_n_sigma": 1.0})
+    assert len(ok) == 6 and ok["dry_allowed_length"] == 2
+    import pytest as _p
+    with _p.raises(ValueError, match="xtc_probability"):
+        sessions.validate_params({"xtc_probability": 2.0})
+
+
+def test_search_survives_parts_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    s = sessions.create(title="viz chat")
+    s["messages"] = [{"role": "user", "content": [
+        {"type": "text", "text": "find the dragon here"},
+        {"type": "image_url", "image_url": {"url": "data:..."}}]}]
+    sessions.save(s)
+    hits = sessions.search("dragon")
+    assert len(hits) == 1 and "dragon" in hits[0]["snippet"]

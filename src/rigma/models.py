@@ -100,6 +100,8 @@ class ComboFlags(BaseModel):
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
     reasoning: str = ""   # ""(engine default) | on | off | auto
+    spec_type: str = "none"   # none | draft-mtp | ngram-simple | ... (engine list)
+    spec_n_max: int = 3
 
     @field_validator("flash_attn", mode="before")
     @classmethod
@@ -150,4 +152,9 @@ class RunPlan(BaseModel):
                  "--cache-type-v", self.flags.cache_type_v]
         if self.flags.reasoning:
             args += ["--reasoning", self.flags.reasoning]
+        if self.flags.spec_type and self.flags.spec_type != "none":
+            args += ["--spec-type", self.flags.spec_type,
+                     "--spec-draft-n-max", str(self.flags.spec_n_max)]
+        # reuse unchanged KV prefixes on edit/regenerate/compact turns
+        args += ["--cache-reuse", "256"]
         return args

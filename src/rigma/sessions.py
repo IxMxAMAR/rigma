@@ -13,7 +13,13 @@ EFFORT_LEVELS = ("", "off", "auto", "on")
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
                 "min_p": (0.0, 1.0), "repeat_penalty": (0.5, 2.0),
-                "max_tokens": (1, 32768)}
+                "max_tokens": (1, 32768),
+                # modern anti-repetition samplers (llama-server per-request)
+                "dry_multiplier": (0.0, 2.0), "dry_base": (1.0, 4.0),
+                "dry_allowed_length": (1, 10),
+                "xtc_probability": (0.0, 1.0), "xtc_threshold": (0.0, 0.5),
+                "top_n_sigma": (-1.0, 5.0)}
+_INT_PARAMS = ("max_tokens", "dry_allowed_length")
 
 
 def chats_dir() -> Path:
@@ -112,7 +118,7 @@ def validate_params(raw: dict) -> dict:
         if isinstance(value, bool):
             raise ValueError(f"{key}: not a number")
         try:
-            value = int(value) if key == "max_tokens" else float(value)
+            value = int(value) if key in _INT_PARAMS else float(value)
         except (TypeError, ValueError):
             raise ValueError(f"{key}: not a number") from None
         if not lo <= value <= hi:
@@ -154,6 +160,9 @@ def search(query: str) -> list[dict]:
         else:
             for m in s.get("messages", []):
                 content = m.get("content", "")
+                if isinstance(content, list):   # vision parts
+                    content = " ".join(p.get("text", "") for p in content
+                                       if isinstance(p, dict))
                 pos = content.lower().find(q)
                 if pos != -1:
                     lo = max(0, pos - 40)

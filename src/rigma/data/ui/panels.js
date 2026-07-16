@@ -9,6 +9,16 @@ const PARAM_DEFS = [
   ["repeat_penalty", 0.5, 2, 0.01],
   ["max_tokens", 1, 32768, 1],
 ];
+// modern anti-repetition samplers — collapsed under "Advanced sampling"
+const PARAM_DEFS_ADV = [
+  ["dry_multiplier", 0, 2, 0.05],
+  ["dry_base", 1, 4, 0.05],
+  ["dry_allowed_length", 1, 10, 1],
+  ["xtc_probability", 0, 1, 0.05],
+  ["xtc_threshold", 0, 0.5, 0.01],
+  ["top_n_sigma", -1, 5, 0.1],
+];
+const INT_PARAMS = ["max_tokens", "dry_allowed_length"];
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -56,7 +66,7 @@ function renderChatTab() {
     "Blank = engine default (or the preset's value). Applied per request.");
   box.appendChild(hint);
   const params = Object.assign({}, current.params || {});
-  for (const [key, lo, hiDef, step] of PARAM_DEFS) {
+  const addParamRow = (key, lo, hiDef, step) => {
     let hi = hiDef;
     const row = el("div", "param-row");
     const lbl = el("label", "", key);
@@ -91,18 +101,21 @@ function renderChatTab() {
       }, 350);
     };
     range.oninput = () => { num.value = range.value;
-      params[key] = key === "max_tokens" ? parseInt(range.value, 10)
+      params[key] = INT_PARAMS.includes(key) ? parseInt(range.value, 10)
                                          : parseFloat(range.value); push(); };
     num.oninput = () => {
       if (num.value === "") { delete params[key]; push(); return; }
       range.value = num.value;
-      params[key] = key === "max_tokens" ? parseInt(num.value, 10)
+      params[key] = INT_PARAMS.includes(key) ? parseInt(num.value, 10)
                                          : parseFloat(num.value); push();
     };
     clear.onclick = () => { num.value = ""; delete params[key]; push(); };
     row.append(range, num, clear);
     box.appendChild(row);
-  }
+  };
+  for (const [key, lo, hi, step] of PARAM_DEFS) addParamRow(key, lo, hi, step);
+  box.appendChild(el("h3", "", "Advanced sampling (anti-repetition)"));
+  for (const [key, lo, hi, step] of PARAM_DEFS_ADV) addParamRow(key, lo, hi, step);
   box.appendChild(el("h3", "", "Memory"));
   const dg = el("textarea");
   dg.rows = 4;
