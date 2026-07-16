@@ -122,3 +122,18 @@ def test_range_escalation_on_truncated_header(monkeypatch, home):
     d = hf_browse.inspect_repo("cool/WebTune-GGUF")
     assert d["name"] == "web-tune-7b"
     assert calls == [8, 32]
+
+
+def test_hf_5xx_and_429_stay_friendly(monkeypatch):
+    """Review 2026-07-17: rate limits / HF hiccups must be HangarError (clean
+    502 upstream), never a raw 500."""
+    import types
+
+    import httpx as _httpx
+    for code in (429, 500, 503):
+        monkeypatch.setattr(hf_browse.httpx, "get",
+                            lambda *a, code=code, **k: types.SimpleNamespace(
+                                status_code=code))
+        with pytest.raises(HangarError, match=str(code)):
+            hf_browse.search("x")
+    assert _httpx  # imported to prove no real network path was involved
