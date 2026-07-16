@@ -123,3 +123,19 @@ def test_corrupt_string_length_raises_instead_of_hanging(tmp_path):
     p.write_bytes(bad)
     with pytest.raises(GgufParseError):
         read_metadata(p)
+
+
+def test_nested_array_bomb_raises_instead_of_recursion_error(tmp_path):
+    """Review 2026-07-17: arrays-of-arrays a few hundred deep must be a clean
+    GgufParseError, not a RecursionError escaping install_model's handler."""
+    depth = 400
+    body = struct.pack("<I", T_ARR)              # value type: array
+    for _ in range(depth - 1):                   # each level: elem=array, n=1
+        body += struct.pack("<I", T_ARR) + struct.pack("<Q", 1)
+    body += struct.pack("<I", T_U32) + struct.pack("<Q", 0)   # innermost: u32[0]
+    kv = _s(b"bomb") + body
+    p = tmp_path / "bomb.gguf"
+    p.write_bytes(b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
+                  + struct.pack("<Q", 1) + kv)
+    with pytest.raises(GgufParseError, match="nesting"):
+        read_metadata(p)
