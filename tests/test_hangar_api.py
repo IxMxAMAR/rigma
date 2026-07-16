@@ -216,3 +216,31 @@ def test_hf_endpoints_delegate_and_map_errors(home, upstream, monkeypatch):
     r = client.post("/api/hf/add", json={"repo": "a/b"})
     assert r.status_code == 400 and "gated" in r.json()["error"]
     assert client.post("/api/hf/add", json={}).status_code == 400
+
+
+def test_ctx_endpoint_relaunches_at_requested_size(home, upstream,
+                                                   monkeypatch):
+    """Owner finding 2026-07-18: no way to raise ctx from the UI."""
+    import os
+
+    from rigma import server_ops
+    from rigma import state as st
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=32768)
+    seen = {}
+
+    def fake_switch(model, reg=None, prof=None, ctx=None):
+        seen.update(model=model, ctx=ctx)
+        return {"model": model, "ctx": ctx, "unloaded": False}
+    monkeypatch.setattr(server_ops, "perform_switch", fake_switch)
+    client = TestClient(build_app(upstream_port=upstream))
+    r = client.post("/api/server/ctx", json={"ctx": 131072})
+    assert r.status_code == 200 and r.json()["ctx"] == 131072
+    assert seen == {"model": "m", "ctx": 131072}
+    assert client.post("/api/server/ctx", json={"ctx": 12}).status_code == 400
+    assert client.post("/api/server/ctx", json={}).status_code == 400
+    def boom(model, reg=None, prof=None, ctx=None):
+        raise RuntimeError("ctx 999,999 doesn't fit — tops out around 262,144")
+    monkeypatch.setattr(server_ops, "perform_switch", boom)
+    r = client.post("/api/server/ctx", json={"ctx": 999999})
+    assert r.status_code == 502 and "tops out" in r.json()["error"]
