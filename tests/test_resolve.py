@@ -113,11 +113,14 @@ def test_coding_prefers_tools_capable_models():
 def test_size_ranking_uses_gguf_bytes_not_layers():
     """Critical regression 2026-07-16: 8B vision model (36 layers) outranked
     the 35B MoE (total_b 35.0) because dense size proxy was n_layers."""
+    from importlib import resources
     from rigma.probe import probe_hardware
     from rigma.registry import Registry
     from rigma.resolve import resolve
     from rigma.models import CpuInfo, GpuInfo, HardwareProfile
-    reg = Registry.load()  # bundled: qwen3.6-35b + qwen3-vl-8b + qwen3-0.6b
+    from pathlib import Path
+    bundled = Path(str(resources.files("rigma").joinpath("data/registry")))
+    reg = Registry.load(bundled)  # hermetic: user cache may be stale
     gpu = GpuInfo(vendor="amd", name="X", vram_mb=16368, arch="rdna4",
                   slug="none", backends=["vulkan"])
     p = HardwareProfile(gpus=[gpu], ram_mb=32768, ram_free_mb=20000,
@@ -128,10 +131,13 @@ def test_size_ranking_uses_gguf_bytes_not_layers():
 
 
 def test_unknown_model_override_clean_error():
+    from importlib import resources
+    from pathlib import Path
     from rigma.registry import Registry
     from rigma.resolve import ResolveError, resolve
     from rigma.models import CpuInfo, GpuInfo, HardwareProfile
-    reg = Registry.load()
+    bundled = Path(str(resources.files("rigma").joinpath("data/registry")))
+    reg = Registry.load(bundled)
     gpu = GpuInfo(vendor="amd", name="X", vram_mb=16368, backends=["vulkan"])
     p = HardwareProfile(gpus=[gpu], ram_mb=32768, ram_free_mb=20000,
                         cpu=CpuInfo(cores=16), os="windows", disk_free_gb=400.0)

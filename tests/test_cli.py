@@ -111,3 +111,12 @@ def test_up_spec_override(tmp_path, monkeypatch):
     res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
                                   "--spec", "warp-drive"])
     assert res.exit_code != 0
+
+
+def test_unknown_model_clean_cli_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    res = runner.invoke(cli.app, ["plan", "--model", "not-a-model"])
+    assert res.exit_code == 1 and "rigma update" in res.output
+    res = runner.invoke(cli.app, ["up", "--model", "not-a-model", "--dry-run"])
+    assert res.exit_code == 1 and "rigma update" in res.output

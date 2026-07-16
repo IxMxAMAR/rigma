@@ -7,7 +7,7 @@ import typer
 
 from .probe import probe_hardware
 from .registry import Registry
-from .resolve import resolve
+from .resolve import ResolveError, resolve
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -140,7 +140,11 @@ def plan(use_case: str = typer.Option("general", "--use-case"),
          explain: bool = typer.Option(False, "--explain")):
     """Show what `rigma up` would run, and why."""
     reg = Registry.load()
-    rp = resolve(_profile(reg), reg, use_case=use_case, model_override=model)
+    try:
+        rp = resolve(_profile(reg), reg, use_case=use_case, model_override=model)
+    except ResolveError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1) from None
     typer.echo(f"model:   {rp.model_slug} ({rp.gguf.quant}, "
                f"{rp.gguf.bytes / 2**30:.1f} GB)")
     typer.echo(f"backend: {rp.backend}   origin: {rp.origin}")
@@ -354,7 +358,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
 
     reg = Registry.load()
     p = _profile(reg)
-    rp = resolve(p, reg, use_case=use_case, model_override=model)
+    try:
+        rp = resolve(p, reg, use_case=use_case, model_override=model)
+    except ResolveError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1) from None
     if ctx is not None:
         native = reg.models[rp.model_slug].native_ctx
         rp.flags = rp.flags.model_copy(update={"ctx": max(1024, min(ctx, native))})
