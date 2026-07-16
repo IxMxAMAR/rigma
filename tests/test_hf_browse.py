@@ -137,3 +137,35 @@ def test_hf_5xx_and_429_stay_friendly(monkeypatch):
         with pytest.raises(HangarError, match=str(code)):
             hf_browse.search("x")
     assert _httpx  # imported to prove no real network path was involved
+
+
+def test_imatrix_gguf_is_not_a_quant_and_probe_falls_forward(monkeypatch,
+                                                             home):
+    """Live find 2026-07-17 (bartowski/Cydonia): repos ship imatrix data as
+    .gguf — must be excluded from quants, and the header probe must not die
+    on a non-model gguf."""
+    tree = [{"path": "Model-imatrix.gguf", "size": 10 * 2**20},
+            {"path": "Model-Q4_K_M.gguf", "size": 4 * 2**30}]
+    monkeypatch.setattr(hf_browse, "_get_json", lambda p, params=None: tree)
+    monkeypatch.setattr(hf_browse, "_fetch_head",
+                        lambda repo, file, cap: HEADER)
+    rf = hf_browse.repo_files("x/y")
+    assert [g["file"] for g in rf["ggufs"]] == ["Model-Q4_K_M.gguf"]
+    d = hf_browse.inspect_repo("x/y")
+    assert d["name"] == "web-tune-7b"
+
+
+def test_probe_falls_forward_past_metadata_less_gguf(monkeypatch, home):
+    """Even without the name filter, a metadata-less smallest gguf must not
+    kill the repo — the next candidate gets probed."""
+    bare = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
+            + struct.pack("<Q", 1)
+            + _kv_str(b"general.architecture", b"mystery"))
+    tree = [{"path": "weird.gguf", "size": 5 * 2**20},
+            {"path": "Model-Q4_K_M.gguf", "size": 4 * 2**30}]
+    monkeypatch.setattr(hf_browse, "_get_json", lambda p, params=None: tree)
+    monkeypatch.setattr(hf_browse, "_fetch_head",
+                        lambda repo, file, cap:
+                        bare if file == "weird.gguf" else HEADER)
+    d = hf_browse.inspect_repo("x/y")
+    assert d["name"] == "web-tune-7b"
