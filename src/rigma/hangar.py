@@ -95,14 +95,20 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
         if dest.exists():
             raise HangarError(f"{dest.name} already exists in Rigma's models "
                               "folder — rename the file and try again")
-        _move(src, dest)
         mm = GgufFile(repo="local", file=dest.name,
-                      bytes=dest.stat().st_size, quant="LOCAL")
-        spec = spec.model_copy(update={
+                      bytes=src.stat().st_size, quant="LOCAL")
+        updated = spec.model_copy(update={
             "mmproj": mm,
             "capabilities": sorted(set(spec.capabilities) | {"vision"})})
-        _write_spec(spec)
-        return spec
+        # spec first, then move: a spec-write failure leaves the user's file
+        # untouched at its source (never silently swallowed)
+        _write_spec(updated)
+        try:
+            _move(src, dest)
+        except OSError:
+            _write_spec(spec)   # roll the mmproj back off the model
+            raise
+        return updated
 
     from .registry import Registry
     slug = _slugify(info.name)
@@ -125,7 +131,6 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
         # overwriting could destroy the running engine's weights
         raise HangarError(f"{dest.name} already exists in Rigma's models "
                           "folder — rename the file and try again")
-    _move(src, dest)
     spec = ModelSpec(
         slug=slug, family=info.arch or "custom", kind=f["kind"],
         n_layers=f["n_layers"], full_attn_layers=f["full_attn_layers"],
@@ -135,7 +140,14 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
                         quant=_quant_from_name(dest.name))],
         moe=moe, license="custom import", use_cases=["general"],
         capabilities=sorted(info.capabilities), custom=True)
+    # spec first, then move: if the move fails, drop the orphan spec so the
+    # library never lists a model whose file isn't there
     _write_spec(spec)
+    try:
+        _move(src, dest)
+    except OSError:
+        (custom_dir() / f"{slug}.json").unlink(missing_ok=True)
+        raise
     return spec
 
 

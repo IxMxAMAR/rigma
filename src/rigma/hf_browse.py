@@ -46,20 +46,32 @@ def _get_json(path: str, params: dict | None = None):
 
 
 def _fetch_head(repo: str, file: str, cap_mb: int) -> bytes:
-    """First cap_mb MB of a repo file (Range survives the CDN redirect)."""
+    """First cap_mb MB of a repo file (Range survives the CDN redirect).
+
+    Streams and hard-caps the read: if a mirror ignores the Range header and
+    replies 200 with the whole 40GB file, we must not pull it into memory."""
+    cap = cap_mb * 2**20
     try:
-        r = httpx.get(f"{HF}/{repo}/resolve/main/{file}",
-                      headers={**_headers(),
-                               "range": f"bytes=0-{cap_mb * 2**20 - 1}"},
-                      timeout=90, follow_redirects=True)
+        with httpx.stream("GET", f"{HF}/{repo}/resolve/main/{file}",
+                          headers={**_headers(),
+                                   "range": f"bytes=0-{cap - 1}"},
+                          timeout=90, follow_redirects=True) as r:
+            if r.status_code in (401, 403):
+                raise HangarError("that repo is gated — accept its license on "
+                                  "huggingface.co and set HF_TOKEN")
+            if r.status_code not in (200, 206):
+                raise HangarError(f"couldn't read {file} "
+                                  f"(HTTP {r.status_code})")
+            buf = bytearray()
+            for chunk in r.iter_bytes(1 << 20):
+                buf += chunk
+                if len(buf) >= cap:     # server ignored Range — stop reading
+                    break
+            return bytes(buf[:cap])
+    except HangarError:
+        raise
     except httpx.HTTPError as e:
         raise HangarError(f"Hugging Face unreachable: {e}") from e
-    if r.status_code in (401, 403):
-        raise HangarError("that repo is gated — accept its license on "
-                          "huggingface.co and set HF_TOKEN")
-    if r.status_code not in (200, 206):
-        raise HangarError(f"couldn't read {file} (HTTP {r.status_code})")
-    return r.content
 
 
 def search(query: str, limit: int = 12) -> list[dict]:
@@ -73,7 +85,10 @@ def search(query: str, limit: int = 12) -> list[dict]:
 
 
 def repo_files(repo: str) -> dict:
-    tree = _get_json(f"/api/models/{repo}/tree/main")
+    # recursive: many repos nest quants in subdirs (a non-recursive tree
+    # returns 0 ggufs and a misleading "no gguf in that repo")
+    tree = _get_json(f"/api/models/{repo}/tree/main",
+                     {"recursive": "true"})
     ggufs, mmprojs, split = [], [], 0
     for f in tree:
         p = str(f.get("path", ""))
