@@ -82,6 +82,8 @@ def repo_files(repo: str) -> dict:
         if _SPLIT_RE.search(p):
             split += 1
             continue
+        if "imatrix" in p.lower():   # importance-matrix data, not a model
+            continue
         entry = {"file": p, "bytes": int(f.get("size", 0) or 0)}
         (mmprojs if "mmproj" in p.lower() else ggufs).append(entry)
     ggufs.sort(key=lambda g: -g["bytes"])    # registry order: largest first
@@ -113,14 +115,21 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
                  "split files aren't supported yet)"
                  if rf["split_skipped"] else "")
         raise HangarError(f"no single-file gguf in that repo{extra}")
-    probe = min(rf["ggufs"], key=lambda g: g["bytes"])   # cheapest header
-    info = remote_inspect(repo, probe["file"])
-    if info.is_mmproj:
-        raise HangarError("that repo only holds a vision projector")
+    # probe cheapest header first; skip odd non-model ggufs (live find
+    # 2026-07-17: bartowski repos ship imatrix data as .gguf) and fall
+    # forward to the next smallest before giving up
+    info = None
+    for probe in sorted(rf["ggufs"], key=lambda g: g["bytes"])[:3]:
+        cand = remote_inspect(repo, probe["file"])
+        f = cand.spec_fields
+        if not cand.is_mmproj and f["n_layers"] > 0 and f["kv_heads"] > 0 \
+                and f["head_dim"] > 0:
+            info = cand
+            break
+    if info is None:
+        raise HangarError("no gguf in that repo carries usable model "
+                          "metadata — Rigma can't compute memory fit")
     f = info.spec_fields
-    if f["n_layers"] <= 0 or f["kv_heads"] <= 0 or f["head_dim"] <= 0:
-        raise HangarError("the gguf header lacks attention metadata — "
-                          "Rigma can't compute memory fit for it")
     caps = sorted(set(info.capabilities)
                   | ({"vision"} if rf["mmproj"] else set()))
     moe = None
