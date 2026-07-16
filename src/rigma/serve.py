@@ -111,6 +111,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             pass
         return {**{k: s[k] for k in ("model", "quant", "public_port", "started_at")},
                 "ctx": s.get("ctx", 0), "capabilities": caps,
+                "unloaded": bool(s.get("unloaded")),
                 "default_system_prompt": _default_prompt()}
 
     @app.get("/api/sessions")
@@ -318,7 +319,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     yield _sse({"delta": delta})
         except Exception as e:
             failed = True
-            yield _sse({"message": str(e) or "model unreachable"}, event="error")
+            msg = str(e) or "model unreachable"
+            if isinstance(e, httpx.ConnectError):
+                msg = ("the engine is unloaded — load it again from "
+                       "⚙ → Server (or run: rigma load)"
+                       if (st.read_state() or {}).get("unloaded")
+                       else "engine unreachable — check ⚙ → Server → log")
+            yield _sse({"message": msg}, event="error")
         finally:
             if resp is not None:
                 await resp.aclose()
@@ -354,7 +361,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         exp = server_ops.expected_tg(s["model"], s["quant"],
                                      s.get("backend", "unknown"))
         info = {k: s.get(k) for k in ("model", "quant", "backend", "use_case",
-                                      "ctx", "started_at", "public_port")}
+                                      "ctx", "started_at", "public_port",
+                                      "unloaded")}
         info.update(server_ops.ram_snapshot())
         info["engine_version"] = server_ops.engine_version()
         info["last_tg"] = telemetry["tg"]
@@ -395,6 +403,71 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         finally:
             switch_lock.release()
         return new_state
+
+    @app.post("/api/server/unload")
+    async def server_unload():
+        from . import server_ops
+        if not switch_lock.acquire(blocking=False):
+            return JSONResponse({"error": "a switch is already in progress"},
+                                status_code=409)
+        try:
+            s = await asyncio.to_thread(server_ops.perform_unload)
+            telemetry["tg"] = None
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        finally:
+            switch_lock.release()
+        return s
+
+    @app.post("/api/server/load")
+    async def server_load():
+        from . import server_ops
+        if not switch_lock.acquire(blocking=False):
+            return JSONResponse({"error": "a switch is already in progress"},
+                                status_code=409)
+        try:
+            s = await asyncio.to_thread(server_ops.perform_load, registry)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+        finally:
+            switch_lock.release()
+        return s
+
+    # ---- Hugging Face browser (Bazaar) --------------------------------------
+
+    @app.get("/api/hf/search")
+    async def hf_search(q: str = ""):
+        from . import hangar
+        from . import hf_browse
+        if not q.strip():
+            return []
+        try:
+            return await asyncio.to_thread(hf_browse.search, q.strip())
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+
+    @app.get("/api/hf/repo")
+    async def hf_repo(id: str):
+        from . import hangar
+        from . import hf_browse
+        try:
+            return await asyncio.to_thread(hf_browse.inspect_repo, id,
+                                           registry)
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @app.post("/api/hf/add")
+    async def hf_add(body: dict):
+        from . import hangar
+        from . import hf_browse
+        repo = str(body.get("repo", "")).strip()
+        if not repo:
+            return JSONResponse({"error": "repo required"}, status_code=400)
+        try:
+            spec = await asyncio.to_thread(hf_browse.add_model, repo, registry)
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return {"slug": spec.slug, "capabilities": spec.capabilities}
 
     # ---- model manager (Hangar) ---------------------------------------------
 

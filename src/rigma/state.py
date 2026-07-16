@@ -15,12 +15,14 @@ def state_path() -> Path:
 
 def write_state(model_slug: str, quant: str, public_port: int,
                 engine_pid: int, ui_pid: int, backend: str = "unknown",
-                use_case: str = "general", ctx: int = 0) -> None:
+                use_case: str = "general", ctx: int = 0,
+                unloaded: bool = False) -> None:
     state_path().parent.mkdir(parents=True, exist_ok=True)
     state_path().write_text(json.dumps({
         "model": model_slug, "quant": quant, "public_port": public_port,
         "engine_pid": engine_pid, "ui_pid": ui_pid, "backend": backend,
         "use_case": use_case, "ctx": ctx, "started_at": time.time(),
+        "unloaded": unloaded,
     }, indent=2), encoding="utf-8")
 
 
@@ -46,6 +48,13 @@ def server_running() -> dict | None:
     s = read_state()
     if s is None:
         return None
+    if s.get("unloaded"):
+        # engine deliberately stopped to free VRAM/RAM; the UI process is
+        # the thing that must still be alive
+        if not pid_alive(int(s.get("ui_pid", -1))):
+            clear_state()
+            return None
+        return s
     if not pid_alive(int(s.get("engine_pid", -1))):
         clear_state()
         return None
@@ -53,6 +62,8 @@ def server_running() -> dict | None:
 
 
 def kill_pid(pid: int) -> None:
+    if pid <= 0:
+        return
     try:
         p = psutil.Process(pid)
         p.terminate()

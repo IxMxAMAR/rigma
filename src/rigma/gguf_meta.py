@@ -33,7 +33,10 @@ def _read_str(f) -> str:
     n = _read(f, "<Q", 8)
     if n > _MAX_STR:
         raise GgufParseError(f"implausible string length {n}")
-    return f.read(n).decode("utf-8", "replace")
+    raw = f.read(n)
+    if len(raw) != n:   # a string cut at a range boundary must not silently
+        raise GgufParseError("truncated gguf header")   # lose template info
+    return raw.decode("utf-8", "replace")
 
 
 def _read_value(f, t: int, keep: bool, depth: int = 0):
@@ -60,28 +63,37 @@ def _read_value(f, t: int, keep: bool, depth: int = 0):
     return (bool(v) if t == 7 else v) if keep else None
 
 
-def read_metadata(path: Path) -> dict:
-    """Header KVs, skipping bulky tokenizer arrays (vocab, merges, scores)."""
-    with open(path, "rb") as f:
-        if f.read(4) != b"GGUF":
-            raise GgufParseError(f"{Path(path).name} is not a GGUF file")
-        version = _read(f, "<I", 4)
-        if version < 2:
-            raise GgufParseError(f"gguf v{version} is too old")
-        _read(f, "<Q", 8)                       # tensor_count
-        n_kv = _read(f, "<Q", 8)
-        if n_kv > 100_000:
-            raise GgufParseError("implausible metadata count")
-        meta: dict = {}
-        for _ in range(n_kv):
-            key = _read_str(f)
-            t = _read(f, "<I", 4)
-            keep = (not key.startswith("tokenizer.")
-                    or key == "tokenizer.chat_template")
-            v = _read_value(f, t, keep)
-            if keep:
-                meta[key] = v
-        return meta
+def read_metadata(src) -> dict:
+    """Header KVs, skipping bulky tokenizer arrays (vocab, merges, scores).
+
+    `src` is a path or a binary file-like (e.g. BytesIO of a ranged HTTP read
+    of a remote gguf — headers fit in the first few MB)."""
+    if hasattr(src, "read"):
+        return _read_meta(src)
+    with open(src, "rb") as f:
+        return _read_meta(f)
+
+
+def _read_meta(f) -> dict:
+    if f.read(4) != b"GGUF":
+        raise GgufParseError("not a GGUF file")
+    version = _read(f, "<I", 4)
+    if version < 2:
+        raise GgufParseError(f"gguf v{version} is too old")
+    _read(f, "<Q", 8)                       # tensor_count
+    n_kv = _read(f, "<Q", 8)
+    if n_kv > 100_000:
+        raise GgufParseError("implausible metadata count")
+    meta: dict = {}
+    for _ in range(n_kv):
+        key = _read_str(f)
+        t = _read(f, "<I", 4)
+        keep = (not key.startswith("tokenizer.")
+                or key == "tokenizer.chat_template")
+        v = _read_value(f, t, keep)
+        if keep:
+            meta[key] = v
+    return meta
 
 
 @dataclass
@@ -93,10 +105,12 @@ class GgufInfo:
     spec_fields: dict = field(default_factory=dict)
 
 
-def inspect_gguf(path: Path) -> GgufInfo:
-    meta = read_metadata(path)
+def inspect_gguf(src, fallback_name: str = "") -> GgufInfo:
+    meta = read_metadata(src)
     arch = str(meta.get("general.architecture", ""))
-    name = str(meta.get("general.name", "") or Path(path).stem)
+    fallback = fallback_name or (
+        Path(src).stem if not hasattr(src, "read") else "model")
+    name = str(meta.get("general.name", "") or fallback)
     if arch == "clip" or any(k.startswith("clip.") for k in meta):
         return GgufInfo(name=name, arch=arch or "clip", is_mmproj=True)
 

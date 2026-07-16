@@ -318,6 +318,31 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
 
 
 @app.command()
+def unload():
+    """Stop the engine to free VRAM/RAM. The UI stays up for reload."""
+    from . import server_ops
+    try:
+        s = server_ops.perform_unload()
+    except RuntimeError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1)
+    typer.echo(f"unloaded {s['model']} — VRAM/RAM freed. Reload with "
+               f"`rigma load` or from the UI (⚙ → Server).")
+
+
+@app.command()
+def load():
+    """Relaunch the model that was unloaded."""
+    from . import server_ops
+    try:
+        s = server_ops.perform_load()
+    except RuntimeError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1)
+    typer.echo(f"loaded {s['model']} ({s['quant']}) at ctx {s.get('ctx', 0)}")
+
+
+@app.command()
 def stop():
     """Stop the running model server and UI."""
     from . import state as st

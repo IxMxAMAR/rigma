@@ -263,6 +263,42 @@ with sync_playwright() as pw:
     page.wait_for_timeout(900)
     check("hangar: custom model removed",
           page.locator(".model-card", has_text="smoke-drop-1b").count() == 0)
+
+
+    # ---- Bazaar: HF search -> fit verdicts -> add to library ----
+    page.fill(".path-row input >> nth=1", "webtune")   # HF search box
+    page.locator(".path-row button", has_text="Search").click()
+    page.wait_for_timeout(700)
+    check("bazaar: search result listed",
+          page.locator(".hf-row", has_text="cool/WebTune-GGUF").count() == 1)
+    page.locator(".hf-row").first.click()
+    page.wait_for_timeout(700)
+    check("bazaar: fit verdicts rendered (one fits, one too big)",
+          page.locator(".fit.ok").count() == 1
+          and page.locator(".fit.no").count() == 1)
+    check("bazaar: caps + mmproj surfaced",
+          "mmproj included" in (page.locator(".hf-results").text_content() or ""))
+    page.locator(".hf-results button", has_text="Add to library").click()
+    page.wait_for_timeout(1000)
+    added = page.locator(".model-card", has_text="web-tune-7b")
+    check("bazaar: added model appears in library",
+          added.count() == 1
+          and added.locator(".badge", has_text="custom").count() == 1)
+    added.locator("button", has_text="Remove").click()   # keep reruns clean
+    page.wait_for_timeout(700)
+
+    # ---- Unload: free VRAM/RAM without killing the UI ----
+    page.click("#drawer-tabs button[data-tab=server]")
+    page.wait_for_timeout(600)
+    unload_btn = page.locator("#drawer-body button",
+                              has_text="Unload engine")
+    if unload_btn.count():                      # rerun-tolerant
+        unload_btn.click()
+        page.wait_for_timeout(900)
+    check("unload: server tab offers reload",
+          page.locator("#drawer-body button", has_text="again").count() == 1)
+    check("unload: engine chip shows unloaded",
+          "unloaded" in (page.locator("#engine-label").text_content() or ""))
     page.click("#drawer-close")
 
     check("no console/page errors at end", not console_errors)
