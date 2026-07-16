@@ -81,7 +81,7 @@ async function renderRail() {
       e.stopPropagation();
       if (!confirm('Delete "' + (s.title || s.id) + '"?')) return;
       await api("DELETE", "/api/sessions/" + s.id);
-      if (current && current.id === s.id) { current = null; renderMessages(); }
+      if (current && current.id === s.id) { current = null; renderAll(); }
       renderRail();
     };
     title.ondblclick = (e) => {
@@ -279,6 +279,7 @@ function renderMessages() {
     const el = addMsg(m.role === "user" ? "user" : "bot", m.content,
                       m.thinking);
     addActions(el, m, idx, idx === msgs.length - 1);
+    if (m.citations && m.citations.length) addCitations(m.citations);
   });
   log.scrollTop = log.scrollHeight;
 }
@@ -344,8 +345,13 @@ async function branchFrom(idx) {
   await openSession(d.id);
 }
 
+let flipping = false;
 async function flipVariant(idx, dir) {
-  if (streaming || !current) return;
+  if (streaming || !current || flipping) return;   // debounce rapid clicks
+  flipping = true;
+  try { await _flipVariant(idx, dir); } finally { flipping = false; }
+}
+async function _flipVariant(idx, dir) {
   const msgs = current.messages.slice();
   const m = Object.assign({}, msgs[idx]);
   const pool = [m.content].concat(m.variants || []);  // all takes, current first
@@ -447,7 +453,13 @@ function chatTurn(message, opts) {
     error(d) {
       errored = true;
       bot.classList.add("error");
-      body.textContent = d.message;
+      // keep any partial reply; append the error under it, don't overwrite
+      const prior = text ? renderMarkdown(text) : "";
+      const err = document.createElement("div");
+      err.className = "stream-err";
+      err.textContent = d.message;
+      body.innerHTML = prior;
+      body.appendChild(err);
       if (/exceeds the available context size/i.test(d.message || ""))
         showFitAdvisor();   // actionable remedy, right where it hurt
     },
@@ -496,21 +508,38 @@ function chatTurn(message, opts) {
         await restorePv();
       }
       setStreaming(false);
+      // persist citations onto the saved reply so they survive a re-render
+      if (!errored && cites && cites.length) {
+        try {
+          const cur = await api("GET", "/api/sessions/" + current.id);
+          const last = cur.messages[cur.messages.length - 1];
+          if (last && last.role === "assistant") {
+            last.citations = cites;
+            await saveMessages(cur.messages);
+          }
+        } catch {}
+      }
       await refreshSession();
       log.style.scrollBehavior = "";
-      // errors aren't persisted server-side — a re-render would erase the
-      // error bubble, so keep the DOM as-is and only refresh the rail
-      if (!errored) {
+      // a restored pending-variant (abort/error after regenerate) must show —
+      // otherwise the reply vanishes until the next full render
+      if (!errored || pv) {
         renderMessages();
-        if (cites && cites.length) addCitations(cites);
-        if (!aborted && pv) await mergeVariants(pv);
+        if (!aborted && !errored && pv) await mergeVariants(pv);
         if (aborted) {
           const mark = document.createElement("div");
           mark.className = "cites";
           mark.textContent = "⏹ stopped";
           log.appendChild(mark);
         }
+        if (errored) {   // restored the old reply, but note the failure
+          const mark = document.createElement("div");
+          mark.className = "cites stream-err";
+          mark.textContent = "regenerate failed — previous reply kept";
+          log.appendChild(mark);
+        }
       }
+      // else: errored with no pv — keep the error bubble already in the DOM
       renderRail();
       input.focus();
     },
@@ -533,8 +562,8 @@ async function regenerate() {
   setStreaming(true);
   const msgs = current.messages.slice();
   let old = null;
-  while (msgs.length && msgs[msgs.length - 1].role === "assistant")
-    old = msgs.pop();
+  if (msgs.length && msgs[msgs.length - 1].role === "assistant")
+    old = msgs.pop();   // exactly ONE reply — popping more would lose them
   if (!msgs.length) { setStreaming(false); return; }
   try {
     await saveMessages(msgs);
@@ -601,19 +630,21 @@ $("effort-toggle").onclick = async () => {
     $("effort-toggle").textContent = effortLabel(current.effort);
   } catch {}
 };
-$("sys-edit").addEventListener("blur", async () => {
+let fieldSaving = null;   // in-flight sys/notes save, awaited before a turn
+$("sys-edit").addEventListener("blur", () => {
   if (!current) return;
   const v = $("sys-edit").value.trim();
   if (v === (current.system_prompt || "")) return;
-  current = await api("POST", "/api/sessions/" + current.id, {system_prompt: v});
-  renderSysBar();
+  fieldSaving = api("POST", "/api/sessions/" + current.id,
+                    {system_prompt: v}).then((s) => { current = s;
+                                                      renderSysBar(); });
 });
-$("notes-edit").addEventListener("blur", async () => {
+$("notes-edit").addEventListener("blur", () => {
   if (!current) return;
   const v = $("notes-edit").value.trim();
   if (v === (current.notes || "")) return;
-  current = await api("POST", "/api/sessions/" + current.id, {notes: v});
-  renderSysBar();
+  fieldSaving = api("POST", "/api/sessions/" + current.id,
+                    {notes: v}).then((s) => { current = s; renderSysBar(); });
 });
 for (const id of ["sys-edit", "notes-edit"]) {
   $(id).addEventListener("keydown", (e) => {
@@ -787,12 +818,18 @@ function renderImgChips() {
   });
 }
 
+let imagesProcessing = null;   // resolves when in-flight downscales finish
 async function addImageFiles(files) {
-  for (const f of files) {
-    if (!f.type.startsWith("image/")) continue;
-    try { pendingImages.push(await downscaleImage(f)); } catch {}
-  }
-  renderImgChips();
+  const job = (async () => {
+    for (const f of files) {
+      if (!f.type.startsWith("image/")) continue;
+      try { pendingImages.push(await downscaleImage(f)); } catch {}
+    }
+    renderImgChips();
+  })();
+  imagesProcessing = job;
+  await job;
+  if (imagesProcessing === job) imagesProcessing = null;
 }
 $("attach").onclick = () => $("img-file").click();
 $("img-file").addEventListener("change", (e) => {
@@ -810,6 +847,12 @@ input.addEventListener("keydown", (e) => {
 form.onsubmit = async (e) => {
   e.preventDefault();
   if (streaming) { stopTurn(); return; }   // Send morphs into Stop mid-turn
+  // a pasted image may still be downscaling, and a focused sys/notes edit may
+  // not have saved — flush both before the turn so nothing is lost or stale
+  if (imagesProcessing) { try { await imagesProcessing; } catch {} }
+  const ae = document.activeElement;
+  if (ae && (ae.id === "sys-edit" || ae.id === "notes-edit")) ae.blur();
+  if (fieldSaving) { try { await fieldSaving; } catch {} fieldSaving = null; }
   const q = input.value.trim();
   if (!q && !pendingImages.length) return;
   const message = pendingImages.length

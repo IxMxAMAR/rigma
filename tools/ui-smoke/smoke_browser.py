@@ -87,8 +87,8 @@ with sync_playwright() as pw:
     # ---- Phase 3: drawer, params, presets manager, search, branch ----
     page.click("#gear")
     check("drawer opens on gear", page.locator("#drawer").is_visible())
-    check("param sliders present (5 core + 6 advanced)",
-          page.locator(".param-row").count() == 11)
+    check("param sliders present (6 core + 6 advanced)",
+          page.locator(".param-row").count() == 12)
     page.fill(".param-row input.val >> nth=0", "1.2")   # temperature number box
     page.wait_for_timeout(700)                            # debounce + save
     sess = page.evaluate("current && current.params")
@@ -280,8 +280,15 @@ with sync_playwright() as pw:
           "mmproj included" in (page.locator(".hf-results").text_content() or ""))
     page.locator(".hf-results button", has_text="Add to library").click()
     page.wait_for_timeout(1000)
+    # the browse panel is preserved (search state not nuked); button confirms
+    check("bazaar: add confirms without nuking browse panel",
+          page.locator(".hf-results button", has_text="Added").count() == 1)
+    # reopening the Models tab shows it in the library; clean up
+    page.click("#drawer-tabs button[data-tab=chat]")
+    page.click("#drawer-tabs button[data-tab=models]")
+    page.wait_for_timeout(1000)
     added = page.locator(".model-card", has_text="web-tune-7b")
-    check("bazaar: added model appears in library",
+    check("bazaar: added model in library on reopen",
           added.count() == 1
           and added.locator(".badge", has_text="custom").count() == 1)
     added.locator("button", has_text="Remove").click()   # keep reruns clean
