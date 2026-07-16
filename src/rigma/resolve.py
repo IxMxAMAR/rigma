@@ -168,13 +168,16 @@ def fallback_plans(plan: RunPlan, registry: Registry,
                 out.append(_apply_calibration(RunPlan(
                     model_slug=spec.slug, gguf=gguf, backend=plan.backend,
                     flags=flags, origin="fallback", explain=explain)))
-    floor_spec = min(registry.models.values(), key=lambda m: m.ggufs[-1].bytes)
-    if (floor_spec.slug, floor_spec.ggufs[-1].quant) != (plan.model_slug,
-                                                         plan.gguf.quant):
-        out.append(RunPlan(
-            model_slug=floor_spec.slug, gguf=floor_spec.ggufs[-1], backend="cpu",
-            flags=ComboFlags(ctx=CTX_FLOOR, ngl=0), origin="fallback:floor",
-            explain=["fallback floor: smallest model on CPU"]))
+    have_ggufs = [m for m in registry.models.values() if m.ggufs]
+    if have_ggufs:
+        floor_spec = min(have_ggufs, key=lambda m: m.ggufs[-1].bytes)
+        if (floor_spec.slug, floor_spec.ggufs[-1].quant) != (plan.model_slug,
+                                                             plan.gguf.quant):
+            out.append(RunPlan(
+                model_slug=floor_spec.slug, gguf=floor_spec.ggufs[-1],
+                backend="cpu", flags=ComboFlags(ctx=CTX_FLOOR, ngl=0),
+                origin="fallback:floor",
+                explain=["fallback floor: smallest model on CPU"]))
     return out
 
 
@@ -207,7 +210,10 @@ def resolve(profile: HardwareProfile, registry: Registry,
     if plan:
         return _apply_calibration(plan)
     # absolute floor: smallest model, smallest quant, CPU
-    spec = min(registry.models.values(), key=lambda m: m.ggufs[-1].bytes)
+    have_ggufs = [m for m in registry.models.values() if m.ggufs]
+    if not have_ggufs:
+        raise ResolveError("no model in the registry has a gguf to run")
+    spec = min(have_ggufs, key=lambda m: m.ggufs[-1].bytes)
     return _apply_calibration(RunPlan(
         model_slug=spec.slug, gguf=spec.ggufs[-1], backend="cpu",
         flags=ComboFlags(ctx=CTX_FLOOR, ngl=0), origin="calculator",

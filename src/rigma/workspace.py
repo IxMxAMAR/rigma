@@ -7,6 +7,7 @@ advisor's ctx warning stays meaningful.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist",
@@ -25,11 +26,9 @@ class WorkspaceError(RuntimeError):
     pass
 
 
-def _skip(path: Path) -> bool:
-    if any(part in _SKIP_DIRS for part in path.parts):
-        return True
-    name = path.name.lower()
-    return any(name.endswith(e) for e in _SKIP_EXT)
+def _skip_name(name: str) -> bool:
+    n = name.lower()
+    return any(n.endswith(e) for e in _SKIP_EXT)
 
 
 def pack_folder(folder: str, max_total: int = _MAX_TOTAL) -> dict:
@@ -37,24 +36,31 @@ def pack_folder(folder: str, max_total: int = _MAX_TOTAL) -> dict:
     if not root.is_dir():
         raise WorkspaceError(f"not a folder: {folder}")
     files, tree, total, truncated = [], [], 0, False
-    for p in sorted(root.rglob("*")):
-        if not p.is_file() or _skip(p.relative_to(root)):
-            continue
-        rel = p.relative_to(root).as_posix()
-        try:
-            if p.stat().st_size > _MAX_FILE:
+    # top-down walk with in-place pruning: never enumerate skipped subtrees
+    # (a monorepo/drive-root shouldn't be fully materialized before the cap)
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        for fn in sorted(filenames):
+            if _skip_name(fn):
                 continue
-            text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue          # binary or unreadable — skip silently
-        if "\x00" in text:
-            continue          # sneaky binary that decoded
-        if total + len(text) > max_total:
-            truncated = True
+            p = Path(dirpath) / fn
+            rel = p.relative_to(root).as_posix()
+            try:
+                if p.stat().st_size > _MAX_FILE:
+                    continue
+                text = p.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue          # binary/unreadable/permission — skip silently
+            if "\x00" in text:
+                continue          # sneaky binary that decoded
+            if total + len(text) > max_total:
+                truncated = True
+                break
+            total += len(text)
+            tree.append(rel)
+            files.append(f'<file path="{rel}">\n{text}\n</file>')
+        if truncated:
             break
-        total += len(text)
-        tree.append(rel)
-        files.append(f'<file path="{rel}">\n{text}\n</file>')
     if not files:
         raise WorkspaceError("no readable text files found in that folder")
     header = (f"<project root=\"{root.name}\" files=\"{len(files)}\">\n"
