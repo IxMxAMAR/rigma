@@ -103,6 +103,26 @@ function renderChatTab() {
     row.append(range, num, clear);
     box.appendChild(row);
   }
+  box.appendChild(el("h3", "", "Memory"));
+  const dg = el("textarea");
+  dg.rows = 4;
+  dg.placeholder = "Compacted digest of earlier turns (empty = none)";
+  dg.value = current.digest || "";
+  dg.onblur = async () => {
+    if (!current || current.id !== sid) return;
+    if (dg.value.trim() === (current.digest || "")) return;
+    try {
+      current = await api("POST", "/api/sessions/" + sid,
+                          {digest: dg.value.trim()});
+    } catch (err) { hint.textContent = err.message; }
+  };
+  box.appendChild(dg);
+  const macts = el("div", "drawer-acts");
+  const compactBtn = el("button", "act", "Compact now (keep last 6)");
+  compactBtn.onclick = () => { $("drawer").hidden = true; compactChat(6); };
+  macts.appendChild(compactBtn);
+  box.appendChild(macts);
+
   box.appendChild(el("h3", "", "This chat"));
   const acts = el("div", "drawer-acts");
   const exMd = el("a", "act", "Export markdown");

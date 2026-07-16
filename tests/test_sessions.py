@@ -199,3 +199,19 @@ def test_export_markdown(tmp_path, monkeypatch):
     assert md.startswith("# tale")
     assert "> be a bard" in md
     assert "**You:**\n\nsing" in md and "**Model:**\n\nla la" in md
+
+
+def test_build_messages_injects_digest_after_notes():
+    s = {"system_prompt": "SYS", "notes": "N", "digest": "Earlier: dragons.",
+         "messages": [{"role": "user", "content": "hi"}]}
+    out = sessions.build_messages(s)
+    assert out[0]["content"] == "SYS"
+    assert out[1]["content"].startswith("Story notes")
+    assert out[2]["role"] == "system"
+    assert out[2]["content"] == "Earlier conversation (compacted):\nEarlier: dragons."
+    assert out[3]["content"] == "hi"
+
+
+def test_mutable_fields_has_digest_not_archive():
+    assert "digest" in sessions.MUTABLE_FIELDS
+    assert "archive" not in sessions.MUTABLE_FIELDS

@@ -334,3 +334,83 @@ def test_export_nonascii_title(client):
     assert r.status_code == 200
     cd = r.headers["content-disposition"]
     assert 'filename="chat.md"' in cd and "filename*=UTF-8''" in cd
+
+
+class _SummarizerUpstream(BaseHTTPRequestHandler):
+    """Non-streaming completion that returns a fixed summary."""
+    last_body = None
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        _SummarizerUpstream.last_body = json.loads(self.rfile.read(n))
+        body = json.dumps({"choices": [{"message": {
+            "role": "assistant", "content": "SUMMARY-OF-OLD-TURNS"}}]}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+def test_compact_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    srv = HTTPServer(("127.0.0.1", 0), _SummarizerUpstream)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        c = TestClient(build_app(upstream_port=srv.server_address[1],
+                                 default_prompt=""))
+        s = c.post("/api/sessions", json={}).json()
+        msgs = [{"role": "user", "content": f"m{i}"} if i % 2 == 0 else
+                {"role": "assistant", "content": f"r{i}"} for i in range(10)]
+        c.post(f"/api/sessions/{s['id']}", json={"messages": msgs})
+        r = c.post(f"/api/sessions/{s['id']}/compact", json={"keep": 4})
+        assert r.status_code == 200
+        out = r.json()
+        assert out["archived"] == 6
+        sess = out["session"]
+        assert len(sess["messages"]) == 4
+        assert sess["messages"][0]["content"] == "m6"
+        assert sess["digest"] == "SUMMARY-OF-OLD-TURNS"
+        assert len(sess["archive"]) == 6
+        sent = _SummarizerUpstream.last_body
+        assert sent["stream"] is False
+        assert any("m0" in str(m) for m in sent["messages"])  # old turns included
+
+        # repeat compact merges: old digest is part of the input
+        c.post(f"/api/sessions/{s['id']}",
+               json={"messages": sess["messages"] + [
+                   {"role": "user", "content": "new1"},
+                   {"role": "assistant", "content": "new2"}]})
+        r2 = c.post(f"/api/sessions/{s['id']}/compact", json={"keep": 2})
+        assert r2.status_code == 200
+        sent2 = _SummarizerUpstream.last_body
+        assert any("SUMMARY-OF-OLD-TURNS" in str(m) for m in sent2["messages"])
+        assert len(r2.json()["session"]["archive"]) == 10  # 6 + 4 more
+    finally:
+        srv.shutdown()
+
+
+def test_compact_nothing_to_do_400(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=1, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    c.post(f"/api/sessions/{s['id']}",
+           json={"messages": [{"role": "user", "content": "a"}]})
+    assert c.post(f"/api/sessions/{s['id']}/compact",
+                  json={"keep": 6}).status_code == 400
+
+
+def test_compact_upstream_failure_leaves_session_untouched(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=1, default_prompt=""))  # nothing there
+    s = c.post("/api/sessions", json={}).json()
+    msgs = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+    c.post(f"/api/sessions/{s['id']}", json={"messages": msgs})
+    r = c.post(f"/api/sessions/{s['id']}/compact", json={"keep": 2})
+    assert r.status_code == 502
+    got = c.get(f"/api/sessions/{s['id']}").json()
+    assert len(got["messages"]) == 8 and not got.get("digest")

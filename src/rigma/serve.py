@@ -23,6 +23,13 @@ def _sse(data: dict, event: str = "") -> bytes:
     return (head + "data: " + json.dumps(data) + "\n\n").encode()
 
 
+_COMPACT_PROMPT = (
+    "Summarize this conversation transcript into a dense digest for the model "
+    "to continue from. Preserve: named characters/entities and their traits, "
+    "established facts and decisions, tone/style commitments, and open threads. "
+    "Write plain prose, no preamble, under 300 words.")
+
+
 async def _upstream_error(resp) -> str:
     body = await resp.aread()
     try:
@@ -151,6 +158,45 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 s[k] = body[k]
         sessions.save(s)
         return s
+
+    @app.post("/api/sessions/{sid}/compact")
+    async def compact_session(sid: str, body: dict | None = None):
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        keep = max(0, int((body or {}).get("keep", 6)))
+        msgs = s.get("messages", [])
+        old = msgs[:-keep] if keep else list(msgs)
+        recent = msgs[-keep:] if keep else []
+        if not old:
+            return JSONResponse({"error": "nothing to compact"}, status_code=400)
+        parts = []
+        if s.get("digest"):
+            parts.append("Previous summary:\n" + s["digest"])
+        for m in old:
+            content = m.get("content", "")
+            if not isinstance(content, str):
+                content = "[non-text content]"
+            parts.append(f"{m.get('role', 'user')}: {content}")
+        try:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content":
+                                    _COMPACT_PROMPT + "\n\n" + "\n".join(parts)}],
+                      "stream": False, "temperature": 0.3},
+                timeout=120.0)
+            if resp.status_code != 200:
+                raise RuntimeError(await _upstream_error(resp))
+            digest = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+            if not digest:
+                raise RuntimeError("summarizer returned an empty digest")
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+        s["digest"] = digest
+        s["archive"] = s.get("archive", []) + old   # nothing is ever destroyed
+        s["messages"] = recent
+        sessions.save(s)
+        return {"session": s, "archived": len(old)}
 
     @app.delete("/api/sessions/{sid}")
     async def delete_session(sid: str):

@@ -309,7 +309,7 @@ async function flipVariant(idx, dir) {
   renderMessages();
 }
 
-/* ---------- context meter ---------- */
+/* ---------- context meter + compact ---------- */
 function renderCtxBar() {
   const bar = $("ctx-bar"), fill = $("ctx-fill");
   if (!lastMeta || !lastMeta.ctx || !lastMeta.prompt_tokens) return;
@@ -319,7 +319,32 @@ function renderCtxBar() {
               lastMeta.ctx.toLocaleString() + " tokens";
   fill.style.width = (frac * 100).toFixed(1) + "%";
   fill.className = frac > 0.9 ? "hot" : frac > 0.75 ? "warn" : "";
+  $("ctx-compact").hidden =
+    !(frac > 0.75 && current && current.messages.length > 8);
 }
+
+async function compactChat(keep) {
+  if (!current || streaming) return;
+  const overlay = $("switching");
+  overlay.firstElementChild.textContent = "compacting…";
+  overlay.hidden = false;
+  try {
+    const out = await api("POST", "/api/sessions/" + current.id + "/compact",
+                          {keep: keep || 6});
+    current = out.session;
+    if (lastMeta) { lastMeta = {ctx: lastMeta.ctx}; }   // meter now stale
+    $("ctx-bar").classList.remove("live");
+    $("ctx-compact").hidden = true;
+    renderMessages();
+    renderRail();
+  } catch (err) {
+    alert("Compact failed: " + err.message);
+  } finally {
+    overlay.hidden = true;
+    overlay.firstElementChild.textContent = "switching model…";
+  }
+}
+$("ctx-compact").onclick = () => compactChat(6);
 
 /* ---------- chat turn ---------- */
 function setStreaming(on) {

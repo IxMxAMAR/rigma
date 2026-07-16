@@ -61,7 +61,11 @@
       Runs on your GPU. Nothing leaves this machine.</div>
   </div>
   <div id="composer">
-    <div id="ctx-bar" title=""><div id="ctx-fill"></div></div>
+    <div id="ctx-row">
+      <div id="ctx-bar" title=""><div id="ctx-fill"></div></div>
+      <button id="ctx-compact" type="button" hidden
+              title="Summarize older turns to reclaim context">compact</button>
+    </div>
     <form id="f">
       <textarea id="in" placeholder="Ask anything — Enter to send, Shift+Enter for a new line"
         autofocus></textarea>

@@ -8,7 +8,7 @@ from pathlib import Path
 from .runtime import rigma_home
 
 MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
-                  "preset_id", "params", "notes")
+                  "preset_id", "params", "notes", "digest")
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
                 "min_p": (0.0, 1.0), "repeat_penalty": (0.5, 2.0),
@@ -29,7 +29,8 @@ def create(title: str = "New chat", system_prompt: str = "") -> dict:
     now = time.time()
     session = {"id": secrets.token_hex(6), "title": title,
                "system_prompt": system_prompt, "use_rag": False,
-               "preset_id": "", "params": {}, "notes": "",
+               "preset_id": "", "params": {}, "notes": "", "digest": "",
+               "archive": [],
                "created_at": now, "updated_at": now, "messages": []}
     save(session)
     return session
@@ -81,6 +82,10 @@ def build_messages(session: dict, default_prompt: str = "",
     if notes:
         head.append({"role": "system",
                      "content": "Story notes (authoritative):\n" + notes})
+    digest = session.get("digest", "")
+    if digest:
+        head.append({"role": "system",
+                     "content": "Earlier conversation (compacted):\n" + digest})
     # sanitize: variants/metadata must never reach the model
     return head + [{"role": m.get("role", "user"), "content": m.get("content", "")}
                    for m in session.get("messages", [])]
