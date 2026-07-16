@@ -308,6 +308,48 @@ with sync_playwright() as pw:
           "unloaded" in (page.locator("#engine-label").text_content() or ""))
     page.click("#drawer-close")
 
+    # ---- B6 features: palette, author's note, prefill, stats ----
+    page.keyboard.press("Control+k")
+    page.wait_for_timeout(300)
+    check("palette: opens on Ctrl+K",
+          not page.locator("#palette").get_attribute("hidden") is not None
+          or page.locator("#palette").is_visible())
+    page.fill("#palette-input", "new")
+    page.wait_for_timeout(200)
+    check("palette: filters to matching action",
+          page.locator(".palette-row", has_text="New chat").count() >= 1)
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(200)
+
+    page.click("#new-chat")
+    page.wait_for_timeout(200)
+    page.click("#an-toggle")
+    check("author's note editor opens", page.locator("#an-edit").is_visible())
+    page.fill("#an-text", "Keep the tone ominous.")
+    page.fill("#an-depth", "2")
+    page.click("#log")
+    page.wait_for_timeout(400)
+    an = page.evaluate("current && current.authors_note")
+    check("author's note persists", an == "Keep the tone ominous.")
+
+    page.click("#prefill-toggle")
+    check("prefill row opens", page.locator("#prefill-row").is_visible())
+    page.fill("#prefill-text", "Sure, here goes:")
+    page.click("#log")
+    page.wait_for_timeout(400)
+    check("prefill persists",
+          page.evaluate("current && current.prefill") == "Sure, here goes:")
+
+    page.click("#engine-chip")
+    page.wait_for_timeout(500)
+    # stats only render once a turn has recorded predicted_n; smoke upstream
+    # sends timings so at least the endpoint must not error
+    check("stats endpoint reachable",
+          page.evaluate("""async () => {
+            const r = await fetch('/api/server/stats');
+            return r.ok; }"""))
+    page.click("#drawer-close")
+
     check("no console/page errors at end", not console_errors)
     page.screenshot(path=SHOT, full_page=False)
     b.close()

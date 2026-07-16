@@ -1,0 +1,17 @@
+{
+  "name": "Rigma",
+  "short_name": "Rigma",
+  "description": "Your local LLM, tuned to your hardware.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0d0f",
+  "theme_color": "#0b0d0f",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='36' fill='%230b0d0f'/%3E%3Ctext x='96' y='138' font-size='120' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%23e8a94f'%3Er%3C/text%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
