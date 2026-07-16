@@ -324,3 +324,16 @@ header .spec:hover { background:var(--bg2); color:var(--fg); }
   font:11px var(--mono); padding:3px 12px; border-radius:999px;
   transition:filter .15s var(--ease); }
 #ctx-compact:hover { filter:brightness(1.15); }
+
+/* ---------- thinking blocks + effort chip ---------- */
+.think { max-width:760px; margin:0 0 8px; }
+.think button { color:var(--faint); font:11px var(--mono); padding:2px 10px;
+  border-radius:999px; }
+.think button:hover { color:var(--dim); background:var(--bg2); }
+.think .tbody { color:var(--faint); font:12px/1.55 var(--mono);
+  border-left:2px solid var(--bg3); padding:4px 0 4px 12px; margin-top:4px;
+  white-space:pre-wrap; max-height:240px; overflow-y:auto; }
+.think.closed .tbody { display:none; }
+#effort-toggle { color:var(--dim); padding:3px 8px; border-radius:999px;
+  transition:color .15s var(--ease); }
+#effort-toggle:hover { color:var(--amber); background:var(--bg2); }

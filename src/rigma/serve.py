@@ -91,8 +91,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = st.server_running()
         if s is None:
             return JSONResponse({"error": "not running"}, status_code=404)
+        caps: list = []
+        try:
+            from .registry import Registry
+            reg = registry if registry is not None else Registry.load()
+            caps = reg.models[s["model"]].capabilities
+        except Exception:
+            pass
         return {**{k: s[k] for k in ("model", "quant", "public_port", "started_at")},
-                "ctx": s.get("ctx", 0),
+                "ctx": s.get("ctx", 0), "capabilities": caps,
                 "default_system_prompt": _default_prompt()}
 
     @app.get("/api/sessions")
@@ -150,6 +157,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 body["params"] = sessions.validate_params(body["params"])
             except ValueError as e:
                 return JSONResponse({"error": str(e)}, status_code=400)
+        if "effort" in body and body["effort"] not in sessions.EFFORT_LEVELS:
+            return JSONResponse(
+                {"error": "effort: must be one of off/auto/on (or blank)"},
+                status_code=400)
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
@@ -244,7 +255,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         body = {"messages": msgs, "stream": True,
                 "stream_options": {"include_usage": True}}
         body.update(sessions.effective_params(s, preset))
-        text, failed, resp = "", False, None
+        effort = s.get("effort", "")
+        if effort == "off":
+            # Qwen-style template switch; engines that ignore it are unharmed
+            body["chat_template_kwargs"] = {"enable_thinking": False}
+        elif effort == "on":
+            body["reasoning_effort"] = "high"
+        text, thinking, failed, resp = "", "", False, None
         usage, timings = {}, {}
         try:
             req = client.build_request("POST", "/v1/chat/completions", json=body)
@@ -271,9 +288,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 usage = obj.get("usage") or usage
                 timings = obj.get("timings") or timings
                 try:
-                    delta = obj["choices"][0]["delta"].get("content")
+                    d = obj["choices"][0]["delta"]
                 except Exception:
-                    delta = None
+                    d = {}
+                rdelta = d.get("reasoning_content")
+                if rdelta:
+                    thinking += rdelta
+                    yield _sse({"delta": rdelta}, event="think")
+                delta = d.get("content")
                 if delta:
                     text += delta
                     yield _sse({"delta": delta})
@@ -296,8 +318,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             last = s["messages"][-1] if s["messages"] else None
             if cont and last and last.get("role") == "assistant":
                 last["content"] = last.get("content", "") + text
+                if thinking:
+                    last["thinking"] = last.get("thinking", "") + thinking
             else:
-                s["messages"].append({"role": "assistant", "content": text})
+                msg = {"role": "assistant", "content": text}
+                if thinking:
+                    msg["thinking"] = thinking
+                s["messages"].append(msg)
             sessions.save(s)
         yield b"data: [DONE]\n\n"
 
@@ -316,6 +343,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         info["last_tg"] = telemetry["tg"]
         info["expected_tg"] = exp
         info["verdict"] = server_ops.verdict(telemetry["tg"], exp)
+        info["openai_base"] = f"http://127.0.0.1:{s['public_port']}/v1"
         return info
 
     @app.get("/api/server/log")

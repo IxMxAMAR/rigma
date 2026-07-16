@@ -7,6 +7,7 @@ const log = $("log"), input = $("in"), form = $("f"), send = $("send"),
 let current = null;        // full session object, server-authoritative
 let defaultPrompt = "";
 let presetList = [];
+let modelCaps = [];        // capabilities of the running model
 let streaming = false;
 let turn = null;           // {abort} handle for the in-flight stream
 let lastMeta = null;
@@ -17,6 +18,8 @@ async function loadStatus() {
     const s = await api("GET", "/api/status");
     $("model").textContent = s.model + " (" + s.quant + ")";
     defaultPrompt = s.default_system_prompt || "";
+    modelCaps = s.capabilities || [];
+    $("effort-toggle").hidden = !modelCaps.includes("thinking");
     if (s.ctx) lastMeta = Object.assign({}, lastMeta, {ctx: s.ctx});
   } catch { $("model").textContent = "server not running"; }
   renderSysBar();
@@ -147,13 +150,14 @@ function decorateCode(body) {
   }
 }
 
-function addMsg(cls, content) {
+function addMsg(cls, content, thinking) {
   const e = $("empty");
   if (e) e.remove();
   const d = document.createElement("div");
   d.className = "msg " + cls;
   if (cls === "user") { d.textContent = content; }
   else {
+    if (thinking) d.appendChild(makeThinkBlock(thinking, true));
     const b = document.createElement("div");
     b.className = "body";
     b.innerHTML = renderMarkdown(content);
@@ -163,6 +167,24 @@ function addMsg(cls, content) {
   log.appendChild(d);
   log.scrollTop = log.scrollHeight;
   return d;
+}
+
+function makeThinkBlock(text, collapsed) {
+  const wrap = document.createElement("div");
+  wrap.className = "think" + (collapsed ? " closed" : "");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "thinking " + (collapsed ? "▸" : "▾");
+  const body = document.createElement("div");
+  body.className = "tbody";
+  body.textContent = text;
+  btn.onclick = () => {
+    wrap.classList.toggle("closed");
+    btn.textContent = "thinking " +
+      (wrap.classList.contains("closed") ? "▸" : "▾");
+  };
+  wrap.append(btn, body);
+  return wrap;
 }
 
 function actionBtn(label, fn, cls) {
@@ -231,7 +253,8 @@ function renderMessages() {
   }
   const msgs = current.messages;
   msgs.forEach((m, idx) => {
-    const el = addMsg(m.role === "user" ? "user" : "bot", m.content);
+    const el = addMsg(m.role === "user" ? "user" : "bot", m.content,
+                      m.thinking);
     addActions(el, m, idx, idx === msgs.length - 1);
   });
   log.scrollTop = log.scrollHeight;
@@ -369,9 +392,21 @@ function chatTurn(message, opts) {
     if (p) p.textContent =
       "thinking… " + Math.round((performance.now() - t0) / 1000) + "s";
   }, 1000);
+  let thinkEl = null, thinkText = "";
   const payload = Object.assign({message}, opts || {});
   turn = streamTurn(current.id, payload, {
+    think(d) {
+      thinkText += d;
+      if (!thinkEl) {
+        thinkEl = makeThinkBlock("", false);
+        bot.insertBefore(thinkEl, body);
+      }
+      thinkEl.querySelector(".tbody").textContent = thinkText;
+      log.scrollTop = log.scrollHeight;
+    },
     delta(d) {
+      if (thinkEl && !thinkEl.classList.contains("closed") && text === "")
+        thinkEl.querySelector("button").click();   // collapse once reply starts
       text += d;
       ntok++;
       body.innerHTML = renderMarkdown(text);
@@ -510,6 +545,7 @@ function renderSysBar() {
   $("sys-edit").placeholder = preset || defaultPrompt
     ? "Blank = preset/default (shown above)" : "System prompt for this chat";
   $("preset-pick").value = (current && current.preset_id) || "";
+  $("effort-toggle").textContent = effortLabel((current && current.effort) || "");
   $("notes-edit").value = (current && current.notes) || "";
   $("notes-toggle").style.color =
     current && current.notes ? "var(--moss)" : "";
@@ -525,6 +561,17 @@ function wireToggle(btnId, areaId, label) {
 }
 wireToggle("sys-toggle", "sys-edit", "sys");
 wireToggle("notes-toggle", "notes-edit", "notes");
+const EFFORTS = ["", "off", "on"];
+function effortLabel(v) { return "effort ▸ " + (v || "auto"); }
+$("effort-toggle").onclick = async () => {
+  if (!current) return;
+  const cur = current.effort || "";
+  const next = EFFORTS[(EFFORTS.indexOf(cur) + 1) % EFFORTS.length];
+  try {
+    current = await api("POST", "/api/sessions/" + current.id, {effort: next});
+    $("effort-toggle").textContent = effortLabel(current.effort);
+  } catch {}
+};
 $("sys-edit").addEventListener("blur", async () => {
   if (!current) return;
   const v = $("sys-edit").value.trim();

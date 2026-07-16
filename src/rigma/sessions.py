@@ -8,7 +8,8 @@ from pathlib import Path
 from .runtime import rigma_home
 
 MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
-                  "preset_id", "params", "notes", "digest")
+                  "preset_id", "params", "notes", "digest", "effort")
+EFFORT_LEVELS = ("", "off", "auto", "on")
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
                 "min_p": (0.0, 1.0), "repeat_penalty": (0.5, 2.0),
@@ -30,7 +31,7 @@ def create(title: str = "New chat", system_prompt: str = "") -> dict:
     session = {"id": secrets.token_hex(6), "title": title,
                "system_prompt": system_prompt, "use_rag": False,
                "preset_id": "", "params": {}, "notes": "", "digest": "",
-               "archive": [],
+               "effort": "", "archive": [],
                "created_at": now, "updated_at": now, "messages": []}
     save(session)
     return session

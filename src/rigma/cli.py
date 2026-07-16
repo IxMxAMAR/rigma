@@ -333,6 +333,8 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        ctx: int = typer.Option(None, "--ctx",
                                help="Context size override (clamped to the "
                                     "model's native window)"),
+       reasoning: str = typer.Option(None, "--reasoning",
+                                     help="Reasoning/thinking: on|off|auto"),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
@@ -352,6 +354,12 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         native = reg.models[rp.model_slug].native_ctx
         rp.flags = rp.flags.model_copy(update={"ctx": max(1024, min(ctx, native))})
         rp.origin += "+ctx-override"
+    if reasoning is not None:
+        if reasoning not in ("on", "off", "auto"):
+            typer.echo("--reasoning must be on, off, or auto")
+            raise typer.Exit(2)
+        rp.flags = rp.flags.model_copy(update={"reasoning": reasoning})
+        rp.origin += "+reasoning-override"
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "

@@ -66,6 +66,8 @@ function streamTurn(sessionId, payload, handlers) {
           else if (ev.event === "citations")
             handlers.citations && handlers.citations(d.citations || []);
           else if (ev.event === "meta") handlers.meta && handlers.meta(d);
+          else if (ev.event === "think")
+            handlers.think && handlers.think(d.delta || "");
           else if (d.delta) handlers.delta && handlers.delta(d.delta);
         }
       }

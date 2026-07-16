@@ -414,3 +414,66 @@ def test_compact_upstream_failure_leaves_session_untouched(tmp_path, monkeypatch
     assert r.status_code == 502
     got = c.get(f"/api/sessions/{s['id']}").json()
     assert len(got["messages"]) == 8 and not got.get("digest")
+
+
+class _ThinkingUpstream(BaseHTTPRequestHandler):
+    """Streams reasoning_content deltas before content deltas (deepseek fmt)."""
+    last_body = None
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        _ThinkingUpstream.last_body = json.loads(self.rfile.read(n))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        for chunk in ({"choices": [{"delta": {"reasoning_content": "hmm "}}]},
+                      {"choices": [{"delta": {"reasoning_content": "ok"}}]},
+                      {"choices": [{"delta": {"content": "Answer."}}]}):
+            self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+def test_chat_turn_streams_think_events_and_persists_thinking(tmp_path,
+                                                              monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    srv = HTTPServer(("127.0.0.1", 0), _ThinkingUpstream)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        c = TestClient(build_app(upstream_port=srv.server_address[1],
+                                 default_prompt=""))
+        s = c.post("/api/sessions", json={}).json()
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "q"})
+        assert "event: think" in r.text and '"delta": "hmm "' in r.text
+        assert '"delta": "Answer."' in r.text and "[DONE]" in r.text
+        got = c.get(f"/api/sessions/{s['id']}").json()
+        last = got["messages"][-1]
+        assert last["content"] == "Answer." and last["thinking"] == "hmm ok"
+        # thinking must never reach the model on later turns
+        from rigma import sessions as sess_mod
+        out = sess_mod.build_messages(got)
+        assert all(set(m) == {"role", "content"} for m in out)
+    finally:
+        srv.shutdown()
+
+
+def test_effort_field_and_request_layer(tmp_path, monkeypatch, oai_upstream):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    r = c.post(f"/api/sessions/{s['id']}", json={"effort": "off"})
+    assert r.json()["effort"] == "off"
+    assert c.post(f"/api/sessions/{s['id']}",
+                  json={"effort": "extreme"}).status_code == 400
+    c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi"})
+    sent = oai_upstream.last()
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in sent
+    c.post(f"/api/sessions/{s['id']}", json={"effort": "on"})
+    c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi2"})
+    sent = oai_upstream.last()
+    assert sent["reasoning_effort"] == "high"
+    assert "chat_template_kwargs" not in sent

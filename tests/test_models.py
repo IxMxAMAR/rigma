@@ -53,3 +53,19 @@ def test_server_args_full():
     bare = RunPlan(model_slug="x", gguf=plan.gguf, backend="vulkan",
                    flags=ComboFlags(ctx=8192), origin="calculator")
     assert "--n-cpu-moe" not in " ".join(bare.server_args("m", 11500))
+
+
+def test_server_args_reasoning_flag():
+    from rigma.models import ComboFlags, GgufFile, RunPlan
+    plan = RunPlan(model_slug="m",
+                   gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                   backend="vulkan",
+                   flags=ComboFlags(ctx=4096, reasoning="off"), origin="test")
+    args = plan.server_args("model.gguf", 11499)
+    i = args.index("--reasoning")
+    assert args[i + 1] == "off"
+    plan2 = RunPlan(model_slug="m",
+                    gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                    backend="vulkan",
+                    flags=ComboFlags(ctx=4096), origin="test")
+    assert "--reasoning" not in plan2.server_args("model.gguf", 11499)

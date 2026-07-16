@@ -83,3 +83,28 @@ def test_calculator_growth_respects_native_ctx(monkeypatch):
     p = HardwareProfile(gpus=[gpu], ram_mb=32000, ram_free_mb=16000,
                         cpu=CpuInfo(cores=8), os="windows", disk_free_gb=100.0)
     assert resolve(p, reg, use_case="general").flags.ctx == 8192
+
+
+def test_coding_prefers_tools_capable_models():
+    from rigma.models import (CachePolicy, CpuInfo, GgufFile, GpuInfo,
+                              HardwareProfile, ModelSpec)
+    from rigma.registry import Registry
+    from rigma.resolve import resolve
+    mk = lambda slug, caps, size: ModelSpec(  # noqa: E731
+        slug=slug, family="f", kind="dense", n_layers=8, full_attn_layers=8,
+        kv_heads=2, head_dim=64, native_ctx=32768, capabilities=caps,
+        ggufs=[GgufFile(repo="r", file=f"{slug}.gguf", bytes=size, quant="Q4")],
+        use_cases=["coding"], cache_type_policy=CachePolicy())
+    reg = Registry([], {"big-plain": mk("big-plain", [], 8 * 2**30),
+                        "small-tools": mk("small-tools", ["tools"], 2 * 2**30)},
+                   {})
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=16000, backends=["vulkan"])
+    p = HardwareProfile(gpus=[gpu], ram_mb=32000, ram_free_mb=16000,
+                        cpu=CpuInfo(cores=8), os="windows", disk_free_gb=100.0)
+    plan = resolve(p, reg, use_case="coding")
+    assert plan.model_slug == "small-tools"      # tools capability outranks size
+    assert any("tools" in ln for ln in plan.explain)
+    # non-coding use case: size still wins
+    reg2 = Registry([], {k: v.model_copy(update={"use_cases": ["general"]})
+                         for k, v in reg.models.items()}, {})
+    assert resolve(p, reg2, use_case="general").model_slug == "big-plain"

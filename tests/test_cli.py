@@ -78,3 +78,14 @@ def test_up_ctx_override_and_clamp(tmp_path, monkeypatch):
     res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
                                   "--ctx", "99999999"])
     assert res.exit_code == 0 and "-c 262144" in res.output  # qwen native cap
+
+
+def test_up_reasoning_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+                                  "--reasoning", "off"])
+    assert res.exit_code == 0 and "--reasoning off" in res.output
+    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+                                  "--reasoning", "sideways"])
+    assert res.exit_code != 0

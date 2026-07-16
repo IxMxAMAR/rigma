@@ -89,6 +89,15 @@ def _calculate(profile: HardwareProfile, registry: Registry,
     explain: list[str] = []
     pool = [m for m in registry.models.values() if use_case in m.use_cases] or \
         list(registry.models.values())
+    if use_case == "coding":
+        tooled = [m for m in pool if "tools" in m.capabilities]
+        if tooled:
+            explain.append("coding: restricting to tools-capable models "
+                           f"({', '.join(m.slug for m in tooled)})")
+            pool = tooled
+        else:
+            explain.append("coding: WARNING - no tools-capable model available; "
+                           "agent tool calling will not work")
 
     def total_b(m: ModelSpec) -> float:
         return m.moe.total_b if m.moe else m.n_layers

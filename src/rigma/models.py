@@ -87,6 +87,7 @@ class ModelSpec(BaseModel):
     cache_type_policy: CachePolicy = CachePolicy()
     license: str = ""
     use_cases: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)  # tools|vision|thinking
     sources: list[str] = Field(default_factory=list)
 
 
@@ -97,6 +98,7 @@ class ComboFlags(BaseModel):
     flash_attn: bool = True
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
+    reasoning: str = ""   # ""(engine default) | on | off | auto
 
 
 class Budget(BaseModel):
@@ -137,4 +139,6 @@ class RunPlan(BaseModel):
             args += ["-fa", "on"]
         args += ["--cache-type-k", self.flags.cache_type_k,
                  "--cache-type-v", self.flags.cache_type_v]
+        if self.flags.reasoning:
+            args += ["--reasoning", self.flags.reasoning]
         return args

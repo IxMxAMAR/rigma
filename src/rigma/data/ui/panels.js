@@ -243,6 +243,8 @@ async function renderServerTab() {
                (info.expected_tg ? "  (expected ~" +
                 info.expected_tg.toFixed(1) + ")" : "")],
     ["verdict", info.verdict],
+    ["agents", "point aider/Cline/Continue at " + (info.openai_base || "—") +
+               " (see docs/agents.md)"],
   ];
   const tbl = el("div", "srv-rows");
   for (const [k, v] of rows) {
