@@ -169,3 +169,31 @@ def test_probe_falls_forward_past_metadata_less_gguf(monkeypatch, home):
                         bare if file == "weird.gguf" else HEADER)
     d = hf_browse.inspect_repo("x/y")
     assert d["name"] == "web-tune-7b"
+
+
+def test_fetch_head_caps_when_server_ignores_range(monkeypatch, home):
+    """Review 2026-07-18: a mirror ignoring Range and returning the whole
+    40GB file must not be pulled into memory — stream + hard cap."""
+    import httpx
+
+    class _Resp:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_bytes(self, n):
+            for _ in range(100):        # would be 100MB if uncapped
+                yield b"x" * (1 << 20)
+    monkeypatch.setattr(hf_browse.httpx, "stream",
+                        lambda *a, **k: _Resp())
+    got = hf_browse._fetch_head("a/b", "big.gguf", 8)
+    assert len(got) == 8 * 2**20       # capped at 8MB, not 100MB
+
+
+def test_repo_files_requests_recursive_tree(monkeypatch, home):
+    seen = {}
+    def _get(path, params=None):
+        seen["params"] = params
+        return TREE
+    monkeypatch.setattr(hf_browse, "_get_json", _get)
+    hf_browse.repo_files("a/b")
+    assert seen["params"] == {"recursive": "true"}

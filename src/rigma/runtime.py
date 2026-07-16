@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import subprocess
 import tarfile
 import time
@@ -49,11 +50,16 @@ def ensure_engine(backend: str, os_name: str) -> Path:
         raise RuntimeError(f"no pinned engine build for {key}")
     root = rigma_home() / "engines" / man["version"] / backend
     exe = root / ("llama-server.exe" if os_name == "windows" else "llama-server")
-    if exe.exists():
-        return exe
-    found = next(root.rglob(exe.name), None) if root.exists() else None
-    if found:
-        return found
+    ready = root / ".ready"
+    # only trust an existing engine once the FULL extraction completed — a
+    # crash after llama-server.exe but before its DLLs leaves a broken engine
+    # that would otherwise be reused and crash on launch
+    if ready.exists():
+        if exe.exists():
+            return exe
+        found = next(root.rglob(exe.name), None) if root.exists() else None
+        if found:
+            return found
     root.mkdir(parents=True, exist_ok=True)
     lock_path = rigma_home() / "engines" / "lock.json"
     lock = json.loads(lock_path.read_text()) if lock_path.exists() else {}
@@ -72,12 +78,11 @@ def ensure_engine(backend: str, os_name: str) -> Path:
         _extract(archive, root)
         archive.unlink()
     lock_path.write_text(json.dumps(lock, indent=2))
-    if exe.exists():
-        return exe
-    found = next(root.rglob(exe.name), None)  # some archives nest under build/bin/
-    if not found:
+    result = exe if exe.exists() else next(root.rglob(exe.name), None)
+    if not result:   # some archives nest under build/bin/
         raise RuntimeError(f"{exe.name} not found in downloaded engine assets")
-    return found
+    ready.write_text("ok", encoding="utf-8")   # extraction fully completed
+    return result
 
 
 def ensure_model(gguf: GgufFile) -> Path:
@@ -135,8 +140,13 @@ def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
     argv = [str(exe), *(extra_args or []),
             *plan.server_args(str(model_path), port),
             "--slot-save-path", str(sessions)]
+    # on Windows, suppress the jarring console window llama-server would pop
+    popen_kw = {}
+    if platform.system() == "Windows":
+        popen_kw["creationflags"] = 0x08000000   # CREATE_NO_WINDOW
     with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
-        proc = subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT,
+                                **popen_kw)
     sp = ServerProcess(proc, port, log_path)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
