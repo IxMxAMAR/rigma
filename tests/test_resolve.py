@@ -163,6 +163,10 @@ def test_fit_budgets_mmproj_vram():
     kv_mb = 4096 * kv_bytes_per_token(mk(None), "f16", "f16") / 2**20
     # file sized to leave only ~200MB headroom at ctx 4096
     file_bytes = int((usable_vram - kv_mb - 200) * 2**20)
-    assert fit_gguf(mk(None), mk(None).ggufs[0], p, 4096, []) is not None
+    without = fit_gguf(mk(None), mk(None).ggufs[0], p, 4096, [])
+    assert without is not None and without.ngl == 99      # fully fits
+    # the 900MB projector must still cost GPU room: it no longer OOMs (dense
+    # partial offload runs it) but it forces layers off the GPU
     mm = GgufFile(repo="r", file="mm.gguf", bytes=900 * 2**20, quant="F16")
-    assert fit_gguf(mk(mm), mk(mm).ggufs[0], p, 4096, []) is None
+    withmm = fit_gguf(mk(mm), mk(mm).ggufs[0], p, 4096, [])
+    assert withmm is not None and withmm.ngl < 8          # projector budgeted

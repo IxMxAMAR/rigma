@@ -33,8 +33,13 @@ def classify_gpu(raw: dict, gpu_table: list[dict], os_name: str) -> GpuInfo:
             return GpuInfo(vendor=row["vendor"], name=name, vram_mb=vram,
                            arch=row["arch"], slug=_slugify(name, vram),
                            backends=backends)
+    # unknown card: pick a sane backend by vendor. A new NVIDIA card missing
+    # from the table should still try CUDA (Vulkan leaves big perf on the table)
+    default_backends = {"nvidia": ["cuda", "vulkan"],
+                        "amd": ["vulkan"],
+                        "intel": ["vulkan"]}.get(vendor, ["vulkan"])
     return GpuInfo(vendor=vendor, name=name, vram_mb=vram,
-                   slug=_slugify(name, vram), backends=["vulkan"])
+                   slug=_slugify(name, vram), backends=default_backends)
 
 
 # --- Vulkan enumeration (ctypes; no SDK needed, the ICD ships with GPU drivers) ---

@@ -99,7 +99,10 @@ def test_perform_switch_happy_and_failure(tmp_path, monkeypatch):
                       use_case="general", ctx=4096)
     with pytest.raises(RuntimeError, match="boom"):
         server_ops.perform_switch("small-model", registry=reg, profile=profile)
-    assert state.read_state() is None  # failed switch clears stale state
+    # failed switch now leaves an UNLOADED state (UI stays manageable), not a
+    # cleared one — the dead engine is gone but the UI can retry a load
+    s = state.read_state()
+    assert s is not None and s["unloaded"] is True and s["engine_pid"] == -1
 
 
 def test_perform_switch_same_model_rejected(tmp_path, monkeypatch):
