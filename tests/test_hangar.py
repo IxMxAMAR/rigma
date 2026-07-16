@@ -163,3 +163,43 @@ def test_registry_wins_slug_collision_on_load(home, tmp_path):
         '"native_ctx": 2048, "ggufs": [], "custom": true}', encoding="utf-8")
     reg = Registry.load()
     assert reg.models["qwen3.6-35b-a3b"].custom is False    # bundled spec wins
+
+
+def test_install_refuses_filename_collision_on_disk(home, tmp_path):
+    """Review 2026-07-17 CRITICAL: same filename, different general.name —
+    the move must never clobber a file another model already owns."""
+    hangar.install_model(_dense_gguf(tmp_path))
+    src2 = _dense_gguf(tmp_path, name=b"Totally Different Model")
+    with pytest.raises(HangarError, match="already exists in Rigma"):
+        hangar.install_model(src2)
+    assert src2.exists()                        # source untouched
+    spec = hangar._load_custom("spicy-tune-8b")
+    assert spec is not None                     # original spec intact
+
+
+def test_ensure_model_short_circuits_disk_and_never_fetches_local(home,
+                                                                  tmp_path):
+    """Review 2026-07-17 CRITICAL: repo='local' must never reach HF, and any
+    on-disk file returns without a network call."""
+    import rigma.runtime as runtime
+    from rigma.models import GgufFile
+
+    def _boom(**kw):
+        raise AssertionError("hf_hub_download must not be called")
+    orig = runtime.hf_hub_download
+    runtime.hf_hub_download = _boom
+    try:
+        f = hangar.models_dir() / "onDisk.gguf"
+        f.write_bytes(b"x")
+        got = runtime.ensure_model(GgufFile(repo="unsloth/whatever",
+                                            file="onDisk.gguf", bytes=1,
+                                            quant="Q4"))
+        assert got == f
+        got = runtime.ensure_model(GgufFile(repo="local", file="onDisk.gguf",
+                                            bytes=1, quant="LOCAL"))
+        assert got == f
+        with pytest.raises(RuntimeError, match="local-only"):
+            runtime.ensure_model(GgufFile(repo="local", file="gone.gguf",
+                                          bytes=1, quant="LOCAL"))
+    finally:
+        runtime.hf_hub_download = orig

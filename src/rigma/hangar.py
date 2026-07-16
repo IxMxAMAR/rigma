@@ -92,6 +92,9 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
             raise HangarError(f"{attach_to} is not a custom model — "
                               "projectors can only attach to custom models")
         dest = models_dir() / src.name
+        if dest.exists():
+            raise HangarError(f"{dest.name} already exists in Rigma's models "
+                              "folder — rename the file and try again")
         _move(src, dest)
         mm = GgufFile(repo="local", file=dest.name,
                       bytes=dest.stat().st_size, quant="LOCAL")
@@ -117,6 +120,11 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
         moe = MoESpec(total_b=est_b, active_b=max(0.5, round(est_b * 0.1, 1)),
                       expert_weight_fraction=0.85)
     dest = models_dir() / src.name
+    if dest.exists():
+        # same filename may back a DIFFERENT model (generic quantizer names) —
+        # overwriting could destroy the running engine's weights
+        raise HangarError(f"{dest.name} already exists in Rigma's models "
+                          "folder — rename the file and try again")
     _move(src, dest)
     spec = ModelSpec(
         slug=slug, family=info.arch or "custom", kind=f["kind"],

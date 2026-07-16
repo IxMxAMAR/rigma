@@ -36,18 +36,20 @@ def _read_str(f) -> str:
     return f.read(n).decode("utf-8", "replace")
 
 
-def _read_value(f, t: int, keep: bool):
+def _read_value(f, t: int, keep: bool, depth: int = 0):
     """Read (and if `keep`, return) one value; always consumes its bytes."""
     if t == 8:
         s = _read_str(f)
         return s if keep else None
     if t == 9:
+        if depth >= 8:   # real ggufs are flat; nested-array bombs are not
+            raise GgufParseError("array nesting too deep")
         et = _read(f, "<I", 4)
         n = _read(f, "<Q", 8)
         keep_items = keep and n <= _MAX_KEPT_ARRAY
         out = [] if keep_items else None
         for _ in range(n):
-            v = _read_value(f, et, keep_items)
+            v = _read_value(f, et, keep_items, depth + 1)
             if keep_items:
                 out.append(v)
         return out

@@ -89,6 +89,15 @@ def ensure_model(gguf: GgufFile) -> Path:
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     local_dir = rigma_home() / "models"
     local_dir.mkdir(parents=True, exist_ok=True)
+    dest = local_dir / gguf.file
+    # on-disk short-circuit — and custom (repo="local") files have no upstream
+    # at all, so a miss is an error, never an HF request for a repo named
+    # "local" (Hangar review 2026-07-17)
+    if dest.exists():
+        return dest
+    if gguf.repo == "local":
+        raise RuntimeError(f"{gguf.file} is a local-only file that is missing "
+                           "from Rigma's models folder — reinstall it")
     return Path(hf_hub_download(repo_id=gguf.repo, filename=gguf.file,
                                 local_dir=str(local_dir)))
 

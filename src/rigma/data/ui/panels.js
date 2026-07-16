@@ -327,16 +327,22 @@ function uploadGguf(file, attachTo, onProg) {
 }
 
 let modelsPollTimer = null;
+let modelsRenderGen = 0;   // only the newest in-flight render may touch the DOM
 async function renderModelsTab() {
   clearTimeout(modelsPollTimer);
+  const myGen = ++modelsRenderGen;
   const box = $("drawer-body");
-  box.innerHTML = "";
   let data = null;
   try { data = await api("GET", "/api/models"); } catch (e) {
+    if (myGen !== modelsRenderGen) return;
+    box.innerHTML = "";
     box.appendChild(el("p", "dim", e.message));
     return;
   }
-  if (activeTab !== "models" || $("drawer").hidden) return;  // stale render
+  // stale render: tab changed, drawer closed, or a newer render superseded us
+  if (myGen !== modelsRenderGen || activeTab !== "models"
+      || $("drawer").hidden) return;
+  box.innerHTML = "";
 
   // disk gauge
   const gauge = el("div", "disk-gauge");
