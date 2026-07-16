@@ -90,6 +90,10 @@ class ModelSpec(BaseModel):
     capabilities: list[str] = Field(default_factory=list)  # tools|vision|thinking
     mmproj: GgufFile | None = None    # multimodal projector (vision models)
     sources: list[str] = Field(default_factory=list)
+    custom: bool = False              # user-installed (Hangar), not registry
+    # model-card recommended sampling (e.g. Qwen: temp .7 + DRY for quantized
+    # builds). Weakest layer: session > preset > these.
+    default_params: dict[str, float] = Field(default_factory=dict)
 
 
 class ComboFlags(BaseModel):

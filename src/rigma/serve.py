@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from importlib import resources
 
@@ -70,6 +71,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return sessions.default_prompt()
         except Exception:
             return ""
+
+    def _model_defaults() -> dict:
+        """Model-card sampling for the running model (weakest param layer)."""
+        try:
+            from .registry import Registry
+            reg = registry if registry is not None else Registry.load()
+            return reg.models[(st.read_state() or {}).get("model", "")
+                              ].default_params
+        except Exception:
+            return {}
 
     @app.get("/", response_class=HTMLResponse)
     async def root():
@@ -260,7 +271,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         msgs = sessions.build_messages(s, _default_prompt(), preset)
         body = {"messages": msgs, "stream": True,
                 "stream_options": {"include_usage": True}}
-        body.update(sessions.effective_params(s, preset))
+        body.update(sessions.effective_params(s, preset, _model_defaults()))
         effort = s.get("effort", "")
         if effort == "off":
             # Qwen-style template switch; engines that ignore it are unharmed
@@ -384,6 +395,97 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         finally:
             switch_lock.release()
         return new_state
+
+    # ---- model manager (Hangar) ---------------------------------------------
+
+    @app.get("/api/models")
+    async def models_list():
+        from . import hangar
+        out = await asyncio.to_thread(hangar.list_models, registry)
+        for m in out["models"]:
+            for q in m["quants"]:
+                p = q.get("pull")
+                if p and p.get("status") == "downloading":
+                    q["pull"] = {**p, "done": hangar.pull_progress(
+                        q["file"], q["bytes"])}
+        return JSONResponse(out, headers=_NO_STORE)
+
+    @app.post("/api/models/install")
+    async def models_install(body: dict):
+        from . import hangar
+        path = str(body.get("path", "")).strip().strip('"')
+        if not path:
+            return JSONResponse({"error": "path required"}, status_code=400)
+        try:
+            spec = await asyncio.to_thread(hangar.install_model, path,
+                                           body.get("attach_to") or None)
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return {"slug": spec.slug, "capabilities": spec.capabilities}
+
+    @app.post("/api/models/upload")
+    async def models_upload(request: Request, filename: str = "",
+                            attach_to: str = ""):
+        """Drag-drop install: raw body stream (no multipart dependency)."""
+        from pathlib import Path as _P
+
+        from . import hangar
+        name = _P(filename).name        # strips any path-traversal attempt
+        if not name.lower().endswith(".gguf"):
+            return JSONResponse({"error": "only .gguf files can be installed"},
+                                status_code=400)
+        inbox = hangar.rigma_home() / "custom" / "incoming"
+        inbox.mkdir(parents=True, exist_ok=True)
+        tmp, staged = inbox / (name + ".part"), inbox / name
+        try:
+            with open(tmp, "wb") as f:
+                async for chunk in request.stream():
+                    f.write(chunk)
+            os.replace(tmp, staged)
+            spec = await asyncio.to_thread(hangar.install_model, staged,
+                                           attach_to or None)
+        except hangar.HangarError as e:
+            staged.unlink(missing_ok=True)
+            return JSONResponse({"error": str(e)}, status_code=400)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return {"slug": spec.slug, "capabilities": spec.capabilities}
+
+    @app.post("/api/models/{slug}/pull")
+    async def models_pull(slug: str, body: dict):
+        from . import hangar
+        try:
+            return hangar.start_pull(slug, str(body.get("file", "")), registry)
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @app.delete("/api/models/{slug}/files/{file}")
+    async def models_delete_file(slug: str, file: str):
+        from . import hangar
+        try:
+            await asyncio.to_thread(hangar.delete_file, slug, file, registry)
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        return {"ok": True}
+
+    @app.delete("/api/models/{slug}")
+    async def models_delete(slug: str):
+        from . import hangar
+        try:
+            await asyncio.to_thread(hangar.delete_model, slug, registry)
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        return {"ok": True}
+
+    @app.patch("/api/models/{slug}")
+    async def models_patch(slug: str, body: dict):
+        from . import hangar
+        try:
+            spec = hangar.patch_capabilities(
+                slug, list(body.get("capabilities", [])))
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return {"slug": spec.slug, "capabilities": spec.capabilities}
 
     @app.get("/api/rag/status")
     async def rag_status():

@@ -1,0 +1,125 @@
+"""Hangar: GGUF header parsing for custom-model import."""
+import struct
+
+import pytest
+
+from rigma.gguf_meta import GgufParseError, inspect_gguf, read_metadata
+
+T_U32, T_F32, T_BOOL, T_STR, T_ARR, T_U64 = 4, 6, 7, 8, 9, 10
+
+
+def _s(text: bytes) -> bytes:
+    return struct.pack("<Q", len(text)) + text
+
+
+def _kv_u32(key: bytes, val: int) -> bytes:
+    return _s(key) + struct.pack("<I", T_U32) + struct.pack("<I", val)
+
+
+def _kv_str(key: bytes, val: bytes) -> bytes:
+    return _s(key) + struct.pack("<I", T_STR) + _s(val)
+
+
+def _kv_arr_u32(key: bytes, vals: list[int]) -> bytes:
+    body = b"".join(struct.pack("<I", v) for v in vals)
+    return (_s(key) + struct.pack("<I", T_ARR)
+            + struct.pack("<I", T_U32) + struct.pack("<Q", len(vals)) + body)
+
+
+def _kv_arr_str(key: bytes, vals: list[bytes]) -> bytes:
+    body = b"".join(_s(v) for v in vals)
+    return (_s(key) + struct.pack("<I", T_ARR)
+            + struct.pack("<I", T_STR) + struct.pack("<Q", len(vals)) + body)
+
+
+def _gguf(kvs: list[bytes]) -> bytes:
+    return (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
+            + struct.pack("<Q", len(kvs)) + b"".join(kvs))
+
+
+def _write(tmp_path, kvs, name="m.gguf"):
+    p = tmp_path / name
+    p.write_bytes(_gguf(kvs))
+    return p
+
+
+DENSE = [
+    _kv_str(b"general.architecture", b"qwen3"),
+    _kv_str(b"general.name", b"Spicy Tune 8B"),
+    _kv_u32(b"qwen3.block_count", 8),
+    _kv_u32(b"qwen3.context_length", 32768),
+    _kv_u32(b"qwen3.embedding_length", 1024),
+    _kv_u32(b"qwen3.attention.head_count", 16),
+    _kv_u32(b"qwen3.attention.head_count_kv", 2),
+    # huge-vocab stand-in: must be skipped, not held in memory
+    _kv_arr_str(b"tokenizer.ggml.tokens", [b"a"] * 3000),
+    _kv_str(b"tokenizer.chat_template",
+            b"{% if tools %}...{% endif %}<think>"),
+]
+
+
+def test_read_metadata_skips_vocab_and_keeps_scalars(tmp_path):
+    meta = read_metadata(_write(tmp_path, DENSE))
+    assert meta["general.name"] == "Spicy Tune 8B"
+    assert meta["qwen3.block_count"] == 8
+    assert "tokenizer.ggml.tokens" not in meta   # skipped, not stored
+    assert "tool" in meta["tokenizer.chat_template"]
+
+
+def test_inspect_dense_spec_fields(tmp_path):
+    info = inspect_gguf(_write(tmp_path, DENSE))
+    assert not info.is_mmproj
+    assert info.name == "Spicy Tune 8B"
+    assert info.spec_fields["n_layers"] == 8
+    assert info.spec_fields["full_attn_layers"] == 8
+    assert info.spec_fields["kv_heads"] == 2
+    assert info.spec_fields["head_dim"] == 64       # 1024 / 16
+    assert info.spec_fields["native_ctx"] == 32768
+    assert info.spec_fields["kind"] == "dense"
+    assert set(info.capabilities) == {"tools", "thinking"}
+
+
+def test_inspect_hybrid_kv_array_counts_full_attn_layers(tmp_path):
+    kvs = [
+        _kv_str(b"general.architecture", b"hyb"),
+        _kv_u32(b"hyb.block_count", 6),
+        _kv_u32(b"hyb.context_length", 8192),
+        _kv_u32(b"hyb.embedding_length", 512),
+        _kv_u32(b"hyb.attention.head_count", 8),
+        # per-layer kv heads: zeros are linear-attention layers
+        _kv_arr_u32(b"hyb.attention.head_count_kv", [0, 2, 0, 2, 0, 2]),
+    ]
+    info = inspect_gguf(_write(tmp_path, kvs))
+    assert info.spec_fields["kv_heads"] == 2
+    assert info.spec_fields["full_attn_layers"] == 3
+
+
+def test_inspect_moe_detected(tmp_path):
+    kvs = DENSE[:-2] + [_kv_u32(b"qwen3.expert_count", 64),
+                        _kv_u32(b"qwen3.expert_used_count", 8)]
+    info = inspect_gguf(_write(tmp_path, kvs))
+    assert info.spec_fields["kind"] == "moe"
+
+
+def test_inspect_mmproj_detected(tmp_path):
+    kvs = [_kv_str(b"general.architecture", b"clip"),
+           _kv_u32(b"clip.vision.image_size", 768)]
+    info = inspect_gguf(_write(tmp_path, kvs))
+    assert info.is_mmproj
+
+
+def test_not_a_gguf_raises(tmp_path):
+    p = tmp_path / "x.gguf"
+    p.write_bytes(b"NOPE" + b"\x00" * 64)
+    with pytest.raises(GgufParseError):
+        read_metadata(p)
+
+
+def test_corrupt_string_length_raises_instead_of_hanging(tmp_path):
+    bad = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
+           + struct.pack("<Q", 1)
+           + struct.pack("<Q", 2**62) + b"xx")   # absurd key length
+    p = tmp_path / "bad.gguf"
+    p.write_bytes(bad)
+    with pytest.raises(GgufParseError):
+        read_metadata(p)

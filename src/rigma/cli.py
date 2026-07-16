@@ -227,6 +227,12 @@ def chat(session: str = typer.Option(None, "--session",
         preset = _presets.resolve(sess.get("preset_id", ""))
     except Exception:
         pass
+    model_defaults = {}
+    try:
+        from .registry import Registry
+        model_defaults = Registry.load().models[s["model"]].default_params
+    except Exception:
+        pass
     typer.echo(f"{s['model']} ({s['quant']}) — session {sess['id']} — "
                f"exit with 'exit' or Ctrl+C")
     while True:
@@ -243,7 +249,8 @@ def chat(session: str = typer.Option(None, "--session",
         try:
             reply = _stream_chat(s["public_port"],
                                  sessions.build_messages(sess, default, preset),
-                                 sessions.effective_params(sess, preset))
+                                 sessions.effective_params(sess, preset,
+                                                           model_defaults))
         except Exception as e:
             typer.echo(f"\nmodel unreachable: {e} — check `rigma status`")
             continue

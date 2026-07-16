@@ -137,8 +137,11 @@ def _safe_params(raw: dict) -> dict:
     return out
 
 
-def effective_params(session: dict, preset: dict | None = None) -> dict:
-    merged = _safe_params((preset or {}).get("params", {}))
+def effective_params(session: dict, preset: dict | None = None,
+                     model_defaults: dict | None = None) -> dict:
+    """Weakest to strongest: model-card defaults < preset < session."""
+    merged = _safe_params(model_defaults or {})
+    merged.update(_safe_params((preset or {}).get("params", {})))
     merged.update(_safe_params(session.get("params", {})))
     return merged
 

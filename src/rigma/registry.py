@@ -67,6 +67,19 @@ class Registry:
         for f in sorted((path / "models").glob("*.json")):
             spec = ModelSpec.model_validate_json(f.read_text(encoding="utf-8"))
             models[spec.slug] = spec
+        # user-installed models (Hangar); registry wins slug collisions
+        from .runtime import rigma_home
+        custom = rigma_home() / "custom" / "models"
+        if custom.is_dir():
+            for f in sorted(custom.glob("*.json")):
+                try:
+                    spec = ModelSpec.model_validate_json(
+                        f.read_text(encoding="utf-8"))
+                except Exception:
+                    continue   # a broken custom spec must not brick startup
+                if spec.slug not in models:
+                    models[spec.slug] = spec.model_copy(
+                        update={"custom": True})
         combos = {}
         for f in sorted((path / "combos").rglob("*.json")):
             rel = f.relative_to(path / "combos").as_posix()
