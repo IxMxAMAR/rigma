@@ -24,6 +24,18 @@ def _sse(data: dict, event: str = "") -> bytes:
     return (head + "data: " + json.dumps(data) + "\n\n").encode()
 
 
+def _with_prefill(prefill: str, text: str) -> str:
+    """llama-server continues from a trailing assistant message AND echoes that
+    prefix in its output, so `text` normally already begins with the prefill.
+    Prepend it only for a (rare) engine that streams just the continuation —
+    so the steered opening is never doubled (the echo case) nor lost."""
+    if not prefill:
+        return text
+    if text.lstrip().startswith(prefill.strip()[:24]):
+        return text
+    return prefill + text
+
+
 _COMPACT_PROMPT = (
     "Summarize this conversation transcript into a dense digest for the model "
     "to continue from. Preserve: named characters/entities and their traits, "
@@ -326,10 +338,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
         msgs = sessions.build_messages(s, _default_prompt(), preset)
-        prefill = (s.get("prefill", "") or "").strip() if not cont else ""
+        # steer the reply's opening: llama-server continues from a trailing
+        # assistant message AND echoes that prefix back in its output, so we
+        # must NOT also add it ourselves. Keep the prefill's own formatting
+        # (trailing newlines/fences matter); only whitespace-only is "none".
+        prefill = "" if cont else (s.get("prefill") or "")
+        if not prefill.strip():
+            prefill = ""
         if prefill:
-            # steer the reply's opening — llama-server continues from a
-            # trailing assistant message as a prefix
             msgs = msgs + [{"role": "assistant", "content": prefill}]
         body = {"messages": msgs, "stream": True,
                 "stream_options": {"include_usage": True}}
@@ -342,8 +358,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             body["chat_template_kwargs"] = {"enable_thinking": True}
         text, thinking, failed, resp = "", "", False, None
         usage, timings = {}, {}
-        if prefill:
-            yield _sse({"delta": prefill})   # show the steered opening
+        # (no manual prefill yield — llama-server streams the echoed prefix)
         try:
             req = client.build_request("POST", "/v1/chat/completions", json=body)
             resp = await client.send(req, stream=True)
@@ -423,7 +438,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if thinking:
                     last["thinking"] = last.get("thinking", "") + thinking
             else:
-                msg = {"role": "assistant", "content": prefill + text}
+                msg = {"role": "assistant", "content": _with_prefill(prefill, text)}
                 if thinking:
                     msg["thinking"] = thinking
                 if timings.get("predicted_per_second"):

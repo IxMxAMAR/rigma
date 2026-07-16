@@ -244,3 +244,85 @@ def test_ctx_endpoint_relaunches_at_requested_size(home, upstream,
     monkeypatch.setattr(server_ops, "perform_switch", boom)
     r = client.post("/api/server/ctx", json={"ctx": 999999})
     assert r.status_code == 502 and "tops out" in r.json()["error"]
+
+
+def test_prefill_not_doubled_when_engine_echoes(home, tmp_path, monkeypatch):
+    """User-reported 2026-07-18: prefill appeared twice. llama-server echoes
+    the assistant prefix, so we must not also stream/prepend it."""
+    import json as _json
+    import os
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from rigma import state as st
+
+    class _Echo(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("content-length", 0))
+            body = _json.loads(self.rfile.read(n))
+            # emulate llama.cpp: echo the trailing assistant prefix, then continue
+            pre = ""
+            if body["messages"] and body["messages"][-1]["role"] == "assistant":
+                pre = body["messages"][-1]["content"]
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            for tok in [pre, "How", " be", " ye?"]:
+                self.wfile.write(b"data: " + _json.dumps(
+                    {"choices": [{"delta": {"content": tok}}]}).encode() + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+
+        def log_message(self, *a):
+            pass
+    srv = HTTPServer(("127.0.0.1", 0), _Echo)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=srv.server_address[1]))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"prefill": "ARRRGH, matey! "})
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    assert r.status_code == 200
+    # the streamed body must contain the prefill exactly ONCE, not twice
+    assert r.text.count("ARRRGH, matey!") == 1, r.text
+    saved = client.get(f"/api/sessions/{sid}").json()
+    asst = [m for m in saved["messages"] if m["role"] == "assistant"][-1]
+    assert asst["content"].count("ARRRGH, matey!") == 1
+    assert "How be ye?" in asst["content"]
+    assert saved["prefill"] == ""          # consumed once
+    srv.shutdown()
+
+
+def test_prefill_prepended_if_engine_does_not_echo(home, tmp_path, monkeypatch):
+    """Robustness: an engine that streams only the continuation still gets the
+    prefill (prepended once, never lost)."""
+    import json as _json
+    import os
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from rigma import state as st
+
+    class _NoEcho(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            for tok in ["How", " be", " ye?"]:   # continuation only, no echo
+                self.wfile.write(b"data: " + _json.dumps(
+                    {"choices": [{"delta": {"content": tok}}]}).encode() + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+
+        def log_message(self, *a):
+            pass
+    srv = HTTPServer(("127.0.0.1", 0), _NoEcho)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=srv.server_address[1]))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"prefill": "Sure: "})
+    client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    saved = client.get(f"/api/sessions/{sid}").json()
+    asst = [m for m in saved["messages"] if m["role"] == "assistant"][-1]
+    assert asst["content"] == "Sure: How be ye?"   # prepended once
+    srv.shutdown()
