@@ -335,6 +335,8 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                                     "model's native window)"),
        reasoning: str = typer.Option(None, "--reasoning",
                                      help="Reasoning/thinking: on|off|auto"),
+       fa: str = typer.Option(None, "--fa",
+                              help="FlashAttention: on|off|auto"),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
@@ -360,6 +362,12 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             raise typer.Exit(2)
         rp.flags = rp.flags.model_copy(update={"reasoning": reasoning})
         rp.origin += "+reasoning-override"
+    if fa is not None:
+        if fa not in ("on", "off", "auto"):
+            typer.echo("--fa must be on, off, or auto")
+            raise typer.Exit(2)
+        rp.flags = rp.flags.model_copy(update={"flash_attn": fa})
+        rp.origin += "+fa-override"
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "

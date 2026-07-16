@@ -86,3 +86,21 @@ def test_modelspec_optional_mmproj():
                       ggufs=[GgufFile(repo="r", file="m.gguf", bytes=1,
                                       quant="Q4")])
     assert spec2.mmproj is None
+
+
+def test_flash_attn_tristate_and_bool_coercion():
+    from rigma.models import ComboFlags, GgufFile, RunPlan
+    assert ComboFlags(ctx=1024, flash_attn=True).flash_attn == "on"
+    assert ComboFlags(ctx=1024, flash_attn=False).flash_attn == "off"
+    assert ComboFlags(ctx=1024, flash_attn="auto").flash_attn == "auto"
+    import pytest as _p
+    with _p.raises(Exception):
+        ComboFlags(ctx=1024, flash_attn="sideways")
+    for mode in ("on", "off", "auto"):
+        plan = RunPlan(model_slug="m",
+                       gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                       backend="vulkan",
+                       flags=ComboFlags(ctx=1024, flash_attn=mode),
+                       origin="t")
+        args = plan.server_args("m.gguf", 1)
+        assert args[args.index("-fa") + 1] == mode

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 STANDARD_GB = [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 
@@ -96,10 +96,19 @@ class ComboFlags(BaseModel):
     ctx: int
     ngl: int = 99
     n_cpu_moe: int = 0
-    flash_attn: bool = True
+    flash_attn: str = "on"   # on | off | auto (legacy bools coerced)
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
     reasoning: str = ""   # ""(engine default) | on | off | auto
+
+    @field_validator("flash_attn", mode="before")
+    @classmethod
+    def _coerce_fa(cls, v):
+        if isinstance(v, bool):
+            return "on" if v else "off"
+        if v not in ("on", "off", "auto"):
+            raise ValueError("flash_attn must be on, off, or auto")
+        return v
 
 
 class Budget(BaseModel):
@@ -136,8 +145,7 @@ class RunPlan(BaseModel):
                 "--parallel", "1"]
         if self.flags.n_cpu_moe > 0:
             args += ["--n-cpu-moe", str(self.flags.n_cpu_moe)]
-        if self.flags.flash_attn:
-            args += ["-fa", "on"]
+        args += ["-fa", self.flags.flash_attn]
         args += ["--cache-type-k", self.flags.cache_type_k,
                  "--cache-type-v", self.flags.cache_type_v]
         if self.flags.reasoning:

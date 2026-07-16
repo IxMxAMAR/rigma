@@ -89,3 +89,14 @@ def test_up_reasoning_override(tmp_path, monkeypatch):
     res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
                                   "--reasoning", "sideways"])
     assert res.exit_code != 0
+
+
+def test_up_fa_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+                                  "--fa", "auto"])
+    assert res.exit_code == 0 and "-fa auto" in res.output
+    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+                                  "--fa", "maybe"])
+    assert res.exit_code != 0
