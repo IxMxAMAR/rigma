@@ -54,24 +54,26 @@ def _model_on_disk(gguf) -> bool:
 
 
 def _free_current(profile, state: dict, reg):
-    """A copy of `profile` with the CURRENTLY-running model's memory added
-    back — perform_switch/ctx-change kill that engine before launching, so
-    fitting against live (starved) free memory is wrong. Without this, a
-    ctx change on the running model probes against its own occupied VRAM/RAM
-    and reports an absurdly small ceiling (live repro 2026-07-18: 35B ctx
-    change said 'tops out at 8,192' while it was running fine at 32K)."""
+    """A copy of `profile` with the CURRENTLY-running model's RAM footprint
+    added back — perform_switch/ctx-change kill that engine before launching,
+    so fitting against live free RAM is wrong. Without this, a ctx change on
+    the running model probes against its own occupied RAM and reports an
+    absurdly small ceiling (live repro 2026-07-18: 35B ctx change said 'tops
+    out at 8,192' while it was running fine at 32K).
+
+    Only RAM is credited: `_budgets` derives the VRAM budget from the card's
+    static total capacity (not live-free), so VRAM is never starved — crediting
+    it would over-report and risk an OOM launch."""
     if not state:
         return profile
     spec = reg.models.get(state.get("model", ""))
     if spec is None or not spec.ggufs:
         return profile
+    # over-credit is safe (32GB RAM); fit_gguf then computes the real split
     freed_mb = max(g.bytes for g in spec.ggufs) / 2**20
     if spec.mmproj:
         freed_mb += spec.mmproj.bytes / 2**20
-    gpus = [g.model_copy(update={"vram_mb": g.vram_mb + int(freed_mb)})
-            if i == 0 else g for i, g in enumerate(profile.gpus)]
     return profile.model_copy(update={
-        "gpus": gpus,
         "ram_free_mb": profile.ram_free_mb + int(freed_mb)})
 
 
@@ -170,7 +172,7 @@ def perform_switch(model: str, registry=None, profile=None,
                 f"ctx {want:,} doesn't fit — {model} ({rp.gguf.quant}) tops "
                 f"out around {rp.flags.ctx:,} on this machine")
         rp.flags = rp.flags.model_copy(update={
-            "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe,
+            "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe, "ngl": flags.ngl,
             "cache_type_k": flags.cache_type_k,
             "cache_type_v": flags.cache_type_v})
     mm = getattr(reg_full.models.get(model), "mmproj", None)
