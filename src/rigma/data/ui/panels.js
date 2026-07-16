@@ -453,13 +453,21 @@ async function renderModelsTab() {
   box.appendChild(hfRow);
   const hfBox = el("div", "hf-results");
   box.appendChild(hfBox);
+  let hfGen = 0;   // out-of-order search/detail responses must not clobber
   const hfDetail = async (repo) => {
+    const g = ++hfGen;
     hfBox.innerHTML = "";
     hfBox.appendChild(el("p", "dim",
       "reading " + repo + "'s header remotely (a few MB, not the model)…"));
     let d = null;
     try { d = await api("GET", "/api/hf/repo?id=" + encodeURIComponent(repo)); }
-    catch (e) { hfBox.innerHTML = ""; hfBox.appendChild(el("p", "drop-status err", e.message)); return; }
+    catch (e) {
+      if (g !== hfGen) return;
+      hfBox.innerHTML = "";
+      hfBox.appendChild(el("p", "drop-status err", e.message));
+      return;
+    }
+    if (g !== hfGen) return;
     hfBox.innerHTML = "";
     const card = el("div", "model-card");
     const head = el("div", "mc-head");
@@ -502,13 +510,20 @@ async function renderModelsTab() {
     hfBox.appendChild(card);
   };
   const doSearch = async () => {
+    const g = ++hfGen;
     const q = hfIn.value.trim();
     if (!q) { hfBox.innerHTML = ""; return; }
     hfBox.innerHTML = "";
     hfBox.appendChild(el("p", "dim", "searching…"));
     let rows = [];
     try { rows = await api("GET", "/api/hf/search?q=" + encodeURIComponent(q)); }
-    catch (e) { hfBox.innerHTML = ""; hfBox.appendChild(el("p", "drop-status err", e.message)); return; }
+    catch (e) {
+      if (g !== hfGen) return;
+      hfBox.innerHTML = "";
+      hfBox.appendChild(el("p", "drop-status err", e.message));
+      return;
+    }
+    if (g !== hfGen) return;
     hfBox.innerHTML = "";
     if (!rows.length) { hfBox.appendChild(el("p", "dim", "no gguf models found")); return; }
     for (const r of rows) {

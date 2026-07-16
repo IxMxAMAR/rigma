@@ -39,7 +39,9 @@ def _get_json(path: str, params: dict | None = None):
                           "huggingface.co and set HF_TOKEN")
     if r.status_code == 404:
         raise HangarError("not found on Hugging Face")
-    r.raise_for_status()
+    if r.status_code >= 400:   # 429 rate-limit, 5xx hiccups — stay friendly
+        raise HangarError(f"Hugging Face replied HTTP {r.status_code} — "
+                          "try again in a moment")
     return r.json()
 
 
