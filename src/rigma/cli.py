@@ -169,6 +169,92 @@ def models():
         typer.echo(f"{slug:24} {spec.kind:5} {fit}")
 
 
+def _spawn_detached(port: int) -> None:
+    """Re-launch `rigma up` as a background process and return the terminal.
+    The child re-runs the same resolution (fast — engine/model already on
+    disk) but this time stays foreground inside its own detached session."""
+    import subprocess
+    import sys
+    argv = [a for a in sys.argv[1:] if a not in ("--detach", "-d")]
+    if "--no-browser" not in argv:
+        argv.append("--no-browser")
+    if "-y" not in argv and "--yes" not in argv:
+        argv.append("--yes")
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL}
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                   | 0x00000008)   # DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    exe = [sys.executable, "-m", "rigma"] if not getattr(sys, "frozen", False) \
+        else [sys.executable]
+    subprocess.Popen(exe + argv, **kwargs)
+    typer.echo(f"Rigma is starting in the background on port {port}.")
+    typer.echo(f"  UI:    http://127.0.0.1:{port}")
+    typer.echo("  stop:  rigma stop   ·   status: rigma status")
+
+
+@app.command(name="list")
+def list_local():
+    """List models on disk with their size (ollama list parity)."""
+    from . import hangar
+    out = hangar.list_models()
+    any_disk = False
+    for m in out["models"]:
+        on = [q for q in m["quants"] if q["on_disk"]]
+        if m.get("mmproj") and m["mmproj"].get("on_disk"):
+            on.append({"quant": "mmproj", "bytes": m["mmproj"]["bytes"]})
+        if not on:
+            continue
+        any_disk = True
+        gb = sum(q["bytes"] for q in on) / 2**30
+        run = "  ← running" if m["running"] else ""
+        tag = "  [custom]" if m["custom"] else ""
+        typer.echo(f"{m['slug']:28} {gb:6.1f} GB  "
+                   f"{', '.join(q['quant'] for q in on)}{tag}{run}")
+    if not any_disk:
+        typer.echo("no models downloaded — get one with: rigma up  (or the "
+                   "Models tab in the UI)")
+    typer.echo(f"\ndisk: {out['disk']['models_gb']} GB models, "
+               f"{out['disk']['free_gb']} GB free")
+
+
+@app.command()
+def rm(model: str = typer.Argument(..., help="Model slug (see `rigma list`)"),
+       yes: bool = typer.Option(False, "--yes", "-y")):
+    """Delete a model's files from disk (ollama rm parity)."""
+    from . import hangar
+    out = hangar.list_models()
+    m = next((x for x in out["models"] if x["slug"] == model), None)
+    if m is None:
+        typer.echo(f"no such model: {model}  (see `rigma list`)")
+        raise typer.Exit(1)
+    if m["running"]:
+        typer.echo(f"{model} is running — stop or switch first")
+        raise typer.Exit(1)
+    on = [q for q in m["quants"] if q["on_disk"]]
+    if not on:
+        typer.echo(f"{model} has no files on disk")
+        raise typer.Exit(0)
+    gb = sum(q["bytes"] for q in on) / 2**30
+    if not yes:
+        typer.confirm(f"delete {len(on)} file(s), {gb:.1f} GB, for {model}?",
+                      abort=True)
+    try:
+        if m["custom"]:
+            hangar.delete_model(model)
+        else:
+            for q in on:
+                hangar.delete_file(model, q["file"])
+            if m.get("mmproj") and m["mmproj"].get("on_disk"):
+                hangar.delete_file(model, m["mmproj"]["file"])
+    except hangar.HangarError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1)
+    typer.echo(f"deleted {model} ({gb:.1f} GB freed)")
+
+
 def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> str:
     import json as _json
 
@@ -253,6 +339,8 @@ def chat(session: str = typer.Option(None, "--session",
                                                            model_defaults))
         except Exception as e:
             typer.echo(f"\nmodel unreachable: {e} — check `rigma status`")
+            sess["messages"].pop()   # drop the unanswered user turn: a
+            sessions.save(sess)      # dangling user msg breaks strict templates
             continue
         sess["messages"].append({"role": "assistant", "content": reply})
         sessions.save(sess)
@@ -313,6 +401,7 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
                    "llamacpp": _engines_manifest()["version"],
                    "os": platform.system().lower(),
                    "measured": r.model_dump()}
+        Path(evidence).parent.mkdir(parents=True, exist_ok=True)
         Path(evidence).write_text(_json.dumps(payload, indent=2), encoding="utf-8")
         typer.echo(f"evidence written -> {evidence}")
 
@@ -376,6 +465,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        spec: str = typer.Option(None, "--spec",
                                 help="Speculative decoding: none|draft-mtp|"
                                      "ngram-simple|... (engine-supported)"),
+       detach: bool = typer.Option(False, "--detach", "-d",
+                                   help="Run in the background; the terminal "
+                                        "returns and Rigma keeps serving"),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
@@ -426,6 +518,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                f"({rp.origin})")
     typer.echo("argv: llama-server " + " ".join(rp.server_args("<model>", port - 1)))
     if dry_run:
+        raise typer.Exit(0)
+    if detach:
+        _spawn_detached(port)
         raise typer.Exit(0)
     for needed in (port, port - 1):
         holder = _port_holder(needed)
