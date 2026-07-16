@@ -135,3 +135,34 @@ def test_switch_options_falls_back_to_on_disk_quant(tmp_path, monkeypatch):
     opts = server_ops.switch_options(s, registry=reg, profile=profile)
     assert [o["quant"] for o in opts] == ["Q3"]
     assert "Q3 on disk" in opts[0]["reason"]
+
+
+def test_perform_switch_uses_on_disk_quant(tmp_path, monkeypatch):
+    """Live repro 2026-07-17: switch-back refused because the resolver
+    preferred a quant that wasn't downloaded, while another quant WAS."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    small = GgufFile(repo="r", file="dual-small.gguf", bytes=10, quant="Q2")
+    big = GgufFile(repo="r", file="dual-big.gguf", bytes=20, quant="Q3")
+    spec = ModelSpec(slug="dual-model", family="f", kind="dense", n_layers=2,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=32768, ggufs=[big, small],
+                     cache_type_policy=CachePolicy())
+    reg = Registry([], {"dual-model": spec}, {})
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=16000, backends=["vulkan"])
+    profile = HardwareProfile(gpus=[gpu], ram_mb=16000, ram_free_mb=8000,
+                              cpu=CpuInfo(cores=8), os="windows",
+                              disk_free_gb=100.0)
+    (tmp_path / "models").mkdir()
+    # ONLY the smaller quant on disk; the resolver PREFERS the bigger one
+    (tmp_path / "models" / "dual-small.gguf").write_text("x")
+    state.write_state("other", "Q0", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan")
+    monkeypatch.setattr("rigma.state.kill_pid", lambda pid: None)
+    monkeypatch.setattr("rigma.runtime.ensure_engine",
+                        lambda backend, os_name: tmp_path / "llama-server.exe")
+    fake_sp = SimpleNamespace(proc=SimpleNamespace(pid=7))
+    monkeypatch.setattr("rigma.runtime.launch_server",
+                        lambda exe, plan, mp, port=0, timeout=300.0,
+                        extra_args=None: fake_sp)
+    new = server_ops.perform_switch("dual-model", registry=reg, profile=profile)
+    assert new["model"] == "dual-model" and new["quant"] == "Q2"

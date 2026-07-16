@@ -115,14 +115,25 @@ def perform_switch(model: str, registry=None, profile=None) -> dict:
         raise RuntimeError("not running")
     if model == s.get("model"):
         raise RuntimeError(f"{model} is already running")
-    rp, _, _ = _resolve_for(model, s, registry, profile)
-    if rp.model_slug != model:
-        raise RuntimeError(f"{model} does not fit this machine")
-    if not _model_on_disk(rp.gguf):
-        raise RuntimeError(
-            f"{model} is not downloaded — run: rigma up --model {model}")
     from .registry import Registry
     reg_full = registry if registry is not None else Registry.load()
+    spec_full = reg_full.models.get(model)
+    if spec_full is None:
+        raise RuntimeError(f"unknown model: {model} — run: rigma update")
+    on_disk = [g for g in spec_full.ggufs if _model_on_disk(g)]
+    if not on_disk:
+        raise RuntimeError(
+            f"{model} is not downloaded — run: rigma up --model {model}")
+    # resolve against on-disk quants only — the resolver may prefer a quant
+    # that was never downloaded (live repro 2026-07-17: switch-back refused
+    # while a perfectly usable quant sat on disk)
+    trimmed = Registry(reg_full.gpus,
+                       {**reg_full.models,
+                        model: spec_full.model_copy(update={"ggufs": on_disk})},
+                       reg_full.combos, reg_full.use_cases)
+    rp, _, _ = _resolve_for(model, s, trimmed, profile)
+    if rp.model_slug != model or not _model_on_disk(rp.gguf):
+        raise RuntimeError(f"{model} does not fit this machine right now")
     mm = getattr(reg_full.models.get(model), "mmproj", None)
     if mm is not None and not _model_on_disk(mm):
         raise RuntimeError(
