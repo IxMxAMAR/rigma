@@ -161,7 +161,7 @@ def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
 
 
 def perform_switch(model: str, registry=None, profile=None,
-                   ctx: int | None = None) -> dict:
+                   ctx: int | None = None, force_calibrate: bool = False) -> dict:
     """Stop the running engine and launch `model` in its place; with `ctx`,
     relaunch (same model allowed) at a requested context size.
 
@@ -173,7 +173,8 @@ def perform_switch(model: str, registry=None, profile=None,
     s = st.read_state()
     if s is None:
         raise RuntimeError("not running")
-    if model == s.get("model") and not s.get("unloaded") and ctx is None:
+    if (model == s.get("model") and not s.get("unloaded") and ctx is None
+            and not force_calibrate):
         raise RuntimeError(f"{model} is already running")
     from .registry import Registry
     reg_full = registry if registry is not None else Registry.load()
@@ -228,7 +229,8 @@ def perform_switch(model: str, registry=None, profile=None,
     from .bench import auto_calibrate, is_calibrated
     if (ctx is None and rp.backend != "cpu"
             and os.environ.get("RIGMA_AUTO_CALIBRATE", "1") != "0"
-            and not is_calibrated(rp.model_slug, rp.gguf.quant, rp.backend)):
+            and (force_calibrate
+                 or not is_calibrated(rp.model_slug, rp.gguf.quant, rp.backend))):
         _write_calib_marker(rp.model_slug, "starting")
         try:
             rp = auto_calibrate(rp, exe, model_path, port=port, extra_args=extra,
@@ -302,3 +304,17 @@ def perform_load(registry=None, profile=None) -> dict:
     if not s.get("unloaded"):
         raise RuntimeError(f"{s['model']} is already loaded")
     return perform_switch(s["model"], registry, profile)
+
+
+def perform_recalibrate(registry=None, profile=None) -> dict:
+    """Forget the running model's tune and re-optimize it now (unload -> quick
+    sweep -> launch the fresh winner). For when a noisy measurement crowned a
+    config that's actually slower — the sweep always includes baseline, so a
+    re-tune can only match or beat plain defaults."""
+    from . import state as st
+    from .bench import clear_calibration
+    s = st.read_state()
+    if s is None:
+        raise RuntimeError("not running")
+    clear_calibration(s["model"], s["quant"], s.get("backend", "unknown"))
+    return perform_switch(s["model"], registry, profile, force_calibrate=True)
