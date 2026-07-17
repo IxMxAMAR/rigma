@@ -88,3 +88,19 @@ def test_code_tools_gated(tmp_path):
     # without the opt-in, it refuses
     assert "not enabled" in tools.run_tool(
         "run_python", {"code": "print(1)"}, {"workspace": str(tmp_path)})
+
+
+def test_workspace_prefix_escape_blocked(tmp_path):
+    """The /workspace vs /workspace2 prefix-match escape must be blocked."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    sibling = tmp_path / "workspace2"
+    sibling.mkdir()
+    (sibling / "secret.txt").write_text("stolen", encoding="utf-8")
+    ctx = {"workspace": str(root), "allow_code": True}
+    # a path that string-prefix-matches the root but is a sibling dir
+    out = tools.run_tool("read_file", {"path": "../workspace2/secret.txt"}, ctx)
+    assert "outside the workspace" in out and "stolen" not in out
+    # empty workspace refuses entirely
+    assert "no workspace" in tools.run_tool("read_file", {"path": "x"},
+                                            {"workspace": "", "allow_code": True})
