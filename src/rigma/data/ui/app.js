@@ -11,12 +11,15 @@ let modelCaps = [];        // capabilities of the running model
 let streaming = false;
 let turn = null;           // {abort} handle for the in-flight stream
 let lastMeta = null;
+let noModel = false;       // UI started with no model loaded (pick one)
 
 /* ---------- header status ---------- */
 async function loadStatus() {
   try {
     const s = await api("GET", "/api/status");
-    $("model").textContent = s.model + " (" + s.quant + ")";
+    noModel = !s.model && !s.calibrating;
+    $("model").textContent = s.model ? (s.model + " (" + s.quant + ")")
+      : (s.calibrating ? $("model").textContent : "no model — pick one");
     defaultPrompt = s.default_system_prompt || "";
     modelCaps = s.capabilities || [];
     $("effort-toggle").hidden = !modelCaps.includes("thinking");
@@ -772,7 +775,7 @@ async function pollEngine() {
   }
   if (engineInfo.unloaded) {
     dot.className = "dot warn";
-    label.textContent = "unloaded";
+    label.textContent = engineInfo.model ? "unloaded" : "no model";
     return;
   }
   const lowRam = engineInfo.ram_free_mb < 1536;
@@ -954,4 +957,6 @@ function renderAll() {
   else { renderAll(); }
   refreshDocs();
   pollEngine();
+  // fresh start with no model? drop the user straight into the picker
+  if (noModel && typeof openModelsView === "function") openModelsView();
 })();

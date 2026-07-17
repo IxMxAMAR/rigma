@@ -378,7 +378,14 @@ async function renderServerTab() {
 
   box.appendChild(el("h3", "", "Engine memory"));
   const memActs = el("div", "drawer-acts");
-  if (info.unloaded) {
+  if (info.unloaded && !info.model) {
+    box.appendChild(el("p", "dim",
+      "No model loaded yet. Pick one from the Models tab or the list below — " +
+      "it downloads, tunes, and loads on demand."));
+    const pick = el("button", "act", "Open Models");
+    pick.onclick = openModelsView;
+    memActs.appendChild(pick);
+  } else if (info.unloaded) {
     box.appendChild(el("p", "dim",
       "Engine unloaded — VRAM/RAM are free. Chats will error until a " +
       "model is loaded."));
@@ -408,6 +415,7 @@ async function renderServerTab() {
   }
   box.appendChild(memActs);
 
+  if (info.model && !info.unloaded) {
   box.appendChild(el("h3", "", "Hardware tuning"));
   box.appendChild(el("p", "dim",
     "Rigma auto-tunes each model on its first load. If a tune landed on a slow " +
@@ -433,13 +441,15 @@ async function renderServerTab() {
   };
   tuneActs.appendChild(reBtn);
   box.appendChild(tuneActs);
+  }
 
-  box.appendChild(el("h3", "", "Switch model (downloaded only)"));
+  box.appendChild(el("h3", "", info.model ? "Switch model (downloaded only)"
+                                          : "Load a downloaded model"));
   let opts = [];
   try { opts = await api("GET", "/api/server/switch-options"); } catch {}
   if (!opts.length) {
     box.appendChild(el("p", "dim",
-      "No alternative models on disk. Download via: rigma up --model <slug>"));
+      "No models on disk yet. Use the Models tab to download one."));
   }
   const acts = el("div", "drawer-acts");
   for (const o of opts) {
