@@ -110,7 +110,7 @@ function paletteActions() {
   const acts = [
     {label: "New chat", run: () => newChat()},
     {label: "Settings — Chat params", run: () => toggleDrawer("chat")},
-    {label: "Models — manage & download", run: () => toggleDrawer("models")},
+    {label: "Models — manage & download", run: () => openModelsView()},
     {label: "Server — engine room", run: () => toggleDrawer("server")},
     {label: "Compact this chat", run: () => current && compactChat(6)},
     {label: "Export chat as markdown",

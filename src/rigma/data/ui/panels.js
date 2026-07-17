@@ -47,7 +47,6 @@ function openTab(name) {
   }
   if (name === "chat") renderChatTab();
   else if (name === "presets") renderPresetsTab();
-  else if (name === "models") renderModelsTab();
   else if (name === "server") renderServerTab();
 }
 function refreshDrawer() {
@@ -478,47 +477,272 @@ function uploadGguf(file, attachTo, onProg) {
   });
 }
 
+/* ---------- Models: full main-area view (the hangar) ---------- */
 let modelsPollTimer = null;
 let modelsRenderGen = 0;   // only the newest in-flight render may touch the DOM
-async function renderModelsTab() {
+
+function openModelsView() {
+  closeDrawer();
+  $("models-view").hidden = false;
+  document.body.classList.add("models-open");
+  renderModelsView();
+}
+function closeModelsView() {
+  clearTimeout(modelsPollTimer);
+  $("models-view").hidden = true;
+  document.body.classList.remove("models-open");
+}
+$("open-models").onclick = openModelsView;
+$("mv-close").onclick = closeModelsView;
+$("mv-refresh").onclick = () => renderModelsView();
+
+// one quant row for the collapsible per-model list (download / delete / progress)
+function quantRow(m, q, reload) {
+  const row = el("div", "quant-row");
+  row.appendChild(el("span", "dot" + (q.on_disk ? " on" : "")));
+  const ql = el("span", "q", q.quant);
+  ql.title = quantHelp(q.quant);
+  row.appendChild(ql);
+  row.appendChild(el("span", "sz", fmtGB(q.bytes)));
+  if (q.pull && q.pull.status === "downloading") {
+    const pct = q.pull.total
+      ? Math.round(100 * (q.pull.done || 0) / q.pull.total) : 0;
+    const bar = el("span", "pull-bar");
+    bar.appendChild(el("span", "fill")).style.width = pct + "%";
+    row.appendChild(bar);
+    row.appendChild(el("span", "sz", pct + "%"));
+  } else if (q.pull && q.pull.status === "error") {
+    row.appendChild(el("span", "err", q.pull.error || "download failed"));
+  } else if (!q.on_disk && !m.custom) {
+    const dl = el("button", "act mini", "Download");
+    dl.onclick = async () => {
+      dl.disabled = true;
+      try { await api("POST", "/api/models/" + m.slug + "/pull",
+                      {file: q.file}); }
+      catch (e) { alert(e.message); }
+      reload();
+    };
+    row.appendChild(dl);
+  } else if (q.on_disk) {
+    const del = el("button", "clear", "✕");
+    del.title = "Delete " + q.file + " from disk";
+    del.setAttribute("aria-label", del.title);
+    del.onclick = async () => {
+      if (!confirm("Delete " + q.file + " (" + fmtGB(q.bytes)
+                   + ") from disk?")) return;
+      try { await api("DELETE", "/api/models/" + m.slug + "/files/"
+                      + encodeURIComponent(q.file)); }
+      catch (e) { alert(e.message); }
+      reload();
+    };
+    row.appendChild(del);
+  }
+  return row;
+}
+
+// a library model as a grid card: leads with the on-disk quant + Run, the
+// full quant list tucked behind a disclosure so the card stays scannable
+function libraryCard(m, reload) {
+  const card = el("div", "model-card" + (m.running ? " running" : ""));
+  const head = el("div", "mc-head");
+  head.appendChild(el("span", "mc-name", m.slug));
+  if (m.running) head.appendChild(el("span", "badge live", "RUNNING"));
+  if (m.custom) head.appendChild(el("span", "badge", "custom"));
+  for (const c of m.capabilities || [])
+    head.appendChild(el("span", "cap " + c, c === "thinking" ? "think" : c));
+  card.appendChild(head);
+  card.appendChild(el("div", "mc-sub", m.family + " · " + m.kind + " · ctx "
+    + (m.native_ctx || 0).toLocaleString()
+    + (m.mmproj ? " · mmproj " + (m.mmproj.on_disk ? "on disk"
+        : "not downloaded") : "")));
+
+  const onDisk = m.quants.filter((q) => q.on_disk);
+  const pulling = m.quants.find((q) => q.pull && q.pull.status === "downloading");
+  const primary = el("div", "mc-primary");
+  if (pulling) {
+    primary.appendChild(quantRow(m, pulling, reload));
+  } else if (onDisk.length) {
+    const q = onDisk[0], ql = el("span", "q", q.quant);
+    ql.title = quantHelp(q.quant);
+    primary.appendChild(el("span", "dot on"));
+    primary.append(ql, el("span", "sz", fmtGB(q.bytes) + " · ready"));
+  } else {
+    primary.className = "mc-primary dim";
+    primary.textContent = "not downloaded — pick a quant below";
+  }
+  card.appendChild(primary);
+
+  if (m.quants.length > (onDisk.length ? 1 : 0)) {
+    const det = el("details", "mc-quants");
+    det.appendChild(el("summary", "", m.quants.length + " quant"
+      + (m.quants.length > 1 ? "s" : "") + " — download or remove"));
+    for (const q of m.quants) det.appendChild(quantRow(m, q, reload));
+    card.appendChild(det);
+  }
+
+  const acts = el("div", "mc-acts");
+  if (!m.running && onDisk.length) {
+    const run = el("button", "act primary", "Run");
+    run.onclick = () => { closeModelsView(); doSwitch(m.slug); };
+    acts.appendChild(run);
+  }
+  if (m.custom) {
+    const caps = el("button", "act", "Edit capabilities");
+    caps.onclick = () => renderCapsEditor(m);
+    acts.appendChild(caps);
+    const rm = el("button", "act danger", "Remove");
+    rm.onclick = async () => {
+      if (!confirm("Remove " + m.slug + " and delete its files?")) return;
+      try { await api("DELETE", "/api/models/" + m.slug); }
+      catch (e) { alert(e.message); }
+      reload();
+    };
+    acts.appendChild(rm);
+  }
+  if (acts.childNodes.length) card.appendChild(acts);
+  return card;
+}
+
+async function renderModelsView() {
   clearTimeout(modelsPollTimer);
   const myGen = ++modelsRenderGen;
-  const box = $("drawer-body");
+  const reload = () => renderModelsView();
+  const body = $("mv-body");
   let data = null;
   try { data = await api("GET", "/api/models"); } catch (e) {
-    if (myGen !== modelsRenderGen) return;
-    box.innerHTML = "";
-    box.appendChild(el("p", "dim", e.message));
+    if (myGen === modelsRenderGen) {
+      body.innerHTML = "";
+      body.appendChild(el("p", "dim", e.message));
+    }
     return;
   }
-  // stale render: tab changed, drawer closed, or a newer render superseded us
-  if (myGen !== modelsRenderGen || activeTab !== "models"
-      || $("drawer").hidden) return;
-  box.innerHTML = "";
+  if (myGen !== modelsRenderGen || $("models-view").hidden) return;
+  body.innerHTML = "";
+  $("mv-disk").textContent = data.disk.models_gb + " GB on disk · "
+    + data.disk.free_gb + " GB free";
+  $("mv-disk").title = data.disk.dir;
 
-  // disk gauge
-  const gauge = el("div", "disk-gauge");
-  gauge.appendChild(el("span", "k", "models on disk"));
-  gauge.appendChild(el("span", "v", data.disk.models_gb + " GB"));
-  gauge.appendChild(el("span", "k", "disk free"));
-  gauge.appendChild(el("span", "v", data.disk.free_gb + " GB"));
-  gauge.title = data.disk.dir;
-  box.appendChild(gauge);
+  // toolbar: find-on-HF + install-your-own, side by side on wide screens
+  const tools = el("div", "mv-tools");
 
-  // install zone: drop a .gguf, or install from a local path (moved, not copied)
-  box.appendChild(el("h3", "", "Install a model"));
+  const find = el("div", "mv-panel");
+  find.appendChild(el("h3", "", "Find a model on Hugging Face"));
+  const hfRow = el("div", "path-row");
+  const hfIn = el("input");
+  hfIn.placeholder = "Search any gguf model…";
+  const hfBtn = el("button", "act", "Search");
+  hfRow.append(hfIn, hfBtn);
+  find.appendChild(hfRow);
+  const hfBox = el("div", "hf-results");
+  find.appendChild(hfBox);
+  let hfGen = 0;
+  const hfDetail = async (repo) => {
+    const g = ++hfGen;
+    hfBox.innerHTML = "";
+    hfBox.appendChild(el("p", "dim",
+      "reading " + repo + "'s header remotely (a few MB, not the model)…"));
+    let d = null;
+    try { d = await api("GET", "/api/hf/repo?id=" + encodeURIComponent(repo)); }
+    catch (e) {
+      if (g !== hfGen) return;
+      hfBox.innerHTML = "";
+      hfBox.appendChild(el("p", "drop-status err", e.message));
+      return;
+    }
+    if (g !== hfGen) return;
+    hfBox.innerHTML = "";
+    const card = el("div", "model-card");
+    const chead = el("div", "mc-head");
+    chead.appendChild(el("span", "mc-name", d.name));
+    for (const c of d.capabilities || [])
+      chead.appendChild(el("span", "cap " + c, c === "thinking" ? "think" : c));
+    card.appendChild(chead);
+    card.appendChild(el("div", "mc-sub", repo + " · " + d.kind + " · ctx "
+      + (d.native_ctx || 0).toLocaleString()
+      + (d.mmproj ? " · mmproj included" : "")
+      + (d.split_skipped ? " · " + d.split_skipped + " split files skipped"
+          : "")));
+    const rec = d.recommended || recommendedQuant(d.ggufs);
+    for (const q of d.ggufs) {
+      const row = el("div", "quant-row" + (q.quant === rec ? " rec-row" : ""));
+      const ql = el("span", "q", q.quant);
+      ql.title = quantHelp(q.quant);
+      row.appendChild(ql);
+      if (q.quant === rec) {
+        const tag = el("span", "rec-tag", "★ Recommended");
+        tag.title = "Best quality that still runs at GPU speed on your machine";
+        row.appendChild(tag);
+      }
+      row.appendChild(el("span", "sz", fmtGB(q.bytes)));
+      row.appendChild(fitBadge(q.fit));
+      card.appendChild(row);
+    }
+    card.appendChild(quantLegend());
+    const acts = el("div", "mc-acts");
+    if (d.already) {
+      acts.appendChild(el("span", "dim", "already in your library"));
+    } else {
+      const add = el("button", "act primary", "Add to library");
+      add.onclick = async () => {
+        add.disabled = true;
+        try { await api("POST", "/api/hf/add", {repo}); add.textContent = "Added ✓"; }
+        catch (e) { add.disabled = false; alert(e.message); }
+      };
+      acts.appendChild(add);
+    }
+    const back = el("button", "act", "Back to results");
+    back.onclick = () => doSearch();
+    acts.appendChild(back);
+    card.appendChild(acts);
+    hfBox.appendChild(card);
+  };
+  const doSearch = async () => {
+    const g = ++hfGen;
+    const q = hfIn.value.trim();
+    if (!q) { hfBox.innerHTML = ""; return; }
+    hfBox.innerHTML = "";
+    hfBox.appendChild(el("p", "dim", "searching…"));
+    let rows = [];
+    try { rows = await api("GET", "/api/hf/search?q=" + encodeURIComponent(q)); }
+    catch (e) {
+      if (g !== hfGen) return;
+      hfBox.innerHTML = "";
+      hfBox.appendChild(el("p", "drop-status err", e.message));
+      return;
+    }
+    if (g !== hfGen) return;
+    hfBox.innerHTML = "";
+    if (!rows.length) {
+      hfBox.appendChild(el("p", "dim", "no gguf models found"));
+      return;
+    }
+    for (const r of rows) {
+      const b = el("button", "hf-row");
+      b.type = "button";
+      b.appendChild(el("span", "repo", r.repo));
+      b.appendChild(el("span", "meta", "↓ " + (r.downloads || 0).toLocaleString()
+        + (r.likes ? "  ♥ " + r.likes : "")));
+      b.onclick = () => hfDetail(r.repo);
+      hfBox.appendChild(b);
+    }
+  };
+  hfBtn.onclick = doSearch;
+  hfIn.onkeydown = (e) => { if (e.key === "Enter") doSearch(); };
+
+  const inst = el("div", "mv-panel");
+  inst.appendChild(el("h3", "", "Install your own"));
   const zone = el("div", "drop-zone");
   zone.appendChild(el("div", "big", "Drop a .gguf here"));
   zone.appendChild(el("div", "dim",
     "Fine-tunes welcome — Rigma reads the file's own header to size it. " +
     "For a vision projector (mmproj-*.gguf), install its model first."));
-  const zStatus = el("div", "drop-status");   // shared by drop + path installs
+  const zStatus = el("div", "drop-status");
   const doInstall = async (run) => {
     try {
       const j = await run();
       zStatus.textContent = "installed: " + j.slug;
       zStatus.className = "drop-status ok";
-      renderModelsTab();
+      reload();
     } catch (e) {
       zStatus.textContent = e.message;
       zStatus.className = "drop-status err";
@@ -549,10 +773,10 @@ async function renderModelsTab() {
       zStatus.className = "drop-status";
     }));
   };
-  box.appendChild(zone);
+  inst.appendChild(zone);
   const pathRow = el("div", "path-row");
   const pathIn = el("input");
-  pathIn.placeholder = "…or paste a file path (file is MOVED into Rigma's folder)";
+  pathIn.placeholder = "…or paste a file path (moved into Rigma's folder)";
   const pathBtn = el("button", "act", "Install");
   pathBtn.onclick = () => {
     const p = pathIn.value.trim();
@@ -560,203 +784,29 @@ async function renderModelsTab() {
   };
   pathIn.onkeydown = (e) => { if (e.key === "Enter") pathBtn.onclick(); };
   pathRow.append(pathIn, pathBtn);
-  box.appendChild(pathRow);
-  box.appendChild(zStatus);
+  inst.appendChild(pathRow);
+  inst.appendChild(zStatus);
 
-  // Hugging Face browser: search anything, fit-check before download
-  box.appendChild(el("h3", "", "Find models on Hugging Face"));
-  const hfRow = el("div", "path-row");
-  const hfIn = el("input");
-  hfIn.placeholder = "Search all gguf models on Hugging Face…";
-  const hfBtn = el("button", "act", "Search");
-  hfRow.append(hfIn, hfBtn);
-  box.appendChild(hfRow);
-  const hfBox = el("div", "hf-results");
-  box.appendChild(hfBox);
-  let hfGen = 0;   // out-of-order search/detail responses must not clobber
-  const hfDetail = async (repo) => {
-    const g = ++hfGen;
-    hfBox.innerHTML = "";
-    hfBox.appendChild(el("p", "dim",
-      "reading " + repo + "'s header remotely (a few MB, not the model)…"));
-    let d = null;
-    try { d = await api("GET", "/api/hf/repo?id=" + encodeURIComponent(repo)); }
-    catch (e) {
-      if (g !== hfGen) return;
-      hfBox.innerHTML = "";
-      hfBox.appendChild(el("p", "drop-status err", e.message));
-      return;
-    }
-    if (g !== hfGen) return;
-    hfBox.innerHTML = "";
-    const card = el("div", "model-card");
-    const head = el("div", "mc-head");
-    head.appendChild(el("span", "mc-name", d.name));
-    for (const c of d.capabilities || [])
-      head.appendChild(el("span", "cap " + c, c === "thinking" ? "think" : c));
-    card.appendChild(head);
-    card.appendChild(el("div", "mc-sub", repo + " · " + d.kind + " · ctx "
-      + (d.native_ctx || 0).toLocaleString()
-      + (d.mmproj ? " · mmproj included" : "")
-      + (d.split_skipped ? " · " + d.split_skipped + " split files skipped" : "")));
-    const rec = d.recommended || recommendedQuant(d.ggufs);
-    for (const q of d.ggufs) {
-      const row = el("div", "quant-row" + (q.quant === rec ? " rec-row" : ""));
-      const ql = el("span", "q", q.quant);
-      ql.title = quantHelp(q.quant);       // hover: what this quant means
-      row.appendChild(ql);
-      if (q.quant === rec) {
-        const tag = el("span", "rec-tag", "★ Recommended");
-        tag.title = "Best quality that still runs at GPU speed on your machine";
-        row.appendChild(tag);
-      }
-      row.appendChild(el("span", "sz", fmtGB(q.bytes)));
-      row.appendChild(fitBadge(q.fit));
-      card.appendChild(row);
-    }
-    card.appendChild(quantLegend());
-    const acts = el("div", "drawer-acts");
-    if (d.already) {
-      acts.appendChild(el("span", "dim", "already in your library"));
-    } else {
-      const add = el("button", "act", "Add to library");
-      add.onclick = async () => {
-        add.disabled = true;
-        try {
-          await api("POST", "/api/hf/add", {repo});
-          // keep the detail card in view (don't nuke the user's browse state);
-          // just mark it added — the model now appears in the list below too
-          add.textContent = "Added ✓";
-        } catch (e) { add.disabled = false; alert(e.message); }
-      };
-      acts.appendChild(add);
-    }
-    const back = el("button", "act", "Back to results");
-    back.onclick = () => doSearch();
-    acts.appendChild(back);
-    card.appendChild(acts);
-    hfBox.appendChild(card);
-  };
-  const doSearch = async () => {
-    const g = ++hfGen;
-    const q = hfIn.value.trim();
-    if (!q) { hfBox.innerHTML = ""; return; }
-    hfBox.innerHTML = "";
-    hfBox.appendChild(el("p", "dim", "searching…"));
-    let rows = [];
-    try { rows = await api("GET", "/api/hf/search?q=" + encodeURIComponent(q)); }
-    catch (e) {
-      if (g !== hfGen) return;
-      hfBox.innerHTML = "";
-      hfBox.appendChild(el("p", "drop-status err", e.message));
-      return;
-    }
-    if (g !== hfGen) return;
-    hfBox.innerHTML = "";
-    if (!rows.length) { hfBox.appendChild(el("p", "dim", "no gguf models found")); return; }
-    for (const r of rows) {
-      const b = el("button", "hf-row");
-      b.type = "button";
-      b.appendChild(el("span", "repo", r.repo));
-      b.appendChild(el("span", "meta", "↓ " + (r.downloads || 0).toLocaleString()
-        + (r.likes ? "  ♥ " + r.likes : "")));
-      b.onclick = () => hfDetail(r.repo);
-      hfBox.appendChild(b);
-    }
-  };
-  hfBtn.onclick = doSearch;
-  hfIn.onkeydown = (e) => { if (e.key === "Enter") doSearch(); };
+  tools.append(find, inst);
+  body.appendChild(tools);
 
-  // model cards
-  box.appendChild(el("h3", "", "Models"));
-  let anyPulling = false;
-  for (const m of data.models) {
-    const card = el("div", "model-card" + (m.running ? " running" : ""));
-    const head = el("div", "mc-head");
-    head.appendChild(el("span", "mc-name", m.slug));
-    if (m.running) head.appendChild(el("span", "badge live", "RUNNING"));
-    if (m.custom) head.appendChild(el("span", "badge", "custom"));
-    for (const c of m.capabilities || [])
-      head.appendChild(el("span", "cap " + c, c === "thinking" ? "think" : c));
-    card.appendChild(head);
-    card.appendChild(el("div", "mc-sub", m.family + " · " + m.kind + " · ctx "
-      + (m.native_ctx || 0).toLocaleString()
-      + (m.mmproj ? " · mmproj " + (m.mmproj.on_disk ? "on disk" : "not downloaded") : "")));
-    const onDisk = m.quants.some((q) => q.on_disk);
-    for (const q of m.quants) {
-      const row = el("div", "quant-row");
-      row.appendChild(el("span", "dot" + (q.on_disk ? " on" : "")));
-      const ql = el("span", "q", q.quant);
-      ql.title = quantHelp(q.quant);       // hover: what this quant means
-      row.appendChild(ql);
-      row.appendChild(el("span", "sz", fmtGB(q.bytes)));
-      if (q.pull && q.pull.status === "downloading") {
-        anyPulling = true;
-        const pct = q.pull.total ? Math.round(100 * (q.pull.done || 0) / q.pull.total) : 0;
-        const bar = el("span", "pull-bar");
-        bar.appendChild(el("span", "fill")).style.width = pct + "%";
-        row.appendChild(bar);
-        row.appendChild(el("span", "sz", pct + "%"));
-      } else if (q.pull && q.pull.status === "error") {
-        const err = el("span", "err", q.pull.error || "download failed");
-        row.appendChild(err);
-      } else if (!q.on_disk && !m.custom) {
-        const dl = el("button", "act mini", "Download");
-        dl.onclick = async () => {
-          dl.disabled = true;
-          try { await api("POST", "/api/models/" + m.slug + "/pull", {file: q.file}); }
-          catch (e) { alert(e.message); }
-          renderModelsTab();
-        };
-        row.appendChild(dl);
-      } else if (q.on_disk) {
-        const del = el("button", "clear", "✕");
-        del.title = "Delete " + q.file + " from disk";
-        del.setAttribute("aria-label", del.title);
-        del.onclick = async () => {
-          if (!confirm("Delete " + q.file + " (" + fmtGB(q.bytes) + ") from disk?")) return;
-          try {
-            await api("DELETE", "/api/models/" + m.slug + "/files/"
-                      + encodeURIComponent(q.file));
-          } catch (e) { alert(e.message); }
-          renderModelsTab();
-        };
-        row.appendChild(del);
-      }
-      card.appendChild(row);
-    }
-    const acts = el("div", "drawer-acts");
-    if (!m.running && onDisk) {
-      const run = el("button", "act", "Run this model");
-      run.onclick = () => doSwitch(m.slug);
-      acts.appendChild(run);
-    }
-    if (m.custom) {
-      const caps = el("button", "act", "Edit capabilities");
-      caps.onclick = () => renderCapsEditor(m);
-      acts.appendChild(caps);
-      const rm = el("button", "act danger", "Remove");
-      rm.onclick = async () => {
-        if (!confirm("Remove " + m.slug + " and delete its files from disk?")) return;
-        try { await api("DELETE", "/api/models/" + m.slug); }
-        catch (e) { alert(e.message); }
-        renderModelsTab();
-      };
-      acts.appendChild(rm);
-    }
-    if (acts.childNodes.length) card.appendChild(acts);
-    box.appendChild(card);
-  }
-  if (anyPulling)
+  // your models — the grid
+  body.appendChild(el("h3", "mv-section", "Your models"));
+  const grid = el("div", "model-grid");
+  for (const m of data.models) grid.appendChild(libraryCard(m, reload));
+  body.appendChild(grid);
+
+  if (data.models.some((m) =>
+        m.quants.some((q) => q.pull && q.pull.status === "downloading")))
     modelsPollTimer = setTimeout(() => {
-      if (activeTab === "models" && !$("drawer").hidden) renderModelsTab();
+      if (!$("models-view").hidden) renderModelsView();
     }, 1500);
 }
 
 function renderCapsEditor(m) {
-  const box = $("drawer-body");
+  const box = $("mv-body");
   box.innerHTML = "";
-  box.appendChild(el("h3", "", m.slug + " — capabilities"));
+  box.appendChild(el("h3", "mv-section", m.slug + " — capabilities"));
   box.appendChild(el("p", "dim",
     "Header-derived guesses; correct them if the model card says otherwise. " +
     "Vision needs an attached mmproj."));
@@ -776,11 +826,11 @@ function renderCapsEditor(m) {
     try {
       await api("PATCH", "/api/models/" + m.slug,
                 {capabilities: [...picked]});
-      renderModelsTab();
+      renderModelsView();
     } catch (e) { alert(e.message); }
   };
   const back = el("button", "act", "Back");
-  back.onclick = renderModelsTab;
+  back.onclick = renderModelsView;
   acts.append(save, back);
   box.appendChild(acts);
 }
