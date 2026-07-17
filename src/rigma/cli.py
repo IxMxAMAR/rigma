@@ -415,6 +415,54 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
 
 
 @app.command()
+def sweep(use_case: str = typer.Option("general", "--use-case"),
+          model: str = typer.Option(None, "--model"),
+          port: int = typer.Option(11601, "--port",
+                                   help="Scratch port for the trial engine — "
+                                        "NOT your live server"),
+          prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
+          gen_tokens: int = typer.Option(96, "--gen-tokens")):
+    """A/B every speedup on THIS machine and save the winner to calibration.
+
+    Launches a throwaway engine on a scratch port (default 11601) and measures
+    baseline vs FA-off, quantized KV, big prefill batch, coopmat-off, and (for
+    MoE) graphics-queue / lighter offload. The fastest config is written to
+    ~/.rigma/calibration.json, which `rigma up` then applies automatically.
+    Your running server is never touched."""
+    from . import runtime
+    from .bench import run_sweep
+
+    reg = Registry.load()
+    p = _profile(reg)
+    try:
+        rp = resolve(p, reg, use_case=use_case, model_override=model)
+    except ResolveError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1) from None
+    os_name = {"Windows": "windows", "Linux": "linux",
+               "Darwin": "darwin"}[platform.system()]
+    typer.echo(f"sweeping {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
+               f"(scratch engine on :{port}, live server untouched)")
+    exe = runtime.ensure_engine(rp.backend, os_name)
+    model_path = runtime.ensure_model(rp.gguf)
+    rows = run_sweep(rp, exe, model_path, port=port,
+                     prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
+                     progress=lambda label: typer.echo(f"  trying {label} ..."))
+    typer.echo("\n  config             gen t/s   prefill t/s")
+    typer.echo("  " + "-" * 40)
+    for r in rows:
+        mark = "" if r["ok"] else "  (failed)"
+        typer.echo(f"  {r['label']:<18} {r['tg_tps']:>6.1f}   "
+                   f"{r['pp_tps']:>8.0f}{mark}")
+    best = next((r for r in rows if r["ok"] and r["flags"]), None)
+    if best:
+        typer.echo(f"\nwinner: {best['label']} {best['flags']} "
+                   f"-> saved to calibration; `rigma up` will use it")
+    else:
+        typer.echo("\nbaseline stays best — no override saved")
+
+
+@app.command()
 def unload():
     """Stop the engine to free VRAM/RAM. The UI stays up for reload."""
     from . import server_ops
