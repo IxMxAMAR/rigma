@@ -30,13 +30,13 @@ hf_browse.inspect_repo = lambda rid, registry=None: {
     "native_ctx": 131072, "capabilities": ["tools", "vision"],
     "already": False, "mmproj": {"file": "mmproj-F16.gguf",
                                  "bytes": 800 * 2**20},
-    "split_skipped": 1,
+    "split_skipped": 1, "recommended": "Q4_K_M",
     "ggufs": [
+        {"file": "WebTune-Q8_0.gguf", "quant": "Q8_0", "bytes": 30 * 2**30,
+         "fit": {"ok": True, "ctx": 8192, "n_cpu_moe": 0, "speed": "offload"}},
         {"file": "WebTune-Q4_K_M.gguf", "quant": "Q4_K_M",
          "bytes": 4 * 2**30, "fit": {"ok": True, "ctx": 131072,
-                                     "n_cpu_moe": 0}},
-        {"file": "WebTune-Q8_0.gguf", "quant": "Q8_0", "bytes": 30 * 2**30,
-         "fit": {"ok": False}},
+                                     "n_cpu_moe": 0, "speed": "gpu"}},
     ]}
 
 
