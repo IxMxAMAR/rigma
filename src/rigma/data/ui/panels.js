@@ -411,6 +411,34 @@ async function renderServerTab() {
 /* ---------- models tab: the hangar ---------- */
 function fmtGB(bytes) { return (bytes / 2 ** 30).toFixed(1) + " GB"; }
 
+// collapsible "what do these mean?" glossary for gguf quant names
+function quantLegend() {
+  const box = el("details", "quant-legend");
+  const sum = el("summary", "", "What do Q4, IQ4_XS, K vs I mean?");
+  box.appendChild(sum);
+  const rows = [
+    ["The number (Q2…Q8)", "bits per weight. Higher = better quality + " +
+      "bigger file. Q4 is the usual sweet spot; below Q3 quality drops off."],
+    ["Q_K (K-quant)", "classic block quantization — well-tested, maximally " +
+      "compatible, a touch faster raw."],
+    ["IQ (i-quant)", "uses an importance matrix to spend bits where they " +
+      "matter — smaller file for the same quality, tiny extra GPU compute."],
+    ["_S / _M / _L / _XS", "size within a level: XS/S small, M balanced, L " +
+      "largest/best. (Some uploaders add their own suffix like _P.)"],
+    ["UD- (Unsloth Dynamic)", "per-tensor bit allocation for better quality " +
+      "at the same size."],
+    ["F16 / BF16", "16-bit, full quality, largest — overkill for chat."],
+    ["★", "the best-quality quant that still fits your machine."],
+  ];
+  for (const [k, v] of rows) {
+    const r = el("div", "gl-row");
+    r.appendChild(el("span", "gl-k", k));
+    r.appendChild(el("span", "gl-v", v));
+    box.appendChild(r);
+  }
+  return box;
+}
+
 function uploadGguf(file, attachTo, onProg) {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
@@ -553,9 +581,17 @@ async function renderModelsTab() {
       + (d.native_ctx || 0).toLocaleString()
       + (d.mmproj ? " · mmproj included" : "")
       + (d.split_skipped ? " · " + d.split_skipped + " split files skipped" : "")));
+    const rec = recommendedQuant(d.ggufs);
     for (const q of d.ggufs) {
       const row = el("div", "quant-row");
-      row.appendChild(el("span", "q", q.quant));
+      const ql = el("span", "q", q.quant);
+      ql.title = quantHelp(q.quant);       // hover: what this quant means
+      row.appendChild(ql);
+      if (q.quant === rec) {
+        const star = el("span", "rec", "★");
+        star.title = "Best quality that fits your machine";
+        row.appendChild(star);
+      }
       row.appendChild(el("span", "sz", fmtGB(q.bytes)));
       const fit = q.fit && q.fit.ok
         ? el("span", "fit ok", "fits — ~" + Math.round(q.fit.ctx / 1024) + "K ctx")
@@ -563,6 +599,7 @@ async function renderModelsTab() {
       row.appendChild(fit);
       card.appendChild(row);
     }
+    card.appendChild(quantLegend());
     const acts = el("div", "drawer-acts");
     if (d.already) {
       acts.appendChild(el("span", "dim", "already in your library"));
@@ -634,7 +671,9 @@ async function renderModelsTab() {
     for (const q of m.quants) {
       const row = el("div", "quant-row");
       row.appendChild(el("span", "dot" + (q.on_disk ? " on" : "")));
-      row.appendChild(el("span", "q", q.quant));
+      const ql = el("span", "q", q.quant);
+      ql.title = quantHelp(q.quant);       // hover: what this quant means
+      row.appendChild(ql);
       row.appendChild(el("span", "sz", fmtGB(q.bytes)));
       if (q.pull && q.pull.status === "downloading") {
         anyPulling = true;
