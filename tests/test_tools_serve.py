@@ -143,3 +143,50 @@ def test_malformed_tool_args_fed_back_not_executed(home, bad_upstream):
     assert "malformed JSON" in r.text          # error surfaced to the model
     assert "fix the JSON" in r.text            # instructional
     assert '"delta": "done"' in r.text         # still reached a final answer
+
+
+class _AlwaysToolUpstream(BaseHTTPRequestHandler):
+    """Model that NEVER stops calling a tool. Records whether each request
+    carried tool defs (the last round must still advertise tools so a stray
+    call is parsed, not leaked as raw text)."""
+    reqs = []
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        body = json.loads(self.rfile.read(n))
+        _AlwaysToolUpstream.reqs.append("tools" in body)
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(b"data: " + json.dumps({"choices": [{"delta": {
+            "tool_calls": [{"index": 0, "id": "c1", "type": "function",
+                            "function": {"name": "calculator",
+                                         "arguments": '{"expression":"1+1"}'}}]}}]}
+            ).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def always_upstream():
+    _AlwaysToolUpstream.reqs = []
+    srv = HTTPServer(("127.0.0.1", 0), _AlwaysToolUpstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
+
+
+def test_runaway_tool_loop_keeps_tools_on_last_round(home, always_upstream):
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=always_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200
+    assert "<tool_call>" not in r.text            # never leaks raw call text
+    assert "<function=" not in r.text
+    reqs = _AlwaysToolUpstream.reqs
+    assert len(reqs) == 10                        # bounded at max_rounds
+    assert all(reqs)                              # EVERY round advertised tools
