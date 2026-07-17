@@ -197,3 +197,24 @@ def test_repo_files_requests_recursive_tree(monkeypatch, home):
     monkeypatch.setattr(hf_browse, "_get_json", _get)
     hf_browse.repo_files("a/b")
     assert seen["params"] == {"recursive": "true"}
+
+
+def test_mtp_and_draft_ggufs_excluded_from_quants(monkeypatch, home):
+    """User-reported 2026-07-18 (HauhauCS Gemma4-26B-A4B ...-MTP): the repo
+    ships an mtp-*.gguf draft head. Left in, it shows as a phantom 0.2GB
+    'quant' AND — being smallest — becomes the header-probe source, making a
+    26B MoE read as 'dense'. Must be filtered like split/imatrix files."""
+    tree = [
+        {"path": "Gemma4-26B-A4B-...-Q4_K_M.gguf", "size": 16018 * 2**20},
+        {"path": "mmproj-Gemma4-26B-A4B-...-BF16.gguf", "size": 1139 * 2**20},
+        {"path": "mtp-gemma-4-26B-A4B-it.gguf", "size": 240 * 2**20},
+        {"path": "model-imatrix.gguf", "size": 10 * 2**20},
+        {"path": "eagle-draft-head.gguf", "size": 50 * 2**20},
+    ]
+    monkeypatch.setattr(hf_browse, "_get_json", lambda p, params=None: tree)
+    rf = hf_browse.repo_files("HauhauCS/x")
+    files = [g["file"] for g in rf["ggufs"]]
+    assert files == ["Gemma4-26B-A4B-...-Q4_K_M.gguf"]   # only the real model
+    assert "mtp" not in " ".join(files).lower()
+    assert "eagle" not in " ".join(files).lower()
+    assert rf["mmproj"] is not None                       # projector still found
