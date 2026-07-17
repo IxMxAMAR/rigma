@@ -368,16 +368,22 @@ def _recall(args, ctx):
 
 @tool("find_files",
       "Find files by glob pattern inside the workspace (e.g. '**/*.py', "
-      "'src/*.js'). Like a file search.",
+      "'src/*.js'). Like a file search. Returns up to 200 paths; if more match, "
+      "the total is reported so you know to narrow the pattern.",
       {"type": "object", "properties": {
           "pattern": {"type": "string"}}, "required": ["pattern"]},
       needs="workspace")
 def _find_files(args, ctx):
     root = _ws_path(ctx, ".")
     pat = str(args.get("pattern", "*"))
-    hits = [str(p.relative_to(root).as_posix())
-            for p in sorted(root.glob(pat))[:200] if p.is_file()]
-    return "\n".join(hits) if hits else f"no files match {pat}"
+    all_hits = [p for p in sorted(root.glob(pat)) if p.is_file()]
+    hits = [p.relative_to(root).as_posix() for p in all_hits[:200]]
+    if not hits:
+        return f"no files match {pat}"
+    body = "\n".join(hits)
+    if len(all_hits) > 200:
+        body += f"\n…(showing 200 of {len(all_hits)} matches — narrow the pattern)"
+    return body
 
 
 @tool("grep",
@@ -439,7 +445,8 @@ def _edit_file(args, ctx):
 
 
 @tool("read_file",
-      "Read a text file inside the chat's workspace folder.",
+      "Read a text file inside the chat's workspace folder. Returns up to the "
+      "first 20000 characters (marked if truncated).",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "path relative to the "
                    "workspace"}}, "required": ["path"]},
@@ -450,11 +457,16 @@ def _read_file(args, ctx):
         return f"error: no such file: {args.get('path')}"
     if p.stat().st_size > 400_000:
         return "error: file too large to read"
-    return p.read_text(encoding="utf-8", errors="replace")[:20000]
+    text = p.read_text(encoding="utf-8", errors="replace")
+    if len(text) > 20000:
+        return text[:20000] + "\n…(truncated at 20000 chars)"
+    return text
 
 
 @tool("list_directory",
-      "List files and folders inside the chat's workspace folder.",
+      "List files and folders inside the chat's workspace folder. Shows up to "
+      "200 entries; the true total is always reported (use find_files or "
+      "run_python to work with large folders).",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "folder path relative to "
                    "the workspace (default: root)"}}},
@@ -464,8 +476,15 @@ def _list_dir(args, ctx):
     if not p.is_dir():
         return f"error: not a folder: {args.get('path')}"
     items = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-    return "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
-                     for x in items[:200]) or "(empty)"
+    if not items:
+        return "(empty)"
+    body = "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
+                     for x in items[:200])
+    if len(items) > 200:
+        body += f"\n…(showing 200 of {len(items)} entries)"
+    else:
+        body += f"\n({len(items)} entries)"
+    return body
 
 
 @tool("write_file",
@@ -486,7 +505,8 @@ def _write_file(args, ctx):
 
 @tool("run_python",
       "Run a short Python 3 snippet and return its stdout/stderr. For "
-      "calculations, data wrangling, quick checks.",
+      "calculations, data wrangling, quick checks. 30s limit; output is capped "
+      "at ~8000 chars, so print summaries/samples rather than everything.",
       {"type": "object", "properties": {
           "code": {"type": "string", "description": "the Python source to run"}},
        "required": ["code"]},
@@ -497,7 +517,8 @@ def _run_python(args, ctx):
 
 
 @tool("run_shell",
-      "Run a shell command and return its output. Use sparingly.",
+      "Run a shell command and return its output. Use sparingly. 30s limit; "
+      "output capped at ~8000 chars.",
       {"type": "object", "properties": {
           "command": {"type": "string"}}, "required": ["command"]},
       safe=False, needs="code")
