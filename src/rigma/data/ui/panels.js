@@ -513,7 +513,7 @@ function quantRow(m, q, reload) {
     row.appendChild(el("span", "sz", pct + "%"));
   } else if (q.pull && q.pull.status === "error") {
     row.appendChild(el("span", "err", q.pull.error || "download failed"));
-  } else if (!q.on_disk && !m.custom) {
+  } else if (!q.on_disk && q.pullable) {
     const dl = el("button", "act mini", "Download");
     dl.onclick = async () => {
       dl.disabled = true;
@@ -523,6 +523,8 @@ function quantRow(m, q, reload) {
       reload();
     };
     row.appendChild(dl);
+  } else if (!q.on_disk && !q.pullable) {
+    row.appendChild(el("span", "err", "local-only — can't re-download"));
   } else if (q.on_disk) {
     const del = el("button", "clear", "✕");
     del.title = "Delete " + q.file + " from disk";
@@ -558,24 +560,34 @@ function libraryCard(m, reload) {
 
   const onDisk = m.quants.filter((q) => q.on_disk);
   const pulling = m.quants.find((q) => q.pull && q.pull.status === "downloading");
-  const primary = el("div", "mc-primary");
   if (pulling) {
-    primary.appendChild(quantRow(m, pulling, reload));
+    const p = el("div", "mc-primary");
+    p.appendChild(quantRow(m, pulling, reload));
+    card.appendChild(p);
   } else if (onDisk.length) {
-    const q = onDisk[0], ql = el("span", "q", q.quant);
+    const q = onDisk[0], p = el("div", "mc-primary");
+    const ql = el("span", "q", q.quant);
     ql.title = quantHelp(q.quant);
-    primary.appendChild(el("span", "dot on"));
-    primary.append(ql, el("span", "sz", fmtGB(q.bytes) + " · ready"));
-  } else {
-    primary.className = "mc-primary dim";
-    primary.textContent = "not downloaded — pick a quant below";
+    p.appendChild(el("span", "dot on"));
+    p.append(ql, el("span", "sz", fmtGB(q.bytes) + " · ready"));
+    card.appendChild(p);
   }
-  card.appendChild(primary);
 
-  if (m.quants.length > (onDisk.length ? 1 : 0)) {
+  // nothing on disk yet -> lead with the download options, expanded, so the
+  // one thing you can do (get the model) is right there, not hidden
+  const remaining = m.quants.filter((q) => !q.on_disk);
+  if (remaining.length) {
     const det = el("details", "mc-quants");
-    det.appendChild(el("summary", "", m.quants.length + " quant"
-      + (m.quants.length > 1 ? "s" : "") + " — download or remove"));
+    if (!onDisk.length) det.open = true;
+    const pull = remaining.some((q) => q.pullable);
+    det.appendChild(el("summary", "",
+      onDisk.length ? m.quants.length + " quants — manage"
+        : (pull ? "Download a quant ↓" : "not on disk")));
+    for (const q of m.quants) det.appendChild(quantRow(m, q, reload));
+    card.appendChild(det);
+  } else if (onDisk.length > 1) {
+    const det = el("details", "mc-quants");
+    det.appendChild(el("summary", "", onDisk.length + " quants on disk"));
     for (const q of m.quants) det.appendChild(quantRow(m, q, reload));
     card.appendChild(det);
   }

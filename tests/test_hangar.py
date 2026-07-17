@@ -203,3 +203,17 @@ def test_ensure_model_short_circuits_disk_and_never_fetches_local(home,
                                           bytes=1, quant="LOCAL"))
     finally:
         runtime.hf_hub_download = orig
+
+
+def test_list_models_marks_pullable(home, tmp_path):
+    """User-reported 2026-07-18: no download option for added/registry models.
+    Registry + HF-added models have a real repo (pullable); drag-dropped ones
+    are repo='local' (not)."""
+    hangar.install_model(_dense_gguf(tmp_path))     # drag-drop -> repo 'local'
+    out = hangar.list_models()
+    by = {m["slug"]: m for m in out["models"]}
+    # a bundled registry model's quants are downloadable
+    reg_q = by["qwen3.6-35b-a3b"]["quants"][0]
+    assert reg_q["pullable"] is True and reg_q["on_disk"] is False
+    # the drag-dropped custom's quant is local-only (not re-downloadable)
+    assert by["spicy-tune-8b"]["quants"][0]["pullable"] is False
