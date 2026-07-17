@@ -214,18 +214,19 @@ with sync_playwright() as pw:
         b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
         + struct.pack("<Q", len(kvs)) + b"".join(kvs) + b"\x00" * 128).decode()
 
-    page.click("#gear")
-    page.wait_for_timeout(300)
-    page.click("#drawer-tabs button[data-tab=models]")
+    page.click("#open-models")                 # full main-area Models view
     page.wait_for_timeout(900)
-    check("models tab: disk gauge", page.locator(".disk-gauge").is_visible())
-    check("models tab: drop zone", page.locator(".drop-zone").is_visible())
-    check("models tab: registry cards listed",
-          page.locator(".model-card").count() >= 3)
-    running_card = page.locator(".model-card.running")
-    check("models tab: running model badged",
+    check("models view: opens full-area", page.locator("#models-view")
+          .is_visible())
+    check("models view: disk readout in header",
+          "GB free" in (page.locator("#mv-disk").text_content() or ""))
+    check("models view: drop zone", page.locator(".drop-zone").is_visible())
+    check("models view: model grid cards",
+          page.locator(".model-grid .model-card").count() >= 3)
+    running_card = page.locator(".model-grid .model-card.running")
+    check("models view: running model badged",
           "qwen3.6-35b-a3b" in (running_card.text_content() or ""))
-    check("models tab: vision cap chip on running model",
+    check("models view: vision cap chip on running model",
           running_card.locator(".cap.vision").count() == 1)
 
     # drag-drop a synthetic gguf onto the zone (full upload->install->rerender)
@@ -242,15 +243,15 @@ with sync_playwright() as pw:
     check("hangar: dropped gguf installed",
           page.locator(".model-card", has_text="smoke-drop-1b").count() == 1)
     dropped = page.locator(".model-card", has_text="smoke-drop-1b")
-    check("hangar: custom badge + on-disk dot",
+    check("hangar: custom badge + on-disk quant shown",
           dropped.locator(".badge", has_text="custom").count() == 1
-          and dropped.locator(".dot.on").count() == 1)
+          and dropped.locator(".dot.on").count() >= 1)
 
     # capability editor round-trip
     dropped.locator("button", has_text="Edit capabilities").click()
     page.wait_for_timeout(300)
     page.locator(".cap-row", has_text="tools").locator("input").check()
-    page.locator("#drawer-body button", has_text="Save").click()
+    page.locator("#mv-body button", has_text="Save").click()
     page.wait_for_timeout(900)
     check("hangar: capability saved",
           page.locator(".model-card", has_text="smoke-drop-1b")
@@ -266,8 +267,8 @@ with sync_playwright() as pw:
 
 
     # ---- Bazaar: HF search -> fit verdicts -> add to library ----
-    page.fill(".path-row input >> nth=1", "webtune")   # HF search box
-    page.locator(".path-row button", has_text="Search").click()
+    page.fill("#mv-body .mv-panel input >> nth=0", "webtune")   # HF search box
+    page.locator(".mv-panel button", has_text="Search").click()
     page.wait_for_timeout(700)
     check("bazaar: search result listed",
           page.locator(".hf-row", has_text="cool/WebTune-GGUF").count() == 1)
@@ -294,18 +295,21 @@ with sync_playwright() as pw:
     # the browse panel is preserved (search state not nuked); button confirms
     check("bazaar: add confirms without nuking browse panel",
           page.locator(".hf-results button", has_text="Added").count() == 1)
-    # reopening the Models tab shows it in the library; clean up
-    page.click("#drawer-tabs button[data-tab=chat]")
-    page.click("#drawer-tabs button[data-tab=models]")
+    # refresh the view shows it in the library grid; clean up
+    page.click("#mv-refresh")
     page.wait_for_timeout(1000)
-    added = page.locator(".model-card", has_text="web-tune-7b")
-    check("bazaar: added model in library on reopen",
+    added = page.locator(".model-grid .model-card", has_text="web-tune-7b")
+    check("bazaar: added model in library grid",
           added.count() == 1
           and added.locator(".badge", has_text="custom").count() == 1)
     added.locator("button", has_text="Remove").click()   # keep reruns clean
     page.wait_for_timeout(700)
+    page.click("#mv-close")                     # back to chat
+    page.wait_for_timeout(300)
 
     # ---- Unload: free VRAM/RAM without killing the UI ----
+    page.click("#gear")
+    page.wait_for_timeout(200)
     page.click("#drawer-tabs button[data-tab=server]")
     page.wait_for_timeout(600)
     unload_btn = page.locator("#drawer-body button",
