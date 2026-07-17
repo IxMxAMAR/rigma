@@ -218,3 +218,36 @@ def test_mtp_and_draft_ggufs_excluded_from_quants(monkeypatch, home):
     assert "mtp" not in " ".join(files).lower()
     assert "eagle" not in " ".join(files).lower()
     assert rf["mmproj"] is not None                       # projector still found
+
+
+def test_recommend_picks_speed_sweet_spot_not_biggest(monkeypatch, home):
+    """User-reported 2026-07-18: the ★ was on the LARGEST quant, which only
+    'fits' via heavy RAM offload (slowest). Recommend the best quality that
+    still runs at GPU speed."""
+    from rigma.models import CachePolicy, GgufFile, ModelSpec
+    from rigma.resolve import _budgets
+    # big dense model: only small quants fit on the 16GB GPU
+    def mk(bytes_):
+        return GgufFile(repo="r", file=f"m-{bytes_}.gguf", bytes=bytes_,
+                        quant={30: "Q8_0", 16: "Q4_K_M", 10: "IQ3_M"}[
+                            bytes_ // 2**30])
+    spec = ModelSpec(slug="big", family="f", kind="dense", n_layers=64,
+                     full_attn_layers=64, kv_heads=4, head_dim=256,
+                     native_ctx=262144,
+                     ggufs=[mk(30 * 2**30), mk(16 * 2**30), mk(10 * 2**30)],
+                     use_cases=["general"], cache_type_policy=CachePolicy())
+    monkeypatch.setattr(hf_browse, "_spec_from_repo",
+                        lambda repo: (spec, {"mmproj": None, "split_skipped": 0}))
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    prof = HardwareProfile(
+        gpus=[GpuInfo(vendor="amd", name="x", vram_mb=16368, arch="rdna4",
+                      slug="x", backends=["vulkan"])],
+        ram_mb=49152, ram_free_mb=44000, cpu=CpuInfo(cores=16), os="windows",
+        disk_free_gb=400.0)
+    d = hf_browse.inspect_repo("x/y", profile=prof)
+    speeds = {q["quant"]: q["fit"].get("speed") for q in d["ggufs"]}
+    assert speeds["Q8_0"] == "offload"          # 30GB spills to RAM — slow
+    assert speeds["IQ3_M"] == "gpu"             # 10GB fits on the card — fast
+    # recommend the largest that's GPU/light, NOT the biggest-that-fits
+    assert d["recommended"] != "Q8_0"
+    assert d["recommended"] in ("Q4_K_M", "IQ3_M")

@@ -199,6 +199,9 @@ def inspect_repo(repo: str, registry=None, profile=None) -> dict:
         from . import state as st
         from .server_ops import _free_current
         prof = _free_current(prof, st.read_state() or {}, reg)
+    from .resolve import _budgets
+    usable_vram, _ = _budgets(prof)
+    mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
     quants = []
     for g in spec.ggufs:
         flags = None
@@ -207,16 +210,40 @@ def inspect_repo(repo: str, registry=None, profile=None) -> dict:
             if flags:
                 flags = _grow_ctx(spec, g, prof, flags, [])
                 break
+        # speed tier: how much of the model sits on the GPU. Weights that
+        # spill to RAM run on the CPU every token, so a bigger quant that only
+        # "fits" via heavy offload is SLOWER, not better.
+        speed = "no"
+        if flags:
+            file_mb = g.bytes / 2**20 + mm_mb
+            if file_mb <= usable_vram:
+                speed = "gpu"            # fully on GPU — fast
+            elif file_mb <= usable_vram * 1.15:
+                speed = "light"          # mostly on GPU — still quick
+            else:
+                speed = "offload"        # heavy RAM offload — runs, but slow
         quants.append({"file": g.file, "quant": g.quant, "bytes": g.bytes,
                        "fit": ({"ok": True, "ctx": flags.ctx,
-                                "n_cpu_moe": flags.n_cpu_moe}
+                                "n_cpu_moe": flags.n_cpu_moe, "speed": speed}
                                if flags else {"ok": False})})
     return {"repo": repo, "name": spec.slug, "family": spec.family,
             "kind": spec.kind, "native_ctx": spec.native_ctx,
             "capabilities": spec.capabilities,
             "already": spec.slug in reg.models,
             "mmproj": rf["mmproj"], "split_skipped": rf["split_skipped"],
-            "ggufs": quants}
+            "ggufs": quants, "recommended": _recommend(quants)}
+
+
+def _recommend(quants: list[dict]) -> str | None:
+    """Best QUALITY that still runs at GPU speed. quants are largest-first, so
+    quality descends down the list; prefer a quant that fits on the GPU (or
+    only lightly offloads) over a bigger one that spills to RAM and crawls."""
+    fast = [q for q in quants
+            if q["fit"].get("ok") and q["fit"].get("speed") in ("gpu", "light")]
+    if fast:
+        return fast[0]["quant"]      # largest fast-enough = best quality @ speed
+    fits = [q for q in quants if q["fit"].get("ok")]
+    return fits[-1]["quant"] if fits else None   # else the least-offloaded
 
 
 def add_model(repo: str, registry=None) -> ModelSpec:

@@ -273,16 +273,20 @@ with sync_playwright() as pw:
           page.locator(".hf-row", has_text="cool/WebTune-GGUF").count() == 1)
     page.locator(".hf-row").first.click()
     page.wait_for_timeout(700)
-    check("bazaar: fit verdicts rendered (one fits, one too big)",
+    check("bazaar: fit verdicts rendered (gpu-fast vs slow offload)",
           page.locator(".fit.ok").count() == 1
-          and page.locator(".fit.no").count() == 1)
+          and page.locator(".fit.warn").count() == 1)
     check("bazaar: caps + mmproj surfaced",
           "mmproj included" in (page.locator(".hf-results").text_content() or ""))
     check("bazaar: quant tooltip present",
           bool(page.locator(".hf-results .quant-row .q").first
                .get_attribute("title")))
-    check("bazaar: recommended star on best-fitting quant",
-          page.locator(".hf-results .quant-row .rec").count() == 1)
+    check("bazaar: Recommended tag on the sweet-spot quant (not the biggest)",
+          page.locator(".hf-results .rec-tag").count() == 1
+          and "Q4_K_M" in (page.locator(".hf-results .rec-row")
+                           .text_content() or ""))
+    check("bazaar: offload quant flagged slow (warn), gpu quant ok",
+          page.locator(".hf-results .fit.warn").count() == 1)
     check("bazaar: quant glossary present",
           page.locator(".quant-legend").count() >= 1)
     page.locator(".hf-results button", has_text="Add to library").click()
