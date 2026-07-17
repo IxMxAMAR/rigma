@@ -52,7 +52,8 @@ def test_up_walks_ladder_on_launch_failure(tmp_path, monkeypatch):
         raise RuntimeError("boom: failed to become healthy")
 
     monkeypatch.setattr(runtime, "launch_server", flaky_launch)
-    res = CliRunner().invoke(cli.app, ["up", "--use-case", "coding", "--yes"])
+    res = CliRunner().invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                       "--use-case", "coding", "--yes"])
     assert res.exit_code == 1
     assert attempts[0] == "UD-Q3_K_XL" and attempts[-1] == "Q8_0"
     assert len(attempts) >= 3

@@ -10,6 +10,20 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_hang_on_run_ui(monkeypatch):
+    """serve.run_ui blocks forever serving the UI; a test that reaches it
+    unmocked would hang the ENTIRE suite (and squat on port 11500). Fail fast
+    instead. Tests that intend to exercise `up`'s serving path patch run_ui
+    themselves — their patch runs after this one and wins."""
+    import rigma.serve as serve
+
+    def _boom(*a, **k):
+        raise RuntimeError("serve.run_ui reached in a test without mocking it "
+                           "— `rigma up` was invoked in a way that serves")
+    monkeypatch.setattr(serve, "run_ui", _boom, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_user_custom_models(monkeypatch, tmp_path_factory):
     """The user's real ~/.rigma/custom installs must never leak into tests
     (live repro 2026-07-17: installing SmolLM2 flipped test_floor_never_fails).
