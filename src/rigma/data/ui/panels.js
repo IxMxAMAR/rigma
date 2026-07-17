@@ -409,6 +409,11 @@ async function renderServerTab() {
 
 /* ---------- models tab: the hangar ---------- */
 function fmtGB(bytes) { return (bytes / 2 ** 30).toFixed(1) + " GB"; }
+function fmtEta(sec) {
+  if (sec < 90) return Math.round(sec) + "s";
+  if (sec < 3600) return Math.round(sec / 60) + " min";
+  return (sec / 3600).toFixed(1) + " h";
+}
 
 // fit verdict badge, speed-aware: a bigger quant that only "fits" via heavy
 // RAM offload is slower, not better — say so plainly.
@@ -505,12 +510,17 @@ function quantRow(m, q, reload) {
   row.appendChild(ql);
   row.appendChild(el("span", "sz", fmtGB(q.bytes)));
   if (q.pull && q.pull.status === "downloading") {
-    const pct = q.pull.total
-      ? Math.round(100 * (q.pull.done || 0) / q.pull.total) : 0;
+    const done = q.pull.done || 0, tot = q.pull.total || q.bytes || 1;
+    const pct = Math.round(100 * done / tot);
     const bar = el("span", "pull-bar");
     bar.appendChild(el("span", "fill")).style.width = pct + "%";
     row.appendChild(bar);
-    row.appendChild(el("span", "sz", pct + "%"));
+    const parts = [pct + "%"];
+    if (q.pull.bps) parts.push((q.pull.bps / 2 ** 20).toFixed(1) + " MB/s");
+    const stat = el("span", "sz pull-stat", parts.join(" · "));
+    stat.title = fmtGB(done) + " of " + fmtGB(tot)
+      + (q.pull.eta ? " · ~" + fmtEta(q.pull.eta) + " left" : "");
+    row.appendChild(stat);
   } else if (q.pull && q.pull.status === "error") {
     row.appendChild(el("span", "err", q.pull.error || "download failed"));
   } else if (!q.on_disk && q.pullable) {
@@ -573,22 +583,20 @@ function libraryCard(m, reload) {
     card.appendChild(p);
   }
 
-  // nothing on disk yet -> lead with the download options, expanded, so the
-  // one thing you can do (get the model) is right there, not hidden
-  const remaining = m.quants.filter((q) => !q.on_disk);
-  if (remaining.length) {
+  // the rest of the quants (not the one already shown in the primary line):
+  // lead with downloads expanded when nothing's on disk, else tuck away
+  const shown = pulling || onDisk[0];
+  const rest = m.quants.filter((q) => q !== shown);
+  if (rest.length) {
+    const others = rest.filter((q) => !q.on_disk);
     const det = el("details", "mc-quants");
-    if (!onDisk.length) det.open = true;
-    const pull = remaining.some((q) => q.pullable);
+    if (!onDisk.length && !pulling) det.open = true;
+    const canPull = others.some((q) => q.pullable);
     det.appendChild(el("summary", "",
-      onDisk.length ? m.quants.length + " quants — manage"
-        : (pull ? "Download a quant ↓" : "not on disk")));
-    for (const q of m.quants) det.appendChild(quantRow(m, q, reload));
-    card.appendChild(det);
-  } else if (onDisk.length > 1) {
-    const det = el("details", "mc-quants");
-    det.appendChild(el("summary", "", onDisk.length + " quants on disk"));
-    for (const q of m.quants) det.appendChild(quantRow(m, q, reload));
+      (onDisk.length || pulling) ? rest.length + " more quant"
+        + (rest.length > 1 ? "s" : "") + " — manage"
+        : (canPull ? "Download a quant ↓" : "not on disk")));
+    for (const q of rest) det.appendChild(quantRow(m, q, reload));
     card.appendChild(det);
   }
 
