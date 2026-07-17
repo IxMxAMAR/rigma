@@ -301,13 +301,14 @@ with sync_playwright() as pw:
     # the browse panel is preserved (search state not nuked); button confirms
     check("bazaar: add confirms without nuking browse panel",
           page.locator(".hf-results button", has_text="Added").count() == 1)
-    # refresh the view shows it in the library grid; clean up
-    page.click("#mv-refresh")
+    # the added model shows in Your Models IN REAL TIME (no reload needed)
     page.wait_for_timeout(1000)
     added = page.locator(".model-grid .model-card", has_text="web-tune-7b")
-    check("bazaar: added model in library grid",
+    check("bazaar: added model appears in grid live (no reload)",
           added.count() == 1
           and added.locator(".badge", has_text="custom").count() == 1)
+    check("bazaar: browse panel still intact after add",
+          page.locator(".hf-results .model-card").count() >= 1)
     added.locator("button", has_text="Remove").click()   # keep reruns clean
     page.wait_for_timeout(700)
     page.click("#mv-close")                     # back to chat
