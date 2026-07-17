@@ -335,149 +335,133 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": "no such preset"}, status_code=404)
         return {"ok": True}
 
-    async def _tool_turn(s: dict):
-        """Agentic loop: hand the model its tools, run the calls it makes, feed
-        results back, repeat until it answers. Tool rounds are non-streamed
-        (they're quick); the final answer is chunked out for a live feel."""
-        from . import tools as toolkit
-        from . import rag
-        preset = presets.resolve(s.get("preset_id", ""), registry) \
-            if s.get("preset_id") else None
-        msgs = sessions.build_messages(s, _default_prompt(), preset)
-        ctx = {"allow_code": bool(s.get("allow_code")),
-               "workspace": s.get("workspace") or ""}
-        specs = toolkit.tool_specs(allow_code=ctx["allow_code"],
-                                   has_rag=bool(rag.recorded_sidecar_port()),
-                                   workspace=ctx["workspace"])
-        params = sessions.effective_params(s, preset, _model_defaults())
-        trace, final, failed = [], "", False
-        try:
-            for _round in range(6):
-                body = {"messages": msgs, "tools": specs, "stream": False}
-                body.update(params)
-                resp = await client.post("/v1/chat/completions", json=body)
-                if resp.status_code != 200:
-                    raise RuntimeError(await _upstream_error(resp))
-                msg = resp.json()["choices"][0]["message"]
-                calls = msg.get("tool_calls") or []
-                if not calls:
-                    final = msg.get("content", "") or ""
-                    break
-                msgs.append({"role": "assistant",
-                             "content": msg.get("content") or "",
-                             "tool_calls": calls})
-                for c in calls:
-                    fn = c.get("function", {})
-                    name = fn.get("name", "")
-                    try:
-                        cargs = json.loads(fn.get("arguments") or "{}")
-                    except Exception:
-                        cargs = {}
-                    yield _sse({"name": name, "args": cargs}, event="tool")
-                    result = await asyncio.to_thread(toolkit.run_tool, name,
-                                                     cargs, ctx)
-                    yield _sse({"name": name, "result": result[:400]},
-                               event="tool_result")
-                    trace.append({"name": name, "args": cargs, "result": result})
-                    msgs.append({"role": "tool", "tool_call_id": c.get("id", ""),
-                                 "content": result})
-            else:
-                final = final or "(stopped after several tool calls)"
-        except Exception as e:
-            failed = True
-            yield _sse({"message": str(e) or "tool turn failed"}, event="error")
-        if not failed:
-            for i in range(0, len(final), 24):     # chunk for a streaming feel
-                yield _sse({"delta": final[i:i + 24]})
-            fresh = sessions.load(s["id"])
-            if fresh is None:
-                yield b"data: [DONE]\n\n"
-                return
-            for k in ("title", "system_prompt", "params", "notes", "digest",
-                      "preset_id", "effort", "use_rag", "use_tools",
-                      "allow_code", "workspace", "authors_note",
-                      "authors_note_depth", "archive"):
-                s[k] = fresh.get(k, s.get(k))
-            msg = {"role": "assistant", "content": final}
-            if trace:
-                msg["tool_trace"] = trace
-            s["messages"].append(msg)
-            sessions.save(s)
-        yield b"data: [DONE]\n\n"
-
     async def _llm_turn(s: dict, cont: bool = False):
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
         msgs = sessions.build_messages(s, _default_prompt(), preset)
         # steer the reply's opening: llama-server continues from a trailing
         # assistant message AND echoes that prefix back in its output, so we
-        # must NOT also add it ourselves. Keep the prefill's own formatting
-        # (trailing newlines/fences matter); only whitespace-only is "none".
-        prefill = "" if cont else (s.get("prefill") or "")
+        # must NOT also add it ourselves. Prefill doesn't combine with tools.
+        use_tools = bool(s.get("use_tools")) and not cont
+        prefill = "" if (cont or use_tools) else (s.get("prefill") or "")
         if not prefill.strip():
             prefill = ""
         if prefill:
             msgs = msgs + [{"role": "assistant", "content": prefill}]
-        body = {"messages": msgs, "stream": True,
-                "stream_options": {"include_usage": True}}
-        body.update(sessions.effective_params(s, preset, _model_defaults()))
+        params = sessions.effective_params(s, preset, _model_defaults())
         effort = s.get("effort", "")
-        if effort == "off":
-            # Qwen-style template switch; engines that ignore it are unharmed
-            body["chat_template_kwargs"] = {"enable_thinking": False}
-        elif effort == "on":
-            body["chat_template_kwargs"] = {"enable_thinking": True}
+        specs, tctx, trace = None, None, []
+        if use_tools:
+            from pathlib import Path as _Path
+
+            from . import rag
+            from . import tools as toolkit
+            tctx = {"allow_code": bool(s.get("allow_code")),
+                    "workspace": s.get("workspace") or str(_Path.home())}
+            specs = toolkit.tool_specs(
+                allow_code=tctx["allow_code"],
+                has_rag=bool(rag.recorded_sidecar_port()),
+                workspace=tctx["workspace"])
         text, thinking, failed, resp = "", "", False, None
         usage, timings = {}, {}
-        # (no manual prefill yield — llama-server streams the echoed prefix)
-        try:
-            req = client.build_request("POST", "/v1/chat/completions", json=body)
-            resp = await client.send(req, stream=True)
-            if resp.status_code != 200:
-                # llama-server rejects some requests outright (e.g. prompt
-                # exceeds ctx) with a JSON error body, not an exception —
-                # surface its message or the turn silently vanishes
-                raise RuntimeError(await _upstream_error(resp))
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                payload = line[6:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(payload)
-                except Exception:
-                    continue
-                if "error" in obj:
-                    err = obj["error"]
-                    raise RuntimeError(err.get("message", "upstream error")
-                                       if isinstance(err, dict) else str(err))
-                usage = obj.get("usage") or usage
-                timings = obj.get("timings") or timings
-                try:
-                    d = obj["choices"][0]["delta"]
-                except Exception:
-                    d = {}
-                rdelta = d.get("reasoning_content")
-                if rdelta:
-                    thinking += rdelta
-                    yield _sse({"delta": rdelta}, event="think")
-                delta = d.get("content")
-                if delta:
-                    text += delta
-                    yield _sse({"delta": delta})
-        except Exception as e:
-            failed = True
-            msg = str(e) or "model unreachable"
-            if isinstance(e, httpx.ConnectError):
-                msg = ("the engine is unloaded — load it again from "
-                       "⚙ → Server (or run: rigma load)"
-                       if (st.read_state() or {}).get("unloaded")
-                       else "engine unreachable — check ⚙ → Server → log")
-            yield _sse({"message": msg}, event="error")
-        finally:
-            if resp is not None:
-                await resp.aclose()
+        # agentic loop: stream a round; if the model called tools, run them,
+        # feed results back and stream again; otherwise this round is the answer
+        for _round in range(6 if use_tools else 1):
+            body = {"messages": msgs, "stream": True,
+                    "stream_options": {"include_usage": True}}
+            body.update(params)
+            if specs:
+                body["tools"] = specs
+            if effort == "off":
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+            elif effort == "on":
+                body["chat_template_kwargs"] = {"enable_thinking": True}
+            rtext, calls = "", {}
+            try:
+                req = client.build_request("POST", "/v1/chat/completions",
+                                           json=body)
+                resp = await client.send(req, stream=True)
+                if resp.status_code != 200:
+                    raise RuntimeError(await _upstream_error(resp))
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    payload = line[6:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(payload)
+                    except Exception:
+                        continue
+                    if "error" in obj:
+                        err = obj["error"]
+                        raise RuntimeError(
+                            err.get("message", "upstream error")
+                            if isinstance(err, dict) else str(err))
+                    usage = obj.get("usage") or usage
+                    timings = obj.get("timings") or timings
+                    try:
+                        d = obj["choices"][0]["delta"]
+                    except Exception:
+                        d = {}
+                    rdelta = d.get("reasoning_content")
+                    if rdelta:
+                        thinking += rdelta
+                        yield _sse({"delta": rdelta}, event="think")
+                    for tc in d.get("tool_calls") or []:   # accumulate by index
+                        slot = calls.setdefault(tc.get("index", 0),
+                                                {"id": "", "name": "", "args": ""})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            slot["args"] += fn["arguments"]
+                    delta = d.get("content")
+                    if delta:
+                        rtext += delta
+                        yield _sse({"delta": delta})
+            except Exception as e:
+                failed = True
+                msg = str(e) or "model unreachable"
+                if isinstance(e, httpx.ConnectError):
+                    msg = ("the engine is unloaded — load it again from "
+                           "⚙ → Server (or run: rigma load)"
+                           if (st.read_state() or {}).get("unloaded")
+                           else "engine unreachable — check ⚙ → Server → log")
+                yield _sse({"message": msg}, event="error")
+            finally:
+                if resp is not None:
+                    await resp.aclose()
+                    resp = None
+            if failed:
+                break
+            if use_tools and calls:            # the model asked to run tools
+                from . import tools as toolkit
+                msgs.append({"role": "assistant", "content": rtext,
+                             "tool_calls": [
+                                 {"id": c["id"], "type": "function",
+                                  "function": {"name": c["name"],
+                                               "arguments": c["args"]}}
+                                 for c in calls.values()]})
+                for c in calls.values():
+                    try:
+                        cargs = json.loads(c["args"] or "{}")
+                    except Exception:
+                        cargs = {}
+                    yield _sse({"name": c["name"], "args": cargs}, event="tool")
+                    result = await asyncio.to_thread(toolkit.run_tool,
+                                                     c["name"], cargs, tctx)
+                    yield _sse({"name": c["name"], "result": result[:400]},
+                               event="tool_result")
+                    trace.append({"name": c["name"], "args": cargs,
+                                  "result": result})
+                    msgs.append({"role": "tool", "tool_call_id": c["id"],
+                                 "content": result})
+                continue                       # stream the next round
+            text = rtext                       # no tool calls -> this is final
+            break
         if not failed:
             meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}
             if usage.get("prompt_tokens"):
@@ -487,7 +471,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 telemetry["tg"] = timings["predicted_per_second"]
             if len(meta) > 1 or meta["ctx"]:
                 yield _sse(meta, event="meta")
-        if text and not failed:
+        # persist if we have an answer OR tools already ran — a mid-loop
+        # failure must not erase the record of files written / commands run
+        if (text or trace) and not (cont and failed):
             # reload before saving: a minutes-long generation must not
             # clobber title/param/notes edits that landed meanwhile (TOCTOU).
             # Messages stay OUR snapshot + this turn — the turn owns them.
@@ -512,6 +498,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 msg = {"role": "assistant", "content": _with_prefill(prefill, text)}
                 if thinking:
                     msg["thinking"] = thinking
+                if trace:
+                    msg["tool_trace"] = trace
                 if timings.get("predicted_per_second"):
                     msg["stats"] = {
                         "tps": round(timings["predicted_per_second"], 1),
@@ -913,10 +901,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse(
                 {"error": "continue is not available for grounded chats"},
                 status_code=400)
-        if s.get("use_tools") and not s.get("use_rag") \
-                and not body.get("continue"):
-            gen = _tool_turn(s)
-        elif s.get("use_rag"):
+        # _llm_turn now folds in the agentic tool loop (streams each round,
+        # runs any tool_calls, loops) — RAG is the only separate path
+        if s.get("use_rag"):
             gen = _rag_turn(s)
         else:
             gen = _llm_turn(s, cont=bool(body.get("continue")))
