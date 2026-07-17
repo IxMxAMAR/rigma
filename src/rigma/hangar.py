@@ -276,16 +276,17 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
         raise HangarError("custom files can't be re-downloaded — they only "
                           "exist on this machine")
     key = f"{slug}::{file}"
+    repo, want = gguf.repo, gguf.bytes
     with _PULL_LOCK:
         if key in _PULLS and _PULLS[key]["status"] == "downloading":
             return _PULLS[key]
-        _PULLS[key] = {"status": "downloading", "total": gguf.bytes,
+        _PULLS[key] = {"status": "downloading", "total": want, "done": 0,
                        "error": None}
 
     def _run():
-        from .runtime import ensure_model
         try:
-            ensure_model(gguf)
+            _download_file(repo, file, models_dir() / file,
+                           lambda n: _PULLS[key].update(done=n))
             _PULLS[key]["status"] = "done"
         except Exception as e:   # surfaced via /api/models, not lost in a thread
             _PULLS[key].update(status="error", error=str(e).splitlines()[0])
@@ -294,14 +295,53 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
     return _PULLS[key]
 
 
+def _download_file(repo: str, file: str, dest, report) -> int:
+    """Stream a HF file straight to `dest` with resume + live byte reporting.
+
+    Direct httpx (not hf_hub_download) on purpose: we get the exact byte count
+    for a real progress bar, resume works off a plain `.part` file, and it
+    never touches the xet backend that hangs on this box."""
+    import httpx
+    if dest.exists():
+        report(dest.stat().st_size)
+        return dest.stat().st_size
+    tok = os.environ.get("HF_TOKEN", "")
+    headers = {"authorization": f"Bearer {tok}"} if tok else {}
+    part = dest.with_name(dest.name + ".part")
+    have = part.stat().st_size if part.exists() else 0
+    if have:
+        headers["range"] = f"bytes={have}-"
+    url = f"https://huggingface.co/{repo}/resolve/main/{file}"
+    with httpx.stream("GET", url, headers=headers, follow_redirects=True,
+                      timeout=httpx.Timeout(60.0, read=120.0)) as r:
+        if r.status_code == 416:          # range past EOF: partial is complete
+            os.replace(part, dest)
+            report(dest.stat().st_size)
+            return dest.stat().st_size
+        if r.status_code in (401, 403):
+            raise HangarError("that repo is gated — accept its license on "
+                              "huggingface.co and set HF_TOKEN")
+        resumed = r.status_code == 206
+        if r.status_code not in (200, 206):
+            raise HangarError(f"Hugging Face returned HTTP {r.status_code}")
+        if not resumed:
+            have = 0                      # server ignored Range — start over
+        with open(part, "ab" if resumed and have else "wb") as f:
+            report(have)
+            for chunk in r.iter_bytes(1 << 20):
+                f.write(chunk)
+                have += len(chunk)
+                report(have)
+    os.replace(part, dest)
+    report(have)
+    return have
+
+
 def pull_progress(file: str, total: int) -> int:
-    """Bytes on disk so far: the final file, or hf_hub's .incomplete part."""
+    """Live bytes for an in-flight pull (tracked in-process), else the final
+    file's size on disk."""
+    for key, st in list(_PULLS.items()):
+        if key.rsplit("::", 1)[-1] == file and st.get("status") == "downloading":
+            return min(int(st.get("done", 0)), total)
     final = models_dir() / file
-    if final.exists():
-        return min(final.stat().st_size, total)
-    part_dir = models_dir() / ".cache" / "huggingface" / "download"
-    best = 0
-    if part_dir.is_dir():
-        for p in part_dir.glob(f"*{file}*.incomplete"):
-            best = max(best, p.stat().st_size)
-    return min(best, total)
+    return min(final.stat().st_size, total) if final.exists() else 0
