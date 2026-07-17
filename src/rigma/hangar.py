@@ -179,6 +179,9 @@ def list_models(registry=None) -> dict:
             used += g.bytes if on_disk else 0
             quants.append({"file": g.file, "quant": g.quant,
                            "bytes": g.bytes, "on_disk": on_disk,
+                           # HF-added models have a real repo (downloadable);
+                           # drag-dropped ones are "local" (only exist here)
+                           "pullable": g.repo != "local",
                            "pull": _PULLS.get(f"{slug}::{g.file}")})
         mm = None
         if spec.mmproj is not None:
