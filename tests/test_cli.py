@@ -44,12 +44,21 @@ def test_stop_when_not_running(tmp_path, monkeypatch):
     assert res.exit_code == 0 and "not running" in res.output.lower()
 
 
-def test_up_dry_run(tmp_path, monkeypatch):
+def test_up_dry_run_ui_only(tmp_path, monkeypatch):
+    # bare `up` now starts the UI with no model — dry-run says exactly that
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run"])
+    res = runner.invoke(cli.app, ["up", "--dry-run"])
+    assert res.exit_code == 0 and "no model" in res.output.lower()
+
+
+def test_up_dry_run_with_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run"])
     assert res.exit_code == 0
-    assert "--n-cpu-moe 10" in res.output and "-fa on" in res.output
+    assert "qwen3.6-35b-a3b" in res.output and "-fa on" in res.output
 
 
 def test_chat_requires_running_server(tmp_path, monkeypatch):
@@ -71,11 +80,11 @@ def test_up_refuses_double_start(tmp_path, monkeypatch):
 def test_up_ctx_override_and_clamp(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b", "--use-case", "coding", "--dry-run",
                                   "--ctx", "4096"])
     assert res.exit_code == 0 and "-c 4096" in res.output
     assert "+ctx-override" in res.output
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b", "--use-case", "coding", "--dry-run",
                                   "--ctx", "99999999"])
     assert res.exit_code == 0 and "-c 262144" in res.output  # qwen native cap
 
@@ -83,10 +92,10 @@ def test_up_ctx_override_and_clamp(tmp_path, monkeypatch):
 def test_up_reasoning_override(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b", "--use-case", "coding", "--dry-run",
                                   "--reasoning", "off"])
     assert res.exit_code == 0 and "--reasoning off" in res.output
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b", "--use-case", "coding", "--dry-run",
                                   "--reasoning", "sideways"])
     assert res.exit_code != 0
 
@@ -94,10 +103,10 @@ def test_up_reasoning_override(tmp_path, monkeypatch):
 def test_up_fa_override(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b", "--use-case", "coding", "--dry-run",
                                   "--fa", "auto"])
     assert res.exit_code == 0 and "-fa auto" in res.output
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b", "--use-case", "coding", "--dry-run",
                                   "--fa", "maybe"])
     assert res.exit_code != 0
 
@@ -105,10 +114,10 @@ def test_up_fa_override(tmp_path, monkeypatch):
 def test_up_spec_override(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b", "--use-case", "coding", "--dry-run",
                                   "--spec", "ngram-simple"])
     assert res.exit_code == 0 and "--spec-type ngram-simple" in res.output
-    res = runner.invoke(cli.app, ["up", "--use-case", "coding", "--dry-run",
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b", "--use-case", "coding", "--dry-run",
                                   "--spec", "warp-drive"])
     assert res.exit_code != 0
 
