@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 STANDARD_GB = [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 
@@ -106,6 +106,9 @@ class ComboFlags(BaseModel):
     reasoning: str = ""   # ""(engine default) | on | off | auto
     spec_type: str = "none"   # none | draft-mtp | ngram-simple | ... (engine list)
     spec_n_max: int = 3
+    batch: int = 0        # -b logical batch (0 = engine default 2048)
+    ubatch: int = 0       # -ub physical batch (0 = engine default 512)
+    env: dict[str, str] = Field(default_factory=dict)  # engine-spawn env overrides
 
     @field_validator("flash_attn", mode="before")
     @classmethod
@@ -115,6 +118,29 @@ class ComboFlags(BaseModel):
         if v not in ("on", "off", "auto"):
             raise ValueError("flash_attn must be on, off, or auto")
         return v
+
+    @field_validator("spec_type")
+    @classmethod
+    def _known_spec(cls, v):
+        ok = {"none", "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash",
+              "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod",
+              "ngram-cache"}
+        if v not in ok:
+            raise ValueError(f"spec_type must be one of {sorted(ok)}")
+        return v
+
+    @model_validator(mode="after")
+    def _symmetric_kv(self):
+        # llama.cpp's fused flash-attn kernel only fires when ctk==ctv; a
+        # mismatch SILENTLY drops to a slow non-fused path (RDNA4 finding
+        # 2026-07-17). Normalize both to the more-precise type to keep the
+        # fast path without silently degrading quality.
+        rank = {"f16": 3, "q8_0": 2, "q4_0": 1}
+        if self.cache_type_k != self.cache_type_v:
+            best = self.cache_type_k if rank.get(self.cache_type_k, 0) >= \
+                rank.get(self.cache_type_v, 0) else self.cache_type_v
+            self.cache_type_k = self.cache_type_v = best
+        return self
 
 
 class Budget(BaseModel):
@@ -151,6 +177,10 @@ class RunPlan(BaseModel):
                 "--parallel", "1"]
         if self.flags.n_cpu_moe > 0:
             args += ["--n-cpu-moe", str(self.flags.n_cpu_moe)]
+        if self.flags.batch > 0:
+            args += ["-b", str(self.flags.batch)]
+        if self.flags.ubatch > 0:
+            args += ["-ub", str(self.flags.ubatch)]
         args += ["-fa", self.flags.flash_attn]
         args += ["--cache-type-k", self.flags.cache_type_k,
                  "--cache-type-v", self.flags.cache_type_v]
