@@ -232,10 +232,18 @@ def _search_docs(args, ctx):
 # ---- gated tools (filesystem + code) ----------------------------------------
 
 def _ws_path(ctx, rel: str) -> Path:
-    """Resolve a path INSIDE the session's workspace root; refuse escapes."""
-    root = Path(ctx.get("workspace", "")).resolve()
+    """Resolve a path INSIDE the session's workspace root; refuse escapes.
+
+    Uses is_relative_to, NOT a string prefix — `str(p).startswith(str(root))`
+    would let /workspace2/evil escape a /workspace root."""
+    ws = (ctx.get("workspace") or "").strip()
+    if not ws:
+        raise ValueError("no workspace folder is set for this chat")
+    root = Path(ws).resolve()
+    if not root.is_dir():
+        raise ValueError("the workspace folder doesn't exist")
     p = (root / rel).resolve()
-    if root == Path("") or not str(p).startswith(str(root)):
+    if p != root and not p.is_relative_to(root):
         raise ValueError("path is outside the workspace")
     return p
 
