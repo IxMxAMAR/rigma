@@ -273,6 +273,72 @@ def _bounded_get(url: str, method: str = "GET", headers=None, json=None,
             return r.status_code, b"".join(buf).decode(enc, errors="ignore")
 
 
+def _gemini_key():
+    """Gemini API key from env, the local key file, or ~/.gemini_api_key
+    (same sources as the global ask_gemini_pro tool)."""
+    k = os.environ.get("GEMINI_API_KEY") or os.environ.get("RIGMA_GEMINI_KEY")
+    if k:
+        return k.strip()
+    for path, field in [
+            (r"~/.gemini_api_key", "gemini_key")]:
+        try:
+            v = json.loads(Path(path).read_text(encoding="utf-8")).get(field, "")
+            if v:
+                return v.strip()
+        except Exception:
+            pass
+    try:
+        t = (Path.home() / ".gemini_api_key").read_text(encoding="utf-8").strip()
+        return t or None
+    except Exception:
+        return None
+
+
+@tool("ask_gemini",
+      "Consult Google's Gemini Pro (a large frontier model) for a hard question, "
+      "a second opinion, up-to-date knowledge, or reasoning beyond your own. Ask "
+      "a complete, self-contained question — Gemini can't see this chat.",
+      {"type": "object", "properties": {
+          "question": {"type": "string",
+                       "description": "a full, self-contained question or task"}},
+       "required": ["question"]})
+def _ask_gemini(args, ctx):
+    import time as _time
+    q = str(args.get("question", "")).strip()
+    if not q:
+        return "error: empty question"
+    key = _gemini_key()
+    if not key:
+        return ("error: no Gemini API key configured — set the GEMINI_API_KEY "
+                "environment variable")
+    try:
+        from google import genai
+        from google.genai import errors as gerr
+        from google.genai import types
+    except Exception:
+        return "error: the google-genai package isn't installed on this machine"
+    model = os.environ.get("RIGMA_GEMINI_MODEL", "gemini-3.1-pro-preview")
+    client = genai.Client(api_key=key, http_options={"timeout": 120000})
+    cfg = types.GenerateContentConfig(response_modalities=["TEXT"],
+                                      temperature=0.3)
+    delay = 3.0
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(model=model, contents=q,
+                                                  config=cfg)
+            out = (resp.text or "").strip() or "(Gemini returned no text)"
+            return out[:6000] + ("\n…(truncated)" if len(out) > 6000 else "")
+        except gerr.ServerError as e:
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            if attempt == 2 or code not in (429, 500, 502, 503, 504):
+                return f"error: Gemini request failed ({code})"
+            _time.sleep(delay)
+            delay *= 2
+        except Exception as e:
+            return f"error: Gemini request failed: {str(e)[:200]}"
+    return "error: Gemini request failed after retries"
+
+
 @tool("current_datetime",
       "Get the current local date and time. Use for anything time-relative "
       "('today', 'now', 'this year').",
