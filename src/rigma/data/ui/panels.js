@@ -147,6 +147,39 @@ function renderChatTab() {
   macts.appendChild(compactBtn);
   box.appendChild(macts);
 
+  box.appendChild(el("h3", "", "Tools — workspace & code"));
+  box.appendChild(el("p", "dim",
+    "Web search, calculator, and document lookup work as soon as you turn on " +
+    "'tools' in the sys bar. File and code tools stay off until you point them " +
+    "at a folder and allow it below."));
+  const wsRow = el("div", "path-row");
+  const ws = el("input");
+  ws.placeholder = "Workspace folder (lets the model read/list files there)";
+  ws.value = current.workspace || "";
+  const wsSave = el("button", "act", "Set");
+  wsSave.onclick = async () => {
+    if (!current || current.id !== sid) return;
+    try { current = await api("POST", "/api/sessions/" + sid,
+                              {workspace: ws.value.trim()}); }
+    catch (err) { hint.textContent = err.message; }
+  };
+  ws.onkeydown = (e) => { if (e.key === "Enter") wsSave.onclick(); };
+  wsRow.append(ws, wsSave);
+  box.appendChild(wsRow);
+  const codeRow = el("label", "cap-row");
+  const codeCb = el("input");
+  codeCb.type = "checkbox";
+  codeCb.checked = !!current.allow_code;
+  codeCb.onchange = async () => {
+    if (!current || current.id !== sid) return;
+    try { current = await api("POST", "/api/sessions/" + sid,
+                              {allow_code: codeCb.checked}); }
+    catch (err) { hint.textContent = err.message; codeCb.checked = !codeCb.checked; }
+  };
+  codeRow.append(codeCb, document.createTextNode(
+    " Allow running Python & shell commands (only in the workspace)"));
+  box.appendChild(codeRow);
+
   box.appendChild(el("h3", "", "This chat"));
   const acts = el("div", "drawer-acts");
   const exMd = el("a", "act", "Export markdown");

@@ -270,6 +270,22 @@ def _list_dir(args, ctx):
                      for x in items[:200]) or "(empty)"
 
 
+@tool("write_file",
+      "Create or overwrite a text file inside the chat's workspace folder.",
+      {"type": "object", "properties": {
+          "path": {"type": "string", "description": "path relative to the "
+                   "workspace"},
+          "content": {"type": "string", "description": "the file's contents"}},
+       "required": ["path", "content"]},
+      safe=False, needs="code")
+def _write_file(args, ctx):
+    p = _ws_path(ctx, str(args.get("path", "")))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    content = str(args.get("content", ""))
+    p.write_text(content, encoding="utf-8")
+    return f"wrote {len(content)} chars to {args.get('path')}"
+
+
 @tool("run_python",
       "Run a short Python 3 snippet and return its stdout/stderr. For "
       "calculations, data wrangling, quick checks.",
