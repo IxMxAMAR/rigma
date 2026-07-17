@@ -488,6 +488,47 @@ def load():
 
 
 @app.command()
+def recalibrate(model: str = typer.Option(None, "--model",
+                                          help="Forget one model's tune so it "
+                                               "re-optimizes on next load"),
+                all: bool = typer.Option(False, "--all",
+                                         help="Wipe every stored tune")):
+    """Reset or redo hardware tuning. No args re-optimizes the RUNNING model now
+    (unload -> quick sweep -> relaunch the fresh winner). The sweep always
+    includes baseline, so a re-tune can only match or beat plain defaults."""
+    import json as _json
+
+    from .bench import calibration_path, load_calibration, reset_all_calibration
+    if all:
+        n = reset_all_calibration()
+        typer.echo(f"cleared {n} tune(s) — each model re-optimizes on next load")
+        return
+    if model:
+        cal = load_calibration()
+        gone = [k for k in list(cal) if k.startswith(model + ":")]
+        for k in gone:
+            del cal[k]
+        calibration_path().write_text(_json.dumps(cal, indent=2), encoding="utf-8")
+        typer.echo(f"cleared {len(gone)} tune(s) for {model} — "
+                   f"re-optimizes on next load")
+        return
+    from . import server_ops
+    from . import state as st
+    if st.read_state() is None:
+        typer.echo("not running — load a model first, or pass --model X / --all")
+        raise typer.Exit(1)
+    typer.echo("re-optimizing the running model (unloads, tunes, relaunches; "
+               "takes a few minutes)...")
+    try:
+        s = server_ops.perform_recalibrate()
+    except RuntimeError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1)
+    typer.echo(f"done — {s['model']} ({s['quant']}) relaunched with the fresh "
+               f"config")
+
+
+@app.command()
 def stop():
     """Stop the running model server and UI."""
     from . import state as st

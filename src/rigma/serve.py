@@ -641,6 +641,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             switch_lock.release()
         return s
 
+    @app.post("/api/server/recalibrate")
+    async def server_recalibrate():
+        from . import server_ops
+        if not switch_lock.acquire(blocking=False):
+            return JSONResponse({"error": "a switch is already in progress"},
+                                status_code=409)
+        try:
+            s = await asyncio.to_thread(server_ops.perform_recalibrate, registry)
+            telemetry["tg"] = None
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+        finally:
+            switch_lock.release()
+        return s
+
     @app.post("/api/workspace/pack")
     async def workspace_pack(body: dict):
         from . import workspace
