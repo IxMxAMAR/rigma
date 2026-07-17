@@ -524,6 +524,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        detach: bool = typer.Option(False, "--detach", "-d",
                                    help="Run in the background; the terminal "
                                         "returns and Rigma keeps serving"),
+       no_calibrate: bool = typer.Option(False, "--no-calibrate",
+                                         help="Skip the one-time first-load "
+                                              "hardware auto-tune"),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
@@ -599,6 +602,16 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             if spec_c is not None and spec_c.mmproj is not None:
                 mm_path = runtime.ensure_model(spec_c.mmproj)
                 extra = ["--mmproj", str(mm_path)]
+            from .bench import auto_calibrate, is_calibrated
+            if (ctx is None and not no_calibrate and cand.backend != "cpu"
+                    and os.environ.get("RIGMA_AUTO_CALIBRATE", "1") != "0"
+                    and not is_calibrated(cand.model_slug, cand.gguf.quant,
+                                          cand.backend)):
+                typer.echo(f"tuning {cand.model_slug} for your hardware "
+                           f"(one-time, a few minutes)...")
+                cand = auto_calibrate(
+                    cand, exe, model_path, port=port - 1, extra_args=extra or None,
+                    progress=lambda lbl: typer.echo(f"  trying {lbl} ..."))
             typer.echo(f"starting llama-server: {cand.model_slug} "
                        f"{cand.gguf.quant} (first load can take minutes)...")
             sp = runtime.launch_server(exe, cand, model_path, port=port - 1,
