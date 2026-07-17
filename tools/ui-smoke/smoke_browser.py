@@ -278,6 +278,13 @@ with sync_playwright() as pw:
           and page.locator(".fit.no").count() == 1)
     check("bazaar: caps + mmproj surfaced",
           "mmproj included" in (page.locator(".hf-results").text_content() or ""))
+    check("bazaar: quant tooltip present",
+          bool(page.locator(".hf-results .quant-row .q").first
+               .get_attribute("title")))
+    check("bazaar: recommended star on best-fitting quant",
+          page.locator(".hf-results .quant-row .rec").count() == 1)
+    check("bazaar: quant glossary present",
+          page.locator(".quant-legend").count() >= 1)
     page.locator(".hf-results button", has_text="Add to library").click()
     page.wait_for_timeout(1000)
     # the browse panel is preserved (search state not nuked); button confirms

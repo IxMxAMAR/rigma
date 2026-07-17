@@ -491,3 +491,16 @@ header .spec:hover { background:var(--bg2); color:var(--fg); }
   padding:2px 10px; font-variant-numeric:tabular-nums; }
 .fit.ok { color:var(--moss); background:var(--moss-soft); }
 .fit.no { color:var(--red); background:rgba(224,108,95,.12); }
+.quant-row .q { cursor:help; }   /* tooltip via title= */
+.quant-row .rec { color:var(--amber); font-size:11px; cursor:help; }
+
+/* quant glossary (collapsible) */
+.quant-legend { margin-top:6px; font:11.5px var(--mono); }
+.quant-legend summary { color:var(--dim); cursor:pointer; padding:4px 0;
+  list-style:none; }
+.quant-legend summary::before { content:"ℹ "; color:var(--faint); }
+.quant-legend summary:hover { color:var(--fg); }
+.quant-legend[open] summary { color:var(--fg); }
+.gl-row { display:flex; gap:10px; padding:4px 0 4px 4px; }
+.gl-row .gl-k { flex:none; width:34%; color:var(--amber); }
+.gl-row .gl-v { color:var(--dim); line-height:1.5; }
