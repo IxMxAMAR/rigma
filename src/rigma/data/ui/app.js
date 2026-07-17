@@ -210,6 +210,46 @@ function makeThinkBlock(text, collapsed) {
   return wrap;
 }
 
+/* ---------- tool-call trace (agentic tools) ---------- */
+function makeToolBox() {
+  const box = document.createElement("div");
+  box.className = "tool-trace";
+  return box;
+}
+function addToolChip(box, name, args) {
+  const row = document.createElement("details");
+  row.className = "tool-chip running";
+  const sum = document.createElement("summary");
+  const a = args && Object.keys(args).length
+    ? " " + Object.values(args).map((v) => String(v)).join(", ").slice(0, 60)
+    : "";
+  sum.innerHTML = '<span class="tc-spin">⟳</span> <b>' + name + "</b>"
+    + '<span class="tc-arg">' + escapeHtml(a) + "</span>";
+  const out = document.createElement("div");
+  out.className = "tc-out";
+  row.append(sum, out);
+  box.appendChild(row);
+  return row;
+}
+function setToolResult(row, result) {
+  row.classList.remove("running");
+  row.classList.add("done");
+  row.querySelector(".tc-spin").textContent = "✓";
+  row.querySelector(".tc-out").textContent = result || "(no output)";
+}
+function renderToolTrace(trace) {
+  const box = makeToolBox();
+  for (const t of trace) {
+    const row = addToolChip(box, t.name, t.args);
+    setToolResult(row, t.result);
+  }
+  return box;
+}
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function actionBtn(label, fn, cls) {
   const b = document.createElement("button");
   b.type = "button";
@@ -278,6 +318,8 @@ function renderMessages() {
   msgs.forEach((m, idx) => {
     const el = addMsg(m.role === "user" ? "user" : "bot", m.content,
                       m.thinking);
+    if (m.tool_trace && m.tool_trace.length)
+      el.insertBefore(renderToolTrace(m.tool_trace), el.querySelector(".body"));
     addActions(el, m, idx, idx === msgs.length - 1);
     if (m.citations && m.citations.length) addCitations(m.citations);
   });
@@ -428,8 +470,19 @@ function chatTurn(message, opts) {
       "thinking… " + Math.round((performance.now() - t0) / 1000) + "s";
   }, 1000);
   let thinkEl = null, thinkText = "";
+  let toolBox = null, lastTool = null;
   const payload = Object.assign({message}, opts || {});
   turn = streamTurn(current.id, payload, {
+    tool(d) {
+      if (!toolBox) { toolBox = makeToolBox(); bot.insertBefore(toolBox, body); }
+      const p = body.querySelector(".pending"); if (p) p.remove();
+      lastTool = addToolChip(toolBox, d.name, d.args);
+      log.scrollTop = log.scrollHeight;
+    },
+    toolResult(d) {
+      if (lastTool) setToolResult(lastTool, d.result);
+      log.scrollTop = log.scrollHeight;
+    },
     think(d) {
       thinkText += d;
       if (!thinkEl) {

@@ -29,6 +29,26 @@ function saveAuthorsNote() {
 $("an-text").addEventListener("blur", saveAuthorsNote);
 $("an-depth").addEventListener("change", saveAuthorsNote);
 
+/* ---------- tools toggle (agentic tools) ---------- */
+function renderToolsToggle() {
+  const b = $("tools-toggle");
+  if (!b) return;
+  const on = !!(current && current.use_tools);
+  b.textContent = "tools ▸ " + (on ? "on" : "off");
+  b.classList.toggle("on", on);
+}
+$("tools-toggle").addEventListener("click", async () => {
+  if (!current) return;
+  current = await api("POST", "/api/sessions/" + current.id,
+                      {use_tools: !current.use_tools});
+  renderToolsToggle();
+});
+// keep the label in sync when a chat opens (wrap renderSysBar if present)
+if (typeof window.renderSysBar === "function") {
+  const _origSys = window.renderSysBar;
+  window.renderSysBar = function () { _origSys(); renderToolsToggle(); };
+}
+
 /* ---------- reply prefill ---------- */
 $("prefill-toggle").addEventListener("click", () => {
   const row = $("prefill-row");

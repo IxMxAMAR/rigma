@@ -9,7 +9,8 @@ from .runtime import rigma_home
 
 MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   "preset_id", "params", "notes", "digest", "effort",
-                  "authors_note", "authors_note_depth", "prefill")
+                  "authors_note", "authors_note_depth", "prefill",
+                  "use_tools", "allow_code", "workspace")
 EFFORT_LEVELS = ("", "off", "auto", "on")
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
@@ -32,7 +33,8 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      "use_rag": False, "preset_id": "", "params": {},
                      "notes": "", "digest": "", "effort": "", "archive": [],
                      "authors_note": "", "authors_note_depth": 3,
-                     "prefill": "", "messages": []}
+                     "prefill": "", "use_tools": False, "allow_code": False,
+                     "workspace": "", "messages": []}
 
 
 def chats_dir() -> Path:
