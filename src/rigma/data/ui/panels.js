@@ -605,6 +605,41 @@ function libraryCard(m, reload) {
     card.appendChild(det);
   }
 
+  // vision projector: a separate file that turns on image understanding.
+  // surface it as its own downloadable row when it isn't on disk yet.
+  if (m.mmproj && (!m.mmproj.on_disk || m.mmproj.pull)) {
+    const mm = m.mmproj, row = el("div", "quant-row mmproj-row");
+    row.appendChild(el("span", "dot" + (mm.on_disk ? " on" : "")));
+    const lbl = el("span", "q", "vision projector");
+    lbl.title = "Enables image understanding — this model needs it to see images";
+    row.appendChild(lbl);
+    row.appendChild(el("span", "sz", fmtGB(mm.bytes)));
+    if (mm.pull && mm.pull.status === "downloading") {
+      const done = mm.pull.done || 0, tot = mm.pull.total || mm.bytes || 1;
+      const bar = el("span", "pull-bar");
+      bar.appendChild(el("span", "fill")).style.width =
+        Math.round(100 * done / tot) + "%";
+      row.appendChild(bar);
+      row.appendChild(el("span", "sz pull-stat", done <= 0 ? "connecting…"
+        : Math.round(100 * done / tot) + "%"
+          + (mm.pull.bps ? " · " + (mm.pull.bps / 2 ** 20).toFixed(1)
+             + " MB/s" : "")));
+    } else if (!mm.on_disk && mm.pullable) {
+      const dl = el("button", "act mini", "Download");
+      dl.onclick = async () => {
+        dl.disabled = true;
+        try { await api("POST", "/api/models/" + m.slug + "/pull",
+                        {file: mm.file}); }
+        catch (e) { alert(e.message); }
+        reload();
+      };
+      row.appendChild(dl);
+    } else if (!mm.on_disk) {
+      row.appendChild(el("span", "err", "local-only"));
+    }
+    card.appendChild(row);
+  }
+
   const acts = el("div", "mc-acts");
   if (!m.running && onDisk.length) {
     const run = el("button", "act primary", "Run");

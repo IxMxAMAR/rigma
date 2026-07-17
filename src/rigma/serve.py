@@ -628,22 +628,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         from . import hangar
         out = await asyncio.to_thread(hangar.list_models, registry)
         now = _now()
+
+        def _with_rate(item):
+            p = item.get("pull")
+            if p and p.get("status") == "downloading":
+                done = hangar.pull_progress(item["file"], item["bytes"])
+                prev = pull_samples.get(item["file"])   # ~1.5s between polls
+                bps = ((done - prev[1]) / (now - prev[0])
+                       if prev and now > prev[0] and done >= prev[1] else None)
+                pull_samples[item["file"]] = (now, done)
+                eta = int((item["bytes"] - done) / bps) if bps and bps > 0 \
+                    else None
+                item["pull"] = {**p, "done": done, "bps": bps, "eta": eta}
+            elif p is None:
+                pull_samples.pop(item["file"], None)
+
         for m in out["models"]:
             for q in m["quants"]:
-                p = q.get("pull")
-                if p and p.get("status") == "downloading":
-                    done = hangar.pull_progress(q["file"], q["bytes"])
-                    # rate from the delta since the last poll (~1.5s apart)
-                    prev = pull_samples.get(q["file"])
-                    bps = None
-                    if prev and now > prev[0] and done >= prev[1]:
-                        bps = (done - prev[1]) / (now - prev[0])
-                    pull_samples[q["file"]] = (now, done)
-                    eta = (int((q["bytes"] - done) / bps)
-                           if bps and bps > 0 else None)
-                    q["pull"] = {**p, "done": done, "bps": bps, "eta": eta}
-                elif p is None:
-                    pull_samples.pop(q["file"], None)
+                _with_rate(q)
+            if m.get("mmproj"):
+                _with_rate(m["mmproj"])
         return JSONResponse(out, headers=_NO_STORE)
 
     @app.post("/api/models/install")
