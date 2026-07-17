@@ -235,3 +235,58 @@ def test_list_models_mmproj_pullable(home, tmp_path):
     mm = {m["slug"]: m for m in out["models"]}["spicy-tune-8b"]["mmproj"]
     assert mm is not None and mm["on_disk"] is False
     assert mm["pullable"] is True     # real repo -> a Download button appears
+
+
+def test_download_file_streams_with_progress_and_resume(home, tmp_path,
+                                                        monkeypatch):
+    """User-reported 2026-07-18: download progress stuck at 'connecting…'
+    because hf's partials are hashed. The direct downloader reports exact
+    bytes and resumes from a .part file."""
+    import httpx
+    from rigma import hangar
+
+    class _Resp:
+        def __init__(self, code, chunks, hdrs=None):
+            self.status_code = code
+            self._chunks = chunks
+            self.headers = hdrs or {}
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def iter_bytes(self, n):
+            yield from self._chunks
+
+    # fresh download: 200 with 3 x 1MB chunks
+    seen = []
+    monkeypatch.setattr(hangar.httpx if hasattr(hangar, "httpx") else httpx,
+                        "stream", lambda *a, **k: _Resp(200, [b"x" * 2**20] * 3))
+    import rigma.hangar as H
+    monkeypatch.setattr("httpx.stream",
+                        lambda *a, **k: _Resp(200, [b"x" * 2**20] * 3))
+    dest = tmp_path / "m.gguf"
+    n = H._download_file("r/x", "m.gguf", dest, lambda b: seen.append(b))
+    assert n == 3 * 2**20 and dest.exists() and dest.stat().st_size == n
+    assert seen and seen[-1] == n and seen == sorted(seen)   # monot, exact
+    assert not (tmp_path / "m.gguf.part").exists()           # renamed cleanly
+
+    # resume: a .part already has 1MB, server returns 206 with the remaining 2MB
+    dest2 = tmp_path / "r.gguf"
+    (tmp_path / "r.gguf.part").write_bytes(b"y" * 2**20)
+    ranged = {}
+    def _stream(method, url, headers=None, **k):
+        ranged["range"] = (headers or {}).get("range")
+        return _Resp(206, [b"z" * 2**20] * 2)
+    monkeypatch.setattr("httpx.stream", _stream)
+    n2 = H._download_file("r/x", "r.gguf", dest2, lambda b: None)
+    assert ranged["range"] == "bytes=1048576-"        # asked to resume
+    assert n2 == 3 * 2**20 and dest2.stat().st_size == n2   # 1 + 2 MB
+
+
+def test_pull_progress_reads_live_bytes(home):
+    from rigma import hangar
+    hangar._PULLS["slugX::big.gguf"] = {"status": "downloading",
+                                        "total": 100, "done": 42}
+    try:
+        assert hangar.pull_progress("big.gguf", 100) == 42
+        assert hangar.pull_progress("other.gguf", 100) == 0
+    finally:
+        hangar._PULLS.pop("slugX::big.gguf", None)
