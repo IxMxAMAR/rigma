@@ -137,3 +137,16 @@ def test_recalibrate_reruns_on_running_model(env, monkeypatch):
     assert len(launches) == 4
     # baseline won this time -> no stale flash_attn:off carried over
     assert launches[-1]["fa"] == "on"
+
+
+def test_switch_from_no_model_state(env, monkeypatch):
+    """After `rigma up` (no model), picking a model in the UI loads it — even
+    from the empty/unloaded starting state."""
+    reg, launches = env
+    st.write_state("", "", 11500, engine_pid=-1, ui_pid=os.getpid(),
+                   backend="", ctx=0, unloaded=True)
+    monkeypatch.setattr(bench, "run_bench", lambda *a, **k: bench.BenchResult(
+        pp_tps=1, tg_tps=50, prompt_tokens=1, gen_tokens=1))
+    out = server_ops.perform_switch("m", reg, _profile())
+    assert out["model"] == "m" and not out.get("unloaded")
+    assert len(launches) >= 1
