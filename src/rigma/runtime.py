@@ -144,6 +144,10 @@ def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
     popen_kw = {}
     if platform.system() == "Windows":
         popen_kw["creationflags"] = 0x08000000   # CREATE_NO_WINDOW
+    # per-plan engine env (e.g. GGML_VK_DISABLE_COOPMAT on the Windows
+    # proprietary Vulkan driver) — merged over the inherited environment
+    if plan.flags.env:
+        popen_kw["env"] = {**os.environ, **plan.flags.env}
     with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
         proc = subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT,
                                 **popen_kw)
