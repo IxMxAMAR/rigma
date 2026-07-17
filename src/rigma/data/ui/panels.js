@@ -411,6 +411,24 @@ async function renderServerTab() {
 /* ---------- models tab: the hangar ---------- */
 function fmtGB(bytes) { return (bytes / 2 ** 30).toFixed(1) + " GB"; }
 
+// fit verdict badge, speed-aware: a bigger quant that only "fits" via heavy
+// RAM offload is slower, not better — say so plainly.
+function fitBadge(fit) {
+  if (!fit || !fit.ok) return el("span", "fit no", "too big for this machine");
+  const ctx = "~" + Math.round(fit.ctx / 1024) + "K ctx";
+  const tiers = {
+    gpu: ["ok", "on GPU · " + ctx, "Runs fully on the GPU — fastest"],
+    light: ["ok", "mostly GPU · " + ctx,
+            "Mostly on the GPU, a little in RAM — still quick"],
+    offload: ["warn", "RAM offload · " + ctx,
+              "Part of the model runs in RAM every token — this will be slow"],
+  };
+  const t = tiers[fit.speed] || ["ok", ctx, ""];
+  const b = el("span", "fit " + t[0], "fits — " + t[1]);
+  if (t[2]) b.title = t[2];
+  return b;
+}
+
 // collapsible "what do these mean?" glossary for gguf quant names
 function quantLegend() {
   const box = el("details", "quant-legend");
@@ -581,22 +599,19 @@ async function renderModelsTab() {
       + (d.native_ctx || 0).toLocaleString()
       + (d.mmproj ? " · mmproj included" : "")
       + (d.split_skipped ? " · " + d.split_skipped + " split files skipped" : "")));
-    const rec = recommendedQuant(d.ggufs);
+    const rec = d.recommended || recommendedQuant(d.ggufs);
     for (const q of d.ggufs) {
-      const row = el("div", "quant-row");
+      const row = el("div", "quant-row" + (q.quant === rec ? " rec-row" : ""));
       const ql = el("span", "q", q.quant);
       ql.title = quantHelp(q.quant);       // hover: what this quant means
       row.appendChild(ql);
       if (q.quant === rec) {
-        const star = el("span", "rec", "★");
-        star.title = "Best quality that fits your machine";
-        row.appendChild(star);
+        const tag = el("span", "rec-tag", "★ Recommended");
+        tag.title = "Best quality that still runs at GPU speed on your machine";
+        row.appendChild(tag);
       }
       row.appendChild(el("span", "sz", fmtGB(q.bytes)));
-      const fit = q.fit && q.fit.ok
-        ? el("span", "fit ok", "fits — ~" + Math.round(q.fit.ctx / 1024) + "K ctx")
-        : el("span", "fit no", "too big for this machine");
-      row.appendChild(fit);
+      row.appendChild(fitBadge(q.fit));
       card.appendChild(row);
     }
     card.appendChild(quantLegend());
