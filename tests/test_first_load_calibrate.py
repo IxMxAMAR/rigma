@@ -107,3 +107,33 @@ def test_status_surfaces_calibrating_marker(tmp_path, monkeypatch):
     server_ops._clear_calib_marker()
     # marker gone -> normal not-running 404
     assert client.get("/api/server").status_code == 404
+
+
+def test_clear_and_reset_calibration(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    bench.save_calibration("m:Q4:vulkan", {"tg_tps": 90}, flags={}, calibrated=True)
+    bench.save_calibration("x:Q8:cpu", {"tg_tps": 5}, flags={}, calibrated=True)
+    assert bench.is_calibrated("m", "Q4", "vulkan") is True
+    assert bench.clear_calibration("m", "Q4", "vulkan") is True
+    assert bench.is_calibrated("m", "Q4", "vulkan") is False
+    assert bench.clear_calibration("m", "Q4", "vulkan") is False  # already gone
+    assert bench.reset_all_calibration() == 1                      # only x left
+    assert bench.is_calibrated("x", "Q8", "cpu") is False
+
+
+def test_recalibrate_reruns_on_running_model(env, monkeypatch):
+    reg, launches = env
+    # the model is already running AND already calibrated to a (bad) config
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=32768, backend="vulkan")
+    bench.save_calibration("m:Q4:vulkan", {"tg_tps": 30},
+                           flags={"flash_attn": "off"}, calibrated=True)
+    tgs = iter([80.0, 40.0, 40.0])   # baseline now wins the re-tune
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=next(tgs), prompt_tokens=8, gen_tokens=8))
+
+    server_ops.perform_recalibrate(reg, _profile())
+    # 3 fresh trials + 1 final launch — it did NOT refuse "already running"
+    assert len(launches) == 4
+    # baseline won this time -> no stale flash_attn:off carried over
+    assert launches[-1]["fa"] == "on"
