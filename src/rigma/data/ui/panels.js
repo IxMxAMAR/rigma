@@ -408,6 +408,32 @@ async function renderServerTab() {
   }
   box.appendChild(memActs);
 
+  box.appendChild(el("h3", "", "Hardware tuning"));
+  box.appendChild(el("p", "dim",
+    "Rigma auto-tunes each model on its first load. If a tune landed on a slow " +
+    "config, re-optimize to measure again — baseline is always tested, so it " +
+    "can never end up slower than plain defaults."));
+  const tuneActs = el("div", "drawer-acts");
+  const reBtn = el("button", "act", "Re-optimize " + info.model);
+  reBtn.title = "Unloads the model, runs a quick benchmark sweep, and " +
+    "relaunches on the fastest config (a few minutes)";
+  reBtn.onclick = async () => {
+    if (!confirm("Re-optimize " + info.model + "?\n\nThis unloads the model, " +
+      "benchmarks a few configs, and relaunches on the fastest. Takes a few " +
+      "minutes.")) return;
+    const ov = $("switching");
+    ov.firstElementChild.textContent = "optimizing " + info.model +
+      " for your hardware…";
+    ov.hidden = false;
+    try { await api("POST", "/api/server/recalibrate"); }
+    catch (e) { alert(e.message); }
+    ov.hidden = true;
+    pollEngine();
+    renderServerTab();
+  };
+  tuneActs.appendChild(reBtn);
+  box.appendChild(tuneActs);
+
   box.appendChild(el("h3", "", "Switch model (downloaded only)"));
   let opts = [];
   try { opts = await api("GET", "/api/server/switch-options"); } catch {}

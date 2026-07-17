@@ -66,6 +66,25 @@ def is_calibrated(model: str, quant: str, backend: str) -> bool:
                 .get("calibrated"))
 
 
+def clear_calibration(model: str, quant: str, backend: str) -> bool:
+    """Forget one model's tune so it re-optimizes on next load (or falls back to
+    the safe defaults). Returns True if there was an entry to clear."""
+    cal = load_calibration()
+    if cal.pop(f"{model}:{quant}:{backend}", None) is None:
+        return False
+    calibration_path().parent.mkdir(parents=True, exist_ok=True)
+    calibration_path().write_text(json.dumps(cal, indent=2), encoding="utf-8")
+    return True
+
+
+def reset_all_calibration() -> int:
+    """Wipe every stored tune. Returns how many were cleared."""
+    n = len(load_calibration())
+    calibration_path().parent.mkdir(parents=True, exist_ok=True)
+    calibration_path().write_text("{}", encoding="utf-8")
+    return n
+
+
 def sweep_configs(base: ComboFlags, moe: bool) -> list[tuple[str, dict]]:
     """Flag-override sets to A/B on this machine. Baseline first; each entry is
     a partial ComboFlags update. Axes come from the RDNA4 findings: FA gates the
