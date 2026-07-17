@@ -354,11 +354,13 @@ with sync_playwright() as pw:
     an = page.evaluate("current && current.authors_note")
     check("author's note persists", an == "Keep the tone ominous.")
 
-    page.click("#tools-toggle")
-    page.wait_for_timeout(400)
-    check("tools toggle turns on",
+    check("tools on by default",
           page.evaluate("current && current.use_tools") is True
           and "on" in (page.locator("#tools-toggle").text_content() or ""))
+    page.click("#tools-toggle")            # toggle it off, then back on
+    page.wait_for_timeout(400)
+    check("tools toggle flips off",
+          page.evaluate("current && current.use_tools") is False)
     page.click("#tools-toggle")
     page.wait_for_timeout(300)
 

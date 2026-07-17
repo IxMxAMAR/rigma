@@ -13,26 +13,33 @@ from rigma.serve import build_app
 
 
 class _ToolUpstream(BaseHTTPRequestHandler):
-    """Round 1: ask to call `calculator`. Round 2 (after the tool result is in
-    the messages): answer with the number."""
+    """Streaming upstream (like llama-server). Round 1: stream a tool_call to
+    `calculator`. Round 2 (after the tool result is in the messages): stream
+    the answer text."""
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
         body = json.loads(self.rfile.read(n))
         has_tool_result = any(m.get("role") == "tool"
                               for m in body.get("messages", []))
-        if not has_tool_result:
-            msg = {"role": "assistant", "content": "",
-                   "tool_calls": [{"id": "c1", "type": "function", "function": {
-                       "name": "calculator",
-                       "arguments": json.dumps({"expression": "6*7"})}}]}
-        else:
-            msg = {"role": "assistant", "content": "The answer is 42."}
-        out = json.dumps({"choices": [{"message": msg}]}).encode()
         self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(out)))
+        self.send_header("content-type", "text/event-stream")
         self.end_headers()
-        self.wfile.write(out)
+
+        def sse(obj):
+            self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+
+        if not has_tool_result:
+            # tool_call arrives split across deltas, by index (real behaviour)
+            sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "type": "function",
+                 "function": {"name": "calculator", "arguments": ""}}]}}]})
+            sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {
+                    "arguments": json.dumps({"expression": "6*7"})}}]}}]})
+        else:
+            for tok in ["The ", "answer ", "is ", "42."]:
+                sse({"choices": [{"delta": {"content": tok}}]})
+        self.wfile.write(b"data: [DONE]\n\n")
 
     def log_message(self, *a):
         pass
@@ -65,7 +72,7 @@ def test_tool_loop_calls_tool_then_answers(home, upstream):
     assert '"name": "calculator"' in r.text
     assert "event: tool_result\n" in r.text
     assert '"result": "42"' in r.text
-    assert "The answer is 42." in r.text
+    assert '"delta": "42."' in r.text          # final answer streamed as tokens
     # persisted with a tool_trace for re-render
     saved = client.get(f"/api/sessions/{sid}").json()
     last = [m for m in saved["messages"] if m["role"] == "assistant"][-1]
@@ -75,10 +82,16 @@ def test_tool_loop_calls_tool_then_answers(home, upstream):
 
 
 def test_tools_off_takes_the_plain_path(home, upstream):
-    # with tools off the model gets no tool defs; this upstream would still
-    # return a tool_call, but the plain path ignores tool_calls entirely
+    # tools explicitly off: no tool defs sent, tool_calls ignored, no execution
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
     client = TestClient(build_app(upstream_port=upstream))
     sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": False})
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
     assert r.status_code == 200 and "event: tool\n" not in r.text
+
+
+def test_tools_on_by_default(home):
+    # a fresh session should have tools enabled without any opt-in
+    from rigma import sessions
+    assert sessions.create()["use_tools"] is True
