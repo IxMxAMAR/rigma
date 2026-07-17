@@ -15,6 +15,46 @@ async function api(method, path, body) {
   return r.json();
 }
 
+// Plain-language explainer for a gguf quant name (e.g. "IQ4_XS", "UD-Q3_K_XL").
+// Pure string -> string; used as tooltips + the Models/Bazaar quant glossary.
+function quantHelp(q) {
+  const s = String(q || "").toUpperCase();
+  if (s === "F16" || s === "BF16")
+    return "16-bit — full quality, largest file. Overkill for chat; " +
+           "use only if you have VRAM to spare.";
+  if (s === "F32") return "32-bit reference precision — enormous, never " +
+           "needed for inference.";
+  const m = s.match(/^(UD-)?(I?)Q(\d)/);
+  if (!m) return "GGUF weights.";
+  const ud = !!m[1], iq = m[2] === "I", bits = +m[3];
+  const quality = bits >= 6 ? "near-lossless"
+    : bits === 5 ? "excellent quality"
+    : bits === 4 ? "very good — the size/quality sweet spot"
+    : bits === 3 ? "usable, with some quality loss"
+    : "small but noticeably degraded";
+  const family = iq
+    ? "i-quant: uses an importance matrix to spend bits where they matter, " +
+      "so it's smaller for the same quality (tiny extra GPU compute)"
+    : "K-quant: classic block quantization — well-tested and maximally " +
+      "compatible";
+  const variant = (s.match(/_(XXS|XS|L|M|S|P)$/) || [, ""])[1];
+  const vnote = {XXS: " (XXS = smallest of this level)",
+    XS: " (XS = extra-small)", S: " (S = small)",
+    M: " (M = medium, balanced)", L: " (L = largest, best quality)",
+    P: ""}[variant] || "";
+  let note = "~" + bits + "-bit, " + quality + ". " + family + vnote + ".";
+  if (ud) note = "Unsloth Dynamic — smarter per-tensor bit allocation for " +
+    "better quality at this size. " + note;
+  return note;
+}
+
+// The quant a given machine should usually pick: the largest (best quality)
+// one that still fits. `quants` items look like {quant, fit:{ok}} (bytes DESC).
+function recommendedQuant(quants) {
+  const fits = (quants || []).filter((q) => q.fit && q.fit.ok);
+  return fits.length ? fits[0].quant : null;   // list is largest-first
+}
+
 // Pure SSE frame parser: complete events out, unconsumed tail back.
 // No DOM, no fetch — node-testable (tests/test_store_js.py).
 function sseParse(buffer) {
