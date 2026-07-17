@@ -175,13 +175,12 @@ def perform_switch(model: str, registry=None, profile=None,
             "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe, "ngl": flags.ngl,
             "cache_type_k": flags.cache_type_k,
             "cache_type_v": flags.cache_type_v})
+    # vision projector: attach it if it's on disk, otherwise run text-only
+    # rather than refusing — a vision model still works for text, and the user
+    # can download the projector separately to turn vision on
     mm = getattr(reg_full.models.get(model), "mmproj", None)
-    if mm is not None and not _model_on_disk(mm):
-        raise RuntimeError(
-            f"{model}'s vision projector is not downloaded — "
-            f"run: rigma up --model {model}")
     extra = (["--mmproj", str(rigma_home() / "models" / mm.file)]
-             if mm is not None else None)
+             if mm is not None and _model_on_disk(mm) else None)
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     exe = runtime.ensure_engine(rp.backend, os_name)

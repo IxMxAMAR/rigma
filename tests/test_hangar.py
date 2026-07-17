@@ -217,3 +217,21 @@ def test_list_models_marks_pullable(home, tmp_path):
     assert reg_q["pullable"] is True and reg_q["on_disk"] is False
     # the drag-dropped custom's quant is local-only (not re-downloadable)
     assert by["spicy-tune-8b"]["quants"][0]["pullable"] is False
+
+
+def test_list_models_mmproj_pullable(home, tmp_path):
+    """User-reported 2026-07-18: downloaded the model but no way to get its
+    vision projector. mmproj of an HF-added model must be downloadable."""
+    from rigma.models import GgufFile
+    hangar.install_model(_dense_gguf(tmp_path))
+    # simulate an HF-added model with a real-repo mmproj (not local)
+    spec = hangar._load_custom("spicy-tune-8b")
+    spec = spec.model_copy(update={
+        "mmproj": GgufFile(repo="some/hf-repo", file="mmproj-x.gguf",
+                           bytes=900 * 2**20, quant="F16"),
+        "capabilities": sorted(set(spec.capabilities) | {"vision"})})
+    hangar._write_spec(spec)
+    out = hangar.list_models()
+    mm = {m["slug"]: m for m in out["models"]}["spicy-tune-8b"]["mmproj"]
+    assert mm is not None and mm["on_disk"] is False
+    assert mm["pullable"] is True     # real repo -> a Download button appears
