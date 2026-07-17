@@ -77,6 +77,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     telemetry = {"tg": None}   # last observed decode speed, for the verdict
     switch_lock = threading.Lock()
     activity = {"last": 0.0}   # last inference request, for idle auto-unload
+    pull_samples = {}          # file -> (time, bytes) for download-rate calc
 
     def _now() -> float:
         import time
@@ -626,12 +627,23 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def models_list():
         from . import hangar
         out = await asyncio.to_thread(hangar.list_models, registry)
+        now = _now()
         for m in out["models"]:
             for q in m["quants"]:
                 p = q.get("pull")
                 if p and p.get("status") == "downloading":
-                    q["pull"] = {**p, "done": hangar.pull_progress(
-                        q["file"], q["bytes"])}
+                    done = hangar.pull_progress(q["file"], q["bytes"])
+                    # rate from the delta since the last poll (~1.5s apart)
+                    prev = pull_samples.get(q["file"])
+                    bps = None
+                    if prev and now > prev[0] and done >= prev[1]:
+                        bps = (done - prev[1]) / (now - prev[0])
+                    pull_samples[q["file"]] = (now, done)
+                    eta = (int((q["bytes"] - done) / bps)
+                           if bps and bps > 0 else None)
+                    q["pull"] = {**p, "done": done, "bps": bps, "eta": eta}
+                elif p is None:
+                    pull_samples.pop(q["file"], None)
         return JSONResponse(out, headers=_NO_STORE)
 
     @app.post("/api/models/install")
