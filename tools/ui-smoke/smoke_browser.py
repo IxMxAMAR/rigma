@@ -228,6 +228,9 @@ with sync_playwright() as pw:
           "qwen3.6-35b-a3b" in (running_card.text_content() or ""))
     check("models view: vision cap chip on running model",
           running_card.locator(".cap.vision").count() == 1)
+    check("models view: not-downloaded model shows a Download button",
+          page.locator(".model-grid .model-card button", has_text="Download")
+          .count() >= 1)
 
     # drag-drop a synthetic gguf onto the zone (full upload->install->rerender)
     page.evaluate("""async (b64) => {
