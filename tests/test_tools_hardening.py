@@ -62,3 +62,18 @@ def test_view_image_missing_file():
     out = tools.run_tool("view_image", {"path": "D:/nope/gone.png"},
                          {"has_vision": True})
     assert "no such file" in out
+
+
+def test_ask_gemini_is_a_safe_tool():
+    base = {t["function"]["name"] for t in tools.tool_specs()}
+    assert "ask_gemini" in base                # available without opt-in
+
+
+def test_ask_gemini_empty_question():
+    assert "empty question" in tools.run_tool("ask_gemini", {"question": " "})
+
+
+def test_ask_gemini_no_key(monkeypatch):
+    monkeypatch.setattr(tools, "_gemini_key", lambda: None)
+    out = tools.run_tool("ask_gemini", {"question": "hi"})
+    assert "no Gemini API key" in out
