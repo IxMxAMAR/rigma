@@ -121,10 +121,26 @@ def inspect_gguf(src, fallback_name: str = "") -> GgufInfo:
     heads = g("attention.head_count", 0)
     heads = max(int(h) for h in heads) if isinstance(heads, list) else int(heads)
     kv = g("attention.head_count_kv", 0)
+    # sliding-window attention (Gemma 2/3/4, …): only the GLOBAL layers keep a
+    # KV cache that grows with context; the windowed layers are bounded by the
+    # window, so counting all layers as full-attention overestimates KV ~6x and
+    # makes long contexts read as "won't fit" (live repro 2026-07-18: Gemma4
+    # 26B-A4B capped at 8K when it runs at 256K).
+    swa = g("attention.sliding_window_pattern")   # True = windowed, False = global
     if isinstance(kv, list):
-        # per-layer table: zeros are linear-attention layers with no KV cache
-        full_attn = sum(1 for h in kv if int(h) > 0)
-        kv_heads = max((int(h) for h in kv), default=0)
+        if isinstance(swa, list) and len(swa) == len(kv):
+            gi = [i for i, w in enumerate(swa) if not w]   # global-layer indices
+            if gi:
+                full_attn = len(gi)
+                kv_heads = max(int(kv[i]) for i in gi)
+            else:                                          # all windowed (rare)
+                full_attn = sum(1 for h in kv if int(h) > 0)
+                kv_heads = max((int(h) for h in kv), default=0)
+        else:
+            # per-layer table without an SWA pattern: zeros are linear-attention
+            # (DeltaNet) layers that hold no KV cache
+            full_attn = sum(1 for h in kv if int(h) > 0)
+            kv_heads = max((int(h) for h in kv), default=0)
     else:
         full_attn, kv_heads = n_layers, int(kv)
     head_dim = int(g("attention.key_length", 0)) or (
