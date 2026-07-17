@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import presets
+from . import server_ops
 from . import sessions
 from . import state as st
 
@@ -169,6 +170,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def status():
         s = st.server_running()
         if s is None:
+            calib = server_ops.read_calib_marker()
+            if calib:
+                return {"calibrating": calib, "unloaded": False}
             return JSONResponse({"error": "not running"}, status_code=404)
         caps: list = []
         try:
@@ -517,6 +521,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         from . import server_ops
         s = st.server_running()
         if s is None:
+            calib = server_ops.read_calib_marker()
+            if calib:   # mid-switch: old engine dead, tuning the new one
+                return {"calibrating": calib, "unloaded": False}
             return JSONResponse({"error": "not running"}, status_code=404)
         exp = server_ops.expected_tg(s["model"], s["quant"],
                                      s.get("backend", "unknown"))
@@ -524,6 +531,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                       "ctx", "started_at", "public_port",
                                       "unloaded")}
         info.update(server_ops.ram_snapshot())
+        info["calibrating"] = server_ops.read_calib_marker()
         info["engine_version"] = server_ops.engine_version()
         info["last_tg"] = telemetry["tg"]
         info["expected_tg"] = exp

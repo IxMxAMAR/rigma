@@ -758,6 +758,18 @@ async function pollEngine() {
   catch { engineInfo = null; }
   const dot = $("engine-dot"), label = $("engine-label");
   if (!engineInfo) { dot.className = "dot"; label.textContent = "engine"; return; }
+  if (engineInfo.calibrating) {
+    // first-load hardware tune in progress — poll faster so the step updates
+    dot.className = "dot warn";
+    const step = engineInfo.calibrating.step || "";
+    label.textContent = "optimizing" + (step && step !== "starting"
+      ? " (" + step + ")" : "…");
+    $("model").textContent = "optimizing " + engineInfo.calibrating.model +
+      " for your hardware…";
+    clearTimeout(pollEngine._t);
+    pollEngine._t = setTimeout(pollEngine, 2000);
+    return;
+  }
   if (engineInfo.unloaded) {
     dot.className = "dot warn";
     label.textContent = "unloaded";
