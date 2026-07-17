@@ -45,8 +45,14 @@ def tool(name, description, parameters, safe=True, needs=""):
     return wrap
 
 
+# marks a tool result that carries an image for the agentic loop to inject as a
+# vision message (tool-role messages can't hold image parts, so serve.py reads
+# the path, base64s it, and appends a user message with the image_url)
+IMAGE_SENTINEL = "\x00__RIGMA_IMAGE__\x00"
+
+
 def tool_specs(allow_code: bool = False, has_rag: bool = False,
-               workspace: str | None = None) -> list[dict]:
+               workspace: str | None = None, has_vision: bool = False) -> list[dict]:
     """OpenAI-format tool definitions to hand the model, filtered to what this
     session actually permits."""
     out = []
@@ -56,6 +62,8 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
         if t.needs == "rag" and not has_rag:
             continue
         if t.needs == "workspace" and not workspace:
+            continue
+        if t.needs == "vision" and not has_vision:
             continue
         out.append({"type": "function", "function": {
             "name": t.name, "description": t.description,
@@ -72,6 +80,8 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
     ctx = ctx or {}
     if t.needs == "code" and not ctx.get("allow_code"):
         return "error: code execution is not enabled for this chat"
+    if t.needs == "vision" and not ctx.get("has_vision"):
+        return "error: this model can't see images"
     try:
         return t.handler(args or {}, ctx)
     except Exception as e:   # a broken tool must not kill the turn
@@ -312,9 +322,12 @@ def _ws_path(ctx, rel: str) -> Path:
     root = Path(ws).resolve()
     if not root.is_dir():
         raise ValueError("the workspace folder doesn't exist")
+    if Path(rel).is_absolute():
+        raise ValueError(f"'{rel}' is an absolute path — pass a path RELATIVE "
+                         f"to the workspace ({root}) instead")
     p = (root / rel).resolve()
     if p != root and not p.is_relative_to(root):
-        raise ValueError("path is outside the workspace")
+        raise ValueError("path is outside the workspace — stay within it")
     return p
 
 
@@ -479,9 +492,12 @@ def _edit_file(args, ctx):
     old = str(args.get("old", ""))
     n = text.count(old)
     if n == 0:
-        return "error: the old string wasn't found in the file"
+        return ("error: the 'old' string wasn't found EXACTLY — check for "
+                "mismatched indentation/whitespace or stray markdown backticks; "
+                "read_file first to copy the exact text")
     if n > 1:
-        return f"error: the old string appears {n} times — make it unique"
+        return (f"error: the 'old' string appears {n} times — add surrounding "
+                "lines to make it unique")
     p.write_text(text.replace(old, str(args.get("new", "")), 1),
                  encoding="utf-8")
     return f"edited {args.get('path')}"
@@ -544,6 +560,39 @@ def _write_file(args, ctx):
     content = str(args.get("content", ""))
     p.write_text(content, encoding="utf-8")
     return f"wrote {len(content)} chars to {args.get('path')}"
+
+
+@tool("view_image",
+      "Look at an image file so you can describe or analyze it. Accepts an "
+      "absolute path (e.g. D:\\pics\\a.png) OR a workspace-relative path. Use "
+      "this whenever the user references an image by its file path — you cannot "
+      "see images any other way.",
+      {"type": "object", "properties": {
+          "path": {"type": "string", "description": "absolute or "
+                   "workspace-relative path to the image file"}},
+       "required": ["path"]},
+      needs="vision")
+def _view_image(args, ctx):
+    import mimetypes
+    ps = str(args.get("path", "")).strip().strip('"').strip("'")
+    if not ps:
+        return "error: no path given"
+    p = Path(ps)
+    if not p.is_absolute():
+        try:
+            p = _ws_path(ctx, ps)          # relative -> confine to workspace
+        except ValueError as e:
+            return f"error: {e}"
+    if not p.is_file():
+        return f"error: no such file: {ps}"
+    mime, _ = mimetypes.guess_type(str(p))
+    if not mime or not mime.startswith("image/"):
+        return (f"error: {p.name} is not an image (only image files can be "
+                "viewed)")
+    if p.stat().st_size > 20_000_000:
+        return "error: image too large to view (max 20MB)"
+    # the loop reads + base64s the file and feeds it to the vision model
+    return IMAGE_SENTINEL + str(p.resolve())
 
 
 @tool("run_python",

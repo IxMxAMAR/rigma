@@ -95,3 +95,51 @@ def test_tools_on_by_default(home):
     # a fresh session should have tools enabled without any opt-in
     from rigma import sessions
     assert sessions.create()["use_tools"] is True
+
+
+class _BadArgsUpstream(BaseHTTPRequestHandler):
+    """Round 1: stream a tool_call with BROKEN JSON args. Round 2 (after the
+    error is fed back as a tool message): answer."""
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        body = json.loads(self.rfile.read(n))
+        has_tool = any(m.get("role") == "tool" for m in body.get("messages", []))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+
+        def sse(obj):
+            self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+
+        if not has_tool:
+            sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "b1", "type": "function",
+                 "function": {"name": "calculator",
+                              "arguments": '{"expression": '}}]}}]})  # broken
+        else:
+            for tok in ["ok ", "done"]:
+                sse({"choices": [{"delta": {"content": tok}}]})
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def bad_upstream():
+    srv = HTTPServer(("127.0.0.1", 0), _BadArgsUpstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
+
+
+def test_malformed_tool_args_fed_back_not_executed(home, bad_upstream):
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=bad_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "2+2?"})
+    assert r.status_code == 200
+    assert "malformed JSON" in r.text          # error surfaced to the model
+    assert "fix the JSON" in r.text            # instructional
+    assert '"delta": "done"' in r.text         # still reached a final answer

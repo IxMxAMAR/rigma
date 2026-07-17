@@ -30,3 +30,35 @@ def test_run_python_stdin_does_not_hang():
     # EOF on stdin -> instant EOFError, not a 30s timeout
     assert time.monotonic() - t0 < 10
     assert "timed out" not in out
+
+
+def test_view_image_gated_on_vision():
+    # not offered without vision, and refused if called anyway
+    base = {t["function"]["name"] for t in tools.tool_specs()}
+    assert "view_image" not in base
+    withvis = {t["function"]["name"] for t in tools.tool_specs(has_vision=True)}
+    assert "view_image" in withvis
+    assert "can't see images" in tools.run_tool(
+        "view_image", {"path": "x.png"}, {"has_vision": False})
+
+
+def test_view_image_returns_sentinel_for_real_image(tmp_path):
+    img = tmp_path / "pic.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)   # .png ext is enough
+    out = tools.run_tool("view_image", {"path": str(img)},
+                         {"has_vision": True})
+    assert out.startswith(tools.IMAGE_SENTINEL)
+    assert out.endswith("pic.png")
+
+
+def test_view_image_rejects_non_image(tmp_path):
+    doc = tmp_path / "notes.txt"
+    doc.write_text("hi")
+    out = tools.run_tool("view_image", {"path": str(doc)}, {"has_vision": True})
+    assert "not an image" in out
+
+
+def test_view_image_missing_file():
+    out = tools.run_tool("view_image", {"path": "D:/nope/gone.png"},
+                         {"has_vision": True})
+    assert "no such file" in out
