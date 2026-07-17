@@ -231,6 +231,9 @@ with sync_playwright() as pw:
     check("models view: not-downloaded model shows a Download button",
           page.locator(".model-grid .model-card button", has_text="Download")
           .count() >= 1)
+    check("models view: vision model offers its projector for download",
+          page.locator(".model-grid .mmproj-row", has_text="vision projector")
+          .count() >= 1)
 
     # drag-drop a synthetic gguf onto the zone (full upload->install->rerender)
     page.evaluate("""async (b64) => {
