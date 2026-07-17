@@ -147,11 +147,9 @@ def _fetch_url(args, ctx):
     url = str(args.get("url", "")).strip()
     if not re.match(r"^https?://", url):
         return "error: url must start with http:// or https://"
-    with _public_client() as c:
-        r = c.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
+    _, raw = _bounded_get(url)
     body = re.sub(r"(?is)<(script|style|noscript|head)[^>]*>.*?</\1>", " ",
-                  r.text)
+                  raw)
     text = _strip(re.sub(r"(?s)<[^>]+>", " ", body))
     text = re.sub(r"\s+\n", "\n", re.sub(r"[ \t]+", " ", text)).strip()
     return text[:6000] + ("\n…(truncated)" if len(text) > 6000 else "")
@@ -194,8 +192,13 @@ def _safe_eval(node):
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return _bounded(node.value)
     if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
-        return _bounded(_OPS[type(node.op)](_safe_eval(node.left),
-                                            _safe_eval(node.right)))
+        left, right = _safe_eval(node.left), _safe_eval(node.right)
+        # guard the EXPONENT before computing — _bounded only sees the result,
+        # but 9**9**9**9 hangs the thread building a 300M-digit int first
+        if isinstance(node.op, ast.Pow) and (not isinstance(right, int)
+                                             or abs(right) > 4096):
+            raise ValueError("exponent too large")
+        return _bounded(_OPS[type(node.op)](left, right))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
         return _bounded(_OPS[type(node.op)](_safe_eval(node.operand)))
     raise ValueError("unsupported expression")
@@ -213,6 +216,10 @@ def _is_public_host(host: str) -> bool:
         return False
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
+        # ::ffff:127.0.0.1 reports itself as global — unwrap the mapped v4 so a
+        # loopback/private target can't sneak through as an IPv6 literal
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
         if (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             return False
@@ -231,6 +238,29 @@ def _public_client():
             raise ValueError("refusing to reach a private/loopback address")
     return httpx.Client(follow_redirects=True, timeout=25,
                         event_hooks={"request": [guard]})
+
+
+_MAX_FETCH_BYTES = 3_000_000   # cap so a 10GB URL / infinite stream can't OOM
+
+
+def _bounded_get(url: str, method: str = "GET", headers=None, json=None,
+                 raise_status=True):
+    """Stream a response and stop after _MAX_FETCH_BYTES so a huge or endless
+    body can't exhaust RAM. Returns (status_code, decoded_text)."""
+    with _public_client() as c:
+        with c.stream(method, url,
+                      headers=headers or {"User-Agent": "Mozilla/5.0"},
+                      json=json) as r:
+            if raise_status:
+                r.raise_for_status()
+            buf, total = [], 0
+            for chunk in r.iter_bytes():
+                buf.append(chunk)
+                total += len(chunk)
+                if total >= _MAX_FETCH_BYTES:
+                    break
+            enc = r.encoding or "utf-8"
+            return r.status_code, b"".join(buf).decode(enc, errors="ignore")
 
 
 @tool("current_datetime",
@@ -302,11 +332,14 @@ def _http_request(args, ctx):
     if not re.match(r"^https?://", url):
         return "error: url must start with http:// or https://"
     method = str(args.get("method", "GET")).upper()
-    with _public_client() as c:
-        r = c.request(method, url, headers=args.get("headers") or None,
-                      json=args.get("json") if method == "POST" else None)
-    body = r.text
-    return (f"HTTP {r.status_code}\n"
+    try:
+        status, body = _bounded_get(
+            url, method=method, headers=args.get("headers") or None,
+            json=args.get("json") if method in ("POST", "PUT", "PATCH") else None,
+            raise_status=False)
+    except Exception as e:
+        return f"error: {e}"
+    return (f"HTTP {status}\n"
             + body[:6000] + ("\n…(truncated)" if len(body) > 6000 else ""))
 
 
@@ -374,15 +407,22 @@ def _recall(args, ctx):
           "pattern": {"type": "string"}}, "required": ["pattern"]},
       needs="workspace")
 def _find_files(args, ctx):
+    import itertools
     root = _ws_path(ctx, ".")
     pat = str(args.get("pattern", "*"))
-    all_hits = [p for p in sorted(root.glob(pat)) if p.is_file()]
+    # cap the WALK at 5000 so `**/*` on a huge tree can't stall/OOM (glob is
+    # lazy; islice stops it early) — then sort the bounded set for stable output
+    scanned = list(itertools.islice(
+        (p for p in root.glob(pat)
+         if p.is_file() and p.resolve().is_relative_to(root)), 5000))
+    all_hits = sorted(scanned)
     hits = [p.relative_to(root).as_posix() for p in all_hits[:200]]
     if not hits:
         return f"no files match {pat}"
     body = "\n".join(hits)
     if len(all_hits) > 200:
-        body += f"\n…(showing 200 of {len(all_hits)} matches — narrow the pattern)"
+        more = f"{len(all_hits)}+" if len(scanned) == 5000 else str(len(all_hits))
+        body += f"\n…(showing 200 of {more} matches — narrow the pattern)"
     return body
 
 
@@ -404,7 +444,10 @@ def _grep(args, ctx):
     glob = str(args.get("glob", "") or "**/*")
     out, seen = [], 0
     for p in sorted(root.glob(glob)):
-        if not p.is_file() or p.stat().st_size > 2_000_000:
+        # a symlink named in the glob can point outside the root; glob won't
+        # re-check, so resolve and confirm containment before reading
+        if (not p.is_file() or p.stat().st_size > 2_000_000
+                or not p.resolve().is_relative_to(root)):
             continue
         try:
             for i, line in enumerate(p.read_text(encoding="utf-8",
@@ -530,8 +573,10 @@ def _run_shell(args, ctx):
 def _run_subprocess(cmd, ctx, shell=False):
     cwd = ctx.get("workspace") or None
     try:
+        # stdin=DEVNULL so input()/`cat` with no args can't block for the full
+        # 30s waiting on a terminal that will never arrive
         r = subprocess.run(cmd, shell=shell, cwd=cwd, capture_output=True,
-                           text=True, timeout=30)
+                           text=True, timeout=30, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return "error: timed out after 30s"
     out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
