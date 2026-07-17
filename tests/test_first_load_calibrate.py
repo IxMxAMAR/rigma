@@ -88,3 +88,22 @@ def test_disabled_via_env_skips_calibration(env, monkeypatch):
     server_ops.perform_switch("m", reg, _profile())
     assert len(launches) == 1
     assert bench.is_calibrated("m", "Q4", "vulkan") is False
+
+
+def test_status_surfaces_calibrating_marker(tmp_path, monkeypatch):
+    """Mid-switch (engine dead, tuning) both status endpoints report progress."""
+    from fastapi.testclient import TestClient
+
+    from rigma.serve import build_app
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    server_ops._write_calib_marker("newmodel", "coopmat-off")
+    # no live engine recorded -> endpoints fall back to the calibrating marker
+    client = TestClient(build_app(upstream_port=1))
+    for path in ("/api/server", "/api/status"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert r.json()["calibrating"]["model"] == "newmodel"
+        assert r.json()["calibrating"]["step"] == "coopmat-off"
+    server_ops._clear_calib_marker()
+    # marker gone -> normal not-running 404
+    assert client.get("/api/server").status_code == 404
