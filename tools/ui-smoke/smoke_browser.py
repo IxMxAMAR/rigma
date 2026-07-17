@@ -354,6 +354,14 @@ with sync_playwright() as pw:
     an = page.evaluate("current && current.authors_note")
     check("author's note persists", an == "Keep the tone ominous.")
 
+    page.click("#tools-toggle")
+    page.wait_for_timeout(400)
+    check("tools toggle turns on",
+          page.evaluate("current && current.use_tools") is True
+          and "on" in (page.locator("#tools-toggle").text_content() or ""))
+    page.click("#tools-toggle")
+    page.wait_for_timeout(300)
+
     page.click("#prefill-toggle")
     check("prefill row opens", page.locator("#prefill-row").is_visible())
     page.fill("#prefill-text", "Sure, here goes:")

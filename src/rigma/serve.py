@@ -335,6 +335,76 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": "no such preset"}, status_code=404)
         return {"ok": True}
 
+    async def _tool_turn(s: dict):
+        """Agentic loop: hand the model its tools, run the calls it makes, feed
+        results back, repeat until it answers. Tool rounds are non-streamed
+        (they're quick); the final answer is chunked out for a live feel."""
+        from . import tools as toolkit
+        from . import rag
+        preset = presets.resolve(s.get("preset_id", ""), registry) \
+            if s.get("preset_id") else None
+        msgs = sessions.build_messages(s, _default_prompt(), preset)
+        ctx = {"allow_code": bool(s.get("allow_code")),
+               "workspace": s.get("workspace") or ""}
+        specs = toolkit.tool_specs(allow_code=ctx["allow_code"],
+                                   has_rag=bool(rag.recorded_sidecar_port()),
+                                   workspace=ctx["workspace"])
+        params = sessions.effective_params(s, preset, _model_defaults())
+        trace, final, failed = [], "", False
+        try:
+            for _round in range(6):
+                body = {"messages": msgs, "tools": specs, "stream": False}
+                body.update(params)
+                resp = await client.post("/v1/chat/completions", json=body)
+                if resp.status_code != 200:
+                    raise RuntimeError(await _upstream_error(resp))
+                msg = resp.json()["choices"][0]["message"]
+                calls = msg.get("tool_calls") or []
+                if not calls:
+                    final = msg.get("content", "") or ""
+                    break
+                msgs.append({"role": "assistant",
+                             "content": msg.get("content") or "",
+                             "tool_calls": calls})
+                for c in calls:
+                    fn = c.get("function", {})
+                    name = fn.get("name", "")
+                    try:
+                        cargs = json.loads(fn.get("arguments") or "{}")
+                    except Exception:
+                        cargs = {}
+                    yield _sse({"name": name, "args": cargs}, event="tool")
+                    result = await asyncio.to_thread(toolkit.run_tool, name,
+                                                     cargs, ctx)
+                    yield _sse({"name": name, "result": result[:400]},
+                               event="tool_result")
+                    trace.append({"name": name, "args": cargs, "result": result})
+                    msgs.append({"role": "tool", "tool_call_id": c.get("id", ""),
+                                 "content": result})
+            else:
+                final = final or "(stopped after several tool calls)"
+        except Exception as e:
+            failed = True
+            yield _sse({"message": str(e) or "tool turn failed"}, event="error")
+        if not failed:
+            for i in range(0, len(final), 24):     # chunk for a streaming feel
+                yield _sse({"delta": final[i:i + 24]})
+            fresh = sessions.load(s["id"])
+            if fresh is None:
+                yield b"data: [DONE]\n\n"
+                return
+            for k in ("title", "system_prompt", "params", "notes", "digest",
+                      "preset_id", "effort", "use_rag", "use_tools",
+                      "allow_code", "workspace", "authors_note",
+                      "authors_note_depth", "archive"):
+                s[k] = fresh.get(k, s.get(k))
+            msg = {"role": "assistant", "content": final}
+            if trace:
+                msg["tool_trace"] = trace
+            s["messages"].append(msg)
+            sessions.save(s)
+        yield b"data: [DONE]\n\n"
+
     async def _llm_turn(s: dict, cont: bool = False):
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
@@ -843,8 +913,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse(
                 {"error": "continue is not available for grounded chats"},
                 status_code=400)
-        gen = (_rag_turn(s) if s.get("use_rag")
-               else _llm_turn(s, cont=bool(body.get("continue"))))
+        if s.get("use_tools") and not s.get("use_rag") \
+                and not body.get("continue"):
+            gen = _tool_turn(s)
+        elif s.get("use_rag"):
+            gen = _rag_turn(s)
+        else:
+            gen = _llm_turn(s, cont=bool(body.get("continue")))
         return StreamingResponse(gen, media_type="text/event-stream",
                                  headers=_NO_STORE)
 
