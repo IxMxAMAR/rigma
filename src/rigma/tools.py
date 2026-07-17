@@ -628,37 +628,95 @@ def _write_file(args, ctx):
     return f"wrote {len(content)} chars to {args.get('path')}"
 
 
+def _resolve_image(ps: str, ctx: dict) -> tuple:
+    """(resolved_path, error). Validates it exists, is an image, and is ≤20MB.
+    Absolute paths are allowed (images live outside the workspace); relative
+    paths are confined to the workspace."""
+    import mimetypes
+    ps = str(ps).strip().strip('"').strip("'")
+    if not ps:
+        return None, "empty path"
+    p = Path(ps)
+    if not p.is_absolute():
+        try:
+            p = _ws_path(ctx, ps)
+        except ValueError as e:
+            return None, str(e)
+    if not p.is_file():
+        return None, f"no such file: {ps}"
+    mime, _ = mimetypes.guess_type(str(p))
+    if not mime or not mime.startswith("image/"):
+        return None, f"{p.name} is not an image"
+    if p.stat().st_size > 20_000_000:
+        return None, f"{p.name} is too large (max 20MB)"
+    return p.resolve(), ""
+
+
+def encode_image_data_uri(path: str, max_px: int = 1024) -> str:
+    """Read an image and return a base64 data URI, DOWNSCALED to max_px on the
+    long edge (ComfyUI PNGs are huge — full-res would swamp a local model's
+    context/compute). Falls back to the raw bytes if Pillow isn't available."""
+    import base64
+    import io
+    data = Path(path).read_bytes()
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.thumbnail((max_px, max_px))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        import mimetypes
+        mime = mimetypes.guess_type(path)[0] or "image/png"
+        return f"data:{mime};base64," + base64.b64encode(data).decode()
+
+
 @tool("view_image",
-      "Look at an image file so you can describe or analyze it. Accepts an "
+      "Look at ONE image file so you can describe or analyze it. Accepts an "
       "absolute path (e.g. D:\\pics\\a.png) OR a workspace-relative path. Use "
       "this whenever the user references an image by its file path — you cannot "
-      "see images any other way.",
+      "see images any other way. To review several at once, use view_images.",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "absolute or "
                    "workspace-relative path to the image file"}},
        "required": ["path"]},
       needs="vision")
 def _view_image(args, ctx):
-    import mimetypes
-    ps = str(args.get("path", "")).strip().strip('"').strip("'")
-    if not ps:
-        return "error: no path given"
-    p = Path(ps)
-    if not p.is_absolute():
-        try:
-            p = _ws_path(ctx, ps)          # relative -> confine to workspace
-        except ValueError as e:
-            return f"error: {e}"
-    if not p.is_file():
-        return f"error: no such file: {ps}"
-    mime, _ = mimetypes.guess_type(str(p))
-    if not mime or not mime.startswith("image/"):
-        return (f"error: {p.name} is not an image (only image files can be "
-                "viewed)")
-    if p.stat().st_size > 20_000_000:
-        return "error: image too large to view (max 20MB)"
-    # the loop reads + base64s the file and feeds it to the vision model
-    return IMAGE_SENTINEL + str(p.resolve())
+    p, err = _resolve_image(args.get("path", ""), ctx)
+    if err:
+        return f"error: {err}"
+    return IMAGE_SENTINEL + str(p)     # the loop reads + injects it as vision
+
+
+@tool("view_images",
+      "Look at SEVERAL images at once (up to 8) — the efficient way to review "
+      "or compare a batch, e.g. to understand a style across many pictures. Pass "
+      "a list of file paths (absolute or workspace-relative). For 20 images, "
+      "call this a few times in batches rather than one-by-one.",
+      {"type": "object", "properties": {
+          "paths": {"type": "array", "items": {"type": "string"},
+                    "description": "up to 8 image file paths"}},
+       "required": ["paths"]},
+      needs="vision")
+def _view_images(args, ctx):
+    paths = args.get("paths") or []
+    if isinstance(paths, str):
+        paths = [paths]
+    if not paths:
+        return "error: no paths given"
+    ok, errs = [], []
+    for ps in list(paths)[:8]:
+        p, err = _resolve_image(ps, ctx)
+        (ok.append(str(p)) if p else errs.append(err))
+    if not ok:
+        return "error: no valid images — " + "; ".join(errs)
+    note = f" (skipped: {'; '.join(errs)})" if errs else ""
+    if len(paths) > 8:
+        note += f" (only the first 8 of {len(paths)} — call again for the rest)"
+    return IMAGE_SENTINEL + "\n".join(ok) + ("\x00" + note if note else "")
 
 
 @tool("run_python",

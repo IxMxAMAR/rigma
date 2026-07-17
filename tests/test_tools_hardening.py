@@ -77,3 +77,40 @@ def test_ask_gemini_no_key(monkeypatch):
     monkeypatch.setattr(tools, "_gemini_key", lambda: None)
     out = tools.run_tool("ask_gemini", {"question": "hi"})
     assert "no Gemini API key" in out
+
+
+def test_view_images_batch(tmp_path):
+    for i in range(3):
+        (tmp_path / f"p{i}.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 40)
+    paths = [str(tmp_path / f"p{i}.png") for i in range(3)]
+    out = tools.run_tool("view_images", {"paths": paths}, {"has_vision": True})
+    assert out.startswith(tools.IMAGE_SENTINEL)
+    body = out[len(tools.IMAGE_SENTINEL):]
+    assert body.count("\n") == 2                 # 3 paths, newline-separated
+
+
+def test_view_images_gated_and_caps(tmp_path):
+    base = {t["function"]["name"] for t in tools.tool_specs()}
+    assert "view_images" not in base
+    assert "view_images" in {t["function"]["name"]
+                             for t in tools.tool_specs(has_vision=True)}
+    # >8 paths: only first 8 kept, with a note
+    for i in range(10):
+        (tmp_path / f"q{i}.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    out = tools.run_tool("view_images",
+                         {"paths": [str(tmp_path / f"q{i}.png") for i in range(10)]},
+                         {"has_vision": True})
+    paths_part = out[len(tools.IMAGE_SENTINEL):].partition("\x00")[0]
+    assert paths_part.count("\n") == 7           # 8 paths
+    assert "first 8 of 10" in out
+
+
+def test_encode_image_data_uri():
+    from rigma import tools as t
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.write(fd, b"\x89PNG\r\n\x1a\n" + b"\0" * 40); os.close(fd)
+    uri = t.encode_image_data_uri(path)
+    os.unlink(path)
+    assert uri.startswith("data:image/")
+    assert "base64," in uri
