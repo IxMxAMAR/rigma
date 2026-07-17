@@ -380,16 +380,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         usage, timings = {}, {}
         # agentic loop: stream a round; if the model called tools, run them,
         # feed results back and stream again; otherwise this round is the answer
-        max_rounds = 6 if use_tools else 1
+        max_rounds = 10 if use_tools else 1
         for _round in range(max_rounds):
             last = _round == max_rounds - 1
-            body = {"messages": msgs, "stream": True,
+            turn_msgs = msgs
+            if use_tools and last:
+                # final round: KEEP tools advertised so a stray tool call is
+                # parsed as a call (and quietly dropped below) instead of
+                # LEAKING as raw "<tool_call>…" text into the chat — then nudge
+                # the model to answer. Withholding tools here was what leaked
+                # the raw call (owner-reported 2026-07-18).
+                turn_msgs = msgs + [{"role": "system", "content":
+                    "You have reached the tool-call limit. Do not call any more "
+                    "tools — give your final answer now using what you already "
+                    "gathered."}]
+            body = {"messages": turn_msgs, "stream": True,
                     "stream_options": {"include_usage": True}}
             body.update(params)
-            # on the final round, withhold tools so the model MUST answer with
-            # what it has — otherwise a tool call on round 6 ends the loop with
-            # no reply at all (Gemini review 2026-07-18)
-            if specs and not last:
+            if specs:
                 body["tools"] = specs
             if effort == "off":
                 body["chat_template_kwargs"] = {"enable_thinking": False}
@@ -457,8 +465,6 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             if failed:
                 break
             if use_tools and calls and not last:   # the model asked for tools
-                import base64 as _b64
-                import mimetypes as _mt
                 from . import tools as toolkit
                 msgs.append({"role": "assistant", "content": rtext,
                              "tool_calls": [
@@ -475,36 +481,40 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     except Exception as e:
                         cargs, bad = {}, f"malformed JSON arguments: {e}"
                     yield _sse({"name": c["name"], "args": cargs}, event="tool")
-                    img = None
+                    imgs = None
                     if bad:                     # don't run — let the model retry
                         result = f"error: {bad} — fix the JSON and call again"
                     else:
                         result = await asyncio.to_thread(toolkit.run_tool,
                                                          c["name"], cargs, tctx)
-                        # view_image returns a sentinel + path; read + base64 it
-                        # and feed it in as a vision message (tool-role can't
-                        # carry image parts)
+                        # view_image/view_images return a sentinel + newline-
+                        # separated paths; downscale + base64 each and feed them
+                        # in as ONE vision message (tool-role can't carry images)
                         if result.startswith(toolkit.IMAGE_SENTINEL):
-                            ipath = result[len(toolkit.IMAGE_SENTINEL):]
+                            payload = result[len(toolkit.IMAGE_SENTINEL):]
+                            payload, _, note = payload.partition("\x00")
+                            ipaths = [p for p in payload.split("\n") if p]
                             try:
-                                data = _Path(ipath).read_bytes()
-                                mime = _mt.guess_type(ipath)[0] or "image/png"
-                                img = (f"data:{mime};base64,"
-                                       + _b64.b64encode(data).decode())
-                                result = f"loaded {_Path(ipath).name} — visible now"
+                                imgs = [await asyncio.to_thread(
+                                    toolkit.encode_image_data_uri, p)
+                                    for p in ipaths]
+                                names = ", ".join(_Path(p).name for p in ipaths)
+                                result = f"loaded {len(imgs)} image(s): {names}{note}"
                             except Exception as e:
-                                result = f"error loading image: {e}"
+                                result, imgs = f"error loading image: {e}", None
                     yield _sse({"name": c["name"], "result": result[:400]},
                                event="tool_result")
                     trace.append({"name": c["name"], "args": cargs,
                                   "result": result})
                     msgs.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": result})
-                    if img:
-                        msgs.append({"role": "user", "content": [
-                            {"type": "text",
-                             "text": "(image loaded via view_image — look at it)"},
-                            {"type": "image_url", "image_url": {"url": img}}]})
+                    if imgs:
+                        content = [{"type": "text",
+                                    "text": "(images loaded — look at them)"}]
+                        for u in imgs:
+                            content.append({"type": "image_url",
+                                            "image_url": {"url": u}})
+                        msgs.append({"role": "user", "content": content})
                 continue                       # stream the next round
             text = rtext                       # no tool calls -> this is final
             break
