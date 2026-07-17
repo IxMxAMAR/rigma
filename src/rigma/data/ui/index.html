@@ -14,6 +14,8 @@
     <span class="wordmark">rigma</span>
     <button id="new-chat" type="button">+ new</button>
   </div>
+  <button id="open-models" type="button" class="rail-nav">
+    <span aria-hidden="true">▤</span> Models &amp; downloads</button>
   <input id="rail-search" placeholder="search chats" spellcheck="false"
          aria-label="Search chats">
   <nav id="chat-list" aria-label="Chats"></nav>
@@ -93,6 +95,15 @@
       <button class="send" id="send" type="submit">Send</button>
     </form>
   </div>
+  <section id="models-view" hidden aria-label="Models and downloads">
+    <div class="mv-head">
+      <button id="mv-close" type="button">◀ back to chat</button>
+      <h2>Models</h2>
+      <span id="mv-disk" class="mv-disk"></span>
+      <button id="mv-refresh" type="button" aria-label="Refresh">⟳</button>
+    </div>
+    <div id="mv-body"></div>
+  </section>
 </main>
 <div id="drawer-scrim" hidden></div>
 <aside id="drawer" hidden aria-label="Settings">
@@ -100,7 +111,6 @@
     <nav id="drawer-tabs" role="tablist">
       <button type="button" role="tab" aria-selected="true" data-tab="chat" class="active">Chat</button>
       <button type="button" role="tab" aria-selected="false" data-tab="presets">Presets</button>
-      <button type="button" role="tab" aria-selected="false" data-tab="models">Models</button>
       <button type="button" role="tab" aria-selected="false" data-tab="server">Server</button>
     </nav>
     <button id="drawer-close" type="button" aria-label="Close settings">✕</button>
