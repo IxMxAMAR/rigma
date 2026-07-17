@@ -103,11 +103,16 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         grown = fit_gguf(spec, gguf, profile, ctx, explain)
         if grown is None:
             break
-        # never trade decode speed for context: stop if the larger window
-        # forces more CPU offload (MoE) or fewer GPU layers (dense)
-        if grown.n_cpu_moe > best.n_cpu_moe or grown.ngl < best.ngl:
+        # dense: fewer GPU layers is a real per-token cost, so stop before the
+        # larger window forces weights off the GPU. MoE: expert offload is
+        # cheap (sparse activation) and users want the context — grow to native
+        # as long as it still fits (the 35B is verified healthy at 262K ctx
+        # with expert offload: 56.7 t/s). Guarding MoE here capped qwen3.6 at
+        # 32K when it runs fine at 256K (owner, 2026-07-18).
+        if grown.ngl < best.ngl or (spec.moe is None
+                                    and grown.n_cpu_moe > best.n_cpu_moe):
             explain.append(f"grow-to-fit: stop at ctx {best.ctx} "
-                           f"(ctx {ctx} would force more offload)")
+                           f"(ctx {ctx} would push weights off the GPU)")
             break
         explain.append(f"grow-to-fit: ctx {best.ctx} -> {ctx} "
                        f"(n_cpu_moe {best.n_cpu_moe} -> {grown.n_cpu_moe})")
