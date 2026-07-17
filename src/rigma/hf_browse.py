@@ -21,6 +21,17 @@ from .models import GgufFile, ModelSpec, MoESpec
 HF = "https://huggingface.co"
 _SPLIT_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
 _RANGE_STEPS_MB = (8, 32, 64)   # escalate when a huge vocab pads the header
+# auxiliary ggufs that are NOT standalone runnable models: importance-matrix
+# data and speculative-decoding draft heads (MTP/EAGLE/Medusa). Left in the
+# quant list they show up as tiny phantom "models" and, being the smallest
+# file, get picked as the header-probe source — mislabelling the real model
+# (live repro 2026-07-18: a 240MB mtp-*.gguf made a 26B MoE read as "dense").
+_AUX_MARKERS = ("imatrix", "mtp", "-draft", "eagle", "medusa")
+
+
+def _is_aux_gguf(name: str) -> bool:
+    n = name.lower()
+    return any(m in n for m in _AUX_MARKERS)
 
 
 def _headers() -> dict:
@@ -97,7 +108,7 @@ def repo_files(repo: str) -> dict:
         if _SPLIT_RE.search(p):
             split += 1
             continue
-        if "imatrix" in p.lower():   # importance-matrix data, not a model
+        if _is_aux_gguf(p):   # imatrix / MTP / draft head — not a model
             continue
         entry = {"file": p, "bytes": int(f.get("size", 0) or 0)}
         (mmprojs if "mmproj" in p.lower() else ggufs).append(entry)
@@ -181,6 +192,13 @@ def inspect_repo(repo: str, registry=None, profile=None) -> dict:
     spec, rf = _spec_from_repo(repo)
     reg = registry if registry is not None else Registry.load()
     prof = profile if profile is not None else probe_hardware(reg.gpus)
+    # running this model means SWITCHING to it (the current one unloads first),
+    # so credit the loaded model's RAM back — otherwise a model that would fit
+    # reads "too big" purely because the running engine is eating RAM
+    if profile is None:
+        from . import state as st
+        from .server_ops import _free_current
+        prof = _free_current(prof, st.read_state() or {}, reg)
     quants = []
     for g in spec.ggufs:
         flags = None
