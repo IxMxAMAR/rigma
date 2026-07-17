@@ -515,11 +515,16 @@ function quantRow(m, q, reload) {
     const bar = el("span", "pull-bar");
     bar.appendChild(el("span", "fill")).style.width = pct + "%";
     row.appendChild(bar);
-    const parts = [pct + "%"];
-    if (q.pull.bps) parts.push((q.pull.bps / 2 ** 20).toFixed(1) + " MB/s");
-    const stat = el("span", "sz pull-stat", parts.join(" · "));
-    stat.title = fmtGB(done) + " of " + fmtGB(tot)
-      + (q.pull.eta ? " · ~" + fmtEta(q.pull.eta) + " left" : "");
+    let stat;
+    if (done <= 0) {                       // no bytes yet — say so, don't lie
+      stat = el("span", "sz pull-stat", "connecting…");
+    } else {
+      const parts = [pct + "%"];
+      if (q.pull.bps) parts.push((q.pull.bps / 2 ** 20).toFixed(1) + " MB/s");
+      stat = el("span", "sz pull-stat", parts.join(" · "));
+      stat.title = fmtGB(done) + " of " + fmtGB(tot)
+        + (q.pull.eta ? " · ~" + fmtEta(q.pull.eta) + " left" : "");
+    }
     row.appendChild(stat);
   } else if (q.pull && q.pull.status === "error") {
     row.appendChild(el("span", "err", q.pull.error || "download failed"));
