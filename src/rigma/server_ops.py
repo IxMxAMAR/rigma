@@ -53,6 +53,39 @@ def _model_on_disk(gguf) -> bool:
     return (rigma_home() / "models" / gguf.file).exists()
 
 
+def _calib_marker_path():
+    return rigma_home() / "calibrating.json"
+
+
+def read_calib_marker() -> dict | None:
+    """First-load tuning progress, if a calibration is running right now. Stale
+    markers (a crash mid-tune) are ignored after 20 min so the UI never sticks
+    on 'optimizing' forever."""
+    p = _calib_marker_path()
+    try:
+        import time
+        if time.time() - p.stat().st_mtime > 1200:
+            return None
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_calib_marker(model: str, step: str) -> None:
+    p = _calib_marker_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"model": model, "step": step}), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _clear_calib_marker() -> None:
+    try:
+        _calib_marker_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _free_current(profile, state: dict, reg):
     """A copy of `profile` with the CURRENTLY-running model's RAM footprint
     added back — perform_switch/ctx-change kill that engine before launching,
@@ -185,8 +218,27 @@ def perform_switch(model: str, registry=None, profile=None,
                "Darwin": "darwin"}[platform.system()]
     exe = runtime.ensure_engine(rp.backend, os_name)
     model_path = rigma_home() / "models" / rp.gguf.file
+    port = int(s["public_port"]) - 1
     st.kill_pid(int(s.get("engine_pid", -1)))
-    _await_port_free(int(s["public_port"]) - 1)   # Windows TIME_WAIT grace
+    _await_port_free(port)   # Windows TIME_WAIT grace
+    # First load of a never-seen model+quant: with the old engine already dead,
+    # VRAM is free — auto-tune the hardware-specific toggles ONCE, then launch
+    # the winner. Cached forever after. Skipped for ctx-relaunches (a deliberate
+    # reconfigure, not a fresh load), CPU, and when disabled.
+    from .bench import auto_calibrate, is_calibrated
+    if (ctx is None and rp.backend != "cpu"
+            and os.environ.get("RIGMA_AUTO_CALIBRATE", "1") != "0"
+            and not is_calibrated(rp.model_slug, rp.gguf.quant, rp.backend)):
+        _write_calib_marker(rp.model_slug, "starting")
+        try:
+            rp = auto_calibrate(rp, exe, model_path, port=port, extra_args=extra,
+                                progress=lambda lbl:
+                                _write_calib_marker(rp.model_slug, lbl))
+        except Exception:
+            pass   # tuning is best-effort; fall through to a normal launch
+        finally:
+            _clear_calib_marker()
+        _await_port_free(port)   # last trial engine just released the port
     try:
         sp = runtime.launch_server(exe, rp, model_path,
                                    port=int(s["public_port"]) - 1,

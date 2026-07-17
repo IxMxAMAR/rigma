@@ -126,6 +126,9 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
             res = run_bench(port, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
             rows.append({"label": label, "flags": override, "tg_tps": res.tg_tps,
                          "pp_tps": res.pp_tps, "ok": True})
+        except Exception as e:  # loaded but wouldn't serve — count as a loss
+            rows.append({"label": label, "flags": override, "tg_tps": 0.0,
+                         "pp_tps": 0.0, "ok": False, "error": str(e)[:200]})
         finally:
             srv.stop()
     rows.sort(key=lambda r: r["tg_tps"], reverse=True)

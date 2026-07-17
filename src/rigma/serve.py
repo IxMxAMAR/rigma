@@ -180,6 +180,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return {**{k: s[k] for k in ("model", "quant", "public_port", "started_at")},
                 "ctx": s.get("ctx", 0), "capabilities": caps,
                 "unloaded": bool(s.get("unloaded")),
+                "calibrating": server_ops.read_calib_marker(),
                 "default_system_prompt": _default_prompt()}
 
     @app.get("/api/sessions")
