@@ -108,6 +108,10 @@ function streamTurn(sessionId, payload, handlers) {
           else if (ev.event === "meta") handlers.meta && handlers.meta(d);
           else if (ev.event === "think")
             handlers.think && handlers.think(d.delta || "");
+          else if (ev.event === "tool")
+            handlers.tool && handlers.tool(d);
+          else if (ev.event === "tool_result")
+            handlers.toolResult && handlers.toolResult(d);
           else if (d.delta) handlers.delta && handlers.delta(d.delta);
         }
       }
