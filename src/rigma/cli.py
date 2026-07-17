@@ -182,14 +182,22 @@ def _spawn_detached(port: int) -> None:
         argv.append("--yes")
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
               "stderr": subprocess.DEVNULL}
-    if platform.system() == "Windows":
-        kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
-                                   | 0x00000008)   # DETACHED_PROCESS
-    else:
-        kwargs["start_new_session"] = True
     exe = [sys.executable, "-m", "rigma"] if not getattr(sys, "frozen", False) \
         else [sys.executable]
-    subprocess.Popen(exe + argv, **kwargs)
+    if platform.system() == "Windows":
+        # DETACHED_PROCESS alone is not enough when the launching shell runs
+        # inside a Windows Job Object that kills children on close (many
+        # terminals/tools do) — the server dies with the shell. BREAKAWAY_FROM_
+        # JOB frees it. Some jobs forbid breakaway, so fall back without it.
+        base = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED
+        try:
+            subprocess.Popen(exe + argv,
+                             creationflags=base | 0x01000000,  # BREAKAWAY_FROM_JOB
+                             **kwargs)
+        except OSError:
+            subprocess.Popen(exe + argv, creationflags=base, **kwargs)
+    else:
+        subprocess.Popen(exe + argv, start_new_session=True, **kwargs)
     typer.echo(f"Rigma is starting in the background on port {port}.")
     typer.echo(f"  UI:    http://127.0.0.1:{port}")
     typer.echo("  stop:  rigma stop   ·   status: rigma status")
