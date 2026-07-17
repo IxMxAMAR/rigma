@@ -666,7 +666,7 @@ function libraryCard(m, reload) {
 async function renderModelsView() {
   clearTimeout(modelsPollTimer);
   const myGen = ++modelsRenderGen;
-  const reload = () => renderModelsView();
+  const reload = refreshModelsGrid;   // card actions refresh grid only
   const body = $("mv-body");
   let data = null;
   try { data = await api("GET", "/api/models"); } catch (e) {
@@ -745,8 +745,11 @@ async function renderModelsView() {
       const add = el("button", "act primary", "Add to library");
       add.onclick = async () => {
         add.disabled = true;
-        try { await api("POST", "/api/hf/add", {repo}); add.textContent = "Added ✓"; }
-        catch (e) { add.disabled = false; alert(e.message); }
+        try {
+          await api("POST", "/api/hf/add", {repo});
+          add.textContent = "Added ✓";
+          refreshModelsGrid();   // show it in Your Models now, keep this panel
+        } catch (e) { add.disabled = false; alert(e.message); }
       };
       acts.appendChild(add);
     }
@@ -850,17 +853,33 @@ async function renderModelsView() {
   tools.append(find, inst);
   body.appendChild(tools);
 
-  // your models — the grid
+  // your models — the grid. Rendered into its own container so it can be
+  // refreshed in place (e.g. after "Add to library") without rebuilding the
+  // HF browse panel and losing the user's search/detail.
   body.appendChild(el("h3", "mv-section", "Your models"));
-  const grid = el("div", "model-grid");
-  for (const m of data.models) grid.appendChild(libraryCard(m, reload));
-  body.appendChild(grid);
+  body.appendChild(el("div", "model-grid", "")).id = "mv-grid";
+  await refreshModelsGrid();
+}
 
-  if (data.models.some((m) =>
-        m.quants.some((q) => q.pull && q.pull.status === "downloading")))
-    modelsPollTimer = setTimeout(() => {
-      if (!$("models-view").hidden) renderModelsView();
-    }, 1500);
+async function refreshModelsGrid() {
+  const grid = document.getElementById("mv-grid");
+  if (!grid || $("models-view").hidden) return;
+  clearTimeout(modelsPollTimer);
+  const myGen = ++modelsRenderGen;
+  let data;
+  try { data = await api("GET", "/api/models"); } catch { return; }
+  if (myGen !== modelsRenderGen || !document.getElementById("mv-grid")
+      || $("models-view").hidden) return;
+  $("mv-disk").textContent = data.disk.models_gb + " GB on disk · "
+    + data.disk.free_gb + " GB free";
+  grid.innerHTML = "";
+  for (const m of data.models)
+    grid.appendChild(libraryCard(m, refreshModelsGrid));
+  const busy = (m) => m.quants.some((q) =>
+      q.pull && q.pull.status === "downloading")
+    || (m.mmproj && m.mmproj.pull && m.mmproj.pull.status === "downloading");
+  if (data.models.some(busy))
+    modelsPollTimer = setTimeout(refreshModelsGrid, 1500);
 }
 
 function renderCapsEditor(m) {
