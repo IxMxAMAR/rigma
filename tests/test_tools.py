@@ -104,3 +104,30 @@ def test_workspace_prefix_escape_blocked(tmp_path):
     # empty workspace refuses entirely
     assert "no workspace" in tools.run_tool("read_file", {"path": "x"},
                                             {"workspace": "", "allow_code": True})
+
+
+def test_calculator_nested_pow_dos_blocked():
+    """Security review 2026-07-18: nested ** bypassed the per-node exponent
+    guard; the result-magnitude bound must catch it."""
+    assert "too large" in tools.run_tool(
+        "calculator", {"expression": "((2**999)**999)**999"})
+    assert "too large" in tools.run_tool(
+        "calculator", {"expression": "10**5000"})
+    assert tools.run_tool("calculator", {"expression": "2**64"}) \
+        == str(2 ** 64)                          # normal big numbers still fine
+
+
+def test_ssrf_private_targets_blocked():
+    """Security review 2026-07-18: the model (or a prompt-injected page) must
+    not be able to fetch localhost / cloud metadata / the LAN."""
+    assert tools._is_public_host("127.0.0.1") is False
+    assert tools._is_public_host("localhost") is False
+    assert tools._is_public_host("169.254.169.254") is False   # cloud metadata
+    assert tools._is_public_host("10.0.0.5") is False
+    assert tools._is_public_host("8.8.8.8") is True
+    # the tool refuses a loopback URL (never issues the request)
+    out = tools.run_tool("fetch_url", {"url": "http://127.0.0.1:11500/api/x"})
+    assert "private" in out or "loopback" in out
+    out = tools.run_tool("http_request",
+                         {"url": "http://169.254.169.254/latest/meta-data"})
+    assert "private" in out or "loopback" in out

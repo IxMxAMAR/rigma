@@ -149,9 +149,9 @@ function renderChatTab() {
 
   box.appendChild(el("h3", "", "Tools — workspace & code"));
   box.appendChild(el("p", "dim",
-    "Web search, calculator, and document lookup work as soon as you turn on " +
-    "'tools' in the sys bar. File and code tools stay off until you point them " +
-    "at a folder and allow it below."));
+    "Tools are on for new chats (toggle in the sys bar). Search, fetch, math, " +
+    "date, and your documents work everywhere. File and code tools use the " +
+    "workspace folder below — defaults to your home folder."));
   const wsRow = el("div", "path-row");
   const ws = el("input");
   ws.placeholder = "Workspace folder (lets the model read/list files there)";
@@ -177,7 +177,8 @@ function renderChatTab() {
     catch (err) { hint.textContent = err.message; codeCb.checked = !codeCb.checked; }
   };
   codeRow.append(codeCb, document.createTextNode(
-    " Allow running Python & shell commands (only in the workspace)"));
+    " Allow running Python & shell on this machine (starts in the workspace "
+    + "folder, but code can reach anywhere you can)"));
   box.appendChild(codeRow);
 
   box.appendChild(el("h3", "", "This chat"));

@@ -33,7 +33,9 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      "use_rag": False, "preset_id": "", "params": {},
                      "notes": "", "digest": "", "effort": "", "archive": [],
                      "authors_note": "", "authors_note_depth": 3,
-                     "prefill": "", "use_tools": False, "allow_code": False,
+                     # tools on by default, full power (owner's call, their
+                     # own local machine) — empty workspace resolves to home
+                     "prefill": "", "use_tools": True, "allow_code": True,
                      "workspace": "", "messages": []}
 
 

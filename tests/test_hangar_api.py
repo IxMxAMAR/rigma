@@ -279,7 +279,7 @@ def test_prefill_not_doubled_when_engine_echoes(home, tmp_path, monkeypatch):
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
     client = TestClient(build_app(upstream_port=srv.server_address[1]))
     sid = client.post("/api/sessions", json={}).json()["id"]
-    client.post(f"/api/sessions/{sid}", json={"prefill": "ARRRGH, matey! "})
+    client.post(f"/api/sessions/{sid}", json={"prefill": "ARRRGH, matey! ", "use_tools": False})
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
     assert r.status_code == 200
     # the streamed body must contain the prefill exactly ONCE, not twice
@@ -320,7 +320,7 @@ def test_prefill_prepended_if_engine_does_not_echo(home, tmp_path, monkeypatch):
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
     client = TestClient(build_app(upstream_port=srv.server_address[1]))
     sid = client.post("/api/sessions", json={}).json()["id"]
-    client.post(f"/api/sessions/{sid}", json={"prefill": "Sure: "})
+    client.post(f"/api/sessions/{sid}", json={"prefill": "Sure: ", "use_tools": False})
     client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
     saved = client.get(f"/api/sessions/{sid}").json()
     asst = [m for m in saved["messages"] if m["role"] == "assistant"][-1]
