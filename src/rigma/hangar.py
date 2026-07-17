@@ -188,7 +188,8 @@ def list_models(registry=None) -> dict:
             mm_on = (mdir / spec.mmproj.file).exists()
             used += spec.mmproj.bytes if mm_on else 0
             mm = {"file": spec.mmproj.file, "bytes": spec.mmproj.bytes,
-                  "on_disk": mm_on}
+                  "on_disk": mm_on, "pullable": spec.mmproj.repo != "local",
+                  "pull": _PULLS.get(f"{slug}::{spec.mmproj.file}")}
         models.append({
             "slug": slug, "family": spec.family, "kind": spec.kind,
             "custom": spec.custom, "capabilities": spec.capabilities,
