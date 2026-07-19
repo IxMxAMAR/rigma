@@ -58,7 +58,7 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _seed(client, n=10):
+def _seed(client, n=24):
     sid = client.post("/api/sessions", json={}).json()["id"]
     s = sessions.load(sid)
     s["messages"] = [{"role": "user", "content": f"m{i}"} for i in range(n)]
@@ -77,7 +77,7 @@ def test_auto_compact_fires_when_nearly_full(home, upstream):
     assert "event: compacted" in r.text
     s = sessions.load(sid)
     assert s["digest"] == "COMPACT DIGEST"
-    assert len(s["messages"]) <= 8            # trimmed to the recent tail
+    assert len(s["messages"]) <= 17           # trimmed to the recent tail
     assert s["archive"]                        # older messages preserved
 
 
@@ -115,3 +115,21 @@ def test_summarizer_failure_does_not_break_turn(home, upstream):
     assert "event: compacted" not in r.text
     s = sessions.load(sid)
     assert s["digest"] == "" and s["messages"][-1]["content"] == "ok"  # answer saved
+
+
+def test_runs_compact_against_a_small_budget():
+    from rigma import serve
+    assert serve.RUN_CTX_BUDGET == 32768
+    # a run session compacts against RUN_CTX_BUDGET, not the engine context
+    assert serve.compact_budget({"run_id": "r1"}, 131072) == serve.RUN_CTX_BUDGET
+    # ...but never above what the engine actually has
+    assert serve.compact_budget({"run_id": "r1"}, 16384) == 16384
+    # a normal chat still uses the engine's context
+    assert serve.compact_budget({}, 131072) == 131072
+
+
+def test_compaction_keeps_enough_actions():
+    # one action now costs TWO messages (assistant + TOOL RESULT), so the keep
+    # window must retain a useful number of ACTIONS, not just messages
+    from rigma import serve
+    assert serve.AUTO_COMPACT_KEEP >= 16

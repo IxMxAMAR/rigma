@@ -64,6 +64,10 @@ def test_preset_settings_flow(tmp_path, monkeypatch, oai_upstream):
     assert "[DONE]" in r.text
     sent = oai_upstream.last()
     assert sent["temperature"] == 0.5
-    assert sent["messages"][0]["content"] == "NOIR"
-    assert sent["messages"][1]["content"].startswith("Story notes")
-    assert sent["messages"][2] == {"role": "user", "content": "write"}
+    # system context is coalesced into ONE leading system message (a second
+    # system block 400s strict chat templates), so notes ride along with it
+    assert sent["messages"][0]["role"] == "system"
+    assert sent["messages"][0]["content"].startswith("NOIR")
+    assert "Ember the dragon" in sent["messages"][0]["content"]
+    assert sum(1 for m in sent["messages"] if m["role"] == "system") == 1
+    assert sent["messages"][1] == {"role": "user", "content": "write"}
