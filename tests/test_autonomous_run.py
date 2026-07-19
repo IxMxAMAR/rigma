@@ -22,10 +22,18 @@ class _Engine(BaseHTTPRequestHandler):
     idx = 0
     hang = False
     delay = 0.0
+    err_status = 0
+    err_body = ""
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
         self.rfile.read(n)
+        if _Engine.err_status:                    # simulate an engine 4xx/5xx
+            self.send_response(_Engine.err_status)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(_Engine.err_body.encode())
+            return
         i = _Engine.idx
         _Engine.idx += 1
         step = _Engine.script[i] if i < len(_Engine.script) else _Engine.script[-1]
@@ -68,6 +76,8 @@ def home(tmp_path, monkeypatch):
     _Engine.hang = False
     _Engine.delay = 0.0
     _Engine.script = []
+    _Engine.err_status = 0
+    _Engine.err_body = ""
 
 
 def _client(port):
@@ -162,6 +172,23 @@ def test_run_control_endpoints(engine):
     c.post(f"/api/runs/{rid}/stop")
     assert runs.load(rid)["status"] == "stopped"
     assert c.get("/api/runs/active").json() == {}    # active released
+
+
+def test_run_fails_fast_on_template_parser_error(engine):
+    # engine can't build a tool-call parser for this model's chat template ->
+    # every turn 400s the same way, so the run must FAIL FAST with the reason,
+    # not silently spin as "no progress" (the near-instant-stall bug).
+    _Engine.err_status = 400
+    _Engine.err_body = json.dumps(
+        {"error": {"message": "Unable to generate parser for this template. "
+                              "Automatic parser generation failed"}})
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid)
+    assert r["status"] == "error"
+    assert "template" in r["halt_reason"] and "tool" in r["halt_reason"]
+    log = c.get(f"/api/runs/{rid}/log").json()["log"]
+    assert "FATAL ENGINE ERROR" in log and "generate parser" in log
 
 
 def test_run_session_uses_agent_system_prompt(engine):
