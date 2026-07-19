@@ -591,3 +591,10 @@ body.models-open #composer { display:none; }
 .gl-row { display:flex; gap:10px; padding:4px 0 4px 4px; }
 .gl-row .gl-k { flex:none; width:34%; color:var(--amber); }
 .gl-row .gl-v { color:var(--dim); line-height:1.5; }
+
+/* auto-compact: in-chat notice + composer toggle */
+.sys-note{text-align:center;font-size:12px;color:var(--dim,#8a8a8a);
+  margin:10px auto;opacity:.8;font-style:italic}
+#auto-compact-lbl{display:inline-flex;align-items:center;gap:4px;
+  font-size:12px;color:var(--dim,#8a8a8a);cursor:pointer;user-select:none}
+#auto-compact-lbl input{margin:0;cursor:pointer}
