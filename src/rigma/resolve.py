@@ -47,18 +47,53 @@ def _budgets(profile: HardwareProfile) -> tuple[float, float]:
 def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
              ctx: int, explain: list[str]) -> ComboFlags | None:
     usable_vram, usable_ram = _budgets(profile)
+    # Two passes, and the order matters: try EVERY cache type fully on the GPU
+    # before letting any of them spill weights to RAM. Quantising the cache
+    # costs ~8.5 effective bits; pushing layers (or experts) to system RAM costs
+    # real tokens/sec. Doing this in one pass picked f16-with-offload over
+    # q8_0-fully-resident, which is strictly the worse trade.
+    for strict in (True, False):
+        for k, v in _cache_candidates(spec):
+            got = _fit_with_cache(spec, gguf, profile, ctx, k, v,
+                                  usable_vram, usable_ram, explain, strict)
+            if got is not None:
+                return got
+    return None
+
+
+def _cache_candidates(spec: ModelSpec):
+    """Cache types to try, best quality first.
+
+    The policy default (f16) is tried first, then q8_0. q8_0 stores 32 values as
+    int8 plus one f16 scale — 1.0625 bytes/element vs 2.0, so it HALVES the KV
+    cache for ~8.5 effective bits. That is far more precision than the weights
+    themselves carry (Q6_K ~6.5 bits, IQ3_M ~3.5), so it is not the accuracy
+    bottleneck — but dropping context to 8K to protect it very much is a real
+    cost. Trying it before giving up context is close to free."""
     k, v = spec.cache_type_policy.k, spec.cache_type_policy.v
+    out = [(k, v)]
+    if (k, v) != ("q8_0", "q8_0"):
+        out.append(("q8_0", "q8_0"))
+    return out
+
+
+def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
+                    ctx: int, k: str, v: str, usable_vram: float,
+                    usable_ram: float, explain: list[str],
+                    strict: bool = False) -> ComboFlags | None:
     file_mb = gguf.bytes / 2**20
     # vision projector loads alongside the weights and can't be offloaded;
     # it counts against VRAM but not the MoE expert math below
     mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
     kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20
-    explain.append(f"{gguf.quant}@ctx{ctx}: file={file_mb:.0f}MB kv={kv_mb:.0f}MB "
+    explain.append(f"{gguf.quant}@ctx{ctx} kv={k}: file={file_mb:.0f}MB kv={kv_mb:.0f}MB "
                    + (f"mmproj={mm_mb:.0f}MB " if mm_mb else "")
                    + f"vs vram={usable_vram:.0f}MB ram={usable_ram:.0f}MB")
     if spec.moe is None:
         if file_mb + mm_mb + kv_mb <= usable_vram:
             return ComboFlags(ctx=ctx, cache_type_k=k, cache_type_v=v)
+        if strict:
+            return None            # try the next cache type before offloading
         # partial offload: keep as many layers on the GPU as fit, spill the
         # rest to system RAM. A 24B dense model on 16GB runs at ~15 t/s this
         # way instead of returning "doesn't fit" and dropping to CPU/a smaller
@@ -77,6 +112,8 @@ def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         explain.append(f"dense partial offload: {n_gpu}/{spec.n_layers} layers "
                        f"on GPU ({spilled:.0f}MB to RAM)")
         return ComboFlags(ctx=ctx, ngl=n_gpu, cache_type_k=k, cache_type_v=v)
+    if strict and file_mb + mm_mb + kv_mb > usable_vram:
+        return None                # ditto for MoE expert offload
     expert_mb = file_mb * spec.moe.expert_weight_fraction
     per_layer = expert_mb / spec.n_layers
     need_off = max(0.0, file_mb + mm_mb + kv_mb - usable_vram)
