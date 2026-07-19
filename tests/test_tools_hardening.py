@@ -153,3 +153,19 @@ def test_http_request_get_cacheable_post_not():
         is False
     assert tools._is_cacheable("http_request",
                                {"url": "u", "headers": {"A": "b"}}) is False
+
+
+def test_view_image_accepts_webp(tmp_path):
+    # regression: .webp was rejected because mimetypes doesn't know it on Windows
+    for ext in (".webp", ".avif", ".jpeg", ".gif"):
+        f = tmp_path / ("pic" + ext)
+        f.write_bytes(b"\x00" * 32)
+        out = tools.run_tool("view_image", {"path": str(f)}, {"has_vision": True})
+        assert out.startswith(tools.IMAGE_SENTINEL), ext
+
+
+def test_view_image_still_rejects_nonimage(tmp_path):
+    f = tmp_path / "notes.md"
+    f.write_text("hi")
+    assert "not an image" in tools.run_tool(
+        "view_image", {"path": str(f)}, {"has_vision": True})

@@ -667,11 +667,16 @@ def _write_file(args, ctx):
     return f"wrote {len(content)} chars to {args.get('path')}"
 
 
+# by EXTENSION, not mimetypes.guess_type — the latter doesn't know .webp/.avif
+# on Windows, so ComfyUI's webp outputs were wrongly rejected as "not an image"
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif",
+               ".tiff", ".jfif", ".avif", ".heic", ".ppm"}
+
+
 def _resolve_image(ps: str, ctx: dict) -> tuple:
     """(resolved_path, error). Validates it exists, is an image, and is ≤20MB.
     Absolute paths are allowed (images live outside the workspace); relative
     paths are confined to the workspace."""
-    import mimetypes
     ps = str(ps).strip().strip('"').strip("'")
     if not ps:
         return None, "empty path"
@@ -683,8 +688,7 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
             return None, str(e)
     if not p.is_file():
         return None, f"no such file: {ps}"
-    mime, _ = mimetypes.guess_type(str(p))
-    if not mime or not mime.startswith("image/"):
+    if p.suffix.lower() not in _IMAGE_EXTS:
         return None, f"{p.name} is not an image"
     if p.stat().st_size > 20_000_000:
         return None, f"{p.name} is too large (max 20MB)"
