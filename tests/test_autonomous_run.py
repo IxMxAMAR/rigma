@@ -264,6 +264,22 @@ def test_one_action_mode_executes_exactly_one_tool_then_ends(engine):
     assert len(r["plan"]) >= 1, "tool call was dropped instead of executed"
 
 
+def test_tool_results_persist_into_the_next_turn(engine):
+    # tool_trace is METADATA and build_messages strips it, so without this the
+    # model never sees what its tools returned and re-lists/re-reads to find out
+    from rigma import sessions
+    _Engine.script = [("manage_plan", {"action": "add", "task": "alpha"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    sess = sessions.load(r["session_id"])
+    rendered = sessions.build_messages(sess)
+    blob = "\n".join(m["content"] for m in rendered
+                     if isinstance(m.get("content"), str))
+    assert "TOOL RESULT" in blob, "the action's result never re-enters context"
+    assert "added step #1" in blob, "the actual result text was not carried forward"
+
+
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.

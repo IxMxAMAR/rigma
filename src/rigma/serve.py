@@ -1471,6 +1471,25 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _runs.append_action(
                         run_id, t.get("name"), t.get("args"),
                         not str(t.get("result", "")).startswith("error"))
+                # Carry the RESULT forward. build_messages() sanitises messages
+                # to role/content, so tool_trace (where results live) never
+                # re-enters context — across turns the model cannot see what any
+                # tool returned, only its own narration. That is the real cause
+                # of the re-orientation loop: it re-lists folders and re-reads
+                # files to rediscover findings it already made.
+                # user role, deliberately: a 2nd system message 400s this chat
+                # template, and role:"tool" needs a matching tool_call_id.
+                if trace:
+                    s4 = sessions.load(sid)
+                    if s4 is not None:
+                        s4["messages"].append({
+                            "role": "user",
+                            "content": "\n".join(
+                                f"TOOL RESULT {t.get('name')}: "
+                                f"{str(t.get('result', ''))[:1200]}"
+                                for t in trace)})
+                        sessions.save(s4)
+                        session = s4
                 ext = sum(1 for t in trace if t.get("name") in _EXTERNAL_TOOLS)
                 run["external_calls"] = run.get("external_calls", 0) + ext
                 if (run["external_calls"] >= MAX_EXTERNAL
