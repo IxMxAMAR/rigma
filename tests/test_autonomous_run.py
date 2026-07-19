@@ -3,6 +3,7 @@ terminal state against a scripted fake engine. Uses the Starlette TestClient,
 whose blocking portal keeps the background asyncio task running between polls."""
 import json
 import os
+import pathlib
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -457,3 +458,33 @@ def test_run_effort_override(engine):
                                     "effort": "off"}).json()["id"]
     _wait(c, rid)
     assert sessions.load(runs.load(rid)["session_id"])["effort"] == "off"
+
+
+def test_task_complete_refused_while_plan_steps_are_open(engine):
+    # a weak model declares victory with work outstanding; evidence beats
+    # self-report, so the run must refuse and name the step
+    _Engine.script = [("manage_plan", {"action": "add", "task": "write the file"}),
+                      ("task_complete", {"summary": "all done"}),
+                      ("task_complete", {"summary": "all done"}),
+                      ("task_complete", {"summary": "all done"}),
+                      ("task_complete", {"summary": "all done"})]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    log = c.get(f"/api/runs/{rid}/log").json()["log"]
+    assert "task_complete refused" in log
+    assert r["completion_challenges"] >= 1
+    # ...but capped, so a bad plan can't make the run unfinishable
+    assert r["status"] in runs.TERMINAL
+
+
+def test_big_tool_result_spills_to_disk_with_a_way_back(tmp_path):
+    from rigma import serve as _s
+    big = "x" * (_s.SPILL_CHARS + 5000)
+    out = _s._spill_big_result("run_shell", big, {})
+    assert len(out) < _s.SPILL_CHARS, "spilled result must be small in context"
+    assert "saved to disk" in out and "read_file path=" in out
+    path = out.split("Full output: ")[1].splitlines()[0]
+    assert pathlib.Path(path).read_text(encoding="utf-8") == big   # nothing lost
+    # read_file is exempt or paging would re-trigger the spill it escapes
+    assert _s._spill_big_result("read_file", big, {}) == big
