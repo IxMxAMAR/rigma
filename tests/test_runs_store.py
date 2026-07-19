@@ -86,3 +86,14 @@ def test_budget_exceeded_reasons():
     r = runs.create("m", "s", token_cap=100)
     r["tokens_used"] = 100
     assert "token budget" in runs.budget_exceeded(r)
+
+
+def test_log_tool_action_writes_a_server_authored_line():
+    r = runs.create("m", "s")
+    runs.log_tool_action(r["id"], "write_file",
+                         {"path": "out.txt", "content": "x" * 999},
+                         "wrote 999 bytes to out.txt")
+    tail = runs.get_log_tail(r["id"], 5)
+    assert "write_file" in tail and "out.txt" in tail
+    assert "wrote 999 bytes" in tail
+    assert len(tail) < 800, "log line must stay compact"
