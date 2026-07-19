@@ -609,10 +609,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # build, line 84) raise on ANY system message that isn't the
                 # first, and llama-server turns that into HTTP 400 "Unable to
                 # generate parser for this template" — which killed real runs.
-                turn_msgs = msgs + [{"role": "user", "content":
+                turn_msgs = msgs + [{"role": "user", "content": (
+                    # force_last means "we just loaded images, take a look" —
+                    # NOT a limit. Telling the model it hit a tool-call limit
+                    # there made it reason about a constraint that isn't real.
+                    "Look at the image(s) above and describe what you actually "
+                    "see. Do not call another tool this turn."
+                    if force_last else
                     "You have reached the tool-call limit. Do not call any more "
                     "tools — give your final answer now using what you already "
-                    "gathered."}]
+                    "gathered.")}]
             body = {"messages": turn_msgs, "stream": True,
                     "stream_options": {"include_usage": True}}
             body.update(params)

@@ -55,6 +55,7 @@ IMAGE_SENTINEL = "\x00__RIGMA_IMAGE__\x00"
 _NETWORK_TOOLS = {"web_search", "fetch_url", "http_request", "ask_gemini"}
 
 _LIST_MAX = 200          # above this, summarise a folder instead of dumping names
+_FUZZY_NOTES: list = []  # filename corrections made during the current call
 
 
 def sanitize_schema(schema: dict) -> dict:
@@ -603,6 +604,33 @@ def _task_complete(args, ctx):
 
 # ---- gated tools (filesystem + code) ----------------------------------------
 
+def _fuzzy_file(p: Path):
+    """Recover a near-miss filename. Weak models retype paths from memory and
+    mangle them — dropping zero padding is the classic one, because digit runs
+    tokenize awkwardly (ComfyUI_00428_.png -> Comfy_UI_428.png). The file it
+    meant is unambiguous, so use it and say what we did. Returns (path, note)."""
+    if p.exists():
+        return p, ""
+    parent = p.parent
+    if not parent.is_dir():
+        return None, ""
+
+    def norm(s: str) -> str:
+        s = re.sub(r"[^a-z0-9.]+", "", s.lower())
+        return re.sub(r"(?<![0-9])0+(?=[0-9])", "", s)   # 00428 -> 428
+
+    want = norm(p.name)
+    names = [x.name for x in parent.iterdir() if x.is_file()]
+    for n in names:                       # exact match ignoring case/pad/punct
+        if norm(n) == want:
+            return parent / n, f" (you asked for '{p.name}' — used '{n}')"
+    import difflib
+    close = difflib.get_close_matches(p.name, names, n=1, cutoff=0.8)
+    if close:
+        return parent / close[0], f" (you asked for '{p.name}' — used '{close[0]}')"
+    return None, ""
+
+
 def _read_path(ctx, raw: str) -> Path:
     """Resolve a path for READ-ONLY tools, allowing ABSOLUTE paths.
 
@@ -828,6 +856,10 @@ def _read_file(args, ctx):
     raw = str(args.get("path", ""))
     p = _read_path(ctx, raw)
     if not p.is_file():
+        fixed, _note = _fuzzy_file(p)
+        if fixed is not None:
+            p = fixed
+    if not p.is_file():
         # Inside a run the model hunts for its own progress log and loops on
         # "no such file" (the real one lives in the run dir, not the workspace).
         # Hand it the actual progress instead of an error.
@@ -984,7 +1016,11 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
         except ValueError as e:
             return None, str(e)
     if not p.is_file():
-        return None, f"no such file: {ps}"
+        # a mangled filename is the model's memory failing, not a missing file
+        p, note = _fuzzy_file(p)
+        if p is None:
+            return None, f"no such file: {ps}"
+        _FUZZY_NOTES.append(note)
     if p.suffix.lower() not in _IMAGE_EXTS:
         return None, f"{p.name} is not an image"
     if p.stat().st_size > 20_000_000:
@@ -1037,6 +1073,10 @@ def _view_image(args, ctx):
       "a list of file paths (absolute or workspace-relative). For 20 images, "
       "call this a few times in batches rather than one-by-one.",
       {"type": "object", "properties": {
+          "folder": {"type": "string", "description": "view a RANDOM SAMPLE "
+                     "from this folder — use this instead of retyping paths"},
+          "count": {"type": "integer", "description": "how many to sample "
+                    "from `folder` (1-8, default 4)"},
           "paths": {"type": "array", "items": {"type": "string"},
                     "description": "up to 8 image file paths"}},
        "required": ["paths"]},
@@ -1045,8 +1085,30 @@ def _view_images(args, ctx):
     paths = args.get("paths") or []
     if isinstance(paths, str):
         paths = [paths]
+    # `folder` + `count`: view a random sample WITHOUT retyping any path. The
+    # model correctly worked out that it cannot copy 20 exact filenames across
+    # turns — so let it skip the copying entirely.
+    folder = str(args.get("folder", "") or "").strip()
+    if folder and not paths:
+        try:
+            base = _read_path(ctx, folder)
+        except ValueError as e:
+            return f"error: {e}"
+        if not base.is_dir():
+            return f"error: not a folder: {folder}"
+        import random
+        pool = [x for x in base.iterdir()
+                if x.is_file() and x.suffix.lower() in _IMAGE_EXTS]
+        if not pool:
+            return f"error: no images in {base}"
+        try:
+            n = max(1, min(int(args.get("count", 4) or 4), 8))
+        except (TypeError, ValueError):
+            n = 4
+        paths = [str(x) for x in random.sample(pool, min(n, len(pool)))]
     if not paths:
         return "error: no paths given"
+    _FUZZY_NOTES.clear()
     ok, errs = [], []
     for ps in list(paths)[:8]:
         p, err = _resolve_image(ps, ctx)
@@ -1054,6 +1116,9 @@ def _view_images(args, ctx):
     if not ok:
         return "error: no valid images — " + "; ".join(errs)
     note = f" (skipped: {'; '.join(errs)})" if errs else ""
+    if _FUZZY_NOTES:      # tell the model the real filenames it got
+        note += "".join(_FUZZY_NOTES)
+        _FUZZY_NOTES.clear()
     if len(paths) > 8:
         note += f" (only the first 8 of {len(paths)} — call again for the rest)"
     return IMAGE_SENTINEL + "\n".join(ok) + ("\x00" + note if note else "")
@@ -1069,7 +1134,8 @@ def _view_images(args, ctx):
       safe=False, needs="code")
 def _run_python(args, ctx):
     code = str(args.get("code", ""))
-    return _run_subprocess(["python", "-I", "-c", code], ctx)
+    return _run_subprocess(["python", "-I", "-c", code], ctx,
+                           python_src=code)
 
 
 @tool("run_shell",
@@ -1091,6 +1157,17 @@ _BLOCKED_CMD = re.compile(
 # deletion verbs, blocked only under the no-delete run profile
 _DELETE_CMD = re.compile(
     r"(?i)\b(del|erase|rm|rmdir|rd|remove-item|unlink)\b")
+
+# The blocklists above are for SHELL text. Running them over PYTHON SOURCE
+# refuses ordinary code: "\bformat\b" matches "{}".format(x) and "\bdel\b" is a
+# Python keyword. That blocked a real run. Python gets its own, narrower rules
+# keyed on destructive APIs rather than English words.
+_BLOCKED_PY = re.compile(
+    r"(?i)(shutil\.rmtree\s*\(\s*[\"']?[a-z]:[\\/]*[\"']?\s*[,)]|"
+    r"(os\.system|subprocess\.\w+)\s*\(\s*\[?\s*[\"'](format|diskpart|mkfs|"
+    r"shutdown|fdisk)\b)")
+_DELETE_PY = re.compile(
+    r"(?i)(os\.(remove|unlink|rmdir)|shutil\.rmtree|\.unlink\s*\(|send2trash)")
 
 
 def _launch_killable(cmd, shell, cwd):
@@ -1117,13 +1194,21 @@ def _kill_tree(pid: int) -> None:
         pass
 
 
-def _run_subprocess(cmd, ctx, shell=False):
-    text = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
-    if _BLOCKED_CMD.search(text):
-        return ("error: blocked — that looks like a destructive system command; "
-                "refusing to run it")
-    if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(text):
-        return "error: blocked — deletion is disabled for this run (no-delete)"
+def _run_subprocess(cmd, ctx, shell=False, python_src=None):
+    if python_src is not None:
+        # PYTHON source: never scan it with the shell wordlist (see _BLOCKED_PY)
+        if _BLOCKED_PY.search(python_src):
+            return ("error: blocked — that code destroys a drive or shells out "
+                    "to a destructive command; refusing to run it")
+        if ctx.get("profile") == "no-delete" and _DELETE_PY.search(python_src):
+            return "error: blocked — deletion is disabled for this run (no-delete)"
+    else:
+        text = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+        if _BLOCKED_CMD.search(text):
+            return ("error: blocked — that looks like a destructive system "
+                    "command; refusing to run it")
+        if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(text):
+            return "error: blocked — deletion is disabled for this run (no-delete)"
     cwd = ctx.get("workspace") or None
     try:
         p = _launch_killable(cmd, shell, cwd)

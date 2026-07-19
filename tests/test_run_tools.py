@@ -226,3 +226,47 @@ def test_blank_tool_name_gets_a_specific_message():
     out = tools.run_tool("", {}, {})
     assert "empty" in out and "DATA" in out
     assert "web_search" not in out and "read_file" not in out
+
+
+def test_python_blocklist_does_not_refuse_ordinary_code():
+    # the SHELL wordlist was scanned over Python source, so "{}".format(x) hit
+    # \bformat\b and `del a[0]` hit \bdel\b — ordinary code was refused
+    ctx = {"allow_code": True}
+    assert not tools.run_tool("run_python", {"code": 'print("{}".format(7))'},
+                              ctx).startswith("error")
+    assert not tools.run_tool("run_python", {"code": 'a=[1]\ndel a[0]\nprint(a)'},
+                              ctx).startswith("error")
+    # genuinely destructive code is still refused
+    assert tools.run_tool("run_python",
+                          {"code": 'import shutil; shutil.rmtree("C:\\\\")'},
+                          ctx).startswith("error")
+    # and the SHELL blocklist is untouched
+    assert tools.run_tool("run_shell", {"command": "format C:"},
+                          ctx).startswith("error")
+
+
+def test_fuzzy_filename_recovery(tmp_path):
+    # models retype paths from memory and drop zero padding, because digit runs
+    # tokenize awkwardly: ComfyUI_00428_.png -> Comfy_UI_428.png
+    real = tmp_path / "ComfyUI_00428_.png"
+    real.write_text("x", encoding="utf-8")
+    from rigma.tools import _fuzzy_file
+    got, note = _fuzzy_file(tmp_path / "Comfy_UI_428.png")
+    assert got == real and "used" in note
+    got, _ = _fuzzy_file(tmp_path / "ComfyUI_428.png")
+    assert got == real
+    # a genuinely different name is not silently substituted
+    assert _fuzzy_file(tmp_path / "totally_other_thing.png")[0] is None
+
+
+def test_view_images_can_sample_a_folder_without_paths(tmp_path):
+    # the model itself worked out it cannot copy 20 exact filenames across
+    # turns; `folder` lets it skip the copying entirely
+    from PIL import Image
+    for i in range(6):
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(tmp_path / f"img_{i:05d}_.png")
+    out = tools.run_tool("view_images", {"folder": str(tmp_path), "count": 3},
+                         {"workspace": str(tmp_path), "has_vision": True})
+    assert out.startswith(tools.IMAGE_SENTINEL)
+    body = out[len(tools.IMAGE_SENTINEL):].split("\x00")[0]
+    assert len([ln for ln in body.splitlines() if ln.strip()]) == 3
