@@ -71,3 +71,47 @@ def test_verify_step_checks_the_artifact_on_disk(tmp_path):
     # exploration steps need no artifact
     assert mission.verify_step({"id": 3, "artifact": "",
                                 "verification": {"type": "none"}})[0] is True
+
+
+class _Recorder:
+    """Captures the payloads compile_mission sends, and replies per-attempt."""
+    def __init__(self, replies):
+        self.replies, self.payloads = list(replies), []
+
+    async def __call__(self, payload):
+        self.payloads.append(payload)
+        r = self.replies.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return {"choices": [{"message": {"content": r}}]}
+
+
+GOOD = ('{"objective": "o", "deliverables": [], "constraints": [],'
+        ' "steps": [{"id": 1, "description": "do it", "artifact": "",'
+        ' "verification": {"type": "none"}}]}')
+
+
+def test_compile_constrains_output_to_json_first():
+    import asyncio
+    rec = _Recorder([GOOD])
+    spec = asyncio.run(mission.compile_mission(RAW, rec))
+    assert spec["compiled"] is True
+    # the FIRST attempt must ask llama.cpp to grammar-constrain the output —
+    # asking a weak model politely for "only JSON" returns markdown instead
+    assert rec.payloads[0]["response_format"] == {"type": "json_object"}
+
+
+def test_compile_retries_unconstrained_if_the_server_rejects_it():
+    import asyncio
+    rec = _Recorder([RuntimeError("400 response_format unsupported"), GOOD])
+    spec = asyncio.run(mission.compile_mission(RAW, rec))
+    assert spec["compiled"] is True                    # recovered
+    assert len(rec.payloads) == 2
+    assert "response_format" not in rec.payloads[1]    # plain retry
+
+
+def test_compile_falls_back_when_both_attempts_fail():
+    import asyncio
+    rec = _Recorder(["not json", "still not json"])
+    spec = asyncio.run(mission.compile_mission(RAW, rec))
+    assert spec["compiled"] is False and len(spec["steps"]) == 1
