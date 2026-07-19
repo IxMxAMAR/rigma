@@ -168,6 +168,25 @@ def pending_tasks(run_id: str) -> list:
     return [t for t in read_plan(run_id) if t.get("status") == "pending"]
 
 
+def done_summary(run_id: str, limit: int = 6) -> str:
+    """Completed steps — the anti-restart signal. Telling a small model what is
+    ALREADY DONE stops it redoing finished phases far better than restating the
+    mission (which it reads as a fresh instruction)."""
+    done = [t for t in read_plan(run_id) if t.get("status") == "done"]
+    if not done:
+        return ""
+    tail = done[-limit:]
+    more = f" (+{len(done) - len(tail)} earlier)" if len(done) > len(tail) else ""
+    return "; ".join(f"#{t['id']} {t['text']}" for t in tail) + more
+
+
+def next_pending(run_id: str) -> str:
+    """The single next step. One target beats a list — a list invites a small
+    model to jump around or start from the top."""
+    pend = pending_tasks(run_id)
+    return f"#{pend[0]['id']} {pend[0]['text']}" if pend else ""
+
+
 def plan_summary(run_id: str, limit: int = 8) -> str:
     pend = pending_tasks(run_id)
     if not pend:
