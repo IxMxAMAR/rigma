@@ -91,6 +91,11 @@ AGENT_SYSTEM_PROMPT = (
     "`manage_plan(action=\"complete\", id=N)`.\n"
     "4. Only when the WHOLE mission is genuinely finished, call "
     "`task_complete(summary=\"…\")` — you will be asked to verify with tools.\n\n"
+    "NEVER SPEND TOOL CALLS FINDING YOUR PLACE. Every turn you are already told "
+    "how many steps are done, your last logged progress, and your ONE next step. "
+    "Do NOT call manage_plan(list), do NOT read progress.md / core_directive.md "
+    "to catch up, and do NOT re-list folders you have already listed. Trust what "
+    "you are given and spend your tool calls on the WORK.\n\n"
     "If a tool errors, read it and try a different approach. Keep going until "
     "task_complete. Do not stop to ask permission — you already have it.")
 
@@ -621,9 +626,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # hit the tool-call ceiling still mid-task with no final answer? never
         # finish silently — give the user something and a clear way to resume
         if use_tools and not failed and not text.strip() and trace:
-            text = ("_(Reached this turn's tool-call limit while still working — "
-                    "send **keep going** and I'll continue. You can raise the "
-                    "limit in the chat's settings.)_")
+            text = (
+                # in a run there is no user to say "keep going" — the loop just
+                # continues, so tell the model that instead of stranding it
+                "_(Reached this turn's tool-call limit. The run continues "
+                "automatically — resume the SAME step next turn, do not start "
+                "over.)_" if s.get("run_id") else
+                "_(Reached this turn's tool-call limit while still working — "
+                "send **keep going** and I'll continue. You can raise the "
+                "limit in the chat's settings.)_")
             yield _sse({"delta": text})
         if not failed:
             meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}
