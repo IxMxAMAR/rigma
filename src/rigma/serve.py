@@ -121,6 +121,10 @@ AGENT_SYSTEM_PROMPT = (
     "web_search, …).\n"
     "   • File tools take ABSOLUTE paths (D:\\Art\\pic.png) — you do NOT need "
     "run_shell to reach a folder outside the workspace.\n"
+    "   • NEVER RETYPE A FILENAME. You will get long names wrong (you cannot "
+    "reliably reproduce ComfyUI_00428_.png). After sample_files, call "
+    "`view_sample()` — it uses the files you were just given, by reference. "
+    "To look at a folder directly use `view_images(folder=..., count=N)`.\n"
     "   • NEVER dump a big folder. list_directory summarises large folders; use "
     "`sample_files(path, count)` when you need examples, and `find_files` with a "
     "glob when you need specific ones. Dumping thousands of filenames wastes "
@@ -1489,12 +1493,53 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             except BaseException:
                 pass
 
+    async def _compile_spec(run_id, sid):
+        """Compile the mission INSIDE the run. Doing this in start_run made the
+        Start button hang for the length of an engine call."""
+        from . import runs as _runs
+        run = _runs.load(run_id)
+        if run is None or run.get("spec") is not None:
+            return
+        raw = run.get("mission", "")
+        _runs.append_progress(run_id, "compiling your request into a plan",
+                              "then working through it",
+                              run.get("workspace", ""))
+
+        async def _post(payload):
+            r = await client.post("/v1/chat/completions", json=payload,
+                                  timeout=180.0)
+            r.raise_for_status()
+            return r.json()
+
+        spec = await _mission_mod.compile_mission(raw, _post)
+        run = _runs.load(run_id) or run
+        run["spec"] = spec
+        if spec.get("compiled"):
+            # the model now EXECUTES a plan instead of inventing one
+            for st_ in spec["steps"]:
+                _runs.plan_add(run_id, st_["description"])
+            s0 = sessions.load(sid)
+            if s0 is not None:
+                s0["mission"] = _mission_mod.spec_block(spec, raw)
+                sessions.save(s0)
+        _runs.append_progress(
+            run_id,
+            f"plan ready — {len(spec['steps'])} step(s)"
+            + ("" if spec.get("compiled") else " (compile failed; using the "
+               "request as a single step)"),
+            "starting step 1", run.get("workspace", ""))
+        _runs.save(run)
+
     async def _run_loop(run_id):
         import time as _time
 
         from . import runs as _runs
         run = _runs.load(run_id)
         sid = run["session_id"]
+        try:
+            await _compile_spec(run_id, sid)
+        except Exception:
+            pass                      # never block a run on compilation
         prev_sig = None
         try:
             while True:
@@ -1539,12 +1584,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
                 def _tick(waited, kind, _rid=run_id):
                     # publish "still alive, N seconds in" so a slow turn shows
-                    # movement in the UI instead of a blank progress panel
-                    r = _runs.load(_rid)
-                    if r is not None:
-                        r["waiting_secs"] = int(waited)
-                        r["waiting_kind"] = kind
-                        _runs.save(r)
+                    # movement in the UI instead of a blank progress panel.
+                    # live.json, NOT run.json — this fires every few seconds.
+                    lv = _runs.load_live(_rid)
+                    lv["waiting_secs"] = int(waited)
+                    lv["waiting_kind"] = kind
+                    _runs.save_live(_rid, lv)
 
                 # Live activity feed: thinking, tool calls and results as they
                 # happen. Without this the UI shows "(waiting…)" for minutes and
@@ -1552,13 +1597,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # seed from what's already there so the feed is a ROLLING history
                 # across turns, not just the current turn (a per-turn feed shows
                 # one line and looks broken)
-                live = {"items": list(run.get("activity") or []), "last": 0.0}
+                live = {"items": list(_runs.load_live(run_id).get("activity") or []),
+                        "last": 0.0}
 
                 def _flush_live(_rid=run_id):
-                    r = _runs.load(_rid)
-                    if r is not None:
-                        r["activity"] = live["items"][-LIVE_MAX:]
-                        _runs.save(r)
+                    lv = _runs.load_live(_rid)
+                    lv["activity"] = live["items"][-LIVE_MAX:]
+                    _runs.save_live(_rid, lv)
                     live["last"] = _time.time()
 
                 def _activity(ev, obj):
@@ -1614,7 +1659,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if live["items"]:
                     _flush_live()                # persist the tail of this turn
                 run = _runs.load(run_id) or run
-                run["waiting_secs"] = 0          # turn is over; clear the notice
+                _lv = _runs.load_live(run_id)
+                _lv["waiting_secs"] = 0          # turn is over; clear the notice
+                _runs.save_live(run_id, _lv)
                 if frozen:
                     run["frozen_streak"] = run.get("frozen_streak", 0) + 1
                     _runs.append_progress(run_id, "(a turn froze — no output)",
@@ -1858,19 +1905,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # the model re-interpret a paragraph every turn (which is how batching
         # got ignored and phases got redone). Best-effort: a failed compile
         # falls back to a one-step spec so the run still starts.
-        from . import mission as _mission
-
-        async def _post(payload):
-            r = await client.post("/v1/chat/completions", json=payload,
-                                  timeout=180.0)
-            r.raise_for_status()
-            return r.json()
-
-        spec = await _mission.compile_mission(mission, _post)
+        # NOTE: compilation happens in the RUN LOOP, not here. Awaiting a
+        # 180s engine call before responding made the Start button look dead.
         sess = sessions.create(title="🤖 " + mission[:32])
         sess.update(use_tools=True, allow_code=True, auto_compact=True,
                     workspace=workspace,
-                    mission=_mission.spec_block(spec, mission),
+                    mission=mission,       # replaced by the compiled spec
                     system_prompt=AGENT_SYSTEM_PROMPT,   # agent role, not chat
                     effort=effort, one_action=True,
                     params={**RUN_PARAMS, **(sess.get("params") or {})},
@@ -1878,11 +1918,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         run = _runs.create(mission, sess["id"], workspace=workspace,
                            profile=profile,
                            budget_hours=float((body or {}).get("budget_hours", 8)))
-        run["spec"] = spec
-        if spec.get("compiled"):
-            # the model no longer invents a plan — it executes a verified one
-            for st_ in spec["steps"]:
-                _runs.plan_add(run["id"], st_["description"])
+        run["spec"] = None          # compiled by the run loop, see _compile_spec
         _runs.save(run)
         sess["run_id"] = run["id"]
         sessions.save(sess)
@@ -1896,6 +1932,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if r is None:
             return {}
         r["log_tail"] = _runs.get_log_tail(r["id"], 40)
+        r.update(_runs.load_live(r["id"]))
         r["plan"] = _runs.read_plan(r["id"])
         return r
 
@@ -1907,6 +1944,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": "no such run"}, status_code=404)
         r["log_tail"] = _runs.get_log_tail(rid, 40)
         r["plan"] = _runs.read_plan(rid)
+        r.update(_runs.load_live(rid))
         return r
 
     @app.get("/api/runs/{rid}/log")
@@ -1963,6 +2001,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r.setdefault("steer_queue", []).append(note)
         _runs.save(r)
         return {"queued": True}
+
+    @app.on_event("shutdown")
+    async def _stop_run_tasks():
+        """Cancel background run loops when the app goes down. Without this an
+        orphaned loop keeps driving a run against an engine that is gone."""
+        for task in list(_run_tasks.values()):
+            if not task.done():
+                task.cancel()
+        _run_tasks.clear()
 
     @app.on_event("startup")
     async def _keepalive_task():

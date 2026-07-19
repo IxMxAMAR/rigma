@@ -263,3 +263,39 @@ def budget_exceeded(run: dict) -> str:
     if cap and run.get("tokens_used", 0) >= cap:
         return "token budget reached"
     return ""
+
+
+def set_last_sample(run_id: str, paths: list) -> None:
+    """Remember the files sample_files just handed out, so the model can act on
+    them by REFERENCE. It cannot reliably retype a name like
+    comfyui-airport-editorial_00013205_(2).webp — three attempts produced three
+    different digit strings — so don't ask it to."""
+    run = load(run_id)
+    if run is not None:
+        run["last_sample"] = [str(p) for p in paths][:50]
+        save(run)
+
+
+def get_last_sample(run_id: str) -> list:
+    return (load(run_id) or {}).get("last_sample") or []
+
+
+# --- live state (hot path) ----------------------------------------------------
+# The activity feed + heartbeat are written many times per turn. Keeping them in
+# run.json meant re-serialising ~100KB of history on every tool event and every
+# tick — synchronous disk I/O on the event loop, and real write amplification
+# over a long run. They live in their own small file instead.
+
+def save_live(run_id: str, live: dict) -> None:
+    try:
+        _atomic_write(run_dir(run_id) / "live.json", json.dumps(live))
+    except Exception:
+        pass
+
+
+def load_live(run_id: str) -> dict:
+    try:
+        return json.loads((run_dir(run_id) / "live.json")
+                          .read_text(encoding="utf-8"))
+    except Exception:
+        return {}
