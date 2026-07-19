@@ -180,6 +180,24 @@ function renderChatTab() {
     " Allow running Python & shell on this machine (starts in the workspace "
     + "folder, but code can reach anywhere you can)"));
   box.appendChild(codeRow);
+  const roundsRow = el("label", "cap-row");
+  const roundsIn = el("input");
+  roundsIn.type = "number"; roundsIn.min = "1"; roundsIn.max = "100";
+  roundsIn.style.width = "64px";
+  roundsIn.value = current.max_tool_rounds || 25;
+  roundsIn.title = "How many tool-call rounds the model may take in one reply "
+    + "before it must stop (raise for long autonomous jobs)";
+  roundsIn.onchange = async () => {
+    if (!current || current.id !== sid) return;
+    const v = Math.max(1, Math.min(100, parseInt(roundsIn.value, 10) || 25));
+    roundsIn.value = v;
+    try { current = await api("POST", "/api/sessions/" + sid,
+                              {max_tool_rounds: v}); }
+    catch (err) { hint.textContent = err.message; }
+  };
+  roundsRow.append(document.createTextNode("Max tool calls per turn: "),
+                   roundsIn);
+  box.appendChild(roundsRow);
 
   box.appendChild(el("h3", "", "This chat"));
   const acts = el("div", "drawer-acts");
