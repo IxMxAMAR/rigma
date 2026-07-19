@@ -1147,17 +1147,29 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def _drain_turn(session):
         """Drain one agentic turn headless with an idle-watchdog: a turn is only
         frozen if it emits nothing for IDLE_SECS (tolerates slow-but-working
-        generation). aclose swallows BaseException so its cleanup can't clobber
-        the outcome; the call site converts a leaked CancelledError -> frozen."""
+        generation). Returns the engine error message if the turn errored (the
+        headless drain would otherwise DISCARD it and mis-read the turn as 'no
+        progress'); else None. aclose swallows BaseException so its cleanup can't
+        clobber the outcome; the call site converts a leaked CancelledError ->
+        frozen."""
         agen = _llm_turn(session)
+        err = None
         try:
             while True:
                 try:
-                    await asyncio.wait_for(agen.__anext__(), timeout=IDLE_SECS)
+                    chunk = await asyncio.wait_for(agen.__anext__(),
+                                                   timeout=IDLE_SECS)
                 except (asyncio.TimeoutError, TimeoutError):
                     raise FrozenTurnError()
                 except StopAsyncIteration:
-                    return
+                    return err
+                if err is None and b"event: error" in chunk:
+                    try:
+                        payload = chunk.decode("utf-8", "replace").split(
+                            "data:", 1)[1].strip()
+                        err = str(json.loads(payload).get("message", ""))[:300]
+                    except Exception:
+                        err = "engine error"
         finally:
             try:
                 await agen.aclose()
@@ -1200,8 +1212,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     {"role": "user", "content": _driving_message(run, session)})
                 sessions.save(session)
                 frozen = False
+                turn_err = None
                 try:
-                    await _drain_turn(session)
+                    turn_err = await _drain_turn(session)
                 except FrozenTurnError:
                     frozen = True
                 except asyncio.CancelledError:
@@ -1232,6 +1245,29 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _runs.save(run)
                     continue
                 run["frozen_streak"] = 0
+                if turn_err:      # the engine rejected/failed the turn — SURFACE it
+                    _runs.append_action(run_id, "(engine)", turn_err, False)
+                    low = turn_err.lower()
+                    if "parser" in low or "template" in low:
+                        # FATAL and unrecoverable: this model's chat template
+                        # can't do tool calling, so EVERY turn will 400 the same
+                        # way — fail fast with a clear, actionable reason
+                        _runs.append_progress(
+                            run_id, "FATAL ENGINE ERROR: " + turn_err,
+                            "this model's chat template does not support tool "
+                            "calling — load a model with a standard template "
+                            "(e.g. the official qwen3.6-35b-a3b)",
+                            run.get("workspace", ""))
+                        _runs.set_status(run, "error", "model's template can't do "
+                                         "tool calling — switch models")
+                        break
+                    run["error_streak"] = run.get("error_streak", 0) + 1
+                    _runs.append_progress(run_id, "ENGINE ERROR: " + turn_err,
+                                          "retrying", run.get("workspace", ""))
+                    run["iteration"] = run.get("iteration", 0) + 1
+                    prev_sig = None
+                    _runs.save(run)
+                    continue
                 trace = _last_trace(sessions.load(sid))
                 for t in trace:
                     _runs.append_action(
