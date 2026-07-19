@@ -54,6 +54,7 @@ PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big co
                         # / slow GPU can take minutes. Nothing waits this long unless
                         # the engine is genuinely dead; a normal turn starts instantly
 TICK_SECS = 5.0         # how often a waiting turn reports "still working" to the UI
+LIVE_MAX = 80           # rolling live-activity entries kept on a run for the UI
 K_ERROR = 8             # consecutive all-error turns before "stalled"
 K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
 M_FROZEN = 2            # consecutive frozen turns before "frozen"
@@ -1157,7 +1158,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     " Call task_complete only when the WHOLE mission is done.")
         return base + f"  Pending plan: {plan}."
 
-    async def _drain_turn(session, on_wait=None):
+    def _sse_parse(chunk: bytes):
+        """(event, obj) for one SSE chunk; ('', None) when there's no JSON body."""
+        try:
+            text = chunk.decode("utf-8", "replace")
+        except Exception:
+            return "", None
+        event, data = "", ""
+        for line in text.splitlines():
+            if line.startswith("event: "):
+                event = line[7:].strip()
+            elif line.startswith("data: "):
+                data = line[6:].strip()
+        if not data or data == "[DONE]":
+            return event, None
+        try:
+            return event, json.loads(data)
+        except Exception:
+            return event, None
+
+    async def _drain_turn(session, on_wait=None, on_event=None):
         """Drain one agentic turn headless with an idle-watchdog: a turn is only
         frozen if it emits nothing for its whole budget (tolerates slow-but-working
         generation). Returns the engine error message if the turn errored (the
@@ -1209,6 +1229,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         on_wait(0.0, kind)        # moving again — clear the notice
                     except Exception:
                         pass
+                if on_event is not None:
+                    ev, obj = _sse_parse(chunk)
+                    if obj is not None:
+                        try:
+                            on_event(ev, obj)
+                        except Exception:
+                            pass          # telemetry must never kill a turn
                 # a tool event => a tool is running and/or a continuation is about
                 # to prefill; grant the next wait the generous budget
                 expect_prefill = b"event: tool" in chunk
@@ -1282,8 +1309,52 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         r["waiting_kind"] = kind
                         _runs.save(r)
 
+                # Live activity feed: thinking, tool calls and results as they
+                # happen. Without this the UI shows "(waiting…)" for minutes and
+                # a working run is indistinguishable from a dead one.
+                # seed from what's already there so the feed is a ROLLING history
+                # across turns, not just the current turn (a per-turn feed shows
+                # one line and looks broken)
+                live = {"items": list(run.get("activity") or []), "last": 0.0}
+
+                def _flush_live(_rid=run_id):
+                    r = _runs.load(_rid)
+                    if r is not None:
+                        r["activity"] = live["items"][-LIVE_MAX:]
+                        _runs.save(r)
+                    live["last"] = _time.time()
+
+                def _activity(ev, obj):
+                    kind = text = None
+                    if ev == "tool_result":
+                        kind = "result"
+                        text = str(obj.get("result", ""))[:200]
+                    elif ev == "tool":
+                        a = obj.get("args") or {}
+                        arg = ", ".join(f"{k}={str(v)[:48]}"
+                                        for k, v in list(a.items())[:3])
+                        kind = "tool"
+                        text = f"{obj.get('name', '?')}({arg})"
+                    elif ev == "think":
+                        kind, text = "think", str(obj.get("delta", ""))
+                    elif not ev and "delta" in obj:
+                        kind, text = "say", str(obj.get("delta", ""))
+                    if not kind or not text:
+                        return
+                    items = live["items"]
+                    # coalesce streamed text; tool calls stay discrete milestones
+                    if kind in ("think", "say") and items and items[-1]["kind"] == kind:
+                        items[-1]["text"] = (items[-1]["text"] + text)[-700:]
+                    else:
+                        items.append({"kind": kind, "text": text})
+                    del items[:-LIVE_MAX]
+                    # flush milestones instantly; throttle token streams
+                    if kind in ("tool", "result") or _time.time() - live["last"] > 1.5:
+                        _flush_live()
+
                 try:
-                    turn_err = await _drain_turn(session, on_wait=_tick)
+                    turn_err = await _drain_turn(session, on_wait=_tick,
+                                                 on_event=_activity)
                 except FrozenTurnError:
                     frozen = True
                 except asyncio.CancelledError:
@@ -1298,6 +1369,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _runs.set_status(_runs.load(run_id) or run, "error",
                                      f"turn failed: {str(e)[:200]}")
                     break
+                if live["items"]:
+                    _flush_live()                # persist the tail of this turn
                 run = _runs.load(run_id) or run
                 run["waiting_secs"] = 0          # turn is over; clear the notice
                 if frozen:
@@ -1456,7 +1529,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r = _runs.active()
         if r is None:
             return {}
-        r["log_tail"] = _runs.get_log_tail(r["id"], 8)
+        r["log_tail"] = _runs.get_log_tail(r["id"], 40)
         r["plan"] = _runs.read_plan(r["id"])
         return r
 
@@ -1466,7 +1539,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r = _runs.load(rid)
         if r is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
-        r["log_tail"] = _runs.get_log_tail(rid, 12)
+        r["log_tail"] = _runs.get_log_tail(rid, 40)
         r["plan"] = _runs.read_plan(rid)
         return r
 
