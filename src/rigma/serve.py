@@ -418,7 +418,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         usage, timings = {}, {}
         # agentic loop: stream a round; if the model called tools, run them,
         # feed results back and stream again; otherwise this round is the answer
-        max_rounds = 10 if use_tools else 1
+        # per-turn tool-call ceiling: a safety backstop against runaway loops,
+        # NOT a feature limit — session-configurable (default 25), clamped sane
+        max_rounds = (max(1, min(int(s.get("max_tool_rounds") or 25), 100))
+                      if use_tools else 1)
         for _round in range(max_rounds):
             last = _round == max_rounds - 1
             turn_msgs = msgs
@@ -565,6 +568,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 continue                       # stream the next round
             text = rtext                       # no tool calls -> this is final
             break
+        # hit the tool-call ceiling still mid-task with no final answer? never
+        # finish silently — give the user something and a clear way to resume
+        if use_tools and not failed and not text.strip() and trace:
+            text = ("_(Reached this turn's tool-call limit while still working — "
+                    "send **keep going** and I'll continue. You can raise the "
+                    "limit in the chat's settings.)_")
+            yield _sse({"delta": text})
         if not failed:
             meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}
             if usage.get("prompt_tokens"):
