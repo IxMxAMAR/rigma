@@ -619,3 +619,31 @@ def test_compiled_spec_seeds_the_plan(engine):
     assert r["spec"]["compiled"] is True
     texts = [t["text"] for t in r["plan"]]
     assert "sample images" in texts and "write prompts 1-25" in texts
+
+
+def test_feed_marks_display_truncation(engine, tmp_path):
+    # a 12-path sample was cut mid-path in the UI ("D:\Good St") and looked like
+    # corrupted data. The model gets the full result; the FEED must say it cut.
+    from rigma import serve as _s
+    big = tmp_path / "many"
+    big.mkdir()
+    for i in range(60):
+        (big / f"ComfyUI_{i:05d}_.png").write_text("x", encoding="utf-8")
+    _Engine.script = [("sample_files", {"path": str(big), "count": 40}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1,
+                                    "workspace": str(tmp_path)}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    results = [a["text"] for a in (r.get("activity") or [])
+               if a["kind"] == "result"]
+    assert results, "the sample result should be in the feed"
+    long_one = max(results, key=len)
+    assert len(long_one) <= _s.LIVE_RESULT_MAX + 40
+    if len(long_one) > _s.LIVE_RESULT_MAX:
+        assert "display truncated" in long_one
+    # and the model itself received the untruncated list
+    blob = "\n".join(m["content"] for m in
+                     __import__("rigma.sessions", fromlist=["x"]).load(
+                         r["session_id"])["messages"]
+                     if isinstance(m.get("content"), str))
+    assert "ComfyUI_00039_.png" in blob or "40" in blob
