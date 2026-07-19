@@ -716,18 +716,18 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     # later in the UI (Models tab / Bazaar), which downloads, tunes, and loads
     # it on demand. Pass --model <slug> to load one straight away instead.
     if model is None:
+        if dry_run:                              # dry-run never touches ports
+            typer.echo(f"would start Rigma (no model) on :{port}")
+            raise typer.Exit(0)
+        if detach:
+            _spawn_detached(port)
+            raise typer.Exit(0)
         for needed in (port, port - 1):
             holder = _port_holder(needed)
             if holder:
                 typer.echo(f"port {needed} is already in use{holder} — "
                            f"free it or pass a different --port")
                 raise typer.Exit(1)
-        if dry_run:
-            typer.echo(f"would start Rigma (no model) on :{port}")
-            raise typer.Exit(0)
-        if detach:
-            _spawn_detached(port)
-            raise typer.Exit(0)
         st.write_state("", "", port, engine_pid=-1, ui_pid=os.getpid(),
                        backend="", use_case=use_case, ctx=0, unloaded=True)
         typer.echo(f"Rigma:  http://127.0.0.1:{port}")
