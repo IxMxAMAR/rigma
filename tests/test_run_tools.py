@@ -100,3 +100,65 @@ def test_task_complete_acknowledges():
     out = tools.run_tool("task_complete", {"summary": "did it"},
                          {"run_id": r["id"]})
     assert "verify" in out.lower()
+
+
+# --- read-only tools accept absolute paths (the run-killer from 2026-07-19) ---
+def test_read_only_tools_accept_absolute_paths(tmp_path):
+    # refusing absolute paths didn't make anything safer (run_shell reaches the
+    # whole disk anyway) — it pushed the model into `run_shell dir`, which
+    # dumped thousands of filenames into context and blew the run up
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.txt").write_text("hello there", encoding="utf-8")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ctx = {"workspace": str(ws)}
+    listing = tools.run_tool("list_directory", {"path": str(outside)}, ctx)
+    assert not listing.startswith("error"), listing
+    assert "a.txt" in listing
+    body = tools.run_tool("read_file", {"path": str(outside / "a.txt")}, ctx)
+    assert body.strip() == "hello there"
+
+
+def test_confined_profile_still_refuses_absolute_paths(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ctx = {"workspace": str(ws), "profile": "confined"}
+    out = tools.run_tool("list_directory", {"path": str(outside)}, ctx)
+    assert "absolute path" in out
+
+
+def test_large_folder_is_summarised_not_dumped(tmp_path):
+    # 2287 raw filenames is what ballooned the owner's context
+    big = tmp_path / "big"
+    big.mkdir()
+    for i in range(450):
+        (big / f"img_{i:04d}.png").write_text("x", encoding="utf-8")
+    for i in range(20):
+        (big / f"clip_{i:02d}.mp4").write_text("x", encoding="utf-8")
+    out = tools.run_tool("list_directory", {"path": str(big)},
+                         {"workspace": str(tmp_path)})
+    assert "470 entries" in out
+    assert "450× .png" in out and "20× .mp4" in out
+    assert "sample_files" in out                  # points at the cheap path
+    assert out.count("img_") <= 20                # not a full dump
+    assert len(out) < 2500, f"summary too fat: {len(out)}"
+
+
+def test_sample_files_returns_a_random_sample(tmp_path):
+    big = tmp_path / "big"
+    big.mkdir()
+    for i in range(300):
+        (big / f"img_{i:04d}.png").write_text("x", encoding="utf-8")
+    (big / "notes.txt").write_text("x", encoding="utf-8")
+    out = tools.run_tool("sample_files",
+                         {"path": str(big), "count": 12, "pattern": "*.png"},
+                         {"workspace": str(tmp_path)})
+    assert "300 files match" in out
+    picked = [ln for ln in out.splitlines() if ln.endswith(".png")]
+    assert len(picked) == 12
+    assert "notes.txt" not in out                 # pattern respected
+    assert tools.run_tool("sample_files", {"path": str(big), "pattern": "*.zip"},
+                          {"workspace": str(tmp_path)}).startswith("no files match")
