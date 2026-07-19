@@ -295,7 +295,7 @@ def test_view_sample_needs_no_paths_at_all(tmp_path):
             tmp_path / f"comfyui-airport-editorial_{i:08d}_(2).png")
     ctx = {"run_id": r["id"], "workspace": str(tmp_path), "has_vision": True}
     out = tools.run_tool("sample_files", {"path": str(tmp_path), "count": 4}, ctx)
-    assert "[1]" in out and "Do NOT retype" in out
+    assert "[1]" in out and "Do not retype" in out
     assert len(runs.get_last_sample(r["id"])) == 4
     seen = tools.run_tool("view_sample", {"count": 2}, ctx)
     assert seen.startswith(tools.IMAGE_SENTINEL)
