@@ -1065,7 +1065,7 @@ async function renderAutoView() {
   if (run && run.id) {          // a live run
     autoRunId = run.id;
     renderAutoDash(box, run);
-    autoPollTimer = setInterval(refreshAuto, 3000);
+    autoPollTimer = setInterval(refreshAuto, 1500);
     return;
   }
   if (autoRunId) {              // no live run, but show the last one's outcome
@@ -1133,7 +1133,7 @@ function renderAutoStart(box) {
       const b = $("auto-body"); b.innerHTML = "";
       renderAutoDash(b, run);
       clearInterval(autoPollTimer);
-      autoPollTimer = setInterval(refreshAuto, 3000);
+      autoPollTimer = setInterval(refreshAuto, 1500);
     } catch (e) { alert(e.message); start.disabled = false; }
   };
   acts.appendChild(start); box.appendChild(acts);
@@ -1173,6 +1173,21 @@ function renderAutoDash(box, run) {
   box.appendChild(el("h3", "", "Plan"));
   const ul = document.createElement("ul"); ul.id = "auto-plan";
   _renderPlan(ul, run.plan); box.appendChild(ul);
+  // live activity: what the model is thinking / calling, right now
+  if (Array.isArray(run.activity) && run.activity.length) {
+    box.appendChild(el("h3", "", "Live activity"));
+    const act = el("div", ""); act.id = "auto-activity";
+    for (const a of run.activity) {
+      const kind = a.kind || "say";
+      const line = el("div", "act act-" + kind);
+      const mark = kind === "tool" ? "→ " : kind === "result" ? "   ✔ "
+                 : kind === "think" ? "" : "";
+      line.textContent = mark + (a.text || "");
+      act.appendChild(line);
+    }
+    box.appendChild(act);
+    act.scrollTop = act.scrollHeight;      // pin to newest
+  }
   box.appendChild(el("h3", "", "Progress log"));
   const log = el("div", ""); log.id = "auto-log";
   log.textContent = run.log_tail
