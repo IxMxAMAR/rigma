@@ -79,6 +79,21 @@ def test_manage_plan_update_rewords_a_step():
         "manage_plan", {"action": "update", "id": 99, "task": "x"}, ctx)
 
 
+def test_read_file_progress_md_returns_the_log_not_an_error():
+    # the model hunts for progress.md and loops on "no such file"; hand it the
+    # real log instead (it lives in the run dir, not the workspace)
+    import tempfile
+    r = runs.create("m", "s")
+    runs.append_progress(r["id"], "sampled 20 images", "write the directive")
+    ctx = {"run_id": r["id"], "workspace": tempfile.mkdtemp()}
+    out = tools.run_tool("read_file", {"path": "progress.md"}, ctx)
+    assert not out.startswith("error")
+    assert "sampled 20 images" in out and "Do NOT restart" in out
+    # a genuinely missing file still errors normally
+    assert tools.run_tool("read_file", {"path": "nope.txt"},
+                          ctx).startswith("error")
+
+
 def test_log_progress_writes_to_run():
     r = runs.create("m", "s")
     ctx = {"run_id": r["id"]}
