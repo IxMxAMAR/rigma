@@ -184,3 +184,45 @@ def test_schema_sanitizer_repairs_llamacpp_hostile_shapes():
         for v in p["properties"].values():
             assert not isinstance(v.get("type"), list)
             assert "anyOf" not in v and "oneOf" not in v
+
+
+# --- weak-model tolerance: repair instead of wasting a turn -------------------
+def test_repair_json_args_handles_common_local_model_breakage():
+    ok, note = tools.repair_json_args('{"path": "a.txt"}')
+    assert ok == {"path": "a.txt"} and not note
+    # literal newline inside a string (the most common local-model case)
+    ok, note = tools.repair_json_args('{"content": "line1\nline2"}')
+    assert ok and ok["content"].startswith("line1")
+    # trailing comma
+    ok, note = tools.repair_json_args('{"a": 1,}')
+    assert ok == {"a": 1} and "repaired" in note
+    # unbalanced closer
+    ok, note = tools.repair_json_args('{"a": {"b": 1}')
+    assert ok == {"a": {"b": 1}} and "repaired" in note
+    # prose wrapped around the object
+    ok, _ = tools.repair_json_args('here you go: {"a": 2} thanks')
+    assert ok == {"a": 2}
+    assert tools.repair_json_args("not json at all")[0] is None
+    assert tools.repair_json_args("")[0] == {}
+
+
+def test_resolve_tool_name_repairs_near_misses():
+    assert tools.resolve_tool_name("read_file") == "read_file"
+    assert tools.resolve_tool_name("Read_File") == "read_file"
+    assert tools.resolve_tool_name("read-file") == "read_file"
+    assert tools.resolve_tool_name("read_file_tool") == "read_file"
+    assert tools.resolve_tool_name("functions.read_file") == "read_file"
+    assert tools.resolve_tool_name("readfile") == "read_file"      # close match
+    assert tools.resolve_tool_name("") is None
+    assert tools.resolve_tool_name("totally_unrelated_xyz") is None
+    # and a near-miss actually EXECUTES rather than erroring
+    out = tools.run_tool("Current_DateTime", {}, {})
+    assert not out.startswith("error"), out
+
+
+def test_blank_tool_name_gets_a_specific_message():
+    # a blank name is a weak model echoing tool-call syntax it read in a FILE;
+    # the reply must say that, and must NOT list the catalogue (more to mimic)
+    out = tools.run_tool("", {}, {})
+    assert "empty" in out and "DATA" in out
+    assert "web_search" not in out and "read_file" not in out
