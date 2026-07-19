@@ -46,6 +46,9 @@ _COMPACT_PROMPT = (
 # auto-compact: when a turn leaves the window this full, summarize older messages
 # so the NEXT turn starts small. Keep the most recent N verbatim.
 AUTO_COMPACT_FRACTION = 0.92
+RESULT_MAX = 8000       # persisted tool-result cap. In one-action mode this
+                        # is the ONLY copy the model sees, so a tight cap
+                        # silently turns read_file into 'read the first N bytes'
 ARCHIVE_MAX = 400       # keep the archive tail bounded; the digest
                         # carries meaning, the archive is convenience
 RUN_CTX_BUDGET = 32768   # autonomous runs keep durable state on DISK, so they
@@ -107,6 +110,14 @@ AGENT_SYSTEM_PROMPT = (
     "you are given and spend your tool calls on the WORK.\n\n"
     "If a tool errors, read it and try a different approach. Keep going until "
     "task_complete. Do not stop to ask permission — you already have it.")
+
+
+def _clip(text: str, limit: int) -> str:
+    """Trim long tool output, telling the model it was trimmed so it can narrow
+    its next call instead of assuming it saw everything."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…(trimmed at {limit} chars — narrow your query)"
 
 
 def compact_budget(session: dict, engine_ctx: int) -> int:
@@ -725,7 +736,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if thinking:
                     last["thinking"] = last.get("thinking", "") + thinking
             else:
-                msg = {"role": "assistant", "content": _with_prefill(prefill, text)}
+                body_text = _with_prefill(prefill, text)
+                if not str(body_text).strip() and trace:
+                    # a tool-only action would otherwise persist an EMPTY
+                    # assistant message, which some templates reject outright.
+                    # Record what it actually did — useful history, and valid.
+                    body_text = "→ " + ", ".join(
+                        str(t.get("name", "?")) for t in trace)
+                msg = {"role": "assistant", "content": body_text}
                 if thinking:
                     msg["thinking"] = thinking
                 if trace:
@@ -1527,11 +1545,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if trace:
                     s4 = sessions.load(sid)
                     if s4 is not None:
+                        # generous cap: in one-action mode the turn ends right
+                        # after the call, so THIS is the only copy the model
+                        # ever sees. Truncating hard here silently turns
+                        # read_file into "read the first 1200 bytes". Tools
+                        # already cap their own output; compaction reclaims it.
                         s4["messages"].append({
                             "role": "user",
                             "content": "\n".join(
                                 f"TOOL RESULT {t.get('name')}: "
-                                f"{str(t.get('result', ''))[:1200]}"
+                                + _clip(str(t.get("result", "")), RESULT_MAX)
                                 for t in trace)})
                         sessions.save(s4)
                         session = s4
