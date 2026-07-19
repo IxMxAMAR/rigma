@@ -162,3 +162,16 @@ def test_run_control_endpoints(engine):
     c.post(f"/api/runs/{rid}/stop")
     assert runs.load(rid)["status"] == "stopped"
     assert c.get("/api/runs/active").json() == {}    # active released
+
+
+def test_run_session_uses_agent_system_prompt(engine):
+    from rigma import sessions
+    c = _client(engine)
+    _Engine.script = [None]                       # stalls fast; we check setup
+    rid = c.post("/api/runs", json={"mission": "do stuff",
+                                    "budget_hours": 1}).json()["id"]
+    _wait(c, rid)                                  # let it terminate
+    s = sessions.load(runs.load(rid)["session_id"])
+    assert "AUTONOMOUS AGENT" in s["system_prompt"]   # not the chat default
+    assert "call at least one tool" in s["system_prompt"].lower()
+    assert runs.load(rid)["mission"] == "do stuff"    # mission kept on the run
