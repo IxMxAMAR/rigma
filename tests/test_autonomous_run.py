@@ -72,6 +72,8 @@ class _Engine(BaseHTTPRequestHandler):
             time.sleep(1.0)                      # exceed a small IDLE_SECS
         if step is None:                          # narrate, no tools -> "lazy"
             sse({"choices": [{"delta": {"content": "thinking about it"}}]})
+        elif isinstance(step, tuple) and step[0] == "__text__":
+            sse({"choices": [{"delta": {"content": step[1]}}]})
         else:
             steps = step if isinstance(step, list) else [step]
             sse({"choices": [{"delta": {"tool_calls": [
@@ -687,3 +689,29 @@ def test_artifact_step_only_completes_when_the_file_exists(engine, tmp_path):
     r = _wait(c, rid, timeout=25)
     assert all(t["status"] == "pending" for t in r["plan"]), \
         "a step with a missing artifact must not be marked done"
+
+
+def test_typing_a_tool_name_is_called_out_specifically(engine):
+    # the model wrote "view_sample()" as prose after reading that string in a
+    # tool result. A generic "you produced nothing" nudge doesn't tell it what
+    # it actually got wrong.
+    _Engine.script = [("__text__", "view_sample()")]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    from rigma import sessions
+    driving = [m["content"] for m in sessions.load(r["session_id"])["messages"]
+               if m.get("role") == "user"]
+    assert any("is not a tool call" in d for d in driving), driving[-2:]
+
+
+def test_sample_files_hint_is_not_callable_looking_text(tmp_path):
+    # the hint itself taught the model to type the name: it read
+    # "call view_sample()" in the result and emitted that as its reply
+    from rigma import runs as _r, tools as _t
+    r = _r.create("m", "s")
+    (tmp_path / "a.png").write_text("x", encoding="utf-8")
+    out = _t.run_tool("sample_files", {"path": str(tmp_path)},
+                      {"run_id": r["id"], "workspace": str(tmp_path)})
+    assert "view_sample" in out                 # still points at the right tool
+    assert "view_sample()" not in out           # but not as copyable syntax
