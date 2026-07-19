@@ -280,6 +280,17 @@ def test_tool_results_persist_into_the_next_turn(engine):
     assert "added step #1" in blob, "the actual result text was not carried forward"
 
 
+def test_identical_repeated_action_is_caught_immediately(engine):
+    # with one action per turn, the same call repeated back-to-back is a loop;
+    # catch it on the SECOND occurrence rather than waiting out a 3-turn streak
+    _Engine.script = [("manage_plan", {"action": "list"})]   # repeats forever
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    assert r["status"] == "stalled"
+    assert r["iteration"] <= 8, f"took too long to notice the loop: {r['iteration']}"
+
+
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.
