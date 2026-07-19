@@ -11,6 +11,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from . import mission as _mission_mod
 from . import presets
 from . import server_ops
 from . import sessions
@@ -1314,6 +1315,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             note = run["steer_queue"].pop(0)
             _runs.save(run)
             return "USER GUIDANCE — follow this now: " + str(note)
+        miss = run.pop("_missing_artifacts", None)
+        if miss:
+            _runs.save(run)
+            listed = "\n".join("  - " + m for m in miss)
+            return ("You called task_complete, but the deliverables are NOT on "
+                    "disk:\n" + listed +
+                    "\nA file you did not write does not exist, no matter what "
+                    "you concluded. Write the missing file(s) now with "
+                    "write_file, then call task_complete again.")
         saved = run.pop("_draft_saved", "")
         if saved:
             _runs.save(run)
@@ -1695,7 +1705,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # declare victory with work outstanding. Capped so a
                     # mis-built plan can't make the run unfinishable.
                     pending = _runs.pending_tasks(run_id)
+                    # ...and check the compiled spec's artifacts ON DISK. A step
+                    # the model ticked off whose file never appeared is not done,
+                    # whatever it says.
+                    missing = []
+                    for st_ in (run.get("spec") or {}).get("steps", []):
+                        ok_, why = _mission_mod.verify_step(
+                            st_, run.get("workspace", ""))
+                        if not ok_:
+                            missing.append(f"#{st_['id']}: {why}")
                     challenges = run.get("completion_challenges", 0)
+                    if missing and challenges < MAX_COMPLETION_CHALLENGES:
+                        run["completion_challenges"] = challenges + 1
+                        run["_missing_artifacts"] = missing[:4]
+                        run["iteration"] = run.get("iteration", 0) + 1
+                        _runs.append_progress(
+                            run_id, "task_complete refused — deliverables missing",
+                            "; ".join(missing[:3]), run.get("workspace", ""))
+                        _runs.save(run)
+                        prev_sig = None
+                        continue
                     if pending and challenges < MAX_COMPLETION_CHALLENGES:
                         run["completion_challenges"] = challenges + 1
                         run["_challenge_pending"] = True
@@ -1825,9 +1854,23 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         effort = (body or {}).get("effort", "on")
         if effort not in sessions.EFFORT_LEVELS:
             effort = "on"
+        # Compile the prose into a systematic spec ONCE, here, instead of making
+        # the model re-interpret a paragraph every turn (which is how batching
+        # got ignored and phases got redone). Best-effort: a failed compile
+        # falls back to a one-step spec so the run still starts.
+        from . import mission as _mission
+
+        async def _post(payload):
+            r = await client.post("/v1/chat/completions", json=payload,
+                                  timeout=180.0)
+            r.raise_for_status()
+            return r.json()
+
+        spec = await _mission.compile_mission(mission, _post)
         sess = sessions.create(title="🤖 " + mission[:32])
         sess.update(use_tools=True, allow_code=True, auto_compact=True,
-                    workspace=workspace, mission=mission,
+                    workspace=workspace,
+                    mission=_mission.spec_block(spec, mission),
                     system_prompt=AGENT_SYSTEM_PROMPT,   # agent role, not chat
                     effort=effort, one_action=True,
                     params={**RUN_PARAMS, **(sess.get("params") or {})},
@@ -1835,6 +1878,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         run = _runs.create(mission, sess["id"], workspace=workspace,
                            profile=profile,
                            budget_hours=float((body or {}).get("budget_hours", 8)))
+        run["spec"] = spec
+        if spec.get("compiled"):
+            # the model no longer invents a plan — it executes a verified one
+            for st_ in spec["steps"]:
+                _runs.plan_add(run["id"], st_["description"])
+        _runs.save(run)
         sess["run_id"] = run["id"]
         sessions.save(sess)
         _run_tasks[run["id"]] = asyncio.create_task(_run_loop(run["id"]))
