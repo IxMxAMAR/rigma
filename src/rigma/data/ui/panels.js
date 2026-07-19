@@ -1034,3 +1034,159 @@ $("rail-search").addEventListener("input", () => {
     }
   }, 250);
 });
+
+/* ---------- Autonomous: full main-area view ---------- */
+let autoPollTimer = null;
+
+function openAutoView() {
+  closeDrawer();
+  $("auto-view").hidden = false;
+  document.body.classList.add("auto-open");
+  renderAutoView();
+}
+function closeAutoView() {
+  clearInterval(autoPollTimer); autoPollTimer = null;
+  $("auto-view").hidden = true;
+  document.body.classList.remove("auto-open");
+}
+$("open-auto").onclick = openAutoView;
+$("auto-close").onclick = closeAutoView;
+$("auto-refresh").onclick = () => renderAutoView();
+
+async function renderAutoView() {
+  const box = $("auto-body"); box.innerHTML = "";
+  clearInterval(autoPollTimer); autoPollTimer = null;
+  let run = {};
+  try { run = await api("GET", "/api/runs/active"); } catch {}
+  if (!run || !run.id) { renderAutoStart(box); return; }
+  renderAutoDash(box, run);
+  autoPollTimer = setInterval(refreshAuto, 3000);
+}
+
+function _input(type, ph, val) {
+  const i = document.createElement(type === "textarea" ? "textarea" : "input");
+  if (type !== "textarea") i.type = type;
+  if (ph) i.placeholder = ph; if (val != null) i.value = val;
+  return i;
+}
+
+function renderAutoStart(box) {
+  box.appendChild(el("p", "dim",
+    "Give the model a mission and it works on its own — planning, acting, "
+    + "logging progress, and compacting its own context — until it's done or a "
+    + "safety cap trips. It keeps going even if you close this tab."));
+  box.appendChild(el("label", "", "Mission"));
+  const mission = _input("textarea",
+    "Be specific. e.g. \"Go through the images in D:\\Art, write a taste "
+    + "directive, then 100 new prompts into prompts.txt\"");
+  box.appendChild(mission);
+  const row = el("div", "row");
+  const hoursL = el("label", "", "Time budget (hours)");
+  const hours = _input("text", "", "8"); hoursL.appendChild(hours);
+  const profL = el("label", "", "Safety profile");
+  const prof = document.createElement("select");
+  for (const p of ["all", "no-network", "no-delete", "confined"]) {
+    const o = document.createElement("option"); o.value = p; o.textContent = p;
+    prof.appendChild(o);
+  }
+  profL.appendChild(prof);
+  row.append(hoursL, profL); box.appendChild(row);
+  box.appendChild(el("label", "", "Workspace folder (where it works / writes)"));
+  const ws = _input("text", "D:\\project  (optional — defaults to home)");
+  box.appendChild(ws);
+  const acts = el("div", "acts");
+  const start = el("button", "act", "▶ Start autonomous run");
+  start.onclick = async () => {
+    if (!mission.value.trim()) { alert("Enter a mission first."); return; }
+    start.disabled = true;
+    try {
+      await api("POST", "/api/runs", {
+        mission: mission.value.trim(), budget_hours: parseFloat(hours.value) || 8,
+        profile: prof.value, workspace: ws.value.trim()});
+      renderAutoView();
+    } catch (e) { alert(e.message); start.disabled = false; }
+  };
+  acts.appendChild(start); box.appendChild(acts);
+}
+
+function _renderPlan(ul, plan) {
+  ul.innerHTML = "";
+  for (const t of (plan || [])) {
+    const li = document.createElement("li");
+    li.className = t.status === "done" ? "done" : "";
+    li.textContent = t.text; ul.appendChild(li);
+  }
+  if (!(plan || []).length) ul.appendChild(el("li", "dim", "(no plan yet)"));
+}
+
+function renderAutoDash(box, run) {
+  const head = el("div", "");
+  head.appendChild(el("span", "auto-badge " + run.status, run.status));
+  head.appendChild(document.createTextNode(
+    "  iter " + (run.iteration || 0) + " · errors " + (run.error_streak || 0)));
+  box.appendChild(head);
+  box.appendChild(el("h3", "", "Mission"));
+  box.appendChild(el("p", "", run.mission || ""));
+  box.appendChild(el("h3", "", "Plan"));
+  const ul = document.createElement("ul"); ul.id = "auto-plan";
+  _renderPlan(ul, run.plan); box.appendChild(ul);
+  box.appendChild(el("h3", "", "Progress log"));
+  const log = el("div", ""); log.id = "auto-log";
+  log.textContent = run.log_tail || "(waiting…)"; box.appendChild(log);
+  const live = ["running", "paused", "waiting_approval"].includes(run.status);
+  if (live) {
+    box.appendChild(el("h3", "", "Steer — course-correct without stopping"));
+    const steer = _input("text", "e.g. \"stop using regex, use BeautifulSoup\"");
+    box.appendChild(steer);
+    const acts = el("div", "acts");
+    const send = el("button", "act", "Send guidance");
+    send.onclick = async () => {
+      if (!steer.value.trim()) return;
+      await api("POST", "/api/runs/" + run.id + "/inject",
+                {message: steer.value.trim()});
+      steer.value = ""; send.textContent = "queued ✓";
+      setTimeout(() => { send.textContent = "Send guidance"; }, 1500);
+    };
+    acts.appendChild(send);
+    const pb = el("button", "act", run.paused ? "Resume" : "Pause");
+    pb.onclick = async () => {
+      await api("POST", "/api/runs/" + run.id
+                + "/" + (run.paused ? "resume" : "pause"), {});
+      renderAutoView();
+    };
+    acts.appendChild(pb);
+    const stop = el("button", "act", "Stop run");
+    stop.onclick = async () => {
+      if (!confirm("Stop this run?")) return;
+      await api("POST", "/api/runs/" + run.id + "/stop", {});
+      renderAutoView();
+    };
+    acts.appendChild(stop); box.appendChild(acts);
+  } else {
+    box.appendChild(el("p", "dim",
+      "Run ended: " + (run.summary || run.halt_reason || run.status)));
+    const acts = el("div", "acts");
+    const nb = el("button", "act", "Start a new run");
+    nb.onclick = () => renderAutoView();
+    acts.appendChild(nb); box.appendChild(acts);
+  }
+}
+
+async function refreshAuto() {
+  if ($("auto-view").hidden) { clearInterval(autoPollTimer); return; }
+  let run = {};
+  try { run = await api("GET", "/api/runs/active"); } catch { return; }
+  const badge = $("auto-body").querySelector(".auto-badge");
+  const logEl = $("auto-log");
+  if (!run || !run.id || !badge || !logEl
+      || !["running", "paused", "waiting_approval"].includes(run.status)) {
+    renderAutoView(); return;   // terminal or shape changed: full re-render
+  }
+  badge.className = "auto-badge " + run.status; badge.textContent = run.status;
+  const head = badge.parentElement;
+  head.childNodes[1].nodeValue =
+    "  iter " + (run.iteration || 0) + " · errors " + (run.error_streak || 0);
+  logEl.textContent = run.log_tail || "(waiting…)";
+  logEl.scrollTop = logEl.scrollHeight;
+  const ul = $("auto-plan"); if (ul) _renderPlan(ul, run.plan);
+}

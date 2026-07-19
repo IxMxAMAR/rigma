@@ -45,6 +45,135 @@ rag_app = typer.Typer(no_args_is_help=True)
 app.add_typer(rag_app, name="rag",
               help="Chat with your documents (Raggity sidecar).")
 
+run_app = typer.Typer(no_args_is_help=True)
+app.add_typer(run_app, name="run",
+              help="Autonomous long-running jobs (give it a mission, walk away).")
+
+
+def _run_server_base() -> str:
+    from . import state as st
+    s = st.read_state()
+    if s is None:
+        typer.echo("Rigma isn't running — start it first with: rigma up")
+        raise typer.Exit(1)
+    return f"http://127.0.0.1:{s['public_port']}"
+
+
+def _active_run_id() -> str:
+    import httpx
+    r = httpx.get(_run_server_base() + "/api/runs/active", timeout=10).json()
+    if not r:
+        typer.echo("no active run")
+        raise typer.Exit(1)
+    return r["id"]
+
+
+@run_app.command("start")
+def run_start(mission: str = typer.Argument(..., help="the job to accomplish"),
+              hours: float = typer.Option(8.0, "--hours",
+                                          help="time budget (safety cap)"),
+              workspace: str = typer.Option("", "--workspace",
+                                            help="folder the model works in"),
+              profile: str = typer.Option("all", "--profile",
+                                          help="all|no-network|no-delete|confined")):
+    """Hand the model a mission; it plans, works, logs, and compacts on its own
+    until it finishes or a safety cap trips. Survives closing the browser."""
+    import httpx
+    r = httpx.post(_run_server_base() + "/api/runs",
+                   json={"mission": mission, "budget_hours": hours,
+                         "workspace": workspace, "profile": profile}, timeout=30)
+    if r.status_code != 200:
+        typer.echo("error: " + r.json().get("error", str(r.status_code)))
+        raise typer.Exit(1)
+    run = r.json()
+    typer.echo(f"started run {run['id']}  (budget {hours}h, profile {profile})")
+    typer.echo("watch:  rigma run log -f     status: rigma run status")
+    typer.echo("steer:  rigma run steer \"…\"   stop:   rigma run stop")
+
+
+@run_app.command("status")
+def run_status():
+    """Show the active run's status, progress, and pending plan."""
+    import httpx
+    r = httpx.get(_run_server_base() + "/api/runs/active", timeout=10).json()
+    if not r:
+        typer.echo("no active run")
+        return
+    typer.echo(f"{r['status'].upper()}  iter {r.get('iteration', 0)}  "
+               f"errors {r.get('error_streak', 0)}  "
+               f"mission: {r.get('mission', '')[:60]}")
+    pend = [t for t in r.get("plan", []) if t.get("status") == "pending"]
+    if pend:
+        typer.echo("pending: " + "; ".join(f"#{t['id']} {t['text']}"
+                                           for t in pend[:6]))
+    if r.get("log_tail"):
+        typer.echo(r["log_tail"])
+
+
+@run_app.command("stop")
+def run_stop():
+    """Stop the active run."""
+    import httpx
+    rid = _active_run_id()
+    httpx.post(_run_server_base() + f"/api/runs/{rid}/stop", timeout=15)
+    typer.echo(f"stopped run {rid}")
+
+
+@run_app.command("pause")
+def run_pause():
+    """Pause the active run (frees the GPU without losing progress)."""
+    import httpx
+    rid = _active_run_id()
+    httpx.post(_run_server_base() + f"/api/runs/{rid}/pause", timeout=15)
+    typer.echo("paused — resume with: rigma run resume")
+
+
+@run_app.command("resume")
+def run_resume():
+    """Resume a paused run."""
+    import httpx
+    rid = _active_run_id()
+    httpx.post(_run_server_base() + f"/api/runs/{rid}/resume", timeout=15)
+    typer.echo("resumed")
+
+
+@run_app.command("steer")
+def run_steer(message: str = typer.Argument(..., help="guidance for the model")):
+    """Inject guidance used on the next step — course-correct without stopping."""
+    import httpx
+    rid = _active_run_id()
+    httpx.post(_run_server_base() + f"/api/runs/{rid}/inject",
+               json={"message": message}, timeout=15)
+    typer.echo("guidance queued for the next step")
+
+
+@run_app.command("log")
+def run_log(follow: bool = typer.Option(False, "-f", "--follow",
+                                        help="stream new entries live")):
+    """Print the run's progress log (the model's journal)."""
+    import time as _t
+
+    import httpx
+    rid = _active_run_id()
+    base = _run_server_base()
+    seen = 0
+    while True:
+        log = httpx.get(base + f"/api/runs/{rid}/log", timeout=15).json().get(
+            "log", "")
+        if len(log) > seen:
+            typer.echo(log[seen:], nl=False)
+            seen = len(log)
+        if not follow:
+            break
+        try:
+            r = httpx.get(base + f"/api/runs/{rid}", timeout=10).json()
+            if r.get("status") not in ("running", "paused", "waiting_approval"):
+                typer.echo(f"\n[run {r.get('status')}]")
+                break
+        except Exception:
+            pass
+        _t.sleep(2)
+
 
 @rag_app.command("add")
 def rag_add(path: str = typer.Argument(..., help="Folder or file to index")):
