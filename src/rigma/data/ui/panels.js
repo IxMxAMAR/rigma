@@ -1149,11 +1149,24 @@ function _renderPlan(ul, plan) {
   if (!(plan || []).length) ul.appendChild(el("li", "dim", "(no plan yet)"));
 }
 
+function _dur(s) {
+  s = Math.round(s || 0);
+  return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
+}
+
 function renderAutoDash(box, run) {
   const head = el("div", "");
   head.appendChild(el("span", "auto-badge " + run.status, run.status));
   head.appendChild(document.createTextNode(
     "  iter " + (run.iteration || 0) + " · errors " + (run.error_streak || 0)));
+  // live heartbeat: a slow turn must never look like a frozen screen
+  if (run.status === "running" && (run.waiting_secs || 0) > 0) {
+    head.appendChild(el("span", "auto-wait", "  ⏳ "
+      + (run.waiting_kind === "starting"
+         ? "model is starting (loading your context)"
+         : "generating")
+      + " — " + _dur(run.waiting_secs) + " so far"));
+  }
   box.appendChild(head);
   box.appendChild(el("h3", "", "Mission"));
   box.appendChild(el("p", "", run.mission || ""));
@@ -1162,7 +1175,11 @@ function renderAutoDash(box, run) {
   _renderPlan(ul, run.plan); box.appendChild(ul);
   box.appendChild(el("h3", "", "Progress log"));
   const log = el("div", ""); log.id = "auto-log";
-  log.textContent = run.log_tail || "(waiting…)"; box.appendChild(log);
+  log.textContent = run.log_tail
+    || ((run.waiting_secs || 0) > 0
+        ? "working… nothing logged yet (" + _dur(run.waiting_secs) + ")"
+        : "(waiting…)");
+  box.appendChild(log);
   const live = ["running", "paused", "waiting_approval"].includes(run.status);
   if (live) {
     box.appendChild(el("h3", "", "Steer — course-correct without stopping"));
