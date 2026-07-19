@@ -47,6 +47,13 @@ _COMPACT_PROMPT = (
 # auto-compact: when a turn leaves the window this full, summarize older messages
 # so the NEXT turn starts small. Keep the most recent N verbatim.
 AUTO_COMPACT_FRACTION = 0.92
+# Sampler defaults for autonomous runs. A local model left to reason alone will
+# repeat itself verbatim ("I will call view_images." x20) and never act; DRY
+# penalises the repeated n-grams that make up such a loop, and the token cap
+# guarantees a runaway turn ENDS so the loop can score it and nudge, instead of
+# grinding for minutes. The user's own params always win.
+RUN_PARAMS = {"dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2,
+              "repeat_penalty": 1.05, "max_tokens": 8192}
 MAX_COMPLETION_CHALLENGES = 2   # refuse a premature task_complete at most
                                 # twice, so a bad plan can't trap the run
 SPILL_CHARS = 12000     # above this a tool result goes to DISK, not context
@@ -1351,10 +1358,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # prefill cost on a slow local model. The previous "Last: <log line>"
         # echo is gone: the actual TOOL RESULT is carried into context directly,
         # which is better continuity than a summary of it.
+        # State the WORK, never the protocol. "Emit ONE tool call" repeated every
+        # turn gave the model something to reason ABOUT — it looped writing "the
+        # prompt says Emit ONE tool call" instead of calling anything. Protocol
+        # rules belong in the (cached) system prompt, said once.
         d, tot = _runs.plan_counts(rid)
-        return (f"[{d}/{tot} done] Next: {nxt}. "
-                "Emit ONE tool call that advances it. Do not re-orient, do not "
-                "narrate, do not repeat your last call.")
+        return f"[{d}/{tot} done] Do this now: {nxt}"
 
     def _sse_parse(chunk: bytes):
         """(event, obj) for one SSE chunk; ('', None) when there's no JSON body."""
@@ -1769,6 +1778,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     workspace=workspace, mission=mission,
                     system_prompt=AGENT_SYSTEM_PROMPT,   # agent role, not chat
                     effort=effort, one_action=True,
+                    params={**RUN_PARAMS, **(sess.get("params") or {})},
                     run_profile=profile if profile in _runs.PROFILES else "all")
         run = _runs.create(mission, sess["id"], workspace=workspace,
                            profile=profile,

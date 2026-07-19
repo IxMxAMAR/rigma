@@ -488,3 +488,32 @@ def test_big_tool_result_spills_to_disk_with_a_way_back(tmp_path):
     assert pathlib.Path(path).read_text(encoding="utf-8") == big   # nothing lost
     # read_file is exempt or paging would re-trigger the spill it escapes
     assert _s._spill_big_result("read_file", big, {}) == big
+
+
+def test_run_gets_anti_repetition_samplers_and_a_token_cap(engine):
+    # a local model left reasoning alone repeats itself verbatim and never acts
+    # ("I will call view_images." over and over). DRY penalises the repeated
+    # n-grams; the token cap guarantees a runaway turn ENDS so it can be scored.
+    from rigma import sessions
+    _Engine.script = [None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    _wait(c, rid, timeout=25)
+    p = sessions.load(runs.load(rid)["session_id"])["params"]
+    assert p["dry_multiplier"] > 0 and p["dry_allowed_length"] >= 1
+    assert p["max_tokens"] <= 16384
+
+
+def test_driving_line_states_the_work_not_the_protocol(engine):
+    # "Emit ONE tool call" repeated every turn gave the model something to
+    # reason ABOUT — it looped narrating the instruction instead of obeying it
+    from rigma import sessions
+    _Engine.script = [("manage_plan", {"action": "add", "task": "write it"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    driving = [m["content"] for m in sessions.load(r["session_id"])["messages"]
+               if m.get("role") == "user"]
+    assert driving
+    assert not any("Emit ONE tool call" in d for d in driving)
+    assert any("Do this now:" in d for d in driving)
