@@ -57,6 +57,42 @@ _NETWORK_TOOLS = {"web_search", "fetch_url", "http_request", "ask_gemini"}
 _LIST_MAX = 200          # above this, summarise a folder instead of dumping names
 
 
+def sanitize_schema(schema: dict) -> dict:
+    """Normalise a tool's JSON Schema into shapes llama.cpp's GBNF converter
+    accepts. Cloud APIs silently tolerate these; llama.cpp can reject the whole
+    request with HTTP 400 "Unable to generate parser for this template" — the
+    same error a bad chat template produces, which makes it painful to diagnose.
+
+    Repairs: a missing/empty `properties` map, union types (`["string","null"]`),
+    and `anyOf`/`oneOf` branches — collapsed to their first concrete type."""
+    s = dict(schema or {})
+    props = dict(s.get("properties") or {})
+    for key, spec in list(props.items()):
+        if not isinstance(spec, dict):
+            continue
+        spec = dict(spec)
+        if isinstance(spec.get("type"), list):        # ["string","null"] -> string
+            concrete = [t for t in spec["type"] if t != "null"]
+            spec["type"] = concrete[0] if concrete else "string"
+        for branch in ("anyOf", "oneOf"):
+            if branch in spec:
+                first = next((b for b in spec[branch]
+                              if isinstance(b, dict) and b.get("type") != "null"),
+                             {"type": "string"})
+                spec.pop(branch)
+                spec.setdefault("type", first.get("type", "string"))
+        props[key] = spec
+    s["type"] = s.get("type", "object")
+    if not props:
+        # a no-argument tool: give the converter a real (optional) field rather
+        # than an empty object, which it may refuse outright
+        props = {"_": {"type": "string",
+                       "description": "unused — pass an empty string"}}
+        s["required"] = []
+    s["properties"] = props
+    return s
+
+
 def tool_specs(allow_code: bool = False, has_rag: bool = False,
                workspace: str | None = None, has_vision: bool = False,
                has_run: bool = False, profile: str = "all") -> list[dict]:
@@ -80,7 +116,7 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
             continue
         out.append({"type": "function", "function": {
             "name": t.name, "description": t.description,
-            "parameters": t.parameters}})
+            "parameters": sanitize_schema(t.parameters)}})
     return out
 
 

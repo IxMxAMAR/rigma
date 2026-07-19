@@ -162,3 +162,25 @@ def test_sample_files_returns_a_random_sample(tmp_path):
     assert "notes.txt" not in out                 # pattern respected
     assert tools.run_tool("sample_files", {"path": str(big), "pattern": "*.zip"},
                           {"workspace": str(tmp_path)}).startswith("no files match")
+
+
+def test_schema_sanitizer_repairs_llamacpp_hostile_shapes():
+    # llama.cpp's GBNF converter can reject shapes cloud APIs tolerate, failing
+    # the whole request with the SAME "Unable to generate parser" 400 a bad chat
+    # template produces — which makes it miserable to diagnose
+    out = tools.sanitize_schema({"type": "object", "properties": {}})
+    assert out["properties"], "empty properties must be given a real field"
+    out = tools.sanitize_schema({"type": "object", "properties": {
+        "a": {"type": ["string", "null"]},
+        "b": {"anyOf": [{"type": "null"}, {"type": "integer"}]}}})
+    assert out["properties"]["a"]["type"] == "string"
+    assert out["properties"]["b"]["type"] == "integer"
+    assert "anyOf" not in out["properties"]["b"]
+    # every advertised tool is clean
+    for spec in tools.tool_specs(allow_code=True, has_rag=True, workspace="C:/",
+                                 has_vision=True, has_run=True):
+        p = spec["function"]["parameters"]
+        assert p.get("properties"), spec["function"]["name"]
+        for v in p["properties"].values():
+            assert not isinstance(v.get("type"), list)
+            assert "anyOf" not in v and "oneOf" not in v
