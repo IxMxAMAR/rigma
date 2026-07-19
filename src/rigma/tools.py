@@ -19,6 +19,7 @@ import operator
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,10 +52,14 @@ def tool(name, description, parameters, safe=True, needs=""):
 IMAGE_SENTINEL = "\x00__RIGMA_IMAGE__\x00"
 
 
+_NETWORK_TOOLS = {"web_search", "fetch_url", "http_request", "ask_gemini"}
+
+
 def tool_specs(allow_code: bool = False, has_rag: bool = False,
-               workspace: str | None = None, has_vision: bool = False) -> list[dict]:
+               workspace: str | None = None, has_vision: bool = False,
+               has_run: bool = False, profile: str = "all") -> list[dict]:
     """OpenAI-format tool definitions to hand the model, filtered to what this
-    session actually permits."""
+    session/run actually permits."""
     out = []
     for t in _REGISTRY.values():
         if t.needs == "code" and not allow_code:
@@ -64,6 +69,12 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
         if t.needs == "workspace" and not workspace:
             continue
         if t.needs == "vision" and not has_vision:
+            continue
+        if t.needs == "run" and not has_run:      # autonomous-run-only tools
+            continue
+        if profile == "no-network" and t.name in _NETWORK_TOOLS:
+            continue
+        if profile == "confined" and t.name in ("run_shell", "run_python"):
             continue
         out.append({"type": "function", "function": {
             "name": t.name, "description": t.description,
@@ -78,10 +89,17 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
     if t is None:
         return f"error: no such tool '{name}'"
     ctx = ctx or {}
+    prof = ctx.get("profile", "all")
+    if prof == "no-network" and name in _NETWORK_TOOLS:
+        return "error: network tools are disabled for this run (no-network)"
+    if prof == "confined" and name in ("run_shell", "run_python"):
+        return "error: code execution is disabled for this run (confined)"
     if t.needs == "code" and not ctx.get("allow_code"):
         return "error: code execution is not enabled for this chat"
     if t.needs == "vision" and not ctx.get("has_vision"):
         return "error: this model can't see images"
+    if t.needs == "run" and not ctx.get("run_id"):
+        return "error: this tool is only available inside an autonomous run"
     try:
         return t.handler(args or {}, ctx)
     except Exception as e:   # a broken tool must not kill the turn
@@ -412,6 +430,71 @@ def _search_docs(args, ctx):
             c.get("source", "") if isinstance(c, dict) else str(c)
             for c in cites[:5])
     return out
+
+
+# ---- autonomous-run tools (only offered inside a Run) -----------------------
+
+@tool("manage_plan",
+      "Maintain your task plan (your durable working memory). action='add' with "
+      "a `task` to add a concrete step; action='complete' with an `id` to check "
+      "one off; action='list' to see it. Break the mission into steps FIRST, then "
+      "work through them — the system reminds you of pending steps every turn.",
+      {"type": "object", "properties": {
+          "action": {"type": "string", "description": "add | complete | list"},
+          "task": {"type": "string", "description": "step text (for add)"},
+          "id": {"type": "integer", "description": "task id (for complete)"}},
+       "required": ["action"]},
+      needs="run")
+def _manage_plan(args, ctx):
+    from . import runs
+    rid = ctx.get("run_id")
+    action = str(args.get("action", "")).lower().strip()
+    if action == "add":
+        t = str(args.get("task", "")).strip()
+        if not t:
+            return "error: `task` text is required to add a step"
+        return f"added step #{runs.plan_add(rid, t)}: {t}"
+    if action == "complete":
+        ok = runs.plan_complete(rid, args.get("id"))
+        return (f"step #{args.get('id')} marked done. Remaining: "
+                f"{runs.plan_summary(rid)}") if ok else "no such step id"
+    if action == "list":
+        return "Plan (pending): " + runs.plan_summary(rid, limit=50)
+    return "error: action must be add, complete, or list"
+
+
+@tool("log_progress",
+      "Record what you just accomplished and what you'll do next. Call this after "
+      "every meaningful step — it is your memory across context resets and the "
+      "log the user watches.",
+      {"type": "object", "properties": {
+          "done": {"type": "string", "description": "what you just accomplished"},
+          "next": {"type": "string", "description": "what you'll do next"}},
+       "required": ["done", "next"]},
+      needs="run")
+def _log_progress(args, ctx):
+    from . import runs
+    done = str(args.get("done", "")).strip()
+    if not done:
+        return "error: `done` is required"
+    runs.append_progress(ctx.get("run_id"), done, str(args.get("next", "")),
+                         workspace=ctx.get("workspace", ""))
+    return "logged."
+
+
+@tool("task_complete",
+      "Call this ONLY when the ENTIRE mission is truly finished. Provide a "
+      "`summary` of what was accomplished. You will be asked to verify with tools "
+      "before the run actually ends.",
+      {"type": "object", "properties": {
+          "summary": {"type": "string", "description": "what was accomplished"}},
+       "required": ["summary"]},
+      needs="run")
+def _task_complete(args, ctx):
+    # the executor detects this call in the turn's trace and drives the
+    # verify-once / finish logic; the handler just acknowledges to the model
+    return ("You signalled completion. The system will now ask you to verify "
+            "the work before ending.")
 
 
 # ---- gated tools (filesystem + code) ----------------------------------------
@@ -786,17 +869,64 @@ def _run_shell(args, ctx):
     return _run_subprocess(cmd, ctx, shell=True)
 
 
+# destructive system commands refused even when code-exec is allowed — these
+# protect against the MODEL's mistakes (a hallucinated `format`), not the owner
+_BLOCKED_CMD = re.compile(
+    r"(?i)(\b(format|diskpart|takeown|icacls|shutdown|restart-computer|mkfs|"
+    r"fdisk|reg\s+delete)\b|rm\s+-rf\s+[/~]|del\s+/[sq].*[\\/]|rd\s+/s\s+\w:)")
+# deletion verbs, blocked only under the no-delete run profile
+_DELETE_CMD = re.compile(
+    r"(?i)\b(del|erase|rm|rmdir|rd|remove-item|unlink)\b")
+
+
+def _launch_killable(cmd, shell, cwd):
+    kw = {}
+    if sys.platform == "win32":
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    return subprocess.Popen(cmd, shell=shell, cwd=cwd,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, **kw)
+
+
+def _kill_tree(pid: int) -> None:
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=False)
+        else:
+            import signal
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except Exception:
+        pass
+
+
 def _run_subprocess(cmd, ctx, shell=False):
+    text = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+    if _BLOCKED_CMD.search(text):
+        return ("error: blocked — that looks like a destructive system command; "
+                "refusing to run it")
+    if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(text):
+        return "error: blocked — deletion is disabled for this run (no-delete)"
     cwd = ctx.get("workspace") or None
     try:
-        # stdin=DEVNULL so input()/`cat` with no args can't block for the full
-        # 30s waiting on a terminal that will never arrive
-        r = subprocess.run(cmd, shell=shell, cwd=cwd, capture_output=True,
-                           text=True, timeout=30, stdin=subprocess.DEVNULL)
+        p = _launch_killable(cmd, shell, cwd)
+    except Exception as e:
+        return f"error: could not start process: {e}"
+    try:
+        # stdin=DEVNULL (in _launch_killable) so input()/bare `cat` can't hang
+        stdout, stderr = p.communicate(timeout=30)
     except subprocess.TimeoutExpired:
-        return "error: timed out after 30s"
-    out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
-    out = out.strip() or f"(no output, exit {r.returncode})"
+        _kill_tree(p.pid)                       # kill the WHOLE tree, not just p
+        try:
+            stdout, stderr = p.communicate(timeout=5)
+        except Exception:
+            stdout, stderr = "", ""
+        return "error: timed out after 30s (process tree killed)"
+    out = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
+    out = out.strip() or f"(no output, exit {p.returncode})"
     return out[:8000] + ("\n…(truncated)" if len(out) > 8000 else "")
 
 
