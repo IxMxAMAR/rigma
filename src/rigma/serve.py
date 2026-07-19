@@ -46,6 +46,11 @@ _COMPACT_PROMPT = (
 # auto-compact: when a turn leaves the window this full, summarize older messages
 # so the NEXT turn starts small. Keep the most recent N verbatim.
 AUTO_COMPACT_FRACTION = 0.92
+MAX_COMPLETION_CHALLENGES = 2   # refuse a premature task_complete at most
+                                # twice, so a bad plan can't trap the run
+SPILL_CHARS = 12000     # above this a tool result goes to DISK, not context
+SPILL_PREVIEW = 1500    # how much of it the model sees inline
+_SPILL_EXEMPT = {"read_file"}   # the recovery tool must never spill itself
 RESULT_MAX = 8000       # persisted tool-result cap. In one-action mode this
                         # is the ONLY copy the model sees, so a tight cap
                         # silently turns read_file into 'read the first N bytes'
@@ -127,6 +132,35 @@ AGENT_SYSTEM_PROMPT = (
     "plausible.\n\n"
     "If a tool errors, read it and try a different approach. Keep going until "
     "task_complete. Do not stop to ask permission — you already have it.")
+
+
+def _spill_big_result(name: str, result: str, tctx: dict) -> str:
+    """A huge tool result is written to DISK and replaced with a preview plus the
+    exact call to read the rest. Truncating throws the data away; spilling keeps
+    it and hands the model a way back to it.
+
+    read_file is exempt on purpose: it is the recovery tool, so spilling it would
+    make paging trigger the very mechanism it exists to escape."""
+    import secrets as _secrets
+
+    from . import state as _st
+    from . import tools as _toolkit
+    if name in _SPILL_EXEMPT or not isinstance(result, str):
+        return result
+    if len(result) <= SPILL_CHARS or result.startswith(_toolkit.IMAGE_SENTINEL):
+        return result
+    try:
+        out = _st.rigma_home() / "results"
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"{name}-{_secrets.token_hex(4)}.txt"
+        path.write_text(result, encoding="utf-8", errors="replace")
+    except Exception:
+        return _clip(result, SPILL_CHARS)      # spilling failed: fall back
+    return (f"(this {name} result was large — {len(result)} chars — so it was "
+            f"saved to disk instead of flooding your context)\n"
+            f"Full output: {path}\n"
+            f"Read more with: read_file path=\"{path}\" offset=1 limit=800\n\n"
+            f"Preview (first {SPILL_PREVIEW} chars):\n{result[:SPILL_PREVIEW]}")
 
 
 def _clip(text: str, limit: int) -> str:
@@ -505,6 +539,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 async with _sem:
                     result = await asyncio.to_thread(toolkit.cached_run,
                                                      name, cargs, tctx)
+                result = _spill_big_result(name, result, tctx)
                 imgs = None
                 if result.startswith(toolkit.IMAGE_SENTINEL):
                     payload = result[len(toolkit.IMAGE_SENTINEL):]
@@ -1238,6 +1273,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             note = run["steer_queue"].pop(0)
             _runs.save(run)
             return "USER GUIDANCE — follow this now: " + str(note)
+        if run.pop("_challenge_pending", False):
+            _runs.save(run)
+            pend = _runs.pending_tasks(rid)
+            step = (f"#{pend[0]['id']} {pend[0]['text']}" if pend else "the mission")
+            return ("You called task_complete, but the plan still has "
+                    f"{len(pend)} step(s) open. Do NOT claim completion yet.\n"
+                    f"Do this now: {step}\n"
+                    "If that step is genuinely already done, mark it with "
+                    "manage_plan(action='complete', id=N) — with evidence you "
+                    "actually produced, not an assumption. If it cannot be done, "
+                    "say what blocked you.")
         if run.get("force_completion"):
             run["force_completion"] = False
             _runs.save(run)
@@ -1587,6 +1633,25 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                           "network tools disabled", "continue "
                                           "offline", run.get("workspace", ""))
                 if any(t.get("name") == "task_complete" for t in trace):
+                    # Evidence beats self-report. If plan steps are still open,
+                    # refuse the claim and name the step — a weak model will
+                    # declare victory with work outstanding. Capped so a
+                    # mis-built plan can't make the run unfinishable.
+                    pending = _runs.pending_tasks(run_id)
+                    challenges = run.get("completion_challenges", 0)
+                    if pending and challenges < MAX_COMPLETION_CHALLENGES:
+                        run["completion_challenges"] = challenges + 1
+                        run["_challenge_pending"] = True
+                        run["iteration"] = run.get("iteration", 0) + 1
+                        _runs.append_progress(
+                            run_id,
+                            f"task_complete refused — {len(pending)} step(s) "
+                            "still pending",
+                            f"finish #{pending[0]['id']} {pending[0]['text']}",
+                            run.get("workspace", ""))
+                        _runs.save(run)
+                        prev_sig = None
+                        continue
                     if not run.get("verified_once"):
                         run.update(verified_once=True, _verify_pending=True,
                                    error_streak=0, lazy_streak=0)
