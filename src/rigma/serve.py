@@ -1323,6 +1323,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             note = run["steer_queue"].pop(0)
             _runs.save(run)
             return "USER GUIDANCE — follow this now: " + str(note)
+        echoed = run.pop("_echoed_tool", "")
+        if echoed:
+            _runs.save(run)
+            return (f"You wrote \"{echoed}\" as TEXT. That is not a tool call — "
+                    "nothing ran, and the turn was wasted. Emit an actual "
+                    f"{echoed} tool call now (the arguments may be empty). "
+                    "Never type a tool's name into your reply.")
         miss = run.pop("_missing_artifacts", None)
         if miss:
             _runs.save(run)
@@ -1536,6 +1543,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     async def _run_loop(run_id):
         import time as _time
+
+        from . import tools as toolkit
 
         from . import runs as _runs
         run = _runs.load(run_id)
@@ -1811,6 +1820,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # unproductive — but the prose may BE the work (the owner watched
                 # it write ~60 prompts into a reply that was then discarded).
                 # Save it, tell the model where it went, and let it carry on.
+                if not trace:
+                    # Did it TYPE a tool name instead of calling one? Name that
+                    # mistake exactly — a generic "you produced nothing" nudge
+                    # doesn't tell it what it got wrong.
+                    tail_txt = ""
+                    for m in reversed((sessions.load(sid) or {}).get("messages", [])):
+                        if m.get("role") == "assistant":
+                            tail_txt = str(m.get("content") or "").strip()
+                            break
+                    probe = re.sub(r"[^a-z_]", "", tail_txt.lower())[:40]
+                    if probe and len(tail_txt) < 120:
+                        hit = toolkit.resolve_tool_name(probe)
+                        if hit:
+                            run["_echoed_tool"] = hit
                 if not trace:
                     said = ""
                     for m in reversed((sessions.load(sid) or {}).get("messages", [])):
