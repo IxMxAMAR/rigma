@@ -46,11 +46,15 @@ class _Engine(BaseHTTPRequestHandler):
         if not body.get("stream", True):
             # non-streaming = the mission compiler (or compaction), NOT a turn.
             # Answer it without consuming the turn script.
+            payload = json.dumps({"choices": [{"message": {
+                "content": _Engine.compile_reply}}]}).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
+            # Content-Length matters: without it httpx waits for EOF, which
+            # stretched every run by seconds and made the suite flaky
+            self.send_header("content-length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(json.dumps({"choices": [{"message": {
-                "content": _Engine.compile_reply}}]}).encode())
+            self.wfile.write(payload)
             return
         i = _Engine.idx
         _Engine.idx += 1
@@ -102,14 +106,43 @@ def home(tmp_path, monkeypatch):
     _Engine.gate = None
     _Engine.bodies = []
     _Engine.compile_reply = "not a spec"
+    yield tmp_path
+    # Stop this test's run so its background loop exits. Nothing cancels those
+    # tasks on teardown, so without this every finished test leaves a loop
+    # spinning against a dead engine and starves the ones that follow — which
+    # showed up as unrelated tests "timing out" at random.
+    try:
+        a = runs.active()
+        if a:
+            runs.set_status(a, "stopped", "test teardown")
+    except Exception:
+        pass
+    while _CLIENTS:                     # close the portal + cancel its tasks
+        try:
+            _CLIENTS.pop().__exit__(None, None, None)
+        except Exception:
+            pass
+
+
+_CLIENTS = []
 
 
 def _client(port):
+    """Enter the TestClient's context so the app gets ONE portal for the whole
+    test. Without it, starlette spins a fresh portal per request, and the
+    background run loop (create_task'd inside the POST handler) lives on a loop
+    that is torn down when that request ends — so whether it progresses is a
+    race. That was the source of the random 'still running' failures."""
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
-    return TestClient(serve.build_app(upstream_port=port))
+    c = TestClient(serve.build_app(upstream_port=port))
+    c.__enter__()
+    _CLIENTS.append(c)
+    return c
 
 
-def _wait(client, rid, timeout=15):
+def _wait(client, rid, timeout=25):
+    # a run now compiles its mission first — one extra engine round-trip before
+    # the first turn — so this is a little longer than the original 15s
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         r = client.get(f"/api/runs/{rid}").json()
@@ -551,3 +584,38 @@ def test_long_prose_is_written_to_a_draft_file(tmp_path, monkeypatch):
     from rigma import serve as _s
     assert _s.DRAFT_MIN_CHARS >= 200
     assert _s.RUN_PARAMS["max_tokens"] >= 16384, "must fit a real batch of work"
+
+
+def test_start_run_responds_immediately(engine, monkeypatch):
+    # compiling inside start_run made the Start button hang for a whole engine
+    # call — the POST must return fast and compile inside the run
+    import time as _t
+    _Engine.script = [None]
+    c = _client(engine)
+    t0 = _t.monotonic()
+    r = c.post("/api/runs", json={"mission": "x", "budget_hours": 1})
+    assert r.status_code == 200
+    assert _t.monotonic() - t0 < 3.0, "start_run blocked on the compile"
+    _wait(c, rid := r.json()["id"], timeout=25)
+
+
+def test_compiled_spec_seeds_the_plan(engine):
+    # a good compile means the model EXECUTES a plan instead of inventing one
+    _Engine.compile_reply = json.dumps({
+        "objective": "write prompts in batches",
+        "deliverables": [{"path": "D:/out/a.txt", "description": "batch 1"}],
+        "constraints": ["do not modify originals"],
+        "steps": [
+            {"id": 1, "description": "sample images", "artifact": "",
+             "verification": {"type": "none"}},
+            {"id": 2, "description": "write prompts 1-25",
+             "artifact": "D:/out/a.txt",
+             "verification": {"type": "file_min_size", "value": 100}}]})
+    _Engine.script = [None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "make prompts in batches",
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    assert r["spec"]["compiled"] is True
+    texts = [t["text"] for t in r["plan"]]
+    assert "sample images" in texts and "write prompts 1-25" in texts
