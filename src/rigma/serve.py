@@ -46,6 +46,8 @@ _COMPACT_PROMPT = (
 # auto-compact: when a turn leaves the window this full, summarize older messages
 # so the NEXT turn starts small. Keep the most recent N verbatim.
 AUTO_COMPACT_FRACTION = 0.92
+ARCHIVE_MAX = 400       # keep the archive tail bounded; the digest
+                        # carries meaning, the archive is convenience
 RUN_CTX_BUDGET = 32768   # autonomous runs keep durable state on DISK, so they
                          # don't need the engine's full window; dragging ~120k
                          # tokens through every action is the dominant per-action
@@ -360,7 +362,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if not digest:
             raise RuntimeError("summarizer returned an empty digest")
         s["digest"] = digest
-        s["archive"] = s.get("archive", []) + old   # nothing is ever destroyed
+        # bounded: a run compacts often (small ctx budget) and re-serialises the
+        # whole session on every save, so an unbounded archive is real write
+        # amplification over a 20h run. The digest carries the meaning; the
+        # archive is a convenience tail.
+        s["archive"] = (s.get("archive", []) + old)[-ARCHIVE_MAX:]
         s["messages"] = recent
         sessions.save(s)
         return s, len(old)
@@ -496,13 +502,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # inner multi-round loop left the model unsupervised for entire hours
         # (owner saw `iter 1` after a full run; 50 tool calls in one turn).
         one_action = bool(s.get("one_action"))
+        force_last = False       # one-action: allow a final look-at-images round
         max_rounds = (max(1, min(int(s.get("max_tool_rounds") or 50), 100))
                       if use_tools else 1)
         for _round in range(max_rounds):
             # `last` MUST stay False in one-action mode: tool calls are only
             # executed when `not last` (see the tool block below), so treating
             # round 0 as last would DROP the action instead of running it.
-            last = (_round == max_rounds - 1) and not one_action
+            last = ((_round == max_rounds - 1) and not one_action) or force_last
             turn_msgs = msgs
             if use_tools and last:
                 # final round: KEEP tools advertised so a stray tool call is
@@ -569,7 +576,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         # EAGER: the moment a call's args parse as a JSON object,
                         # start it running so its I/O overlaps the rest of
                         # generation and any sibling tool calls
-                        if (use_tools and not last and idx not in started
+                        # not in one-action mode: we keep only the FIRST call
+                        # there, so eagerly starting siblings would run work we
+                        # are about to drop
+                        if (use_tools and not last and not one_action
+                                and idx not in started
                                 and slot["name"] and slot["args"].strip()):
                             try:
                                 _ca = json.loads(slot["args"])
@@ -602,6 +613,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     task.cancel()              # don't leak eager tool tasks
                 break
             if use_tools and calls and not last:   # the model asked for tools
+                if one_action and len(calls) > 1:
+                    # ONE action per turn: a model may emit several parallel
+                    # tool_calls in a single round — keep the first and drop the
+                    # rest, or the loop is unsupervised again at smaller scale
+                    first = sorted(calls)[0]
+                    calls = {first: calls[first]}
+                round_imgs = False
                 msgs.append({"role": "assistant", "content": rtext,
                              "tool_calls": [
                                  {"id": c["id"], "type": "function",
@@ -644,7 +662,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             content.append({"type": "image_url",
                                             "image_url": {"url": u}})
                         msgs.append({"role": "user", "content": content})
+                        round_imgs = True
                 if one_action:
+                    if round_imgs:
+                        # the images were appended for the NEXT round's request —
+                        # breaking here would discard them and the model would
+                        # never see a single pixel, only "image loaded" text.
+                        # Take one more round (tools off) so it actually LOOKS.
+                        force_last = True
+                        continue
                     text = rtext               # keep any narration with the action
                     break                      # ONE action: end the turn here
                 continue                       # stream the next round
