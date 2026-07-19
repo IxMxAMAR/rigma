@@ -46,7 +46,14 @@ _COMPACT_PROMPT = (
 # auto-compact: when a turn leaves the window this full, summarize older messages
 # so the NEXT turn starts small. Keep the most recent N verbatim.
 AUTO_COMPACT_FRACTION = 0.92
-AUTO_COMPACT_KEEP = 8
+RUN_CTX_BUDGET = 32768   # autonomous runs keep durable state on DISK, so they
+                         # don't need the engine's full window; dragging ~120k
+                         # tokens through every action is the dominant per-action
+                         # cost and dilutes attention badly on a 3B-active model.
+                         # Clamped to the engine's real ctx, so lowering the
+                         # engine to -c 16384 automatically wins.
+AUTO_COMPACT_KEEP = 16  # one action = TWO messages now (assistant + TOOL
+                        # RESULT), so 8 kept only ~4 actions of history
 
 # --- Autonomous Mode tunables (see docs/.../autonomous-mode-design.md) ---
 IDLE_SECS = 90.0        # inter-token idle: frozen only if the stream STALLS this long
@@ -98,6 +105,15 @@ AGENT_SYSTEM_PROMPT = (
     "you are given and spend your tool calls on the WORK.\n\n"
     "If a tool errors, read it and try a different approach. Keep going until "
     "task_complete. Do not stop to ask permission — you already have it.")
+
+
+def compact_budget(session: dict, engine_ctx: int) -> int:
+    """Context budget to compact against: small for autonomous runs (their
+    durable state lives on disk), the engine's full window for normal chats.
+    Never above what the engine actually has."""
+    if (session or {}).get("run_id"):
+        return min(RUN_CTX_BUDGET, engine_ctx or RUN_CTX_BUDGET)
+    return engine_ctx
 
 
 async def _upstream_error(resp) -> str:
@@ -700,7 +716,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # auto-compact when the window is nearly full, so the NEXT turn
             # starts small (reactive; uses the engine's real prompt_tokens)
             ptoks = usage.get("prompt_tokens") or 0
-            wctx = (st.read_state() or {}).get("ctx", 0)
+            wctx = compact_budget(s, (st.read_state() or {}).get("ctx", 0))
             if (s.get("auto_compact", True) and ptoks and wctx
                     and ptoks >= AUTO_COMPACT_FRACTION * wctx
                     and len(s.get("messages", [])) > AUTO_COMPACT_KEEP):
