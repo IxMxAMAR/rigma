@@ -343,6 +343,28 @@ def test_one_action_lets_the_model_see_loaded_images(engine, tmp_path):
         toolkit._REGISTRY.pop("fake_view", None)
 
 
+def test_persisted_tool_result_is_not_crippled(engine, tmp_path):
+    # one-action mode ends the turn right after the call, so the ONLY copy the
+    # model ever sees is the persisted one. Truncating it to ~1k chars would
+    # silently turn read_file into "read the first 1200 bytes".
+    from rigma import sessions
+    big = tmp_path / "big.txt"
+    big.write_text("L%03d: the quick brown fox jumps over the lazy dog\n" % 0
+                   + "".join("L%03d: padding line for the file body\n" % i
+                             for i in range(1, 200)), encoding="utf-8")
+    _Engine.script = [("read_file", {"path": "big.txt"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1,
+                                    "workspace": str(tmp_path)}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    sess = sessions.load(r["session_id"])
+    blob = "\n".join(m["content"] for m in sess["messages"]
+                     if isinstance(m.get("content"), str)
+                     and m["content"].startswith("TOOL RESULT"))
+    assert "L100:" in blob, "file content was truncated away before the model saw it"
+    assert len(blob) > 4000, f"persisted result far too small: {len(blob)}"
+
+
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.

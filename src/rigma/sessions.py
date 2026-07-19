@@ -137,9 +137,15 @@ def build_messages(session: dict, default_prompt: str = "",
         sections.append("Earlier conversation (compacted):\n" + digest)
     head = ([{"role": "system", "content": "\n\n".join(sections)}]
             if sections else [])
-    # sanitize: variants/metadata must never reach the model
+    # sanitize: variants/metadata must never reach the model.
+    # Also DROP empty assistant turns: a tool-only action persists an assistant
+    # message with no text, and some chat templates (this Qwen3 build) 400 on
+    # them — "Unable to generate parser for this template". They carry no
+    # information for the model either way.
     msgs = [{"role": m.get("role", "user"), "content": m.get("content", "")}
-            for m in session.get("messages", [])]
+            for m in session.get("messages", [])
+            if not (m.get("role") == "assistant"
+                    and not str(m.get("content") or "").strip())]
     an = session.get("authors_note", "")
     if an:
         # depth-targeted injection: N messages from the end beats the system
