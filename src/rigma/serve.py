@@ -61,7 +61,10 @@ K_ERROR = 8             # consecutive all-error turns before "stalled"
 K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
 M_FROZEN = 2            # consecutive frozen turns before "frozen"
 T_REMIND_SECS = 600     # (unused directly; cadence is turn-based below)
-K_REMIND = 5            # a full Core Directive Reminder every N turns
+K_REMIND = 8            # anti-restart checkpoint every N turns. The mission is
+                        # pinned in the system prompt every turn, so this exists
+                        # only to say "keep going, here's what's done" — every
+                        # injected token is prefill cost on a slow local model
 MAX_EXTERNAL = 50       # paid/external tool-call cap per run (ask_gemini/http)
 _EXTERNAL_TOOLS = {"ask_gemini", "http_request"}
 
@@ -1151,7 +1154,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return ("New mission — do NOT execute yet. First call manage_plan("
                     "action='add', task='…') 3–5 times to break the mission into "
                     "concrete, verifiable steps. Then start working through them.")
-        plan = _runs.plan_summary(rid)
+        nxt = _runs.next_pending(rid) or "(no pending steps — verify and finish)"
         last = _last_trace(session)
         # called it but didn't do it: name the gap instead of a generic nudge
         if last and all(t.get("name") in _BOOKKEEPING_TOOLS for t in last):
@@ -1160,14 +1163,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "perform the actual work with a real tool (write_file / "
                     "run_python / read_file / view_images) and produce the "
                     "artifact. Do not touch manage_plan or log_progress until "
-                    f"the work exists. Pending plan: {plan}.")
+                    f"the work exists. Continue with: {nxt}")
         base = _dynamic_line(last)
-        if run.get("iteration", 0) % K_REMIND == 0:   # full reminder cadence
-            return ("CORE DIRECTIVE REMINDER — Mission: " + run["mission"] +
-                    f"\nPending plan: {plan}\nRecent progress:\n"
-                    + (_runs.get_log_tail(rid, 3) or "(none yet)") + "\n" + base +
-                    " Call task_complete only when the WHOLE mission is done.")
-        return base + f"  Pending plan: {plan}."
+        if run.get("iteration", 0) % K_REMIND == 0:
+            # Periodic checkpoint. Deliberately does NOT restate the mission:
+            # it is already pinned in the system prompt every single turn, and
+            # re-injecting it as a user message reads to a small model like a
+            # NEW instruction — it restarts from phase 1 (owner hit exactly
+            # this). Anchor on what is DONE + the ONE next step instead.
+            done = _runs.done_summary(rid)
+            return ("CHECKPOINT — you are MID-RUN. Do NOT start over and do NOT "
+                    "redo finished work.\n"
+                    + (f"Already done: {done}\n" if done else "")
+                    + f"Your next step: {nxt}\n" + base)
+        return base + f"  Next: {nxt}"
 
     def _sse_parse(chunk: bytes):
         """(event, obj) for one SSE chunk; ('', None) when there's no JSON body."""
