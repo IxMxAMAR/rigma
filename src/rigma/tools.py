@@ -738,10 +738,17 @@ def _edit_file(args, ctx):
 
 @tool("read_file",
       "Read a text file. Accepts an ABSOLUTE path or one relative to the "
-      "workspace. Returns up to the first 20000 characters (marked if truncated).",
+      "workspace. Use `offset` (1-indexed line) and `limit` to PAGE THROUGH a "
+      "big file instead of pulling it all in at once — the reply tells you the "
+      "exact offset to pass next.",
       {"type": "object", "properties": {
-          "path": {"type": "string", "description": "path relative to the "
-                   "workspace"}}, "required": ["path"]},
+          "path": {"type": "string", "description": "absolute path, or one "
+                   "relative to the workspace"},
+          "offset": {"type": "integer", "description": "first line to read "
+                     "(1-indexed, default 1)"},
+          "limit": {"type": "integer", "description": "how many lines "
+                    "(default 800, max 2000)"}},
+       "required": ["path"]},
       needs="workspace")
 def _read_file(args, ctx):
     raw = str(args.get("path", ""))
@@ -762,9 +769,37 @@ def _read_file(args, ctx):
     if p.stat().st_size > 400_000:
         return "error: file too large to read"
     text = p.read_text(encoding="utf-8", errors="replace")
-    if len(text) > 20000:
-        return text[:20000] + "\n…(truncated at 20000 chars)"
-    return text
+    lines = text.splitlines()
+    try:
+        offset = max(1, int(args.get("offset", 1) or 1))
+    except (TypeError, ValueError):
+        offset = 1
+    try:
+        limit = max(1, min(int(args.get("limit", 800) or 800), 2000))
+    except (TypeError, ValueError):
+        limit = 800
+    chunk = lines[offset - 1: offset - 1 + limit]
+    if not chunk:
+        return (f"(no lines at offset {offset}; the file has {len(lines)} lines)")
+    body = "\n".join(chunk)
+    clipped = len(body) > 20000               # hard char cap per page
+    if clipped:                               # (one enormous line hits this)
+        body = body[:20000]
+        shown = body.count("\n") + 1
+    else:
+        shown = len(chunk)
+    end = offset - 1 + shown
+    # NEVER truncate silently, and spell out the NEXT call — a weak model will
+    # not infer paging from a schema
+    notes = []
+    if clipped:
+        notes.append("truncated at 20000 chars")
+    if end < len(lines):
+        notes.append(f"lines {offset}-{end} of {len(lines)} — "
+                     f"call read_file with offset={end + 1} to continue")
+    elif offset > 1:
+        notes.append(f"lines {offset}-{end} of {len(lines)} — end of file")
+    return body + ("\n…(" + "; ".join(notes) + ")" if notes else "")
 
 
 @tool("list_directory",
