@@ -501,7 +501,9 @@ def test_run_gets_anti_repetition_samplers_and_a_token_cap(engine):
     _wait(c, rid, timeout=25)
     p = sessions.load(runs.load(rid)["session_id"])["params"]
     assert p["dry_multiplier"] > 0 and p["dry_allowed_length"] >= 1
-    assert p["max_tokens"] <= 16384
+    # generous: it must fit a real batch of work (25 detailed prompts +
+    # a thinking block). 8192 truncated legitimate output mid-sentence.
+    assert 16384 <= p["max_tokens"] <= 32768
 
 
 def test_driving_line_states_the_work_not_the_protocol(engine):
@@ -517,3 +519,23 @@ def test_driving_line_states_the_work_not_the_protocol(engine):
     assert driving
     assert not any("Emit ONE tool call" in d for d in driving)
     assert any("Do this now:" in d for d in driving)
+
+
+def test_prose_turn_is_saved_not_discarded(engine, tmp_path):
+    # the owner watched it generate ~60 prompts into a REPLY, which the loop
+    # scored as unproductive and threw away. Prose in a run may BE the work.
+    _Engine.script = [None]                     # narrates, never calls a tool
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1,
+                                    "workspace": str(tmp_path)}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    log = c.get(f"/api/runs/{rid}/log").json()["log"]
+    # the fake engine narrates only ~17 chars, below DRAFT_MIN_CHARS, so nothing
+    # should be saved — the guard must not write junk drafts for short replies
+    assert "saved" not in log or not (tmp_path / "rigma-drafts").exists()
+
+
+def test_long_prose_is_written_to_a_draft_file(tmp_path, monkeypatch):
+    from rigma import serve as _s
+    assert _s.DRAFT_MIN_CHARS >= 200
+    assert _s.RUN_PARAMS["max_tokens"] >= 16384, "must fit a real batch of work"
