@@ -597,7 +597,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # LEAKING as raw "<tool_call>…" text into the chat — then nudge
                 # the model to answer. Withholding tools here was what leaked
                 # the raw call (owner-reported 2026-07-18).
-                turn_msgs = msgs + [{"role": "system", "content":
+                # role MUST be user, not system: strict templates (this Qwen3
+                # build, line 84) raise on ANY system message that isn't the
+                # first, and llama-server turns that into HTTP 400 "Unable to
+                # generate parser for this template" — which killed real runs.
+                turn_msgs = msgs + [{"role": "user", "content":
                     "You have reached the tool-call limit. Do not call any more "
                     "tools — give your final answer now using what you already "
                     "gathered."}]

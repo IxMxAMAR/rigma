@@ -296,3 +296,20 @@ def test_build_messages_drops_empty_assistant_turns():
     assert all(not (m["role"] == "assistant" and not m["content"].strip())
                for m in out)
     assert [m["role"] for m in out] == ["system", "user", "user", "assistant"]
+
+
+def test_only_the_first_message_is_ever_system():
+    # THE run-killer, three times over. This chat template (and many others)
+    # does: {%- if message.role == "system" %}{%- if not loop.first %}
+    #       {{- raise_exception('System message must be at the beginning.') }}
+    # llama-server surfaces that as HTTP 400 "Unable to generate parser for this
+    # template", which reads like a broken model rather than a bad request.
+    s = {"system_prompt": "SYS", "mission": "M", "notes": "N", "digest": "D",
+         "authors_note": "AN", "authors_note_depth": 1,
+         "messages": [{"role": "user", "content": "a"},
+                      {"role": "assistant", "content": "b"},
+                      {"role": "user", "content": "c"}]}
+    out = sessions.build_messages(s)
+    systems = [i for i, m in enumerate(out) if m["role"] == "system"]
+    assert systems == [0], f"system messages at {systems}, must be [0] only"
+    assert any("Author's note" in str(m["content"]) for m in out)   # still applied
