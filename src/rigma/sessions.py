@@ -112,6 +112,15 @@ def build_messages(session: dict, default_prompt: str = "",
               or (preset or {}).get("system_prompt", "")
               or default_prompt)
     head = [{"role": "system", "content": prompt}] if prompt else []
+    # Autonomous Mode: pin the mission at the top so compaction (which only
+    # summarizes the message history) can never summarize away the objective.
+    mission = session.get("mission", "")
+    if mission:
+        head.insert(0, {"role": "system", "content":
+            "CORE DIRECTIVE — never lose sight of this:\n" + mission +
+            "\n\nYour context is periodically compacted; your plan and progress "
+            "live on disk and are shown to you each step. Do NOT read "
+            "progress.md yourself — the latest steps are provided for you."})
     notes = session.get("notes", "")
     if notes:
         head.append({"role": "system",

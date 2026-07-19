@@ -48,6 +48,20 @@ _COMPACT_PROMPT = (
 AUTO_COMPACT_FRACTION = 0.92
 AUTO_COMPACT_KEEP = 8
 
+# --- Autonomous Mode tunables (see docs/.../autonomous-mode-design.md) ---
+IDLE_SECS = 90.0        # a turn is "frozen" only if it emits NOTHING for this long
+K_ERROR = 8             # consecutive all-error turns before "stalled"
+K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
+M_FROZEN = 2            # consecutive frozen turns before "frozen"
+T_REMIND_SECS = 600     # (unused directly; cadence is turn-based below)
+K_REMIND = 5            # a full Core Directive Reminder every N turns
+MAX_EXTERNAL = 50       # paid/external tool-call cap per run (ask_gemini/http)
+_EXTERNAL_TOOLS = {"ask_gemini", "http_request"}
+
+
+class FrozenTurnError(Exception):
+    """A turn produced no output for IDLE_SECS — the engine is hung."""
+
 
 async def _upstream_error(resp) -> str:
     body = await resp.aread()
@@ -385,13 +399,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 has_vision = "vision" in reg2.models[mdl].capabilities
             except Exception:
                 pass
+            run_id = s.get("run_id", "")
+            run_profile = s.get("run_profile", "all")
             tctx = {"allow_code": bool(s.get("allow_code")),
                     "workspace": s.get("workspace") or str(_Path.home()),
-                    "has_vision": has_vision}
+                    "has_vision": has_vision,
+                    "run_id": run_id, "profile": run_profile}
             specs = toolkit.tool_specs(
                 allow_code=tctx["allow_code"],
                 has_rag=bool(rag.recorded_sidecar_port()),
-                workspace=tctx["workspace"], has_vision=has_vision)
+                workspace=tctx["workspace"], has_vision=has_vision,
+                has_run=bool(run_id), profile=run_profile)
             _sem = asyncio.Semaphore(8)   # cap concurrent tool subprocesses / IO
 
             async def _run_call(name, cargs):
@@ -1054,6 +1072,316 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             gen = _llm_turn(s, cont=bool(body.get("continue")))
         return StreamingResponse(gen, media_type="text/event-stream",
                                  headers=_NO_STORE)
+
+    # ================= Autonomous Mode (Runs) =========================
+    _run_tasks: dict = {}   # run_id -> asyncio.Task (for cancellation)
+
+    def _last_trace(session):
+        for m in reversed((session or {}).get("messages", [])):
+            if m.get("role") == "assistant":
+                return m.get("tool_trace", []) or []
+        return []
+
+    def _turn_sig(trace):
+        return tuple(sorted(
+            (t.get("name", ""), json.dumps(t.get("args", {}), sort_keys=True,
+                                           default=str)) for t in trace))
+
+    def _dynamic_line(trace):
+        if not trace:
+            return "Take a concrete action now — call a tool to advance the plan."
+        errs = [t for t in trace if str(t.get("result", "")).startswith("error")]
+        if errs and len(errs) == len(trace):
+            return (f"Your last tool call failed: {str(errs[-1].get('result',''))[:160]}. "
+                    "Fix it or try a different approach.")
+        names = ", ".join(dict.fromkeys(t.get("name", "") for t in trace))
+        return f"Last step used {names}. Do the next step in your plan."
+
+    def _driving_message(run, session):
+        from . import runs as _runs
+        rid = run["id"]
+        if run.get("steer_queue"):
+            note = run["steer_queue"].pop(0)
+            _runs.save(run)
+            return "USER GUIDANCE — follow this now: " + str(note)
+        if run.get("_verify_pending"):
+            return ("You called task_complete. Before this run can end you MUST "
+                    "VERIFY: use tools (read_file / find_files / run_shell) to "
+                    "confirm EVERY plan item is actually done. If anything is "
+                    "missing, finish it. Only then call task_complete again.")
+        if run.get("iteration", 0) == 0:
+            return ("New mission — do NOT execute yet. First call manage_plan("
+                    "action='add', task='…') 3–5 times to break the mission into "
+                    "concrete, verifiable steps. Then start working through them.")
+        plan = _runs.plan_summary(rid)
+        base = _dynamic_line(_last_trace(session))
+        if run.get("iteration", 0) % K_REMIND == 0:   # full reminder cadence
+            return ("CORE DIRECTIVE REMINDER — Mission: " + run["mission"] +
+                    f"\nPending plan: {plan}\nRecent progress:\n"
+                    + (_runs.get_log_tail(rid, 3) or "(none yet)") + "\n" + base +
+                    " Call task_complete only when the WHOLE mission is done.")
+        return base + f"  Pending plan: {plan}."
+
+    async def _drain_turn(session):
+        """Drain one agentic turn headless with an idle-watchdog: a turn is only
+        frozen if it emits nothing for IDLE_SECS (tolerates slow-but-working
+        generation). aclose swallows BaseException so its cleanup can't clobber
+        the outcome; the call site converts a leaked CancelledError -> frozen."""
+        agen = _llm_turn(session)
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(agen.__anext__(), timeout=IDLE_SECS)
+                except (asyncio.TimeoutError, TimeoutError):
+                    raise FrozenTurnError()
+                except StopAsyncIteration:
+                    return
+        finally:
+            try:
+                await agen.aclose()
+            except BaseException:
+                pass
+
+    async def _run_loop(run_id):
+        import time as _time
+
+        from . import runs as _runs
+        run = _runs.load(run_id)
+        sid = run["session_id"]
+        prev_sig = None
+        try:
+            while True:
+                run = _runs.load(run_id)
+                if run is None or run.get("status") != "running":
+                    if run and run.get("paused"):
+                        await asyncio.sleep(3)
+                        continue
+                    break
+                if run.get("paused"):
+                    await asyncio.sleep(3)
+                    continue
+                over = _runs.budget_exceeded(run)
+                if over:
+                    _runs.set_status(run, "budget_exhausted", over)
+                    break
+                if run.get("error_streak", 0) >= K_ERROR:
+                    _runs.set_status(run, "stalled", "too many tool errors")
+                    break
+                if run.get("lazy_streak", 0) >= K_LAZY:
+                    _runs.set_status(run, "stalled", "no progress / idle")
+                    break
+                session = sessions.load(sid)
+                if session is None:
+                    _runs.set_status(run, "error", "session was deleted")
+                    break
+                session["messages"].append(
+                    {"role": "user", "content": _driving_message(run, session)})
+                sessions.save(session)
+                frozen = False
+                try:
+                    await _drain_turn(session)
+                except FrozenTurnError:
+                    frozen = True
+                except asyncio.CancelledError:
+                    # /stop sets status BEFORE cancelling, so a cancel with the
+                    # run still "running" is the idle-timeout's leaked inner
+                    # cancellation — treat it as a frozen turn, not a stop
+                    if (_runs.load(run_id) or {}).get("status") == "running":
+                        frozen = True
+                    else:
+                        raise
+                except Exception as e:
+                    _runs.set_status(_runs.load(run_id) or run, "error",
+                                     f"turn failed: {str(e)[:200]}")
+                    break
+                run = _runs.load(run_id) or run
+                if frozen:
+                    run["frozen_streak"] = run.get("frozen_streak", 0) + 1
+                    _runs.append_progress(run_id, "(a turn froze — no output)",
+                                          "retry", run.get("workspace", ""))
+                    try:
+                        await _ensure_loaded()   # best-effort engine restart
+                    except Exception:
+                        pass
+                    if run["frozen_streak"] >= M_FROZEN:
+                        _runs.set_status(run, "frozen", "engine unresponsive")
+                        break
+                    run["iteration"] = run.get("iteration", 0) + 1
+                    _runs.save(run)
+                    continue
+                run["frozen_streak"] = 0
+                trace = _last_trace(sessions.load(sid))
+                for t in trace:
+                    _runs.append_action(
+                        run_id, t.get("name"), t.get("args"),
+                        not str(t.get("result", "")).startswith("error"))
+                ext = sum(1 for t in trace if t.get("name") in _EXTERNAL_TOOLS)
+                run["external_calls"] = run.get("external_calls", 0) + ext
+                if (run["external_calls"] >= MAX_EXTERNAL
+                        and session.get("run_profile") != "no-network"):
+                    s3 = sessions.load(sid)
+                    if s3:
+                        s3["run_profile"] = "no-network"
+                        sessions.save(s3)
+                    _runs.append_progress(run_id, "external-API budget reached — "
+                                          "network tools disabled", "continue "
+                                          "offline", run.get("workspace", ""))
+                if any(t.get("name") == "task_complete" for t in trace):
+                    if not run.get("verified_once"):
+                        run.update(verified_once=True, _verify_pending=True,
+                                   error_streak=0, lazy_streak=0)
+                        run["iteration"] = run.get("iteration", 0) + 1
+                        _runs.save(run)
+                        prev_sig = None
+                        continue
+                    summ = next((t.get("args", {}).get("summary", "")
+                                 for t in trace
+                                 if t.get("name") == "task_complete"), "")
+                    run["summary"] = str(summ)[:2000]
+                    _runs.set_status(run, "done", "task_complete (verified)")
+                    break
+                run["_verify_pending"] = False
+                sig = _turn_sig(trace)
+                if not trace:
+                    run["lazy_streak"] = run.get("lazy_streak", 0) + 1
+                elif all(str(t.get("result", "")).startswith("error")
+                         for t in trace):
+                    run["error_streak"] = run.get("error_streak", 0) + 1
+                elif sig == prev_sig:
+                    run["lazy_streak"] = run.get("lazy_streak", 0) + 1
+                else:
+                    run.update(error_streak=0, lazy_streak=0,
+                               last_progress_at=_time.time())
+                prev_sig = sig
+                run["iteration"] = run.get("iteration", 0) + 1
+                _runs.save(run)
+        except asyncio.CancelledError:
+            r = _runs.load(run_id)
+            if r and r.get("status") == "running":
+                _runs.set_status(r, "stopped", "cancelled")
+            raise
+        except Exception as e:
+            r = _runs.load(run_id)
+            if r:
+                _runs.set_status(r, "error", f"loop crashed: {str(e)[:200]}")
+        finally:
+            _run_tasks.pop(run_id, None)
+            s2 = sessions.load(sid)
+            if s2 is not None and s2.get("mission"):
+                s2["mission"] = ""
+                s2["run_id"] = ""
+                sessions.save(s2)
+            r = _runs.load(run_id)
+            if r:
+                try:
+                    _runs.append_progress(
+                        run_id, f"RUN {r.get('status', '?').upper()}: "
+                        + (r.get("summary") or r.get("halt_reason", "")),
+                        "(run ended)", r.get("workspace", ""))
+                except Exception:
+                    pass
+
+    @app.post("/api/runs")
+    async def start_run(body: dict):
+        from . import runs as _runs
+        s = st.server_running()
+        if s is None or s.get("unloaded"):
+            return JSONResponse({"error": "no model is loaded — load one first"},
+                                status_code=409)
+        if _runs.active() is not None:
+            return JSONResponse({"error": "a run is already active — stop it first"},
+                                status_code=409)
+        mission = str((body or {}).get("mission", "")).strip()
+        if not mission:
+            return JSONResponse({"error": "mission is required"}, status_code=400)
+        profile = (body or {}).get("profile", "all")
+        workspace = str((body or {}).get("workspace", "")).strip()
+        sess = sessions.create(title="🤖 " + mission[:32])
+        sess.update(use_tools=True, allow_code=True, auto_compact=True,
+                    workspace=workspace, mission=mission,
+                    run_profile=profile if profile in _runs.PROFILES else "all")
+        run = _runs.create(mission, sess["id"], workspace=workspace,
+                           profile=profile,
+                           budget_hours=float((body or {}).get("budget_hours", 8)))
+        sess["run_id"] = run["id"]
+        sessions.save(sess)
+        _run_tasks[run["id"]] = asyncio.create_task(_run_loop(run["id"]))
+        return run
+
+    @app.get("/api/runs/active")
+    async def active_run():
+        from . import runs as _runs
+        r = _runs.active()
+        if r is None:
+            return {}
+        r["log_tail"] = _runs.get_log_tail(r["id"], 8)
+        r["plan"] = _runs.read_plan(r["id"])
+        return r
+
+    @app.get("/api/runs/{rid}")
+    async def get_run(rid: str):
+        from . import runs as _runs
+        r = _runs.load(rid)
+        if r is None:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        r["log_tail"] = _runs.get_log_tail(rid, 12)
+        r["plan"] = _runs.read_plan(rid)
+        return r
+
+    @app.get("/api/runs/{rid}/log")
+    async def get_run_log(rid: str):
+        from . import runs as _runs
+        try:
+            return {"log": (_runs.run_dir(rid) / "progress.md").read_text(
+                encoding="utf-8")}
+        except Exception:
+            return {"log": ""}
+
+    @app.post("/api/runs/{rid}/stop")
+    async def stop_run(rid: str):
+        from . import runs as _runs
+        r = _runs.load(rid)
+        if r is None:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        task = _run_tasks.get(rid)
+        if task:
+            task.cancel()
+        if r.get("status") in ("running", "paused"):
+            _runs.set_status(r, "stopped", "stopped by user")
+        return _runs.load(rid)
+
+    @app.post("/api/runs/{rid}/pause")
+    async def pause_run(rid: str):
+        from . import runs as _runs
+        r = _runs.load(rid)
+        if r is None:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        r["paused"] = True
+        _runs.save(r)
+        return r
+
+    @app.post("/api/runs/{rid}/resume")
+    async def resume_run(rid: str):
+        from . import runs as _runs
+        r = _runs.load(rid)
+        if r is None:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        r["paused"] = False
+        _runs.save(r)
+        return r
+
+    @app.post("/api/runs/{rid}/inject")
+    async def inject_run(rid: str, body: dict):
+        from . import runs as _runs
+        r = _runs.load(rid)
+        if r is None:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        note = str((body or {}).get("message", "")).strip()
+        if not note:
+            return JSONResponse({"error": "message required"}, status_code=400)
+        r.setdefault("steer_queue", []).append(note)
+        _runs.save(r)
+        return {"queued": True}
 
     @app.on_event("startup")
     async def _keepalive_task():
