@@ -56,7 +56,7 @@ PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big co
 TICK_SECS = 5.0         # how often a waiting turn reports "still working" to the UI
 LIVE_MAX = 80           # rolling live-activity entries kept on a run for the UI
 # bookkeeping ≠ work: these move no real work forward on their own
-_BOOKKEEPING_TOOLS = {"manage_plan", "log_progress", "task_complete"}
+_BOOKKEEPING_TOOLS = {"manage_plan", "task_complete"}
 K_ERROR = 8             # consecutive all-error turns before "stalled"
 K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
 M_FROZEN = 2            # consecutive frozen turns before "frozen"
@@ -87,8 +87,8 @@ AGENT_SYSTEM_PROMPT = (
     "break the mission into concrete, verifiable steps.\n"
     "2. Otherwise DO the next pending step with the right tool (read_file, "
     "write_file, run_shell, run_python, find_files, view_images, web_search, …).\n"
-    "3. After a real step, call `log_progress(done=\"…\", next=\"…\")` and "
-    "`manage_plan(action=\"complete\", id=N)`.\n"
+    "3. After a real step, call `manage_plan(action=\"complete\", id=N)`. Your "
+    "progress log is written for you automatically — never narrate it.\n"
     "4. Only when the WHOLE mission is genuinely finished, call "
     "`task_complete(summary=\"…\")` — you will be asked to verify with tools.\n\n"
     "NEVER SPEND TOOL CALLS FINDING YOUR PLACE. Every turn you are already told "
@@ -1187,8 +1187,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "what you will do is not doing it. RIGHT NOW, in this turn, "
                     "perform the actual work with a real tool (write_file / "
                     "run_python / read_file / view_images) and produce the "
-                    "artifact. Do not touch manage_plan or log_progress until "
-                    f"the work exists. Continue with: {nxt}")
+                    "artifact. Do not touch manage_plan until the work exists. "
+                    f"Continue with: {nxt}")
         base = _dynamic_line(last)
         if run.get("iteration", 0) % K_REMIND == 0:
             # Periodic checkpoint. Deliberately does NOT restate the mission:
@@ -1471,6 +1471,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _runs.append_action(
                         run_id, t.get("name"), t.get("args"),
                         not str(t.get("result", "")).startswith("error"))
+                    _runs.log_tool_action(run_id, t.get("name"), t.get("args"),
+                                          str(t.get("result", "")),
+                                          run.get("workspace", ""))
                 # Carry the RESULT forward. build_messages() sanitises messages
                 # to role/content, so tool_trace (where results live) never
                 # re-enters context — across turns the model cannot see what any
