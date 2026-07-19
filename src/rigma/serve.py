@@ -475,10 +475,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # feed results back and stream again; otherwise this round is the answer
         # per-turn tool-call ceiling: a safety backstop against runaway loops,
         # NOT a feature limit — session-configurable (default 25), clamped sane
+        # ONE ACTION PER TURN for autonomous runs: every action returns to the
+        # outer loop so it can be scored, logged, steered and interrupted. The
+        # inner multi-round loop left the model unsupervised for entire hours
+        # (owner saw `iter 1` after a full run; 50 tool calls in one turn).
+        one_action = bool(s.get("one_action"))
         max_rounds = (max(1, min(int(s.get("max_tool_rounds") or 50), 100))
                       if use_tools else 1)
         for _round in range(max_rounds):
-            last = _round == max_rounds - 1
+            # `last` MUST stay False in one-action mode: tool calls are only
+            # executed when `not last` (see the tool block below), so treating
+            # round 0 as last would DROP the action instead of running it.
+            last = (_round == max_rounds - 1) and not one_action
             turn_msgs = msgs
             if use_tools and last:
                 # final round: KEEP tools advertised so a stray tool call is
@@ -620,12 +628,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             content.append({"type": "image_url",
                                             "image_url": {"url": u}})
                         msgs.append({"role": "user", "content": content})
+                if one_action:
+                    text = rtext               # keep any narration with the action
+                    break                      # ONE action: end the turn here
                 continue                       # stream the next round
             text = rtext                       # no tool calls -> this is final
             break
         # hit the tool-call ceiling still mid-task with no final answer? never
         # finish silently — give the user something and a clear way to resume
-        if use_tools and not failed and not text.strip() and trace:
+        # In one-action mode stopping after a single call is NORMAL, not a
+        # ceiling — the notice would otherwise fire on every single action.
+        if (use_tools and not failed and not text.strip() and trace
+                and not one_action):
             text = (
                 # in a run there is no user to say "keep going" — the loop just
                 # continues, so tell the model that instead of stranding it
@@ -1562,7 +1576,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         sess.update(use_tools=True, allow_code=True, auto_compact=True,
                     workspace=workspace, mission=mission,
                     system_prompt=AGENT_SYSTEM_PROMPT,   # agent role, not chat
-                    effort=effort,
+                    effort=effort, one_action=True,
                     run_profile=profile if profile in _runs.PROFILES else "all")
         run = _runs.create(mission, sess["id"], workspace=workspace,
                            profile=profile,
