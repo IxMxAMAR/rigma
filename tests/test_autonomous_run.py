@@ -126,6 +126,7 @@ def test_run_stalls_on_pure_narration(engine):
 
 def test_run_freezes_when_engine_hangs(engine, monkeypatch):
     monkeypatch.setattr(serve, "IDLE_SECS", 0.2)
+    monkeypatch.setattr(serve, "PREFILL_SECS", 0.2)   # first-token budget too
     monkeypatch.setattr(serve, "M_FROZEN", 2)
     _Engine.hang = True
     _Engine.script = [("manage_plan", {"action": "add", "task": "x"})]
@@ -133,6 +134,34 @@ def test_run_freezes_when_engine_hangs(engine, monkeypatch):
     rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
     r = _wait(c, rid)
     assert r["status"] == "frozen"
+
+
+def test_prefill_budget_tolerates_slow_first_token(engine, monkeypatch):
+    # a slow first token (prefill) must NOT be read as frozen when it lands
+    # within PREFILL_SECS, even though it exceeds the inter-token IDLE_SECS
+    monkeypatch.setattr(serve, "IDLE_SECS", 0.1)
+    monkeypatch.setattr(serve, "PREFILL_SECS", 2.0)
+    _Engine.delay = 0.4                                # > IDLE_SECS, < PREFILL_SECS
+    _Engine.script = [("task_complete", {"summary": "quick win"}),
+                      ("task_complete", {"summary": "quick win"})]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid)
+    assert r["status"] == "done"                       # not "frozen"
+
+
+def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
+    # model goes quiet (no tools) past the lazy threshold, then — when given the
+    # completion ultimatum — calls task_complete. The run must end DONE, not stalled.
+    monkeypatch.setattr(serve, "K_LAZY", 3)
+    _Engine.script = [None, None, None,               # 3 idle turns -> would stall
+                      ("task_complete", {"summary": "all done"}),
+                      ("task_complete", {"summary": "all done"})]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid)
+    assert r["status"] == "done"
+    assert r["verified_once"] is True
 
 
 def test_second_run_refused_while_active(engine):
