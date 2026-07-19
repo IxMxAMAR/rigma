@@ -1249,17 +1249,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _runs.append_action(run_id, "(engine)", turn_err, False)
                     low = turn_err.lower()
                     if "parser" in low or "template" in low:
-                        # FATAL and unrecoverable: this model's chat template
-                        # can't do tool calling, so EVERY turn will 400 the same
-                        # way — fail fast with a clear, actionable reason
+                        # FATAL and unrecoverable within a run: the engine can't
+                        # build a tool-call parser for this request, so every
+                        # turn 400s identically — fail fast instead of burning
+                        # the retry budget. Point at the log, not the model:
+                        # the usual cause is a request the template rejects
+                        # (e.g. a strict template that forbids >1 system block).
                         _runs.append_progress(
                             run_id, "FATAL ENGINE ERROR: " + turn_err,
-                            "this model's chat template does not support tool "
-                            "calling — load a model with a standard template "
-                            "(e.g. the official qwen3.6-35b-a3b)",
+                            "the engine rejected the chat template while building "
+                            "the tool-call parser — see the llama-server log; if "
+                            "this persists, try a model with a standard template",
                             run.get("workspace", ""))
-                        _runs.set_status(run, "error", "model's template can't do "
-                                         "tool calling — switch models")
+                        _runs.set_status(run, "error", "engine could not build a "
+                                         "tool-call parser for this template")
                         break
                     run["error_streak"] = run.get("error_streak", 0) + 1
                     _runs.append_progress(run_id, "ENGINE ERROR: " + turn_err,

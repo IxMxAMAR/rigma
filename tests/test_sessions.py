@@ -64,6 +64,22 @@ def test_build_messages_no_prompt_at_all():
     assert sessions.build_messages(s) == [{"role": "user", "content": "hi"}]
 
 
+def test_build_messages_coalesces_system_blocks():
+    # mission + prompt + notes + digest must produce EXACTLY ONE system message
+    # at the head — strict templates (Qwen3) raise on a second system message.
+    s = {"system_prompt": "be an agent", "mission": "ship the thing",
+         "notes": "canon here", "digest": "earlier chat",
+         "messages": [{"role": "user", "content": "go"}]}
+    out = sessions.build_messages(s)
+    systems = [m for m in out if m["role"] == "system"]
+    assert len(systems) == 1                       # not four
+    assert out[0]["role"] == "system"
+    c = out[0]["content"]
+    assert c.index("CORE DIRECTIVE") < c.index("be an agent") < c.index("earlier chat")
+    assert "ship the thing" in c and "canon here" in c
+    assert out[-1] == {"role": "user", "content": "go"}
+
+
 def _fake_reg(**prompts):
     return Registry([], {}, {}, {k: UseCase(name=k, system_prompt=v)
                                  for k, v in prompts.items()})
@@ -127,14 +143,15 @@ def test_build_messages_preset_layer():
     assert sessions.build_messages(s, "DEFAULT")[0]["content"] == "DEFAULT"
 
 
-def test_build_messages_notes_second_system_message():
+def test_build_messages_notes_folded_into_single_system():
     s = {"system_prompt": "SYS", "notes": "The dragon is named Ember.",
          "messages": [{"role": "user", "content": "hi"}]}
     out = sessions.build_messages(s)
-    assert out[0] == {"role": "system", "content": "SYS"}
-    assert out[1]["role"] == "system"
-    assert out[1]["content"].startswith("Story notes (authoritative):")
-    assert "Ember" in out[1]["content"] and out[2]["content"] == "hi"
+    systems = [m for m in out if m["role"] == "system"]
+    assert len(systems) == 1                       # one block, not two
+    assert out[0]["content"].startswith("SYS")
+    assert "Story notes (authoritative):" in out[0]["content"]
+    assert "Ember" in out[0]["content"] and out[1]["content"] == "hi"
 
 
 def test_build_messages_sanitizes_to_role_content():
@@ -205,11 +222,12 @@ def test_build_messages_injects_digest_after_notes():
     s = {"system_prompt": "SYS", "notes": "N", "digest": "Earlier: dragons.",
          "messages": [{"role": "user", "content": "hi"}]}
     out = sessions.build_messages(s)
-    assert out[0]["content"] == "SYS"
-    assert out[1]["content"].startswith("Story notes")
-    assert out[2]["role"] == "system"
-    assert out[2]["content"] == "Earlier conversation (compacted):\nEarlier: dragons."
-    assert out[3]["content"] == "hi"
+    systems = [m for m in out if m["role"] == "system"]
+    assert len(systems) == 1                        # coalesced, order preserved
+    c = out[0]["content"]
+    assert c.index("SYS") < c.index("Story notes") < c.index("Earlier conversation")
+    assert "Earlier: dragons." in c
+    assert out[1]["content"] == "hi"
 
 
 def test_mutable_fields_has_digest_not_archive():
