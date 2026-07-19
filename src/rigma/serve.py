@@ -1201,14 +1201,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "redo finished work.\n"
                     + (f"Already done: {done}\n" if done else "")
                     + f"Your next step: {nxt}\n" + base)
-        # Position on EVERY turn. Without it the model burns whole turns
-        # re-orienting — listing dirs, hunting for progress.md — instead of
-        # working. A few tokens here is far cheaper than a wasted turn.
+        # Fires on EVERY action now, so it stays one short line — each token is
+        # prefill cost on a slow local model. The previous "Last: <log line>"
+        # echo is gone: the actual TOOL RESULT is carried into context directly,
+        # which is better continuity than a summary of it.
         d, tot = _runs.plan_counts(rid)
-        recent = (_runs.get_log_tail(rid, 1) or "").strip()
-        return (base + f"  [{d}/{tot} steps done]"
-                + (f" Last: {recent[-160:]}" if recent else "")
-                + f"  Next: {nxt}")
+        return (f"[{d}/{tot} done] Next: {nxt}. "
+                "Emit ONE tool call that advances it. Do not re-orient, do not "
+                "narrate, do not repeat your last call.")
 
     def _sse_parse(chunk: bytes):
         """(event, obj) for one SSE chunk; ('', None) when there's no JSON body."""
