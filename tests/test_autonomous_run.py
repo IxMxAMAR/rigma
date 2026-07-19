@@ -176,6 +176,23 @@ def test_slow_turn_reports_heartbeat(engine, monkeypatch):
     assert r.get("waiting_secs", 0) == 0  # cleared when the turn ended
 
 
+def test_activity_feed_records_tool_calls(engine):
+    # the UI must be able to show WHAT the model is doing, not just "(waiting…)"
+    # last entry is None (narrate) so the fake engine stops looping tools once
+    # the script is exhausted — otherwise one turn floods the rolling window
+    _Engine.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid)                       # ends stalled; we're testing the feed
+    acts = r.get("activity") or []
+    assert acts, "activity feed must be populated"
+    tools_seen = [a["text"] for a in acts if a["kind"] == "tool"]
+    assert any("manage_plan" in t for t in tools_seen), f"activity={acts}"
+    assert any("action=add" in t for t in tools_seen)   # args shown, not just name
+    assert any(a["kind"] == "result" for a in acts)     # results shown too
+    assert any(a["kind"] == "say" for a in acts)        # and plain model text
+
+
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.
