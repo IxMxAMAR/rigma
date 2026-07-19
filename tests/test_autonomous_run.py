@@ -245,6 +245,25 @@ def test_checkpoint_never_restates_the_mission(engine, monkeypatch):
     assert mission in sessions.build_messages(live)[0]["content"]
 
 
+def test_one_action_mode_executes_exactly_one_tool_then_ends(engine):
+    # one action per turn: the tool MUST still run. A naive max_tool_rounds=1
+    # makes round 0 "last", and tool calls are only executed when NOT last —
+    # that would silently drop every action.
+    from rigma import sessions
+    _Engine.script = [("manage_plan", {"action": "add", "task": "alpha"}),
+                      ("manage_plan", {"action": "add", "task": "beta"})]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    sess = sessions.load(r["session_id"])
+    assert sess is not None
+    traces = [m.get("tool_trace") or [] for m in sess["messages"]
+              if m.get("role") == "assistant"]
+    assert traces, "at least one assistant turn was persisted"
+    assert all(len(t) <= 1 for t in traces), f"turn ran multiple actions: {traces}"
+    assert len(r["plan"]) >= 1, "tool call was dropped instead of executed"
+
+
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.
