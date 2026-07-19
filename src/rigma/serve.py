@@ -52,8 +52,12 @@ AUTO_COMPACT_FRACTION = 0.92
 # penalises the repeated n-grams that make up such a loop, and the token cap
 # guarantees a runaway turn ENDS so the loop can score it and nudge, instead of
 # grinding for minutes. The user's own params always win.
+# max_tokens must fit REAL work (25 detailed prompts + a thinking block), not
+# just bound a loop — 8192 truncated legitimate output mid-sentence. DRY is what
+# breaks repetition loops; this is only a runaway backstop.
 RUN_PARAMS = {"dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2,
-              "repeat_penalty": 1.05, "max_tokens": 8192}
+              "repeat_penalty": 1.05, "max_tokens": 20000}
+DRAFT_MIN_CHARS = 400   # prose this long in a run is WORK — never discard it
 MAX_COMPLETION_CHALLENGES = 2   # refuse a premature task_complete at most
                                 # twice, so a bad plan can't trap the run
 SPILL_CHARS = 12000     # above this a tool result goes to DISK, not context
@@ -1310,6 +1314,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             note = run["steer_queue"].pop(0)
             _runs.save(run)
             return "USER GUIDANCE — follow this now: " + str(note)
+        saved = run.pop("_draft_saved", "")
+        if saved:
+            _runs.save(run)
+            return ("Your last reply was PROSE. In this mode a reply reaches "
+                    "nobody — only files persist. I saved that text to "
+                    f"{saved} so it isn't lost.\n"
+                    "From now on put every deliverable in a file with "
+                    "write_file(path=..., content=...). Continue the mission "
+                    "from where that draft stopped — do not start over.")
         if run.pop("_challenge_pending", False):
             _runs.save(run)
             pend = _runs.pending_tasks(rid)
@@ -1710,6 +1723,33 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _runs.set_status(run, "done", "task_complete (verified)")
                     break
                 run["_verify_pending"] = False
+                # A turn that produced PROSE instead of a tool call is scored as
+                # unproductive — but the prose may BE the work (the owner watched
+                # it write ~60 prompts into a reply that was then discarded).
+                # Save it, tell the model where it went, and let it carry on.
+                if not trace:
+                    said = ""
+                    for m in reversed((sessions.load(sid) or {}).get("messages", [])):
+                        if m.get("role") == "assistant":
+                            said = str(m.get("content") or "")
+                            break
+                    if len(said.strip()) >= DRAFT_MIN_CHARS:
+                        try:
+                            from pathlib import Path as _P
+                            ws = _P(run.get("workspace")
+                                    or _P.home()) / "rigma-drafts"
+                            ws.mkdir(parents=True, exist_ok=True)
+                            dpath = ws / f"draft-{run.get('iteration', 0):03d}.md"
+                            dpath.write_text(said, encoding="utf-8")
+                            run["drafts"] = (run.get("drafts") or []) + [str(dpath)]
+                            run["_draft_saved"] = str(dpath)
+                            _runs.append_progress(
+                                run_id, f"reply was prose, not a tool call — "
+                                f"saved {len(said)} chars to {dpath.name}",
+                                "tell it to write deliverables with write_file",
+                                run.get("workspace", ""))
+                        except Exception:
+                            pass
                 sig = _turn_sig(trace)
                 # Bookkeeping is not work. A turn that only ticks plan items and
                 # logs "done: X" while producing NO artifact must NOT reset the
