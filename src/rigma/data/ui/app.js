@@ -526,6 +526,15 @@ function chatTurn(message, opts) {
         tps.textContent = d.predicted_per_second.toFixed(1) + " tok/s";
       renderCtxBar();
     },
+    compacted(d) {
+      const note = document.createElement("div");
+      note.className = "sys-note";
+      const n = d.archived || 0;
+      note.textContent = "✦ auto-compacted " + n + " older message" +
+        (n === 1 ? "" : "s") + " to free context";
+      log.appendChild(note);
+      log.scrollTop = log.scrollHeight;
+    },
     async done(aborted) {
       clearInterval(pendingTimer);
       bot.classList.remove("streaming");
@@ -948,7 +957,15 @@ function renderAll() {
   renderCtxBar();
   $("use-rag").checked = !!(current && current.use_rag);
   document.body.classList.toggle("rag-on", !!(current && current.use_rag));
+  $("auto-compact-toggle").checked = !current || current.auto_compact !== false;
 }
+$("auto-compact-toggle").addEventListener("change", async (e) => {
+  if (!current) return;
+  try {
+    current = await api("POST", "/api/sessions/" + current.id,
+                        {auto_compact: e.target.checked});
+  } catch { e.target.checked = current.auto_compact !== false; }
+});
 (async function boot() {
   await loadStatus();
   await loadPresets();

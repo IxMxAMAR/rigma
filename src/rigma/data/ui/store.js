@@ -112,6 +112,8 @@ function streamTurn(sessionId, payload, handlers) {
             handlers.tool && handlers.tool(d);
           else if (ev.event === "tool_result")
             handlers.toolResult && handlers.toolResult(d);
+          else if (ev.event === "compacted")
+            handlers.compacted && handlers.compacted(d);
           else if (d.delta) handlers.delta && handlers.delta(d.delta);
         }
       }

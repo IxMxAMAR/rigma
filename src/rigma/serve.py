@@ -43,6 +43,11 @@ _COMPACT_PROMPT = (
     "established facts and decisions, tone/style commitments, and open threads. "
     "Write plain prose, no preamble, under 300 words.")
 
+# auto-compact: when a turn leaves the window this full, summarize older messages
+# so the NEXT turn starts small. Keep the most recent N verbatim.
+AUTO_COMPACT_FRACTION = 0.92
+AUTO_COMPACT_KEEP = 8
+
 
 async def _upstream_error(resp) -> str:
     body = await resp.aread()
@@ -256,21 +261,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         sessions.save(s)
         return s
 
-    @app.post("/api/sessions/{sid}/compact")
-    async def compact_session(sid: str, body: dict | None = None):
-        s = sessions.load(sid)
-        if s is None:
-            return JSONResponse({"error": "no such session"}, status_code=404)
-        try:
-            keep = max(0, int((body or {}).get("keep", 6)))
-        except (TypeError, ValueError):
-            return JSONResponse({"error": "keep: must be an integer"},
-                                status_code=400)
+    async def _compact(s: dict, keep: int):
+        """Summarize all but the last `keep` messages into `s["digest"]`, move
+        them to `s["archive"]` (never destroyed), save. Returns (session,
+        archived_count), or None if there was nothing to compact. Raises on a
+        summarizer failure. Shared by the manual endpoint and auto-compact."""
         msgs = s.get("messages", [])
         old = msgs[:-keep] if keep else list(msgs)
         recent = msgs[-keep:] if keep else []
         if not old:
-            return JSONResponse({"error": "nothing to compact"}, status_code=400)
+            return None
         parts = []
         if s.get("digest"):
             parts.append("Previous summary:\n" + s["digest"])
@@ -281,25 +281,41 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     p.get("text", "") if p.get("type") == "text" else "[image]"
                     for p in content if isinstance(p, dict))
             parts.append(f"{m.get('role', 'user')}: {content}")
-        try:
-            resp = await client.post(
-                "/v1/chat/completions",
-                json={"messages": [{"role": "user", "content":
-                                    _COMPACT_PROMPT + "\n\n" + "\n".join(parts)}],
-                      "stream": False, "temperature": 0.3},
-                timeout=120.0)
-            if resp.status_code != 200:
-                raise RuntimeError(await _upstream_error(resp))
-            digest = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-            if not digest:
-                raise RuntimeError("summarizer returned an empty digest")
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=502)
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content":
+                                _COMPACT_PROMPT + "\n\n" + "\n".join(parts)}],
+                  "stream": False, "temperature": 0.3},
+            timeout=120.0)
+        if resp.status_code != 200:
+            raise RuntimeError(await _upstream_error(resp))
+        digest = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        if not digest:
+            raise RuntimeError("summarizer returned an empty digest")
         s["digest"] = digest
         s["archive"] = s.get("archive", []) + old   # nothing is ever destroyed
         s["messages"] = recent
         sessions.save(s)
-        return {"session": s, "archived": len(old)}
+        return s, len(old)
+
+    @app.post("/api/sessions/{sid}/compact")
+    async def compact_session(sid: str, body: dict | None = None):
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        try:
+            keep = max(0, int((body or {}).get("keep", 6)))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "keep: must be an integer"},
+                                status_code=400)
+        try:
+            result = await _compact(s, keep)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+        if result is None:
+            return JSONResponse({"error": "nothing to compact"}, status_code=400)
+        sess, archived = result
+        return {"session": sess, "archived": archived}
 
     @app.delete("/api/sessions/{sid}")
     async def delete_session(sid: str):
@@ -565,6 +581,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 s["messages"].append(msg)
             sessions.save(s)
             _bump_stats(timings)
+            # auto-compact when the window is nearly full, so the NEXT turn
+            # starts small (reactive; uses the engine's real prompt_tokens)
+            ptoks = usage.get("prompt_tokens") or 0
+            wctx = (st.read_state() or {}).get("ctx", 0)
+            if (s.get("auto_compact", True) and ptoks and wctx
+                    and ptoks >= AUTO_COMPACT_FRACTION * wctx
+                    and len(s.get("messages", [])) > AUTO_COMPACT_KEEP):
+                try:
+                    r = await _compact(s, AUTO_COMPACT_KEEP)
+                    if r:
+                        yield _sse({"archived": r[1]}, event="compacted")
+                except Exception:
+                    pass   # a summariser hiccup must never break the chat
         yield b"data: [DONE]\n\n"
 
     @app.get("/api/server")
