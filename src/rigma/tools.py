@@ -88,6 +88,45 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
         return f"error running {name}: {e}"
 
 
+# --- short-TTL cache for idempotent read-only tools ---------------------------
+import time as _time  # noqa: E402
+
+_CACHEABLE = {"web_search", "fetch_url"}   # no side effects, no auth
+_CACHE_TTL = 300.0
+_CACHE_MAX = 128
+_cache: dict = {}   # key -> (expiry_monotonic, result)
+
+
+def _is_cacheable(name: str, args: dict) -> bool:
+    if name in _CACHEABLE:
+        return True
+    # http_request only when it's a plain GET with no custom headers
+    if name == "http_request":
+        a = args or {}
+        return (str(a.get("method", "GET")).upper() == "GET"
+                and not a.get("headers"))
+    return False
+
+
+def cached_run(name: str, args: dict, ctx: dict | None = None) -> str:
+    """run_tool with a short TTL cache for idempotent read-only tools — a
+    repeated identical web_search/fetch_url/GET returns instantly. Errors are
+    never cached; everything else runs uncached."""
+    if not _is_cacheable(name, args or {}):
+        return run_tool(name, args, ctx)
+    key = name + ":" + json.dumps(args or {}, sort_keys=True, default=str)
+    now = _time.monotonic()
+    hit = _cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    result = run_tool(name, args, ctx)
+    if not str(result).startswith("error"):   # never cache failures
+        if len(_cache) >= _CACHE_MAX:
+            _cache.clear()                     # cheap bound
+        _cache[key] = (now + _CACHE_TTL, result)
+    return result
+
+
 # ---- safe tools --------------------------------------------------------------
 
 @tool("web_search",

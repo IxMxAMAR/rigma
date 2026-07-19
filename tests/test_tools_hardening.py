@@ -114,3 +114,42 @@ def test_encode_image_data_uri():
     os.unlink(path)
     assert uri.startswith("data:image/")
     assert "base64," in uri
+
+
+def test_cached_run_serves_repeat_from_cache(monkeypatch):
+    tools._cache.clear()
+    n = {"c": 0}
+    monkeypatch.setattr(tools, "run_tool",
+                        lambda *a, **k: (n.__setitem__("c", n["c"] + 1) or "R"))
+    a = tools.cached_run("web_search", {"query": "x"})
+    b = tools.cached_run("web_search", {"query": "x"})
+    assert a == b == "R" and n["c"] == 1          # 2nd served from cache
+
+
+def test_cached_run_skips_noncacheable(monkeypatch):
+    tools._cache.clear()
+    n = {"c": 0}
+    monkeypatch.setattr(tools, "run_tool",
+                        lambda *a, **k: (n.__setitem__("c", n["c"] + 1) or "R"))
+    tools.cached_run("read_file", {"path": "x"})
+    tools.cached_run("read_file", {"path": "x"})
+    assert n["c"] == 2                            # file reads never cached
+
+
+def test_cached_run_never_caches_errors(monkeypatch):
+    tools._cache.clear()
+    n = {"c": 0}
+    monkeypatch.setattr(tools, "run_tool",
+                        lambda *a, **k: (n.__setitem__("c", n["c"] + 1)
+                                         or "error: boom"))
+    tools.cached_run("fetch_url", {"url": "http://x"})
+    tools.cached_run("fetch_url", {"url": "http://x"})
+    assert n["c"] == 2                            # failures aren't cached
+
+
+def test_http_request_get_cacheable_post_not():
+    assert tools._is_cacheable("http_request", {"url": "u"}) is True     # GET
+    assert tools._is_cacheable("http_request", {"url": "u", "method": "POST"}) \
+        is False
+    assert tools._is_cacheable("http_request",
+                               {"url": "u", "headers": {"A": "b"}}) is False

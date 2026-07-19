@@ -190,3 +190,67 @@ def test_runaway_tool_loop_keeps_tools_on_last_round(home, always_upstream):
     reqs = _AlwaysToolUpstream.reqs
     assert len(reqs) == 10                        # bounded at max_rounds
     assert all(reqs)                              # EVERY round advertised tools
+
+
+class _MultiToolUpstream(BaseHTTPRequestHandler):
+    """Round 1: emit THREE tool_calls at once. Round 2: answer."""
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        body = json.loads(self.rfile.read(n))
+        has_tool = any(m.get("role") == "tool" for m in body.get("messages", []))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+
+        def sse(o):
+            self.wfile.write(b"data: " + json.dumps(o).encode() + b"\n\n")
+
+        if not has_tool:
+            sse({"choices": [{"delta": {"tool_calls": [
+                {"index": i, "id": f"c{i}", "type": "function",
+                 "function": {"name": "calculator",
+                              "arguments": json.dumps({"expression": f"{i}+1"})}}
+                for i in range(3)]}}]})
+        else:
+            sse({"choices": [{"delta": {"content": "done"}}]})
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def multi_upstream():
+    srv = HTTPServer(("127.0.0.1", 0), _MultiToolUpstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
+
+
+def test_tool_calls_run_in_parallel(home, multi_upstream, monkeypatch):
+    import time
+    from rigma import tools
+    active = {"n": 0, "max": 0}
+    lock = threading.Lock()
+
+    def slow(name, args, ctx=None):
+        with lock:
+            active["n"] += 1
+            active["max"] = max(active["max"], active["n"])
+        time.sleep(0.3)
+        with lock:
+            active["n"] -= 1
+        return "ok"
+
+    monkeypatch.setattr(tools, "run_tool", slow)
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=multi_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    t0 = time.monotonic()
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    dt = time.monotonic() - t0
+    assert r.status_code == 200
+    assert active["max"] >= 2          # ran concurrently, not one-by-one
+    assert dt < 0.75                   # ~1x (0.3s), not 3x (0.9s)
+    assert r.text.count("event: tool_result") == 3
