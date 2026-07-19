@@ -11,7 +11,7 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   "preset_id", "params", "notes", "digest", "effort",
                   "authors_note", "authors_note_depth", "prefill",
                   "use_tools", "allow_code", "workspace", "auto_compact",
-                  "max_tool_rounds")
+                  "max_tool_rounds", "one_action")
 EFFORT_LEVELS = ("", "off", "auto", "on")
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
@@ -41,7 +41,7 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # per-turn agentic tool-call ceiling (safety backstop, not a
                      # feature limit) — big tasks (view 20 images, write files)
                      # need many; raise it for even longer autonomous runs
-                     "max_tool_rounds": 50, "messages": []}
+                     "max_tool_rounds": 50, "one_action": False, "messages": []}
 
 
 def chats_dir() -> Path:
