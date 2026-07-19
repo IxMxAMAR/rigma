@@ -49,7 +49,9 @@ AUTO_COMPACT_FRACTION = 0.92
 AUTO_COMPACT_KEEP = 8
 
 # --- Autonomous Mode tunables (see docs/.../autonomous-mode-design.md) ---
-IDLE_SECS = 90.0        # a turn is "frozen" only if it emits NOTHING for this long
+IDLE_SECS = 90.0        # inter-token idle: frozen only if the stream STALLS this long
+PREFILL_SECS = 420.0    # first-token budget: prefill on a big context / slow GPU can
+                        # take minutes — don't misread slow prefill as a frozen turn
 K_ERROR = 8             # consecutive all-error turns before "stalled"
 K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
 M_FROZEN = 2            # consecutive frozen turns before "frozen"
@@ -1126,6 +1128,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             note = run["steer_queue"].pop(0)
             _runs.save(run)
             return "USER GUIDANCE — follow this now: " + str(note)
+        if run.get("force_completion"):
+            run["force_completion"] = False
+            _runs.save(run)
+            return ("You have stopped making progress. DECIDE NOW:\n"
+                    "• If the ENTIRE mission is complete, call "
+                    "task_complete(summary='…') THIS TURN.\n"
+                    "• If it is NOT complete, take the next concrete action with a "
+                    "tool.\nDo not narrate or repeat yourself — act. This is your "
+                    "last chance before the run is marked incomplete.")
         if run.get("_verify_pending"):
             return ("You called task_complete. Before this run can end you MUST "
                     "VERIFY: use tools (read_file / find_files / run_shell) to "
@@ -1154,15 +1165,25 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         frozen."""
         agen = _llm_turn(session)
         err = None
+        # The generous PREFILL budget covers the slow gaps: the first token of a
+        # turn, a tool that takes a while to run, and the continuation request
+        # that prefills a big context after a tool. A normal token->token gap
+        # uses the tight IDLE budget. Being liberal here only ever prevents a
+        # FALSE freeze; under-budgeting is what kills a working run.
+        expect_prefill = True
         try:
             while True:
                 try:
-                    chunk = await asyncio.wait_for(agen.__anext__(),
-                                                   timeout=IDLE_SECS)
+                    chunk = await asyncio.wait_for(
+                        agen.__anext__(),
+                        timeout=PREFILL_SECS if expect_prefill else IDLE_SECS)
                 except (asyncio.TimeoutError, TimeoutError):
                     raise FrozenTurnError()
                 except StopAsyncIteration:
                     return err
+                # a tool event => a tool is running and/or a continuation is about
+                # to prefill; grant the next wait the generous budget
+                expect_prefill = b"event: tool" in chunk
                 if err is None and b"event: error" in chunk:
                     try:
                         payload = chunk.decode("utf-8", "replace").split(
@@ -1202,8 +1223,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _runs.set_status(run, "stalled", "too many tool errors")
                     break
                 if run.get("lazy_streak", 0) >= K_LAZY:
-                    _runs.set_status(run, "stalled", "no progress / idle")
-                    break
+                    if not run.get("completion_checked"):
+                        # The model may have FINISHED the work but forgotten to
+                        # call task_complete (common — it just goes quiet). Before
+                        # giving up, issue ONE explicit ultimatum to finish cleanly
+                        # (or take the next step). Only stall if it idles again.
+                        run["completion_checked"] = True
+                        run["force_completion"] = True
+                        run["lazy_streak"] = 0
+                        _runs.save(run)
+                    else:
+                        _runs.set_status(run, "stalled", "no progress / idle")
+                        break
                 session = sessions.load(sid)
                 if session is None:
                     _runs.set_status(run, "error", "session was deleted")
@@ -1312,6 +1343,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     run["lazy_streak"] = run.get("lazy_streak", 0) + 1
                 else:
                     run.update(error_streak=0, lazy_streak=0,
+                               completion_checked=False,
                                last_progress_at=_time.time())
                 prev_sig = sig
                 run["iteration"] = run.get("iteration", 0) + 1
