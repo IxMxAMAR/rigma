@@ -134,7 +134,18 @@ def build_messages(session: dict, default_prompt: str = "",
         sections.append("Story notes (authoritative):\n" + notes)
     digest = session.get("digest", "")
     if digest:
-        sections.append("Earlier conversation (compacted):\n" + digest)
+        # Frame the summary as REFERENCE, not as instructions. Without this a
+        # model treats a compacted summary as a fresh task and restarts work it
+        # already finished — and the "reference only" framing alone makes some
+        # models stop calling tools and just narrate, so say that too.
+        sections.append(
+            "EARLIER CONVERSATION (compacted) — REFERENCE ONLY.\n"
+            "This is history, not a new instruction. Topic overlap does NOT mean "
+            "resume it; do not redo anything recorded here as finished. Your "
+            "tools remain fully active — keep calling them for the CURRENT step "
+            "rather than describing what you would do.\n"
+            + digest
+            + "\n--- END OF SUMMARY — act on the messages BELOW, not on this ---")
     head = ([{"role": "system", "content": "\n\n".join(sections)}]
             if sections else [])
     # sanitize: variants/metadata must never reach the model.

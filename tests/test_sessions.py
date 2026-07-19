@@ -225,8 +225,13 @@ def test_build_messages_injects_digest_after_notes():
     systems = [m for m in out if m["role"] == "system"]
     assert len(systems) == 1                        # coalesced, order preserved
     c = out[0]["content"]
-    assert c.index("SYS") < c.index("Story notes") < c.index("Earlier conversation")
+    assert c.index("SYS") < c.index("Story notes") < c.index("EARLIER CONVERSATION")
     assert "Earlier: dragons." in c
+    # the digest is framed as REFERENCE, not as a fresh instruction — otherwise
+    # the model restarts finished work after a compaction
+    assert "REFERENCE ONLY" in c and "not a new instruction" in c
+    assert "tools remain fully active" in c      # or it narrates instead
+    assert "END OF SUMMARY" in c
     assert out[1]["content"] == "hi"
 
 
