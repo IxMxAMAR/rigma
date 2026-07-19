@@ -186,7 +186,7 @@ def test_run_fails_fast_on_template_parser_error(engine):
     rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
     r = _wait(c, rid)
     assert r["status"] == "error"
-    assert "template" in r["halt_reason"] and "tool" in r["halt_reason"]
+    assert "template" in r["halt_reason"] and "parser" in r["halt_reason"]
     log = c.get(f"/api/runs/{rid}/log").json()["log"]
     assert "FATAL ENGINE ERROR" in log and "generate parser" in log
 

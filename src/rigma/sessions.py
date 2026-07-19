@@ -111,24 +111,32 @@ def build_messages(session: dict, default_prompt: str = "",
     prompt = (session.get("system_prompt")
               or (preset or {}).get("system_prompt", "")
               or default_prompt)
-    head = [{"role": "system", "content": prompt}] if prompt else []
-    # Autonomous Mode: pin the mission at the top so compaction (which only
+    # Coalesce ALL system-role context into ONE leading system message. Many
+    # chat templates (Qwen3 among them) `raise_exception` on any second system
+    # message anywhere in the conversation — emitting separate system blocks
+    # 400s those models ("Unable to generate parser for this template"). This
+    # bit autonomous runs (mission + agent prompt = two blocks) and would bite
+    # any chat post-compaction (a `digest` block would be the second system).
+    sections = []
+    # Autonomous Mode: pin the mission FIRST so compaction (which only
     # summarizes the message history) can never summarize away the objective.
     mission = session.get("mission", "")
     if mission:
-        head.insert(0, {"role": "system", "content":
+        sections.append(
             "CORE DIRECTIVE — never lose sight of this:\n" + mission +
             "\n\nYour context is periodically compacted; your plan and progress "
             "live on disk and are shown to you each step. Do NOT read "
-            "progress.md yourself — the latest steps are provided for you."})
+            "progress.md yourself — the latest steps are provided for you.")
+    if prompt:
+        sections.append(prompt)
     notes = session.get("notes", "")
     if notes:
-        head.append({"role": "system",
-                     "content": "Story notes (authoritative):\n" + notes})
+        sections.append("Story notes (authoritative):\n" + notes)
     digest = session.get("digest", "")
     if digest:
-        head.append({"role": "system",
-                     "content": "Earlier conversation (compacted):\n" + digest})
+        sections.append("Earlier conversation (compacted):\n" + digest)
+    head = ([{"role": "system", "content": "\n\n".join(sections)}]
+            if sections else [])
     # sanitize: variants/metadata must never reach the model
     msgs = [{"role": m.get("role", "user"), "content": m.get("content", "")}
             for m in session.get("messages", [])]
