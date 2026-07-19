@@ -41,7 +41,7 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # per-turn agentic tool-call ceiling (safety backstop, not a
                      # feature limit) — big tasks (view 20 images, write files)
                      # need many; raise it for even longer autonomous runs
-                     "max_tool_rounds": 25, "messages": []}
+                     "max_tool_rounds": 50, "messages": []}
 
 
 def chats_dir() -> Path:
