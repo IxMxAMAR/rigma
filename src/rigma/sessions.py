@@ -165,8 +165,11 @@ def build_messages(session: dict, default_prompt: str = "",
             depth = max(0, int(session.get("authors_note_depth", 3)))
         except (TypeError, ValueError):
             depth = 3
+        # role MUST be user: a system message anywhere but position 0 makes
+        # strict templates raise, which llama-server reports as HTTP 400
+        # "Unable to generate parser for this template"
         msgs.insert(max(0, len(msgs) - depth),
-                    {"role": "system", "content": f"[Author's note: {an}]"})
+                    {"role": "user", "content": f"[Author's note: {an}]"})
     return head + msgs
 
 
