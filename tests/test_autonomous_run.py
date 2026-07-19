@@ -174,4 +174,5 @@ def test_run_session_uses_agent_system_prompt(engine):
     s = sessions.load(runs.load(rid)["session_id"])
     assert "AUTONOMOUS AGENT" in s["system_prompt"]   # not the chat default
     assert "call at least one tool" in s["system_prompt"].lower()
+    assert s["effort"] == "off"                        # act, don't <think> in circles
     assert runs.load(rid)["mission"] == "do stuff"    # mission kept on the run
