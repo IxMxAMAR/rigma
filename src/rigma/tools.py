@@ -980,8 +980,17 @@ def _sample_files(args, ctx):
     if not hits:
         return f"no files match '{pat}' in {p}"
     picked = sorted(random.sample(hits, min(n, len(hits))), key=lambda x: x.name)
+    rid = ctx.get("run_id")
+    if rid:
+        # remember them so the model can act on the sample BY REFERENCE — it
+        # cannot reliably retype names this long
+        from . import runs
+        runs.set_last_sample(rid, [str(x) for x in picked])
+    body = "\n".join(f"  [{i}] {x}" for i, x in enumerate(picked, 1))
+    tail = ("\nDo NOT retype these paths — you will get them wrong. To look at "
+            "them call view_sample()." if rid else "")
     return (f"{len(hits)} files match '{pat}' in {p}; random sample of "
-            f"{len(picked)}:\n" + "\n".join(str(x) for x in picked))
+            f"{len(picked)}:\n{body}{tail}")
 
 
 @tool("write_file",
@@ -1126,6 +1135,39 @@ def _view_images(args, ctx):
     if len(paths) > 8:
         note += f" (only the first 8 of {len(paths)} — call again for the rest)"
     return IMAGE_SENTINEL + "\n".join(ok) + ("\x00" + note if note else "")
+
+
+@tool("view_sample",
+      "Look at the files sample_files just gave you, BY REFERENCE — no paths. "
+      "Always prefer this over retyping filenames: you will get long filenames "
+      "wrong. Optionally pass `first` and `count` to pick a slice of the sample.",
+      {"type": "object", "properties": {
+          "first": {"type": "integer", "description": "1-based index into the "
+                    "last sample (default 1)"},
+          "count": {"type": "integer", "description": "how many, 1-8 (default 4)"}}},
+      needs="vision")
+def _view_sample(args, ctx):
+    rid = ctx.get("run_id")
+    if not rid:
+        return ("error: no active sample — call sample_files first, or use "
+                "view_images(folder=...)")
+    from . import runs
+    sample = runs.get_last_sample(rid)
+    if not sample:
+        return ("error: nothing sampled yet — call sample_files(path=...) first")
+    try:
+        first = max(1, int(args.get("first", 1) or 1))
+    except (TypeError, ValueError):
+        first = 1
+    try:
+        n = max(1, min(int(args.get("count", 4) or 4), 8))
+    except (TypeError, ValueError):
+        n = 4
+    chosen = sample[first - 1: first - 1 + n]
+    if not chosen:
+        return (f"error: the sample has {len(sample)} files; `first` must be "
+                f"between 1 and {len(sample)}")
+    return _view_images({"paths": chosen}, ctx)
 
 
 @tool("run_python",
