@@ -25,10 +25,11 @@ class _Engine(BaseHTTPRequestHandler):
     err_status = 0
     err_body = ""
     gate = None          # threading.Event: hold the turn OPEN after the 1st chunk
+    bodies = []          # every request body the engine received
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
-        self.rfile.read(n)
+        _body = self.rfile.read(n)
         if _Engine.err_status:                    # simulate an engine 4xx/5xx
             self.send_response(_Engine.err_status)
             self.send_header("content-type", "application/json")
@@ -38,6 +39,10 @@ class _Engine(BaseHTTPRequestHandler):
         i = _Engine.idx
         _Engine.idx += 1
         step = _Engine.script[i] if i < len(_Engine.script) else _Engine.script[-1]
+        try:
+            _Engine.bodies.append(json.loads(_body or b"{}"))
+        except Exception:
+            pass
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
@@ -52,10 +57,11 @@ class _Engine(BaseHTTPRequestHandler):
         if step is None:                          # narrate, no tools -> "lazy"
             sse({"choices": [{"delta": {"content": "thinking about it"}}]})
         else:
-            name, args = step
+            steps = step if isinstance(step, list) else [step]
             sse({"choices": [{"delta": {"tool_calls": [
-                {"index": 0, "id": f"c{i}", "type": "function",
-                 "function": {"name": name, "arguments": json.dumps(args)}}]}}]})
+                {"index": j, "id": f"c{i}_{j}", "type": "function",
+                 "function": {"name": nm, "arguments": json.dumps(ar)}}
+                for j, (nm, ar) in enumerate(steps)]}}]})
         if _Engine.gate is not None:      # hold the turn open, deterministically
             _Engine.gate.wait(timeout=10)
         self.wfile.write(b"data: [DONE]\n\n")
@@ -82,6 +88,7 @@ def home(tmp_path, monkeypatch):
     _Engine.err_status = 0
     _Engine.err_body = ""
     _Engine.gate = None
+    _Engine.bodies = []
 
 
 def _client(port):
@@ -100,11 +107,11 @@ def _wait(client, rid, timeout=15):
 
 
 def test_run_reaches_done_with_verify_once(engine):
-    # plan, plan, log, task_complete (rejected -> verify), task_complete (done)
+    # plan, plan, complete, task_complete (rejected -> verify), task_complete
     _Engine.script = [
         ("manage_plan", {"action": "add", "task": "read the folder"}),
         ("manage_plan", {"action": "add", "task": "write the prompts"}),
-        ("log_progress", {"done": "read folder", "next": "write prompts"}),
+        ("manage_plan", {"action": "complete", "id": 1}),
         ("task_complete", {"summary": "all prompts written"}),
         ("task_complete", {"summary": "all prompts written"}),
     ]
@@ -289,6 +296,51 @@ def test_identical_repeated_action_is_caught_immediately(engine):
     r = _wait(c, rid, timeout=25)
     assert r["status"] == "stalled"
     assert r["iteration"] <= 8, f"took too long to notice the loop: {r['iteration']}"
+
+
+def test_one_action_caps_parallel_tool_calls(engine):
+    # a model may emit SEVERAL tool_calls in one round; one-action mode must
+    # still execute only one, or the loop is unsupervised again at small scale
+    from rigma import sessions
+    _Engine.script = [[("manage_plan", {"action": "add", "task": "a"}),
+                       ("manage_plan", {"action": "add", "task": "b"})], None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    sess = sessions.load(r["session_id"])
+    traces = [m.get("tool_trace") or [] for m in sess["messages"]
+              if m.get("role") == "assistant"]
+    assert traces
+    assert all(len(t) <= 1 for t in traces), f"executed parallel calls: {traces}"
+
+
+def test_one_action_lets_the_model_see_loaded_images(engine, tmp_path):
+    # a tool that loads images appends them to the NEXT round's request. In
+    # one-action mode an unconditional break discarded that round, so the model
+    # was told "image loaded" but never actually saw a single pixel.
+    from PIL import Image
+    from rigma import tools as toolkit
+    png = tmp_path / "x.png"
+    Image.new("RGB", (8, 8), (200, 30, 30)).save(png)
+
+    @toolkit.tool("fake_view", "test-only image loader",
+                  {"type": "object", "properties": {}})
+    def _fake(args, ctx):
+        return toolkit.IMAGE_SENTINEL + str(png)
+
+    try:
+        _Engine.script = [("fake_view", {}), None]
+        c = _client(engine)
+        rid = c.post("/api/runs",
+                     json={"mission": "x", "budget_hours": 1}).json()["id"]
+        _wait(c, rid, timeout=25)
+        saw_image = any(
+            isinstance(m.get("content"), list)
+            and any(p.get("type") == "image_url" for p in m["content"])
+            for b in _Engine.bodies for m in b.get("messages", []))
+        assert saw_image, "the loaded image never reached the model"
+    finally:
+        toolkit._REGISTRY.pop("fake_view", None)
 
 
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
