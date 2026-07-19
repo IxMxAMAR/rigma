@@ -221,6 +221,30 @@ def test_bookkeeping_only_turns_do_not_count_as_progress(engine):
     assert r["iteration"] <= 12, "run kept going on bookkeeping alone"
 
 
+def test_checkpoint_never_restates_the_mission(engine, monkeypatch):
+    # Re-injecting the mission as a user message makes a small model treat it as
+    # a NEW instruction and restart from phase 1 (owner hit exactly this). The
+    # mission is already pinned in the system prompt every turn.
+    from rigma import sessions
+    monkeypatch.setattr(serve, "K_REMIND", 2)          # fire a checkpoint early
+    mission = "ZEBRAQUEST-TOKEN assemble the widget"
+    _Engine.script = [("manage_plan", {"action": "add", "task": "a"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": mission,
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    s = sessions.load(r["session_id"])
+    driving = [m["content"] for m in s["messages"] if m.get("role") == "user"]
+    assert driving
+    assert not any(mission in d for d in driving), "mission must not be re-injected"
+    assert any("MID-RUN" in d or "start over" in d for d in driving)
+    # ...because the system prompt carries it EVERY turn, so dropping it from the
+    # checkpoint loses nothing. (run-end clears session["mission"], so assert the
+    # pinning invariant on a live-shaped session rather than the finished one.)
+    live = dict(s, mission=mission)
+    assert mission in sessions.build_messages(live)[0]["content"]
+
+
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.
