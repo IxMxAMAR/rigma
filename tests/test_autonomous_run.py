@@ -206,6 +206,21 @@ def test_activity_feed_records_tool_calls(engine):
 # on the full re-render that happens when a run ends.
 
 
+def test_bookkeeping_only_turns_do_not_count_as_progress(engine):
+    # ticking plan items forever while producing NO artifact must be treated as
+    # idle. Each add has distinct args, so the repeat-signature check can't catch
+    # it — only the productive-work check can.
+    _Engine.script = [("manage_plan", {"action": "add", "task": f"step {i}"})
+                      for i in range(20)]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    assert r["status"] == "stalled"          # cut short, not marched through
+    # streaks count TURNS (a turn makes many calls), so assert on iterations:
+    # without the productive-work check this never accumulates idle at all
+    assert r["iteration"] <= 12, "run kept going on bookkeeping alone"
+
+
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.

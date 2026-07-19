@@ -55,6 +55,8 @@ PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big co
                         # the engine is genuinely dead; a normal turn starts instantly
 TICK_SECS = 5.0         # how often a waiting turn reports "still working" to the UI
 LIVE_MAX = 80           # rolling live-activity entries kept on a run for the UI
+# bookkeeping ≠ work: these move no real work forward on their own
+_BOOKKEEPING_TOOLS = {"manage_plan", "log_progress", "task_complete"}
 K_ERROR = 8             # consecutive all-error turns before "stalled"
 K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
 M_FROZEN = 2            # consecutive frozen turns before "frozen"
@@ -465,7 +467,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # feed results back and stream again; otherwise this round is the answer
         # per-turn tool-call ceiling: a safety backstop against runaway loops,
         # NOT a feature limit — session-configurable (default 25), clamped sane
-        max_rounds = (max(1, min(int(s.get("max_tool_rounds") or 25), 100))
+        max_rounds = (max(1, min(int(s.get("max_tool_rounds") or 50), 100))
                       if use_tools else 1)
         for _round in range(max_rounds):
             last = _round == max_rounds - 1
@@ -1150,7 +1152,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "action='add', task='…') 3–5 times to break the mission into "
                     "concrete, verifiable steps. Then start working through them.")
         plan = _runs.plan_summary(rid)
-        base = _dynamic_line(_last_trace(session))
+        last = _last_trace(session)
+        # called it but didn't do it: name the gap instead of a generic nudge
+        if last and all(t.get("name") in _BOOKKEEPING_TOOLS for t in last):
+            return ("You updated your plan/log but produced NOTHING. Describing "
+                    "what you will do is not doing it. RIGHT NOW, in this turn, "
+                    "perform the actual work with a real tool (write_file / "
+                    "run_python / read_file / view_images) and produce the "
+                    "artifact. Do not touch manage_plan or log_progress until "
+                    f"the work exists. Pending plan: {plan}.")
+        base = _dynamic_line(last)
         if run.get("iteration", 0) % K_REMIND == 0:   # full reminder cadence
             return ("CORE DIRECTIVE REMINDER — Mission: " + run["mission"] +
                     f"\nPending plan: {plan}\nRecent progress:\n"
@@ -1446,11 +1457,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     break
                 run["_verify_pending"] = False
                 sig = _turn_sig(trace)
+                # Bookkeeping is not work. A turn that only ticks plan items and
+                # logs "done: X" while producing NO artifact must NOT reset the
+                # idle streak — otherwise the model narrates its way through the
+                # whole plan ("Now I'll generate prompts 1-25...") without ever
+                # writing anything, and the watchdog reads it as healthy.
+                productive = [t for t in trace
+                              if t.get("name") not in _BOOKKEEPING_TOOLS
+                              and not str(t.get("result", "")).startswith("error")]
                 if not trace:
                     run["lazy_streak"] = run.get("lazy_streak", 0) + 1
                 elif all(str(t.get("result", "")).startswith("error")
                          for t in trace):
                     run["error_streak"] = run.get("error_streak", 0) + 1
+                elif not productive and run.get("iteration", 0) > 0:
+                    # iteration 0 is legitimately plan-building, so exempt it
+                    run["lazy_streak"] = run.get("lazy_streak", 0) + 1
                 elif sig == prev_sig:
                     run["lazy_streak"] = run.get("lazy_streak", 0) + 1
                 else:
