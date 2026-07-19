@@ -62,6 +62,23 @@ def test_manage_plan_add_complete():
     assert len(runs.pending_tasks(r["id"])) == 1
 
 
+def test_manage_plan_update_rewords_a_step():
+    # models reach for action='update' naturally; rejecting it burned tool calls
+    r = runs.create("m", "s")
+    ctx = {"run_id": r["id"]}
+    tools.run_tool("manage_plan", {"action": "add", "task": "draft it"}, ctx)
+    out = tools.run_tool("manage_plan",
+                         {"action": "update", "id": 1,
+                          "task": "Define Core Directive"}, ctx)
+    assert "updated" in out
+    assert runs.read_plan(r["id"])[0]["text"] == "Define Core Directive"
+    assert runs.read_plan(r["id"])[0]["status"] == "pending"   # status untouched
+    assert "required" in tools.run_tool("manage_plan",
+                                        {"action": "update", "id": 1}, ctx)
+    assert "no such step" in tools.run_tool(
+        "manage_plan", {"action": "update", "id": 99, "task": "x"}, ctx)
+
+
 def test_log_progress_writes_to_run():
     r = runs.create("m", "s")
     ctx = {"run_id": r["id"]}
