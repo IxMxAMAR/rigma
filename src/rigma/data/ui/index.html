@@ -16,6 +16,8 @@
   </div>
   <button id="open-models" type="button" class="rail-nav">
     <span aria-hidden="true">▤</span> Models &amp; downloads</button>
+  <button id="open-auto" type="button" class="rail-nav">
+    <span aria-hidden="true">🤖</span> Autonomous</button>
   <input id="rail-search" placeholder="search chats" spellcheck="false"
          aria-label="Search chats">
   <nav id="chat-list" aria-label="Chats"></nav>
@@ -109,6 +111,14 @@
       <button id="mv-refresh" type="button" aria-label="Refresh">⟳</button>
     </div>
     <div id="mv-body"></div>
+  </section>
+  <section id="auto-view" hidden aria-label="Autonomous runs">
+    <div class="mv-head">
+      <button id="auto-close" type="button">◀ back to chat</button>
+      <h2>Autonomous</h2>
+      <button id="auto-refresh" type="button" aria-label="Refresh">⟳</button>
+    </div>
+    <div id="auto-body"></div>
   </section>
 </main>
 <div id="drawer-scrim" hidden></div>
