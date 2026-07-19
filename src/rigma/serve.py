@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 from importlib import resources
 
@@ -161,6 +162,22 @@ def _spill_big_result(name: str, result: str, tctx: dict) -> str:
             f"Full output: {path}\n"
             f"Read more with: read_file path=\"{path}\" offset=1 limit=800\n\n"
             f"Preview (first {SPILL_PREVIEW} chars):\n{result[:SPILL_PREVIEW]}")
+
+
+_THINK_TAGS = ("think", "thinking", "reasoning", "thought")
+
+
+def _strip_think(text: str) -> str:
+    """Remove reasoning blocks that leak into normal content. Qwen3.6 emits
+    <think>…</think>; when the server doesn't split it into reasoning_content it
+    lands in the answer. Also handles an UNTERMINATED opening tag, which happens
+    when generation is cut off mid-thought."""
+    if not text or "<" not in text:
+        return text
+    for tag in _THINK_TAGS:
+        text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.S | re.I)
+        text = re.sub(rf"<{tag}>.*\Z", "", text, flags=re.S | re.I)
+    return text.strip()
 
 
 def _clip(text: str, limit: int) -> str:
@@ -701,12 +718,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             result, imgs = f"error running {name}: {e}", None
                     else:
                         bad = None
-                        try:
-                            cargs = json.loads(c["args"] or "{}")
-                            if not isinstance(cargs, dict):
-                                bad = "arguments must be a JSON object"
-                        except Exception as e:
-                            cargs, bad = {}, f"malformed JSON arguments: {e}"
+                        cargs, note = toolkit.repair_json_args(c["args"])
+                        if cargs is None:
+                            cargs, bad = {}, ("malformed JSON arguments — "
+                                              "auto-repair failed too")
+                        # note: repaired args run normally — the model is told
+                        # about the repair via the result, not punished for it
                         yield _sse({"name": name, "args": cargs}, event="tool")
                         if bad:                 # don't run — let the model retry
                             result, imgs = (f"error: {bad} — fix the JSON and "
@@ -788,7 +805,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if thinking:
                     last["thinking"] = last.get("thinking", "") + thinking
             else:
-                body_text = _with_prefill(prefill, text)
+                body_text = _strip_think(_with_prefill(prefill, text))
                 if not str(body_text).strip() and trace:
                     # a tool-only action would otherwise persist an EMPTY
                     # assistant message, which some templates reject outright.
@@ -1262,7 +1279,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         errs = [t for t in trace if str(t.get("result", "")).startswith("error")]
         if errs and len(errs) == len(trace):
             return (f"Your last tool call failed: {str(errs[-1].get('result',''))[:160]}. "
-                    "Fix it or try a different approach.")
+                    "Read that error and change your approach — different "
+                    "arguments, or a different tool. Do NOT reply with text "
+                    "only; keep using tools, but diagnose before retrying.")
         names = ", ".join(dict.fromkeys(t.get("name", "") for t in trace))
         return f"Last step used {names}. Do the next step in your plan."
 
