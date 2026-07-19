@@ -147,12 +147,23 @@ def verify_step(step: dict, workspace: str = "") -> tuple[bool, str]:
 
 async def compile_mission(raw: str, post) -> dict:
     """Compile raw prose into a spec using the loaded model. `post` is an async
-    callable taking the chat-completions payload. Falls back on any failure."""
-    try:
-        resp = await post({
-            "messages": [{"role": "user", "content": COMPILE_PROMPT + raw}],
-            "stream": False, "temperature": 0.2, "max_tokens": 2000})
-        text = resp["choices"][0]["message"]["content"] or ""
-    except Exception:
-        return fallback_spec(raw)
-    return parse_spec(text) or fallback_spec(raw)
+    callable taking the chat-completions payload. Falls back on any failure.
+
+    The first attempt CONSTRAINS the output to JSON (llama.cpp builds a grammar
+    from response_format, so the model physically cannot emit prose). A weak
+    model asked politely for "only JSON" returns markdown and commentary — which
+    is exactly why compilation kept failing and every run got a single-step
+    fallback plan. If the server rejects response_format we retry unconstrained
+    rather than lose the compile entirely."""
+    base = {"messages": [{"role": "user", "content": COMPILE_PROMPT + raw}],
+            "stream": False, "temperature": 0.2, "max_tokens": 2000}
+    for payload in ({**base, "response_format": {"type": "json_object"}}, base):
+        try:
+            resp = await post(payload)
+            text = resp["choices"][0]["message"]["content"] or ""
+        except Exception:
+            continue
+        spec = parse_spec(text)
+        if spec:
+            return spec
+    return fallback_spec(raw)
