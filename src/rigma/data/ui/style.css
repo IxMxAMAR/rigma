@@ -528,6 +528,12 @@ body.auto-open #composer { display:none; }
   border:1px solid var(--line,#2a2a2a); border-radius:8px; padding:10px 12px;
   max-height:300px; overflow-y:auto; margin:8px 0; }
 #auto-activity .act { white-space:pre-wrap; word-break:break-word; margin:2px 0; }
+#auto-activity .act-tag { display:inline-block; margin-right:8px; padding:0 6px;
+  border-radius:4px; background:var(--bg2,#222); color:var(--dim,#888);
+  font:10px/1.6 var(--mono); text-transform:uppercase; letter-spacing:.05em;
+  vertical-align:1px; }
+#auto-activity .act { padding:3px 0; border-top:1px solid var(--line,#222); }
+#auto-activity .act:first-child { border-top:0; }
 #auto-activity .act-think { color:var(--dim,#8a8a8a); font-style:italic; }
 #auto-activity .act-tool { color:var(--amber,#e0b060); }
 #auto-activity .act-result { color:#8fe0a8; }
