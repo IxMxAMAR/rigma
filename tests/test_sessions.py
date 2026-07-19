@@ -274,3 +274,20 @@ def test_search_survives_parts_content(tmp_path, monkeypatch):
     sessions.save(s)
     hits = sessions.search("dragon")
     assert len(hits) == 1 and "dragon" in hits[0]["snippet"]
+
+
+def test_build_messages_drops_empty_assistant_turns():
+    # a tool-only action persists an assistant message with no text; this Qwen3
+    # template 400s on it ("Unable to generate parser for this template"), and
+    # it carries no information for the model either way
+    s = {"system_prompt": "SYS", "messages": [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "TOOL RESULT list_directory: ok"},
+        {"role": "assistant", "content": "   "},
+        {"role": "assistant", "content": "real answer"},
+    ]}
+    out = sessions.build_messages(s)
+    assert all(not (m["role"] == "assistant" and not m["content"].strip())
+               for m in out)
+    assert [m["role"] for m in out] == ["system", "user", "user", "assistant"]
