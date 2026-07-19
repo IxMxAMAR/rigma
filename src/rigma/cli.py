@@ -75,13 +75,17 @@ def run_start(mission: str = typer.Argument(..., help="the job to accomplish"),
               workspace: str = typer.Option("", "--workspace",
                                             help="folder the model works in"),
               profile: str = typer.Option("all", "--profile",
-                                          help="all|no-network|no-delete|confined")):
+                                          help="all|no-network|no-delete|confined"),
+              effort: str = typer.Option("on", "--effort",
+                                         help="reasoning: on|auto|off "
+                                              "(on = plan each step, best quality)")):
     """Hand the model a mission; it plans, works, logs, and compacts on its own
     until it finishes or a safety cap trips. Survives closing the browser."""
     import httpx
     r = httpx.post(_run_server_base() + "/api/runs",
                    json={"mission": mission, "budget_hours": hours,
-                         "workspace": workspace, "profile": profile}, timeout=30)
+                         "workspace": workspace, "profile": profile,
+                         "effort": effort}, timeout=30)
     if r.status_code != 200:
         typer.echo("error: " + r.json().get("error", str(r.status_code)))
         raise typer.Exit(1)

@@ -1354,14 +1354,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": "mission is required"}, status_code=400)
         profile = (body or {}).get("profile", "all")
         workspace = str((body or {}).get("workspace", "")).strip()
+        # Reasoning is ON by default: a long unattended job benefits from the
+        # model planning each step. (The near-instant "0 tool calls" stall was
+        # never thinking-in-circles — it was the engine 400ing on a bad chat
+        # template; see _drain_turn.) Callers may override per run: effort
+        # off | auto | on. Blank/absent -> "on".
+        effort = (body or {}).get("effort", "on")
+        if effort not in sessions.EFFORT_LEVELS:
+            effort = "on"
         sess = sessions.create(title="🤖 " + mission[:32])
         sess.update(use_tools=True, allow_code=True, auto_compact=True,
                     workspace=workspace, mission=mission,
                     system_prompt=AGENT_SYSTEM_PROMPT,   # agent role, not chat
-                    # thinking OFF by default: a reasoning model in an autonomous
-                    # loop tends to <think> in circles and never emit a tool call
-                    # (owner repro: 0 tool calls, empty turns). Act, don't deliberate.
-                    effort="off",
+                    effort=effort,
                     run_profile=profile if profile in _runs.PROFILES else "all")
         run = _runs.create(mission, sess["id"], workspace=workspace,
                            profile=profile,
