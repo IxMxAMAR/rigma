@@ -184,12 +184,12 @@ function renderChatTab() {
   const roundsIn = el("input");
   roundsIn.type = "number"; roundsIn.min = "1"; roundsIn.max = "100";
   roundsIn.style.width = "64px";
-  roundsIn.value = current.max_tool_rounds || 25;
+  roundsIn.value = current.max_tool_rounds || 50;
   roundsIn.title = "How many tool-call rounds the model may take in one reply "
     + "before it must stop (raise for long autonomous jobs)";
   roundsIn.onchange = async () => {
     if (!current || current.id !== sid) return;
-    const v = Math.max(1, Math.min(100, parseInt(roundsIn.value, 10) || 25));
+    const v = Math.max(1, Math.min(100, parseInt(roundsIn.value, 10) || 50));
     roundsIn.value = v;
     try { current = await api("POST", "/api/sessions/" + sid,
                               {max_tool_rounds: v}); }
