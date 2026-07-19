@@ -24,6 +24,7 @@ class _Engine(BaseHTTPRequestHandler):
     delay = 0.0
     err_status = 0
     err_body = ""
+    gate = None          # threading.Event: hold the turn OPEN after the 1st chunk
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
@@ -55,6 +56,8 @@ class _Engine(BaseHTTPRequestHandler):
             sse({"choices": [{"delta": {"tool_calls": [
                 {"index": 0, "id": f"c{i}", "type": "function",
                  "function": {"name": name, "arguments": json.dumps(args)}}]}}]})
+        if _Engine.gate is not None:      # hold the turn open, deterministically
+            _Engine.gate.wait(timeout=10)
         self.wfile.write(b"data: [DONE]\n\n")
 
     def log_message(self, *a):
@@ -78,6 +81,7 @@ def home(tmp_path, monkeypatch):
     _Engine.script = []
     _Engine.err_status = 0
     _Engine.err_body = ""
+    _Engine.gate = None
 
 
 def _client(port):
@@ -191,6 +195,15 @@ def test_activity_feed_records_tool_calls(engine):
     assert any("action=add" in t for t in tools_seen)   # args shown, not just name
     assert any(a["kind"] == "result" for a in acts)     # results shown too
     assert any(a["kind"] == "say" for a in acts)        # and plain model text
+
+
+# NOTE: mid-run visibility (activity readable WHILE status=="running") is not
+# covered here. Under TestClient the run loop starves the HTTP portal and even a
+# gated fake engine finished before the first sample, so every attempt measured
+# the harness, not the product. The flush path itself is covered above (tool
+# events flush immediately; text throttles to 1.5s); the bug the owner actually
+# hit was UI-side — refreshAuto never repainted the panel, so it only appeared
+# on the full re-render that happens when a run ends.
 
 
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):

@@ -1154,40 +1154,56 @@ function _dur(s) {
   return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
 }
 
+function _fillWait(span, run) {
+  const on = run.status === "running" && (run.waiting_secs || 0) > 0;
+  span.hidden = !on;
+  span.textContent = on
+    ? ("  ⏳ " + (run.waiting_kind === "starting"
+                 ? "model is starting (loading your context)" : "generating")
+       + " — " + _dur(run.waiting_secs) + " so far")
+    : "";
+}
+
+function _fillActivity(box, items) {
+  items = Array.isArray(items) ? items : [];
+  // keep the view pinned to newest unless the user has scrolled up to read
+  const pinned = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  box.innerHTML = "";
+  if (!items.length) {
+    box.appendChild(el("div", "act act-think",
+      "(nothing yet — waiting for the model's first output)"));
+    return;
+  }
+  for (const a of items) {
+    const kind = a.kind || "say";
+    const mark = kind === "tool" ? "→ " : kind === "result" ? "   ✔ " : "";
+    box.appendChild(el("div", "act act-" + kind, mark + (a.text || "")));
+  }
+  if (pinned) box.scrollTop = box.scrollHeight;
+}
+
 function renderAutoDash(box, run) {
   const head = el("div", "");
   head.appendChild(el("span", "auto-badge " + run.status, run.status));
   head.appendChild(document.createTextNode(
     "  iter " + (run.iteration || 0) + " · errors " + (run.error_streak || 0)));
   // live heartbeat: a slow turn must never look like a frozen screen
-  if (run.status === "running" && (run.waiting_secs || 0) > 0) {
-    head.appendChild(el("span", "auto-wait", "  ⏳ "
-      + (run.waiting_kind === "starting"
-         ? "model is starting (loading your context)"
-         : "generating")
-      + " — " + _dur(run.waiting_secs) + " so far"));
-  }
+  const wait = el("span", "auto-wait"); wait.id = "auto-wait";
+  _fillWait(wait, run);
+  head.appendChild(wait);
   box.appendChild(head);
   box.appendChild(el("h3", "", "Mission"));
   box.appendChild(el("p", "", run.mission || ""));
   box.appendChild(el("h3", "", "Plan"));
   const ul = document.createElement("ul"); ul.id = "auto-plan";
   _renderPlan(ul, run.plan); box.appendChild(ul);
-  // live activity: what the model is thinking / calling, right now
-  if (Array.isArray(run.activity) && run.activity.length) {
-    box.appendChild(el("h3", "", "Live activity"));
-    const act = el("div", ""); act.id = "auto-activity";
-    for (const a of run.activity) {
-      const kind = a.kind || "say";
-      const line = el("div", "act act-" + kind);
-      const mark = kind === "tool" ? "→ " : kind === "result" ? "   ✔ "
-                 : kind === "think" ? "" : "";
-      line.textContent = mark + (a.text || "");
-      act.appendChild(line);
-    }
-    box.appendChild(act);
-    act.scrollTop = act.scrollHeight;      // pin to newest
-  }
+  // live activity: what the model is thinking / calling, right now.
+  // ALWAYS create the container (even when empty) so the 1.5s poll can fill it
+  // without a full re-render — otherwise it only appears when the run ends.
+  box.appendChild(el("h3", "", "Live activity"));
+  const act = el("div", ""); act.id = "auto-activity";
+  _fillActivity(act, run.activity);
+  box.appendChild(act);
   box.appendChild(el("h3", "", "Progress log"));
   const log = el("div", ""); log.id = "auto-log";
   log.textContent = run.log_tail
@@ -1253,4 +1269,8 @@ async function refreshAuto() {
   logEl.textContent = run.log_tail || "(waiting…)";
   logEl.scrollTop = logEl.scrollHeight;
   const ul = $("auto-plan"); if (ul) _renderPlan(ul, run.plan);
+  // the live panels must repaint on the fast path too — without these they only
+  // appeared on a full re-render, i.e. the moment the run ended
+  const act = $("auto-activity"); if (act) _fillActivity(act, run.activity);
+  const wait = $("auto-wait"); if (wait) _fillWait(wait, run);
 }
