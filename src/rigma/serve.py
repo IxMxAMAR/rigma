@@ -392,6 +392,28 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 allow_code=tctx["allow_code"],
                 has_rag=bool(rag.recorded_sidecar_port()),
                 workspace=tctx["workspace"], has_vision=has_vision)
+            _sem = asyncio.Semaphore(8)   # cap concurrent tool subprocesses / IO
+
+            async def _run_call(name, cargs):
+                """Run one tool (cached, capped) and resolve any image sentinel
+                into base64 vision payloads. Returns (result_text, imgs|None)."""
+                async with _sem:
+                    result = await asyncio.to_thread(toolkit.cached_run,
+                                                     name, cargs, tctx)
+                imgs = None
+                if result.startswith(toolkit.IMAGE_SENTINEL):
+                    payload = result[len(toolkit.IMAGE_SENTINEL):]
+                    payload, _, note = payload.partition("\x00")
+                    ipaths = [p for p in payload.split("\n") if p]
+                    try:
+                        imgs = await asyncio.gather(*[
+                            asyncio.to_thread(toolkit.encode_image_data_uri, p)
+                            for p in ipaths])
+                        names = ", ".join(_Path(p).name for p in ipaths)
+                        result = f"loaded {len(imgs)} image(s): {names}{note}"
+                    except Exception as e:
+                        result, imgs = f"error loading image: {e}", None
+                return result, imgs
         text, thinking, failed, resp = "", "", False, None
         usage, timings = {}, {}
         # agentic loop: stream a round; if the model called tools, run them,
@@ -419,7 +441,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 body["chat_template_kwargs"] = {"enable_thinking": False}
             elif effort == "on":
                 body["chat_template_kwargs"] = {"enable_thinking": True}
-            rtext, calls = "", {}
+            rtext, calls, started = "", {}, {}   # started: idx -> (task, cargs)
             try:
                 req = client.build_request("POST", "/v1/chat/completions",
                                            json=body)
@@ -452,7 +474,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         thinking += rdelta
                         yield _sse({"delta": rdelta}, event="think")
                     for tc in d.get("tool_calls") or []:   # accumulate by index
-                        slot = calls.setdefault(tc.get("index", 0),
+                        idx = tc.get("index", 0)
+                        slot = calls.setdefault(idx,
                                                 {"id": "", "name": "", "args": ""})
                         if tc.get("id"):
                             slot["id"] = tc["id"]
@@ -461,6 +484,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             slot["name"] = fn["name"]
                         if fn.get("arguments"):
                             slot["args"] += fn["arguments"]
+                        # EAGER: the moment a call's args parse as a JSON object,
+                        # start it running so its I/O overlaps the rest of
+                        # generation and any sibling tool calls
+                        if (use_tools and not last and idx not in started
+                                and slot["name"] and slot["args"].strip()):
+                            try:
+                                _ca = json.loads(slot["args"])
+                            except Exception:
+                                _ca = None
+                            if isinstance(_ca, dict):
+                                yield _sse({"name": slot["name"], "args": _ca},
+                                           event="tool")
+                                started[idx] = (asyncio.create_task(
+                                    _run_call(slot["name"], _ca)), _ca)
                     delta = d.get("content")
                     if delta:
                         rtext += delta
@@ -479,49 +516,43 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     await resp.aclose()
                     resp = None
             if failed:
+                for task, _ in started.values():
+                    task.cancel()              # don't leak eager tool tasks
                 break
             if use_tools and calls and not last:   # the model asked for tools
-                from . import tools as toolkit
                 msgs.append({"role": "assistant", "content": rtext,
                              "tool_calls": [
                                  {"id": c["id"], "type": "function",
                                   "function": {"name": c["name"],
                                                "arguments": c["args"]}}
                                  for c in calls.values()]})
-                for c in calls.values():
-                    bad = None
-                    try:
-                        cargs = json.loads(c["args"] or "{}")
-                        if not isinstance(cargs, dict):
-                            bad = "arguments must be a JSON object"
-                    except Exception as e:
-                        cargs, bad = {}, f"malformed JSON arguments: {e}"
-                    yield _sse({"name": c["name"], "args": cargs}, event="tool")
-                    imgs = None
-                    if bad:                     # don't run — let the model retry
-                        result = f"error: {bad} — fix the JSON and call again"
+                # collect results IN ORDER — eager tasks are already running (in
+                # parallel); calls whose args never parsed early run now
+                for idx, c in calls.items():
+                    name = c["name"]
+                    if idx in started:
+                        task, cargs = started[idx]
+                        try:
+                            result, imgs = await task
+                        except Exception as e:
+                            result, imgs = f"error running {name}: {e}", None
                     else:
-                        result = await asyncio.to_thread(toolkit.run_tool,
-                                                         c["name"], cargs, tctx)
-                        # view_image/view_images return a sentinel + newline-
-                        # separated paths; downscale + base64 each and feed them
-                        # in as ONE vision message (tool-role can't carry images)
-                        if result.startswith(toolkit.IMAGE_SENTINEL):
-                            payload = result[len(toolkit.IMAGE_SENTINEL):]
-                            payload, _, note = payload.partition("\x00")
-                            ipaths = [p for p in payload.split("\n") if p]
-                            try:
-                                imgs = [await asyncio.to_thread(
-                                    toolkit.encode_image_data_uri, p)
-                                    for p in ipaths]
-                                names = ", ".join(_Path(p).name for p in ipaths)
-                                result = f"loaded {len(imgs)} image(s): {names}{note}"
-                            except Exception as e:
-                                result, imgs = f"error loading image: {e}", None
-                    yield _sse({"name": c["name"], "result": result[:400]},
+                        bad = None
+                        try:
+                            cargs = json.loads(c["args"] or "{}")
+                            if not isinstance(cargs, dict):
+                                bad = "arguments must be a JSON object"
+                        except Exception as e:
+                            cargs, bad = {}, f"malformed JSON arguments: {e}"
+                        yield _sse({"name": name, "args": cargs}, event="tool")
+                        if bad:                 # don't run — let the model retry
+                            result, imgs = (f"error: {bad} — fix the JSON and "
+                                            "call again"), None
+                        else:
+                            result, imgs = await _run_call(name, cargs)
+                    yield _sse({"name": name, "result": str(result)[:400]},
                                event="tool_result")
-                    trace.append({"name": c["name"], "args": cargs,
-                                  "result": result})
+                    trace.append({"name": name, "args": cargs, "result": result})
                     msgs.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": result})
                     if imgs:
