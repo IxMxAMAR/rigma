@@ -576,6 +576,7 @@ let modelsRenderGen = 0;   // only the newest in-flight render may touch the DOM
 
 function openModelsView() {
   closeDrawer();
+  if (typeof closeAutoView === "function") closeAutoView();
   $("models-view").hidden = false;
   document.body.classList.add("models-open");
   renderModelsView();
@@ -1040,6 +1041,7 @@ let autoPollTimer = null;
 
 function openAutoView() {
   closeDrawer();
+  if (typeof closeModelsView === "function") closeModelsView();
   $("auto-view").hidden = false;
   document.body.classList.add("auto-open");
   renderAutoView();
@@ -1053,14 +1055,26 @@ $("open-auto").onclick = openAutoView;
 $("auto-close").onclick = closeAutoView;
 $("auto-refresh").onclick = () => renderAutoView();
 
+let autoRunId = null;   // the run we're showing (persists after it ends)
+
 async function renderAutoView() {
   const box = $("auto-body"); box.innerHTML = "";
   clearInterval(autoPollTimer); autoPollTimer = null;
   let run = {};
   try { run = await api("GET", "/api/runs/active"); } catch {}
-  if (!run || !run.id) { renderAutoStart(box); return; }
-  renderAutoDash(box, run);
-  autoPollTimer = setInterval(refreshAuto, 3000);
+  if (run && run.id) {          // a live run
+    autoRunId = run.id;
+    renderAutoDash(box, run);
+    autoPollTimer = setInterval(refreshAuto, 3000);
+    return;
+  }
+  if (autoRunId) {              // no live run, but show the last one's outcome
+    try {
+      const last = await api("GET", "/api/runs/" + autoRunId);
+      if (last && last.id) { renderAutoDash(box, last); return; }
+    } catch {}
+  }
+  renderAutoStart(box);
 }
 
 function _input(type, ph, val) {
@@ -1100,10 +1114,17 @@ function renderAutoStart(box) {
     if (!mission.value.trim()) { alert("Enter a mission first."); return; }
     start.disabled = true;
     try {
-      await api("POST", "/api/runs", {
+      const run = await api("POST", "/api/runs", {
         mission: mission.value.trim(), budget_hours: parseFloat(hours.value) || 8,
         profile: prof.value, workspace: ws.value.trim()});
-      renderAutoView();
+      autoRunId = run.id;                                   // track it
+      if (typeof renderRail === "function") renderRail();   // show its chat
+      // render the dashboard immediately from the created run, then poll —
+      // don't re-fetch /active (a fast-stalling run would flip back to the form)
+      const b = $("auto-body"); b.innerHTML = "";
+      renderAutoDash(b, run);
+      clearInterval(autoPollTimer);
+      autoPollTimer = setInterval(refreshAuto, 3000);
     } catch (e) { alert(e.message); start.disabled = false; }
   };
   acts.appendChild(start); box.appendChild(acts);
@@ -1167,7 +1188,7 @@ function renderAutoDash(box, run) {
       "Run ended: " + (run.summary || run.halt_reason || run.status)));
     const acts = el("div", "acts");
     const nb = el("button", "act", "Start a new run");
-    nb.onclick = () => renderAutoView();
+    nb.onclick = () => { autoRunId = null; renderAutoView(); };
     acts.appendChild(nb); box.appendChild(acts);
   }
 }
@@ -1175,7 +1196,9 @@ function renderAutoDash(box, run) {
 async function refreshAuto() {
   if ($("auto-view").hidden) { clearInterval(autoPollTimer); return; }
   let run = {};
-  try { run = await api("GET", "/api/runs/active"); } catch { return; }
+  try {   // poll the tracked run (persists after it ends), not /active
+    run = await api("GET", "/api/runs/" + (autoRunId || "_"));
+  } catch { return; }
   const badge = $("auto-body").querySelector(".auto-badge");
   const logEl = $("auto-log");
   if (!run || !run.id || !badge || !logEl

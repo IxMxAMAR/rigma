@@ -111,6 +111,7 @@ async function renderRail() {
 }
 
 async function newChat() {
+  _exitFullView();
   current = await api("POST", "/api/sessions", {});
   lastMeta = lastMeta ? {ctx: lastMeta.ctx} : null;
   $("ctx-bar").classList.remove("live");
@@ -119,7 +120,13 @@ async function newChat() {
   input.focus();
 }
 
+function _exitFullView() {   // leave Models/Autonomous when navigating to a chat
+  if (typeof closeModelsView === "function") closeModelsView();
+  if (typeof closeAutoView === "function") closeAutoView();
+}
+
 async function openSession(id) {
+  _exitFullView();
   current = await api("GET", "/api/sessions/" + id);
   document.body.classList.remove("rail-open");
   lastMeta = lastMeta ? {ctx: lastMeta.ctx} : null;
