@@ -437,12 +437,16 @@ def _search_docs(args, ctx):
 @tool("manage_plan",
       "Maintain your task plan (your durable working memory). action='add' with "
       "a `task` to add a concrete step; action='complete' with an `id` to check "
-      "one off; action='list' to see it. Break the mission into steps FIRST, then "
+      "one off; action='update' with an `id` and `task` to reword a step; "
+      "action='list' to see it. Break the mission into steps FIRST, then "
       "work through them — the system reminds you of pending steps every turn.",
       {"type": "object", "properties": {
-          "action": {"type": "string", "description": "add | complete | list"},
-          "task": {"type": "string", "description": "step text (for add)"},
-          "id": {"type": "integer", "description": "task id (for complete)"}},
+          "action": {"type": "string",
+                     "description": "add | complete | update | list"},
+          "task": {"type": "string",
+                   "description": "step text (for add and update)"},
+          "id": {"type": "integer",
+                 "description": "task id (for complete and update)"}},
        "required": ["action"]},
       needs="run")
 def _manage_plan(args, ctx):
@@ -458,9 +462,16 @@ def _manage_plan(args, ctx):
         ok = runs.plan_complete(rid, args.get("id"))
         return (f"step #{args.get('id')} marked done. Remaining: "
                 f"{runs.plan_summary(rid)}") if ok else "no such step id"
+    if action == "update":
+        t = str(args.get("task", "")).strip()
+        if not t:
+            return "error: `task` text is required to update a step"
+        return (f"step #{args.get('id')} updated: {t}"
+                if runs.plan_update(rid, args.get("id"), t)
+                else "no such step id")
     if action == "list":
         return "Plan (pending): " + runs.plan_summary(rid, limit=50)
-    return "error: action must be add, complete, or list"
+    return "error: action must be add, complete, update, or list"
 
 
 @tool("log_progress",

@@ -151,6 +151,19 @@ def plan_complete(run_id: str, task_id) -> bool:
     return hit
 
 
+def plan_update(run_id: str, task_id, text: str) -> bool:
+    """Reword a step in place. Models reach for this naturally; without it they
+    burn tool calls on errors (and can stall the run on repeated failures)."""
+    plan = read_plan(run_id)
+    hit = False
+    for t in plan:
+        if str(t.get("id")) == str(task_id):
+            t["text"] = str(text)[:300]
+            hit = True
+    write_plan(run_id, plan)
+    return hit
+
+
 def pending_tasks(run_id: str) -> list:
     return [t for t in read_plan(run_id) if t.get("status") == "pending"]
 
