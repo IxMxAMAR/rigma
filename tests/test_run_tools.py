@@ -270,3 +270,15 @@ def test_view_images_can_sample_a_folder_without_paths(tmp_path):
     assert out.startswith(tools.IMAGE_SENTINEL)
     body = out[len(tools.IMAGE_SENTINEL):].split("\x00")[0]
     assert len([ln for ln in body.splitlines() if ln.strip()]) == 3
+
+
+def test_repair_handles_windows_paths_in_json_args():
+    # a model writing "D:\Good Stuff\x.png" emits INVALID json (\G, \x are not
+    # escapes). This is the most likely arg breakage on a Windows mission.
+    raw = r'{"path": "D:\Good Stuff\ComfyUI_00428_.png"}'
+    got, note = tools.repair_json_args(raw)
+    assert got and got["path"] == r"D:\Good Stuff\ComfyUI_00428_.png"
+    assert "repaired" in note
+    # correctly-escaped JSON is untouched and reports no repair
+    ok, note2 = tools.repair_json_args(r'{"path": "D:\\ok\\x.png"}')
+    assert ok["path"] == r"D:\ok\x.png" and not note2

@@ -27,6 +27,7 @@ class _Engine(BaseHTTPRequestHandler):
     err_body = ""
     gate = None          # threading.Event: hold the turn OPEN after the 1st chunk
     bodies = []          # every request body the engine received
+    compile_reply = "not a spec"   # mission compiler falls back by default
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
@@ -37,13 +38,23 @@ class _Engine(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(_Engine.err_body.encode())
             return
+        try:
+            body = json.loads(_body or b"{}")
+        except Exception:
+            body = {}
+        _Engine.bodies.append(body)
+        if not body.get("stream", True):
+            # non-streaming = the mission compiler (or compaction), NOT a turn.
+            # Answer it without consuming the turn script.
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"choices": [{"message": {
+                "content": _Engine.compile_reply}}]}).encode())
+            return
         i = _Engine.idx
         _Engine.idx += 1
         step = _Engine.script[i] if i < len(_Engine.script) else _Engine.script[-1]
-        try:
-            _Engine.bodies.append(json.loads(_body or b"{}"))
-        except Exception:
-            pass
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
@@ -90,6 +101,7 @@ def home(tmp_path, monkeypatch):
     _Engine.err_body = ""
     _Engine.gate = None
     _Engine.bodies = []
+    _Engine.compile_reply = "not a spec"
 
 
 def _client(port):
