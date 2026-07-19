@@ -150,6 +150,32 @@ def test_prefill_budget_tolerates_slow_first_token(engine, monkeypatch):
     assert r["status"] == "done"                       # not "frozen"
 
 
+def test_slow_turn_reports_heartbeat(engine, monkeypatch):
+    # a slow turn must publish "still working" progress so the UI never shows a
+    # dead screen — and must still finish normally
+    monkeypatch.setattr(serve, "IDLE_SECS", 0.1)
+    monkeypatch.setattr(serve, "PREFILL_SECS", 5.0)
+    monkeypatch.setattr(serve, "TICK_SECS", 0.05)
+    seen = []
+    _Engine.delay = 0.4                   # slow enough to cross several ticks
+    _Engine.script = [("task_complete", {"summary": "s"}),
+                      ("task_complete", {"summary": "s"})]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    # poll while it runs; we should catch a non-zero waiting_secs at some point
+    end = time.time() + 15
+    while time.time() < end:
+        r = c.get(f"/api/runs/{rid}").json()
+        if (r.get("waiting_secs") or 0) > 0:
+            seen.append(r["waiting_secs"])
+        if r.get("status") in runs.TERMINAL:
+            break
+        time.sleep(0.02)
+    r = c.get(f"/api/runs/{rid}").json()
+    assert r["status"] == "done"          # heartbeat didn't break the turn
+    assert r.get("waiting_secs", 0) == 0  # cleared when the turn ended
+
+
 def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.

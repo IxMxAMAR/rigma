@@ -524,6 +524,10 @@ body.auto-open #composer { display:none; }
 .auto-badge.stalled, .auto-badge.frozen, .auto-badge.error,
 .auto-badge.budget_exhausted { background:#3d1f1f; color:#e08f8f; }
 .auto-badge.paused, .auto-badge.stopped { background:#3d331f; color:#e0c88f; }
+.auto-wait { color:var(--amber,#e0b060); font:12px var(--mono);
+  animation:auto-pulse 1.6s ease-in-out infinite; }
+@keyframes auto-pulse { 0%,100% { opacity:1; } 50% { opacity:.45; } }
+@media (prefers-reduced-motion:reduce) { .auto-wait { animation:none; } }
 #auto-log { white-space:pre-wrap; font:12px var(--mono); background:var(--bg1,#141414);
   border:1px solid var(--line,#2a2a2a); border-radius:8px; padding:12px;
   max-height:340px; overflow-y:auto; margin:8px 0; }

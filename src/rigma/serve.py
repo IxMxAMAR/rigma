@@ -50,8 +50,10 @@ AUTO_COMPACT_KEEP = 8
 
 # --- Autonomous Mode tunables (see docs/.../autonomous-mode-design.md) ---
 IDLE_SECS = 90.0        # inter-token idle: frozen only if the stream STALLS this long
-PREFILL_SECS = 420.0    # first-token budget: prefill on a big context / slow GPU can
-                        # take minutes — don't misread slow prefill as a frozen turn
+PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big context
+                        # / slow GPU can take minutes. Nothing waits this long unless
+                        # the engine is genuinely dead; a normal turn starts instantly
+TICK_SECS = 5.0         # how often a waiting turn reports "still working" to the UI
 K_ERROR = 8             # consecutive all-error turns before "stalled"
 K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
 M_FROZEN = 2            # consecutive frozen turns before "frozen"
@@ -1155,14 +1157,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     " Call task_complete only when the WHOLE mission is done.")
         return base + f"  Pending plan: {plan}."
 
-    async def _drain_turn(session):
+    async def _drain_turn(session, on_wait=None):
         """Drain one agentic turn headless with an idle-watchdog: a turn is only
-        frozen if it emits nothing for IDLE_SECS (tolerates slow-but-working
+        frozen if it emits nothing for its whole budget (tolerates slow-but-working
         generation). Returns the engine error message if the turn errored (the
         headless drain would otherwise DISCARD it and mis-read the turn as 'no
         progress'); else None. aclose swallows BaseException so its cleanup can't
         clobber the outcome; the call site converts a leaked CancelledError ->
-        frozen."""
+        frozen. `on_wait(waited, kind)` fires every TICK_SECS while waiting so the
+        UI can show the run is alive instead of a blank screen."""
         agen = _llm_turn(session)
         err = None
         # The generous PREFILL budget covers the slow gaps: the first token of a
@@ -1173,14 +1176,39 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         expect_prefill = True
         try:
             while True:
+                budget = PREFILL_SECS if expect_prefill else IDLE_SECS
+                kind = "starting" if expect_prefill else "generating"
+                # Poll ONE long-lived __anext__ task on a tick. Never re-issue
+                # wait_for per tick: cancelling __anext__ mid-await corrupts the
+                # async generator (and leaks CancelledError). Only the final
+                # timeout cancels it.
+                task = asyncio.ensure_future(agen.__anext__())
+                waited = 0.0
+                while True:
+                    # never let a tick overshoot the remaining budget, or a short
+                    # budget would be rounded UP to a whole tick
+                    slice_t = min(TICK_SECS, max(0.0, budget - waited))
+                    done, _pending = await asyncio.wait({task}, timeout=slice_t)
+                    if done:
+                        break
+                    waited += slice_t
+                    if waited >= budget:
+                        task.cancel()
+                        raise FrozenTurnError()
+                    if on_wait is not None:
+                        try:
+                            on_wait(waited, kind)
+                        except Exception:
+                            pass          # telemetry must never kill a turn
                 try:
-                    chunk = await asyncio.wait_for(
-                        agen.__anext__(),
-                        timeout=PREFILL_SECS if expect_prefill else IDLE_SECS)
-                except (asyncio.TimeoutError, TimeoutError):
-                    raise FrozenTurnError()
+                    chunk = task.result()
                 except StopAsyncIteration:
                     return err
+                if on_wait is not None and waited:
+                    try:
+                        on_wait(0.0, kind)        # moving again — clear the notice
+                    except Exception:
+                        pass
                 # a tool event => a tool is running and/or a continuation is about
                 # to prefill; grant the next wait the generous budget
                 expect_prefill = b"event: tool" in chunk
@@ -1244,8 +1272,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 sessions.save(session)
                 frozen = False
                 turn_err = None
+
+                def _tick(waited, kind, _rid=run_id):
+                    # publish "still alive, N seconds in" so a slow turn shows
+                    # movement in the UI instead of a blank progress panel
+                    r = _runs.load(_rid)
+                    if r is not None:
+                        r["waiting_secs"] = int(waited)
+                        r["waiting_kind"] = kind
+                        _runs.save(r)
+
                 try:
-                    turn_err = await _drain_turn(session)
+                    turn_err = await _drain_turn(session, on_wait=_tick)
                 except FrozenTurnError:
                     frozen = True
                 except asyncio.CancelledError:
@@ -1261,6 +1299,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                      f"turn failed: {str(e)[:200]}")
                     break
                 run = _runs.load(run_id) or run
+                run["waiting_secs"] = 0          # turn is over; clear the notice
                 if frozen:
                     run["frozen_streak"] = run.get("frozen_streak", 0) + 1
                     _runs.append_progress(run_id, "(a turn froze — no output)",
