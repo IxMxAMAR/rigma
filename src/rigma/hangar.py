@@ -23,6 +23,9 @@ _QUANT_RE = re.compile(
     re.IGNORECASE)
 
 
+DOWNLOAD_ATTEMPTS = 6   # multi-GB pulls WILL drop; resume and retry
+
+
 class HangarError(RuntimeError):
     pass
 
@@ -305,36 +308,58 @@ def _download_file(repo: str, file: str, dest, report) -> int:
     if dest.exists():
         report(dest.stat().st_size)
         return dest.stat().st_size
+    import time
     tok = os.environ.get("HF_TOKEN", "")
-    headers = {"authorization": f"Bearer {tok}"} if tok else {}
     part = dest.with_name(dest.name + ".part")
-    have = part.stat().st_size if part.exists() else 0
-    if have:
-        headers["range"] = f"bytes={have}-"
     url = f"https://huggingface.co/{repo}/resolve/main/{file}"
-    with httpx.stream("GET", url, headers=headers, follow_redirects=True,
-                      timeout=httpx.Timeout(60.0, read=120.0)) as r:
-        if r.status_code == 416:          # range past EOF: partial is complete
+    # A multi-GB download WILL have the connection dropped ("peer closed
+    # connection without sending complete message body"). Resume existed but
+    # nothing retried, so one drop threw away the transfer. Retry from the
+    # .part file instead — that's what resume is for.
+    last = ""
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        headers = {"authorization": f"Bearer {tok}"} if tok else {}
+        have = part.stat().st_size if part.exists() else 0
+        if have:
+            headers["range"] = f"bytes={have}-"
+        try:
+            with httpx.stream("GET", url, headers=headers,
+                              follow_redirects=True,
+                              timeout=httpx.Timeout(60.0, read=120.0)) as r:
+                if r.status_code == 416:   # range past EOF: partial is complete
+                    os.replace(part, dest)
+                    report(dest.stat().st_size)
+                    return dest.stat().st_size
+                if r.status_code in (401, 403):
+                    raise HangarError("that repo is gated — accept its license "
+                                      "on huggingface.co and set HF_TOKEN")
+                resumed = r.status_code == 206
+                if r.status_code not in (200, 206):
+                    raise HangarError(
+                        f"Hugging Face returned HTTP {r.status_code}")
+                if not resumed:
+                    have = 0               # server ignored Range — start over
+                with open(part, "ab" if resumed and have else "wb") as f:
+                    report(have)
+                    for chunk in r.iter_bytes(1 << 20):
+                        f.write(chunk)
+                        have += len(chunk)
+                        report(have)
             os.replace(part, dest)
-            report(dest.stat().st_size)
-            return dest.stat().st_size
-        if r.status_code in (401, 403):
-            raise HangarError("that repo is gated — accept its license on "
-                              "huggingface.co and set HF_TOKEN")
-        resumed = r.status_code == 206
-        if r.status_code not in (200, 206):
-            raise HangarError(f"Hugging Face returned HTTP {r.status_code}")
-        if not resumed:
-            have = 0                      # server ignored Range — start over
-        with open(part, "ab" if resumed and have else "wb") as f:
             report(have)
-            for chunk in r.iter_bytes(1 << 20):
-                f.write(chunk)
-                have += len(chunk)
-                report(have)
-    os.replace(part, dest)
-    report(have)
-    return have
+            return have
+        except HangarError:
+            raise                          # gated/HTTP errors are terminal
+        except Exception as e:             # transport drop: resume and retry
+            last = str(e)[:200]
+            if attempt == DOWNLOAD_ATTEMPTS - 1:
+                break
+            time.sleep(min(2 ** attempt, 20))
+    done = part.stat().st_size if part.exists() else 0
+    raise HangarError(
+        f"download kept dropping after {DOWNLOAD_ATTEMPTS} attempts "
+        f"({done:,} bytes saved — press Download again to resume from there). "
+        f"Last error: {last}")
 
 
 def pull_progress(file: str, total: int) -> int:
