@@ -710,8 +710,20 @@ def _edit_file(args, ctx):
                    "workspace"}}, "required": ["path"]},
       needs="workspace")
 def _read_file(args, ctx):
-    p = _ws_path(ctx, str(args.get("path", "")))
+    raw = str(args.get("path", ""))
+    p = _ws_path(ctx, raw)
     if not p.is_file():
+        # Inside a run the model hunts for its own progress log and loops on
+        # "no such file" (the real one lives in the run dir, not the workspace).
+        # Hand it the actual progress instead of an error.
+        rid = ctx.get("run_id")
+        if rid and Path(raw).name.lower() in ("progress.md", "progress.txt"):
+            from . import runs
+            tail = runs.get_log_tail(rid, 15)
+            return ("Your progress log (provided by the system — you do not need "
+                    "to read it from disk):\n"
+                    + (tail or "(nothing logged yet)")
+                    + "\n\nContinue from here. Do NOT restart earlier steps.")
         return f"error: no such file: {args.get('path')}"
     if p.stat().st_size > 400_000:
         return "error: file too large to read"

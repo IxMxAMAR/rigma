@@ -180,6 +180,13 @@ def done_summary(run_id: str, limit: int = 6) -> str:
     return "; ".join(f"#{t['id']} {t['text']}" for t in tail) + more
 
 
+def plan_counts(run_id: str) -> tuple[int, int]:
+    """(done, total) — a one-glance position marker for the driving line, so the
+    model never has to go hunting on disk to work out where it is."""
+    plan = read_plan(run_id)
+    return sum(1 for t in plan if t.get("status") == "done"), len(plan)
+
+
 def next_pending(run_id: str) -> str:
     """The single next step. One target beats a list — a list invites a small
     model to jump around or start from the top."""

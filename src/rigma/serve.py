@@ -1176,7 +1176,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "redo finished work.\n"
                     + (f"Already done: {done}\n" if done else "")
                     + f"Your next step: {nxt}\n" + base)
-        return base + f"  Next: {nxt}"
+        # Position on EVERY turn. Without it the model burns whole turns
+        # re-orienting — listing dirs, hunting for progress.md — instead of
+        # working. A few tokens here is far cheaper than a wasted turn.
+        d, tot = _runs.plan_counts(rid)
+        recent = (_runs.get_log_tail(rid, 1) or "").strip()
+        return (base + f"  [{d}/{tot} steps done]"
+                + (f" Last: {recent[-160:]}" if recent else "")
+                + f"  Next: {nxt}")
 
     def _sse_parse(chunk: bytes):
         """(event, obj) for one SSE chunk; ('', None) when there's no JSON body."""
