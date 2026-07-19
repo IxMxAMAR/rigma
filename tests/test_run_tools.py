@@ -44,7 +44,8 @@ def test_run_tools_gated_off_without_run():
     assert "manage_plan" not in base and "task_complete" not in base
     withrun = {t["function"]["name"]
                for t in tools.tool_specs(has_run=True)}
-    assert {"manage_plan", "log_progress", "task_complete"} <= withrun
+    assert {"manage_plan", "task_complete"} <= withrun
+    assert "log_progress" not in withrun   # server writes the log now
     # calling without a run_id in ctx is refused
     assert "only available inside" in tools.run_tool("manage_plan",
                                                      {"action": "list"}, {})
@@ -92,15 +93,6 @@ def test_read_file_progress_md_returns_the_log_not_an_error():
     # a genuinely missing file still errors normally
     assert tools.run_tool("read_file", {"path": "nope.txt"},
                           ctx).startswith("error")
-
-
-def test_log_progress_writes_to_run():
-    r = runs.create("m", "s")
-    ctx = {"run_id": r["id"]}
-    assert tools.run_tool("log_progress",
-                          {"done": "read 20 images", "next": "write doc"},
-                          ctx) == "logged."
-    assert "read 20 images" in runs.get_log_tail(r["id"])
 
 
 def test_task_complete_acknowledges():

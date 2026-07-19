@@ -218,6 +218,17 @@ def append_progress(run_id: str, done: str, next_step: str,
             pass
 
 
+def log_tool_action(run_id: str, name: str, args, result: str,
+                    workspace: str = "") -> None:
+    """Server-authored progress line. The model will not reliably narrate its
+    own work (progress.md was empty in practice) and the server already knows
+    exactly what ran — so the server writes the log."""
+    a = args if isinstance(args, dict) else {}
+    shown = ", ".join(f"{k}={str(v)[:60]}" for k, v in list(a.items())[:3])
+    res = " ".join(str(result).split())[:200]
+    append_progress(run_id, f"{name}({shown})", res or "(no output)", workspace)
+
+
 def get_log_tail(run_id: str, n: int = 5) -> str:
     try:
         lines = (run_dir(run_id) / "progress.md").read_text(

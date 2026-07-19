@@ -474,25 +474,6 @@ def _manage_plan(args, ctx):
     return "error: action must be add, complete, update, or list"
 
 
-@tool("log_progress",
-      "Record what you just accomplished and what you'll do next. Call this after "
-      "every meaningful step — it is your memory across context resets and the "
-      "log the user watches.",
-      {"type": "object", "properties": {
-          "done": {"type": "string", "description": "what you just accomplished"},
-          "next": {"type": "string", "description": "what you'll do next"}},
-       "required": ["done", "next"]},
-      needs="run")
-def _log_progress(args, ctx):
-    from . import runs
-    done = str(args.get("done", "")).strip()
-    if not done:
-        return "error: `done` is required"
-    runs.append_progress(ctx.get("run_id"), done, str(args.get("next", "")),
-                         workspace=ctx.get("workspace", ""))
-    return "logged."
-
-
 @tool("task_complete",
       "Call this ONLY when the ENTIRE mission is truly finished. Provide a "
       "`summary` of what was accomplished. You will be asked to verify with tools "
