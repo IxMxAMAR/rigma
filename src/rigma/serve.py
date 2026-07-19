@@ -86,6 +86,7 @@ PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big co
 TICK_SECS = 5.0         # how often a waiting turn reports "still working" to the UI
 LIVE_MAX = 80           # rolling live-activity entries kept on a run for the UI
 LIVE_TEXT_MAX = 1200    # per streamed-text entry; the tail is kept and marked
+LIVE_RESULT_MAX = 900   # per tool-result entry in the feed (display only)
 # bookkeeping ≠ work: these move no real work forward on their own
 _BOOKKEEPING_TOOLS = {"manage_plan", "task_complete"}
 K_ERROR = 8             # consecutive all-error turns before "stalled"
@@ -757,7 +758,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                             "call again"), None
                         else:
                             result, imgs = await _run_call(name, cargs)
-                    yield _sse({"name": name, "result": str(result)[:400]},
+                    _shown = str(result)
+                    if len(_shown) > 900:      # display only; the model gets it all
+                        _shown = _shown[:900] + " …(display truncated)"
+                    yield _sse({"name": name, "result": _shown},
                                event="tool_result")
                     trace.append({"name": name, "args": cargs, "result": result})
                     msgs.append({"role": "tool", "tool_call_id": c["id"],
@@ -1610,7 +1614,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     kind = text = None
                     if ev == "tool_result":
                         kind = "result"
-                        text = str(obj.get("result", ""))[:200]
+                        raw = str(obj.get("result", ""))
+                        # mark the cut: a bare slice ends mid-path and reads as
+                        # corrupted data (the model got the FULL result)
+                        text = (raw[:LIVE_RESULT_MAX] + " …(display truncated)"
+                                if len(raw) > LIVE_RESULT_MAX else raw)
                     elif ev == "tool":
                         a = obj.get("args") or {}
                         arg = ", ".join(f"{k}={str(v)[:48]}"
