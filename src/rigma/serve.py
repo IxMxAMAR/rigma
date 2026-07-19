@@ -1322,6 +1322,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         sess.update(use_tools=True, allow_code=True, auto_compact=True,
                     workspace=workspace, mission=mission,
                     system_prompt=AGENT_SYSTEM_PROMPT,   # agent role, not chat
+                    # thinking OFF by default: a reasoning model in an autonomous
+                    # loop tends to <think> in circles and never emit a tool call
+                    # (owner repro: 0 tool calls, empty turns). Act, don't deliberate.
+                    effort="off",
                     run_profile=profile if profile in _runs.PROFILES else "all")
         run = _runs.create(mission, sess["id"], workspace=workspace,
                            profile=profile,
