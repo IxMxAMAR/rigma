@@ -987,8 +987,12 @@ def _sample_files(args, ctx):
         from . import runs
         runs.set_last_sample(rid, [str(x) for x in picked])
     body = "\n".join(f"  [{i}] {x}" for i, x in enumerate(picked, 1))
-    tail = ("\nDo NOT retype these paths — you will get them wrong. To look at "
-            "them call view_sample()." if rid else "")
+    # Deliberately NOT written as `view_sample()`: a weak model copies
+    # callable-looking text out of tool output and emits it as prose instead of
+    # making the call (owner watched exactly that). Describe, don't demonstrate.
+    tail = ("\nThese paths are already recorded. Do not retype them — you will "
+            "get them wrong. Use the view_sample tool, with no arguments, to "
+            "look at this sample." if rid else "")
     return (f"{len(hits)} files match '{pat}' in {p}; random sample of "
             f"{len(picked)}:\n{body}{tail}")
 
