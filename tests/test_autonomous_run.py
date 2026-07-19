@@ -647,3 +647,43 @@ def test_feed_marks_display_truncation(engine, tmp_path):
                          r["session_id"])["messages"]
                      if isinstance(m.get("content"), str))
     assert "ComfyUI_00039_.png" in blob or "40" in blob
+
+
+def test_server_advances_the_plan_after_real_work(engine):
+    # the owner watched it re-sample the same images three turns running: it had
+    # DONE step #1 but never called manage_plan(complete), so the driving line
+    # said "Do this now: #1 ..." forever. The server advances the plan now.
+    _Engine.compile_reply = json.dumps({
+        "objective": "look then write",
+        "deliverables": [], "constraints": [],
+        "steps": [
+            {"id": 1, "description": "explore the folder", "artifact": "",
+             "verification": {"type": "none"}},
+            {"id": 2, "description": "write the notes", "artifact": "",
+             "verification": {"type": "none"}}]})
+    _Engine.script = [("current_datetime", {}), ("current_datetime", {}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "explore then write",
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    done = [t for t in r["plan"] if t["status"] == "done"]
+    assert done, f"no step was ever completed: {r['plan']}"
+    assert "complete" in c.get(f"/api/runs/{rid}/log").json()["log"]
+
+
+def test_artifact_step_only_completes_when_the_file_exists(engine, tmp_path):
+    # a step that promises a file is NOT done until the file is on disk
+    target = tmp_path / "out.txt"
+    _Engine.compile_reply = json.dumps({
+        "objective": "write a file", "deliverables": [], "constraints": [],
+        "steps": [{"id": 1, "description": "write the file",
+                   "artifact": str(target),
+                   "verification": {"type": "file_min_size", "value": 5}}]})
+    _Engine.script = [("current_datetime", {}), None]   # productive, but no file
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "write a file",
+                                    "budget_hours": 1,
+                                    "workspace": str(tmp_path)}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    assert all(t["status"] == "pending" for t in r["plan"]), \
+        "a step with a missing artifact must not be marked done"
