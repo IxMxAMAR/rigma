@@ -182,14 +182,16 @@ def test_runaway_tool_loop_keeps_tools_on_last_round(home, always_upstream):
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
     client = TestClient(build_app(upstream_port=always_upstream))
     sid = client.post("/api/sessions", json={}).json()["id"]
-    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    client.post(f"/api/sessions/{sid}",
+                json={"use_tools": True, "max_tool_rounds": 10})
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
     assert r.status_code == 200
     assert "<tool_call>" not in r.text            # never leaks raw call text
     assert "<function=" not in r.text
     reqs = _AlwaysToolUpstream.reqs
-    assert len(reqs) == 10                        # bounded at max_rounds
+    assert len(reqs) == 10                        # bounded at max_tool_rounds
     assert all(reqs)                              # EVERY round advertised tools
+    assert "keep going" in r.text                 # never finishes silently
 
 
 class _MultiToolUpstream(BaseHTTPRequestHandler):
@@ -254,3 +256,15 @@ def test_tool_calls_run_in_parallel(home, multi_upstream, monkeypatch):
     assert active["max"] >= 2          # ran concurrently, not one-by-one
     assert dt < 0.75                   # ~1x (0.3s), not 3x (0.9s)
     assert r.text.count("event: tool_result") == 3
+
+
+def test_max_tool_rounds_configurable(home, always_upstream):
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    _AlwaysToolUpstream.reqs = []
+    client = TestClient(build_app(upstream_port=always_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}",
+                json={"use_tools": True, "max_tool_rounds": 3})
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert len(_AlwaysToolUpstream.reqs) == 3      # honored the low ceiling
+    assert "keep going" in r.text
