@@ -1104,7 +1104,16 @@ function renderAutoStart(box) {
     prof.appendChild(o);
   }
   profL.appendChild(prof);
-  row.append(hoursL, profL); box.appendChild(row);
+  const effL = el("label", "", "Reasoning");
+  const eff = document.createElement("select");
+  for (const [v, t] of [["on", "on — plan each step (best quality)"],
+                        ["auto", "auto — model default"],
+                        ["off", "off — act fast, no thinking"]]) {
+    const o = document.createElement("option"); o.value = v; o.textContent = t;
+    eff.appendChild(o);
+  }
+  effL.appendChild(eff);
+  row.append(hoursL, profL, effL); box.appendChild(row);
   box.appendChild(el("label", "", "Workspace folder (where it works / writes)"));
   const ws = _input("text", "D:\\project  (optional — defaults to home)");
   box.appendChild(ws);
@@ -1116,7 +1125,7 @@ function renderAutoStart(box) {
     try {
       const run = await api("POST", "/api/runs", {
         mission: mission.value.trim(), budget_hours: parseFloat(hours.value) || 8,
-        profile: prof.value, workspace: ws.value.trim()});
+        profile: prof.value, effort: eff.value, workspace: ws.value.trim()});
       autoRunId = run.id;                                   // track it
       if (typeof renderRail === "function") renderRail();   // show its chat
       // render the dashboard immediately from the created run, then poll —

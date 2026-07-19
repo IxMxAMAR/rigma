@@ -201,5 +201,15 @@ def test_run_session_uses_agent_system_prompt(engine):
     s = sessions.load(runs.load(rid)["session_id"])
     assert "AUTONOMOUS AGENT" in s["system_prompt"]   # not the chat default
     assert "call at least one tool" in s["system_prompt"].lower()
-    assert s["effort"] == "off"                        # act, don't <think> in circles
+    assert s["effort"] == "on"                          # reason each step by default
     assert runs.load(rid)["mission"] == "do stuff"    # mission kept on the run
+
+
+def test_run_effort_override(engine):
+    from rigma import sessions
+    c = _client(engine)
+    _Engine.script = [None]
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1,
+                                    "effort": "off"}).json()["id"]
+    _wait(c, rid)
+    assert sessions.load(runs.load(rid)["session_id"])["effort"] == "off"
