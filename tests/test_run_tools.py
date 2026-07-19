@@ -282,3 +282,29 @@ def test_repair_handles_windows_paths_in_json_args():
     # correctly-escaped JSON is untouched and reports no repair
     ok, note2 = tools.repair_json_args(r'{"path": "D:\\ok\\x.png"}')
     assert ok["path"] == r"D:\ok\x.png" and not note2
+
+
+def test_view_sample_needs_no_paths_at_all(tmp_path):
+    # the model cannot retype comfyui-airport-editorial_00013205_(2).webp —
+    # three attempts produced three different digit strings. So let it act on
+    # the sample BY REFERENCE instead of reproducing names.
+    from PIL import Image
+    r = runs.create("m", "s")
+    for i in range(5):
+        Image.new("RGB", (4, 4), (9, 9, 9)).save(
+            tmp_path / f"comfyui-airport-editorial_{i:08d}_(2).png")
+    ctx = {"run_id": r["id"], "workspace": str(tmp_path), "has_vision": True}
+    out = tools.run_tool("sample_files", {"path": str(tmp_path), "count": 4}, ctx)
+    assert "[1]" in out and "Do NOT retype" in out
+    assert len(runs.get_last_sample(r["id"])) == 4
+    seen = tools.run_tool("view_sample", {"count": 2}, ctx)
+    assert seen.startswith(tools.IMAGE_SENTINEL)
+    body = seen[len(tools.IMAGE_SENTINEL):].split("\x00")[0]
+    assert len([ln for ln in body.splitlines() if ln.strip()]) == 2
+    # a slice of the sample, still with no paths
+    assert tools.run_tool("view_sample", {"first": 3, "count": 2},
+                          ctx).startswith(tools.IMAGE_SENTINEL)
+    # and a clear error when nothing was sampled
+    r2 = runs.create("m2", "s2")
+    assert "sample_files" in tools.run_tool(
+        "view_sample", {}, {"run_id": r2["id"], "has_vision": True})
