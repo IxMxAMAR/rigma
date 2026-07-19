@@ -139,7 +139,11 @@ def repair_json_args(raw: str):
             return v, ""
     except Exception:
         pass
-    fixed = re.sub(r",\s*([}\]])", r"\1", s)          # trailing commas
+    # Windows paths: a model writing "D:\Good Stuff\x.png" produces INVALID
+    # JSON (\G and \x are not escapes). Escape any stray backslash. This is the
+    # single most likely breakage for this user's missions.
+    fixed = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", s)
+    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)      # trailing commas
     for opener, closer in (("[", "]"), ("{", "}")):   # unbalanced closers
         missing = fixed.count(opener) - fixed.count(closer)
         if missing > 0:
