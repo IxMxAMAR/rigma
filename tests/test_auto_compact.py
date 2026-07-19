@@ -133,3 +133,21 @@ def test_compaction_keeps_enough_actions():
     # window must retain a useful number of ACTIONS, not just messages
     from rigma import serve
     assert serve.AUTO_COMPACT_KEEP >= 16
+
+
+def test_archive_is_bounded(home, upstream):
+    # a run compacts often and re-serialises the whole session each save, so an
+    # unbounded archive is real write amplification over a long run
+    from rigma import serve as _s
+    assert _s.ARCHIVE_MAX <= 1000
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=1000)
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = _seed(client, n=24)
+    s = sessions.load(sid)
+    s["archive"] = [{"role": "user", "content": f"old{i}"}
+                    for i in range(_s.ARCHIVE_MAX + 50)]
+    sessions.save(s)
+    _Upstream.prompt_tokens, _Upstream.compact_status = 950, 200
+    client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    assert len(sessions.load(sid)["archive"]) <= _s.ARCHIVE_MAX
