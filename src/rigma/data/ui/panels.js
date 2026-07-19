@@ -1176,8 +1176,16 @@ function _fillActivity(box, items) {
   }
   for (const a of items) {
     const kind = a.kind || "say";
-    const mark = kind === "tool" ? "→ " : kind === "result" ? "   ✔ " : "";
-    box.appendChild(el("div", "act act-" + kind, mark + (a.text || "")));
+    const line = el("div", "act act-" + kind);
+    // label every entry: without this, streamed thinking runs straight into the
+    // tool result above it and reads as one corrupted block
+    const tag = kind === "tool" ? "→ " : kind === "result" ? "   ✔ "
+              : kind === "think" ? "" : "";
+    if (kind === "think" || kind === "say") {
+      line.appendChild(el("span", "act-tag", kind === "think" ? "thinking" : "says"));
+    }
+    line.appendChild(document.createTextNode(tag + (a.text || "")));
+    box.appendChild(line);
   }
   if (pinned) box.scrollTop = box.scrollHeight;
 }

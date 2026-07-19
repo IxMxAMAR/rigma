@@ -80,6 +80,7 @@ PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big co
                         # the engine is genuinely dead; a normal turn starts instantly
 TICK_SECS = 5.0         # how often a waiting turn reports "still working" to the UI
 LIVE_MAX = 80           # rolling live-activity entries kept on a run for the UI
+LIVE_TEXT_MAX = 1200    # per streamed-text entry; the tail is kept and marked
 # bookkeeping ≠ work: these move no real work forward on their own
 _BOOKKEEPING_TOOLS = {"manage_plan", "task_complete"}
 K_ERROR = 8             # consecutive all-error turns before "stalled"
@@ -1551,7 +1552,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     items = live["items"]
                     # coalesce streamed text; tool calls stay discrete milestones
                     if kind in ("think", "say") and items and items[-1]["kind"] == kind:
-                        items[-1]["text"] = (items[-1]["text"] + text)[-700:]
+                        merged = items[-1]["text"] + text
+                        if len(merged) > LIVE_TEXT_MAX:
+                            # keep the TAIL (what it's doing now), but say so —
+                            # a bare slice starts mid-word and reads as garbage
+                            merged = "…" + merged[-LIVE_TEXT_MAX:]
+                        items[-1]["text"] = merged
                     else:
                         items.append({"kind": kind, "text": text})
                     del items[:-LIVE_MAX]
