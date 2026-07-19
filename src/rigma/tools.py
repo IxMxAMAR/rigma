@@ -54,6 +54,8 @@ IMAGE_SENTINEL = "\x00__RIGMA_IMAGE__\x00"
 
 _NETWORK_TOOLS = {"web_search", "fetch_url", "http_request", "ask_gemini"}
 
+_LIST_MAX = 200          # above this, summarise a folder instead of dumping names
+
 
 def tool_specs(allow_code: bool = False, has_rag: bool = False,
                workspace: str | None = None, has_vision: bool = False,
@@ -491,6 +493,21 @@ def _task_complete(args, ctx):
 
 # ---- gated tools (filesystem + code) ----------------------------------------
 
+def _read_path(ctx, raw: str) -> Path:
+    """Resolve a path for READ-ONLY tools, allowing ABSOLUTE paths.
+
+    Missions routinely name folders outside the workspace ("go through
+    D:\\Good Stuff"). Refusing those didn't make anything safer — run_shell can
+    already reach the whole filesystem — it just pushed the model into
+    `run_shell dir`, which dumped thousands of filenames into context and blew
+    the run up. Writes still go through _ws_path; the 'confined' profile keeps
+    everything workspace-relative."""
+    raw = str(raw or "").strip()
+    if Path(raw).is_absolute() and ctx.get("profile") != "confined":
+        return Path(raw).resolve()
+    return _ws_path(ctx, raw or ".")
+
+
 def _ws_path(ctx, rel: str) -> Path:
     """Resolve a path INSIDE the session's workspace root; refuse escapes.
 
@@ -684,15 +701,15 @@ def _edit_file(args, ctx):
 
 
 @tool("read_file",
-      "Read a text file inside the chat's workspace folder. Returns up to the "
-      "first 20000 characters (marked if truncated).",
+      "Read a text file. Accepts an ABSOLUTE path or one relative to the "
+      "workspace. Returns up to the first 20000 characters (marked if truncated).",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "path relative to the "
                    "workspace"}}, "required": ["path"]},
       needs="workspace")
 def _read_file(args, ctx):
     raw = str(args.get("path", ""))
-    p = _ws_path(ctx, raw)
+    p = _read_path(ctx, raw)
     if not p.is_file():
         # Inside a run the model hunts for its own progress log and loops on
         # "no such file" (the real one lives in the run dir, not the workspace).
@@ -715,27 +732,75 @@ def _read_file(args, ctx):
 
 
 @tool("list_directory",
-      "List files and folders inside the chat's workspace folder. Shows up to "
-      "200 entries; the true total is always reported (use find_files or "
-      "run_python to work with large folders).",
+      "List files and folders. Accepts an ABSOLUTE path (e.g. D:/Art) or one "
+      "relative to the workspace. Large folders are SUMMARISED (counts by type "
+      "+ examples) — use sample_files or find_files to work with them.",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "folder path relative to "
                    "the workspace (default: root)"}}},
       needs="workspace")
 def _list_dir(args, ctx):
-    p = _ws_path(ctx, str(args.get("path", "") or "."))
+    p = _read_path(ctx, str(args.get("path", "") or "."))
     if not p.is_dir():
         return f"error: not a folder: {args.get('path')}"
     items = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
     if not items:
         return "(empty)"
-    body = "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
-                     for x in items[:200])
-    if len(items) > 200:
-        body += f"\n…(showing 200 of {len(items)} entries)"
-    else:
-        body += f"\n({len(items)} entries)"
-    return body
+    if len(items) <= _LIST_MAX:
+        body = "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
+                         for x in items)
+        return body + f"\n({len(items)} entries)"
+    # BIG folder: a summary beats 200 raw filenames — it's a fraction of the
+    # tokens and actually tells the model what's in there. Dumping names is
+    # what ballooned context and stalled runs.
+    from collections import Counter
+    files = [x for x in items if x.is_file()]
+    dirs = [x for x in items if x.is_dir()]
+    kinds = ", ".join(f"{n}× {e}" for e, n in
+                      Counter((x.suffix.lower() or "(no ext)")
+                              for x in files).most_common(8))
+    out = [f"{len(items)} entries in {p} — too many to list in full.",
+           f"{len(files)} files ({kinds}); {len(dirs)} folders."]
+    if dirs:
+        out.append("folders: " + ", ".join(d.name for d in dirs[:10]))
+    out.append("example files:\n"
+               + "\n".join("📄 " + x.name for x in files[:15]))
+    out.append("To work with this folder use sample_files (random sample) or "
+               "find_files (glob). Do NOT dump the whole listing.")
+    return "\n".join(out)
+
+
+@tool("sample_files",
+      "Pick a RANDOM SAMPLE of files from a folder. Use this instead of listing "
+      "a huge folder when you only need examples (e.g. 20 images out of 2000). "
+      "Returns full paths, ready to pass straight to other tools.",
+      {"type": "object", "properties": {
+          "path": {"type": "string", "description": "folder — absolute (e.g. "
+                   "D:\\\\Good Stuff) or relative to the workspace"},
+          "count": {"type": "integer", "description": "how many, 1-50 (default 20)"},
+          "pattern": {"type": "string", "description": "optional glob filter, "
+                      "e.g. '*.png'"}},
+       "required": ["path"]},
+      needs="workspace")
+def _sample_files(args, ctx):
+    import random
+    p = _read_path(ctx, str(args.get("path", "") or "."))
+    if not p.is_dir():
+        return f"error: not a folder: {args.get('path')}"
+    pat = str(args.get("pattern", "") or "*").strip() or "*"
+    try:
+        n = max(1, min(int(args.get("count", 20) or 20), 50))
+    except (TypeError, ValueError):
+        n = 20
+    try:
+        hits = [x for x in p.glob(pat) if x.is_file()]
+    except Exception as e:
+        return f"error: bad pattern '{pat}': {e}"
+    if not hits:
+        return f"no files match '{pat}' in {p}"
+    picked = sorted(random.sample(hits, min(n, len(hits))), key=lambda x: x.name)
+    return (f"{len(hits)} files match '{pat}' in {p}; random sample of "
+            f"{len(picked)}:\n" + "\n".join(str(x) for x in picked))
 
 
 @tool("write_file",

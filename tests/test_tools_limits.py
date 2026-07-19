@@ -7,12 +7,16 @@ def _ws(tmp):
     return {"workspace": str(tmp), "allow_code": True}
 
 
-def test_list_directory_reports_total_when_truncated(tmp_path):
+def test_list_directory_summarises_large_folders(tmp_path):
+    # a big folder is SUMMARISED (counts by type + examples) rather than dumped:
+    # 200 raw filenames was a large, low-value chunk of a slow model's context
     for i in range(250):
         (tmp_path / f"f{i:03}.png").write_bytes(b"x")
     out = tools.run_tool("list_directory", {}, _ws(tmp_path))
-    assert "250" in out                      # true total surfaced
-    assert "200 of 250" in out               # explicit partial-view marker
+    assert "250" in out                      # true total still surfaced
+    assert "250× .png" in out                # what's actually in there
+    assert "sample_files" in out             # and the cheap way to use it
+    assert out.count("f0") < 30              # not a full dump
 
 
 def test_list_directory_small_folder_has_no_more_marker(tmp_path):
