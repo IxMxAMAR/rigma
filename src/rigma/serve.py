@@ -1834,15 +1834,41 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 run.get("workspace", ""))
                         except Exception:
                             pass
+                productive = [t for t in trace
+                              if t.get("name") not in _BOOKKEEPING_TOOLS
+                              and not str(t.get("result", "")).startswith("error")]
+                # ADVANCE THE PLAN OURSELVES. The model rarely calls
+                # manage_plan(complete), so a finished step stays pending and the
+                # driving line repeats "Do this now: #1 ..." forever — the owner
+                # watched it re-sample the same images three turns running.
+                # An artifact step completes when its file verifies; an
+                # exploration step (nothing to verify) completes after one
+                # productive action, because repeating it achieves nothing.
+                if productive:
+                    pend = _runs.pending_tasks(run_id)
+                    if pend:
+                        cur = pend[0]
+                        spec_steps = (run.get("spec") or {}).get("steps") or []
+                        st_spec = next((s for s in spec_steps
+                                        if s.get("description") == cur.get("text")),
+                                       None)
+                        done_now, why = True, "no artifact to verify"
+                        if st_spec and st_spec.get("artifact"):
+                            done_now, why = _mission_mod.verify_step(
+                                st_spec, run.get("workspace", ""))
+                        if done_now:
+                            _runs.plan_complete(run_id, cur["id"])
+                            _runs.append_progress(
+                                run_id, f"step #{cur['id']} complete "
+                                f"({cur['text'][:80]})",
+                                _runs.next_pending(run_id) or "verify and finish",
+                                run.get("workspace", ""))
                 sig = _turn_sig(trace)
                 # Bookkeeping is not work. A turn that only ticks plan items and
                 # logs "done: X" while producing NO artifact must NOT reset the
                 # idle streak — otherwise the model narrates its way through the
                 # whole plan ("Now I'll generate prompts 1-25...") without ever
                 # writing anything, and the watchdog reads it as healthy.
-                productive = [t for t in trace
-                              if t.get("name") not in _BOOKKEEPING_TOOLS
-                              and not str(t.get("result", "")).startswith("error")]
                 if not trace:
                     run["lazy_streak"] = run.get("lazy_streak", 0) + 1
                 elif all(str(t.get("result", "")).startswith("error")
