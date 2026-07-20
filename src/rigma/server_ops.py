@@ -160,10 +160,17 @@ def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
     return out
 
 
+KV_CACHE_TYPES = ("f16", "q8_0", "q5_1", "q4_0")
+
+
 def perform_switch(model: str, registry=None, profile=None,
-                   ctx: int | None = None, force_calibrate: bool = False) -> dict:
+                   ctx: int | None = None, force_calibrate: bool = False,
+                   kv: str | None = None) -> dict:
     """Stop the running engine and launch `model` in its place; with `ctx`,
-    relaunch (same model allowed) at a requested context size.
+    relaunch (same model allowed) at a requested context size; with `kv`,
+    force the KV-cache quantisation (f16/q8_0/q5_1/q4_0). Growing the cache
+    (q8_0 -> f16) may not fit — the launch failure path reports it honestly
+    and leaves the UI manageable.
 
     Raises RuntimeError with a user-facing message on any failure; a failure
     after the old engine died clears state (one requested plan, one honest
@@ -173,8 +180,10 @@ def perform_switch(model: str, registry=None, profile=None,
     s = st.read_state()
     if s is None:
         raise RuntimeError("not running")
+    if kv is not None and kv not in KV_CACHE_TYPES:
+        raise RuntimeError(f"kv must be one of {', '.join(KV_CACHE_TYPES)}")
     if (model == s.get("model") and not s.get("unloaded") and ctx is None
-            and not force_calibrate):
+            and kv is None and not force_calibrate):
         raise RuntimeError(f"{model} is already running")
     from .registry import Registry
     reg_full = registry if registry is not None else Registry.load()
@@ -209,6 +218,9 @@ def perform_switch(model: str, registry=None, profile=None,
             "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe, "ngl": flags.ngl,
             "cache_type_k": flags.cache_type_k,
             "cache_type_v": flags.cache_type_v})
+    if kv is not None:
+        rp.flags = rp.flags.model_copy(update={"cache_type_k": kv,
+                                               "cache_type_v": kv})
     # vision projector: attach it if it's on disk, otherwise run text-only
     # rather than refusing — a vision model still works for text, and the user
     # can download the projector separately to turn vision on
@@ -266,7 +278,7 @@ def perform_switch(model: str, registry=None, profile=None,
                    engine_pid=sp.proc.pid,
                    ui_pid=int(s.get("ui_pid", os.getpid())),
                    backend=rp.backend, use_case=s.get("use_case", "general"),
-                   ctx=rp.flags.ctx)
+                   ctx=rp.flags.ctx, kv_cache=rp.flags.cache_type_k or "")
     return st.read_state()
 
 

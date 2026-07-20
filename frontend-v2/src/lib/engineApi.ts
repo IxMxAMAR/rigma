@@ -18,6 +18,7 @@ export interface ServerInfo {
   backend?: string;
   ctx?: number;
   unloaded?: boolean;
+  kv_cache?: string;
   calibrating?: unknown;
   engine_version?: string;
   last_tg?: number | null;
@@ -73,7 +74,8 @@ export const engineApi = {
   server: () => j<ServerInfo>("GET", "/api/server"),
   switchOptions: () => j<SwitchOption[]>("GET", "/api/server/switch-options"),
   switchTo: (model: string) => j<unknown>("POST", "/api/server/switch", { model }),
-  setCtx: (ctx: number) => j<unknown>("POST", "/api/server/ctx", { ctx }),
+  relaunch: (ctx: number, kv?: string) =>
+    j<unknown>("POST", "/api/server/ctx", kv ? { ctx, kv } : { ctx }),
   load: () => j<unknown>("POST", "/api/server/load", {}),
   unload: () => j<unknown>("POST", "/api/server/unload", {}),
   recalibrate: () => j<unknown>("POST", "/api/server/recalibrate", {}),

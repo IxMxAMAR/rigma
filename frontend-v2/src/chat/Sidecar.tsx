@@ -2,6 +2,7 @@
 // Collapsible; state persists to the session via the existing PATCH API.
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { useApp } from "../store";
 import { useChat } from "./chatStore";
 
 interface RagStatus {
@@ -121,6 +122,9 @@ interface PresetRow {
 
 function SamplingCard() {
   const currentId = useChat((s) => s.currentId);
+  // the cap follows the ENGINE's context — a hardcoded 32768 silently
+  // clamped a 131072 the user had set (owner report 2026-07-21)
+  const maxTok = useApp((s) => s.server?.ctx) || 262144;
   const [params, setParams] = useState<Record<string, number>>({});
   const [prompt, setPrompt] = useState("");
   const [dirty, setDirty] = useState(false);
@@ -215,7 +219,7 @@ function SamplingCard() {
       {num("temperature", "temperature", 0.05, 2)}
       {num("dry_multiplier", "DRY", 0.05, 2)}
       {num("repeat_penalty", "repeat pen.", 0.01, 2)}
-      {num("max_tokens", "max tokens", 256, 32768)}
+      {num("max_tokens", "max reply tokens", 1024, maxTok)}
       {dirty && (
         <button
           onClick={() => void save()}

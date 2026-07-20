@@ -138,7 +138,7 @@ export default function EngineSurface() {
                   const v = Number(e.target.value);
                   if (v && v !== info.ctx &&
                       window.confirm(`Relaunch at ${Math.round(v / 1024)}K context?`))
-                    void act("ctx", () => engineApi.setCtx(v));
+                    void act("ctx", () => engineApi.relaunch(v));
                 }}
                 aria-label="Context size"
                 className="rounded-md bg-surface px-2 py-1 outline-none"
@@ -150,6 +150,29 @@ export default function EngineSurface() {
                   .map((v) => (
                     <option key={v} value={v}>{Math.round(v / 1024)}K</option>
                   ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1.5 font-mono text-[12px] text-secondary">
+              kv cache
+              <select
+                value={String(info.kv_cache || "")}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v && v !== info.kv_cache && info.ctx &&
+                      window.confirm(
+                        `Relaunch with ${v} KV cache? ` +
+                        (v === "f16"
+                          ? "f16 uses the most VRAM and may not fit at the current context."
+                          : "Smaller cache types trade a little quality for VRAM.")))
+                    void act("kv", () => engineApi.relaunch(info.ctx as number, v));
+                }}
+                aria-label="KV cache quantisation"
+                className="rounded-md bg-surface px-2 py-1 outline-none"
+              >
+                {!info.kv_cache && <option value="">auto</option>}
+                {["f16", "q8_0", "q5_1", "q4_0"].map((v) => (
+                  <option key={v} value={v}>{v}</option>
+                ))}
               </select>
             </label>
             <button
