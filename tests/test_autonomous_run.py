@@ -565,7 +565,11 @@ def test_driving_line_states_the_work_not_the_protocol(engine):
                if m.get("role") == "user"]
     assert driving
     assert not any("Emit ONE tool call" in d for d in driving)
-    assert any("Do this now:" in d for d in driving)
+    # was: assert any("Do this now:" in d ...). The work is still named every
+    # turn — it is now stated as status rather than ordered, because an
+    # imperative in a role=user message reads as a fresh human command and
+    # restarts the step (see test_driving_message.py for the trap itself).
+    assert any("next:" in d for d in driving), driving[-2:]
 
 
 def test_prose_turn_is_saved_not_discarded(engine, tmp_path):

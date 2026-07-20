@@ -377,16 +377,30 @@ def _driving_message(run, session):
                 "redo finished work.\n"
                 + (f"Already done: {done}\n" if done else "")
                 + f"Your next step: {nxt}\n" + base)
-    # Fires on EVERY action now, so it stays one short line — each token is
-    # prefill cost on a slow local model. The previous "Last: <log line>"
-    # echo is gone: the actual TOOL RESULT is carried into context directly,
-    # which is better continuity than a summary of it.
-    # State the WORK, never the protocol. "Emit ONE tool call" repeated every
-    # turn gave the model something to reason ABOUT — it looped writing "the
-    # prompt says Emit ONE tool call" instead of calling anything. Protocol
-    # rules belong in the (cached) system prompt, said once.
+    # The routine turn: STATUS, not an order. This arrives as a role=user
+    # message every single turn, and an imperative there is indistinguishable
+    # from the human typing a new command — recency bias makes the model read
+    # "Do this now: #1" as *start* step 1 and restart finished work (the
+    # reinjection trap; watched live 2026-07-20).
+    #
+    # So: no imperative mood, nothing addressed to "you". There is no
+    # instruction here to restart FROM. Real interruptions — steering, missing
+    # artifacts, failed verification — stay imperative above, because those are
+    # events rather than status and should read as interruptions.
+    #
+    # Position is deliberately unchanged (appended last). Appending leaves the
+    # cached prompt prefix intact; moving per-turn state into the pinned system
+    # block would invalidate the whole KV cache every turn.
+    #
+    # Still no mission restatement and still no protocol rules: both are in the
+    # cached system prompt, and repeating them gave the model something to
+    # reason ABOUT instead of act on.
     d, tot = _runs.plan_counts(rid)
-    return f"[{d}/{tot} done] Do this now: {nxt}"
+    lines = ["### RUN STATE", f"step: {d + 1} of {tot}", f"next: {nxt}"]
+    if last:
+        names = ", ".join(dict.fromkeys(t.get("name", "") for t in last))
+        lines.append(f"last action: {names}")
+    return "\n".join(lines)
 
 
 def build_app(upstream_port: int, default_prompt: str | None = None,
