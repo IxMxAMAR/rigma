@@ -169,3 +169,51 @@ def test_view_image_still_rejects_nonimage(tmp_path):
     f.write_text("hi")
     assert "not an image" in tools.run_tool(
         "view_image", {"path": str(f)}, {"has_vision": True})
+
+
+# ---- rescue parser for engine-missed tool calls (live 2026-07-20) ----
+
+def test_rescue_parses_the_exact_leaked_call():
+    # verbatim from the stalled live run: llama-server yielded NO tool_calls
+    # and this arrived as content
+    from rigma.tools import rescue_xml_tool_call
+    text = ("<tool_call><function=list_directory>\n<parameter=path>\n.\n"
+            "</parameter>\n</function>\n</tool_call>")
+    name, args = rescue_xml_tool_call(text)
+    assert name == "list_directory"
+    assert args == {"path": "."}
+
+
+def test_rescue_handles_multiline_code_params():
+    from rigma.tools import rescue_xml_tool_call
+    text = ("<tool_call><function=run_python>\n<parameter=code>\n"
+            "import os\nprint(len(os.listdir('.')))\n</parameter>\n"
+            "</function></tool_call>")
+    name, args = rescue_xml_tool_call(text)
+    assert name == "run_python"
+    assert "os.listdir" in args["code"]
+
+
+def test_rescue_ignores_prose_and_mentions():
+    from rigma.tools import rescue_xml_tool_call
+    for text in ("I will call list_directory now.",
+                 "the function=thing syntax is documented",
+                 "", None):
+        assert rescue_xml_tool_call(text) == (None, None)
+
+
+def test_rescue_takes_only_the_first_call():
+    # one-action mode must hold even through the rescue path
+    from rigma.tools import rescue_xml_tool_call
+    text = ("<function=read_file><parameter=path>a.md</parameter></function>"
+            "<function=write_file><parameter=path>b.md</parameter></function>")
+    name, args = rescue_xml_tool_call(text)
+    assert name == "read_file"
+
+
+def test_rescue_structured_values_stay_structured():
+    from rigma.tools import rescue_xml_tool_call
+    text = ('<function=view_images><parameter=paths>["a.png", "b.png"]'
+            '</parameter></function>')
+    name, args = rescue_xml_tool_call(text)
+    assert args["paths"] == ["a.png", "b.png"]
