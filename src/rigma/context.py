@@ -38,18 +38,27 @@ def session_chars(messages: list[dict]) -> int:
     return total
 
 
+# the legacy sniff demands the full shape `TOOL RESULT <name>: `, not just the
+# two words: a human steering message like "TOOL RESULT formats are failing,
+# fix your syntax" starts with the bare prefix, and masking IT would erase the
+# very correction the user typed. Only the server writes the colon form.
+_LEGACY_RE = re.compile(r"^TOOL RESULT \S+: ")
+
+
 def is_observation(msg: dict) -> bool:
     """A tool result, as opposed to a real user turn or the RUN STATE block.
 
-    Prefers the explicit tag, falls back to the text prefix: sessions written
+    Prefers the explicit tag, falls back to the text shape: sessions written
     before the tag existed are on disk in live runs and must still mask.
     """
     if msg.get("role") != "user":
         return False
     if msg.get("kind") == "tool_result":
         return True
+    if "kind" in msg:                      # explicitly something else
+        return False
     return isinstance(msg.get("content"), str) and \
-        msg["content"].startswith(_PREFIX)
+        bool(_LEGACY_RE.match(msg["content"]))
 
 
 def _mask_one(msg: dict) -> dict:
@@ -80,17 +89,23 @@ def mask_observations(messages: list[dict], keep_recent: int = 6,
     Returns (new_messages, n_masked). Does not mutate the input.
     """
     out = [dict(m) for m in messages]
-    if session_chars(out) <= budget_chars:
+    # running total, adjusted as messages shrink. Recomputing session_chars()
+    # inside the loop was O(n²) — harmless in tests, but this runs ON the
+    # asyncio event loop, and a long trajectory would freeze every other
+    # request while it ground through millions of length checks.
+    total = session_chars(out)
+    if total <= budget_chars:
         return out, 0
     tail_start = len(out) - keep_recent if keep_recent else len(out)
     masked = 0
     for i, msg in enumerate(out):
-        if session_chars(out) <= budget_chars:
+        if total <= budget_chars:
             break
         if i >= tail_start or not is_observation(msg):
             continue
         new = _mask_one(msg)
         if new["content"] != msg["content"]:
+            total -= len(msg.get("content", "")) - len(new["content"])
             out[i] = new
             masked += 1
     return out, masked

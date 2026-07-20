@@ -177,13 +177,18 @@ def test_empty_store_renders_nothing(tmp_path):
     assert render_pitfall_block([]) == ""
 
 
-def test_drafts_are_labelled_unverified(tmp_path):
-    # nothing graduates in phase 1 (promotion needs phase 3's outcome
-    # tracking), so drafts ARE shown — but always hedged. A labelled hint is
-    # not a foundation, which is what the quarantine protects against.
+def test_drafts_are_shown_but_not_hedged(tmp_path):
+    # drafts ARE pinned (nothing can graduate until phase 3), but WITHOUT the
+    # "UNVERIFIED:" prefix an earlier revision used: under a header saying
+    # "these are rules, not suggestions" the hedge is a contradiction a weak
+    # model resolves badly. The store still tracks status for phase 3; the
+    # bounded cap is the quarantine until then.
     store = MemoryStore(tmp_path / "m.jsonl")
-    store.add(kind="pitfall", text="Never type filenames.")
-    assert "UNVERIFIED" in render_pitfall_block(store.all())
+    m = store.add(kind="pitfall", text="Never type filenames.")
+    assert m["status"] == "draft"                  # data model unchanged
+    block = render_pitfall_block(store.all())
+    assert "Never type filenames" in block
+    assert "UNVERIFIED" not in block
 
 
 def test_verified_memories_are_not_hedged(tmp_path):
@@ -289,3 +294,61 @@ def test_harvest_is_bounded(tmp_path):
 def test_harvest_never_raises_on_a_broken_trace(tmp_path):
     store = MemoryStore(tmp_path / "m.jsonl")
     assert _run(harvest_run([{"garbage": True}], store, _reply("x"))) == []
+
+
+# ---- review fixes (2026-07-20 adversarial review) ----
+
+def test_store_writes_are_atomic(tmp_path):
+    # write_text truncates in place: a crash mid-write 19 hours into a run
+    # would zero the store. The fix writes a sibling tmp file and os.replace()s
+    # it — the store is always either the old rows or the new rows.
+    p = tmp_path / "m.jsonl"
+    store = MemoryStore(p)
+    store.add(kind="pitfall", text="Never type filenames.")
+    store.add(kind="pitfall", text="Deliverables go in files.")
+    assert not p.with_suffix(".tmp").exists(), "tmp must not linger"
+    assert len(MemoryStore(p).all()) == 2
+
+
+def test_guard_rejection_is_logged_not_silent(tmp_path, caplog):
+    # a swallowed NameError already cost a whole session once. Failures stay
+    # non-fatal but must be OBSERVABLE.
+    import logging
+    store = MemoryStore(tmp_path / "m.jsonl")
+    actions = [_a("view_images", {"p": r"D:\x\a.png"}, ok=False),
+               _a("view_sample", {}, ok=True)]
+    with caplog.at_level(logging.INFO, logger="rigma.memory"):
+        _run(harvest_run(actions, store, _reply(r"Do not open D:\x\a.png")))
+    assert any("guard rejected" in r.message for r in caplog.records)
+
+
+def test_pitfall_store_is_bounded(tmp_path):
+    # the distiller at nonzero temperature paraphrases the same lesson
+    # differently every run — exact dedup cannot catch that, so the cap is
+    # what stops 50 runs producing 150 near-duplicate rules
+    from rigma.memory import MAX_PITFALLS
+    store = MemoryStore(tmp_path / "m.jsonl")
+    for i in range(MAX_PITFALLS + 10):
+        store.add(kind="pitfall", text=f"Distinct paraphrase number {i}.")
+    pits = [m for m in store.all() if m["kind"] == "pitfall"]
+    assert len(pits) <= MAX_PITFALLS
+
+
+def test_eviction_spares_the_proven_rule(tmp_path):
+    from rigma.memory import MAX_PITFALLS
+    store = MemoryStore(tmp_path / "m.jsonl")
+    for _ in range(3):   # reinforce one rule so it is provably not junk
+        store.add(kind="pitfall", text="Never type filenames.")
+    for i in range(MAX_PITFALLS + 5):
+        store.add(kind="pitfall", text=f"One-off hunch {i}.")
+    texts = [m["text"] for m in store.all()]
+    assert "Never type filenames." in texts
+
+
+def test_pinned_rules_carry_no_epistemic_hedge(tmp_path):
+    # "these are rules, not suggestions" + "UNVERIFIED:" is a contradiction a
+    # weak model resolves badly — ignore the hedge, narrate it, or TEST the
+    # unverified rule. What gets pinned gets committed to.
+    store = MemoryStore(tmp_path / "m.jsonl")
+    store.add(kind="pitfall", text="Never type filenames.")
+    assert "UNVERIFIED" not in render_pitfall_block(store.all())

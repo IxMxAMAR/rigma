@@ -27,9 +27,13 @@ Pure functions plus one file. No engine, no network, no inference.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # How far after a failure a success still counts as "the thing that fixed it".
 # Wide enough for a real recovery (diagnose, then act), narrow enough that two
@@ -39,6 +43,14 @@ RECOVERY_WINDOW = 4
 # Kinds whose whole purpose is naming an artifact, where a literal filename is
 # the content rather than noise. Behavioural rules get no such licence.
 _GUARD_EXEMPT_KINDS = {"project"}
+
+# Hard cap on stored pitfalls. Exact-text dedup cannot catch an LLM distiller
+# paraphrasing the same lesson differently every run ("Never type filenames" /
+# "Do not manually type file names" / ...), so without a bound the store
+# accumulates near-duplicates with flat counts and the pinned top-5 becomes a
+# pseudo-random slice of redundant rules. Until phase 2 brings semantic dedup,
+# the cap IS the quarantine: overflow evicts the least-proven rule.
+MAX_PITFALLS = 24
 
 _WIN_PATH = re.compile(r"[A-Za-z]:[\\/]")
 _UNC_PATH = re.compile(r"\\\\[^\\]+\\")
@@ -125,9 +137,18 @@ class MemoryStore:
         return out
 
     def _write_all(self, rows: list[dict]) -> None:
+        # write-then-rename, never truncate-in-place: write_text() empties the
+        # file before refilling it, so a crash mid-write (or the box losing
+        # power 19 hours into a run) would leave ZERO memories where months of
+        # accumulated rules used to be. os.replace is atomic on Windows and
+        # POSIX — the store is always either the old rows or the new rows.
+        # (No cross-process lock: one Rigma process, one active run at a time,
+        # and the store is only written from the run loop's post-mortem.)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(r) + "\n" for r in rows),
+                       encoding="utf-8")
+        os.replace(tmp, self.path)
 
     def add(self, kind: str, text: str, **extra) -> dict:
         """Store a memory. Raises ValueError if it carries a raw trace.
@@ -156,6 +177,16 @@ class MemoryStore:
                "seen_count": 1, "outcome_score": 0,
                "born": time.time(), "last_seen": time.time(), **extra}
         rows.append(rec)
+        # bounded: evict the least-proven pitfall when over cap. Verified rules
+        # outrank drafts; among equals, lowest outcome then lowest seen goes.
+        pits = [r for r in rows if r.get("kind") == "pitfall"]
+        if len(pits) > MAX_PITFALLS:
+            evict = min(pits, key=lambda m: (m.get("status") == "verified",
+                                             m.get("outcome_score", 0),
+                                             m.get("seen_count", 0),
+                                             m.get("last_seen", 0)))
+            rows.remove(evict)
+            log.info("memory: cap reached, evicted %r", evict.get("text", "")[:60])
         self._write_all(rows)
         return rec
 
@@ -227,6 +258,10 @@ async def harvest_run(actions: list[dict], store: MemoryStore, complete,
     try:
         events = mine_events(actions)
     except Exception:
+        # non-fatal by design, but NEVER invisible: an unlogged broad except
+        # already hid a NameError here for a whole session, during which every
+        # test passed while memory silently did nothing.
+        log.exception("memory: event mining failed")
         return written
     for event in events[:max_rules]:
         rule = await distil(event, complete)
@@ -234,12 +269,14 @@ async def harvest_run(actions: list[dict], store: MemoryStore, complete,
             continue
         try:
             written.append(store.add(kind="pitfall", text=rule))
-        except ValueError:
+        except ValueError as e:
             # the distiller leaked a path or a literal argument. Dropping it is
             # correct: an un-generalised rule is worthless at best, and the
             # guard exists because a raw trace actively teaches the failure.
+            log.info("memory: guard rejected a rule (%s)", e)
             continue
         except Exception:
+            log.exception("memory: store write failed")
             continue
     return written
 
@@ -255,23 +292,25 @@ def render_pitfall_block(memories: list[dict], limit: int = 5,
     and nothing else. An empty store renders nothing at all — an empty header
     would just be context the model feels invited to comment on.
 
-    `include_drafts` defaults True in phase 1 and the spec says drafts must
-    never be PINNED. Both are right, and the resolution is the label: nothing
-    graduates yet (promotion needs the outcome tracking phase 3 builds), so
-    verified-only would render an empty block forever and phase 1 would ship
-    inert. An explicitly UNVERIFIED line is a hint, not a foundation, which is
-    what the quarantine was protecting against. Flip this default to False when
-    graduation exists.
+    Drafts are shown (nothing can graduate until phase 3 builds outcome
+    tracking; verified-only would render an empty block forever) but they are
+    NOT labelled. An earlier revision prefixed drafts with "UNVERIFIED:", and
+    review killed it: under a header saying "these are rules, not suggestions"
+    the hedge is an epistemic contradiction a sub-40B model resolves badly —
+    it either ignores the label (quarantine meaningless) or fixates on it and
+    narrates its uncertainty, or worse, decides to TEST the unverified rule.
+    What gets pinned gets committed to; the real quarantine is the store cap
+    and, in phase 3, graduation. `status: draft` stays in the data model.
     """
     rows = [m for m in memories or [] if m.get("kind") == "pitfall"]
     if not include_drafts:
         rows = [m for m in rows if m.get("status") == "verified"]
     if not rows:
         return ""
-    rows.sort(key=lambda m: (m.get("outcome_score", 0), m.get("seen_count", 0)),
-              reverse=True)
+    rows.sort(key=lambda m: (m.get("status") == "verified",
+                             m.get("outcome_score", 0),
+                             m.get("seen_count", 0)), reverse=True)
     lines = ["WHAT YOU LEARNED BEFORE — these are rules, not suggestions:"]
     for m in rows[:limit]:
-        tag = "UNVERIFIED: " if m.get("status") != "verified" else ""
-        lines.append(f"  • {tag}{m.get('text', '')}")
+        lines.append(f"  • {m.get('text', '')}")
     return "\n".join(lines)
