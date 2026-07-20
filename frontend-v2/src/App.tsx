@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react";
 import AutonomousSurface from "./autonomous/AutonomousSurface";
 import { useChat } from "./chat/chatStore";
+import { Copy as CopyIcon, External } from "./Icon";
 import ChatSurface from "./chat/ChatSurface";
 import EngineSurface from "./engine/EngineSurface";
 import MemorySurface from "./memory/MemorySurface";
@@ -134,9 +135,9 @@ function Header() {
                 }}
                 aria-label="Copy workspace path"
                 title={copied ? "copied!" : "copy path"}
-                className="shrink-0 text-muted hover:text-secondary text-[11px]"
+                className="shrink-0 text-muted hover:text-secondary"
               >
-                {copied ? "✓" : "⧉"}
+                {copied ? <span className="font-mono text-[11px] text-moss">✓</span> : <CopyIcon />}
               </button>
               <button
                 onClick={() => {
@@ -145,9 +146,9 @@ function Header() {
                 }}
                 aria-label="Open workspace in file manager"
                 title="open in Explorer"
-                className="shrink-0 text-muted hover:text-amber text-[12px]"
+                className="shrink-0 text-muted hover:text-amber"
               >
-                ⤴
+                <External />
               </button>
             </>
           )}

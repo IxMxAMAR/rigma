@@ -4,6 +4,7 @@
 // is when files appear).
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useChat } from "./chat/chatStore";
+import { Edit as EditIcon, External, Refresh } from "./Icon";
 import { useApp } from "./store";
 
 interface Entry {
@@ -65,9 +66,9 @@ export default function WorkspacePanel() {
         <button
           onClick={() => { setDraft(data?.path ?? ""); setEditing(!editing); }}
           aria-label="Set workspace folder" title="click to change folder"
-          className="font-mono text-[10.5px] text-muted hover:text-secondary uppercase tracking-[0.08em] flex-1 text-left"
+          className="font-mono text-[10.5px] text-muted hover:text-secondary uppercase tracking-[0.08em] flex-1 text-left inline-flex items-center gap-1.5"
         >
-          workspace ✎
+          workspace <EditIcon size={10} />
         </button>
         {data?.path && (
           <>
@@ -77,10 +78,10 @@ export default function WorkspacePanel() {
                            { method: "POST" });
               }}
               aria-label="Open in file manager" title="open in Explorer"
-              className="text-muted hover:text-amber text-[11px]">⤴</button>
+              className="text-muted hover:text-amber"><External size={11} /></button>
             <button onClick={() => void refresh()} aria-label="Refresh workspace"
                     title="refresh"
-                    className="text-muted hover:text-secondary text-[11px]">↻</button>
+                    className="text-muted hover:text-secondary"><Refresh size={11} /></button>
           </>
         )}
       </div>

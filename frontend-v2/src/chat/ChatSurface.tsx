@@ -2,6 +2,8 @@
 // Right sidecar (params, grounding) arrives in Phase 4.
 import { useEffect, useRef, useState } from "react";
 import FloatWindow from "../FloatWindow";
+import { Attach, Close, Download, Duplicate } from "../Icon";
+import ModelPicker from "./ModelPicker";
 import { useApp } from "../store";
 import Sidecar from "./Sidecar";
 import Transcript from "./Transcript";
@@ -53,19 +55,19 @@ function SessionRail() {
             >
               {s.title || "untitled"}
             </button>
-            <span className="hidden group-hover:flex items-center pr-1 shrink-0">
+            <span className="hidden group-hover:flex items-center gap-0.5 pr-1.5 shrink-0">
               <a href={`/api/sessions/${s.id}/export?fmt=md`} download
                  title="export as markdown" aria-label={`export ${s.title}`}
-                 className="px-1 text-muted hover:text-amber text-[12px]">↧</a>
+                 className="p-0.5 text-muted hover:text-amber"><Download /></a>
               <button onClick={() => void duplicateChat(s.id)}
                       title="duplicate" aria-label={`duplicate ${s.title}`}
-                      className="px-1 text-muted hover:text-primary text-[12px]">⧉</button>
+                      className="p-0.5 text-muted hover:text-primary"><Duplicate /></button>
               <button onClick={() => {
                         if (window.confirm(`Delete "${s.title || "untitled"}"?`))
                           void deleteChat(s.id);
                       }}
                       title="delete" aria-label={`delete ${s.title}`}
-                      className="px-1 text-muted hover:text-red text-[12px]">×</button>
+                      className="p-0.5 text-muted hover:text-red"><Close /></button>
             </span>
           </div>
         ))}
@@ -177,9 +179,9 @@ function Composer() {
           onClick={() => fileRef.current?.click()}
           aria-label="Attach images"
           title="attach images (needs a vision model)"
-          className="shrink-0 text-muted hover:text-secondary text-[15px] pb-0.5"
+          className="shrink-0 text-muted hover:text-secondary pb-1"
         >
-          ⊕
+          <Attach />
         </button>
         <textarea
           ref={ref}
@@ -247,6 +249,7 @@ export default function ChatSurface() {
                    onClose={() => setSidecar(false)}>
         <Sidecar />
       </FloatWindow>
+      <ModelPicker />
     </div>
   );
 }
