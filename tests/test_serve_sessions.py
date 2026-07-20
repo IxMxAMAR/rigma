@@ -61,7 +61,9 @@ def test_chat_turn_injects_prompt_streams_and_persists(tmp_path, monkeypatch,
     assert r.status_code == 200
     assert '"delta": "Hel"' in r.text and "[DONE]" in r.text
     sent = oai_upstream.last()["messages"]
-    assert sent[0] == {"role": "system", "content": "DEFAULT"}
+    assert sent[0]["role"] == "system"
+    assert sent[0]["content"].startswith("DEFAULT")
+    assert "TOOL RULES" in sent[0]["content"]
     assert sent[1] == {"role": "user", "content": "hi"}
     got = c.get(f"/api/sessions/{s['id']}").json()
     assert got["title"] == "hi"
@@ -243,7 +245,11 @@ def test_chat_turn_sends_params_and_emits_meta(tmp_path, monkeypatch):
         sent = _UsageUpstream.last_body
         assert sent["temperature"] == 0.4 and sent["top_p"] == 0.8
         assert sent["stream_options"] == {"include_usage": True}
-        assert sent["messages"][0] == {"role": "system", "content": "PROMPT"}
+        sys0 = sent["messages"][0]
+        assert sys0["role"] == "system"
+        # tools default ON: doctrine rides beneath the preset prompt
+        assert sys0["content"].startswith("PROMPT")
+        assert "TOOL RULES" in sys0["content"]
         assert "event: meta" in r.text
         assert '"prompt_tokens": 2244' in r.text and '"ctx": 4096' in r.text
         assert "15.5" in r.text and "[DONE]" in r.text
