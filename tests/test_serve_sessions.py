@@ -588,3 +588,22 @@ def test_workspace_listing(tmp_path, monkeypatch):
     names = [e["name"] for e in d["entries"]]
     assert names == ["sub", "story.md"]          # dirs first, dotfiles hidden
     assert d["entries"][1]["size"] == 5
+
+
+def test_workspace_open_is_scoped_to_the_session(tmp_path, monkeypatch):
+    # opens ONLY the session's recorded workspace — no path from the request
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    import rigma.serve as srv
+    from fastapi.testclient import TestClient
+    opened = []
+    monkeypatch.setattr(srv.os, "startfile", lambda p: opened.append(p),
+                        raising=False)
+    monkeypatch.setattr(srv.platform, "system", lambda: "Windows")
+    c = TestClient(srv.build_app(upstream_port=1))
+    s = c.post("/api/sessions", json={}).json()
+    assert c.post(f"/api/sessions/{s['id']}/workspace/open").status_code == 404
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    c.post(f"/api/sessions/{s['id']}", json={"workspace": str(ws)})
+    r = c.post(f"/api/sessions/{s['id']}/workspace/open")
+    assert r.status_code == 200 and opened == [str(ws)]

@@ -43,9 +43,8 @@ export default function WorkspacePanel() {
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const [copied, setCopied] = useState(false);
   if (!currentId) return null;
-  const base = data?.path
-    ? data.path.replace(/[\/]+$/, "").split(/[\/]/).pop() : null;
   const savePath = async () => {
     setEditing(false);
     const v = draft.trim();
@@ -58,19 +57,44 @@ export default function WorkspacePanel() {
   };
   return (
     <div className="px-2 pt-3 border-t border-white/5 mx-2 min-h-0 flex flex-col">
-      <div className="flex items-center gap-1.5 px-2 pb-1">
-        <span className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em] flex-1 truncate"
-              title={data?.path || "no workspace set"}>
-          workspace{base ? ` · ${base}` : ""}
+      <div className="flex items-center gap-1.5 px-2 pb-0.5">
+        <span className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em] flex-1">
+          workspace
         </span>
         <button onClick={() => { setDraft(data?.path ?? ""); setEditing(!editing); }}
-                aria-label="Set workspace folder"
+                aria-label="Set workspace folder" title="change folder"
                 className="text-muted hover:text-secondary text-[11px]">✎</button>
         {data?.path && (
-          <button onClick={() => void refresh()} aria-label="Refresh workspace"
-                  className="text-muted hover:text-secondary text-[11px]">↻</button>
+          <>
+            <button
+              onClick={() => {
+                void fetch(`/api/sessions/${currentId}/workspace/open`,
+                           { method: "POST" });
+              }}
+              aria-label="Open in file manager" title="open in Explorer"
+              className="text-muted hover:text-amber text-[11px]">⤴</button>
+            <button onClick={() => void refresh()} aria-label="Refresh workspace"
+                    title="refresh"
+                    className="text-muted hover:text-secondary text-[11px]">↻</button>
+          </>
         )}
       </div>
+      {data?.path && (
+        <button
+          onClick={() => {
+            void navigator.clipboard.writeText(data.path).then(() => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1200);
+            });
+          }}
+          title={copied ? "copied!" : data.path + "  (click to copy)"}
+          aria-label="Copy workspace path"
+          className="mx-2 mb-1 text-left font-mono text-[11px] rounded px-0 truncate hover:text-secondary text-muted"
+          dir="rtl"
+        >
+          {copied ? "✓ copied" : "‎" + data.path}
+        </button>
+      )}
       {editing && (
         <form className="px-2 pb-1.5" onSubmit={(e) => { e.preventDefault(); void savePath(); }}>
           <input autoFocus value={draft}
