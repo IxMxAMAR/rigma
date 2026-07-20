@@ -797,11 +797,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                          "the ONE question below, then reply with a short "
                          "factual answer (under 150 words). No preamble."},
                         {"role": "user", "content": q}]
+                # The inner loop runs the SAME weak model that needed every
+                # guardrail in the outer loop, so it inherits the load-bearing
+                # ones: temp 0.3 (syntax stability), the rescue parser, a
+                # repeated-identical-call breaker, and a hard context budget.
+                # An unguarded 5-hop inner loop was review-flagged as a
+                # context-collapse vector, and runs 1-2 proved the model earns
+                # the concern.
+                seen_calls: set = set()
                 for _hop in range(5):
+                    if sum(len(str(m.get("content", ""))) for m in msgs) > 24_000:
+                        break               # context budget: answer with less
                     resp = await client.post(
                         "/v1/chat/completions",
                         json={"messages": msgs, "stream": False,
-                              "tools": sub_specs, "temperature": 0.2,
+                              "tools": sub_specs, "temperature": 0.3,
                               "max_tokens": 1200}, timeout=240.0)
                     if resp.status_code != 200:
                         return "delegate failed: " + await _upstream_error(resp)
@@ -809,8 +819,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     calls = m.get("tool_calls") or []
                     if not calls:
                         ans = (m.get("content") or "").strip()
-                        return _clip(ans, 900) if ans else \
-                            "delegate returned no answer"
+                        r_name, r_args = toolkit.rescue_xml_tool_call(ans)
+                        if r_name and r_name in _DELEGATE_TOOLS:
+                            calls = [{"id": f"rescued-{_hop}", "type":
+                                      "function", "function": {
+                                          "name": r_name,
+                                          "arguments": json.dumps(r_args)}}]
+                        else:
+                            return _clip(ans, 900) if ans else \
+                                "delegate returned no answer"
                     msgs.append({"role": "assistant",
                                  "content": m.get("content") or "",
                                  "tool_calls": calls})
@@ -818,6 +835,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         fn = tc.get("function") or {}
                         cargs, _n = toolkit.repair_json_args(
                             fn.get("arguments", ""))
+                        sig = (fn.get("name", ""),
+                               json.dumps(cargs or {}, sort_keys=True))
+                        if sig in seen_calls:
+                            msgs.append({"role": "tool",
+                                         "tool_call_id": tc.get("id", ""),
+                                         "content": "you already made exactly "
+                                         "this call — answer the question now "
+                                         "with what you have"})
+                            continue
+                        seen_calls.add(sig)
                         result = await asyncio.to_thread(
                             toolkit.cached_run, fn.get("name", ""),
                             cargs or {}, tctx)

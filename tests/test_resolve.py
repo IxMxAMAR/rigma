@@ -28,7 +28,11 @@ def test_exact_combo_wins():
     assert plan.gguf.quant == "UD-Q3_K_XL" and plan.backend == "vulkan"
 
 
-def test_calculator_kicks_in_for_unknown_gpu():
+def test_calculator_kicks_in_for_unknown_gpu(tmp_path, monkeypatch):
+    # RIGMA_HOME isolated: the resolver now prefers ON-DISK quants, so with
+    # the real home this test would see the owner's models and pick a
+    # calibrated on-disk quant instead of the pure calculator answer
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     p = _profile(vram=20480, slug="future-card-20g")  # no combo, no class file
     plan = resolve(p, Registry.load(), use_case="coding")
     assert plan.origin == "calculator"
@@ -228,3 +232,32 @@ def test_quantised_cache_beats_spilling_weights_to_ram():
     # returned before q8_0-with-offload. Picking the variant that keeps more
     # layers resident would be better, but that case doesn't arise for the
     # models in play here, so it's left alone rather than guessed at.
+
+
+def test_resolver_prefers_on_disk_quants(tmp_path, monkeypatch):
+    # live 2026-07-20: `up -y` silently began a 26GB download while a 14.4GB
+    # quant of the same model sat on disk. Any on-disk quant that fits beats
+    # any remote one; remote is only considered when nothing local fits.
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma.models import (CachePolicy, CpuInfo, GgufFile, GpuInfo,
+                              HardwareProfile, ModelSpec)
+    from rigma.registry import Registry
+    from rigma.resolve import resolve
+    big = GgufFile(repo="r", quant="Q5_K_P", file="m-q5.gguf",
+                   bytes=26 * 2**30)
+    small = GgufFile(repo="r", quant="IQ3_M", file="m-iq3.gguf",
+                     bytes=14 * 2**30)
+    (tmp_path / "models").mkdir(parents=True)
+    (tmp_path / "models" / "m-iq3.gguf").write_text("x")   # only IQ3 on disk
+    spec = ModelSpec(slug="m", family="f", kind="dense", n_layers=8,
+                     full_attn_layers=8, kv_heads=2, head_dim=64,
+                     native_ctx=32768, ggufs=[big, small],
+                     use_cases=["general"], capabilities=["tools"],
+                     cache_type_policy=CachePolicy())
+    reg = Registry([], {"m": spec}, {})
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=16000, backends=["vulkan"])
+    prof = HardwareProfile(gpus=[gpu], ram_mb=32000, ram_free_mb=16000,
+                           cpu=CpuInfo(cores=8), os="windows",
+                           disk_free_gb=100.0)
+    plan = resolve(prof, reg, model_override="m")
+    assert plan.gguf.quant == "IQ3_M",         f"picked {plan.gguf.quant} — locality must beat quality"
