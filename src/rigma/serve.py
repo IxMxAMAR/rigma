@@ -253,8 +253,12 @@ def _ui_file(name: str) -> str:
 
 
 # ---- driving-message helpers -------------------------------------------
-# module scope, not nested in build_app: these are pure functions of
-# (run, session) and the only way to test the driving line directly.
+# Module scope, not nested in build_app, so the driving line is testable
+# directly. NOT pure, despite appearances: _driving_message consumes one-shot
+# queued state (steer_queue, _echoed_tool, _missing_artifacts, _draft_saved,
+# _challenge_pending, force_completion) and persists the run after each
+# consumption. Calling it is taking a turn — call it once per turn, and never
+# from a read-only path like a status endpoint.
 def _last_trace(session):
     for m in reversed((session or {}).get("messages", [])):
         if m.get("role") == "assistant":
@@ -2251,10 +2255,33 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def _stop_run_tasks():
         """Cancel background run loops when the app goes down. Without this an
         orphaned loop keeps driving a run against an engine that is gone."""
-        for task in list(_run_tasks.values()):
-            if not task.done():
-                task.cancel()
+        tasks = [t for t in _run_tasks.values() if not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # actually WAIT for them: cancel() only requests. Returning
+            # immediately raced the loop teardown against each task's
+            # CancelledError handler — the status write that marks the run
+            # "stopped" often never ran, leaving run.json at "running".
+            await asyncio.wait(tasks, timeout=10)
         _run_tasks.clear()
+
+    @app.on_event("startup")
+    async def _reconcile_orphaned_runs():
+        """A run that says "running" at boot is lying: _run_tasks is empty at
+        startup, so no task is driving it. Before this hook existed, any
+        restart mid-run (crash, Windows update reboot, manual restart) left
+        active.json wedged at status=running — and start_run 409s while a run
+        is active, so EVERY future run was blocked until someone hand-cleared
+        the file. On a machine doing 20-hour unattended jobs, a reboot
+        permanently disabled the feature."""
+        from . import runs as _runs
+        try:
+            a = _runs.active()
+            if a and a.get("status") in ("running", "paused"):
+                _runs.set_status(a, "stopped", "server restarted mid-run")
+        except Exception:
+            _log.exception("startup: run reconciliation failed")
 
     @app.on_event("startup")
     async def _keepalive_task():

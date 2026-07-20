@@ -6,7 +6,9 @@ longer existed. It invented a step #4 to have something to obey, got told off
 for inventing it, then emitted a bare tool name as prose twice in a row while
 receiving the identical correction both times.
 
-These are pure functions of (run, session), so none of this needs an engine.
+None of this needs an engine — but note _driving_message is NOT pure: it
+drains one-shot state and saves the run (see the persistence test at the
+bottom, which pins exactly that).
 """
 from rigma import runs as _runs
 from rigma.serve import _driving_message
@@ -151,3 +153,22 @@ def test_routine_state_never_restates_the_mission():
     run = _plan(_run(mission), ("a", "done"), ("b", "pending"))
     msg = _driving_message(run, _session([{"name": "read_file", "result": "ok"}]))
     assert mission not in msg
+
+
+# ---- local review 2026-07-20: state consumption must PERSIST ----
+
+def test_consumed_state_is_persisted_to_disk():
+    # _driving_message drains one-shot state (steer_queue, _echoed_tool...)
+    # and saves the run. Every earlier test asserted on the in-memory dict
+    # only, so a regression dropping the _runs.save() calls — turning this
+    # back into the pure formatter its old comment claimed — would have
+    # passed the whole file while silently re-delivering consumed steering
+    # on every later turn.
+    run = _plan(_run(), ("a", "pending"))
+    run["steer_queue"] = ["do the thing"]
+    _runs.save(run)
+    msg = _driving_message(run, _session())
+    assert "do the thing" in msg
+    reloaded = _runs.load(run["id"])
+    assert reloaded.get("steer_queue") == [], \
+        "consumed steering must be gone from DISK, not just from memory"
