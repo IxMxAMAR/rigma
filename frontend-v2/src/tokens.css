@@ -1,0 +1,39 @@
+/* RIGMA DESIGN CONSTITUTION tokens — docs/design/CONSTITUTION.md is law.
+   Never invent hex codes, spacing, or durations outside this file. */
+@import "tailwindcss";
+
+@theme {
+  /* Section 3: color architecture */
+  --color-canvas: #0d0d12;
+  --color-panel: #16161d;
+  --color-surface: #23232e;
+  --color-float: #2e2e3a;
+  --color-primary: #f2f2f5;
+  --color-secondary: #a0a0ab;
+  --color-muted: #686873;
+  --color-amber: #e8a94f;   /* telemetry */
+  --color-moss: #8fb573;    /* grounded / healthy */
+  --color-red: #e06c5f;     /* degraded only */
+
+  /* Section 2: typography — Windows-native, offline, two weights only */
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", Consolas, ui-monospace, monospace;
+
+  /* Section 6: motion — 150ms ease-out, nothing else */
+  --ease-app: cubic-bezier(0, 0, 0.2, 1);
+}
+
+:root { color-scheme: dark; }
+html, body, #root { height: 100%; }
+body {
+  background: var(--color-canvas);
+  color: var(--color-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+* { transition-duration: 150ms; transition-timing-function: var(--ease-app); }
+:focus-visible { outline: 2px solid var(--color-amber); outline-offset: 2px; }
+::selection { background: rgba(232, 169, 79, 0.2); }
+* { scrollbar-width: thin; scrollbar-color: var(--color-float) transparent; }
