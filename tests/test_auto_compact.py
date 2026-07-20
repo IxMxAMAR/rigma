@@ -151,3 +151,64 @@ def test_archive_is_bounded(home, upstream):
     _Upstream.prompt_tokens, _Upstream.compact_status = 950, 200
     client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
     assert len(sessions.load(sid)["archive"]) <= _s.ARCHIVE_MAX
+
+
+def _seed_run(client, n_obs=20, body=800):
+    """A RUN session whose bulk is tool-result observations."""
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    s = sessions.load(sid)
+    s["run_id"] = "run-1"
+    msgs = []
+    for i in range(n_obs):
+        msgs.append({"role": "assistant", "content": f"step {i} reasoning"})
+        msgs.append({"role": "user", "kind": "tool_result",
+                     "tools": [{"name": "sample_files", "ok": True}],
+                     "content": f"TOOL RESULT sample_files: " + "x" * body})
+    s["messages"] = msgs
+    sessions.save(s)
+    return sid
+
+
+def test_runs_mask_observations_instead_of_summarizing(home, upstream):
+    # masking is deterministic and lossless where it matters; the digest keeps
+    # the gist and destroys the exact strings an agent navigates by. Masking
+    # must be TRIED FIRST, and when it succeeds the summarizer must not run.
+    # ctx must exceed what keep_recent preserves, or masking cannot possibly
+    # reach budget and falling back to the digest is correct.
+    _Upstream.prompt_tokens, _Upstream.compact_status = 3900, 200
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=4000)
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = _seed_run(client)
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    assert r.status_code == 200
+    assert "event: masked" in r.text, r.text[-400:]
+    s = sessions.load(sid)
+    assert s["digest"] == "", "masking was enough — the summarizer should not run"
+    assert any("masked" in m.get("content", "") for m in s["messages"])
+
+
+def test_masking_preserves_the_models_own_turns(home, upstream):
+    _Upstream.prompt_tokens, _Upstream.compact_status = 3900, 200
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=4000)
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = _seed_run(client)
+    before = [m["content"] for m in sessions.load(sid)["messages"]
+              if m["role"] == "assistant"]
+    client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    after = [m["content"] for m in sessions.load(sid)["messages"]
+             if m["role"] == "assistant"]
+    assert before == after[:len(before)], "the model's reasoning must be intact"
+
+
+def test_chats_still_summarize_and_never_mask(home, upstream):
+    # no run_id: the prose IS the content, and a digest is the right abstraction
+    _Upstream.prompt_tokens, _Upstream.compact_status = 950, 200
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=1000)
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = _seed(client)
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    assert "event: masked" not in r.text
+    assert sessions.load(sid)["digest"] == "COMPACT DIGEST"
