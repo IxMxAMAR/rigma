@@ -79,3 +79,12 @@ def _tests_run_against_the_source_tree():
         pytest.exit(f"rigma imports from {got}, not the source tree {src} — "
                     "run `pip install -e .` and remove the shadowing copy",
                     returncode=3)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _never_touch_the_real_rigma_home(tmp_path_factory):
+    """514 zombie runs landed in the user's real ~/.rigma because one test
+    module created runs without redirecting RIGMA_HOME (2026-07-21). Default
+    the whole session to a throwaway home; tests that monkeypatch their own
+    RIGMA_HOME still override this per-test."""
+    os.environ["RIGMA_HOME"] = str(tmp_path_factory.mktemp("rigma-home"))
