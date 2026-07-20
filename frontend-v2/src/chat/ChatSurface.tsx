@@ -109,8 +109,13 @@ function ContextMeter() {
         <div className={`h-full ${frac > 0.85 ? "bg-red" : frac > 0.6 ? "bg-amber" : "bg-moss"}`}
              style={{ width: `${frac * 100}%` }} />
       </div>
-      <span className="font-mono text-[10.5px] text-muted">
-        {estimated ? "~" : ""}{Math.round(frac * 100)}% of {Math.round(ctx / 1024)}K
+      <span
+        className="font-mono text-[10.5px] text-muted"
+        title={"context window: how full the model's memory of this chat is. "
+               + "Set at engine launch (Engine page) — not related to max "
+               + "tokens, which caps reply length."}
+      >
+        ctx {estimated ? "~" : ""}{Math.round(frac * 100)}% of {Math.round(ctx / 1024)}K
       </span>
       {frac > 0.6 && currentId && (
         <button
