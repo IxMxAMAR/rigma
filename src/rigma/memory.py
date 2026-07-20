@@ -276,6 +276,11 @@ def _cos(a, b) -> float:
 
 # --- retrieval (phase 2): metadata filter FIRST, then hybrid ------------------
 
+# ambient cosine between UNRELATED texts on the active embedder (anisotropy).
+# Measured on nomic-embed-text-v1.5, 2026-07-21: unrelated 0.39-0.45,
+# related 0.60. Dense contributions are rescaled so this reads as zero.
+_DENSE_BASELINE = 0.40
+
 _WORD = re.compile(r"[a-z0-9_]+")
 
 
@@ -340,10 +345,18 @@ def retrieve(rows: list[dict], query: str, kinds: tuple = ("pitfall",
     for r, ls in zip(pool, lex):
         s = 0.5 * (ls / top_lex)
         if qv and r.get("vec"):
-            s += 0.5 * _cos(qv, r["vec"])
+            # Anisotropy correction. Embedding spaces are cones, not spheres:
+            # two UNRELATED sentences score ~0.39-0.45 cosine on nomic
+            # (measured here 2026-07-21), so raw cos * 0.5 put every random
+            # memory over the old 0.15 floor and the filter passed everything
+            # the moment dense was available — injecting garbage that then got
+            # falsely punished by outcome scoring. Subtract the ambient
+            # baseline so zero means "unrelated", not "orthogonal".
+            s += 0.5 * max(0.0, (_cos(qv, r["vec"]) - _DENSE_BASELINE)
+                           / (1.0 - _DENSE_BASELINE))
         scored.append((s, r))
     scored.sort(key=lambda t: t[0], reverse=True)
-    return [r for s, r in scored[:k] if s >= 0.15]
+    return [r for s, r in scored[:k] if s >= 0.12]
 
 
 # --- distillation ------------------------------------------------------------
@@ -375,11 +388,28 @@ def describe_event(event: dict) -> str:
 
 
 def clean_rule(text: str) -> str:
-    """Normalise whatever the distiller replied with into one rule line."""
+    """Normalise whatever the distiller replied with into one rule line.
+
+    Not simply the first line: a chatty quantised model answers
+    "Here is the rule:\nNever type filenames." despite the prompt, and taking
+    line one would store the PREAMBLE as a behavioural rule — junk that passes
+    the anchoring guard (no paths in it) and squats in the capped store. Pick
+    the first line that reads like an imperative: several words, not ending in
+    a colon, not an announcement about the rule it precedes.
+    """
     text = (text or "").strip()
     if not text:
         return ""
-    return text.strip('"').splitlines()[0].strip()[:200]
+    lines = [ln.strip().strip('"') for ln in text.splitlines() if ln.strip()]
+    _PREAMBLE = re.compile(
+        r"^(here('s| is| are)|sure|certainly|the (rule|answer)|answer\b|ok(ay)?\b)",
+        re.I)
+    for ln in lines:
+        if ln.endswith(":") or _PREAMBLE.match(ln):
+            continue
+        if len(ln.split()) >= 3:
+            return ln[:200]
+    return lines[0].rstrip(":")[:200] if lines else ""
 
 
 async def distil(event: dict, complete) -> str:
@@ -521,17 +551,34 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
             a=best.get("text", ""), b=text)) or "").strip().upper()
     except Exception:
         verdict = ""
-    if verdict.startswith("CONFLICT"):
-        # the NEW observation supersedes: it is more recent evidence. The old
-        # rule is retired, never merged — a contradiction collapsed into one
-        # row is how a superseded rule gains authority from being wrong.
-        best["status"] = "retired"
+    # substring, not startswith: a quantised model pads despite the prompt
+    # ("Answer: CONFLICT"), and startswith silently defaulted every padded
+    # verdict to DISTINCT — bypassing consolidation entirely. CONFLICT is
+    # checked first: a reply naming both words is treating them as options,
+    # and the destructive reading must not win by accident of ordering — but
+    # between the two, a false append (DISTINCT) is recoverable and a false
+    # merge is not, so ambiguity falls through to append.
+    is_conflict = "CONFLICT" in verdict and "DUPLICATE" not in verdict
+    is_duplicate = "DUPLICATE" in verdict and "CONFLICT" not in verdict
+    if is_conflict:
+        # The NEW observation supersedes — but how far depends on the old
+        # rule's standing. A wrong CONFLICT verdict against a VERIFIED rule
+        # would permanently destroy proven capability in favour of an untested
+        # draft (the worst possible trade), so verified rules are DEMOTED to
+        # draft rather than retired: still retrievable, must re-earn their
+        # status. Only drafts die outright.
+        if best.get("status") == "verified":
+            best["status"] = "draft"
+            log.info("memory: %r demoted by conflict with %r",
+                     best.get("text", "")[:50], text[:50])
+        else:
+            best["status"] = "retired"
+            log.info("memory: %r superseded %r", text[:50],
+                     best.get("text", "")[:50])
         store._write_all([r if r.get("id") != best.get("id") else best
                           for r in rows])
-        log.info("memory: %r superseded %r", text[:50],
-                 best.get("text", "")[:50])
         return store.add(kind=kind, text=text, born_run=run_id)
-    if verdict.startswith("DUPLICATE"):
+    if is_duplicate:
         best["seen_count"] = best.get("seen_count", 1) + 1
         best["last_seen"] = time.time()
         store._write_all([r if r.get("id") != best.get("id") else best

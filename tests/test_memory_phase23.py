@@ -274,3 +274,87 @@ def test_model_driven_completion_also_scores(tmp_path, monkeypatch):
     assert row["outcome_score"] == 1
     assert row["status"] == "verified", \
         "+1 from a different run than born_run must graduate the draft"
+
+
+# ---- final-review fixes (2026-07-21) ----
+
+def test_unrelated_dense_matches_fall_below_the_floor(monkeypatch):
+    # anisotropy: unrelated sentences score ~0.40-0.45 raw cosine, so an
+    # uncorrected 0.5*cos put EVERY memory over the floor once dense was
+    # active — the filter passed garbage which outcome scoring then falsely
+    # punished. The baseline subtraction makes "unrelated" read as zero.
+    monkeypatch.delenv("RIGMA_MEMORY_EMBED", raising=False)
+    import math
+    def fake_embed(text, purpose="doc"):
+        # unrelated pair at the measured ambient cosine (~0.43)
+        return [1.0, 0.0] if purpose == "query" else None
+    monkeypatch.setattr(memory, "embed_one", fake_embed)
+    amb = 0.43
+    row = _row("Prefer q8_0 KV cache.", vec=[amb, math.sqrt(1 - amb * amb)])
+    hits = retrieve([row], "write a poem about autumn leaves")
+    assert hits == [], "ambient-cosine noise must not be retrieved"
+
+
+def test_related_dense_matches_still_pass(monkeypatch):
+    monkeypatch.delenv("RIGMA_MEMORY_EMBED", raising=False)
+    import math
+    monkeypatch.setattr(memory, "embed_one",
+                        lambda text, purpose="doc": [1.0, 0.0])
+    row = _row("Prefer q8_0 KV cache.", vec=[0.62, math.sqrt(1 - 0.62**2)])
+    # cos = 0.62 -> rescaled (0.62-0.40)/0.60 = 0.367 -> 0.5*0.367 = 0.18 > 0.12
+    hits = retrieve([row], "no lexical overlap whatsoever here")
+    assert hits, "a genuinely related memory must survive the correction"
+
+
+def test_padded_conflict_verdicts_are_understood(tmp_path, monkeypatch):
+    # 'Answer: CONFLICT' failed startswith and silently defaulted to DISTINCT,
+    # bypassing consolidation entirely
+    monkeypatch.delenv("RIGMA_MEMORY_EMBED", raising=False)
+    monkeypatch.setattr(memory, "embed_one",
+                        lambda text, purpose="doc": [1.0, 0.0])
+    store = MemoryStore(tmp_path / "m.jsonl")
+    _run(add_consolidated(store, "pitfall", "Prefer the f16 KV cache.", None))
+    _run(add_consolidated(store, "pitfall", "Prefer the q8_0 KV cache.",
+                          _reply("Answer: CONFLICT")))
+    rows = {r["text"]: r for r in store.all()}
+    assert rows["Prefer the f16 KV cache."]["status"] == "retired"
+
+
+def test_a_verdict_naming_both_words_appends(tmp_path, monkeypatch):
+    # ambiguity must fall to the recoverable side: append, never merge/retire
+    monkeypatch.delenv("RIGMA_MEMORY_EMBED", raising=False)
+    monkeypatch.setattr(memory, "embed_one",
+                        lambda text, purpose="doc": [1.0, 0.0])
+    store = MemoryStore(tmp_path / "m.jsonl")
+    _run(add_consolidated(store, "pitfall", "Prefer the f16 KV cache.", None))
+    _run(add_consolidated(store, "pitfall", "Prefer the q8_0 KV cache.",
+                          _reply("Could be CONFLICT or DUPLICATE honestly")))
+    assert len([r for r in store.all() if r["status"] != "retired"]) == 2
+
+
+def test_conflict_demotes_verified_rules_instead_of_killing_them(tmp_path,
+                                                                 monkeypatch):
+    # a wrong CONFLICT verdict against a VERIFIED rule would trade proven
+    # capability for an untested draft — the worst possible error. Verified
+    # rules are demoted (must re-earn status), only drafts are retired.
+    monkeypatch.delenv("RIGMA_MEMORY_EMBED", raising=False)
+    monkeypatch.setattr(memory, "embed_one",
+                        lambda text, purpose="doc": [1.0, 0.0])
+    store = MemoryStore(tmp_path / "m.jsonl")
+    m = store.add(kind="pitfall", text="Prefer the f16 KV cache.")
+    rows = store.all(); rows[0]["status"] = "verified"; store._write_all(rows)
+    _run(add_consolidated(store, "pitfall", "Prefer the q8_0 KV cache.",
+                          _reply("CONFLICT")))
+    rows = {r["text"]: r for r in store.all()}
+    assert rows["Prefer the f16 KV cache."]["status"] == "draft", \
+        "demoted, not retired"
+
+
+def test_clean_rule_skips_chatty_preambles():
+    from rigma.memory import clean_rule
+    assert clean_rule("Here is the rule:\nNever type filenames manually.") \
+        == "Never type filenames manually."
+    assert clean_rule("Sure! The rule is:\n\nUse sample_files for big folders.") \
+        == "Use sample_files for big folders."
+    assert clean_rule("Never type filenames.") == "Never type filenames."
+    assert clean_rule('"Answer briefly."') == "Answer briefly."
