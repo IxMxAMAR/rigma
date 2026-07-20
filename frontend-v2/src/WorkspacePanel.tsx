@@ -4,6 +4,7 @@
 // is when files appear).
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useChat } from "./chat/chatStore";
+import { useApp } from "./store";
 
 interface Entry {
   name: string;
@@ -35,6 +36,10 @@ export default function WorkspacePanel() {
   }, [currentId]);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  const setWorkspacePath = useApp((s) => s.setWorkspacePath);
+  useEffect(() => {
+    setWorkspacePath(data?.path ?? "");
+  }, [data?.path, setWorkspacePath]);
   useEffect(() => {
     // falling edge of streaming = a turn just finished; files may have changed
     if (wasStreaming.current && !streaming) void refresh();
@@ -43,7 +48,6 @@ export default function WorkspacePanel() {
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
-  const [copied, setCopied] = useState(false);
   if (!currentId) return null;
   const savePath = async () => {
     setEditing(false);
@@ -79,22 +83,7 @@ export default function WorkspacePanel() {
           </>
         )}
       </div>
-      {data?.path && (
-        <button
-          onClick={() => {
-            void navigator.clipboard.writeText(data.path).then(() => {
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 1200);
-            });
-          }}
-          title={copied ? "copied!" : data.path + "  (click to copy)"}
-          aria-label="Copy workspace path"
-          className="mx-2 mb-1 text-left font-mono text-[11px] rounded px-0 truncate hover:text-secondary text-muted"
-          dir="rtl"
-        >
-          {copied ? "✓ copied" : "‎" + data.path}
-        </button>
-      )}
+
       {editing && (
         <form className="px-2 pb-1.5" onSubmit={(e) => { e.preventDefault(); void savePath(); }}>
           <input autoFocus value={draft}
