@@ -107,9 +107,9 @@ export default function ChatSurface() {
     void loadSessions();
   }, [loadSessions]);
   return (
-    <div className="flex-1 flex min-w-0">
+    <div className="flex-1 flex min-w-0 min-h-0">
       <SessionRail />
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 min-h-0">
         <Transcript />
         <Composer />
       </div>
