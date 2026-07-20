@@ -68,3 +68,11 @@ body {
 .prose-rigma a:hover { text-decoration: underline; }
 .prose-rigma hr { border: 0; border-top: 1px solid rgba(255,255,255,0.08);
   margin: 1em 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
