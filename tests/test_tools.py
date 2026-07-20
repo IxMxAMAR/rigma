@@ -1,5 +1,4 @@
 """Tool registry + handlers (safe + gated)."""
-import pytest
 
 from rigma import tools
 
@@ -40,7 +39,6 @@ def test_unknown_tool_and_broken_tool_return_text_not_raise():
 
 
 def test_web_search_tavily_and_ddg(monkeypatch):
-    import types
     # Tavily path when a key is set
     monkeypatch.setenv("TAVILY_API_KEY", "k")
     monkeypatch.setattr(tools, "run_tool", tools.run_tool)  # noqa (keep import)
@@ -50,7 +48,6 @@ def test_web_search_tavily_and_ddg(monkeypatch):
         def json(self): return {"results": [
             {"title": "Hello Wikipedia", "url": "https://en.wikipedia.org/Hello",
              "content": "Hello is a greeting."}]}
-    import rigma.tools as T
     import httpx
     monkeypatch.setattr(httpx, "post", lambda *a, **k: _R())
     out = tools.run_tool("web_search", {"query": "hello"})

@@ -1,3 +1,4 @@
+# ruff: noqa: F811 — pytest fixtures used as params shadow their imports by design
 """The loop that justifies the whole feature: a failure in one run becomes a
 rule the NEXT run starts with.
 
@@ -6,14 +7,10 @@ they are actually wired to the run lifecycle — that harvesting happens at run
 end and injection at run start. Both are easy to get right in isolation and
 leave unconnected.
 """
-import os
 import time
 
-import pytest
-from fastapi.testclient import TestClient
 
-from rigma import memory, runs, serve
-from rigma import state as st
+from rigma import memory, runs
 
 # `home` matters as much as the rest: it is autouse INSIDE its own module only,
 # so importing the others without it would point RIGMA_HOME at the real

@@ -231,7 +231,6 @@ def multi_upstream():
 
 def test_tool_calls_run_in_parallel(home, multi_upstream, monkeypatch):
     import time
-    from rigma import tools
     active = {"n": 0, "max": 0}
     lock = threading.Lock()
 
