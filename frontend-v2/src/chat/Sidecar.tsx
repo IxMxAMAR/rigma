@@ -114,19 +114,35 @@ function GroundingCard() {
   );
 }
 
+interface PresetRow {
+  id: string;
+  name: string;
+}
+
 function SamplingCard() {
   const currentId = useChat((s) => s.currentId);
   const [params, setParams] = useState<Record<string, number>>({});
   const [prompt, setPrompt] = useState("");
   const [dirty, setDirty] = useState(false);
+  const [presets, setPresets] = useState<PresetRow[]>([]);
+  const [presetId, setPresetId] = useState("");
+
+  useEffect(() => {
+    fetch("/api/presets")
+      .then((r) => r.json())
+      .then((d: unknown) => Array.isArray(d) && setPresets(d as PresetRow[]))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!currentId) return;
     api.getSession(currentId).then((s) => {
       const raw = (s as unknown as { params?: Record<string, number>;
-                                     system_prompt?: string });
+                                     system_prompt?: string;
+                                     preset_id?: string });
       setParams(raw.params ?? {});
       setPrompt(raw.system_prompt ?? "");
+      setPresetId(raw.preset_id ?? "");
       setDirty(false);
     }).catch(() => {});
   }, [currentId]);
@@ -168,6 +184,26 @@ function SamplingCard() {
       <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em]">
         this chat
       </h3>
+      <label className="flex items-center gap-2 text-[12.5px]">
+        <span className="w-24 text-secondary">preset</span>
+        <select
+          value={presetId}
+          onChange={async (e) => {
+            const v = e.target.value;
+            setPresetId(v);
+            if (currentId)
+              await api.updateSession(currentId, { preset_id: v })
+                .catch(() => {});
+          }}
+          aria-label="Preset"
+          className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"
+        >
+          <option value="">none</option>
+          {presets.map((pr) => (
+            <option key={pr.id} value={pr.id}>{pr.name}</option>
+          ))}
+        </select>
+      </label>
       <textarea
         value={prompt}
         onChange={(e) => { setPrompt(e.target.value); setDirty(true); }}
