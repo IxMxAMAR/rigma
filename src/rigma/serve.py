@@ -758,9 +758,65 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 has_run=bool(run_id), profile=run_profile)
             _sem = asyncio.Semaphore(8)   # cap concurrent tool subprocesses / IO
 
+            # read-only exploration set for the delegate helper. No writes, no
+            # code, and no delegate — a helper that delegates recurses forever.
+            _DELEGATE_TOOLS = {"read_file", "find_files", "grep",
+                               "list_directory", "sample_files",
+                               "current_datetime"}
+
+            async def _delegate_call(question: str, path: str) -> str:
+                """The context firewall. A FRESH message list — the main
+                session's history never crosses this boundary — does the messy
+                multi-step exploration and only the condensed answer returns.
+                The single biggest context-engineering win per the research:
+                a 2000-file listing lives and dies inside this helper."""
+                sub_specs = [s for s in toolkit.tool_specs(
+                    workspace=tctx["workspace"], has_run=False,
+                    profile=run_profile)
+                    if s["function"]["name"] in _DELEGATE_TOOLS]
+                q = question + (f"\n(Focus on: {path})" if path else "")
+                msgs = [{"role": "system", "content":
+                         "You are a research helper. Use the tools to answer "
+                         "the ONE question below, then reply with a short "
+                         "factual answer (under 150 words). No preamble."},
+                        {"role": "user", "content": q}]
+                for _hop in range(5):
+                    resp = await client.post(
+                        "/v1/chat/completions",
+                        json={"messages": msgs, "stream": False,
+                              "tools": sub_specs, "temperature": 0.2,
+                              "max_tokens": 1200}, timeout=240.0)
+                    if resp.status_code != 200:
+                        return "delegate failed: " + await _upstream_error(resp)
+                    m = resp.json()["choices"][0]["message"]
+                    calls = m.get("tool_calls") or []
+                    if not calls:
+                        ans = (m.get("content") or "").strip()
+                        return _clip(ans, 900) if ans else \
+                            "delegate returned no answer"
+                    msgs.append({"role": "assistant",
+                                 "content": m.get("content") or "",
+                                 "tool_calls": calls})
+                    for tc in calls[:2]:
+                        fn = tc.get("function") or {}
+                        cargs, _n = toolkit.repair_json_args(
+                            fn.get("arguments", ""))
+                        result = await asyncio.to_thread(
+                            toolkit.cached_run, fn.get("name", ""),
+                            cargs or {}, tctx)
+                        msgs.append({"role": "tool",
+                                     "tool_call_id": tc.get("id", ""),
+                                     "content": _clip(str(result), 4000)})
+                return "delegate hit its round limit without a final answer"
+
             async def _run_call(name, cargs):
                 """Run one tool (cached, capped) and resolve any image sentinel
                 into base64 vision payloads. Returns (result_text, imgs|None)."""
+                if name == "delegate":
+                    async with _sem:
+                        return await _delegate_call(
+                            str((cargs or {}).get("question", "")),
+                            str((cargs or {}).get("path", ""))), None
                 async with _sem:
                     result = await asyncio.to_thread(toolkit.cached_run,
                                                      name, cargs, tctx)
@@ -1664,6 +1720,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         from . import memory as _mem
         return _mem.MemoryStore(runtime.rigma_home() / "memory" / "memories.jsonl")
 
+    def _score_current_step(run, delta):
+        """Discredit/credit memories injected into the run's current step."""
+        try:
+            if os.environ.get("RIGMA_MEMORY") == "0":
+                return
+            from . import memory as _mem
+            from . import runs as _runs
+            pend = _runs.pending_tasks(run["id"])
+            ids = (run.get("step_injected") or {}).get(
+                str(pend[0]["id"]) if pend else "")
+            if ids:
+                _mem.score_memories(_memory_store(), ids, delta,
+                                    run_id=run["id"])
+        except Exception:
+            _log.exception("memory: step scoring failed")
+
     async def _harvest_memories(run_id):
         """Distil this run's failures into rules. Post-mortem only."""
         from . import memory as _mem
@@ -1685,7 +1757,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 return ""
             return resp.json()["choices"][0]["message"]["content"] or ""
 
-        return await _mem.harvest_run(actions, _memory_store(), _complete_async)
+        return await _mem.harvest_run(actions, _memory_store(), _complete_async,
+                                      run_id=run_id)
 
     async def _run_loop(run_id):
         import time as _time
@@ -1716,6 +1789,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _runs.set_status(run, "budget_exhausted", over)
                     break
                 if run.get("error_streak", 0) >= K_ERROR:
+                    # a memory injected into the step that just failed gets
+                    # discredited fast: -2 against +1, asymmetric on purpose
+                    _score_current_step(run, -2)
                     _runs.set_status(run, "stalled", "too many tool errors")
                     break
                 if run.get("lazy_streak", 0) >= K_LAZY:
@@ -1729,14 +1805,44 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         run["lazy_streak"] = 0
                         _runs.save(run)
                     else:
+                        _score_current_step(run, -2)
                         _runs.set_status(run, "stalled", "no progress / idle")
                         break
                 session = sessions.load(sid)
                 if session is None:
                     _runs.set_status(run, "error", "session was deleted")
                     break
-                session["messages"].append(
-                    {"role": "user", "content": _driving_message(run, session)})
+                driving = _driving_message(run, session)
+                # Per-step memory recall: ONCE when the step changes, never per
+                # turn (per-turn injection is what caused the narration loop).
+                # Hard metadata filter + hybrid BM25/dense; passive note lines,
+                # same register as RUN STATE. Injected ids are remembered so
+                # step outcomes can score them (+1 done / -2 stalled).
+                try:
+                    if os.environ.get("RIGMA_MEMORY") != "0":
+                        pend = _runs.pending_tasks(run_id)
+                        cur_step = str(pend[0]["id"]) if pend else ""
+                        if cur_step and cur_step != run.get("_mem_step"):
+                            from . import memory as _mem
+                            hits = _mem.retrieve(
+                                _memory_store().all(), pend[0].get("text", ""),
+                                workspace=run.get("workspace", ""))
+                            run["_mem_step"] = cur_step
+                            if hits:
+                                driving += ("\n### NOTES (from earlier runs)\n"
+                                            + "\n".join("  • " + h.get("text", "")
+                                                        for h in hits))
+                                inj = run.setdefault("step_injected", {})
+                                inj[cur_step] = [h.get("id") for h in hits]
+                                _runs.append_progress(
+                                    run_id, f"recalled {len(hits)} memories "
+                                    f"for step #{cur_step}",
+                                    pend[0].get("text", "")[:60],
+                                    run.get("workspace", ""))
+                            _runs.save(run)
+                except Exception:
+                    _log.exception("memory: per-step recall failed")
+                session["messages"].append({"role": "user", "content": driving})
                 sessions.save(session)
                 frozen = False
                 turn_err = None
@@ -2040,6 +2146,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 f"({cur['text'][:80]})",
                                 _runs.next_pending(run_id) or "verify and finish",
                                 run.get("workspace", ""))
+                            # the step succeeded: credit the memories that were
+                            # injected into it. This is what eventually retires
+                            # wrong rules — time decay only drops UNUSED ones.
+                            ids = (run.get("step_injected") or {}).get(
+                                str(cur["id"]))
+                            if ids and os.environ.get("RIGMA_MEMORY") != "0":
+                                from . import memory as _mem
+                                _mem.score_memories(_memory_store(), ids, +1,
+                                                    run_id=run_id)
                 sig = _turn_sig(trace)
                 # Bookkeeping is not work. A turn that only ticks plan items and
                 # logs "done: X" while producing NO artifact must NOT reset the

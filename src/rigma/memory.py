@@ -183,8 +183,12 @@ class MemoryStore:
                 r["last_seen"] = time.time()
                 self._write_all(rows)
                 return r
-        rec = {"kind": kind, "text": text, "status": "draft",
+        import hashlib
+        rec = {"id": hashlib.sha1(f"{kind}:{text}".encode("utf-8", "replace"))
+               .hexdigest()[:12],
+               "kind": kind, "text": text, "status": "draft",
                "seen_count": 1, "outcome_score": 0,
+               "vec": embed_one(text, purpose="doc"),
                "born": time.time(), "last_seen": time.time(), **extra}
         rows.append(rec)
         # bounded: evict the least-proven pitfall when over cap. Verified rules
@@ -199,6 +203,147 @@ class MemoryStore:
             log.info("memory: cap reached, evicted %r", evict.get("text", "")[:60])
         self._write_all(rows)
         return rec
+
+
+# --- embeddings (optional, never load-bearing) -------------------------------
+
+# Providers in preference order. nomic-embed-text-v1.5 is the research pick
+# (task prefixes match the short-rule/long-query asymmetry; owner authorised
+# its download 2026-07-20); bge-small is the fallback already on disk from
+# Raggity. STRICTLY offline at import: HF_HUB_OFFLINE is set before fastembed
+# loads, so this module itself can never start a download — a missing model
+# means lexical-only, which is a working (if weaker) retrieval mode, not an
+# error.
+_EMBED_MODELS = ["nomic-ai/nomic-embed-text-v1.5", "BAAI/bge-small-en-v1.5"]
+_embedder = None
+_embedder_tried = False
+
+
+def get_embedder():
+    global _embedder, _embedder_tried
+    if _embedder_tried:
+        return _embedder
+    _embedder_tried = True
+    if os.environ.get("RIGMA_MEMORY_EMBED") == "0":
+        return None
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    cache = os.path.join(os.environ.get("TEMP", ""), "fastembed_cache")
+    try:
+        from fastembed import TextEmbedding
+        for name in _EMBED_MODELS:
+            try:
+                _embedder = TextEmbedding(name, cache_dir=cache)
+                log.info("memory: dense retrieval via %s", name)
+                break
+            except Exception:
+                continue
+    except Exception:
+        _embedder = None
+    if _embedder is None:
+        log.info("memory: no cached embedding model — lexical retrieval only")
+    return _embedder
+
+
+def embed_one(text: str, purpose: str = "doc") -> list | None:
+    """purpose: "doc" for a stored rule, "query" for a step description.
+    nomic is trained with asymmetric task prefixes — a short imperative rule
+    retrieved by a longer task description is exactly the asymmetry they
+    exist for. bge ignores unknown prefixes gracefully, so prefix only when
+    the active provider is nomic."""
+    emb = get_embedder()
+    if emb is None:
+        return None
+    text = str(text)
+    if "nomic" in getattr(emb, "model_name", ""):
+        text = ("search_query: " if purpose == "query"
+                else "search_document: ") + text
+    try:
+        vec = next(iter(emb.embed([text])))
+        return [round(float(x), 5) for x in vec]
+    except Exception:
+        return None
+
+
+def _cos(a, b) -> float:
+    try:
+        num = sum(x * y for x, y in zip(a, b))
+        da = sum(x * x for x in a) ** 0.5
+        db = sum(y * y for y in b) ** 0.5
+        return num / (da * db) if da and db else 0.0
+    except Exception:
+        return 0.0
+
+
+# --- retrieval (phase 2): metadata filter FIRST, then hybrid ------------------
+
+_WORD = re.compile(r"[a-z0-9_]+")
+
+
+def _toks(text: str) -> list[str]:
+    """Tokens plus two normalisations the replay eval proved necessary:
+    naive plural-stripping ("deliverable" must hit "Deliverables"), and
+    snake_case splitting so "view the sampled images" reaches the rule that
+    names view_sample — tool names ARE the rare entities retrieval exists
+    to catch, and treating them as one opaque token hid them."""
+    out = []
+    for t in _WORD.findall(str(text).lower()):
+        out.append(t)
+        if "_" in t:
+            out.extend(p for p in t.split("_") if len(p) > 2)
+    return [t[:-1] if len(t) > 3 and t.endswith("s") else t for t in out]
+
+
+def _bm25(query_toks: list[str], docs: list[list[str]],
+          k1: float = 1.5, b: float = 0.75) -> list[float]:
+    """Tiny BM25 — the store is ≤ a few dozen one-line rules, so a real index
+    would be machinery for machinery's sake. Keyword scoring is load-bearing
+    here, not a nicety: the rare entities ARE the memory (tool names, flags,
+    error strings) and dense embeddings flatten exactly those."""
+    import math
+    n = len(docs)
+    if not n:
+        return []
+    avg = sum(len(d) for d in docs) / n or 1.0
+    df: dict[str, int] = {}
+    for d in docs:
+        for t in set(d):
+            df[t] = df.get(t, 0) + 1
+    scores = []
+    for d in docs:
+        s = 0.0
+        for t in query_toks:
+            f = d.count(t)
+            if not f:
+                continue
+            idf = math.log(1 + (n - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5))
+            s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * len(d) / avg))
+        scores.append(s)
+    return scores
+
+
+def retrieve(rows: list[dict], query: str, kinds: tuple = ("pitfall",
+             "technique", "project"), workspace: str = "", k: int = 3) -> list[dict]:
+    """Top-k memories for a step. Hard metadata filter BEFORE any scoring —
+    post-filtering can return a top-3 entirely from the wrong scope and then
+    discard it, a silent recall failure indistinguishable from an empty store."""
+    pool = [r for r in rows
+            if r.get("kind") in kinds and r.get("status") != "retired"
+            and (r.get("kind") != "project" or not r.get("workspace")
+                 or r.get("workspace") == workspace)]
+    if not pool or not str(query).strip():
+        return []
+    q = _toks(query)
+    lex = _bm25(q, [_toks(r.get("text", "")) for r in pool])
+    top_lex = max(lex) if lex and max(lex) > 0 else 1.0
+    qv = embed_one(query, purpose="query")
+    scored = []
+    for r, ls in zip(pool, lex):
+        s = 0.5 * (ls / top_lex)
+        if qv and r.get("vec"):
+            s += 0.5 * _cos(qv, r["vec"])
+        scored.append((s, r))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [r for s, r in scored[:k] if s >= 0.15]
 
 
 # --- distillation ------------------------------------------------------------
@@ -251,7 +396,7 @@ async def distil(event: dict, complete) -> str:
 
 
 async def harvest_run(actions: list[dict], store: MemoryStore, complete,
-                      max_rules: int = 3) -> list[dict]:
+                      max_rules: int = 3, run_id: str = "") -> list[dict]:
     """Mine a finished run's trace and store what can be distilled.
 
     THE production entry point — serve.py calls exactly this, so the path the
@@ -278,7 +423,10 @@ async def harvest_run(actions: list[dict], store: MemoryStore, complete,
         if not rule:
             continue
         try:
-            written.append(store.add(kind="pitfall", text=rule))
+            rec = await add_consolidated(store, "pitfall", rule, complete,
+                                         run_id=run_id)
+            if rec:
+                written.append(rec)
         except ValueError as e:
             # the distiller leaked a path or a literal argument. Dropping it is
             # correct: an un-generalised rule is worthless at best, and the
@@ -289,6 +437,107 @@ async def harvest_run(actions: list[dict], store: MemoryStore, complete,
             log.exception("memory: store write failed")
             continue
     return written
+
+
+# --- outcome tracking (phase 3) ----------------------------------------------
+
+def score_memories(store: MemoryStore, ids: list[str], delta: int,
+                   run_id: str = "") -> None:
+    """The librarian's ledger. +1 when a step a memory was injected into
+    succeeds, -2 when it fails: a rule must earn its place repeatedly but can
+    be discredited quickly. Time decay retires unused memories; only THIS
+    retires wrong ones — a bad rule that keeps matching keeps being retrieved,
+    and without outcome scoring, being wrong made it more prominent.
+
+    Graduation rides on the same signal: a draft that helped a run OTHER than
+    the one that wrote it has proven it generalises, which is the exact claim
+    "verified" makes."""
+    if not ids:
+        return
+    try:
+        rows = store.all()
+        hit = False
+        for r in rows:
+            if r.get("id") in ids:
+                r["outcome_score"] = r.get("outcome_score", 0) + delta
+                r["last_seen"] = time.time()
+                if (delta > 0 and r.get("status") == "draft"
+                        and run_id and r.get("born_run")
+                        and r["born_run"] != run_id):
+                    r["status"] = "verified"
+                    log.info("memory: %r graduated to verified",
+                             r.get("text", "")[:60])
+                hit = True
+        if hit:
+            store._write_all(rows)
+    except Exception:
+        log.exception("memory: outcome scoring failed")
+
+
+# --- conflict-gated consolidation (phase 2) ----------------------------------
+
+_CONFLICT_PROMPT = (
+    "Two rules for an autonomous agent are shown. Answer with ONE word.\n"
+    "Answer CONFLICT if an agent cannot follow both (they demand opposite "
+    "actions in the same situation).\n"
+    "Answer DUPLICATE if they tell the agent the same thing in different "
+    "words.\n"
+    "Answer DISTINCT otherwise.\n\n"
+    "Rule A: {a}\nRule B: {b}\n\nAnswer:")
+
+# similarity NOMINATES; it never decides. "prefer q8_0 cache" vs "prefer f16
+# cache" score >0.95 — identical syntax, opposite instruction — so merging on
+# cosine alone would make a rule MORE authoritative for having just been
+# contradicted. The gate is one word from the model; without an answer we
+# append rather than merge, and the cap bounds the bloat.
+_NOMINATE_COS = 0.75
+
+
+async def add_consolidated(store: MemoryStore, kind: str, text: str,
+                           complete, run_id: str = "") -> dict | None:
+    """Add a memory through the semantic pipeline. Falls back to plain add()
+    when there is nothing to consolidate against or no engine to ask."""
+    text = clean_rule(text) if kind == "pitfall" else str(text or "").strip()
+    if not text:
+        return None
+    rows = store.all()
+    for r in rows:                      # exact text: reinforce, no LLM needed
+        if r.get("kind") == kind and r.get("text") == text:
+            return store.add(kind=kind, text=text, born_run=run_id)
+    nv = embed_one(text, purpose="doc")
+    best, best_cos = None, 0.0
+    if nv:
+        for r in rows:
+            if r.get("kind") != kind or r.get("status") == "retired" \
+                    or not r.get("vec"):
+                continue
+            c = _cos(nv, r["vec"])
+            if c > best_cos:
+                best, best_cos = r, c
+    if best is None or best_cos < _NOMINATE_COS or complete is None:
+        return store.add(kind=kind, text=text, born_run=run_id)
+    try:
+        verdict = str(await complete(_CONFLICT_PROMPT.format(
+            a=best.get("text", ""), b=text)) or "").strip().upper()
+    except Exception:
+        verdict = ""
+    if verdict.startswith("CONFLICT"):
+        # the NEW observation supersedes: it is more recent evidence. The old
+        # rule is retired, never merged — a contradiction collapsed into one
+        # row is how a superseded rule gains authority from being wrong.
+        best["status"] = "retired"
+        store._write_all([r if r.get("id") != best.get("id") else best
+                          for r in rows])
+        log.info("memory: %r superseded %r", text[:50],
+                 best.get("text", "")[:50])
+        return store.add(kind=kind, text=text, born_run=run_id)
+    if verdict.startswith("DUPLICATE"):
+        best["seen_count"] = best.get("seen_count", 1) + 1
+        best["last_seen"] = time.time()
+        store._write_all([r if r.get("id") != best.get("id") else best
+                          for r in rows])
+        return best
+    return store.add(kind=kind, text=text, born_run=run_id)
 
 
 # --- reading it back ---------------------------------------------------------

@@ -513,6 +513,36 @@ def _ask_gemini(args, ctx):
     return "error: Gemini request failed after retries"
 
 
+# The context firewall: the model hands a QUESTION to a helper that runs in a
+# fresh context, does the messy multi-step exploration there, and returns one
+# condensed answer. The raw file dumps never enter the main conversation.
+# Execution lives in serve.py (it needs the engine); this sentinel tells the
+# agentic loop to route the call there instead of running a local handler.
+DELEGATE_SENTINEL = "\x00__RIGMA_DELEGATE__\x00"
+
+
+@tool("delegate",
+      "Hand a research question to a helper agent with a FRESH context. The "
+      "helper explores files/folders itself and returns one short answer, so "
+      "the details never crowd your context. Use for broad questions like "
+      "'what naming scheme do the files in X use' or 'summarise what this "
+      "folder contains' — NOT for reading one specific file you already know.",
+      {"type": "object", "properties": {
+          "question": {"type": "string",
+                       "description": "one specific question for the helper"},
+          "path": {"type": "string",
+                   "description": "optional folder/file to focus on"}},
+       "required": ["question"]},
+      needs="run")
+def _delegate(args, ctx):
+    # never runs — serve.py intercepts on the sentinel. Returning it from the
+    # handler keeps every non-serve caller (tests, cached_run) safe: they get
+    # a string, not a crash.
+    return DELEGATE_SENTINEL + json.dumps(
+        {"question": str(args.get("question", "")),
+         "path": str(args.get("path", ""))})
+
+
 @tool("current_datetime",
       "Get the current local date and time. Use for anything time-relative "
       "('today', 'now', 'this year').",
