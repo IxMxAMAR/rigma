@@ -2423,6 +2423,44 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         _run_tasks[run["id"]] = asyncio.create_task(_run_loop(run["id"]))
         return run
 
+    @app.get("/api/runs")
+    async def list_runs():
+        """Run history, newest first — the v2 dashboard's spine."""
+        from . import runs as _runs
+        out = []
+        try:
+            base = _runs._runs_dir()
+            for d in sorted(base.iterdir(), reverse=True):
+                r = _runs.load(d.name)
+                if r is None:
+                    continue
+                out.append({"id": r["id"], "status": r.get("status"),
+                            "mission": str(r.get("mission", ""))[:140],
+                            "workspace": r.get("workspace", ""),
+                            "iteration": r.get("iteration", 0)})
+                if len(out) >= 40:
+                    break
+        except Exception:
+            pass
+        return out
+
+    @app.get("/api/memory")
+    async def memory_list():
+        """The memory trust surface: every learned rule, inspectable."""
+        rows = _memory_store().all()
+        rows.sort(key=lambda m: (m.get("outcome_score", 0),
+                                 m.get("seen_count", 0)), reverse=True)
+        for m in rows:
+            m.pop("vec", None)          # 768 floats of noise for a UI
+        return rows
+
+    @app.delete("/api/memory/{mid}")
+    async def memory_forget(mid: str):
+        store = _memory_store()
+        rows = [r for r in store.all() if r.get("id") != mid]
+        store._write_all(rows)
+        return {"remaining": len(rows)}
+
     @app.get("/api/runs/active")
     async def active_run():
         from . import runs as _runs

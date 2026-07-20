@@ -89,3 +89,23 @@ def test_app_js_served_and_targets_session_api(upstream):
     store = client.get("/ui/store.js").text
     assert "/api/sessions/" in store and "sseParse" in store
     assert "/v1/chat/completions" not in store
+
+
+def test_runs_list_and_memory_endpoints(tmp_path, monkeypatch):
+    # v2 phase 4/5 backends: run history + the memory trust surface
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import runs as _runs
+    from rigma.memory import MemoryStore
+    client = TestClient(build_app(upstream_port=1))
+    assert client.get("/api/runs").json() == []
+    r = _runs.create("do the thing", "sess-x")
+    lst = client.get("/api/runs").json()
+    assert lst and lst[0]["id"] == r["id"] and "do the thing" in lst[0]["mission"]
+
+    store = MemoryStore(tmp_path / "memory" / "memories.jsonl")
+    m = store.add(kind="pitfall", text="Never type filenames.")
+    rows = client.get("/api/memory").json()
+    assert rows and rows[0]["text"] == "Never type filenames."
+    assert "vec" not in rows[0]
+    client.delete(f"/api/memory/{m['id']}")
+    assert client.get("/api/memory").json() == []
