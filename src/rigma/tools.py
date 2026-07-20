@@ -1083,18 +1083,40 @@ def _sample_files(args, ctx):
 
 
 @tool("write_file",
-      "Create or overwrite a text file inside the chat's workspace folder.",
+      "Create or overwrite a text file inside the chat's workspace folder. "
+      "For LONG documents, write in parts: first call creates the file, later "
+      "calls use append=true — calling again WITHOUT append REPLACES the "
+      "whole file.",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "path relative to the "
                    "workspace"},
-          "content": {"type": "string", "description": "the file's contents"}},
+          "content": {"type": "string", "description": "the file's contents"},
+          "append": {"type": "boolean", "description":
+                     "add to the end of the existing file instead of "
+                     "replacing it"}},
        "required": ["path", "content"]},
       safe=False, needs="code")
 def _write_file(args, ctx):
     p = _ws_path(ctx, str(args.get("path", "")))
     p.parent.mkdir(parents=True, exist_ok=True)
     content = str(args.get("content", ""))
+    existed = p.exists()
+    old_len = len(p.read_text(encoding="utf-8", errors="replace")) if existed \
+        else 0
+    if args.get("append") and existed:
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(content)
+        return (f"appended {len(content)} chars to {args.get('path')} "
+                f"(file is now {old_len + len(content)} chars)")
     p.write_text(content, encoding="utf-8")
+    if existed:
+        # Loud on purpose. Live 2026-07-21: the model wrote a 15,389-char
+        # chapter, then a second call silently replaced it with 8,766 chars —
+        # "wrote 8766 chars" gave it no way to notice it had just destroyed
+        # its own draft. The replaced size is the signal.
+        return (f"wrote {len(content)} chars to {args.get('path')} — REPLACED "
+                f"the previous {old_len}-char version, which is now GONE. If "
+                "you meant to continue the file, use append=true next time.")
     return f"wrote {len(content)} chars to {args.get('path')}"
 
 

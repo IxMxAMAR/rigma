@@ -131,3 +131,29 @@ def test_ssrf_private_targets_blocked():
     out = tools.run_tool("http_request",
                          {"url": "http://169.254.169.254/latest/meta-data"})
     assert "private" in out or "loopback" in out
+
+
+# ---- write_file overwrite signal + append (owner story loss 2026-07-21) ----
+
+def test_write_file_announces_overwrites(tmp_path):
+    # the model wrote a 15,389-char chapter, then a second call replaced it
+    # with 8,766 chars — and the result said only "wrote 8766 chars". Nothing
+    # told it a bigger draft just died. A weak model NEEDS that signal.
+    from rigma.tools import run_tool
+    ctx = {"workspace": str(tmp_path), "allow_code": True}
+    run_tool("write_file", {"path": "ch.txt", "content": "x" * 100}, ctx)
+    out = run_tool("write_file", {"path": "ch.txt", "content": "y" * 40}, ctx)
+    assert "REPLACED" in out and "100" in out
+    out2 = run_tool("write_file", {"path": "new.txt", "content": "z"}, ctx)
+    assert "REPLACED" not in out2
+
+
+def test_write_file_append_mode(tmp_path):
+    # long documents need multi-part writing that does not destroy part 1
+    from rigma.tools import run_tool
+    ctx = {"workspace": str(tmp_path), "allow_code": True}
+    run_tool("write_file", {"path": "ch.txt", "content": "part1 "}, ctx)
+    out = run_tool("write_file", {"path": "ch.txt", "content": "part2",
+                                  "append": True}, ctx)
+    assert "append" in out.lower()
+    assert (tmp_path / "ch.txt").read_text(encoding="utf-8") == "part1 part2"
