@@ -49,9 +49,17 @@ function previewArgs(args: unknown): string {
 
 function Thinking({ text, live }: { text: string; live: boolean }) {
   const [open, setOpen] = useState(live);
+  const body = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
   useEffect(() => {
     if (!live) setOpen(false);
   }, [live]);
+  useEffect(() => {
+    // follow the newest thinking while streaming, unless the user scrolled
+    // up to read something (same stickiness rule as the transcript)
+    const el = body.current;
+    if (el && live && stick.current) el.scrollTop = el.scrollHeight;
+  }, [text, live, open]);
   if (!text) return null;
   return (
     <div className="rounded-md bg-panel/70">
@@ -63,7 +71,15 @@ function Thinking({ text, live }: { text: string; live: boolean }) {
         {open ? "▾" : "▸"} thinking
       </button>
       {open && (
-        <div className="px-3 pb-2 text-[12.5px] text-muted whitespace-pre-wrap max-h-64 overflow-y-auto">
+        <div
+          ref={body}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stick.current =
+              el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          }}
+          className="px-3 pb-2 text-[12.5px] text-muted whitespace-pre-wrap max-h-64 overflow-y-auto"
+        >
           {text}
         </div>
       )}
@@ -129,6 +145,26 @@ function MessageActions({ m }: { m: ChatMessage }) {
   );
 }
 
+function Working({ label }: { label: string }) {
+  // a hairline "…" was invisible on a 2K screen (owner report 2026-07-21):
+  // the working state earns a real indicator — dot, words, elapsed time
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    const t0 = Date.now();
+    const t = setInterval(() => setSecs(Math.floor((Date.now() - t0) / 1000)),
+                          1000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div className="flex items-center gap-2.5 py-1">
+      <span className="w-2.5 h-2.5 rounded-full bg-amber animate-pulse" />
+      <span className="font-mono text-[12.5px] text-secondary">
+        {label}{secs >= 3 ? ` — ${secs}s` : ""}
+      </span>
+    </div>
+  );
+}
+
 function LiveTurn({ turn }: { turn: StreamingTurn }) {
   return (
     <div className="flex flex-col gap-2">
@@ -147,7 +183,13 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         </div>
       )}
       {!turn.text && !turn.error && (
-        <div className="font-mono text-[12px] text-muted animate-pulse">…</div>
+        <Working
+          label={turn.chips.some((c) => c.state === "running")
+            ? "running tools"
+            : turn.thinking
+              ? "thinking"
+              : "generating"}
+        />
       )}
     </div>
   );

@@ -1391,7 +1391,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                      s.get("backend", "unknown"))
         info = {k: s.get(k) for k in ("model", "quant", "backend", "use_case",
                                       "ctx", "started_at", "public_port",
-                                      "unloaded")}
+                                      "unloaded", "kv_cache")}
         info.update(server_ops.ram_snapshot())
         info["calibrating"] = server_ops.read_calib_marker()
         info["engine_version"] = server_ops.engine_version()
@@ -1464,9 +1464,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if not switch_lock.acquire(blocking=False):
             return JSONResponse({"error": "a switch is already in progress"},
                                 status_code=409)
+        kv = body.get("kv") or None
+        if kv is not None and kv not in server_ops.KV_CACHE_TYPES:
+            switch_lock.release()
+            return JSONResponse(
+                {"error": f"kv must be one of "
+                          f"{', '.join(server_ops.KV_CACHE_TYPES)}"},
+                status_code=400)
         try:
             new_state = await asyncio.to_thread(
-                server_ops.perform_switch, s["model"], registry, None, want)
+                server_ops.perform_switch, s["model"], registry, None, want,
+                False, kv)
             telemetry["tg"] = None
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)

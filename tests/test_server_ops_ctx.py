@@ -41,7 +41,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr("rigma.runtime.ensure_engine",
                         lambda backend, osn: "llama-server.exe")
     def fake_launch(exe, rp, path, port, extra_args=None):
-        launched.update(ctx=rp.flags.ctx, n_cpu_moe=rp.flags.n_cpu_moe)
+        launched.update(ctx=rp.flags.ctx, n_cpu_moe=rp.flags.n_cpu_moe,
+                        plan=rp)
         return _SP()
     monkeypatch.setattr("rigma.runtime.launch_server", fake_launch)
     monkeypatch.setattr(st, "kill_pid", lambda pid: None)
@@ -121,3 +122,18 @@ def test_ctx_relaunch_carries_dense_ngl(monkeypatch, tmp_path):
                            disk_free_gb=400.0)
     server_ops.perform_switch("big", reg, prof, ctx=16384)
     assert 0 < launched["ngl"] < 40      # partial offload carried through
+
+
+def test_kv_override_reaches_the_launch_flags(env):
+    reg, launched = env
+    server_ops.perform_switch("m", reg, _profile(), ctx=8192, kv="q8_0")
+    assert launched["plan"].flags.cache_type_k == "q8_0"
+    assert launched["plan"].flags.cache_type_v == "q8_0"
+    from rigma import state as st2
+    assert st2.read_state()["kv_cache"] == "q8_0"
+
+
+def test_kv_rejects_unknown_types(env):
+    reg, _ = env
+    with pytest.raises(RuntimeError, match="kv must be one of"):
+        server_ops.perform_switch("m", reg, _profile(), kv="q2_k")
