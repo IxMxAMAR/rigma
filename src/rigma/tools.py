@@ -484,19 +484,10 @@ def _bounded_get(url: str, method: str = "GET", headers=None, json=None,
 
 
 def _gemini_key():
-    """Gemini API key from env, the local key file, or ~/.gemini_api_key
-    (same sources as the global ask_gemini_pro tool)."""
+    """Gemini API key from GEMINI_API_KEY / RIGMA_GEMINI_KEY, or ~/.gemini_api_key."""
     k = os.environ.get("GEMINI_API_KEY") or os.environ.get("RIGMA_GEMINI_KEY")
     if k:
         return k.strip()
-    for path, field in [
-            (r"~/.gemini_api_key", "gemini_key")]:
-        try:
-            v = json.loads(Path(path).read_text(encoding="utf-8")).get(field, "")
-            if v:
-                return v.strip()
-        except Exception:
-            pass
     try:
         t = (Path.home() / ".gemini_api_key").read_text(encoding="utf-8").strip()
         return t or None
