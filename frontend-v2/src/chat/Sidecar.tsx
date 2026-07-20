@@ -126,6 +126,7 @@ function SamplingCard() {
   const [dirty, setDirty] = useState(false);
   const [presets, setPresets] = useState<PresetRow[]>([]);
   const [presetId, setPresetId] = useState("");
+  const [workspace, setWorkspace] = useState("");
 
   useEffect(() => {
     fetch("/api/presets")
@@ -139,17 +140,20 @@ function SamplingCard() {
     api.getSession(currentId).then((s) => {
       const raw = (s as unknown as { params?: Record<string, number>;
                                      system_prompt?: string;
-                                     preset_id?: string });
+                                     preset_id?: string;
+                                     workspace?: string });
       setParams(raw.params ?? {});
       setPrompt(raw.system_prompt ?? "");
       setPresetId(raw.preset_id ?? "");
+      setWorkspace(raw.workspace ?? "");
       setDirty(false);
     }).catch(() => {});
   }, [currentId]);
 
   const save = async () => {
     if (!currentId) return;
-    await api.updateSession(currentId, { params, system_prompt: prompt })
+    await api.updateSession(currentId,
+      { params, system_prompt: prompt, workspace })
       .catch(() => {});
     setDirty(false);
   };
@@ -212,6 +216,16 @@ function SamplingCard() {
         rows={3}
         className="rounded-md bg-surface px-2 py-1.5 text-[12.5px] outline-none resize-y placeholder:text-muted"
       />
+      <label className="flex items-center gap-2 text-[12.5px]">
+        <span className="w-24 text-secondary">workspace</span>
+        <input
+          value={workspace}
+          onChange={(e) => { setWorkspace(e.target.value); setDirty(true); }}
+          placeholder="folder for file tools"
+          aria-label="Workspace folder"
+          className="flex-1 min-w-0 rounded-md bg-surface px-2 py-0.5 font-mono text-[12px] outline-none placeholder:text-muted"
+        />
+      </label>
       {num("temperature", "temperature", 0.05, 2)}
       {num("dry_multiplier", "DRY", 0.05, 2)}
       {num("repeat_penalty", "repeat pen.", 0.01, 2)}

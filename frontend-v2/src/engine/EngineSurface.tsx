@@ -129,7 +129,29 @@ export default function EngineSurface() {
               OpenAI API: <span className="text-secondary">{String(info.openai_base)}</span>
             </div>
           )}
-          <div className="flex gap-2 mt-5">
+          <div className="flex gap-2 mt-5 items-center">
+            <label className="flex items-center gap-1.5 font-mono text-[12px] text-secondary">
+              ctx
+              <select
+                value={String(info.ctx ?? "")}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (v && v !== info.ctx &&
+                      window.confirm(`Relaunch at ${Math.round(v / 1024)}K context?`))
+                    void act("ctx", () => engineApi.setCtx(v));
+                }}
+                aria-label="Context size"
+                className="rounded-md bg-surface px-2 py-1 outline-none"
+              >
+                {[8192, 16384, 32768, 65536, 131072]
+                  .concat(info.ctx && ![8192, 16384, 32768, 65536, 131072]
+                          .includes(info.ctx as number) ? [info.ctx as number] : [])
+                  .sort((a, b) => a - b)
+                  .map((v) => (
+                    <option key={v} value={v}>{Math.round(v / 1024)}K</option>
+                  ))}
+              </select>
+            </label>
             <button
               onClick={() => void act("unload", engineApi.unload)}
               className="rounded-md bg-surface hover:bg-float px-3 py-1.5 text-[13px]"
