@@ -54,8 +54,15 @@ MAX_PITFALLS = 24
 
 _WIN_PATH = re.compile(r"[A-Za-z]:[\\/]")
 _UNC_PATH = re.compile(r"\\\\[^\\]+\\")
+# enumerated whitelist rather than "any dotted token": the generic form
+# rejects version numbers ("use Python 3.12" would be dropped as a filename).
+# The list covers what THIS box's tools actually produce — review found the
+# first cut missed .ps1/.log/.bat etc., so "check server.log for the trace"
+# passed the guard and would have been pinned into every future run.
 _FILENAME = re.compile(
-    r"\S+\.(?:png|jpe?g|webp|gif|bmp|md|txt|json|jsonl|py|csv|gguf|safetensors)\b",
+    r"\S+\.(?:png|jpe?g|webp|gif|bmp|md|txt|json|jsonl|py|csv|gguf"
+    r"|safetensors|ps1|bat|cmd|log|ya?ml|ini|cfg|toml|pt|pth|ckpt|onnx"
+    r"|bin|zip|7z|exe|html?|pdf|sh|js|ts|css)\b",
     re.I)
 _CALL_SYNTAX = re.compile(r"\w+\([^)]*['\"][^)]*\)")
 
@@ -85,7 +92,10 @@ def mine_events(actions: list[dict]) -> list[dict]:
     for i, act in enumerate(actions or []):
         if act.get("ok", True):
             continue
-        key = (act.get("tool"), act.get("args"))
+        # identity by full-args hash when the trace carries one; the stored
+        # args string is display-truncated to 300 chars and collides for big
+        # write_file/run_python payloads that share a prefix
+        key = (act.get("tool"), act.get("args_sha") or act.get("args"))
         seen_failures[key] = seen_failures.get(key, 0) + 1
         # the same call failing twice is a loop forming, not bad luck
         if seen_failures[key] == 2:

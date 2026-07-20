@@ -352,3 +352,25 @@ def test_pinned_rules_carry_no_epistemic_hedge(tmp_path):
     store = MemoryStore(tmp_path / "m.jsonl")
     store.add(kind="pitfall", text="Never type filenames.")
     assert "UNVERIFIED" not in render_pitfall_block(store.all())
+
+
+def test_mining_through_the_real_trace_roundtrip(tmp_path, monkeypatch):
+    # every _a() fixture builds args by hand — production args go through
+    # append_action, which TRUNCATES to 300 chars for display. Two different
+    # write_file calls sharing their first 300 chars must not collide into a
+    # false loop, which is why identity now rides on a full-args hash.
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import runs as _r
+    run = _r.create("m", "s")
+    base = {"path": "out.md", "content": "x" * 400}
+    _r.append_action(run["id"], "write_file", base, ok=False)
+    _r.append_action(run["id"], "write_file",
+                     {**base, "content": "x" * 400 + "DIFFERENT"}, ok=False)
+    events = mine_events(_r.read_actions(run["id"]))
+    assert not [e for e in events if e["kind"] == "loop"], \
+        "different calls sharing a 300-char prefix are not a loop"
+    # ...and a REAL identical repeat still is one
+    _r.append_action(run["id"], "write_file", base, ok=False)
+    _r.append_action(run["id"], "write_file", base, ok=False)
+    events = mine_events(_r.read_actions(run["id"]))
+    assert [e for e in events if e["kind"] == "loop"]
