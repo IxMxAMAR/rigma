@@ -3,6 +3,8 @@
 // Phase 1 ships the chrome; each later phase fills one canvas.
 import { useEffect } from "react";
 import ChatSurface from "./chat/ChatSurface";
+import EngineSurface from "./engine/EngineSurface";
+import ModelsSurface from "./models/ModelsSurface";
 import Palette from "./Palette";
 import { SURFACES, useApp } from "./store";
 
@@ -82,6 +84,8 @@ function Canvas() {
   const surface = useApp((s) => s.surface);
   const meta = SURFACES.find((s) => s.id === surface);
   if (surface === "chat") return <ChatSurface />;
+  if (surface === "engine") return <EngineSurface />;
+  if (surface === "models") return <ModelsSurface />;
   // Remaining surfaces: a deliberate, designed empty state each —
   // CONSTITUTION §7: "an empty screen is an invitation to act", never blank.
   return (
