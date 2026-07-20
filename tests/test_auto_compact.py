@@ -212,3 +212,34 @@ def test_chats_still_summarize_and_never_mask(home, upstream):
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
     assert "event: masked" not in r.text
     assert sessions.load(sid)["digest"] == "COMPACT DIGEST"
+
+
+def test_chat_auto_titles_after_a_few_turns(home, upstream):
+    # the rail was "Sup bro", "Hello", and three identical truncations —
+    # after the 4th message one tiny non-streaming call names the chat.
+    # _Upstream answers non-streaming calls with COMPACT DIGEST, which here
+    # plays the generated title.
+    _Upstream.prompt_tokens, _Upstream.compact_status = 100, 200
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=131072)
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}/chat", json={"message": "Sup bro"})
+    assert sessions.load(sid)["title"] == "Sup bro"      # too early
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "more"})
+    s = sessions.load(sid)
+    assert s["title"] == "COMPACT DIGEST"
+    assert s["title_source"] == "auto"
+    assert "event: meta" in r.text
+
+
+def test_user_rename_is_never_overwritten(home, upstream):
+    _Upstream.prompt_tokens, _Upstream.compact_status = 100, 200
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=131072)
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"title": "My Novel"})
+    for m in ("a", "b", "c"):
+        client.post(f"/api/sessions/{sid}/chat", json={"message": m})
+    assert sessions.load(sid)["title"] == "My Novel"

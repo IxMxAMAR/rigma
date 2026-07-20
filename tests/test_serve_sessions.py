@@ -464,6 +464,9 @@ def test_effort_field_and_request_layer(tmp_path, monkeypatch, oai_upstream):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt=""))
     s = c.post("/api/sessions", json={}).json()
+    # a user-set title keeps the auto-titler quiet, so oai_upstream.last()
+    # is the chat turn itself, not a follow-up title request
+    c.post(f"/api/sessions/{s['id']}", json={"title": "effort test"})
     r = c.post(f"/api/sessions/{s['id']}", json={"effort": "off"})
     assert r.json()["effort"] == "off"
     assert c.post(f"/api/sessions/{s['id']}",

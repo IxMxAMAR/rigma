@@ -148,6 +148,8 @@ def test_model_default_params_reach_upstream_but_session_wins(home, tmp_path,
                    ui_pid=os.getpid())
     client = TestClient(build_app(upstream_port=upstream, registry=reg))
     sid = client.post("/api/sessions", json={}).json()["id"]
+    # user title keeps the auto-titler quiet so last_body stays the turn
+    client.post(f"/api/sessions/{sid}", json={"title": "params test"})
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
     assert r.status_code == 200
     assert _Echo.last_body["temperature"] == 0.7
@@ -194,6 +196,8 @@ def test_unloaded_chat_gets_honest_error_event(home, upstream, monkeypatch):
     # upstream port that nothing listens on -> ConnectError
     client = TestClient(build_app(upstream_port=1))
     sid = client.post("/api/sessions", json={}).json()["id"]
+    # user title keeps the auto-titler quiet so last_body stays the turn
+    client.post(f"/api/sessions/{sid}", json={"title": "params test"})
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
     assert r.status_code == 200
     assert "event: error" in r.text and "unloaded" in r.text

@@ -747,6 +747,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         for k in sessions.MUTABLE_FIELDS:
             if k in body:
                 s[k] = body[k]
+        if "title" in body:
+            # an explicit rename is the user's word — auto-titling never
+            # overwrites it afterwards
+            s["title_source"] = "user"
         sessions.save(s)
         return s
 
@@ -1286,7 +1290,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 return
             for k in ("title", "system_prompt", "params", "notes",
                       "digest", "preset_id", "effort", "use_rag",
-                      "authors_note", "authors_note_depth", "archive"):
+                      "authors_note", "authors_note_depth", "archive",
+                      "title_source"):
                 s[k] = fresh.get(k, s.get(k))
             if prefill:
                 s["prefill"] = ""   # consumed once, like a variant
@@ -1323,6 +1328,43 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 s["messages"].append(msg)
             sessions.save(s)
             _bump_stats(timings)
+            # Auto-title once the conversation has a shape (owner request
+            # 2026-07-21: the rail was "Sup bro", "Hello", and three identical
+            # truncations). One tiny non-streaming call after the 4th message;
+            # a title the USER typed via rename is never overwritten, and
+            # failure changes nothing — the truncation stays.
+            try:
+                if (len(s.get("messages", [])) >= 4
+                        and s.get("title_source") not in ("user", "auto")
+                        and not s.get("run_id")):
+                    convo = []
+                    for m in s["messages"][:6]:
+                        c = m.get("content", "")
+                        if not isinstance(c, str):
+                            c = " ".join(pt.get("text", "") for pt in c
+                                         if isinstance(pt, dict))
+                        convo.append(f"{m.get('role')}: {c[:200]}")
+                    tresp = await client.post(
+                        "/v1/chat/completions",
+                        json={"messages": [{"role": "user", "content":
+                              "Give this conversation a title: 3 to 6 plain "
+                              "words, no quotes, no punctuation at the end. "
+                              "Reply with the title only." + chr(10)
+                              + chr(10).join(convo)}],
+                              "stream": False, "temperature": 0.3,
+                              "max_tokens": 24},
+                        timeout=20.0)
+                    if tresp.status_code == 200:
+                        new_t = (tresp.json()["choices"][0]["message"]
+                                 ["content"] or "").strip().strip('"')
+                        new_t = new_t.splitlines()[0].strip()[:60]
+                        if new_t:
+                            s["title"] = new_t
+                            s["title_source"] = "auto"
+                            sessions.save(s)
+                            yield _sse({"title": new_t}, event="meta")
+            except Exception:
+                pass          # titling is never load-bearing
             # auto-compact when the window is nearly full, so the NEXT turn
             # starts small (reactive; uses the engine's real prompt_tokens)
             ptoks = usage.get("prompt_tokens") or 0
@@ -1401,6 +1443,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         info.update(server_ops.ram_snapshot())
         info["calibrating"] = server_ops.read_calib_marker()
         info["engine_version"] = server_ops.engine_version()
+        try:
+            info["native_ctx"] = registry.models[s["model"]].native_ctx                 if registry and s.get("model") in registry.models else None
+        except Exception:
+            info["native_ctx"] = None
         info["last_tg"] = telemetry["tg"]
         info["expected_tg"] = exp
         info["verdict"] = server_ops.verdict(telemetry["tg"], exp)

@@ -143,13 +143,16 @@ export default function EngineSurface() {
                 aria-label="Context size"
                 className="rounded-md bg-surface px-2 py-1 outline-none"
               >
-                {[8192, 16384, 32768, 65536, 131072]
-                  .concat(info.ctx && ![8192, 16384, 32768, 65536, 131072]
-                          .includes(info.ctx as number) ? [info.ctx as number] : [])
-                  .sort((a, b) => a - b)
-                  .map((v) => (
+                {(() => {
+                  const native = (info.native_ctx as number) || 131072;
+                  const opts = [8192, 16384, 32768, 65536, 131072, 262144]
+                    .filter((v) => v <= native);
+                  if (info.ctx && !opts.includes(info.ctx as number))
+                    opts.push(info.ctx as number);
+                  return opts.sort((a, b) => a - b).map((v) => (
                     <option key={v} value={v}>{Math.round(v / 1024)}K</option>
-                  ))}
+                  ));
+                })()}
               </select>
             </label>
             <label className="flex items-center gap-1.5 font-mono text-[12px] text-secondary">

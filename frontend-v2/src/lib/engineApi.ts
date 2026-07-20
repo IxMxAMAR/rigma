@@ -19,6 +19,7 @@ export interface ServerInfo {
   ctx?: number;
   unloaded?: boolean;
   kv_cache?: string;
+  native_ctx?: number;
   calibrating?: unknown;
   engine_version?: string;
   last_tg?: number | null;
