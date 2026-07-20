@@ -64,6 +64,12 @@ AUTO_COMPACT_FRACTION = 0.92
 # just bound a loop — 8192 truncated legitimate output mid-sentence. DRY is what
 # breaks repetition loops; this is only a runaway backstop.
 RUN_PARAMS = {"dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2,
+              # DRY scans RECENT output only. At the default (whole context)
+              # it punished the model for faithfully re-emitting file content
+              # it had legitimately read - chapters came back paraphrased and
+              # compressed (live 2026-07-21). Loops live in the tail; distant
+              # context is material, not repetition.
+              "dry_penalty_last_n": 4096,
               "repeat_penalty": 1.05, "max_tokens": 20000,
               # low temperature in agent mode: at the default ~0.8 an IQ-quant
               # model's tool-call SYNTAX drifts nondeterministically and the
@@ -1195,10 +1201,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 result, imgs = (
                                     "error: this tool call was CUT OFF by the "
                                     "token limit — its arguments were "
-                                    "incomplete and it was NOT executed. "
-                                    "Re-issue it with less content, or write "
-                                    "long files in parts with write_file's "
-                                    "append=true."), None
+                                    "incomplete and it was NOT executed. Do "
+                                    "NOT shorten the content. Write the SAME "
+                                    "content in parts: first write_file call "
+                                    "with the first part, then append=true "
+                                    "calls for the rest."), None
                                 _shown = result
                                 yield _sse({"id": c["id"], "name": name,
                                             "result": _shown},

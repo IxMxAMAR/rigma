@@ -1074,10 +1074,11 @@ def _sample_files(args, ctx):
 
 
 @tool("write_file",
-      "Create or overwrite a text file inside the chat's workspace folder. "
-      "For LONG documents, write in parts: first call creates the file, later "
-      "calls use append=true — calling again WITHOUT append REPLACES the "
-      "whole file.",
+      "Create a NEW text file, or extend one with append=true. For LONG "
+      "documents write in parts: first call creates, append=true continues. "
+      "To CHANGE part of an existing file use edit_file instead — rewriting "
+      "a whole existing file from memory degrades it and destroys the "
+      "original.",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "path relative to the "
                    "workspace"},
