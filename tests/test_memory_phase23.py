@@ -227,3 +227,50 @@ def test_replay_r_at_3_hybrid(step, expect, monkeypatch):
     hits = retrieve(rows, step, k=3)
     assert any(expect in h["text"] for h in hits), \
         f"hybrid R@3 miss for {step!r}: {[h['text'] for h in hits]}"
+
+
+# ---- live run #3 findings ----
+
+def test_anchor_strips_hallucinated_absolute_artifacts():
+    # the compiler wrote C:\workspace\naming.md — a folder that does not
+    # exist — because its example showed absolute paths and a weak model
+    # imitates the example over the rule. Wrong path -> server could never
+    # verify -> plan never advanced -> memories never credited.
+    from rigma.mission import anchor_spec
+    spec = {"steps": [{"id": 1, "artifact": r"C:\workspace\naming.md"}],
+            "deliverables": [{"path": r"C:\workspace\count.md"}]}
+    out = anchor_spec(spec)
+    assert out["steps"][0]["artifact"] == "naming.md"
+    assert out["deliverables"][0]["path"] == "count.md"
+
+
+def test_anchor_keeps_real_absolute_paths(tmp_path):
+    # a user who NAMES a real folder means it
+    from rigma.mission import anchor_spec
+    real = str(tmp_path / "out.md")
+    spec = {"steps": [{"id": 1, "artifact": real}], "deliverables": []}
+    assert anchor_spec(spec)["steps"][0]["artifact"] == real
+
+
+def test_model_driven_completion_also_scores(tmp_path, monkeypatch):
+    # scoring rode only the server-advance path; live run #3 completed its
+    # steps through manage_plan and the injected memories sat at -4 while the
+    # run succeeded around them
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.delenv("RIGMA_MEMORY", raising=False)
+    from rigma import runs as _r
+    from rigma import tools as _t
+    store = MemoryStore(tmp_path / "memory" / "memories.jsonl")
+    m = store.add(kind="pitfall", text="Never type filenames.",
+                  born_run="other-run")
+    run = _r.create("m", "s")
+    _r.plan_add(run["id"], "do the thing")
+    run["step_injected"] = {"1": [m["id"]]}
+    _r.save(run)
+    out = _t.run_tool("manage_plan", {"action": "complete", "id": 1},
+                      {"run_id": run["id"], "workspace": str(tmp_path)})
+    assert "marked done" in out
+    row = store.all()[0]
+    assert row["outcome_score"] == 1
+    assert row["status"] == "verified", \
+        "+1 from a different run than born_run must graduate the draft"
