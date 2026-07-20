@@ -239,6 +239,127 @@ def _ui_file(name: str) -> str:
         return _FALLBACK_HTML if name == "index.html" else ""
 
 
+# ---- driving-message helpers -------------------------------------------
+# module scope, not nested in build_app: these are pure functions of
+# (run, session) and the only way to test the driving line directly.
+def _last_trace(session):
+    for m in reversed((session or {}).get("messages", [])):
+        if m.get("role") == "assistant":
+            return m.get("tool_trace", []) or []
+    return []
+
+def _turn_sig(trace):
+    return tuple(sorted(
+        (t.get("name", ""), json.dumps(t.get("args", {}), sort_keys=True,
+                                       default=str)) for t in trace))
+
+def _dynamic_line(trace):
+    if not trace:
+        return "Take a concrete action now — call a tool to advance the plan."
+    errs = [t for t in trace if str(t.get("result", "")).startswith("error")]
+    if errs and len(errs) == len(trace):
+        return (f"Your last tool call failed: {str(errs[-1].get('result',''))[:160]}. "
+                "Read that error and change your approach — different "
+                "arguments, or a different tool. Do NOT reply with text "
+                "only; keep using tools, but diagnose before retrying.")
+    names = ", ".join(dict.fromkeys(t.get("name", "") for t in trace))
+    return f"Last step used {names}. Do the next step in your plan."
+
+def _driving_message(run, session):
+    from . import runs as _runs
+    rid = run["id"]
+    if run.get("steer_queue"):
+        note = run["steer_queue"].pop(0)
+        _runs.save(run)
+        return "USER GUIDANCE — follow this now: " + str(note)
+    echoed = run.pop("_echoed_tool", "")
+    if echoed:
+        _runs.save(run)
+        return (f"You wrote \"{echoed}\" as TEXT. That is not a tool call — "
+                "nothing ran, and the turn was wasted. Emit an actual "
+                f"{echoed} tool call now (the arguments may be empty). "
+                "Never type a tool's name into your reply.")
+    miss = run.pop("_missing_artifacts", None)
+    if miss:
+        _runs.save(run)
+        listed = "\n".join("  - " + m for m in miss)
+        return ("You called task_complete, but the deliverables are NOT on "
+                "disk:\n" + listed +
+                "\nA file you did not write does not exist, no matter what "
+                "you concluded. Write the missing file(s) now with "
+                "write_file, then call task_complete again.")
+    saved = run.pop("_draft_saved", "")
+    if saved:
+        _runs.save(run)
+        return ("Your last reply was PROSE. In this mode a reply reaches "
+                "nobody — only files persist. I saved that text to "
+                f"{saved} so it isn't lost.\n"
+                "From now on put every deliverable in a file with "
+                "write_file(path=..., content=...). Continue the mission "
+                "from where that draft stopped — do not start over.")
+    if run.pop("_challenge_pending", False):
+        _runs.save(run)
+        pend = _runs.pending_tasks(rid)
+        step = (f"#{pend[0]['id']} {pend[0]['text']}" if pend else "the mission")
+        return ("You called task_complete, but the plan still has "
+                f"{len(pend)} step(s) open. Do NOT claim completion yet.\n"
+                f"Do this now: {step}\n"
+                "If that step is genuinely already done, mark it with "
+                "manage_plan(action='complete', id=N) — with evidence you "
+                "actually produced, not an assumption. If it cannot be done, "
+                "say what blocked you.")
+    if run.get("force_completion"):
+        run["force_completion"] = False
+        _runs.save(run)
+        return ("You have stopped making progress. DECIDE NOW:\n"
+                "• If the ENTIRE mission is complete, call "
+                "task_complete(summary='…') THIS TURN.\n"
+                "• If it is NOT complete, take the next concrete action with a "
+                "tool.\nDo not narrate or repeat yourself — act. This is your "
+                "last chance before the run is marked incomplete.")
+    if run.get("_verify_pending"):
+        return ("You called task_complete. Before this run can end you MUST "
+                "VERIFY: use tools (read_file / find_files / run_shell) to "
+                "confirm EVERY plan item is actually done. If anything is "
+                "missing, finish it. Only then call task_complete again.")
+    if run.get("iteration", 0) == 0:
+        return ("New mission — do NOT execute yet. First call manage_plan("
+                "action='add', task='…') 3–5 times to break the mission into "
+                "concrete, verifiable steps. Then start working through them.")
+    nxt = _runs.next_pending(rid) or "(no pending steps — verify and finish)"
+    last = _last_trace(session)
+    # called it but didn't do it: name the gap instead of a generic nudge
+    if last and all(t.get("name") in _BOOKKEEPING_TOOLS for t in last):
+        return ("You updated your plan/log but produced NOTHING. Describing "
+                "what you will do is not doing it. RIGHT NOW, in this turn, "
+                "perform the actual work with a real tool (write_file / "
+                "run_python / read_file / view_images) and produce the "
+                "artifact. Do not touch manage_plan until the work exists. "
+                f"Continue with: {nxt}")
+    base = _dynamic_line(last)
+    if run.get("iteration", 0) % K_REMIND == 0:
+        # Periodic checkpoint. Deliberately does NOT restate the mission:
+        # it is already pinned in the system prompt every single turn, and
+        # re-injecting it as a user message reads to a small model like a
+        # NEW instruction — it restarts from phase 1 (owner hit exactly
+        # this). Anchor on what is DONE + the ONE next step instead.
+        done = _runs.done_summary(rid)
+        return ("CHECKPOINT — you are MID-RUN. Do NOT start over and do NOT "
+                "redo finished work.\n"
+                + (f"Already done: {done}\n" if done else "")
+                + f"Your next step: {nxt}\n" + base)
+    # Fires on EVERY action now, so it stays one short line — each token is
+    # prefill cost on a slow local model. The previous "Last: <log line>"
+    # echo is gone: the actual TOOL RESULT is carried into context directly,
+    # which is better continuity than a summary of it.
+    # State the WORK, never the protocol. "Emit ONE tool call" repeated every
+    # turn gave the model something to reason ABOUT — it looped writing "the
+    # prompt says Emit ONE tool call" instead of calling anything. Protocol
+    # rules belong in the (cached) system prompt, said once.
+    d, tot = _runs.plan_counts(rid)
+    return f"[{d}/{tot} done] Do this now: {nxt}"
+
+
 def build_app(upstream_port: int, default_prompt: str | None = None,
               registry=None) -> FastAPI:
     app = FastAPI(title="rigma", docs_url=None, redoc_url=None)
@@ -1292,123 +1413,6 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     # ================= Autonomous Mode (Runs) =========================
     _run_tasks: dict = {}   # run_id -> asyncio.Task (for cancellation)
-
-    def _last_trace(session):
-        for m in reversed((session or {}).get("messages", [])):
-            if m.get("role") == "assistant":
-                return m.get("tool_trace", []) or []
-        return []
-
-    def _turn_sig(trace):
-        return tuple(sorted(
-            (t.get("name", ""), json.dumps(t.get("args", {}), sort_keys=True,
-                                           default=str)) for t in trace))
-
-    def _dynamic_line(trace):
-        if not trace:
-            return "Take a concrete action now — call a tool to advance the plan."
-        errs = [t for t in trace if str(t.get("result", "")).startswith("error")]
-        if errs and len(errs) == len(trace):
-            return (f"Your last tool call failed: {str(errs[-1].get('result',''))[:160]}. "
-                    "Read that error and change your approach — different "
-                    "arguments, or a different tool. Do NOT reply with text "
-                    "only; keep using tools, but diagnose before retrying.")
-        names = ", ".join(dict.fromkeys(t.get("name", "") for t in trace))
-        return f"Last step used {names}. Do the next step in your plan."
-
-    def _driving_message(run, session):
-        from . import runs as _runs
-        rid = run["id"]
-        if run.get("steer_queue"):
-            note = run["steer_queue"].pop(0)
-            _runs.save(run)
-            return "USER GUIDANCE — follow this now: " + str(note)
-        echoed = run.pop("_echoed_tool", "")
-        if echoed:
-            _runs.save(run)
-            return (f"You wrote \"{echoed}\" as TEXT. That is not a tool call — "
-                    "nothing ran, and the turn was wasted. Emit an actual "
-                    f"{echoed} tool call now (the arguments may be empty). "
-                    "Never type a tool's name into your reply.")
-        miss = run.pop("_missing_artifacts", None)
-        if miss:
-            _runs.save(run)
-            listed = "\n".join("  - " + m for m in miss)
-            return ("You called task_complete, but the deliverables are NOT on "
-                    "disk:\n" + listed +
-                    "\nA file you did not write does not exist, no matter what "
-                    "you concluded. Write the missing file(s) now with "
-                    "write_file, then call task_complete again.")
-        saved = run.pop("_draft_saved", "")
-        if saved:
-            _runs.save(run)
-            return ("Your last reply was PROSE. In this mode a reply reaches "
-                    "nobody — only files persist. I saved that text to "
-                    f"{saved} so it isn't lost.\n"
-                    "From now on put every deliverable in a file with "
-                    "write_file(path=..., content=...). Continue the mission "
-                    "from where that draft stopped — do not start over.")
-        if run.pop("_challenge_pending", False):
-            _runs.save(run)
-            pend = _runs.pending_tasks(rid)
-            step = (f"#{pend[0]['id']} {pend[0]['text']}" if pend else "the mission")
-            return ("You called task_complete, but the plan still has "
-                    f"{len(pend)} step(s) open. Do NOT claim completion yet.\n"
-                    f"Do this now: {step}\n"
-                    "If that step is genuinely already done, mark it with "
-                    "manage_plan(action='complete', id=N) — with evidence you "
-                    "actually produced, not an assumption. If it cannot be done, "
-                    "say what blocked you.")
-        if run.get("force_completion"):
-            run["force_completion"] = False
-            _runs.save(run)
-            return ("You have stopped making progress. DECIDE NOW:\n"
-                    "• If the ENTIRE mission is complete, call "
-                    "task_complete(summary='…') THIS TURN.\n"
-                    "• If it is NOT complete, take the next concrete action with a "
-                    "tool.\nDo not narrate or repeat yourself — act. This is your "
-                    "last chance before the run is marked incomplete.")
-        if run.get("_verify_pending"):
-            return ("You called task_complete. Before this run can end you MUST "
-                    "VERIFY: use tools (read_file / find_files / run_shell) to "
-                    "confirm EVERY plan item is actually done. If anything is "
-                    "missing, finish it. Only then call task_complete again.")
-        if run.get("iteration", 0) == 0:
-            return ("New mission — do NOT execute yet. First call manage_plan("
-                    "action='add', task='…') 3–5 times to break the mission into "
-                    "concrete, verifiable steps. Then start working through them.")
-        nxt = _runs.next_pending(rid) or "(no pending steps — verify and finish)"
-        last = _last_trace(session)
-        # called it but didn't do it: name the gap instead of a generic nudge
-        if last and all(t.get("name") in _BOOKKEEPING_TOOLS for t in last):
-            return ("You updated your plan/log but produced NOTHING. Describing "
-                    "what you will do is not doing it. RIGHT NOW, in this turn, "
-                    "perform the actual work with a real tool (write_file / "
-                    "run_python / read_file / view_images) and produce the "
-                    "artifact. Do not touch manage_plan until the work exists. "
-                    f"Continue with: {nxt}")
-        base = _dynamic_line(last)
-        if run.get("iteration", 0) % K_REMIND == 0:
-            # Periodic checkpoint. Deliberately does NOT restate the mission:
-            # it is already pinned in the system prompt every single turn, and
-            # re-injecting it as a user message reads to a small model like a
-            # NEW instruction — it restarts from phase 1 (owner hit exactly
-            # this). Anchor on what is DONE + the ONE next step instead.
-            done = _runs.done_summary(rid)
-            return ("CHECKPOINT — you are MID-RUN. Do NOT start over and do NOT "
-                    "redo finished work.\n"
-                    + (f"Already done: {done}\n" if done else "")
-                    + f"Your next step: {nxt}\n" + base)
-        # Fires on EVERY action now, so it stays one short line — each token is
-        # prefill cost on a slow local model. The previous "Last: <log line>"
-        # echo is gone: the actual TOOL RESULT is carried into context directly,
-        # which is better continuity than a summary of it.
-        # State the WORK, never the protocol. "Emit ONE tool call" repeated every
-        # turn gave the model something to reason ABOUT — it looped writing "the
-        # prompt says Emit ONE tool call" instead of calling anything. Protocol
-        # rules belong in the (cached) system prompt, said once.
-        d, tot = _runs.plan_counts(rid)
-        return f"[{d}/{tot} done] Do this now: {nxt}"
 
     def _sse_parse(chunk: bytes):
         """(event, obj) for one SSE chunk; ('', None) when there's no JSON body."""
