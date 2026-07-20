@@ -160,6 +160,79 @@ class MemoryStore:
         return rec
 
 
+# --- distillation ------------------------------------------------------------
+
+_DISTIL_PROMPT = (
+    "You turn one observed agent failure into ONE reusable rule.\n"
+    "Write a single imperative sentence, under 90 characters, telling a future "
+    "agent what to do instead.\n"
+    "NEVER mention specific filenames, paths, or arguments — a rule about one "
+    "file is useless. Generalise to the CLASS of mistake.\n"
+    "Reply with the sentence only. No preamble, no quotes.\n\n"
+    "Example observation: view_images failed on a hand-typed path, then "
+    "view_sample succeeded.\n"
+    "Example rule: Never type filenames; pass files by reference with "
+    "view_sample.\n\n"
+    "Observation: ")
+
+
+def describe_event(event: dict) -> str:
+    """One line of evidence for the distiller. Stays inside this module — it
+    carries raw args and must never reach the store."""
+    if event.get("kind") == "loop":
+        return (f"{event.get('tool')} was called with identical arguments "
+                f"{event.get('count')} times and failed every time "
+                f"(args: {event.get('args')})")
+    return (f"{event.get('failed_tool')} failed (args: "
+            f"{event.get('failed_args')}), then {event.get('worked_tool')} "
+            "succeeded")
+
+
+def distil(event: dict, complete) -> str:
+    """Ask the model to generalise one event into a rule.
+
+    `complete` is a callable taking a prompt and returning text — injected so
+    this is testable without an engine, and swappable for a stronger model
+    later exactly as the mission compiler is.
+    """
+    try:
+        text = (complete(_DISTIL_PROMPT + describe_event(event)) or "").strip()
+    except Exception:
+        return ""
+    text = text.strip().strip('"').splitlines()[0] if text else ""
+    return text[:200]
+
+
+def harvest_run(actions: list[dict], store: MemoryStore, complete,
+                max_rules: int = 3) -> list[dict]:
+    """Mine a finished run's trace and store what can be distilled.
+
+    Bounded on purpose: a bad run can produce dozens of events, and writing a
+    rule for each would swamp the store with near-duplicates. Never raises —
+    memory is not load-bearing, and a run that already ended must not report a
+    failure because its post-mortem failed.
+    """
+    written: list[dict] = []
+    try:
+        events = mine_events(actions)
+    except Exception:
+        return written
+    for event in events[:max_rules]:
+        rule = distil(event, complete)
+        if not rule:
+            continue
+        try:
+            written.append(store.add(kind="pitfall", text=rule))
+        except ValueError:
+            # the distiller leaked a path or a literal argument. Dropping it is
+            # correct: an un-generalised rule is worthless at best, and the
+            # guard exists because a raw trace actively teaches the failure.
+            continue
+        except Exception:
+            continue
+    return written
+
+
 # --- reading it back ---------------------------------------------------------
 
 def render_pitfall_block(memories: list[dict], limit: int = 5,
