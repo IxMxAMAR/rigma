@@ -275,3 +275,23 @@ def test_mtp_preserved_models_are_not_filtered_as_aux():
     # unrelated markers unchanged
     assert aux("something-imatrix.gguf") and aux("foo-draft.gguf")
     assert not aux("Rocinante-X-12B-v1b-Q6_K.gguf")
+
+
+def test_quant_labels_are_always_distinguishable():
+    """Repos that don't use Q4_K_M-style tags collapsed to a single label.
+    SC117's APEX ships I-Compact / I-Quality / I-Balanced: the picker showed
+    three identical "GGUF" rows and marked EVERY one recommended, because the
+    badge compares on this label."""
+    from rigma.hf_browse import _distinct_quants as dq
+    apex = ["m-Native-MTP-Preserved-APEX-I-Balanced.gguf",
+            "m-Native-MTP-Preserved-APEX-I-Quality.gguf",
+            "m-Native-MTP-Preserved-APEX-I-Compact.gguf"]
+    got = dq(apex)
+    assert len(set(got)) == 3, got
+    assert got == ["BALANCED", "QUALITY", "COMPACT"]
+    # ordinary quant tags must be left exactly as they are
+    assert dq(["m-Q4_K_M.gguf", "m-Q5_K_M.gguf", "m-IQ3_M.gguf"]) == \
+        ["Q4_K_M", "Q5_K_M", "IQ3_M"]
+    assert dq(["Rocinante-X-12B-v1b-Q6_K.gguf"]) == ["Q6_K"]
+    # same stem in different folders still resolves to distinct labels
+    assert len(set(dq(["a/model.gguf", "b/model.gguf"]))) == 2
