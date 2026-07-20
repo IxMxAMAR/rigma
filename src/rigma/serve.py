@@ -1231,7 +1231,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             result, imgs = await _run_call(name, cargs)
                     _shown = str(result)
                     if len(_shown) > 900:      # display only; the model gets it all
-                        _shown = _shown[:900] + " …(display truncated)"
+                        _shown = _shown[:900] + " …(display clipped — the model sees the full text)"
                     yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
                                 "result": _shown}, event="tool_result")
                     trace.append({"name": name, "args": cargs, "result": result})
@@ -2137,7 +2137,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         raw = str(obj.get("result", ""))
                         # mark the cut: a bare slice ends mid-path and reads as
                         # corrupted data (the model got the FULL result)
-                        text = (raw[:LIVE_RESULT_MAX] + " …(display truncated)"
+                        text = (raw[:LIVE_RESULT_MAX] + " …(display clipped — the model sees the full text)"
                                 if len(raw) > LIVE_RESULT_MAX else raw)
                     elif ev == "tool":
                         a = obj.get("args") or {}
