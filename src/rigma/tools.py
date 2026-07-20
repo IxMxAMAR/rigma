@@ -121,6 +121,42 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
     return out
 
 
+_XML_CALL = re.compile(r"<function=([\w.-]+)>(.*?)(?:</function>|$)", re.S)
+_XML_PARAM = re.compile(r"<parameter=([\w.-]+)>\s*(.*?)\s*(?:</parameter>|$)", re.S)
+
+
+def rescue_xml_tool_call(text: str):
+    """Parse a tool call the ENGINE's parser missed out of raw reply text.
+
+    Live-verified failure mode (2026-07-20, HauhauCS Qwen IQ3_M + v21.3
+    template): at sampling temperature the model's XML tool-call syntax
+    drifts just enough that llama-server's strict format parser sometimes
+    yields NO tool_calls — the whole call arrives as content. The identical
+    request replayed can parse fine; it is nondeterministic. Each miss wastes
+    a full turn and, repeated, stalls the run. So the harness stops trusting
+    the server's parser as the only reader: if a reply contains an
+    unmistakable call shape, salvage it.
+
+    Returns (name, args) or (None, None). Deliberately strict about the
+    OUTER shape (must see <function=...>) and lenient inside it.
+    """
+    if not text or "<function=" not in text:
+        return None, None
+    m = _XML_CALL.search(text)
+    if not m:
+        return None, None
+    name, body = m.group(1), m.group(2)
+    args = {}
+    for pm in _XML_PARAM.finditer(body):
+        val = pm.group(2)
+        # values are strings on the wire; let JSON-looking ones be structured
+        try:
+            args[pm.group(1)] = json.loads(val)
+        except (ValueError, TypeError):
+            args[pm.group(1)] = val
+    return name, args
+
+
 def repair_json_args(raw: str):
     """Best-effort parse of model-emitted tool arguments.
 
