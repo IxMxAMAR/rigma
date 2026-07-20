@@ -127,9 +127,14 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
   );
 }
 
+const WINDOW = 150;
+
 export default function Transcript() {
   const messages = useChat((s) => s.messages);
   const streaming = useChat((s) => s.streaming);
+  const currentId = useChat((s) => s.currentId);
+  const [shown, setShown] = useState(WINDOW);
+  useEffect(() => setShown(WINDOW), [currentId]);
   const endRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
 
@@ -156,8 +161,16 @@ export default function Transcript() {
             </p>
           </div>
         )}
-        {messages.map((m, i) => (
-          <Bubble key={i} m={m} />
+        {messages.length > shown && (
+          <button
+            onClick={() => setShown((n) => n + WINDOW)}
+            className="self-center rounded-md bg-surface hover:bg-float px-3 py-1 font-mono text-[12px] text-secondary"
+          >
+            show {Math.min(WINDOW, messages.length - shown)} earlier messages
+          </button>
+        )}
+        {messages.slice(-shown).map((m, i) => (
+          <Bubble key={messages.length - shown + i} m={m} />
         ))}
         {streaming && <LiveTurn turn={streaming} />}
         <div ref={endRef} />

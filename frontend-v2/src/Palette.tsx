@@ -3,6 +3,7 @@
 // to run; Esc closes. Actions are a flat, data-driven list so later phases
 // register surface-specific commands without touching this component.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useChat } from "./chat/chatStore";
 import { SURFACES, useApp } from "./store";
 
 export interface Command {
@@ -14,15 +15,34 @@ export interface Command {
 
 export function usePaletteCommands(): Command[] {
   const setSurface = useApp((s) => s.setSurface);
+  const newChat = useChat((s) => s.newChat);
   return useMemo(
-    () =>
-      SURFACES.map((s) => ({
+    () => [
+      {
+        id: "new-chat",
+        label: "New chat",
+        hint: "fresh conversation with the loaded model",
+        run: () => {
+          setSurface("chat");
+          void newChat();
+        },
+      },
+      ...SURFACES.map((s) => ({
         id: `go-${s.id}`,
         label: `Go to ${s.label}`,
         hint: s.hint,
         run: () => setSurface(s.id),
       })),
-    [setSurface],
+      {
+        id: "legacy",
+        label: "Open legacy UI",
+        hint: "/rizz — full functionality until v2 parity",
+        run: () => {
+          window.location.href = "/rizz";
+        },
+      },
+    ],
+    [setSurface, newChat],
   );
 }
 
