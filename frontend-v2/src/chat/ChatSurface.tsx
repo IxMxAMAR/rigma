@@ -1,6 +1,7 @@
 // The Chat surface: inner rail (sessions) + transcript + composer.
 // Right sidecar (params, grounding) arrives in Phase 4.
 import { useEffect, useRef, useState } from "react";
+import FloatWindow from "../FloatWindow";
 import { useApp } from "../store";
 import Sidecar from "./Sidecar";
 import Transcript from "./Transcript";
@@ -233,15 +234,19 @@ export default function ChatSurface() {
         <button
           onClick={() => setSidecar(!sidecar)}
           aria-expanded={sidecar}
-          aria-label="Chat settings"
+          aria-label="This chat's settings"
+          title="this chat — grounding, sampling, workspace"
           className="absolute top-2 right-3 z-10 rounded-md bg-surface/80 hover:bg-float px-2 py-0.5 font-mono text-[12px] text-secondary"
         >
-          {sidecar ? "⇥" : "⚙"}
+          ⚙
         </button>
         <Transcript />
         <Composer />
       </div>
-      <Sidecar open={sidecar} />
+      <FloatWindow id="chat-settings" title="this chat" open={sidecar}
+                   onClose={() => setSidecar(false)}>
+        <Sidecar />
+      </FloatWindow>
     </div>
   );
 }

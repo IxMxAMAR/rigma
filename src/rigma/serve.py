@@ -638,6 +638,38 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def search_sessions(q: str = ""):
         return await asyncio.to_thread(sessions.search, q)
 
+    @app.get("/api/sessions/{sid}/workspace")
+    async def session_workspace(sid: str):
+        """The chat's workspace folder, listed — so the user can SEE what the
+        model's file tools can touch. Names and sizes only, never contents."""
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        ws = str(s.get("workspace") or "").strip()
+        if not ws:
+            return {"path": "", "entries": []}
+        import pathlib as _pl
+        root = _pl.Path(ws)
+        if not root.is_dir():
+            return {"path": ws, "entries": [], "missing": True}
+        entries = []
+        try:
+            for e in sorted(root.iterdir(),
+                            key=lambda x: (not x.is_dir(), x.name.lower())):
+                if e.name.startswith("."):
+                    continue
+                try:
+                    entries.append({"name": e.name, "dir": e.is_dir(),
+                                    "size": 0 if e.is_dir()
+                                    else e.stat().st_size})
+                except OSError:
+                    continue
+                if len(entries) >= 200:
+                    break
+        except OSError:
+            pass
+        return {"path": ws, "entries": entries}
+
     @app.get("/api/sessions/{sid}")
     async def get_session(sid: str):
         s = sessions.load(sid)

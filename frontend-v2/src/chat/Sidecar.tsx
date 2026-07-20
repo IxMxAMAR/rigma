@@ -242,13 +242,12 @@ function SamplingCard() {
   );
 }
 
-export default function Sidecar({ open }: { open: boolean }) {
-  if (!open) return null;
+// rendered inside the draggable FloatWindow — no layout chrome of its own
+export default function Sidecar() {
   return (
-    <aside className="w-[260px] shrink-0 border-l border-white/5 overflow-y-auto p-3 flex flex-col gap-3"
-           aria-label="Chat settings">
+    <>
       <GroundingCard />
       <SamplingCard />
-    </aside>
+    </>
   );
 }
