@@ -16,11 +16,26 @@ interface MemoryRow {
 
 export default function MemorySurface() {
   const [rows, setRows] = useState<MemoryRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
   const refresh = useCallback(async () => {
+    // guard r.ok AND the shape: a server started before this endpoint existed
+    // 404s, and treating {error} as rows rendered pure darkness (owner report
+    // 2026-07-21). A surface must never be empty void - worst case it says
+    // exactly what is wrong.
     try {
       const r = await fetch("/api/memory");
-      setRows((await r.json()) as MemoryRow[]);
-    } catch {
+      const d: unknown = await r.json();
+      if (!r.ok || !Array.isArray(d)) {
+        setErr(r.status === 404
+          ? "This server predates the memory API - restart Rigma to enable it."
+          : `memory API: ${(d as { error?: string })?.error ?? r.status}`);
+        setRows([]);
+        return;
+      }
+      setErr(null);
+      setRows(d as MemoryRow[]);
+    } catch (e) {
+      setErr((e as Error).message);
       setRows([]);
     }
   }, []);
@@ -40,6 +55,11 @@ export default function MemorySurface() {
           still on probation. Deleting is safe — a useful rule will be
           re-learned.
         </p>
+        {err && (
+          <div className="rounded-md bg-red/10 text-red px-3 py-2 text-[13px] mb-4">
+            {err}
+          </div>
+        )}
         {rows.length === 0 ? (
           <div className="text-center pt-16">
             <div className="font-mono text-[12px] text-muted uppercase tracking-[0.1em] mb-2">

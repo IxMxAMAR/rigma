@@ -185,7 +185,8 @@ export default function AutonomousSurface() {
   const refreshHistory = useCallback(async () => {
     try {
       const r = await fetch("/api/runs");
-      setHistory((await r.json()) as RunSummary[]);
+      const d: unknown = await r.json();
+      if (r.ok && Array.isArray(d)) setHistory(d as RunSummary[]);
     } catch { /* keep last */ }
   }, []);
 

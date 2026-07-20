@@ -179,6 +179,12 @@ function HfSearch({ onAdded }: { onAdded: () => void }) {
 
 export default function ModelsSurface() {
   const [cards, setCards] = useState<ModelCard[]>([]);
+  const [view, setView] = useState<"grid" | "list">(
+    () => (localStorage.getItem("rigma.modelsView") === "list" ? "list" : "grid"));
+  const setViewPersist = (v: "grid" | "list") => {
+    setView(v);
+    localStorage.setItem("rigma.modelsView", v);
+  };
   const refresh = useCallback(async () => {
     try {
       setCards((await engineApi.models()).models);
@@ -200,17 +206,38 @@ export default function ModelsSurface() {
 
   return (
     <main className="flex-1 overflow-y-auto p-6">
-      <div className="max-w-[860px] mx-auto flex flex-col gap-4">
-        <HfSearch onAdded={refresh} />
+      <div className="max-w-[1200px] mx-auto flex flex-col gap-4">
+        <div className="flex items-start gap-3">
+          <div className="flex-1 min-w-0">
+            <HfSearch onAdded={refresh} />
+          </div>
+          <div className="shrink-0 flex rounded-md bg-panel p-0.5 font-mono text-[12px]"
+               role="group" aria-label="View">
+            {(["grid", "list"] as const).map((v) => (
+              <button
+                key={v}
+                onClick={() => setViewPersist(v)}
+                aria-pressed={view === v}
+                className={`px-2.5 py-1 rounded ${view === v ? "bg-surface text-primary" : "text-muted hover:text-secondary"}`}
+              >
+                {v}
+              </button>
+            ))}
+          </div>
+        </div>
         {cards.length === 0 && (
           <p className="text-secondary text-[13.5px] text-center pt-12">
             No models yet — search Hugging Face above, or drop a GGUF into
             ~/.rigma/models.
           </p>
         )}
-        {cards.map((c) => (
-          <Card key={c.slug} card={c} onAction={refresh} />
-        ))}
+        <div className={view === "grid"
+          ? "grid grid-cols-1 lg:grid-cols-2 gap-4 items-start"
+          : "flex flex-col gap-4"}>
+          {cards.map((c) => (
+            <Card key={c.slug} card={c} onAction={refresh} />
+          ))}
+        </div>
       </div>
     </main>
   );
