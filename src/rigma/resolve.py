@@ -178,8 +178,27 @@ def _calculate(profile: HardwareProfile, registry: Registry,
         # with 36 layers outranked the 35B MoE (regression caught 2026-07-16)
         return max((g.bytes for g in m.ggufs), default=0)
 
+    def _on_disk(g: GgufFile) -> bool:
+        from .runtime import rigma_home
+        try:
+            return (rigma_home() / "models" / g.file).exists()
+        except Exception:
+            return False
+
     for spec in sorted(pool, key=total_b, reverse=True):
-        for gguf in spec.ggufs:  # registry order: largest quant first
+        # LOCALITY BEFORE QUALITY. Live 2026-07-20: `up -y` on a model whose
+        # 14.4GB quant sat on disk silently began downloading the 26GB quant,
+        # because registry order (largest first) was the only order. Rule: any
+        # on-disk quant that fits beats any remote one; remote quants are only
+        # considered when nothing local fits. Cold-starting a fresh machine
+        # still works — the local list is empty and the order degenerates to
+        # the old one.
+        local = [g for g in spec.ggufs if _on_disk(g)]
+        ordered = local + [g for g in spec.ggufs if g not in local]
+        if local:
+            explain.append(f"{spec.slug}: preferring on-disk quant(s) "
+                           f"{', '.join(g.quant for g in local)}")
+        for gguf in ordered:  # on-disk first, then registry order
             ctx = min(CTX_DEFAULT.get(use_case, 16384), spec.native_ctx)
             while ctx >= CTX_FLOOR:
                 flags = fit_gguf(spec, gguf, profile, ctx, explain)
