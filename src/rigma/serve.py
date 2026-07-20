@@ -11,6 +11,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from . import context
 from . import mission as _mission_mod
 from . import presets
 from . import server_ops
@@ -75,6 +76,13 @@ RUN_CTX_BUDGET = 32768   # autonomous runs keep durable state on DISK, so they
                          # cost and dilutes attention badly on a 3B-active model.
                          # Clamped to the engine's real ctx, so lowering the
                          # engine to -c 16384 automatically wins.
+# chars per token, for sizing masking against a token budget. Deliberately a
+# constant rather than a tokeniser: this only has to threshold, and loading a
+# tokeniser costs RAM on a box whose VRAM is fully committed to the model. ~3.5
+# is conservative for the tool-result text this actually measures (paths and
+# filenames tokenise worse than prose, so under-estimating chars per token
+# would make masking fire too late).
+CHARS_PER_TOKEN = 3
 AUTO_COMPACT_KEEP = 16  # one action = TWO messages now (assistant + TOOL
                         # RESULT), so 8 kept only ~4 actions of history
 
@@ -1029,9 +1037,41 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     and ptoks >= AUTO_COMPACT_FRACTION * wctx
                     and len(s.get("messages", [])) > AUTO_COMPACT_KEEP):
                 try:
-                    r = await _compact(s, AUTO_COMPACT_KEEP)
-                    if r:
-                        yield _sse({"archived": r[1]}, event="compacted")
+                    # Autonomous runs: mask observations FIRST. Summarising is
+                    # lossy in the worst direction for an agent — it keeps the
+                    # gist and drops the exact strings (filenames, error text,
+                    # the argument that worked) it navigates by, which
+                    # measurably lengthens trajectories. Masking shrinks only
+                    # the environment's replies and leaves the model's own
+                    # reasoning byte-identical. Chats keep the digest: there the
+                    # prose IS the content.
+                    still_over = True
+                    if s.get("run_id"):
+                        # ONE target for both the masking and the re-check.
+                        # Masking to `budget` while judging against
+                        # `fraction * budget` makes it stop just above the bar
+                        # and summarise anyway — which silently defeats the
+                        # whole point.
+                        target = AUTO_COMPACT_FRACTION * wctx * CHARS_PER_TOKEN
+                        masked, n = context.mask_observations(
+                            s["messages"], keep_recent=AUTO_COMPACT_KEEP,
+                            budget_chars=int(target))
+                        if n:
+                            s["messages"] = masked
+                            sessions.save(s)
+                            yield _sse({"masked": n}, event="masked")
+                            # Re-check on the char estimate ONLY when masking
+                            # actually changed something. The engine's
+                            # prompt_tokens is authoritative but describes the
+                            # turn we already sent, so it cannot see the masking
+                            # we just did. Chats never take this path and keep
+                            # using the real token count.
+                            still_over = (context.session_chars(s["messages"])
+                                          >= target)
+                    if still_over:
+                        r = await _compact(s, AUTO_COMPACT_KEEP)
+                        if r:
+                            yield _sse({"archived": r[1]}, event="compacted")
                 except Exception:
                     pass   # a summariser hiccup must never break the chat
         yield b"data: [DONE]\n\n"
@@ -1793,6 +1833,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         # already cap their own output; compaction reclaims it.
                         s4["messages"].append({
                             "role": "user",
+                            # tagged so observation masking can find these
+                            # structurally instead of sniffing the text prefix.
+                            # build_messages() strips both keys, so neither
+                            # ever reaches the model.
+                            "kind": "tool_result",
+                            "tools": [{"name": t.get("name"),
+                                       "ok": not str(t.get("result", ""))
+                                       .startswith("error")} for t in trace],
                             "content": "\n".join(
                                 f"TOOL RESULT {t.get('name')}: "
                                 + _clip(str(t.get("result", "")), RESULT_MAX)
