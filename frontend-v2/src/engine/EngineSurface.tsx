@@ -3,6 +3,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { engineApi, type ServerInfo, type SwitchOption } from "../lib/engineApi";
 
+function uptime(startedAt: number): string {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+}
+
 function Stat({ label, value, tone }: { label: string; value: string;
                                         tone?: "amber" | "moss" | "red" }) {
   return (
@@ -90,7 +97,7 @@ export default function EngineSurface() {
 
   return (
     <main className="flex-1 overflow-y-auto p-6">
-      <div className="max-w-[860px] mx-auto flex flex-col gap-5">
+      <div className="max-w-[1200px] mx-auto flex flex-col gap-5">
         {err && (
           <div className="rounded-md bg-red/10 text-red px-3 py-2 text-[13px]">{err}</div>
         )}
@@ -102,7 +109,7 @@ export default function EngineSurface() {
               {info.engine_version as string}
             </span>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-4">
             <Stat label="quant" value={String(info.quant ?? "—")} />
             <Stat label="backend" value={String(info.backend ?? "—")} />
             <Stat label="context" value={info.ctx ? `${Math.round((info.ctx as number) / 1024)}K` : "—"} />
@@ -111,7 +118,17 @@ export default function EngineSurface() {
               value={tg != null ? tg.toFixed(1) : "—"}
               tone={verdictTone as "moss" | "red" | undefined}
             />
+            <Stat label="expected" value={info.expected_tg != null ? `${(info.expected_tg as number).toFixed(0)}` : "—"} />
+            <Stat label="uptime" value={info.started_at ? uptime(info.started_at as number) : "—"} />
+            <Stat label="port" value={String((info as Record<string, unknown>).public_port ?? "—")} />
+            <Stat label="verdict" value={String(info.verdict ?? "—")}
+                  tone={verdictTone as "moss" | "red" | undefined} />
           </div>
+          {info.openai_base != null && (
+            <div className="font-mono text-[11.5px] text-muted mt-3">
+              OpenAI API: <span className="text-secondary">{String(info.openai_base)}</span>
+            </div>
+          )}
           <div className="flex gap-2 mt-5">
             <button
               onClick={() => void act("unload", engineApi.unload)}
