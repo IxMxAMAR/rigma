@@ -268,3 +268,59 @@ def test_max_tool_rounds_configurable(home, always_upstream):
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
     assert len(_AlwaysToolUpstream.reqs) == 3      # honored the low ceiling
     assert "keep going" in r.text
+
+
+def test_truncated_tool_call_is_not_executed(tmp_path, monkeypatch):
+    """finish_reason=length mid-call: the repairer would balance the braces of
+    HALF a write_file and run a partial write as if complete (silent data
+    loss). Truncated calls must come back as an error result, never run."""
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from fastapi.testclient import TestClient
+
+    from rigma import state as st
+    from rigma.serve import build_app
+
+    class _Cut(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("content-length", 0))
+            self.rfile.read(n)
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+
+            def sse(o):
+                self.wfile.write(b"data: " + _json.dumps(o).encode() + b"\n\n")
+
+            # a write_file whose args got cut mid-string, then length stop
+            sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {
+                    "name": "write_file",
+                    "arguments": '{"path": "ch.txt", "content": "the story beg'
+                }}]}}]})
+            sse({"choices": [{"delta": {}, "finish_reason": "length"}]})
+            self.wfile.write(b"data: [DONE]\n\n")
+
+        def log_message(self, *a):
+            pass
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    srv = HTTPServer(("127.0.0.1", 0), _Cut)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        st.write_state("m", "Q4", 11500, engine_pid=1, ui_pid=1, ctx=4096)
+        c = TestClient(build_app(upstream_port=srv.server_address[1]))
+        s = c.post("/api/sessions", json={}).json()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        c.post(f"/api/sessions/{s['id']}",
+               json={"use_tools": True, "allow_code": True,
+                     "workspace": str(ws)})
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "write"})
+        assert "CUT OFF" in r.text
+        assert not (ws / "ch.txt").exists(), \
+            "a truncated write must never reach the disk"
+    finally:
+        srv.shutdown()

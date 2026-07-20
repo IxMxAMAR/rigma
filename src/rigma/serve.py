@@ -929,6 +929,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             elif effort == "on":
                 body["chat_template_kwargs"] = {"enable_thinking": True}
             rtext, calls, started = "", {}, {}   # started: idx -> (task, cargs)
+            finish_reason = None
             try:
                 req = client.build_request("POST", "/v1/chat/completions",
                                            json=body)
@@ -952,6 +953,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             if isinstance(err, dict) else str(err))
                     usage = obj.get("usage") or usage
                     timings = obj.get("timings") or timings
+                    try:
+                        fr = obj["choices"][0].get("finish_reason")
+                        if fr:
+                            finish_reason = fr
+                    except Exception:
+                        pass
                     try:
                         d = obj["choices"][0]["delta"]
                     except Exception:
@@ -1050,6 +1057,36 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             result, imgs = f"error running {name}: {e}", None
                     else:
                         bad = None
+                        # A generation cut by the token limit can end MID
+                        # tool-call; the JSON repairer would happily balance
+                        # the braces of half a write_file and execute a partial
+                        # write as if it were the whole thing (silent data
+                        # loss — the model believes it saved everything).
+                        # Strict-parse under finish_reason=length: repaired
+                        # args there mean truncation, and truncated calls are
+                        # never run.
+                        if finish_reason == "length":
+                            try:
+                                json.loads(c["args"])
+                            except Exception:
+                                yield _sse({"name": name, "args": {}},
+                                           event="tool")
+                                result, imgs = (
+                                    "error: this tool call was CUT OFF by the "
+                                    "token limit — its arguments were "
+                                    "incomplete and it was NOT executed. "
+                                    "Re-issue it with less content, or write "
+                                    "long files in parts with write_file's "
+                                    "append=true."), None
+                                _shown = result
+                                yield _sse({"name": name, "result": _shown},
+                                           event="tool_result")
+                                trace.append({"name": name, "args": {},
+                                              "result": result})
+                                msgs.append({"role": "tool",
+                                             "tool_call_id": c["id"],
+                                             "content": result})
+                                continue
                         cargs, note = toolkit.repair_json_args(c["args"])
                         if cargs is None:
                             cargs, bad = {}, ("malformed JSON arguments — "
