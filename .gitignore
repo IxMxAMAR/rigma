@@ -8,3 +8,6 @@ dist/
 dist/
 tools/ui-smoke/pwenv/
 frontend-v2/node_modules/
+
+# internal working notes — never published
+docs/
