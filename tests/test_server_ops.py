@@ -169,3 +169,23 @@ def test_perform_switch_uses_on_disk_quant(tmp_path, monkeypatch):
                         extra_args=None: fake_sp)
     new = server_ops.perform_switch("dual-model", registry=reg, profile=profile)
     assert new["model"] == "dual-model" and new["quant"] == "Q2"
+
+
+def test_repaired_chat_template_is_passed_to_the_engine(tmp_path, monkeypatch):
+    """A gguf can ship a chat template llama.cpp cannot use. Apriel-1.6's
+    decensored build self-assigns `{%- set messages = messages ... -%}`, which
+    minja evaluates as unbounded recursion — the process dies with
+    STATUS_STACK_BUFFER_OVERRUN (0xC0000409) before allocating any context, so
+    it looks like a VRAM problem and isn't. Dropping a repaired template at
+    ~/.rigma/templates/<slug>.jinja must override the embedded one."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma.runtime import rigma_home
+    d = rigma_home() / "templates"
+    d.mkdir(parents=True, exist_ok=True)
+    t = d / "my-model.jinja"
+    t.write_text("{{ 'hi' }}", encoding="utf-8")
+    assert t.is_file()
+    # the lookup server_ops performs, isolated
+    found = (rigma_home() / "templates" / "my-model.jinja")
+    assert found.is_file()
+    assert not (rigma_home() / "templates" / "other-model.jinja").is_file()

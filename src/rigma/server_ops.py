@@ -215,6 +215,14 @@ def perform_switch(model: str, registry=None, profile=None,
     mm = getattr(reg_full.models.get(model), "mmproj", None)
     extra = (["--mmproj", str(rigma_home() / "models" / mm.file)]
              if mm is not None and _model_on_disk(mm) else None)
+    # Some ggufs ship a chat template that llama.cpp cannot use — Apriel-1.6's
+    # decensored build self-assigns `{%- set messages = messages ... -%}`, which
+    # minja evaluates as unbounded recursion and the process dies with
+    # STATUS_STACK_BUFFER_OVERRUN before it ever allocates a context. A repaired
+    # template dropped next to the model overrides the embedded one.
+    tmpl = rigma_home() / "templates" / f"{model}.jinja"
+    if tmpl.is_file():
+        extra = (extra or []) + ["--chat-template-file", str(tmpl)]
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     exe = runtime.ensure_engine(rp.backend, os_name)
