@@ -31,7 +31,13 @@ _AUX_MARKERS = ("imatrix", "-draft", "eagle", "medusa")
 # name ("...-Native-MTP-Preserved-APEX-I-Compact.gguf", unsloth's
 # "...-A3B-MTP-UD-Q4_K_XL.gguf") and are exactly what the user wants. Only a
 # standalone draft head — mtp.gguf / foo-mtp.gguf / foo-mtp-head.gguf — is aux.
-_AUX_MTP_RE = re.compile(r"(?:^|[-_/])mtp(?:[-_]?head)?\.gguf$", re.I)
+# A head is named like an mmproj — "mtp-<model>.gguf" (prefix) — or ends in
+# "-mtp.gguf"/"-mtp-head.gguf". "mtp" in the MIDDLE is a descriptor of a full
+# model ("...-MTP-Preserved-I-Compact.gguf") and must NOT be filtered.
+_AUX_MTP_RE = re.compile(
+    r"(?:^|/)mtp[-_][^/]*\.gguf$"          # mtp-gemma-4-26B-A4B-it.gguf
+    r"|(?:^|[-_/])mtp(?:[-_]?head)?\.gguf$",  # foo-mtp.gguf, mtp-head.gguf
+    re.I)
 
 
 def _is_aux_gguf(name: str) -> bool:
