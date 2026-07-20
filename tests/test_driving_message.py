@@ -108,3 +108,46 @@ def test_first_echo_nudge_is_unchanged():
     msg = _driving_message(run, _session())
     assert "is not a tool call" in msg
     assert "view_sample" in msg
+
+
+# ---- the reinjection trap: routine state must not read as a command ----
+
+_IMPERATIVES = ("do this now", "continue with", "right now", "you must",
+                "do not start", "your next step")
+
+
+def test_routine_state_is_not_phrased_as_an_instruction():
+    # the whole reinjection trap: this arrives as a role=user message every
+    # single turn, so an imperative reads to the model as the human typing a
+    # NEW command, and it restarts the step instead of continuing it
+    run = _plan(_run(), ("a", "done"), ("write the batch file", "pending"))
+    msg = _driving_message(run, _session([{"name": "view_sample", "result": "6 images"}]))
+    low = msg.lower()
+    assert not any(i in low for i in _IMPERATIVES), msg
+
+
+def test_routine_state_still_carries_position_and_next_step():
+    # passive does not mean useless — the model must still know where it is
+    run = _plan(_run(), ("a", "done"), ("write the batch file", "pending"))
+    msg = _driving_message(run, _session([{"name": "view_sample", "result": "6 images"}]))
+    assert "write the batch file" in msg
+    assert "2" in msg and "of" in msg.lower()
+
+
+def test_real_interruptions_stay_imperative():
+    # steering, missing artifacts and failed verification are EVENTS, not
+    # status. They should read as interruptions, because they are.
+    run = _plan(_run(), ("a", "pending"))
+    run["steer_queue"] = ["stop sampling and write the file"]
+    assert "follow this now" in _driving_message(run, _session()).lower()
+
+    run2 = _plan(_run(), ("a", "pending"))
+    run2["_missing_artifacts"] = ["D:\\out\\notes.md"]
+    assert "write" in _driving_message(run2, _session()).lower()
+
+
+def test_routine_state_never_restates_the_mission():
+    mission = "generate one hundred prompts about widgets"
+    run = _plan(_run(mission), ("a", "done"), ("b", "pending"))
+    msg = _driving_message(run, _session([{"name": "read_file", "result": "ok"}]))
+    assert mission not in msg
