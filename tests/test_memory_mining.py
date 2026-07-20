@@ -204,19 +204,34 @@ def test_verified_outrank_drafts(tmp_path):
 
 # ---- distillation ----
 
+import asyncio   # noqa: E402
+
 from rigma.memory import distil, harvest_run   # noqa: E402
+
+
+def _run(coro):
+    """distil/harvest_run are async because the engine call is. asyncio.run
+    keeps these tests plugin-free."""
+    return asyncio.run(coro)
+
+
+def _reply(text):
+    """An async completer that always answers `text`."""
+    async def _c(prompt):
+        return text
+    return _c
 
 
 def test_distil_asks_for_a_generalised_rule():
     seen = {}
 
-    def fake(prompt):
+    async def fake(prompt):
         seen["prompt"] = prompt
         return "Never type filenames; pass files by reference with view_sample."
 
     ev = mine_events([_a("view_images", {"p": r"D:\x\a_00428_.png"}, ok=False),
                       _a("view_sample", {}, ok=True)])[0]
-    rule = distil(ev, fake)
+    rule = _run(distil(ev, fake))
     assert rule.startswith("Never type filenames")
     assert "NEVER mention specific filenames" in seen["prompt"]
     assert "a_00428_" in seen["prompt"], "the distiller needs the evidence"
@@ -224,11 +239,11 @@ def test_distil_asks_for_a_generalised_rule():
 
 def test_distiller_failure_is_silent():
     # memory is never load-bearing
-    def boom(prompt):
+    async def boom(prompt):
         raise RuntimeError("engine down")
 
     ev = {"kind": "loop", "tool": "x", "args": "{}", "count": 2}
-    assert distil(ev, boom) == ""
+    assert _run(distil(ev, boom)) == ""
 
 
 def test_harvest_drops_rules_that_leak_a_path(tmp_path):
@@ -238,7 +253,8 @@ def test_harvest_drops_rules_that_leak_a_path(tmp_path):
     store = MemoryStore(tmp_path / "m.jsonl")
     actions = [_a("view_images", {"p": r"D:\x\a.png"}, ok=False),
                _a("view_sample", {}, ok=True)]
-    written = harvest_run(actions, store, lambda p: r"Do not open D:\x\a.png")
+    written = _run(harvest_run(actions, store,
+                               _reply(r"Do not open D:\x\a.png")))
     assert written == []
     assert store.all() == []
 
@@ -247,7 +263,8 @@ def test_harvest_stores_a_clean_rule(tmp_path):
     store = MemoryStore(tmp_path / "m.jsonl")
     actions = [_a("view_images", {"p": r"D:\x\a.png"}, ok=False),
                _a("view_sample", {}, ok=True)]
-    written = harvest_run(actions, store, lambda p: "Never retype filenames.")
+    written = _run(harvest_run(actions, store,
+                               _reply("Never retype filenames.")))
     assert len(written) == 1
     assert store.all()[0]["text"] == "Never retype filenames."
 
@@ -261,14 +278,14 @@ def test_harvest_is_bounded(tmp_path):
         actions += [_a("view_images", {"p": i}, ok=False), _a("view_sample", {})]
     n = [0]
 
-    def fake(p):
+    async def fake(p):
         n[0] += 1
         return f"Rule number {n[0]}."
 
-    harvest_run(actions, store, fake, max_rules=3)
+    _run(harvest_run(actions, store, fake, max_rules=3))
     assert len(store.all()) <= 3
 
 
 def test_harvest_never_raises_on_a_broken_trace(tmp_path):
     store = MemoryStore(tmp_path / "m.jsonl")
-    assert harvest_run([{"garbage": True}], store, lambda p: "x") == []
+    assert _run(harvest_run([{"garbage": True}], store, _reply("x"))) == []

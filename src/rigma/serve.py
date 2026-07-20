@@ -1654,23 +1654,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 return ""
             return resp.json()["choices"][0]["message"]["content"] or ""
 
-        events = _mem.mine_events(actions)
-        store = _memory_store()
-        written = []
-        for event in events[:3]:
-            try:
-                rule = (await _complete_async(
-                    _mem._DISTIL_PROMPT + _mem.describe_event(event))).strip()
-            except Exception:
-                continue
-            rule = rule.strip('"').splitlines()[0][:200] if rule else ""
-            if not rule:
-                continue
-            try:
-                written.append(store.add(kind="pitfall", text=rule))
-            except Exception:
-                continue          # guard rejected it, or the store is unwritable
-        return written
+        return await _mem.harvest_run(actions, _memory_store(), _complete_async)
 
     async def _run_loop(run_id):
         import time as _time
