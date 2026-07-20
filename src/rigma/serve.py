@@ -1308,9 +1308,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     msg["thinking"] = thinking
                 if trace:
                     msg["tool_trace"] = trace
-                if timings.get("predicted_per_second"):
+                # stats attach whenever the engine reported ANYTHING — gating
+                # on timings alone left tool-heavy turns stat-less, and the
+                # UI's context meter walked back to a stale value and froze
+                # (owner report 2026-07-21: "stuck at 8%")
+                if timings.get("predicted_per_second") or usage.get(
+                        "prompt_tokens"):
+                    tps = timings.get("predicted_per_second")
                     msg["stats"] = {
-                        "tps": round(timings["predicted_per_second"], 1),
+                        "tps": round(tps, 1) if tps else None,
                         "tokens": timings.get("predicted_n"),
                         "prompt_tokens": usage.get("prompt_tokens"),
                         "model": (st.read_state() or {}).get("model", "")}
