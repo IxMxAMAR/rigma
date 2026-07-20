@@ -568,3 +568,23 @@ def test_vision_historical_images_blocked_on_text_model(tmp_path, monkeypatch):
         {"role": "assistant", "content": "saw it"}]})
     r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "and now?"})
     assert r.status_code == 400 and "delete the image" in r.json()["error"]
+
+
+def test_workspace_listing(tmp_path, monkeypatch):
+    # the sidebar workspace browser: names and sizes only, never contents
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from fastapi.testclient import TestClient
+
+    from rigma.serve import build_app
+    c = TestClient(build_app(upstream_port=1))
+    s = c.post("/api/sessions", json={}).json()
+    assert c.get(f"/api/sessions/{s['id']}/workspace").json()["entries"] == []
+    ws = tmp_path / "ws"
+    (ws / "sub").mkdir(parents=True)
+    (ws / "story.md").write_text("hello", encoding="utf-8")
+    (ws / ".hidden").write_text("x", encoding="utf-8")
+    c.post(f"/api/sessions/{s['id']}", json={"workspace": str(ws)})
+    d = c.get(f"/api/sessions/{s['id']}/workspace").json()
+    names = [e["name"] for e in d["entries"]]
+    assert names == ["sub", "story.md"]          # dirs first, dotfiles hidden
+    assert d["entries"][1]["size"] == 5

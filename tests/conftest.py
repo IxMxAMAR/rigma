@@ -65,3 +65,17 @@ def oai_upstream():
     yield SimpleNamespace(port=srv.server_address[1],
                           last=lambda: _OpenAIUpstream.last_body)
     srv.shutdown()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _tests_run_against_the_source_tree():
+    """A stale site-packages copy of rigma once shadowed the editable install
+    (2026-07-21) and every subsequent test run silently validated the WRONG
+    code. If imports ever resolve outside this repo, fail everything loudly."""
+    import rigma
+    src = str(Path(__file__).resolve().parent.parent / "src")
+    got = str(Path(rigma.__file__).resolve())
+    if not got.startswith(src):
+        pytest.exit(f"rigma imports from {got}, not the source tree {src} — "
+                    "run `pip install -e .` and remove the shadowing copy",
+                    returncode=3)

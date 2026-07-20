@@ -9,6 +9,7 @@ import MemorySurface from "./memory/MemorySurface";
 import ModelsSurface from "./models/ModelsSurface";
 import SettingsSurface from "./settings/SettingsSurface";
 import Palette from "./Palette";
+import WorkspacePanel from "./WorkspacePanel";
 import { SURFACES, useApp } from "./store";
 
 function Sidebar() {
@@ -39,6 +40,7 @@ function Sidebar() {
           </li>
         ))}
       </ul>
+      <WorkspacePanel />
       <div className="mt-auto px-4 pt-3 text-muted font-mono text-[11px]">
         <button
           className="hover:text-secondary"
