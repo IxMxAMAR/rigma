@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import re
+import subprocess
 import threading
 from importlib import resources
 
@@ -669,6 +671,30 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except OSError:
             pass
         return {"path": ws, "entries": entries}
+
+    @app.post("/api/sessions/{sid}/workspace/open")
+    async def session_workspace_open(sid: str):
+        """Open the chat's workspace in the OS file manager. Localhost app on
+        the user's own machine; scoped to the session's recorded workspace —
+        never an arbitrary path from the request."""
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        ws = str(s.get("workspace") or "").strip()
+        import pathlib as _pl
+        if not ws or not _pl.Path(ws).is_dir():
+            return JSONResponse({"error": "no workspace folder"},
+                                status_code=404)
+        try:
+            if platform.system() == "Windows":
+                os.startfile(ws)                       # noqa: S606
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", ws])
+            else:
+                subprocess.Popen(["xdg-open", ws])
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        return {"opened": ws}
 
     @app.get("/api/sessions/{sid}")
     async def get_session(sid: str):
