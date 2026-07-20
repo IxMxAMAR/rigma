@@ -1,8 +1,9 @@
 // The inverted-L shell (docs/design/UI-REWORK-PLAN.md): left sidebar =
 // navigation, top header = context + telemetry, main canvas = the surface.
 // Phase 1 ships the chrome; each later phase fills one canvas.
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import AutonomousSurface from "./autonomous/AutonomousSurface";
+import { useChat } from "./chat/chatStore";
 import ChatSurface from "./chat/ChatSurface";
 import EngineSurface from "./engine/EngineSurface";
 import MemorySurface from "./memory/MemorySurface";
@@ -15,11 +16,27 @@ import { SURFACES, useApp } from "./store";
 function Sidebar() {
   const surface = useApp((s) => s.surface);
   const setSurface = useApp((s) => s.setSurface);
+  const width = useApp((s) => s.sidebarWidth);
+  const setWidth = useApp((s) => s.setSidebarWidth);
   return (
     <nav
-      className="w-[200px] shrink-0 bg-panel flex flex-col py-3"
+      className="relative shrink-0 bg-panel flex flex-col py-3"
+      style={{ width }}
       aria-label="Primary"
     >
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        title="drag to resize"
+        className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-white/10"
+        onPointerDown={(e) => {
+          (e.target as HTMLElement).setPointerCapture(e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          if (e.buttons === 1) setWidth(e.clientX);
+        }}
+      />
       <div className="px-4 pb-3 font-mono font-semibold text-[13px] tracking-[0.08em] text-secondary">
         RIGMA
       </div>
@@ -59,10 +76,43 @@ function Sidebar() {
 function Header() {
   const surface = useApp((s) => s.surface);
   const server = useApp((s) => s.server);
+  const workspacePath = useApp((s) => s.workspacePath);
   const label = SURFACES.find((s) => s.id === surface)?.label ?? "";
+  const currentId = useChat((s) => s.currentId);
+  const [copied, setCopied] = useState(false);
   return (
     <header className="h-12 shrink-0 flex items-center gap-4 px-5 bg-panel">
-      <h1 className="text-[14px] font-semibold">{label}</h1>
+      <h1 className="text-[14px] font-semibold shrink-0">{label}</h1>
+      {surface === "chat" && workspacePath && (
+        <span className="flex items-center gap-1.5 min-w-0 max-w-[40%]">
+          <button
+            onClick={() => {
+              void navigator.clipboard.writeText(workspacePath).then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1200);
+              });
+            }}
+            title={copied ? "copied!" : workspacePath + "  (click to copy)"}
+            aria-label="Copy workspace path"
+            dir="rtl"
+            className="font-mono text-[11.5px] text-muted hover:text-secondary truncate min-w-0"
+          >
+            {copied ? "✓ copied" : "‎" + workspacePath}
+          </button>
+          <button
+            onClick={() => {
+              if (currentId)
+                void fetch(`/api/sessions/${currentId}/workspace/open`,
+                           { method: "POST" });
+            }}
+            aria-label="Open workspace in file manager"
+            title="open in Explorer"
+            className="shrink-0 text-muted hover:text-amber text-[12px]"
+          >
+            ⤴
+          </button>
+        </span>
+      )}
       <div className="ml-auto flex items-center gap-4 font-mono text-[12px]">
         {server ? (
           <>
