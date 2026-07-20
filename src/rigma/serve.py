@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from . import context
 from . import mission as _mission_mod
 from . import presets
+from . import runtime
 from . import server_ops
 from . import sessions
 from . import state as st
@@ -1628,6 +1629,49 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             "starting step 1", run.get("workspace", ""))
         _runs.save(run)
 
+    def _memory_store():
+        from . import memory as _mem
+        return _mem.MemoryStore(runtime.rigma_home() / "memory" / "memories.jsonl")
+
+    async def _harvest_memories(run_id):
+        """Distil this run's failures into rules. Post-mortem only."""
+        from . import memory as _mem
+        from . import runs as _runs
+        if os.environ.get("RIGMA_MEMORY") == "0":
+            return []
+        actions = _runs.read_actions(run_id)
+        if not actions:
+            return []
+        # the distiller is one small completion per event, capped at 3 — a few
+        # seconds total at 36 tok/s, after the run has already finished
+        async def _complete_async(prompt: str) -> str:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": prompt}],
+                      "stream": False, "temperature": 0.2, "max_tokens": 120},
+                timeout=90.0)
+            if resp.status_code != 200:
+                return ""
+            return resp.json()["choices"][0]["message"]["content"] or ""
+
+        events = _mem.mine_events(actions)
+        store = _memory_store()
+        written = []
+        for event in events[:3]:
+            try:
+                rule = (await _complete_async(
+                    _mem._DISTIL_PROMPT + _mem.describe_event(event))).strip()
+            except Exception:
+                continue
+            rule = rule.strip('"').splitlines()[0][:200] if rule else ""
+            if not rule:
+                continue
+            try:
+                written.append(store.add(kind="pitfall", text=rule))
+            except Exception:
+                continue          # guard rejected it, or the store is unwritable
+        return written
+
     async def _run_loop(run_id):
         import time as _time
 
@@ -2029,6 +2073,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         "(run ended)", r.get("workspace", ""))
                 except Exception:
                     pass
+                # Post-mortem: mine the action trace for lessons. Runs AFTER
+                # the run has already ended, so it cannot affect its outcome,
+                # and swallows everything — memory is never load-bearing.
+                try:
+                    written = await _harvest_memories(run_id)
+                    if written:
+                        _runs.append_progress(
+                            run_id, f"learned {len(written)} lesson(s) for "
+                            "next time", "(run ended)", r.get("workspace", ""))
+                except Exception:
+                    pass
 
     @app.post("/api/runs")
     async def start_run(body: dict):
@@ -2060,10 +2115,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # NOTE: compilation happens in the RUN LOOP, not here. Awaiting a
         # 180s engine call before responding made the Start button look dead.
         sess = sessions.create(title="🤖 " + mission[:32])
+        # What earlier runs learned, pinned into the system block so it is
+        # stated ONCE and survives compaction. Set at run start and never
+        # after, so it does not churn the cached prompt prefix. A model that
+        # begins already knowing "you cannot retype long filenames" is a
+        # different model; failing to read them just means it starts naive.
+        agent_prompt = AGENT_SYSTEM_PROMPT
+        try:
+            if os.environ.get("RIGMA_MEMORY") != "0":
+                from . import memory as _mem
+                block = _mem.render_pitfall_block(_memory_store().all())
+                if block:
+                    agent_prompt = AGENT_SYSTEM_PROMPT + "\n\n" + block
+        except Exception:
+            pass                   # memory is never load-bearing
         sess.update(use_tools=True, allow_code=True, auto_compact=True,
                     workspace=workspace,
                     mission=mission,       # replaced by the compiled spec
-                    system_prompt=AGENT_SYSTEM_PROMPT,   # agent role, not chat
+                    system_prompt=agent_prompt,          # agent role, not chat
                     effort=effort, one_action=True,
                     params={**RUN_PARAMS, **(sess.get("params") or {})},
                     run_profile=profile if profile in _runs.PROFILES else "all")
