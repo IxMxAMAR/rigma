@@ -125,8 +125,9 @@ export default function App() {
           setServer({
             model: d.model ?? "",
             quant: d.quant ?? "",
-            tps: d.tps ?? null,
+            tps: d.last_tg ?? d.tps ?? null,
             healthy: !d.unloaded && !!d.model,
+            ctx: d.ctx ?? 0,
           });
       } catch {
         if (alive) setServer(null);

@@ -103,6 +103,32 @@ function Bubble({ m }: { m: ChatMessage }) {
   );
 }
 
+function MessageActions({ m }: { m: ChatMessage }) {
+  const regenerate = useChat((s) => s.regenerate);
+  const continueTurn = useChat((s) => s.continueTurn);
+  const flipVariant = useChat((s) => s.flipVariant);
+  const takes = (m.variants?.length ?? 0) + 1;
+  return (
+    <div className="flex items-center gap-3 pt-1 opacity-0 group-hover/msg:opacity-100 font-mono text-[11.5px] text-muted">
+      <button onClick={() => void regenerate()} className="hover:text-amber">
+        regenerate
+      </button>
+      <button onClick={() => void continueTurn()} className="hover:text-amber">
+        continue
+      </button>
+      {takes > 1 && (
+        <span className="flex items-center gap-1">
+          <button onClick={() => void flipVariant(-1)} aria-label="previous take"
+                  className="hover:text-primary">◂</button>
+          {takes} takes
+          <button onClick={() => void flipVariant(1)} aria-label="next take"
+                  className="hover:text-primary">▸</button>
+        </span>
+      )}
+    </div>
+  );
+}
+
 function LiveTurn({ turn }: { turn: StreamingTurn }) {
   return (
     <div className="flex flex-col gap-2">
@@ -169,9 +195,17 @@ export default function Transcript() {
             show {Math.min(WINDOW, messages.length - shown)} earlier messages
           </button>
         )}
-        {messages.slice(-shown).map((m, i) => (
-          <Bubble key={messages.length - shown + i} m={m} />
-        ))}
+        {messages.slice(-shown).map((m, i) => {
+          const abs = Math.max(0, messages.length - shown) + i;
+          const isLastAssistant =
+            abs === messages.length - 1 && m.role === "assistant";
+          return (
+            <div key={abs} className="group/msg">
+              <Bubble m={m} />
+              {isLastAssistant && !streaming && <MessageActions m={m} />}
+            </div>
+          );
+        })}
         {streaming && <LiveTurn turn={streaming} />}
         <div ref={endRef} />
       </div>
