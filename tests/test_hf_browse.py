@@ -174,7 +174,6 @@ def test_probe_falls_forward_past_metadata_less_gguf(monkeypatch, home):
 def test_fetch_head_caps_when_server_ignores_range(monkeypatch, home):
     """Review 2026-07-18: a mirror ignoring Range and returning the whole
     40GB file must not be pulled into memory — stream + hard cap."""
-    import httpx
 
     class _Resp:
         status_code = 200
@@ -225,7 +224,6 @@ def test_recommend_picks_speed_sweet_spot_not_biggest(monkeypatch, home):
     'fits' via heavy RAM offload (slowest). Recommend the best quality that
     still runs at GPU speed."""
     from rigma.models import CachePolicy, GgufFile, ModelSpec
-    from rigma.resolve import _budgets
     # big dense model: only small quants fit on the 16GB GPU
     def mk(bytes_):
         return GgufFile(repo="r", file=f"m-{bytes_}.gguf", bytes=bytes_,

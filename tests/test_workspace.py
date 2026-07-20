@@ -50,7 +50,6 @@ def test_pack_errors_cleanly(tmp_path):
 
 
 def test_pack_endpoint(tmp_path, monkeypatch):
-    import os
     from http.server import BaseHTTPRequestHandler, HTTPServer
     import threading
 
@@ -61,8 +60,12 @@ def test_pack_endpoint(tmp_path, monkeypatch):
     (tmp_path / "proj" / "a.py").write_text("pass", encoding="utf-8")
 
     class _U(BaseHTTPRequestHandler):
-        def do_GET(self): self.send_response(200); self.end_headers()
-        def log_message(self, *a): pass
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
     srv = HTTPServer(("127.0.0.1", 0), _U)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     client = TestClient(build_app(upstream_port=srv.server_address[1]))

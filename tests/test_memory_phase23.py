@@ -341,8 +341,10 @@ def test_conflict_demotes_verified_rules_instead_of_killing_them(tmp_path,
     monkeypatch.setattr(memory, "embed_one",
                         lambda text, purpose="doc": [1.0, 0.0])
     store = MemoryStore(tmp_path / "m.jsonl")
-    m = store.add(kind="pitfall", text="Prefer the f16 KV cache.")
-    rows = store.all(); rows[0]["status"] = "verified"; store._write_all(rows)
+    store.add(kind="pitfall", text="Prefer the f16 KV cache.")
+    rows = store.all()
+    rows[0]["status"] = "verified"
+    store._write_all(rows)
     _run(add_consolidated(store, "pitfall", "Prefer the q8_0 KV cache.",
                           _reply("CONFLICT")))
     rows = {r["text"]: r for r in store.all()}
