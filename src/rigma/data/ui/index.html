@@ -23,18 +23,24 @@
   <nav id="chat-list" aria-label="Chats"></nav>
   <section id="docs-panel">
     <button id="docs-toggle" type="button" aria-expanded="false">
-      <span class="dot" id="rag-dot" aria-hidden="true"></span>my documents
+      <span class="dot" id="rag-dot" aria-hidden="true"></span>
+      <span class="docs-name">Grounded chat</span>
+      <span class="docs-chevron" aria-hidden="true">▾</span>
     </button>
     <div id="docs-body" hidden>
-      <label class="rag-switch" title="Answer this chat from your indexed documents">
-        <input type="checkbox" id="use-rag">use in this chat</label>
-      <ul id="source-list"></ul>
+      <label class="ground-row" title="The model searches your indexed folders mid-conversation and cites what it finds">
+        <span class="ground-label">Ground this chat
+          <small>model reads your documents as it talks</small></span>
+        <span class="switch"><input type="checkbox" id="use-rag">
+          <span class="track" aria-hidden="true"></span></span>
+      </label>
+      <ul id="source-list" aria-label="Indexed folders"></ul>
       <form id="add-source">
-        <input id="source-path" placeholder="C:\path\to\folder" spellcheck="false"
-               aria-label="Folder to index">
-        <button type="submit">Add</button>
+        <input id="source-path" placeholder="add a folder to index…"
+               spellcheck="false" aria-label="Folder to index">
+        <button type="submit" aria-label="Index this folder">+</button>
       </form>
-      <div id="docs-status" class="dim" role="status"></div>
+      <div id="docs-status" role="status"></div>
     </div>
   </section>
 </aside>

@@ -136,7 +136,7 @@ function paletteActions() {
     {label: "Export chat as markdown",
      run: () => current && window.open("/api/sessions/" + current.id +
                                        "/export?fmt=md")},
-    {label: "Toggle documents (RAG) for this chat", run: async () => {
+    {label: "Toggle grounded chat (search my documents)", run: async () => {
       if (!current) return;
       current = await api("POST", "/api/sessions/" + current.id,
                           {use_rag: !current.use_rag});
