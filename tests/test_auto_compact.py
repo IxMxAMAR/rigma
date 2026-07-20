@@ -163,7 +163,7 @@ def _seed_run(client, n_obs=20, body=800):
         msgs.append({"role": "assistant", "content": f"step {i} reasoning"})
         msgs.append({"role": "user", "kind": "tool_result",
                      "tools": [{"name": "sample_files", "ok": True}],
-                     "content": f"TOOL RESULT sample_files: " + "x" * body})
+                     "content": "TOOL RESULT sample_files: " + "x" * body})
     s["messages"] = msgs
     sessions.save(s)
     return sid

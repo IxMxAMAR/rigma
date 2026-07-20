@@ -12,8 +12,6 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-_log = logging.getLogger(__name__)
-
 from . import context
 from . import mission as _mission_mod
 from . import presets
@@ -21,6 +19,8 @@ from . import runtime
 from . import server_ops
 from . import sessions
 from . import state as st
+
+_log = logging.getLogger(__name__)
 
 _FALLBACK_HTML = "<!doctype html><html><body><h1>Rigma</h1></body></html>"
 _HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}

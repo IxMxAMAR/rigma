@@ -579,7 +579,7 @@ def test_prose_turn_is_saved_not_discarded(engine, tmp_path):
     c = _client(engine)
     rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1,
                                     "workspace": str(tmp_path)}).json()["id"]
-    r = _wait(c, rid, timeout=25)
+    _wait(c, rid, timeout=25)
     log = c.get(f"/api/runs/{rid}/log").json()["log"]
     # the fake engine narrates only ~17 chars, below DRAFT_MIN_CHARS, so nothing
     # should be saved — the guard must not write junk drafts for short replies
@@ -602,7 +602,7 @@ def test_start_run_responds_immediately(engine, monkeypatch):
     r = c.post("/api/runs", json={"mission": "x", "budget_hours": 1})
     assert r.status_code == 200
     assert _t.monotonic() - t0 < 3.0, "start_run blocked on the compile"
-    _wait(c, rid := r.json()["id"], timeout=25)
+    _wait(c, r.json()["id"], timeout=25)
 
 
 def test_compiled_spec_seeds_the_plan(engine):

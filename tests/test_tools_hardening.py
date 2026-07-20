@@ -107,9 +107,11 @@ def test_view_images_gated_and_caps(tmp_path):
 
 def test_encode_image_data_uri():
     from rigma import tools as t
-    import tempfile, os
+    import tempfile
+    import os
     fd, path = tempfile.mkstemp(suffix=".png")
-    os.write(fd, b"\x89PNG\r\n\x1a\n" + b"\0" * 40); os.close(fd)
+    os.write(fd, b"\x89PNG\r\n\x1a\n" + b"\0" * 40)
+    os.close(fd)
     uri = t.encode_image_data_uri(path)
     os.unlink(path)
     assert uri.startswith("data:image/")
