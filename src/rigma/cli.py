@@ -810,6 +810,13 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             if spec_c is not None and spec_c.mmproj is not None:
                 mm_path = runtime.ensure_model(spec_c.mmproj)
                 extra = ["--mmproj", str(mm_path)]
+            # repaired-template override, same rule as server_ops.switch_model.
+            # Live-verify 2026-07-20 caught the asymmetry: a model whose fixed
+            # template sat in ~/.rigma/templates booted through `up` with its
+            # BROKEN embedded template, because only the switch path looked.
+            tmpl = runtime.rigma_home() / "templates" / f"{cand.model_slug}.jinja"
+            if tmpl.is_file():
+                extra = extra + ["--chat-template-file", str(tmpl)]
             from .bench import auto_calibrate, is_calibrated
             if (ctx is None and not no_calibrate and cand.backend != "cpu"
                     and os.environ.get("RIGMA_AUTO_CALIBRATE", "1") != "0"
