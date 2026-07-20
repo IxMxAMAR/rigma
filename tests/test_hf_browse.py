@@ -251,3 +251,25 @@ def test_recommend_picks_speed_sweet_spot_not_biggest(monkeypatch, home):
     # recommend the largest that's GPU/light, NOT the biggest-that-fits
     assert d["recommended"] != "Q8_0"
     assert d["recommended"] in ("Q4_K_M", "IQ3_M")
+
+
+def test_mtp_preserved_models_are_not_filtered_as_aux():
+    """"mtp" as a bare substring rejected entire repos. MTP-PRESERVED models
+    carry it in their filename and are exactly what a user wants; only a
+    standalone draft head is auxiliary. This made
+    SC117/...-MTP-Preserved-APEX-GGUF report "no single-file gguf in that repo"
+    when it has three."""
+    from rigma.hf_browse import _is_aux_gguf as aux
+    # real filenames from repos that must WORK
+    assert not aux("Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-"
+                   "APEX-I-Compact.gguf")
+    assert not aux("Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf")      # unsloth official
+    assert not aux("Huihui-Qwen3.6-35B-A3B-abliterated-MTP-Q4_K.gguf")
+    # genuine auxiliary heads must still be skipped
+    assert aux("mtp.gguf")
+    assert aux("Qwen3-30B-mtp.gguf")
+    assert aux("model-mtp-head.gguf")
+    assert aux("model_mtp_head.gguf")
+    # unrelated markers unchanged
+    assert aux("something-imatrix.gguf") and aux("foo-draft.gguf")
+    assert not aux("Rocinante-X-12B-v1b-Q6_K.gguf")
