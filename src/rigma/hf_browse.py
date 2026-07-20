@@ -26,12 +26,19 @@ _RANGE_STEPS_MB = (8, 32, 64)   # escalate when a huge vocab pads the header
 # quant list they show up as tiny phantom "models" and, being the smallest
 # file, get picked as the header-probe source — mislabelling the real model
 # (live repro 2026-07-18: a 240MB mtp-*.gguf made a 26B MoE read as "dense").
-_AUX_MARKERS = ("imatrix", "mtp", "-draft", "eagle", "medusa")
+_AUX_MARKERS = ("imatrix", "-draft", "eagle", "medusa")
+# "mtp" as a bare substring was wrong: MTP-PRESERVED models carry it in their
+# name ("...-Native-MTP-Preserved-APEX-I-Compact.gguf", unsloth's
+# "...-A3B-MTP-UD-Q4_K_XL.gguf") and are exactly what the user wants. Only a
+# standalone draft head — mtp.gguf / foo-mtp.gguf / foo-mtp-head.gguf — is aux.
+_AUX_MTP_RE = re.compile(r"(?:^|[-_/])mtp(?:[-_]?head)?\.gguf$", re.I)
 
 
 def _is_aux_gguf(name: str) -> bool:
     n = name.lower()
-    return any(m in n for m in _AUX_MARKERS)
+    if any(m in n for m in _AUX_MARKERS):
+        return True
+    return bool(_AUX_MTP_RE.search(n))
 
 
 def _headers() -> dict:
