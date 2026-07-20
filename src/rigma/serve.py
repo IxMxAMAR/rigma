@@ -1524,6 +1524,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 "sources": rag.load_sources(),
                 "indexing": ingest_state["busy"], "error": ingest_state["error"]}
 
+    @app.delete("/api/rag/sources")
+    async def rag_remove_source(body: dict):
+        from . import rag
+        path = str((body or {}).get("path", "")).strip()
+        srcs = rag.remove_source(path)
+        return {"sources": srcs}
+
     @app.post("/api/rag/sources")
     async def rag_add_source(body: dict):
         from pathlib import Path
@@ -1547,41 +1554,6 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         ingest_tasks.add(task)          # asyncio keeps only a weak ref
         task.add_done_callback(ingest_tasks.discard)
         return JSONResponse({"sources": srcs, "indexing": True}, status_code=202)
-
-    async def _rag_turn(s: dict):
-        from . import rag
-        q = s["messages"][-1]["content"]
-        if isinstance(q, list):   # vision parts -> text only for the sidecar
-            q = " ".join(p.get("text", "") for p in q
-                         if isinstance(p, dict) and p.get("type") == "text")
-        yield _sse({"delta": ""}, event="think")   # keep-alive: retrieval is slow
-        try:
-            await asyncio.to_thread(rag.ensure_sidecar)
-            a = await asyncio.to_thread(rag.ask, q)
-            if not isinstance(a, dict):
-                raise RuntimeError(f"unexpected sidecar reply: {type(a).__name__}")
-        except Exception as e:
-            yield _sse({"message": f"documents unavailable: {e}"}, event="error")
-            yield b"data: [DONE]\n\n"
-            return
-        text = a.get("answer", "")
-        if a.get("abstained"):
-            text = "(abstained — not enough evidence in your documents)\n" + text
-        if not text:
-            yield _sse({"message": "documents returned an empty answer"},
-                       event="error")
-            yield b"data: [DONE]\n\n"
-            return
-        yield _sse({"delta": text})
-        cites = a.get("citations") or []
-        if cites:
-            yield _sse({"citations": cites}, event="citations")
-        if sessions.load(s["id"]) is None:   # deleted mid-retrieval: discard
-            yield b"data: [DONE]\n\n"
-            return
-        s["messages"].append({"role": "assistant", "content": text})
-        sessions.save(s)
-        yield b"data: [DONE]\n\n"
 
     @app.post("/api/sessions/{sid}/chat")
     async def chat_turn(sid: str, body: dict):
@@ -1627,16 +1599,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if not s["messages"]:
             return JSONResponse({"error": "session has no messages"},
                                 status_code=400)
-        if body.get("continue") and s.get("use_rag"):
-            return JSONResponse(
-                {"error": "continue is not available for grounded chats"},
-                status_code=400)
-        # _llm_turn now folds in the agentic tool loop (streams each round,
-        # runs any tool_calls, loops) — RAG is the only separate path
+        # Grounded chat (owner rework 2026-07-21): grounding no longer swaps
+        # the pipeline for a single-shot sidecar Q&A box (last message only,
+        # no history, no tools, no follow-ups — never used once since it was
+        # built). It now means a NORMAL conversation with the sidecar up and
+        # search_my_documents advertised, so the model pulls document passages
+        # mid-chat when it needs them. A dead sidecar degrades to plain chat —
+        # grounding must never kill the conversation.
         if s.get("use_rag"):
-            gen = _rag_turn(s)
-        else:
-            gen = _llm_turn(s, cont=bool(body.get("continue")))
+            from . import rag
+            s["use_tools"] = True         # the tool IS the grounding
+            sessions.save(s)
+            try:
+                await asyncio.to_thread(rag.ensure_sidecar)
+            except Exception as e:
+                _log.warning("grounded chat: sidecar unavailable (%s)", e)
+        gen = _llm_turn(s, cont=bool(body.get("continue")))
         return StreamingResponse(gen, media_type="text/event-stream",
                                  headers=_NO_STORE)
 
