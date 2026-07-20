@@ -41,19 +41,53 @@ export default function WorkspacePanel() {
     wasStreaming.current = !!streaming;
   }, [streaming, refresh]);
 
-  if (!data || !data.path) return null;
-  const base = data.path.replace(/[\/]+$/, "").split(/[\/]/).pop();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  if (!currentId) return null;
+  const base = data?.path
+    ? data.path.replace(/[\/]+$/, "").split(/[\/]/).pop() : null;
+  const savePath = async () => {
+    setEditing(false);
+    const v = draft.trim();
+    await fetch(`/api/sessions/${currentId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspace: v }),
+    }).catch(() => {});
+    void refresh();
+  };
   return (
     <div className="px-2 pt-3 border-t border-white/5 mx-2 min-h-0 flex flex-col">
       <div className="flex items-center gap-1.5 px-2 pb-1">
         <span className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em] flex-1 truncate"
-              title={data.path}>
-          workspace · {base}
+              title={data?.path || "no workspace set"}>
+          workspace{base ? ` · ${base}` : ""}
         </span>
-        <button onClick={() => void refresh()} aria-label="Refresh workspace"
-                className="text-muted hover:text-secondary text-[11px]">↻</button>
+        <button onClick={() => { setDraft(data?.path ?? ""); setEditing(!editing); }}
+                aria-label="Set workspace folder"
+                className="text-muted hover:text-secondary text-[11px]">✎</button>
+        {data?.path && (
+          <button onClick={() => void refresh()} aria-label="Refresh workspace"
+                  className="text-muted hover:text-secondary text-[11px]">↻</button>
+        )}
       </div>
-      {data.missing ? (
+      {editing && (
+        <form className="px-2 pb-1.5" onSubmit={(e) => { e.preventDefault(); void savePath(); }}>
+          <input autoFocus value={draft}
+                 onChange={(e) => setDraft(e.target.value)}
+                 onBlur={() => void savePath()}
+                 placeholder="D:\Writing"
+                 aria-label="Workspace folder path"
+                 className="w-full rounded-md bg-surface px-2 py-1 font-mono text-[11.5px] outline-none placeholder:text-muted" />
+        </form>
+      )}
+      {!data?.path && !editing && (
+        <button onClick={() => { setDraft(""); setEditing(true); }}
+                className="mx-2 mb-1 text-left font-mono text-[11px] text-muted hover:text-secondary">
+          set a folder for this chat's files…
+        </button>
+      )}
+      {!data?.path ? null : data.missing ? (
         <div className="px-2 font-mono text-[11px] text-red">folder missing</div>
       ) : data.entries.length === 0 ? (
         <div className="px-2 font-mono text-[11px] text-muted">empty</div>
