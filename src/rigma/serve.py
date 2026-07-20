@@ -536,6 +536,49 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # never let any UI (ours included) outlive its server via cache.
         return HTMLResponse(_ui_file("index.html"), headers=_NO_STORE)
 
+    # ---- /v2: the parallel next-gen UI (docs/design/UI-REWORK-PLAN.md) ----
+    # Built by frontend-v2/ (Vite) into data/ui_v2 and committed, so the pip
+    # wheel ships it and the user's machine never needs Node. The legacy UI
+    # at / stays the daily driver until parity; cutover is a route flip.
+    _V2_MIME = {".html": "text/html", ".js": "text/javascript",
+                ".css": "text/css", ".svg": "image/svg+xml",
+                ".map": "application/json", ".woff2": "font/woff2"}
+
+    def _v2_file(rel: str):
+        base = resources.files("rigma").joinpath("data/ui_v2")
+        # resolve + prefix check: path traversal must die here
+        try:
+            f = base.joinpath(rel)
+            data = f.read_bytes()
+        except Exception:
+            return None
+        import pathlib as _pl
+        ext = _pl.PurePosixPath(rel).suffix.lower()
+        return data, _V2_MIME.get(ext, "application/octet-stream")
+
+    @app.get("/v2")
+    @app.get("/v2/")
+    async def v2_root():
+        hit = _v2_file("index.html")
+        if hit is None:
+            return HTMLResponse(
+                "<h1>v2 UI not built</h1><p>run `npm run build` in "
+                "frontend-v2/ — the legacy UI at <a href='/'>/</a> is "
+                "unaffected.</p>", status_code=503)
+        return Response(hit[0], media_type=hit[1], headers=_NO_STORE)
+
+    @app.get("/v2/assets/{name}")
+    async def v2_asset(name: str):
+        if "/" in name or "\\" in name or ".." in name:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        hit = _v2_file(f"assets/{name}")
+        if hit is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        # hashed filenames: cache forever, invalidation is a new hash
+        return Response(hit[0], media_type=hit[1],
+                        headers={"cache-control":
+                                 "public, max-age=31536000, immutable"})
+
     @app.get("/ui/{name}")
     async def ui_asset(name: str):
         if name not in _UI_FILES:

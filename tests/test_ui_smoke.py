@@ -72,3 +72,24 @@ def test_preset_settings_flow(tmp_path, monkeypatch, oai_upstream):
     assert "Ember the dragon" in sent["messages"][0]["content"]
     assert sum(1 for m in sent["messages"] if m["role"] == "system") == 1
     assert sent["messages"][1] == {"role": "user", "content": "write"}
+
+
+def test_v2_ui_is_served(tmp_path, monkeypatch):
+    # the parallel /v2 route: built assets ship inside the wheel; the legacy
+    # UI at / must remain untouched while v2 grows (UI-REWORK-PLAN.md)
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=1))
+    r = c.get("/v2")
+    assert r.status_code in (200, 503)
+    if r.status_code == 200:                    # dist committed
+        assert "<div id=\"root\">" in r.text
+        import re
+        m = re.search(r'assets/(index-[\w-]+\.js)', r.text)
+        assert m, "index.html must reference the hashed bundle"
+        a = c.get(f"/v2/assets/{m.group(1)}")
+        assert a.status_code == 200
+        assert "immutable" in a.headers.get("cache-control", "")
+    # traversal dies
+    assert c.get("/v2/assets/..%2f..%2fserve.py").status_code == 404
+    # legacy root unaffected
+    assert c.get("/").status_code == 200
