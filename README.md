@@ -66,4 +66,4 @@ low-RAM process — ~300 MB) for grounded, cited answers from your own files thr
 local model: `pip install raggity[server]`, then `rigma rag add <folder>` and
 `rigma rag ask "..."`. If raggity isn't on PATH, point `RIGMA_RAGGITY_CMD` at it.
 
-Design: `docs/superpowers/specs/2026-07-03-rigma-design.md`. License: Apache-2.0.
+License: Apache-2.0.

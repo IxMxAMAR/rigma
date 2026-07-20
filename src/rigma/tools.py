@@ -22,7 +22,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable
 
 
@@ -1126,6 +1126,13 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif",
                ".tiff", ".jfif", ".avif", ".heic", ".ppm"}
 
 
+def _is_abs_anyos(ps: str) -> bool:
+    """Absolute under EITHER path flavour. The product runs on Windows but CI
+    runs on linux, where Path('D:/x').is_absolute() is False and every
+    windows-style absolute silently became workspace-relative."""
+    return PureWindowsPath(ps).is_absolute() or ps.startswith("/")
+
+
 def _resolve_image(ps: str, ctx: dict) -> tuple:
     """(resolved_path, error). Validates it exists, is an image, and is ≤20MB.
     Absolute paths are allowed (images live outside the workspace); relative
@@ -1133,6 +1140,8 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
     ps = str(ps).strip().strip('"').strip("'")
     if not ps:
         return None, "empty path"
+    if _is_abs_anyos(ps) and not Path(ps).exists():
+        return None, f"no such file: {ps}"
     p = Path(ps)
     if not p.is_absolute():
         try:
