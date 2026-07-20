@@ -17,6 +17,7 @@ dependencies = [
   "huggingface_hub>=0.23",
   "fastapi>=0.111",
   "uvicorn>=0.30",
+  "pillow>=10",
 ]
 
 [project.optional-dependencies]

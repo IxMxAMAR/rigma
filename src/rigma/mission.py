@@ -18,7 +18,7 @@ refused one.
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 MAX_STEPS = 12
 
@@ -164,9 +164,12 @@ def anchor_spec(spec: dict, workspace: str = "") -> dict:
             raw_p = str(item.get(key) or "")
             if not raw_p:
                 continue
-            p = Path(raw_p)
-            if p.is_absolute() and not p.parent.exists():
-                item[key] = p.name
+            # PureWindowsPath judges both flavours: 'C:\x' AND '/x' read
+            # as absolute, on any host OS. Plain Path said C:\x was
+            # RELATIVE on linux, so CI never stripped it (2026-07-21).
+            pw = PureWindowsPath(raw_p)
+            if pw.is_absolute() and not Path(raw_p).parent.exists():
+                item[key] = pw.name
     return spec
 
 
