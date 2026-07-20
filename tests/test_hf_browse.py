@@ -270,6 +270,8 @@ def test_mtp_preserved_models_are_not_filtered_as_aux():
     assert aux("Qwen3-30B-mtp.gguf")
     assert aux("model-mtp-head.gguf")
     assert aux("model_mtp_head.gguf")
+    # a head can also be named like an mmproj, with mtp as a PREFIX
+    assert aux("mtp-gemma-4-26B-A4B-it.gguf")
     # unrelated markers unchanged
     assert aux("something-imatrix.gguf") and aux("foo-draft.gguf")
     assert not aux("Rocinante-X-12B-v1b-Q6_K.gguf")
