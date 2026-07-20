@@ -80,37 +80,77 @@ function Header() {
   const label = SURFACES.find((s) => s.id === surface)?.label ?? "";
   const currentId = useChat((s) => s.currentId);
   const [copied, setCopied] = useState(false);
+  const [editingWs, setEditingWs] = useState(false);
+  const setWorkspacePath = useApp((s) => s.setWorkspacePath);
+  const saveWs = async (raw: string) => {
+    setEditingWs(false);
+    const v = raw.trim();
+    if (v === workspacePath || !currentId) return;
+    await fetch(`/api/sessions/${currentId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspace: v }),
+    }).catch(() => {});
+    setWorkspacePath(v);
+  };
   return (
     <header className="h-12 shrink-0 flex items-center gap-4 px-5 bg-panel">
       <h1 className="text-[14px] font-semibold shrink-0">{label}</h1>
-      {surface === "chat" && workspacePath && (
-        <span className="flex items-center gap-1.5 min-w-0 max-w-[40%]">
-          <button
-            onClick={() => {
-              void navigator.clipboard.writeText(workspacePath).then(() => {
-                setCopied(true);
-                window.setTimeout(() => setCopied(false), 1200);
-              });
-            }}
-            title={copied ? "copied!" : workspacePath + "  (click to copy)"}
-            aria-label="Copy workspace path"
-            dir="rtl"
-            className="font-mono text-[11.5px] text-muted hover:text-secondary truncate min-w-0"
-          >
-            {copied ? "✓ copied" : "‎" + workspacePath}
-          </button>
-          <button
-            onClick={() => {
-              if (currentId)
-                void fetch(`/api/sessions/${currentId}/workspace/open`,
-                           { method: "POST" });
-            }}
-            aria-label="Open workspace in file manager"
-            title="open in Explorer"
-            className="shrink-0 text-muted hover:text-amber text-[12px]"
-          >
-            ⤴
-          </button>
+      {surface === "chat" && currentId && (
+        <span className="flex items-center gap-1.5 min-w-0 max-w-[44%]">
+          {editingWs ? (
+            <input
+              autoFocus
+              defaultValue={workspacePath}
+              placeholder="D:\Writing"
+              aria-label="Workspace folder path"
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setEditingWs(false);
+                if (e.key === "Enter")
+                  void saveWs((e.target as HTMLInputElement).value);
+              }}
+              onBlur={(e) => void saveWs(e.target.value)}
+              className="min-w-[220px] rounded-md bg-surface px-2 py-0.5 font-mono text-[11.5px] outline-none placeholder:text-muted"
+            />
+          ) : (
+            <button
+              onClick={() => setEditingWs(true)}
+              title={(workspacePath || "no workspace") + "  (click to edit)"}
+              aria-label="Edit workspace path"
+              dir="rtl"
+              className="font-mono text-[11.5px] text-muted hover:text-secondary truncate min-w-0"
+            >
+              {workspacePath ? "‎" + workspacePath : "set workspace…"}
+            </button>
+          )}
+          {workspacePath && !editingWs && (
+            <>
+              <button
+                onClick={() => {
+                  void navigator.clipboard.writeText(workspacePath).then(() => {
+                    setCopied(true);
+                    window.setTimeout(() => setCopied(false), 1200);
+                  });
+                }}
+                aria-label="Copy workspace path"
+                title={copied ? "copied!" : "copy path"}
+                className="shrink-0 text-muted hover:text-secondary text-[11px]"
+              >
+                {copied ? "✓" : "⧉"}
+              </button>
+              <button
+                onClick={() => {
+                  void fetch(`/api/sessions/${currentId}/workspace/open`,
+                             { method: "POST" });
+                }}
+                aria-label="Open workspace in file manager"
+                title="open in Explorer"
+                className="shrink-0 text-muted hover:text-amber text-[12px]"
+              >
+                ⤴
+              </button>
+            </>
+          )}
         </span>
       )}
       <div className="ml-auto flex items-center gap-4 font-mono text-[12px]">
