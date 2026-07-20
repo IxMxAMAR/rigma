@@ -105,3 +105,58 @@ def test_non_tool_user_messages_are_never_masked():
     msgs.insert(2, {"role": "user", "content": "### RUN STATE\nstep: 1 of 3"})
     out, _ = mask_observations(msgs, keep_recent=0, budget_chars=10)
     assert any(m["content"].startswith("### RUN STATE") for m in out)
+
+
+# ---- review fixes (2026-07-20 adversarial review) ----
+
+def test_user_steering_starting_with_the_prefix_is_not_masked():
+    # a human typing "TOOL RESULT formats are failing, fix your syntax" is
+    # steering, not an observation — masking it would erase the very
+    # correction the user sent. Only the server's "TOOL RESULT <name>: " shape
+    # counts as legacy.
+    msgs = _msgs()
+    msgs.insert(2, {"role": "user",
+                    "content": "TOOL RESULT formats are failing, fix them"})
+    for m in msgs:
+        m.pop("kind", None)
+        m.pop("tools", None)
+    out, _ = mask_observations(msgs, keep_recent=0, budget_chars=10)
+    kept = [m for m in out if "formats are failing" in m["content"]]
+    assert kept, "steering text must survive masking untouched"
+
+
+def test_a_tagged_non_tool_kind_is_never_sniffed():
+    # a message that explicitly declares another kind must not fall through to
+    # the legacy prefix sniff, whatever its text looks like
+    msgs = _msgs()
+    msgs.insert(2, {"role": "user", "kind": "steering",
+                    "content": "TOOL RESULT sample_files: do it differently"})
+    out, _ = mask_observations(msgs, keep_recent=0, budget_chars=10)
+    assert any("do it differently" in m["content"] for m in out)
+
+
+def test_legacy_masking_is_idempotent_too():
+    # the masked form still starts with "TOOL RESULT <name>: ", so it still
+    # LOOKS like an observation — a second pass must recognise the placeholder
+    # and leave it alone rather than masking the mask
+    msgs = _msgs()
+    for m in msgs:
+        m.pop("kind", None)
+        m.pop("tools", None)
+    once, n1 = mask_observations(msgs, keep_recent=0, budget_chars=10)
+    twice, n2 = mask_observations(once, keep_recent=0, budget_chars=10)
+    assert n1 > 0 and n2 == 0
+    assert [m["content"] for m in once] == [m["content"] for m in twice]
+
+
+def test_masking_a_long_session_is_fast():
+    # session_chars() used to be recomputed inside the loop — O(n^2) ON the
+    # asyncio event loop. This pins the running-total fix with a budget a
+    # quadratic implementation cannot meet.
+    import time as _t
+    msgs = _msgs(n_pairs=3000, body_len=300)
+    t0 = _t.perf_counter()
+    out, n = mask_observations(msgs, keep_recent=6, budget_chars=50_000)
+    took = _t.perf_counter() - t0
+    assert n > 0
+    assert took < 1.0, f"masking 6000 messages took {took:.2f}s"
