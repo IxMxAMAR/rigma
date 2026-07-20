@@ -8,4 +8,4 @@ import os
 # runs first for any `rigma` import, so the flag is set in time.
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"

@@ -79,11 +79,21 @@ interface ChatState {
   messages: ChatMessage[];
   streaming: StreamingTurn | null;
   abort: AbortController | null;
+  images: string[];               // data URIs staged in the composer
+  pendingVariant: { content: unknown; variants: unknown[] } | null;
 
   loadSessions: () => Promise<void>;
+  search: (q: string) => Promise<void>;
   open: (id: string) => Promise<void>;
   newChat: () => Promise<void>;
+  deleteChat: (id: string) => Promise<void>;
+  duplicateChat: (id: string) => Promise<void>;
   send: (message: string | null, opts?: Record<string, unknown>) => Promise<void>;
+  regenerate: () => Promise<void>;
+  continueTurn: () => Promise<void>;
+  flipVariant: (dir: 1 | -1) => Promise<void>;
+  addImage: (dataUri: string) => void;
+  removeImage: (i: number) => void;
   stop: () => void;
 }
 
@@ -93,9 +103,36 @@ export const useChat = create<ChatState>((set, get) => ({
   messages: [],
   streaming: null,
   abort: null,
+  images: [],
+  pendingVariant: null,
 
   loadSessions: async () => {
     set({ sessions: await api.listSessions() });
+  },
+
+  search: async (q) => {
+    if (!q.trim()) return get().loadSessions();
+    try {
+      const r = await fetch(`/api/sessions/search?q=${encodeURIComponent(q)}`);
+      const d: unknown = await r.json();
+      if (r.ok && Array.isArray(d)) set({ sessions: d as SessionSummary[] });
+    } catch { /* keep list */ }
+  },
+
+  deleteChat: async (id) => {
+    await api.deleteSession(id).catch(() => {});
+    if (get().currentId === id)
+      set({ currentId: null, messages: [], streaming: null });
+    await get().loadSessions();
+  },
+
+  duplicateChat: async (id) => {
+    try {
+      const r = await fetch(`/api/sessions/${id}/duplicate`, { method: "POST" });
+      const d = (await r.json()) as { id?: string };
+      await get().loadSessions();
+      if (d.id) await get().open(d.id);
+    } catch { /* nothing */ }
   },
 
   open: async (id) => {
@@ -118,16 +155,26 @@ export const useChat = create<ChatState>((set, get) => ({
       id = s.id;
       set({ currentId: id });
     }
-    if (message != null)
+    const staged = get().images;
+    let content: ChatMessage["content"] | null = message;
+    if (message != null && staged.length > 0) {
+      content = [
+        { type: "text", text: message },
+        ...staged.map((u) => ({ type: "image_url", image_url: { url: u } })),
+      ] as ChatMessage["content"];
+      set({ images: [] });
+    }
+    if (content != null)
       set((st) => ({
-        messages: [...st.messages, { role: "user", content: message }],
+        messages: [...st.messages,
+                   { role: "user", content: content as ChatMessage["content"] }],
       }));
     const ctl = new AbortController();
     set({ streaming: emptyTurn(), abort: ctl });
     try {
       await streamChat(
         id,
-        { message, ...(opts ?? {}) },
+        { message: content, ...(opts ?? {}) },
         (ev) =>
           set((st) => ({
             streaming: st.streaming ? applyEvent(st.streaming, ev) : null,
@@ -145,12 +192,66 @@ export const useChat = create<ChatState>((set, get) => ({
     // reload the authoritative transcript; the streamed turn was a preview
     try {
       const s = await api.getSession(id);
-      set({ messages: s.messages, streaming: null, abort: null });
+      let msgs = s.messages;
+      // a completed regenerate folds the replaced reply into variants
+      const pv = get().pendingVariant;
+      const last = msgs[msgs.length - 1];
+      if (pv && last && last.role === "assistant") {
+        const variants = [...(last.variants ?? []), ...pv.variants, pv.content]
+          .filter(Boolean);
+        msgs = [...msgs.slice(0, -1), { ...last, variants }];
+        await api.updateSession(id, { messages: msgs }).catch(() => {});
+      }
+      set({ messages: msgs, streaming: null, abort: null,
+            pendingVariant: null });
     } catch {
-      set({ streaming: null, abort: null });
+      set({ streaming: null, abort: null, pendingVariant: null });
     }
     void get().loadSessions();
   },
+
+  regenerate: async () => {
+    const { currentId, messages, streaming } = get();
+    if (!currentId || streaming) return;
+    const msgs = [...messages];
+    let old: ChatMessage | null = null;
+    if (msgs.length && msgs[msgs.length - 1].role === "assistant")
+      old = msgs.pop() ?? null;
+    if (!msgs.length) return;
+    await api.updateSession(currentId, { messages: msgs }).catch(() => {});
+    set({
+      messages: msgs,
+      pendingVariant: old
+        ? { content: old.content, variants: old.variants ?? [] }
+        : null,
+    });
+    await get().send(null);
+  },
+
+  continueTurn: async () => {
+    if (!get().currentId || get().streaming) return;
+    await get().send(null, { continue: true });
+  },
+
+  flipVariant: async (dir) => {
+    const { currentId, messages } = get();
+    const last = messages[messages.length - 1];
+    if (!currentId || !last || last.role !== "assistant") return;
+    const pool = [...(last.variants ?? []), last.content];
+    if (pool.length < 2) return;
+    // rotate: current content goes to the back/front, next one becomes live
+    const next = dir === 1 ? pool[0] : pool[pool.length - 2];
+    const variants = pool.filter((v) => v !== next);
+    const msgs = [...messages.slice(0, -1),
+                  { ...last, content: next as ChatMessage["content"],
+                    variants }];
+    set({ messages: msgs });
+    await api.updateSession(currentId, { messages: msgs }).catch(() => {});
+  },
+
+  addImage: (dataUri) => set((st) => ({ images: [...st.images, dataUri] })),
+  removeImage: (i) =>
+    set((st) => ({ images: st.images.filter((_, j) => j !== i) })),
 
   stop: () => {
     get().abort?.abort();
