@@ -243,10 +243,19 @@ def get_log_tail(run_id: str, n: int = 5) -> str:
 
 def append_action(run_id: str, tool: str, args, ok: bool) -> None:
     try:
-        a = json.dumps(args, default=str)[:300]
+        full = json.dumps(args, default=str)
     except Exception:
-        a = str(args)[:300]
-    rec = {"ts": time.time(), "tool": tool, "args": a, "ok": bool(ok)}
+        full = str(args)
+    # args are truncated for display, but identity must come from the FULL
+    # args: write_file/run_python calls routinely exceed 300 chars, and two
+    # different calls agreeing in their first 300 (same path, evolving
+    # content) would otherwise collide into a false "loop" event and feed the
+    # memory distiller a wrong premise.
+    import hashlib
+    rec = {"ts": time.time(), "tool": tool, "args": full[:300],
+           "args_sha": hashlib.sha1(full.encode("utf-8", "replace"))
+           .hexdigest()[:16],
+           "ok": bool(ok)}
     with open(run_dir(run_id) / "actions.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 

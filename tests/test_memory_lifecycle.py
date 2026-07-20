@@ -89,3 +89,27 @@ def test_an_unwritable_store_does_not_break_a_run(engine, monkeypatch):
     rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
     r = _wait(c, rid, timeout=25)
     assert r["status"] in runs.TERMINAL, r["status"]
+
+
+def test_a_reboot_does_not_strand_the_active_run(engine):
+    # local review, critical: shutdown only REQUESTS cancellation and there
+    # was no startup reconciliation, so a reboot mid-run left active.json at
+    # status=running forever — and start_run 409s while a run is active, so
+    # one Windows update permanently disabled autonomous mode.
+    _Engine.compile_reply = "not a spec"
+    _Engine.script = [("current_datetime", {}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    _wait(c, rid, timeout=25)      # let the first loop actually END —
+    # in production a reboot kills it; in this shared-process test it would
+    # otherwise keep driving the run and overwrite the state we forge next
+    r = runs.load(rid)
+    r["status"] = "running"        # forge what a crash leaves behind
+    runs.save(r)
+    import json as _json
+    runs._active_path().write_text(_json.dumps({"id": rid}), encoding="utf-8")
+    # a NEW app instance boots (the TestClient context manager runs startup)
+    c2 = _client(engine)
+    r2 = c2.post("/api/runs", json={"mission": "y", "budget_hours": 1})
+    assert r2.status_code == 200, r2.json()
+    assert runs.load(rid)["status"] == "stopped"
