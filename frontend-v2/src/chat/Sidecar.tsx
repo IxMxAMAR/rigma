@@ -144,23 +144,43 @@ function SamplingCard() {
       const raw = (s as unknown as { params?: Record<string, number>;
                                      system_prompt?: string;
                                      preset_id?: string });
-      setParams(raw.params ?? {});
+      const loaded = { ...(raw.params ?? {}) };
+      // retro-clamp: values saved before limits existed (the 2,500,000 max
+      // tokens era) must not survive a reload
+      if (loaded.max_tokens != null && loaded.max_tokens > maxTok)
+        loaded.max_tokens = maxTok;
+      setParams(loaded);
       setPrompt(raw.system_prompt ?? "");
       setPresetId(raw.preset_id ?? "");
       setDirty(false);
     }).catch(() => {});
   }, [currentId]);
 
+  const LIMITS: Record<string, number> = {
+    temperature: 2, dry_multiplier: 2, repeat_penalty: 2, max_tokens: maxTok,
+  };
   const save = async () => {
     if (!currentId) return;
-    await api.updateSession(currentId, { params, system_prompt: prompt })
-      .catch(() => {});
+    const clamped: Record<string, number> = {};
+    for (const [k, v] of Object.entries(params))
+      clamped[k] = Math.min(LIMITS[k] ?? v, Math.max(0, v));
+    setParams(clamped);
+    await api.updateSession(currentId,
+      { params: clamped, system_prompt: prompt }).catch(() => {});
     setDirty(false);
   };
 
-  const num = (key: string, label: string, step: number, max: number) => (
+  const num = (key: string, label: string, step: number, max: number,
+               showMax = false) => (
     <label className="flex items-center gap-2 text-[12.5px]">
-      <span className="w-24 text-secondary">{label}</span>
+      <span className="w-24 text-secondary">
+        {label}
+        {showMax && (
+          <span className="block font-mono text-[10px] text-muted">
+            max {max.toLocaleString()}
+          </span>
+        )}
+      </span>
       <input
         type="number"
         step={step}
@@ -230,7 +250,7 @@ function SamplingCard() {
       {num("temperature", "temperature", 0.05, 2)}
       {num("dry_multiplier", "DRY", 0.05, 2)}
       {num("repeat_penalty", "repeat pen.", 0.01, 2)}
-      {num("max_tokens", "max reply tokens", 1024, maxTok)}
+      {num("max_tokens", "max tokens", 1024, maxTok, true)}
       {dirty && (
         <button
           onClick={() => void save()}
