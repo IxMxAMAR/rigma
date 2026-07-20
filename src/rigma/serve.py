@@ -274,11 +274,28 @@ def _driving_message(run, session):
         return "USER GUIDANCE — follow this now: " + str(note)
     echoed = run.pop("_echoed_tool", "")
     if echoed:
+        # Escalate on repeat. Watched live 2026-07-20: this correction was sent
+        # verbatim twice and the model emitted the bare name both times. A
+        # nudge that has already failed once will not work by being repeated —
+        # repeating it IS the loop. The second form stops asking for the same
+        # tool at all, because the model is usually stuck on a token path the
+        # grammar blocks; any other tool breaks the deadlock.
+        run["_echo_streak"] = run.get("_echo_streak", 0) + 1
+        streak = run["_echo_streak"]
         _runs.save(run)
-        return (f"You wrote \"{echoed}\" as TEXT. That is not a tool call — "
-                "nothing ran, and the turn was wasted. Emit an actual "
-                f"{echoed} tool call now (the arguments may be empty). "
-                "Never type a tool's name into your reply.")
+        if streak == 1:
+            return (f"You wrote \"{echoed}\" as TEXT. That is not a tool call — "
+                    "nothing ran, and the turn was wasted. Emit an actual "
+                    f"{echoed} tool call now (the arguments may be empty). "
+                    "Never type a tool's name into your reply.")
+        return (f"Still text, not a tool call — {streak} turns wasted. STOP "
+                f"trying to call {echoed}.\n"
+                "Call a DIFFERENT tool this turn: read_file, find_files or "
+                "write_file. Any real tool call is better than another attempt "
+                f"at {echoed}.")
+    if "_echo_streak" in run:          # it recovered — reset
+        run.pop("_echo_streak", None)
+        _runs.save(run)
     miss = run.pop("_missing_artifacts", None)
     if miss:
         _runs.save(run)
@@ -326,8 +343,20 @@ def _driving_message(run, session):
         return ("New mission — do NOT execute yet. First call manage_plan("
                 "action='add', task='…') 3–5 times to break the mission into "
                 "concrete, verifiable steps. Then start working through them.")
-    nxt = _runs.next_pending(rid) or "(no pending steps — verify and finish)"
+    nxt = _runs.next_pending(rid)
     last = _last_trace(session)
+    # EVERY step is done. There is no "next step" to order, and the old code
+    # interpolated a placeholder into "Do this now: {}" — commanding the model
+    # to perform a step that does not exist. Watched live 2026-07-20: it
+    # invented a step #4 via manage_plan purely to have something to obey, and
+    # was then scolded for inventing it. Nothing below here is coherent without
+    # a pending step, so finishing is the only instruction worth giving.
+    if not nxt:
+        return ("Every plan step is marked done. Do NOT start new work and do "
+                "NOT add plan steps.\n"
+                "VERIFY the deliverables exist (read_file / find_files), then "
+                "call task_complete(summary='…'). If verification shows "
+                "something is genuinely missing, write that file now.")
     # called it but didn't do it: name the gap instead of a generic nudge
     if last and all(t.get("name") in _BOOKKEEPING_TOOLS for t in last):
         return ("You updated your plan/log but produced NOTHING. Describing "
