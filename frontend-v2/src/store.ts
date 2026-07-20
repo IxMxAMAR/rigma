@@ -25,6 +25,7 @@ interface ServerStatus {
   quant: string;
   tps: number | null;
   healthy: boolean;
+  ctx: number;
 }
 
 interface AppState {

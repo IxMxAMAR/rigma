@@ -148,10 +148,29 @@ function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
           ))}
         </ul>
       )}
+      {(run.activity?.length ?? 0) > 0 && (
+        <div className="bg-canvas rounded-md p-3 max-h-72 overflow-y-auto flex flex-col gap-1.5">
+          {run.activity!.map((a, i) => (
+            <div key={i} className={`text-[12px] whitespace-pre-wrap break-words ${
+              a.kind === "tool" ? "font-mono text-amber"
+              : a.kind === "result" ? "font-mono text-moss"
+              : a.kind === "think" ? "text-muted italic"
+              : "text-secondary"}`}>
+              {a.kind === "tool" ? "→ " : a.kind === "result" ? "✓ " : ""}
+              {a.text}
+            </div>
+          ))}
+        </div>
+      )}
       {run.log_tail && (
-        <pre className="font-mono text-[11.5px] text-secondary bg-canvas rounded-md p-3 max-h-44 overflow-y-auto whitespace-pre-wrap">
-          {run.log_tail}
-        </pre>
+        <details className="mt-2">
+          <summary className="font-mono text-[11px] text-muted cursor-pointer">
+            progress log
+          </summary>
+          <pre className="font-mono text-[11.5px] text-secondary bg-canvas rounded-md p-3 max-h-44 overflow-y-auto whitespace-pre-wrap mt-1">
+            {run.log_tail}
+          </pre>
+        </details>
       )}
       <form
         className="flex gap-1.5 mt-3"
