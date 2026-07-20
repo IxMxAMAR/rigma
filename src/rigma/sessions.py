@@ -132,6 +132,16 @@ def build_messages(session: dict, default_prompt: str = "",
     notes = session.get("notes", "")
     if notes:
         sections.append("Story notes (authoritative):\n" + notes)
+    if session.get("use_rag"):
+        # grounded search: the tool does the grounding, but a weak model needs
+        # TELLING that the tool is the point of this conversation — without
+        # the nudge it answers from its own weights and never reaches for it
+        sections.append(
+            "GROUNDED CHAT is ON. The user has indexed their own documents. "
+            "For any question their documents could answer, call "
+            "search_my_documents FIRST and base your answer on what it "
+            "returns, citing the source files. Only answer purely from your "
+            "own knowledge when the documents have nothing relevant.")
     digest = session.get("digest", "")
     if digest:
         # Frame the summary as REFERENCE, not as instructions. Without this a

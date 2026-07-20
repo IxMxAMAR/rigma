@@ -30,16 +30,17 @@ def test_full_ui_conversation_flow(tmp_path, monkeypatch, oai_upstream):
     s = c.get(f"/api/sessions/{s['id']}").json()
     assert [m["role"] for m in s["messages"]] == ["user", "assistant"]
 
-    # rename + RAG toggle + grounded turn
+    # rename + grounded-chat toggle. Grounding no longer swaps the pipeline
+    # for a sidecar Q&A box (owner rework 2026-07-21) — the ENGINE still
+    # answers, with the sidecar up and search_my_documents advertised.
     assert c.post(f"/api/sessions/{s['id']}",
                   json={"title": "story"}).json()["title"] == "story"
     c.post(f"/api/sessions/{s['id']}", json={"use_rag": True})
-    grounded = {"answer": "From your docs.", "citations": ["a.md"],
-                "abstained": False}
-    with patch("rigma.rag.ensure_sidecar", return_value={}), \
-         patch("rigma.rag.ask", return_value=grounded):
+    with patch("rigma.rag.ensure_sidecar", return_value={}) as ens, \
+         patch("rigma.rag.recorded_sidecar_port", return_value=8899):
         r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "cite it"})
-    assert "From your docs." in r.text and "event: citations" in r.text
+    assert "Hel" in r.text and "[DONE]" in r.text
+    assert ens.called
 
     # rail summary reflects everything
     lst = c.get("/api/sessions").json()
