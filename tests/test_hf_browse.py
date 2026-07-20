@@ -51,6 +51,15 @@ def fake_hf(monkeypatch):
             return TREE
         raise AssertionError(path)
     monkeypatch.setattr(hf_browse, "_get_json", _get_json)
+    # fit verdicts must be deterministic: CI runners have no GPU, and the
+    # fixture's assertions describe a 16GB card
+    from rigma import probe as _probe
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    monkeypatch.setattr(_probe, "probe_hardware", lambda gpus=None: HardwareProfile(
+        gpus=[GpuInfo(vendor="amd", name="RX", vram_mb=16368,
+                      backends=["vulkan"])],
+        ram_mb=32768, ram_free_mb=24000, cpu=CpuInfo(cores=16),
+        os="windows", disk_free_gb=400.0))
     monkeypatch.setattr(hf_browse, "_fetch_head",
                         lambda repo, file, cap: HEADER)
 
