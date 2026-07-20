@@ -52,9 +52,11 @@ def test_root_serves_html(upstream):
     assert "<html" in r.text.lower() or "<!doctype" in r.text.lower()
 
 
-def test_root_serves_real_chat_ui(upstream):
+def test_rizz_serves_real_legacy_chat_ui(upstream):
+    # the complete legacy app moved to /rizz (owner cutover 2026-07-21);
+    # the point of this test is unchanged — the REAL app, not the fallback
     client = TestClient(build_app(upstream_port=upstream))
-    body = client.get("/").text
+    body = client.get("/rizz").text
     assert "/ui/app.js" in body and "/ui/style.css" in body and "/ui/md.js" in body
     assert "/ui/store.js" in body
 
