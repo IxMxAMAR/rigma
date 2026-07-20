@@ -22,7 +22,8 @@ def test_chat_persists_to_session_store(tmp_path, monkeypatch):
          patch("rigma.sessions.default_prompt", return_value="DEFAULT"):
         r = runner.invoke(app, ["chat"], input="ping\nexit\n")
     assert r.exit_code == 0
-    assert seen["history"][0] == {"role": "system", "content": "DEFAULT"}
+    assert seen["history"][0]["role"] == "system"
+    assert seen["history"][0]["content"].startswith("DEFAULT")
     assert seen["history"][1] == {"role": "user", "content": "ping"}
     stored = sessions.list_sessions()
     assert len(stored) == 1 and stored[0]["message_count"] == 2
@@ -91,5 +92,6 @@ def test_chat_uses_preset_prompt_and_params(tmp_path, monkeypatch):
         r = runner.invoke(app, ["chat", "--session", sess["id"]],
                           input="ping\nexit\n")
     assert r.exit_code == 0
-    assert seen["history"][0] == {"role": "system", "content": "PRESET-PROMPT"}
+    assert seen["history"][0]["role"] == "system"
+    assert seen["history"][0]["content"].startswith("PRESET-PROMPT")
     assert seen["params"] == {"temperature": 1.3}

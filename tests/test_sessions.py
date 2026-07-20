@@ -313,3 +313,28 @@ def test_only_the_first_message_is_ever_system():
     systems = [i for i, m in enumerate(out) if m["role"] == "system"]
     assert systems == [0], f"system messages at {systems}, must be [0] only"
     assert any("Author's note" in str(m["content"]) for m in out)   # still applied
+
+
+def test_tool_doctrine_rides_with_tools_only():
+    # the doctrine is a built-in system section, not a preset a user can
+    # lose - and toolless chats never pay its tokens
+    from rigma.sessions import build_messages
+    s = {"messages": [{"role": "user", "content": "hi"}], "use_tools": True}
+    sys_msg = build_messages(s, "be helpful")[0]
+    assert sys_msg["role"] == "system"
+    assert "TOOL RULES" in sys_msg["content"]
+    assert sys_msg["content"].startswith("be helpful") or \
+        "be helpful" in sys_msg["content"]
+
+    s2 = {"messages": [{"role": "user", "content": "hi"}]}
+    built = build_messages(s2, "be helpful")
+    assert "TOOL RULES" not in built[0]["content"]
+
+
+def test_doctrine_never_displaces_the_users_prompt():
+    from rigma.sessions import build_messages
+    s = {"messages": [{"role": "user", "content": "hi"}],
+         "use_tools": True, "system_prompt": "You are Ember the dragon."}
+    c = build_messages(s)[0]["content"]
+    assert c.index("Ember the dragon") < c.index("TOOL RULES"), \
+        "the user's persona leads; doctrine follows"

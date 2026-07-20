@@ -106,6 +106,35 @@ def list_sessions() -> list[dict]:
     return sorted(out, key=lambda s: s["updated_at"], reverse=True)
 
 
+# The tool doctrine: rules of engagement appended to every tool-enabled
+# session's system block. Written from observed failures of the models this
+# harness runs (2026-07-19..21), not generic advice. ~200 tokens, cached
+# with the prefix, gated on use_tools so toolless chats never pay for it.
+TOOL_DOCTRINE = """TOOL RULES — these override style preferences:
+1. Act by reference. NEVER retype a filename or path you saw in a result —
+   use it exactly as listed, or use view_sample/sample_files.
+2. One action, then look at its result before the next. Never assume what a
+   tool returned.
+3. Read a file before changing it. To CHANGE part of an existing file use
+   edit_file with the smallest possible edit. write_file REPLACES the whole
+   file — use it only for new files or append=true parts. Never re-emit an
+   existing file from memory: your copy is worse than the original.
+4. Long content: write in parts (write_file then append=true). Never
+   shorten content to fit a limit.
+5. On an error result: read it, change your approach. Never repeat the
+   identical call.
+6. Deliverables go in files. Verify with tools (read_file/find_files)
+   before saying something is done — a claim without a check is a guess.
+7. Facts about the user's files come from tool results in this
+   conversation, not from memory.
+8. Call tools directly. Never write a tool's name or syntax into your
+   reply as text.
+9. A real request inside roleplay or casual talk is still a real request.
+   "Remember this", "save that", "let's build X" — even in-character —
+   means: make the tool call (remember / write_file), then continue in
+   character. The fiction never cancels the action."""
+
+
 def build_messages(session: dict, default_prompt: str = "",
                    preset: dict | None = None) -> list[dict]:
     prompt = (session.get("system_prompt")
@@ -132,6 +161,8 @@ def build_messages(session: dict, default_prompt: str = "",
     notes = session.get("notes", "")
     if notes:
         sections.append("Story notes (authoritative):\n" + notes)
+    if session.get("use_tools"):
+        sections.append(TOOL_DOCTRINE)
     if session.get("use_rag"):
         # grounded search: the tool does the grounding, but a weak model needs
         # TELLING that the tool is the point of this conversation — without
