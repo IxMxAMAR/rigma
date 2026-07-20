@@ -2,9 +2,12 @@
 // navigation, top header = context + telemetry, main canvas = the surface.
 // Phase 1 ships the chrome; each later phase fills one canvas.
 import { useEffect } from "react";
+import AutonomousSurface from "./autonomous/AutonomousSurface";
 import ChatSurface from "./chat/ChatSurface";
 import EngineSurface from "./engine/EngineSurface";
+import MemorySurface from "./memory/MemorySurface";
 import ModelsSurface from "./models/ModelsSurface";
+import SettingsSurface from "./settings/SettingsSurface";
 import Palette from "./Palette";
 import { SURFACES, useApp } from "./store";
 
@@ -86,6 +89,9 @@ function Canvas() {
   if (surface === "chat") return <ChatSurface />;
   if (surface === "engine") return <EngineSurface />;
   if (surface === "models") return <ModelsSurface />;
+  if (surface === "autonomous") return <AutonomousSurface />;
+  if (surface === "memory") return <MemorySurface />;
+  if (surface === "settings") return <SettingsSurface />;
   // Remaining surfaces: a deliberate, designed empty state each —
   // CONSTITUTION §7: "an empty screen is an invitation to act", never blank.
   return (

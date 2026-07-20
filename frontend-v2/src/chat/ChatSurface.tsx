@@ -1,6 +1,7 @@
 // The Chat surface: inner rail (sessions) + transcript + composer.
 // Right sidecar (params, grounding) arrives in Phase 4.
 import { useEffect, useRef, useState } from "react";
+import Sidecar from "./Sidecar";
 import Transcript from "./Transcript";
 import { useChat } from "./chatStore";
 
@@ -103,16 +104,26 @@ function Composer() {
 
 export default function ChatSurface() {
   const loadSessions = useChat((s) => s.loadSessions);
+  const [sidecar, setSidecar] = useState(false);
   useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
   return (
     <div className="flex-1 flex min-w-0 min-h-0">
       <SessionRail />
-      <div className="flex-1 flex flex-col min-w-0 min-h-0">
+      <div className="flex-1 flex flex-col min-w-0 min-h-0 relative">
+        <button
+          onClick={() => setSidecar(!sidecar)}
+          aria-expanded={sidecar}
+          aria-label="Chat settings"
+          className="absolute top-2 right-3 z-10 rounded-md bg-surface/80 hover:bg-float px-2 py-0.5 font-mono text-[12px] text-secondary"
+        >
+          {sidecar ? "⇥" : "⚙"}
+        </button>
         <Transcript />
         <Composer />
       </div>
+      <Sidecar open={sidecar} />
     </div>
   );
 }
