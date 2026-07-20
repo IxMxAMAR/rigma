@@ -178,6 +178,17 @@ function SamplingCard() {
           });
           setDirty(true);
         }}
+        onBlur={() => {
+          // the max attribute only gates the SPINNER; typing walks straight
+          // past it (owner demonstrated with 2,500,000 max tokens). Clamp
+          // for real once focus leaves.
+          setParams((p) => {
+            const v = p[key];
+            if (v == null) return p;
+            const clamped = Math.min(max, Math.max(0, v));
+            return clamped === v ? p : { ...p, [key]: clamped };
+          });
+        }}
         className="flex-1 min-w-0 rounded-md bg-surface px-2 py-0.5 font-mono text-[12px] outline-none"
       />
     </label>
