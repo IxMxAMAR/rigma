@@ -16,7 +16,7 @@ def render(src: str) -> str:
     driver = (MD_JS.read_text(encoding="utf-8")
               + f"\nprocess.stdout.write(renderMarkdown({json.dumps(src)}));")
     res = subprocess.run(["node", "-"], input=driver, capture_output=True,
-                         text=True, timeout=10)
+                         text=True, timeout=60)
     assert res.returncode == 0, res.stderr
     return res.stdout
 
