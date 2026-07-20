@@ -229,17 +229,19 @@ def test_ctx_endpoint_relaunches_at_requested_size(home, upstream,
                    ui_pid=os.getpid(), ctx=32768)
     seen = {}
 
-    def fake_switch(model, reg=None, prof=None, ctx=None):
-        seen.update(model=model, ctx=ctx)
+    def fake_switch(model, reg=None, prof=None, ctx=None,
+                    force_calibrate=False, kv=None):
+        seen.update(model=model, ctx=ctx, kv=kv)
         return {"model": model, "ctx": ctx, "unloaded": False}
     monkeypatch.setattr(server_ops, "perform_switch", fake_switch)
     client = TestClient(build_app(upstream_port=upstream))
     r = client.post("/api/server/ctx", json={"ctx": 131072})
     assert r.status_code == 200 and r.json()["ctx"] == 131072
-    assert seen == {"model": "m", "ctx": 131072}
+    assert seen == {"model": "m", "ctx": 131072, "kv": None}
     assert client.post("/api/server/ctx", json={"ctx": 12}).status_code == 400
     assert client.post("/api/server/ctx", json={}).status_code == 400
-    def boom(model, reg=None, prof=None, ctx=None):
+    def boom(model, reg=None, prof=None, ctx=None,
+             force_calibrate=False, kv=None):
         raise RuntimeError("ctx 999,999 doesn't fit — tops out around 262,144")
     monkeypatch.setattr(server_ops, "perform_switch", boom)
     r = client.post("/api/server/ctx", json={"ctx": 999999})

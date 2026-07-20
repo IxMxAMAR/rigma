@@ -81,12 +81,25 @@ function ContextMeter() {
   const currentId = useChat((s) => s.currentId);
   const ctx = useApp((s) => s.server?.ctx ?? 0);
   const [busy, setBusy] = useState(false);
-  // the engine's own prompt_tokens from the last completed turn — stored on
-  // the assistant message by the server
+  // engine-reported prompt_tokens from the last message that HAS stats —
+  // but if newer messages exist past that point (tool-heavy turns could
+  // miss stats), extend with a char-based estimate so the meter never
+  // freezes on a stale number (owner report 2026-07-21: stuck at 8%)
   let ptoks = 0;
+  let statsAt = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     const st = (messages[i] as { stats?: { prompt_tokens?: number } }).stats;
-    if (st?.prompt_tokens) { ptoks = st.prompt_tokens; break; }
+    if (st?.prompt_tokens) { ptoks = st.prompt_tokens; statsAt = i; break; }
+  }
+  let estimated = false;
+  if (statsAt < messages.length - 1) {
+    let extra = 0;
+    for (let i = statsAt + 1; i < messages.length; i++) {
+      const c = messages[i].content;
+      extra += typeof c === "string" ? c.length
+        : (c as unknown[]).length * 400;
+    }
+    if (extra > 0) { ptoks += Math.round(extra / 3); estimated = true; }
   }
   if (!ctx || !ptoks) return null;
   const frac = Math.min(1, ptoks / ctx);
@@ -97,7 +110,7 @@ function ContextMeter() {
              style={{ width: `${frac * 100}%` }} />
       </div>
       <span className="font-mono text-[10.5px] text-muted">
-        {Math.round(frac * 100)}% of {Math.round(ctx / 1024)}K
+        {estimated ? "~" : ""}{Math.round(frac * 100)}% of {Math.round(ctx / 1024)}K
       </span>
       {frac > 0.6 && currentId && (
         <button
