@@ -91,5 +91,12 @@ def test_v2_ui_is_served(tmp_path, monkeypatch):
         assert "immutable" in a.headers.get("cache-control", "")
     # traversal dies
     assert c.get("/v2/assets/..%2f..%2fserve.py").status_code == 404
-    # legacy root unaffected
-    assert c.get("/").status_code == 200
+    # / serves v2 when the dist exists (owner cutover call 2026-07-21);
+    # the complete legacy UI lives on at /rizz until parity
+    root = c.get("/")
+    assert root.status_code == 200
+    if r.status_code == 200:
+        assert 'id="root"' in root.text        # v2 shell
+    rizz = c.get("/rizz")
+    assert rizz.status_code == 200
+    assert "docs-panel" in rizz.text           # the full legacy app

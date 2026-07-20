@@ -2,6 +2,7 @@
 // navigation, top header = context + telemetry, main canvas = the surface.
 // Phase 1 ships the chrome; each later phase fills one canvas.
 import { useEffect } from "react";
+import ChatSurface from "./chat/ChatSurface";
 import Palette from "./Palette";
 import { SURFACES, useApp } from "./store";
 
@@ -40,6 +41,9 @@ function Sidebar() {
         >
           ctrl+k commands
         </button>
+        <a href="/rizz" className="block pt-1 hover:text-secondary">
+          legacy ui →
+        </a>
       </div>
     </nav>
   );
@@ -77,7 +81,8 @@ function Header() {
 function Canvas() {
   const surface = useApp((s) => s.surface);
   const meta = SURFACES.find((s) => s.id === surface);
-  // Phase 1: the canvas is a deliberate, designed empty state per surface —
+  if (surface === "chat") return <ChatSurface />;
+  // Remaining surfaces: a deliberate, designed empty state each —
   // CONSTITUTION §7: "an empty screen is an invitation to act", never blank.
   return (
     <main className="flex-1 overflow-y-auto bg-canvas flex items-center justify-center">
@@ -88,8 +93,8 @@ function Canvas() {
         <p className="text-secondary text-[13.5px]">
           {meta?.hint}. This surface arrives in a later phase — the legacy UI
           at{" "}
-          <a href="/" className="text-amber hover:underline">
-            /
+          <a href="/rizz" className="text-amber hover:underline">
+            /rizz
           </a>{" "}
           keeps full functionality until parity.
         </p>

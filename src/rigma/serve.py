@@ -534,6 +534,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # no-store: llama-server's own webui once bound this port on a user
         # machine and the browser kept serving its cached SPA long after —
         # never let any UI (ours included) outlive its server via cache.
+        #
+        # Owner call 2026-07-21: v2 is the front door as soon as its dist
+        # exists; the complete legacy UI stays one click away at /rizz until
+        # v2 reaches parity. A source checkout without a built dist still
+        # gets the legacy UI here, so nothing can dead-end.
+        try:
+            v2 = resources.files("rigma").joinpath(
+                "data/ui_v2/index.html").read_text(encoding="utf-8")
+            return HTMLResponse(v2, headers=_NO_STORE)
+        except Exception:
+            return HTMLResponse(_ui_file("index.html"), headers=_NO_STORE)
+
+    @app.get("/rizz", response_class=HTMLResponse)
+    async def rizz():
+        """The legacy UI, in full — the daily escape hatch until v2 parity."""
         return HTMLResponse(_ui_file("index.html"), headers=_NO_STORE)
 
     # ---- /v2: the parallel next-gen UI (docs/design/UI-REWORK-PLAN.md) ----
@@ -1035,7 +1050,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             except Exception:
                                 _ca = None
                             if isinstance(_ca, dict):
-                                yield _sse({"name": slot["name"], "args": _ca},
+                                yield _sse({"id": slot["id"] or f"call-{idx}",
+                                            "name": slot["name"], "args": _ca},
                                            event="tool")
                                 started[idx] = (asyncio.create_task(
                                     _run_call(slot["name"], _ca)), _ca)
@@ -1112,8 +1128,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             try:
                                 json.loads(c["args"])
                             except Exception:
-                                yield _sse({"name": name, "args": {}},
-                                           event="tool")
+                                yield _sse({"id": c["id"], "name": name,
+                                            "args": {}}, event="tool")
                                 result, imgs = (
                                     "error: this tool call was CUT OFF by the "
                                     "token limit — its arguments were "
@@ -1122,7 +1138,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                     "long files in parts with write_file's "
                                     "append=true."), None
                                 _shown = result
-                                yield _sse({"name": name, "result": _shown},
+                                yield _sse({"id": c["id"], "name": name,
+                                            "result": _shown},
                                            event="tool_result")
                                 trace.append({"name": name, "args": {},
                                               "result": result})
@@ -1136,7 +1153,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                               "auto-repair failed too")
                         # note: repaired args run normally — the model is told
                         # about the repair via the result, not punished for it
-                        yield _sse({"name": name, "args": cargs}, event="tool")
+                        yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
+                                    "args": cargs}, event="tool")
                         if bad:                 # don't run — let the model retry
                             result, imgs = (f"error: {bad} — fix the JSON and "
                                             "call again"), None
@@ -1145,8 +1163,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _shown = str(result)
                     if len(_shown) > 900:      # display only; the model gets it all
                         _shown = _shown[:900] + " …(display truncated)"
-                    yield _sse({"name": name, "result": _shown},
-                               event="tool_result")
+                    yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
+                                "result": _shown}, event="tool_result")
                     trace.append({"name": name, "args": cargs, "result": result})
                     msgs.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": result})
