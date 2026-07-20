@@ -31,16 +31,18 @@ Rules:
   artifact (a file) or gather information needed by a later step.
 - If the user asks for output "in batches" or "separately", make EACH BATCH ITS
   OWN STEP with its own output file. Never collapse batches into one step.
-- Use absolute paths exactly as the user wrote them. Never invent folders.
+- Artifact paths are RELATIVE to the agent's workspace folder — write
+  "naming.md", never an absolute path, and NEVER invent folders. The single
+  exception: if the user themselves wrote an absolute path, keep it exactly.
 - `verification` says how a step is checked: "file_min_size" with a byte count
   for anything written, "none" for pure exploration steps.
 - Output ONLY the JSON object. No commentary, no markdown fence.
 
 JSON shape:
 {"objective": "one sentence",
- "deliverables": [{"path": "C:\\\\out\\\\file.txt", "description": "..."}],
+ "deliverables": [{"path": "file.txt", "description": "..."}],
  "constraints": ["..."],
- "steps": [{"id": 1, "description": "...", "artifact": "C:\\\\out\\\\file.txt",
+ "steps": [{"id": 1, "description": "...", "artifact": "file.txt",
             "verification": {"type": "file_min_size", "value": 500}}]}
 
 User's request:
@@ -145,6 +147,30 @@ def verify_step(step: dict, workspace: str = "") -> tuple[bool, str]:
     return True, ""
 
 
+def anchor_spec(spec: dict, workspace: str = "") -> dict:
+    """Strip hallucinated absolute artifact paths down to workspace-relative.
+
+    Live run #3 (2026-07-20): the compiler invented C:\\workspace\\naming.md —
+    a folder that does not exist — because the old prompt's EXAMPLE showed
+    absolute paths, and a weak model imitates the example over the rule. The
+    server could then never verify the artifact (wrong path), never advanced
+    the plan, and never credited the injected memories. Defence in depth: even
+    with the prompt fixed, any absolute artifact whose parent directory does
+    not actually exist is reduced to its basename, which verify_step resolves
+    against the real workspace.
+    """
+    for coll, key in ((spec.get("steps") or [], "artifact"),
+                      (spec.get("deliverables") or [], "path")):
+        for item in coll:
+            raw_p = str(item.get(key) or "")
+            if not raw_p:
+                continue
+            p = Path(raw_p)
+            if p.is_absolute() and not p.parent.exists():
+                item[key] = p.name
+    return spec
+
+
 async def compile_mission(raw: str, post) -> dict:
     """Compile raw prose into a spec using the loaded model. `post` is an async
     callable taking the chat-completions payload. Falls back on any failure.
@@ -165,5 +191,5 @@ async def compile_mission(raw: str, post) -> dict:
             continue
         spec = parse_spec(text)
         if spec:
-            return spec
+            return anchor_spec(spec)
     return fallback_spec(raw)

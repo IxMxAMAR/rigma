@@ -643,6 +643,25 @@ def _manage_plan(args, ctx):
         return f"added step #{runs.plan_add(rid, t)}: {t}"
     if action == "complete":
         ok = runs.plan_complete(rid, args.get("id"))
+        if ok:
+            # Credit memories injected into this step. Scoring originally rode
+            # only the SERVER-advance path; live run #3 completed its steps via
+            # this tool (the compiled artifact path was wrong, so the server
+            # could never verify-and-advance) and the injected memories sat
+            # uncredited at -4 while the run succeeded around them. Either
+            # completion route is a step outcome; both must say so.
+            try:
+                from . import memory as _memory
+                from .runtime import rigma_home
+                run = runs.load(rid) or {}
+                ids = (run.get("step_injected") or {}).get(str(args.get("id")))
+                if ids and os.environ.get("RIGMA_MEMORY") != "0":
+                    _memory.score_memories(
+                        _memory.MemoryStore(rigma_home() / "memory"
+                                            / "memories.jsonl"),
+                        ids, +1, run_id=rid)
+            except Exception:
+                pass          # memory is never load-bearing
         return (f"step #{args.get('id')} marked done. Remaining: "
                 f"{runs.plan_summary(rid)}") if ok else "no such step id"
     if action == "update":
