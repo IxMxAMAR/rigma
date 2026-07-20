@@ -188,24 +188,35 @@ def describe_event(event: dict) -> str:
             "succeeded")
 
 
-def distil(event: dict, complete) -> str:
+def clean_rule(text: str) -> str:
+    """Normalise whatever the distiller replied with into one rule line."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    return text.strip('"').splitlines()[0].strip()[:200]
+
+
+async def distil(event: dict, complete) -> str:
     """Ask the model to generalise one event into a rule.
 
-    `complete` is a callable taking a prompt and returning text — injected so
-    this is testable without an engine, and swappable for a stronger model
-    later exactly as the mission compiler is.
+    `complete` is an async callable taking a prompt and returning text —
+    injected so this is testable without an engine, and swappable for a
+    stronger model later exactly as the mission compiler is.
     """
     try:
-        text = (complete(_DISTIL_PROMPT + describe_event(event)) or "").strip()
+        return clean_rule(await complete(_DISTIL_PROMPT + describe_event(event)))
     except Exception:
         return ""
-    text = text.strip().strip('"').splitlines()[0] if text else ""
-    return text[:200]
 
 
-def harvest_run(actions: list[dict], store: MemoryStore, complete,
-                max_rules: int = 3) -> list[dict]:
+async def harvest_run(actions: list[dict], store: MemoryStore, complete,
+                      max_rules: int = 3) -> list[dict]:
     """Mine a finished run's trace and store what can be distilled.
+
+    THE production entry point — serve.py calls exactly this, so the path the
+    tests exercise is the path that ships. An earlier revision had serve
+    hand-rolling its own copy of this loop against a private prompt constant,
+    which meant the tested code and the running code had quietly diverged.
 
     Bounded on purpose: a bad run can produce dozens of events, and writing a
     rule for each would swamp the store with near-duplicates. Never raises —
@@ -218,7 +229,7 @@ def harvest_run(actions: list[dict], store: MemoryStore, complete,
     except Exception:
         return written
     for event in events[:max_rules]:
-        rule = distil(event, complete)
+        rule = await distil(event, complete)
         if not rule:
             continue
         try:
