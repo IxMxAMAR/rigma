@@ -147,6 +147,36 @@ def remote_inspect(repo: str, file: str):
             raise HangarError(f"couldn't parse {file}: {e}") from e
 
 
+def _distinct_quants(files: list[str]) -> list[str]:
+    """A label per gguf that actually distinguishes them.
+
+    _quant_from_name looks for Q4_K_M/IQ3_M-style tags. Repos that name their
+    variants some other way — SC117's APEX ships I-Compact / I-Quality /
+    I-Balanced — all collapse to "GGUF", so the picker showed three identical
+    rows AND flagged every one of them as recommended (the badge compares on
+    this label). Fall back to whatever part of the filename actually differs."""
+    import os as _os
+    from pathlib import Path as _P
+    labels = [_quant_from_name(f) for f in files]
+    if len(set(labels)) == len(labels):
+        return labels                       # real quant tags: leave them alone
+    stems = [_P(f).stem for f in files]
+    pre = _os.path.commonprefix(stems)
+    suf = _os.path.commonprefix([s[::-1] for s in stems])[::-1]
+    out = []
+    for stem, fallback in zip(stems, labels):
+        core = stem[len(pre):len(stem) - len(suf)] if len(pre) + len(suf) < len(stem) \
+            else stem
+        core = core.strip("-_. ")
+        out.append((core or fallback).upper()[:24])
+    if len(set(out)) == len(out):
+        return out
+    # still ambiguous (same stem in different subdirs): keep the path, which is
+    # the only thing left that differs
+    return [str(_P(f).with_suffix("")).replace("\\", "/").upper()[-24:]
+            for f in files]
+
+
 def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
     rf = repo_files(repo)
     if not rf["ggufs"]:
@@ -188,8 +218,10 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
         full_attn_layers=f["full_attn_layers"], kv_heads=f["kv_heads"],
         head_dim=f["head_dim"], native_ctx=max(2048, f["native_ctx"]),
         ggufs=[GgufFile(repo=repo, file=g["file"], bytes=g["bytes"],
-                        quant=_quant_from_name(g["file"]))
-               for g in rf["ggufs"]],
+                        quant=q)
+               for g, q in zip(rf["ggufs"],
+                               _distinct_quants([g["file"]
+                                                 for g in rf["ggufs"]]))],
         moe=moe, mmproj=mm, license="see model card", use_cases=["general"],
         capabilities=caps, custom=True,
         sources=[f"{HF}/{repo}"])
