@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import threading
@@ -10,6 +11,8 @@ from importlib import resources
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+_log = logging.getLogger(__name__)
 
 from . import context
 from . import mission as _mission_mod
@@ -77,12 +80,13 @@ RUN_CTX_BUDGET = 32768   # autonomous runs keep durable state on DISK, so they
                          # cost and dilutes attention badly on a 3B-active model.
                          # Clamped to the engine's real ctx, so lowering the
                          # engine to -c 16384 automatically wins.
-# chars per token, for sizing masking against a token budget. Deliberately a
-# constant rather than a tokeniser: this only has to threshold, and loading a
-# tokeniser costs RAM on a box whose VRAM is fully committed to the model. ~3.5
-# is conservative for the tool-result text this actually measures (paths and
-# filenames tokenise worse than prose, so under-estimating chars per token
-# would make masking fire too late).
+# chars per token — FALLBACK only, used when the engine has not yet reported
+# prompt_tokens for the session. The live path measures the real ratio
+# (session chars ÷ engine ptoks) per turn, because the mix of prose and
+# Windows paths swings the true value between ~1 and ~4 and a wrong guess in
+# the high direction lets masking "succeed" in chars while still over budget
+# in tokens. No tokeniser on purpose: this only thresholds, and loading one
+# costs RAM on a box whose VRAM is fully committed to the model.
 CHARS_PER_TOKEN = 3
 AUTO_COMPACT_KEEP = 16  # one action = TWO messages now (assistant + TOOL
                         # RESULT), so 8 kept only ~4 actions of history
@@ -409,6 +413,15 @@ def _driving_message(run, session):
     if last:
         names = ", ".join(dict.fromkeys(t.get("name", "") for t in last))
         lines.append(f"last action: {names}")
+    else:
+        # Escalation, not a fixture: pure status risks "agency collapse" — a
+        # sub-40B model reading telemetry with no mandate can settle into
+        # narrating the status instead of acting on it. But putting a protocol
+        # imperative here EVERY turn is the 2026-07-19 narration bug ("Emit
+        # ONE tool call" became the thing it reasoned about). So the push line
+        # exists only on the turn after the model produced no tool call:
+        # passive while it acts, directive the moment it stops.
+        lines.append("no tool ran last turn — call one now to continue")
     return "\n".join(lines)
 
 
@@ -1048,12 +1061,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # prose IS the content.
                     still_over = True
                     if s.get("run_id"):
+                        # chars-per-token measured from THIS session's actual
+                        # content, not guessed: the engine just told us ptoks
+                        # for exactly these messages, so chars/ptoks is ground
+                        # truth for this trajectory's mix of prose and paths.
+                        # The static constant failed in a nasty direction —
+                        # path-heavy sessions tokenise near 1 char/token, so a
+                        # 3× assumption let masking finish "under budget" in
+                        # chars while still over in tokens, skipping the
+                        # summarise fallback and setting up a context overflow
+                        # on the NEXT turn. Clamped: a mid-stream ptoks can be
+                        # partial or zero.
+                        sess_chars = context.session_chars(s["messages"])
+                        cpt = max(1.0, min(6.0, sess_chars / ptoks)) \
+                            if ptoks else CHARS_PER_TOKEN
                         # ONE target for both the masking and the re-check.
                         # Masking to `budget` while judging against
                         # `fraction * budget` makes it stop just above the bar
                         # and summarise anyway — which silently defeats the
                         # whole point.
-                        target = AUTO_COMPACT_FRACTION * wctx * CHARS_PER_TOKEN
+                        target = AUTO_COMPACT_FRACTION * wctx * cpt
                         masked, n = context.mask_observations(
                             s["messages"], keep_recent=AUTO_COMPACT_KEEP,
                             budget_chars=int(target))
@@ -2059,15 +2086,28 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     pass
                 # Post-mortem: mine the action trace for lessons. Runs AFTER
                 # the run has already ended, so it cannot affect its outcome,
-                # and swallows everything — memory is never load-bearing.
+                # and stays non-fatal — memory is never load-bearing.
+                #
+                # SHIELDED, because this finally usually runs with a
+                # cancellation in flight: stop_run() calls task.cancel(), so a
+                # bare await here re-raises CancelledError at its first await
+                # point — and CancelledError is a BaseException, which the old
+                # `except Exception` did not catch. Net effect before this fix:
+                # every user-stopped run skipped its harvest AND aborted the
+                # rest of cleanup, precisely on the runs whose lessons matter
+                # most. shield() lets the harvest finish detached; the progress
+                # note is best-effort.
                 try:
-                    written = await _harvest_memories(run_id)
+                    fut = asyncio.ensure_future(_harvest_memories(run_id))
+                    written = await asyncio.shield(fut)
                     if written:
                         _runs.append_progress(
                             run_id, f"learned {len(written)} lesson(s) for "
                             "next time", "(run ended)", r.get("workspace", ""))
+                except asyncio.CancelledError:
+                    pass          # harvest continues detached on the live loop
                 except Exception:
-                    pass
+                    _log.exception("memory: post-run harvest failed")
 
     @app.post("/api/runs")
     async def start_run(body: dict):
