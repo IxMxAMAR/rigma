@@ -363,9 +363,20 @@ def _driving_message(run, session):
                 "confirm EVERY plan item is actually done. If anything is "
                 "missing, finish it. Only then call task_complete again.")
     if run.get("iteration", 0) == 0:
-        return ("New mission — do NOT execute yet. First call manage_plan("
-                "action='add', task='…') 3–5 times to break the mission into "
-                "concrete, verifiable steps. Then start working through them.")
+        # Ask the model to build a plan ONLY when there is no plan. The mission
+        # compiler usually already produced one, and telling the model "do NOT
+        # execute yet, add steps" while a compiled plan sits ready is a direct
+        # contradiction — live run #2 (2026-07-20) obeyed it to the letter:
+        # added duplicate steps, listed them, completed one of its own
+        # additions, and stalled having done nothing but bookkeeping. The fake
+        # engine never caught this because its compile always falls back to an
+        # empty plan, making this branch look correct in every test.
+        d0, tot0 = _runs.plan_counts(rid)
+        if tot0 == 0:
+            return ("New mission — do NOT execute yet. First call manage_plan("
+                    "action='add', task='…') 3–5 times to break the mission "
+                    "into concrete, verifiable steps. Then start working "
+                    "through them.")
     nxt = _runs.next_pending(rid)
     last = _last_trace(session)
     # EVERY step is done. There is no "next step" to order, and the old code

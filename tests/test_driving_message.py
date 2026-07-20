@@ -172,3 +172,22 @@ def test_consumed_state_is_persisted_to_disk():
     reloaded = _runs.load(run["id"])
     assert reloaded.get("steer_queue") == [], \
         "consumed steering must be gone from DISK, not just from memory"
+
+
+def test_iteration_zero_with_a_compiled_plan_does_not_ask_for_one():
+    # live run #2 (2026-07-20): the compiler had already produced a 4-step
+    # plan, but the iteration-0 message still said "do NOT execute yet — call
+    # manage_plan 3-5 times". The model obeyed exactly: added duplicate
+    # steps, listed them, completed one of its own additions, stalled with
+    # zero real work. The fake engine's compile always falls back to an empty
+    # plan, so every test made this branch look correct.
+    run = _plan(_run(iteration=0), ("compiled step one", "pending"))
+    msg = _driving_message(run, _session())
+    assert "do NOT execute" not in msg
+    assert "compiled step one" in msg
+
+
+def test_iteration_zero_with_no_plan_still_asks_for_one():
+    run = _run(iteration=0)
+    msg = _driving_message(run, _session())
+    assert "manage_plan" in msg
