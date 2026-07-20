@@ -164,12 +164,20 @@ def anchor_spec(spec: dict, workspace: str = "") -> dict:
             raw_p = str(item.get(key) or "")
             if not raw_p:
                 continue
-            # PureWindowsPath judges both flavours: 'C:\x' AND '/x' read
-            # as absolute, on any host OS. Plain Path said C:\x was
-            # RELATIVE on linux, so CI never stripped it (2026-07-21).
+            # Cross-platform on purpose, and twice burned: plain Path
+            # called 'C:\x' RELATIVE on linux, and even with the flavour
+            # detected, Path(raw).parent on linux is '.' (the backslashed
+            # string is one segment) — which exists, so the strip never
+            # fired on CI. Parse with the flavour the path is written in.
             pw = PureWindowsPath(raw_p)
-            if pw.is_absolute() and not Path(raw_p).parent.exists():
-                item[key] = pw.name
+            if pw.drive:                       # windows-style absolute
+                parent, name = Path(str(pw.parent)), pw.name
+            elif raw_p.startswith("/"):        # posix-style absolute
+                parent, name = Path(raw_p).parent, Path(raw_p).name
+            else:
+                continue                        # relative: already anchored
+            if not parent.exists():
+                item[key] = name
     return spec
 
 
