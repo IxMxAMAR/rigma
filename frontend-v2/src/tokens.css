@@ -24,7 +24,7 @@
 }
 
 :root { color-scheme: dark; }
-html, body, #root { height: 100%; }
+html, body, #root { height: 100%; overflow: hidden; }
 body {
   background: var(--color-canvas);
   color: var(--color-primary);
