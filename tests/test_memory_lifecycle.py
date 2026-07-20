@@ -113,3 +113,46 @@ def test_a_reboot_does_not_strand_the_active_run(engine):
     r2 = c2.post("/api/runs", json={"mission": "y", "budget_hours": 1})
     assert r2.status_code == 200, r2.json()
     assert runs.load(rid)["status"] == "stopped"
+
+
+def test_delegate_runs_in_a_fresh_context_and_returns_one_answer(engine):
+    # the context firewall: the helper's exploration must NOT enter the main
+    # session — only its condensed answer does. The fake engine answers every
+    # non-streaming call with compile_reply, which here plays the helper's
+    # final answer.
+    from rigma import sessions
+    _Engine.compile_reply = "The files use ComfyUI_%05d_.png naming."
+    _Engine.script = [("delegate", {"question": "what naming scheme?"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "investigate naming",
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    blob = "\n".join(str(m.get("content", "")) for m in
+                     sessions.load(r["session_id"])["messages"])
+    assert "TOOL RESULT delegate: The files use ComfyUI_" in blob
+    # the helper conversation itself (system prompt etc.) must never leak in
+    assert "research helper" not in blob
+
+
+def test_per_step_recall_injects_notes_once_per_step(engine):
+    import json as _json
+    from rigma import sessions
+    _store().add(kind="pitfall",
+                 text="Never type filenames; use view_sample.")
+    _Engine.compile_reply = _json.dumps({
+        "objective": "look at images", "deliverables": [], "constraints": [],
+        "steps": [{"id": 1, "description": "view the sampled images",
+                   "artifact": "", "verification": {"type": "none"}}]})
+    _Engine.script = [("current_datetime", {}), ("current_datetime", {}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "look at images",
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    driving = [str(m.get("content", "")) for m in
+               sessions.load(r["session_id"])["messages"]
+               if m.get("role") == "user"]
+    notes = [d for d in driving if "### NOTES" in d]
+    assert notes, "step-matched memory should be recalled into the driving line"
+    assert "view_sample" in notes[0]
+    # once per STEP, not per turn — per-turn injection caused the narration loop
+    assert len(notes) == 1, f"injected {len(notes)} times for one step"
