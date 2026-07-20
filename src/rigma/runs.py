@@ -251,6 +251,25 @@ def append_action(run_id: str, tool: str, args, ok: bool) -> None:
         f.write(json.dumps(rec) + "\n")
 
 
+def read_actions(run_id: str) -> list:
+    """The action trace, for post-mortem mining. A missing or partly-written
+    file yields what it can — this feeds memory, which is never load-bearing."""
+    out = []
+    try:
+        text = (run_dir(run_id) / "actions.jsonl").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 # --- budget ------------------------------------------------------------------
 
 def budget_exceeded(run: dict) -> str:

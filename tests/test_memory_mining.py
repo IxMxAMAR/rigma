@@ -200,3 +200,75 @@ def test_verified_outrank_drafts(tmp_path):
               "seen_count": 1, "outcome_score": 5}
     block = render_pitfall_block([drafted, proven])
     assert block.index("proven rule") < block.index("hunch")
+
+
+# ---- distillation ----
+
+from rigma.memory import distil, harvest_run   # noqa: E402
+
+
+def test_distil_asks_for_a_generalised_rule():
+    seen = {}
+
+    def fake(prompt):
+        seen["prompt"] = prompt
+        return "Never type filenames; pass files by reference with view_sample."
+
+    ev = mine_events([_a("view_images", {"p": r"D:\x\a_00428_.png"}, ok=False),
+                      _a("view_sample", {}, ok=True)])[0]
+    rule = distil(ev, fake)
+    assert rule.startswith("Never type filenames")
+    assert "NEVER mention specific filenames" in seen["prompt"]
+    assert "a_00428_" in seen["prompt"], "the distiller needs the evidence"
+
+
+def test_distiller_failure_is_silent():
+    # memory is never load-bearing
+    def boom(prompt):
+        raise RuntimeError("engine down")
+
+    ev = {"kind": "loop", "tool": "x", "args": "{}", "count": 2}
+    assert distil(ev, boom) == ""
+
+
+def test_harvest_drops_rules_that_leak_a_path(tmp_path):
+    # the distiller runs on a quantised local model and WILL sometimes echo the
+    # path back. The guard is the backstop, and a dropped rule beats a stored
+    # trace that teaches the failure.
+    store = MemoryStore(tmp_path / "m.jsonl")
+    actions = [_a("view_images", {"p": r"D:\x\a.png"}, ok=False),
+               _a("view_sample", {}, ok=True)]
+    written = harvest_run(actions, store, lambda p: r"Do not open D:\x\a.png")
+    assert written == []
+    assert store.all() == []
+
+
+def test_harvest_stores_a_clean_rule(tmp_path):
+    store = MemoryStore(tmp_path / "m.jsonl")
+    actions = [_a("view_images", {"p": r"D:\x\a.png"}, ok=False),
+               _a("view_sample", {}, ok=True)]
+    written = harvest_run(actions, store, lambda p: "Never retype filenames.")
+    assert len(written) == 1
+    assert store.all()[0]["text"] == "Never retype filenames."
+
+
+def test_harvest_is_bounded(tmp_path):
+    # a badly broken run emits dozens of events; one rule each would swamp the
+    # store with near-duplicates
+    store = MemoryStore(tmp_path / "m.jsonl")
+    actions = []
+    for i in range(20):
+        actions += [_a("view_images", {"p": i}, ok=False), _a("view_sample", {})]
+    n = [0]
+
+    def fake(p):
+        n[0] += 1
+        return f"Rule number {n[0]}."
+
+    harvest_run(actions, store, fake, max_rules=3)
+    assert len(store.all()) <= 3
+
+
+def test_harvest_never_raises_on_a_broken_trace(tmp_path):
+    store = MemoryStore(tmp_path / "m.jsonl")
+    assert harvest_run([{"garbage": True}], store, lambda p: "x") == []
