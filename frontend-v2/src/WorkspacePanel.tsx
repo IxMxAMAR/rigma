@@ -62,12 +62,13 @@ export default function WorkspacePanel() {
   return (
     <div className="px-2 pt-3 border-t border-white/5 mx-2 min-h-0 flex flex-col">
       <div className="flex items-center gap-1.5 px-2 pb-0.5">
-        <span className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em] flex-1">
-          workspace
-        </span>
-        <button onClick={() => { setDraft(data?.path ?? ""); setEditing(!editing); }}
-                aria-label="Set workspace folder" title="change folder"
-                className="text-muted hover:text-secondary text-[11px]">✎</button>
+        <button
+          onClick={() => { setDraft(data?.path ?? ""); setEditing(!editing); }}
+          aria-label="Set workspace folder" title="click to change folder"
+          className="font-mono text-[10.5px] text-muted hover:text-secondary uppercase tracking-[0.08em] flex-1 text-left"
+        >
+          workspace ✎
+        </button>
         {data?.path && (
           <>
             <button
