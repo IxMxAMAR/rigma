@@ -159,7 +159,22 @@ def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
         if sp.is_healthy():
             return sp
         time.sleep(0.5)
+    code = proc.poll()
     sp.stop()
     tail = "".join(log_path.read_text(encoding="utf-8",
                                       errors="replace").splitlines(True)[-40:])
+    # A hard crash right after "initializing" means the ENGINE could not build a
+    # context for this model — the model/build are incompatible. Saying "failed
+    # to become healthy" sends people hunting for VRAM and context settings that
+    # have nothing to do with it (verified 2026-07-20: one gguf crashed
+    # identically at ctx 512, ctx 16384, ngl 0, ngl 99, with and without mmproj,
+    # and on the CPU build, while other models loaded fine on the same engine).
+    if code is not None and code != 0 and "initializing" in tail:
+        raise RuntimeError(
+            f"llama-server crashed while initialising this model (exit "
+            f"{code & 0xFFFFFFFF:#010x}).\nThe engine loaded the weights but "
+            "could not create a context, which means THIS MODEL is not "
+            "supported by the current engine build — it is not a VRAM or "
+            "context-size problem. Try a different quant/repo of the model, or "
+            f"a newer engine build.\n{tail}")
     raise RuntimeError(f"llama-server failed to become healthy on :{port}\n{tail}")
