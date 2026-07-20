@@ -7,3 +7,4 @@ dist/
 .ruff_cache/
 dist/
 tools/ui-smoke/pwenv/
+frontend-v2/node_modules/
