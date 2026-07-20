@@ -226,13 +226,29 @@ function makeToolBox() {
   box.className = "tool-trace";
   return box;
 }
+// what a chip SHOWS: the identifying argument, never the payload. Dumping
+// Object.values() put write_file's whole content into the label — the user's
+// own prose crammed after the filename (owner report 2026-07-21). The path IS
+// the identity; the payload is summarised as a size.
+const CHIP_KEY = ["path", "paths", "pattern", "question", "query", "cmd",
+                  "code", "task", "id", "action"];
+function chipPreview(name, args) {
+  if (!args || !Object.keys(args).length) return "";
+  const size = typeof args.content === "string"
+    ? " · " + args.content.length + " chars" : "";
+  for (const k of CHIP_KEY) {
+    if (args[k] === undefined) continue;
+    const v = Array.isArray(args[k]) ? args[k].join(", ") : String(args[k]);
+    return " " + v.slice(0, 60) + (v.length > 60 ? "…" : "") + size;
+  }
+  return " " + Object.keys(args).join(", ").slice(0, 60) + size;
+}
+
 function addToolChip(box, name, args) {
   const row = document.createElement("details");
   row.className = "tool-chip running";
   const sum = document.createElement("summary");
-  const a = args && Object.keys(args).length
-    ? " " + Object.values(args).map((v) => String(v)).join(", ").slice(0, 60)
-    : "";
+  const a = chipPreview(name, args);
   sum.innerHTML = '<span class="tc-spin">⟳</span> <b>' + name + "</b>"
     + '<span class="tc-arg">' + escapeHtml(a) + "</span>";
   const out = document.createElement("div");
@@ -291,8 +307,8 @@ function addActions(el, m, idx, isLast) {
   }
   if (m.role === "assistant" && isLast) {
     row.appendChild(actionBtn("regenerate", regenerate));
-    if (!(current && current.use_rag))
-      row.appendChild(actionBtn("continue", continueTurn));
+    // grounded chats are real conversations now — continue works everywhere
+    row.appendChild(actionBtn("continue", continueTurn));
   }
   log.appendChild(row);
 }
@@ -480,17 +496,25 @@ function chatTurn(message, opts) {
       "thinking… " + Math.round((performance.now() - t0) / 1000) + "s";
   }, 1000);
   let thinkEl = null, thinkText = "";
-  let toolBox = null, lastTool = null;
+  // FIFO of unresolved chips, NOT a single lastTool: with parallel calls the
+  // events arrive chip A, chip B, result A, result B — and a lastTool pointer
+  // hung A's result on B's row (instant green check with the wrong content)
+  // while A spun forever. The server yields results strictly in call order,
+  // so first-unresolved-chip is always the right match. (Owner caught this
+  // live 2026-07-21 with two read_file calls.)
+  let toolBox = null;
+  const pendingChips = [];
   const payload = Object.assign({message}, opts || {});
   turn = streamTurn(current.id, payload, {
     tool(d) {
       if (!toolBox) { toolBox = makeToolBox(); bot.insertBefore(toolBox, body); }
       const p = body.querySelector(".pending"); if (p) p.remove();
-      lastTool = addToolChip(toolBox, d.name, d.args);
+      pendingChips.push(addToolChip(toolBox, d.name, d.args));
       log.scrollTop = log.scrollHeight;
     },
     toolResult(d) {
-      if (lastTool) setToolResult(lastTool, d.result);
+      const chip = pendingChips.shift();
+      if (chip) setToolResult(chip, d.result);
       log.scrollTop = log.scrollHeight;
     },
     think(d) {
@@ -724,7 +748,11 @@ for (const id of ["sys-edit", "notes-edit"]) {
   });
 }
 
-/* ---------- RAG toggle + docs panel (rail) ---------- */
+/* ---------- Grounded chat panel (rail) ----------
+   Not a separate pipeline any more: grounding keeps the NORMAL conversation
+   and lets the model call search_my_documents mid-chat. This panel is the
+   control surface: the switch grounds the current chat, folders are the
+   index, the status line is sidecar telemetry. */
 $("use-rag").addEventListener("change", async (e) => {
   if (!current) { e.target.checked = false; return; }
   current = await api("POST", "/api/sessions/" + current.id,
@@ -742,14 +770,33 @@ async function refreshDocs() {
   ul.innerHTML = "";
   for (const src of s.sources) {
     const li = document.createElement("li");
-    li.textContent = src;
     li.title = src;
+    const base = document.createElement("span");
+    base.className = "src-base";
+    base.textContent = src.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || src;
+    const path = document.createElement("span");
+    path.className = "src-path";
+    path.textContent = src;
+    const rm = document.createElement("button");
+    rm.className = "src-rm";
+    rm.type = "button";
+    rm.textContent = "×";
+    rm.setAttribute("aria-label", "Stop indexing " + src);
+    rm.onclick = async () => {
+      try { await api("DELETE", "/api/rag/sources", {path: src}); } catch {}
+      refreshDocs();
+    };
+    li.append(base, path, rm);
     ul.appendChild(li);
   }
-  $("docs-status").textContent = s.indexing ? "indexing…"
-    : s.error ? "index failed: " + s.error
-    : s.running ? "sidecar running"
-    : s.sources.length ? "sidecar starts on first grounded message" : "";
+  const st = $("docs-status");
+  const n = s.sources.length;
+  st.className = s.error ? "err" : s.running ? "live" : "";
+  st.textContent = s.indexing ? "● indexing…"
+    : s.error ? "▲ index failed: " + s.error
+    : s.running ? `● ready · ${n} folder${n === 1 ? "" : "s"}`
+    : n ? "○ starts with your first grounded message"
+    : "no folders indexed yet";
   clearTimeout(docsTimer);
   if (s.indexing) docsTimer = setTimeout(refreshDocs, 2000);
 }
