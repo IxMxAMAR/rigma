@@ -177,7 +177,7 @@ function SamplingCard() {
         {label}
         {showMax && (
           <span className="block font-mono text-[10px] text-muted">
-            max {max.toLocaleString()}
+            reply cap · max {max.toLocaleString()}
           </span>
         )}
       </span>
@@ -251,6 +251,17 @@ function SamplingCard() {
       {num("dry_multiplier", "DRY", 0.05, 2)}
       {num("repeat_penalty", "repeat pen.", 0.01, 2)}
       {num("max_tokens", "max tokens", 1024, maxTok, true)}
+      <p className="text-[10.5px] text-muted leading-snug">
+        max tokens caps one reply. The context window (the “of{" "}
+        {Math.round(maxTok / 1024)}K” bar) is set on the{" "}
+        <button
+          className="text-amber hover:underline"
+          onClick={() => useApp.getState().setSurface("engine")}
+        >
+          Engine page
+        </button>{" "}
+        and needs a model relaunch.
+      </p>
       {dirty && (
         <button
           onClick={() => void save()}
