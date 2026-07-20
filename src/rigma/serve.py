@@ -62,7 +62,13 @@ AUTO_COMPACT_FRACTION = 0.92
 # just bound a loop — 8192 truncated legitimate output mid-sentence. DRY is what
 # breaks repetition loops; this is only a runaway backstop.
 RUN_PARAMS = {"dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2,
-              "repeat_penalty": 1.05, "max_tokens": 20000}
+              "repeat_penalty": 1.05, "max_tokens": 20000,
+              # low temperature in agent mode: at the default ~0.8 an IQ-quant
+              # model's tool-call SYNTAX drifts nondeterministically and the
+              # engine's strict parser misses it (live 2026-07-20 — the same
+              # request parsed clean on replay). Creativity lives in the
+              # mission content; the call syntax must be boring.
+              "temperature": 0.3}
 DRAFT_MIN_CHARS = 400   # prose this long in a run is WORK — never discard it
 MAX_COMPLETION_CHALLENGES = 2   # refuse a premature task_complete at most
                                 # twice, so a bad plan can't trap the run
@@ -966,6 +972,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 for task, _ in started.values():
                     task.cancel()              # don't leak eager tool tasks
                 break
+            if use_tools and not calls and not last and rtext:
+                # RESCUE: the engine's tool-call parser is nondeterministically
+                # strict — live 2026-07-20, the same request that parsed clean
+                # on replay yielded the whole call as raw text in the run, and
+                # every miss wasted a full turn until the watchdog stalled the
+                # run. If the reply contains an unmistakable call shape, parse
+                # it ourselves rather than treating the turn as prose.
+                r_name, r_args = toolkit.rescue_xml_tool_call(rtext)
+                if r_name and r_name in {s["function"]["name"] for s in specs}:
+                    yield _sse({"note": f"rescued {r_name} from raw text"},
+                               event="think")
+                    calls = {0: {"id": "rescued-0", "name": r_name,
+                                 "args": json.dumps(r_args)}}
+                    rtext = ""          # the text WAS the call; don't keep both
             if use_tools and calls and not last:   # the model asked for tools
                 if one_action and len(calls) > 1:
                     # ONE action per turn: a model may emit several parallel
