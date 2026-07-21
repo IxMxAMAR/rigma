@@ -97,3 +97,41 @@ describe("sse parser", () => {
     expect(evs).toHaveLength(1);
   });
 });
+
+describe("macro turns", () => {
+  it("folds macro_step into the turn", () => {
+    const t = applyEvent(emptyTurn(), {
+      event: "macro_step",
+      data: { index: 0, total: 3, kind: "tool", label: "Finish chapter" },
+    });
+    expect(t.macro).toEqual({ label: "Finish chapter", index: 0, total: 3 });
+  });
+
+  it("keeps chips while stepping, and tracks the current step", () => {
+    let t = applyEvent(emptyTurn(), {
+      event: "macro_step",
+      data: { index: 0, total: 2, kind: "tool", label: "M" },
+    });
+    t = applyEvent(t, { event: "tool", data: { id: "m0", name: "read_file" } });
+    t = applyEvent(t, {
+      event: "macro_step",
+      data: { index: 1, total: 2, kind: "prompt", label: "M" },
+    });
+    expect(t.macro?.index).toBe(1);
+    expect(t.chips).toHaveLength(1);
+  });
+
+  it("clears the macro banner when the macro is done", () => {
+    let t = applyEvent(emptyTurn(), {
+      event: "macro_step",
+      data: { index: 0, total: 1, kind: "note", label: "M" },
+    });
+    t = applyEvent(t, { event: "macro_done", data: { steps: 1 } });
+    expect(t.macro).toBeNull();
+  });
+
+  it("a plain chat turn never grows a macro banner", () => {
+    const t = feed(emptyTurn(), [["message", { delta: "hi" }]]);
+    expect(t.macro).toBeNull();
+  });
+});

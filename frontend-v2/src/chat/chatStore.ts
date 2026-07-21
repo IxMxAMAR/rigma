@@ -5,6 +5,7 @@
 // the fallback for id-less legacy events.
 import { create } from "zustand";
 import { api, type ChatMessage, type SessionSummary } from "../lib/api";
+import { runMacroStream } from "../lib/methods";
 import { streamChat, type SseEvent } from "../lib/sse";
 
 export interface Chip {
@@ -21,6 +22,8 @@ export interface StreamingTurn {
   chips: Chip[];
   citations: unknown[];
   error: string | null;
+  /** set while a macro drives this turn, so the UI can say which step */
+  macro: { label: string; index: number; total: number } | null;
 }
 
 export const emptyTurn = (): StreamingTurn => ({
@@ -29,6 +32,7 @@ export const emptyTurn = (): StreamingTurn => ({
   chips: [],
   citations: [],
   error: null,
+  macro: null,
 });
 
 /** Pure: fold one SSE event into the streaming turn. Returns a NEW object —
@@ -61,6 +65,19 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
       });
       return { ...turn, chips };
     }
+    // A macro's steps ride the SAME reducer as a chat turn, so its tool calls
+    // render as the ordinary chips — one rendering path, not two.
+    case "macro_step":
+      return {
+        ...turn,
+        macro: {
+          label: String(d.label ?? ""),
+          index: Number(d.index ?? 0),
+          total: Number(d.total ?? 0),
+        },
+      };
+    case "macro_done":
+      return { ...turn, macro: null };
     case "citations":
       return { ...turn, citations: (d.citations as unknown[]) ?? [] };
     case "error":
@@ -89,6 +106,8 @@ interface ChatState {
   deleteChat: (id: string) => Promise<void>;
   duplicateChat: (id: string) => Promise<void>;
   send: (message: string | null, opts?: Record<string, unknown>) => Promise<void>;
+  runMacro: (macroId: string, confirm?: "run" | "always",
+             answers?: Record<string, string>) => Promise<void>;
   regenerate: () => Promise<void>;
   continueTurn: () => Promise<void>;
   flipVariant: (dir: 1 | -1) => Promise<void>;
@@ -144,6 +163,50 @@ export const useChat = create<ChatState>((set, get) => ({
     const s = await api.createSession();
     set({ currentId: s.id, messages: [], streaming: null });
     await get().loadSessions();
+  },
+
+  runMacro: async (macroId, confirm, answers) => {
+    const { currentId, streaming } = get();
+    if (!currentId || streaming) return;   // one turn at a time, macro or not
+    const ctl = new AbortController();
+    set({ streaming: emptyTurn(), abort: ctl });
+    let spawned: string | null = null;
+    try {
+      await runMacroStream(
+        currentId,
+        { macro_id: macroId, confirm, answers },
+        (ev) => {
+          if (ev.event === "macro_done") {
+            const nid = (ev.data as { new_session_id?: string })
+              ?.new_session_id;
+            if (nid) spawned = nid;
+          }
+          set((st) => ({
+            streaming: st.streaming ? applyEvent(st.streaming, ev) : null,
+          }));
+        },
+        ctl.signal,
+      );
+    } catch (e) {
+      if ((e as Error).name !== "AbortError")
+        set((st) => ({
+          streaming: st.streaming
+            ? { ...st.streaming, error: (e as Error).message }
+            : null,
+        }));
+    }
+    // the macro wrote real messages server-side; reload so they replace the
+    // streamed preview rather than double-rendering
+    try {
+      const s = await api.getSession(currentId);
+      set({ messages: s.messages });
+    } catch { /* keep what is on screen */ }
+    set({ streaming: null, abort: null });
+    // a new_chat step spawned the next chapter: follow it
+    if (spawned) {
+      await get().loadSessions();
+      await get().open(spawned);
+    }
   },
 
   send: async (message, opts) => {
