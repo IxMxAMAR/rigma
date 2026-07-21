@@ -146,3 +146,73 @@ def test_method_apply_endpoint_still_works(client):
     assert got["method"] == "coding" and "engineer" in got["system_prompt"]
     assert client.post(f"/api/sessions/{sid}/method",
                        json={"id": "nope"}).status_code == 404
+
+
+def test_events_arrive_before_the_macro_finishes(client, monkeypatch):
+    """Plan 1 buffered every event to the end. A macro whose first step is
+    slow must still show its first step immediately.
+
+    This drives the endpoint's async generator DIRECTLY rather than through
+    TestClient. Measured 2026-07-21: both starlette's TestClient and
+    httpx.ASGITransport buffer a StreamingResponse whole -- a generator that
+    yields instantly and then sleeps 3s reports its FIRST chunk after 3.02s
+    through either. So a request-level timing test cannot observe streaming
+    at all, and would pass just as happily against the buffered version.
+    """
+    import asyncio
+    import threading
+    import time
+    BLOCK = 20.0
+    released = threading.Event()
+
+    def slow(name, args, ctx):
+        released.wait(timeout=BLOCK)
+        return "done"
+    monkeypatch.setattr("rigma.tools.cached_run", slow)
+    client.post("/api/methods", json={
+        "id": "slowm", "name": "Slow", "tagline": "t",
+        "apply": {"system_prompt": "p", "params": {}, "effort": "auto",
+                  "use_tools": True, "allow_code": False,
+                  "notes_template": ""},
+        "macros": [{"id": "two", "label": "Two", "steps": [
+            {"kind": "tool", "name": "read_file", "args": {"path": "a"}},
+            {"kind": "tool", "name": "read_file", "args": {"path": "b"}}]}]})
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}/method", json={"id": "slowm"})
+    # ONE pass over the stream (httpx forbids a second): note whether the
+    # first step announced itself BEFORE the tool was allowed to return.
+    # reach the route's own coroutine, so nothing between us can buffer
+    app = client.app
+    ep = next(r.endpoint for r in app.routes
+              if getattr(r, "path", "") == "/api/sessions/{sid}/macro"
+              and "POST" in getattr(r, "methods", set()))
+
+    async def drain():
+        resp = await ep(sid, {"macro_id": "two", "confirm": "run"})
+        chunks, first_at = [], None
+        t0 = time.monotonic()
+        async for chunk in resp.body_iterator:
+            chunks.append(chunk if isinstance(chunk, bytes)
+                          else str(chunk).encode())
+            if first_at is None:
+                first_at = time.monotonic() - t0
+            if b"macro_step" in b"".join(chunks):
+                released.set()          # only now let step 1's tool return
+        return b"".join(chunks), first_at
+
+    body, first_at = asyncio.run(drain())
+    assert b"macro_done" in body
+    assert first_at is not None and first_at < BLOCK / 2, (
+        f"first event took {first_at:.1f}s — it was buffered until the "
+        "macro had finished")
+
+
+def test_a_client_disconnect_does_not_wedge_the_server(client, monkeypatch):
+    monkeypatch.setattr("rigma.tools.cached_run", lambda n, a, c: "ok")
+    client.post("/api/methods", json=_doc())
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}/method", json={"id": "mine"})
+    with client.stream("POST", f"/api/sessions/{sid}/macro",
+                       json={"macro_id": "peek"}) as r:
+        assert r.status_code == 200
+    assert client.get("/api/methods").status_code == 200
