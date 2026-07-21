@@ -90,12 +90,15 @@ def register(app, *, sse, drive_turn, aux_complete, tool_ctx_for) -> None:
         steps = macro.get("steps") or []
         ctx = macros.build_context(s, m, answers=body.get("answers"),
                                    selection=str(body.get("selection") or ""))
-        effectful = macros.is_effectful(steps)
+        # allow_code decides whether a plain `prompt` step can reach a write
+        # tool at all -- see macros.is_effectful
+        code = bool(s.get("allow_code"))
+        effectful = macros.is_effectful(steps, allow_code=code)
         trusted = macros.is_trusted(m["id"], macro["id"])
         return {"macro_id": macro["id"], "label": macro.get("label", ""),
                 "effectful": effectful, "trusted": trusted,
                 "needs_confirm": effectful and not trusted,
-                "preview": macros.preview_line(macro, ctx),
+                "preview": macros.preview_line(macro, ctx, allow_code=code),
                 "asks": macros.asks(steps)}
 
     @app.post("/api/sessions/{sid}/macro")
@@ -107,14 +110,15 @@ def register(app, *, sse, drive_turn, aux_complete, tool_ctx_for) -> None:
         s, m, macro = got
         steps = macro.get("steps") or []
         confirm = str(body.get("confirm") or "")
-        if (macros.is_effectful(steps)
+        code = bool(s.get("allow_code"))
+        if (macros.is_effectful(steps, allow_code=code)
                 and not macros.is_trusted(m["id"], macro["id"])
                 and confirm not in ("run", "always")):
             return JSONResponse(
                 {"error": "this macro changes things -- POST again with "
                           "confirm: 'run' or 'always'",
                  "preview": macros.preview_line(
-                     macro, macros.build_context(s, m))},
+                     macro, macros.build_context(s, m), allow_code=code)},
                 status_code=403)
         if confirm == "always":
             macros.trust(m["id"], macro["id"])

@@ -93,10 +93,29 @@ def test_asks_lists_labels_in_order_without_duplicates():
 
 def test_read_only_steps_are_not_effectful():
     steps = [{"kind": "tool", "name": "read_file", "args": {"path": "x"}},
-             {"kind": "prompt", "text": "hi"},
+             {"kind": "prompt", "to": "aux", "text": "hi"},
              {"kind": "note", "op": "append", "text": "n"},
              {"kind": "settings", "set": {"effort": "on"}}]
     assert macros.is_effectful(steps) is False
+
+
+def test_a_chat_prompt_is_effectful_because_the_model_can_reach_tools():
+    """A macro made only of prompts is NOT read-only: the turn it drives can
+    call write_file on the model's own initiative."""
+    steps = [{"kind": "prompt", "text": "tidy up my folder"}]
+    assert macros.is_effectful(steps) is True
+
+
+def test_a_chat_prompt_is_safe_when_the_session_cannot_run_code():
+    """Every write/exec tool is registered needs="code", so with allow_code
+    off the turn is never offered one (this is the roleplay posture)."""
+    steps = [{"kind": "prompt", "text": "advance the scene"}]
+    assert macros.is_effectful(steps, allow_code=False) is False
+
+
+def test_an_aux_prompt_is_always_safe():
+    steps = [{"kind": "prompt", "to": "aux", "text": "recap"}]
+    assert macros.is_effectful(steps, allow_code=True) is False
 
 
 def test_a_write_tool_makes_a_macro_effectful():

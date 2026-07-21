@@ -52,6 +52,50 @@ METHODS: list[dict] = [
             "Long installs/builds: it can use start_job and keep working",
             "Keep the brief in Notes current — it survives compaction",
         ],
+        "rules": [
+            {"id": "verify_first", "kind": "standing",
+             "text": "Prove a change works with a tool before calling it "
+                     "done."}],
+        "macros": [
+            {"id": "run_tests", "label": "Run tests",
+             "hint": "run the project's test command and report",
+             "steps": [{"kind": "prompt",
+                        "text": "Run this project's test suite with a tool "
+                                "and report the result. Do not guess the "
+                                "command — look for it first."}]},
+            {"id": "explain_file", "label": "Explain this file",
+             "hint": "read a file and summarise what it does",
+             "steps": [
+                 {"kind": "tool", "name": "read_file",
+                  "args": {"path": "{{ask:Which file}}"}},
+                 {"kind": "prompt", "to": "aux",
+                  "text": "Explain in 5 sentences what this file does and "
+                          "what depends on it:\n\n{{step:0}}"}]},
+            {"id": "write_plan", "label": "Write PLAN file",
+             "hint": "capture the current plan on disk",
+             "steps": [{"kind": "prompt",
+                        "text": "Write the current plan to PLAN.md with "
+                                "write_file: goal, steps, and what is done "
+                                "so far. Keep it under 40 lines."}]},
+            {"id": "review_diff", "label": "Review my diff",
+             "hint": "read the working diff and critique it",
+             "steps": [{"kind": "prompt",
+                        "text": "Show the working diff with a tool, then "
+                                "review it for bugs and missed cases. Be "
+                                "specific about file and line."}]}],
+        "workflows": [
+            {"id": "feature", "label": "Feature: plan, build, test, log",
+             "resumable": True,
+             "steps": [
+                 {"kind": "prompt",
+                  "text": "Write a short plan for: {{ask:What feature}}. "
+                          "Save it to PLAN.md."},
+                 {"kind": "prompt",
+                  "text": "Implement the first unchecked step of PLAN.md."},
+                 {"kind": "prompt",
+                  "text": "Run the tests and fix what fails."},
+                 {"kind": "prompt",
+                  "text": "Mark the finished step done in PLAN.md."}]}],
     },
     {
         "id": "book",
@@ -90,11 +134,73 @@ METHODS: list[dict] = [
             "Done with a chapter? Hit 'Finish chapter' below — the bible "
             "updates itself and a fresh chat opens for the next one",
         ],
-        # the ritual is what makes this a METHOD, not a preset: the workflow
-        # move itself is a button (owner critique 2026-07-21: "this is
-        # simply a system preset")
-        "ritual": {"kind": "book_next_chapter",
-                   "label": "Finish chapter — update bible, start next"},
+        # the components are what make this a METHOD, not a preset: the
+        # workflow moves themselves are buttons (owner critique 2026-07-21:
+        # "this is simply a system preset"). `finish_chapter` is the old
+        # hardcoded book_next_chapter ritual, now an ordinary step list.
+        "vars": {
+            "bible": {"label": "Story bible file", "default": "story_bible.md",
+                      "kind": "path"}},
+        "rules": [
+            {"id": "bible_is_law", "kind": "standing",
+             "text": "The story bible in the notes is authoritative for cast, "
+                     "world, voice and what has happened."},
+            {"id": "chapter_written", "kind": "trigger",
+             "on": {"event": "tool_ran", "tool": "write_file",
+                    "path_glob": "chapters/*"},
+             "do": {"mode": "nudge",
+                    "text": "A chapter file just changed — update the "
+                            "bible's STORY SO FAR."}}],
+        "macros": [
+            {"id": "finish_chapter", "label": "Finish chapter",
+             "hint": "summarise into the bible, then open the next chapter",
+             "steps": [
+                 {"kind": "prompt", "to": "aux",
+                  "text": "A chapter of a novel was just finished in the "
+                          "excerpts below. Write 2-3 short sentences for the "
+                          "story bible's STORY SO FAR: what HAPPENED (events "
+                          "and changes only, no praise, no analysis). Reply "
+                          "with the sentences only.\n\n{{transcript}}"},
+                 {"kind": "note", "op": "append", "text": "- {{step:0}}"},
+                 {"kind": "new_chat", "title": "{{title_next}}",
+                  "carry": ["notes", "method", "workspace", "params",
+                            "use_rag"]}]},
+            {"id": "recap_so_far", "label": "Recap so far",
+             "hint": "a private recap that does not enter the chat",
+             "steps": [{"kind": "prompt", "to": "aux",
+                        "text": "Recap what has happened in these excerpts "
+                                "in 5 bullet points:\n\n{{transcript}}"}]},
+            {"id": "continue_drafting", "label": "Continue drafting",
+             "hint": "keep writing from where the prose stopped",
+             "steps": [{"kind": "prompt",
+                        "text": "Continue the chapter from where it stopped. "
+                                "Append to the chapter file rather than "
+                                "re-emitting what is already written."}]},
+            {"id": "check_continuity", "label": "Check continuity",
+             "hint": "read the bible and flag contradictions",
+             "steps": [
+                 {"kind": "tool", "name": "read_file",
+                  "args": {"path": "{{bible}}"}},
+                 {"kind": "prompt",
+                  "text": "Check the recent prose against this bible and "
+                          "list any contradictions in cast, world or "
+                          "timeline. If there are none, say so.\n\n"
+                          "{{step:0}}"}]}],
+        "workflows": [
+            {"id": "new_chapter", "label": "New chapter", "resumable": True,
+             "steps": [
+                 {"kind": "prompt",
+                  "text": "Outline the next chapter in 5 beats, using the "
+                          "bible in the notes."},
+                 {"kind": "prompt",
+                  "text": "Draft beat one as prose and append it to the "
+                          "chapter file."},
+                 {"kind": "prompt",
+                  "text": "Draft the remaining beats, appending as you go."},
+                 {"kind": "prompt", "to": "aux",
+                  "text": "Summarise this chapter in 2-3 sentences for STORY "
+                          "SO FAR:\n\n{{transcript}}"},
+                 {"kind": "note", "op": "append", "text": "- {{step:3}}"}]}],
     },
     {
         "id": "roleplay",
@@ -128,6 +234,35 @@ METHODS: list[dict] = [
             "A real request mid-scene (save this, remember that) still "
             "gets done — the fiction never cancels tools",
         ],
+        "rules": [
+            {"id": "never_puppet", "kind": "standing",
+             "text": "Never speak or act for the user's character."}],
+        "macros": [
+            {"id": "advance_scene", "label": "Advance the scene",
+             "hint": "move time forward",
+             "steps": [{"kind": "prompt",
+                        "text": "Advance the scene. Something changes; do "
+                                "not summarise what already happened."}]},
+            {"id": "describe_surroundings", "label": "Describe surroundings",
+             "hint": "sensory detail, in character",
+             "steps": [{"kind": "prompt",
+                        "text": "Describe the surroundings in sensory "
+                                "detail, staying in character."}]},
+            {"id": "ooc_note", "label": "OOC note",
+             "hint": "step out of character with thinking on",
+             "steps": [
+                 {"kind": "settings", "set": {"effort": "on"}},
+                 {"kind": "prompt",
+                  "text": "Out of character for one message: "
+                          "{{ask:What do you want to say}}"}]},
+            {"id": "save_to_notes", "label": "Save this to notes",
+             "hint": "pin what just happened",
+             "steps": [
+                 {"kind": "prompt", "to": "aux",
+                  "text": "In one line, what changed in the scenario in "
+                          "these excerpts?\n\n{{transcript}}"},
+                 {"kind": "note", "op": "append", "text": "- {{step:0}}"}]}],
+        "workflows": [],
     },
     {
         "id": "research",
@@ -154,6 +289,38 @@ METHODS: list[dict] = [
             "Grounded chat + an indexed folder = it cites YOUR documents",
             "Big side-questions: it can delegate them to a helper",
         ],
+        "rules": [
+            {"id": "say_vs_infer", "kind": "standing",
+             "text": "Separate what the sources say from what you infer."}],
+        "macros": [
+            {"id": "find_sources", "label": "Find sources",
+             "hint": "search the web for the question in notes",
+             "steps": [{"kind": "prompt",
+                        "text": "Search the web for the research question in "
+                                "the notes and list the best sources with "
+                                "one line each on why."}]},
+            {"id": "summarise_cited", "label": "Summarise with citations",
+             "hint": "answer so far, every claim sourced",
+             "steps": [{"kind": "prompt",
+                        "text": "Summarise what we know so far. Every claim "
+                                "carries the source it came from."}]},
+            {"id": "save_findings", "label": "Save findings",
+             "hint": "write findings to a file",
+             "steps": [{"kind": "prompt",
+                        "text": "Write the findings so far to findings.md "
+                                "with write_file, sources included."}]}],
+        "workflows": [
+            {"id": "research_question", "label": "Research a question",
+             "resumable": True,
+             "steps": [
+                 {"kind": "prompt",
+                  "text": "Search the web for: {{ask:What question}}"},
+                 {"kind": "prompt",
+                  "text": "Read the most promising sources with fetch_url "
+                          "and note what each actually claims."},
+                 {"kind": "prompt",
+                  "text": "Write findings.md: the answer, the evidence, and "
+                          "what is still uncertain."}]}],
     },
     {
         "id": "tutor",
@@ -178,6 +345,33 @@ METHODS: list[dict] = [
             "Ground the chat on your course materials for cited answers",
             "Ask for a quiz at the end of each session",
         ],
+        "rules": [
+            {"id": "ask_first", "kind": "standing",
+             "text": "Ask a checking question before revealing an answer."}],
+        "macros": [
+            {"id": "quiz_me", "label": "Quiz me",
+             "hint": "five questions on the current topic",
+             "steps": [{"kind": "prompt",
+                        "text": "Quiz me with 5 questions on what we have "
+                                "covered. Ask them all, then wait."}]},
+            {"id": "explain_simpler", "label": "Explain simpler",
+             "hint": "re-explain the last answer differently",
+             "steps": [{"kind": "prompt",
+                        "text": "Explain that again, differently and more "
+                                "simply. Do not repeat the same words."}]},
+            {"id": "worked_example", "label": "Worked example",
+             "hint": "one concrete example, step by step",
+             "steps": [{"kind": "prompt",
+                        "text": "Give one concrete worked example, step by "
+                                "step, with the reasoning shown."}]},
+            {"id": "track_progress", "label": "Track progress",
+             "hint": "append what was covered to the notes",
+             "steps": [
+                 {"kind": "prompt", "to": "aux",
+                  "text": "In one line, what did the student cover in these "
+                          "excerpts?\n\n{{transcript}}"},
+                 {"kind": "note", "op": "append", "text": "- {{step:0}}"}]}],
+        "workflows": [],
     },
     {
         "id": "organize",
@@ -205,6 +399,32 @@ METHODS: list[dict] = [
             "Big jobs (thousands of files): use Autonomous mode instead "
             "and it works unattended",
         ],
+        "rules": [
+            {"id": "propose_first", "kind": "standing",
+             "text": "Propose the plan before moving anything, and never "
+                     "delete."}],
+        "macros": [
+            {"id": "preview_plan", "label": "Preview plan",
+             "hint": "explore and propose, changing nothing",
+             "steps": [
+                 {"kind": "tool", "name": "list_directory",
+                  "args": {"path": "{{ask:Which folder}}"}},
+                 {"kind": "prompt",
+                  "text": "Propose how to organise this folder. Say what "
+                          "moves where. Change nothing yet.\n\n"
+                          "{{step:0}}"}]},
+            {"id": "execute_plan", "label": "Execute plan",
+             "hint": "carry out the proposed moves",
+             "steps": [{"kind": "prompt",
+                        "text": "Carry out the plan you just proposed using "
+                                "move_files by reference. Never retype "
+                                "paths."}]},
+            {"id": "undo_last", "label": "Undo last",
+             "hint": "reverse the most recent change",
+             "steps": [{"kind": "prompt",
+                        "text": "Undo the most recent change you made, using "
+                                "undo_last_change."}]}],
+        "workflows": [],
     },
 ]
 
