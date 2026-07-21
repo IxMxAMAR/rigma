@@ -1145,6 +1145,87 @@ def _flexible_find(text: str, old: str):
     return (starts[i], ends[i + len(nold) - 1])
 
 
+# fuzzy word-level matching thresholds. Live autopsy 2026-07-21: a failing
+# `old` had 93% of the file's words but ZERO normalised matches — the model
+# lightly REWRITES words while quoting (swaps a synonym, drops a filler).
+# String matching cannot heal word changes; bounded fuzzy matching can
+# (Aider ships the same for the same reason).
+_FUZZY_ACCEPT = 0.85     # similarity a region must reach to be edited
+_FUZZY_MARGIN = 0.04     # ...and beat the runner-up by, so we never guess
+
+
+def _fuzzy_region(text: str, old: str):
+    """Best word-level match for `old` in `text`, drift-tolerant.
+    Returns (span|None, ratio, region_span|None): `span` is set only when
+    the match clears _FUZZY_ACCEPT uniquely; `region_span` is the best
+    candidate either way (for the error message)."""
+    import difflib
+    ntext, starts, ends = _norm_map(text)
+    nold, _, _ = _norm_map(old.strip())
+    ow = nold.split()
+    if not (3 <= len(ow) <= 400):
+        return None, 0.0, None
+    fw = [(m.group(), m.start(), m.end())
+          for m in re.finditer(r"\S+", ntext)]
+    if len(fw) < 3:
+        return None, 0.0, None
+    cands = []
+    sm = difflib.SequenceMatcher(None, b=ow, autojunk=False)
+    for wlen in sorted({max(3, len(ow) - 2), len(ow),
+                        min(len(fw), len(ow) + 2)}):
+        if wlen > len(fw):
+            continue
+        for i in range(0, len(fw) - wlen + 1):
+            sm.set_seq1([w for w, _, _ in fw[i:i + wlen]])
+            # 0.5, not higher: below-threshold best candidates must still
+            # surface so the ERROR can show the region they belong to
+            if sm.quick_ratio() < 0.5:
+                continue
+            cands.append((sm.ratio(), i, wlen))
+    if not cands:
+        return None, 0.0, None
+    cands.sort(reverse=True)
+    r0, i0, l0 = cands[0]
+    span = (starts[fw[i0][1]], ends[fw[i0 + l0 - 1][2] - 1])
+    span = _extend_to_sentence(text, span, old)
+    runner = next((c for c in cands[1:] if abs(c[1] - i0) >= l0), None)
+    if r0 >= _FUZZY_ACCEPT and (runner is None
+                                or r0 - runner[0] >= _FUZZY_MARGIN):
+        return span, r0, span
+    return None, r0, span
+
+
+def _extend_to_sentence(text: str, span: tuple, old: str) -> tuple:
+    """If `old` claims to end at a sentence boundary, the matched span should
+    too — a word-window match can stop one word short ('…three years' vs
+    '…three years now.') and leave a dangling fragment after the edit."""
+    o = old.rstrip()
+    if not o or o[-1] not in ".!?”\"'":
+        return span
+    seg = text[span[0]:span[1]].rstrip()
+    if seg and seg[-1] in ".!?”\"'":
+        return span
+    j, limit = span[1], min(len(text), span[1] + 60)
+    while j < limit and text[j] != "\n":
+        j += 1
+        if text[j - 1] in ".!?":
+            while j < len(text) and text[j] in "”\"'":
+                j += 1
+            return (span[0], j)
+    return span
+
+
+def _region_lines(text: str, span: tuple, ratio: float) -> str:
+    lo_line = text[:span[0]].count("\n")
+    hi_line = text[:span[1]].count("\n")
+    lines = text.splitlines()
+    lo = max(0, lo_line - 1)
+    hi = min(len(lines), hi_line + 2, lo + 12)
+    excerpt = "\n".join(f"{j + 1}: {lines[j][:160]}" for j in range(lo, hi))
+    return (f"\nThe closest region ({int(ratio * 100)}% similar) is:\n"
+            + excerpt + "\nCopy the EXACT text from there into 'old'.")
+
+
 def _nearest_region(text: str, old: str) -> str:
     """The closest-matching few lines of the file, so the model can correct
     its 'old' text in ONE turn instead of burning a read_file round-trip."""
@@ -1217,10 +1298,23 @@ def _edit_file(args, ctx):
         return (f"error: the 'old' text wasn't found, and at {len(old)} "
                 "chars it is too big to match reliably — pick the SMALLEST "
                 "unique snippet around the change instead of a huge block")
+    # last resort: the model lightly REWRITES words while quoting (a synonym
+    # swapped, a filler dropped). Fuzzy word-level match, accepted only when
+    # decisively similar AND unique — never a guess between candidates.
+    span, ratio, region = _fuzzy_region(text, old)
+    if span is not None:
+        _snapshot_before_write(p)
+        p.write_text(text[:span[0]] + new + text[span[1]:], encoding="utf-8")
+        return (f"edited {args.get('path')} (note: your 'old' wording "
+                f"differed slightly from the file — matched the closest "
+                f"region at {int(ratio * 100)}% similarity and replaced the "
+                "FILE's actual text. undo_last_change reverts if this was "
+                "the wrong spot)")
     return ("error: the 'old' string wasn't found EXACTLY — check for "
             "mismatched indentation/whitespace or stray markdown backticks."
-            + (_nearest_region(text, old)
-               or "\nread_file first to copy the exact text"))
+            + (_region_lines(text, region, ratio) if region else
+               (_nearest_region(text, old)
+                or "\nread_file first to copy the exact text")))
 
 
 @tool("read_file",
