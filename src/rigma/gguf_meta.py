@@ -151,6 +151,11 @@ def inspect_gguf(src, fallback_name: str = "") -> GgufInfo:
         caps.append("tools")
     if "<think>" in template or "thinking" in template:
         caps.append("thinking")
+    # MTP heads preserved (verified live: the heretic APEX gguf carries
+    # qwen35moe.nextn_predict_layers=1, the plain unsloth quant has no such
+    # key) — enables the draft-mtp speculative-decoding calibration trial
+    if int(g("nextn_predict_layers", 0) or 0) > 0:
+        caps.append("mtp")
     fields = {"n_layers": n_layers, "full_attn_layers": full_attn,
               "kv_heads": kv_heads, "head_dim": head_dim,
               "native_ctx": int(g("context_length", 0)),

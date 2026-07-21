@@ -104,6 +104,7 @@ class ComboFlags(BaseModel):
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
     reasoning: str = ""   # ""(engine default) | on | off | auto
+    reasoning_budget: int = -1   # max thinking tokens/turn (-1 = unlimited)
     spec_type: str = "none"   # none | draft-mtp | ngram-simple | ... (engine list)
     spec_n_max: int = 3
     batch: int = 0        # -b logical batch (0 = engine default 2048)
@@ -169,12 +170,18 @@ class RunPlan(BaseModel):
     explain: list[str] = Field(default_factory=list)
 
     def server_args(self, model_path: str, port: int) -> list[str]:
-        # --parallel 1: Rigma serves one user. llama-server defaults to 4
-        # slots, each allocating a full ctx of KV cache — 4x the memory the
-        # resolver budgeted, which silently overflows VRAM into system RAM.
+        # --parallel 2 + --kv-unified: one slot for the user's conversation,
+        # one for Rigma's own aux calls (auto-title, compaction, delegate,
+        # memory harvest). With ONE slot every aux call evicted the main
+        # trajectory's prompt cache, forcing a full re-prefill of 20-60K
+        # tokens (~30-90s dead) before the next real turn — the single
+        # biggest hidden latency tax on agent runs (audit 2026-07-21).
+        # --kv-unified keeps ONE shared KV pool of size ctx, so the memory
+        # the resolver budgeted is unchanged (non-unified would allocate a
+        # full ctx PER SLOT — the 4x overflow the old --parallel 1 avoided).
         args = ["-m", model_path, "--port", str(port), "--host", "127.0.0.1",
                 "-ngl", str(self.flags.ngl), "-c", str(self.flags.ctx),
-                "--parallel", "1"]
+                "--parallel", "2", "--kv-unified"]
         if self.flags.n_cpu_moe > 0:
             args += ["--n-cpu-moe", str(self.flags.n_cpu_moe)]
         if self.flags.batch > 0:
@@ -186,9 +193,19 @@ class RunPlan(BaseModel):
                  "--cache-type-v", self.flags.cache_type_v]
         if self.flags.reasoning:
             args += ["--reasoning", self.flags.reasoning]
+        if self.flags.reasoning_budget >= 0:
+            args += ["--reasoning-budget", str(self.flags.reasoning_budget)]
         if self.flags.spec_type and self.flags.spec_type != "none":
             args += ["--spec-type", self.flags.spec_type,
                      "--spec-draft-n-max", str(self.flags.spec_n_max)]
-        # reuse unchanged KV prefixes on edit/regenerate/compact turns
+        # reuse unchanged KV prefixes on edit/regenerate/compact turns.
+        # (No effect on DeltaNet hybrids — KV shifting is unsupported there,
+        # llama.cpp #18497 — but harmless, and it still helps pure
+        # transformers.)
         args += ["--cache-reuse", "256"]
+        # hybrid/recurrent models can't rewind KV freely: any edit deep in
+        # history rolls back to the nearest checkpoint or reprocesses from
+        # scratch. Denser checkpoints (default spacing 8192) make observation
+        # masking and compaction edits cheap; harmless on pure transformers.
+        args += ["--checkpoint-min-step", "4096"]
         return args

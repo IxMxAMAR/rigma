@@ -225,7 +225,8 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
         moe=moe, mmproj=mm, license="see model card", use_cases=["general"],
         capabilities=caps, custom=True,
         sources=[f"{HF}/{repo}"])
-    return spec, rf
+    from .hangar import inherit_family_defaults
+    return inherit_family_defaults(spec), rf
 
 
 def inspect_repo(repo: str, registry=None, profile=None) -> dict:

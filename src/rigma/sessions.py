@@ -201,10 +201,31 @@ def build_messages(session: dict, default_prompt: str = "",
     # message with no text, and some chat templates (this Qwen3 build) 400 on
     # them — "Unable to generate parser for this template". They carry no
     # information for the model either way.
-    msgs = [{"role": m.get("role", "user"), "content": m.get("content", "")}
-            for m in session.get("messages", [])
-            if not (m.get("role") == "assistant"
-                    and not str(m.get("content") or "").strip())]
+    # Autonomous runs CARRY recent reasoning back in (reasoning_content):
+    # Qwen3.6's agent guidance — with preserve_thinking the model stops
+    # re-deriving its plan every turn. Only the last few turns' worth, capped,
+    # so carried thinking never bloats the window.
+    carry_think = bool(session.get("one_action")) \
+        and session.get("effort", "") != "off"
+    msgs = []
+    for m in session.get("messages", []):
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "assistant" and not str(content or "").strip():
+            continue
+        entry = {"role": role, "content": content}
+        if carry_think and role == "assistant" and m.get("thinking"):
+            entry["reasoning_content"] = str(m["thinking"])[:4000]
+        msgs.append(entry)
+    if carry_think:
+        # strip reasoning from all but the last 4 assistant turns
+        kept = 0
+        for m in reversed(msgs):
+            if m["role"] != "assistant" or "reasoning_content" not in m:
+                continue
+            kept += 1
+            if kept > 4:
+                del m["reasoning_content"]
     an = session.get("authors_note", "")
     if an:
         # depth-targeted injection: N messages from the end beats the system
