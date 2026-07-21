@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from pathlib import Path
@@ -23,10 +24,20 @@ PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
                 # modern anti-repetition samplers (llama-server per-request)
                 "dry_multiplier": (0.0, 2.0), "dry_base": (1.0, 4.0),
                 "dry_allowed_length": (1, 10),
+                # was MISSING here, so validation silently stripped it and
+                # DRY scanned the whole context — RUN_PARAMS' cap (serve.py)
+                # never reached the engine on chat turns. Found by the
+                # 2026-07-21 Gemini code audit.
+                "dry_penalty_last_n": (-1, 262144),
                 "xtc_probability": (0.0, 1.0), "xtc_threshold": (0.0, 0.5),
                 "top_n_sigma": (-1.0, 5.0)}
-_INT_PARAMS = ("max_tokens", "dry_allowed_length", "seed", "top_k")
+_INT_PARAMS = ("max_tokens", "dry_allowed_length", "seed", "top_k",
+               "dry_penalty_last_n")
 _MAX_STOPS = 4
+# control bytes minus \t \n \r — a run of these in model-visible text is file
+# corruption (NUL floods from crash-interrupted writes) and reads to the model
+# as end-of-document: it answers with instant EOS. See tools._defuse_control_bytes.
+_CTRL_RUN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 
 # every field a session is guaranteed to carry — load() backfills these so
 # v0.5.x session files survive an upgrade instead of KeyError-ing the app
@@ -241,6 +252,25 @@ def build_messages(session: dict, default_prompt: str = "",
         role = m.get("role", "user")
         content = m.get("content", "")
         if role == "assistant" and not str(content or "").strip():
+            continue
+        if isinstance(content, str) and _CTRL_RUN.search(content):
+            # heal sessions that persisted control bytes BEFORE the tool-side
+            # defusal existed: a stored NUL run re-poisons every later turn
+            # of that chat otherwise (the 2026-07-21 instant-EOS, which came
+            # from crash-corrupted files read into a tool-result carrier)
+            content = _CTRL_RUN.sub(
+                lambda mo: f"[{len(mo.group())} unreadable control byte(s)]",
+                content)
+        if (msgs and role == "user" and msgs[-1]["role"] == "user"
+                and isinstance(content, str)
+                and isinstance(msgs[-1]["content"], str)):
+            # merge consecutive user messages: strict templates concatenate
+            # them into ONE block anyway, so each extra "continue" rewrote
+            # the block and invalidated the prompt cache from the carrier
+            # onward — measured live: 3816 tokens re-prefilled (~9 s) per
+            # turn. One block, stable prefix, cache survives.
+            msgs[-1]["content"] = (str(msgs[-1]["content"]) + "\n\n"
+                                   + content)
             continue
         entry = {"role": role, "content": content}
         if carry_think and role == "assistant" and m.get("thinking"):

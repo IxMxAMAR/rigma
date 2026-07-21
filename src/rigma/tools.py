@@ -239,6 +239,36 @@ def resolve_tool_name(name: str):
     return close[0] if close else None
 
 
+_CTRL_RUN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
+
+
+def _defuse_control_bytes(text: str) -> str:
+    """Replace control-byte runs in tool output with a visible marker.
+
+    THE instant-EOS root cause (2026-07-21, run to ground over a whole day):
+    the owner's GPU crashes mid-write left a 207-byte run of NUL (\\x00) inside
+    story_bible.md and another ~221 in a chapter file. read_file fed them to
+    the model verbatim; a NUL flood is the strongest end-of-document signal a
+    language model knows, so it emitted EOS as its FIRST token (p=0.999,
+    measured by logprob probe) on every turn whose context contained the file —
+    turns died at "generating", samplers/system-prompt/structure all
+    irrelevant. Invisible in any UI, invisible to text regexes; found only by
+    bisecting the live payload and taking a character histogram.
+
+    Replacing the run with a readable marker cures generation on the exact
+    failing payload (live-verified) AND tells model + owner the file is
+    corrupt instead of silently poisoning the conversation. \\t \\n \\r stay."""
+    if not text or not _CTRL_RUN.search(text):
+        return text
+    if IMAGE_SENTINEL in text:
+        # the ONE legitimate control-byte use: view_image's unfakeable marker,
+        # consumed by the agent loop — never fed to the model as text
+        return text
+    return _CTRL_RUN.sub(
+        lambda m: f"[{len(m.group())} unreadable control byte(s) — "
+                  "file corruption?]", text)
+
+
 def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
     """Execute a tool by name. Returns a plain-text result the model reads;
     never raises — errors come back as text so the model can react."""
@@ -258,7 +288,8 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
             return "error: code execution is not enabled for this chat"
         try:
             from . import mcp_client
-            return mcp_client.manager().call(name, args or {})
+            return _defuse_control_bytes(
+                mcp_client.manager().call(name, args or {}))
         except Exception as e:
             return f"error: mcp call failed: {e}"
     resolved = resolve_tool_name(name)
@@ -280,7 +311,9 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
     if t.needs == "run" and not ctx.get("run_id"):
         return "error: this tool is only available inside an autonomous run"
     try:
-        return t.handler(args or {}, ctx)
+        # defuse at the ONE choke point every tool result passes through, so
+        # read_file, grep, run_shell, carriers and persistence all inherit it
+        return _defuse_control_bytes(t.handler(args or {}, ctx))
     except Exception as e:   # a broken tool must not kill the turn
         return f"error running {name}: {e}"
 
@@ -1499,6 +1532,10 @@ def _write_file(args, ctx):
     p = _ws_path(ctx, str(args.get("path", "")))
     p.parent.mkdir(parents=True, exist_ok=True)
     content = str(args.get("content", ""))
+    if _CTRL_RUN.search(content):
+        # never author a poisoned file: control bytes in a text write are
+        # always an accident (echoed corruption markers, pasted binary)
+        content = _CTRL_RUN.sub("", content)
     existed = p.exists()
     old_len = len(p.read_text(encoding="utf-8", errors="replace")) if existed \
         else 0
