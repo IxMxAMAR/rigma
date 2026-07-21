@@ -12,6 +12,7 @@ export interface ChatMessage {
   content: string | { type: string; [k: string]: unknown }[];
   tool_trace?: { name: string; args?: unknown; result?: string }[];
   variants?: unknown[];
+  kind?: string;          // "tool_result" = model-context carrier, not UI
 }
 
 export interface Session {
