@@ -105,6 +105,20 @@ CHARS_PER_TOKEN = 3
 AUTO_COMPACT_KEEP = 16  # one action = TWO messages now (assistant + TOOL
                         # RESULT), so 8 kept only ~4 actions of history
 
+# --- slot pinning (llama-server runs --parallel 2 --kv-unified) --------------
+# The user's conversation owns slot 0; every aux request (auto-title,
+# compaction, delegate helper, mission compile, memory judge) is pinned to
+# slot 1. With one slot, each aux call evicted the conversation's prompt
+# cache and the next real turn re-prefilled the whole history — 30-90s dead
+# time per action on long runs. Similarity routing would usually get this
+# right; explicit pinning is deterministic.
+MAIN_SLOT = 0
+AUX_SLOT = 1
+# models whose template/engine rejected tool_choice:"required" (HTTP 400) —
+# forcing is skipped for them from then on and the rescue parser carries
+# the load, exactly as before
+_TOOL_CHOICE_UNSUPPORTED: set = set()
+
 # --- Autonomous Mode tunables (see docs/.../autonomous-mode-design.md) ---
 IDLE_SECS = 90.0        # inter-token idle: frozen only if the stream STALLS this long
 PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big context
@@ -784,7 +798,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             "/v1/chat/completions",
             json={"messages": [{"role": "user", "content":
                                 _COMPACT_PROMPT + "\n\n" + "\n".join(parts)}],
-                  "stream": False, "temperature": 0.3},
+                  "stream": False, "temperature": 0.3,
+                  "id_slot": AUX_SLOT},
             timeout=120.0)
         if resp.status_code != 200:
             raise RuntimeError(await _upstream_error(resp))
@@ -938,7 +953,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         "/v1/chat/completions",
                         json={"messages": msgs, "stream": False,
                               "tools": sub_specs, "temperature": 0.3,
-                              "max_tokens": 1200}, timeout=240.0)
+                              "max_tokens": 1200, "id_slot": AUX_SLOT},
+                        timeout=240.0)
                     if resp.status_code != 200:
                         return "delegate failed: " + await _upstream_error(resp)
                     m = resp.json()["choices"][0]["message"]
@@ -1046,20 +1062,64 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "tools — give your final answer now using what you already "
                     "gathered.")}]
             body = {"messages": turn_msgs, "stream": True,
-                    "stream_options": {"include_usage": True}}
+                    "stream_options": {"include_usage": True},
+                    "id_slot": MAIN_SLOT}
             body.update(params)
             if specs:
                 body["tools"] = specs
+            # GRAMMAR-FORCED tool calls on autonomous action turns: llama.cpp
+            # builds a lazy GBNF grammar from the tool schemas, and
+            # tool_choice:"required" makes a syntactically valid call
+            # physically inevitable — deleting the "narrated the call instead
+            # of making it" failure class the loop otherwise fights with
+            # prose nudges and the rescue parser. Never on the final round
+            # (that one wants an answer), and never for models that 400'd on
+            # it (fallback below).
+            engine_model = (st.read_state() or {}).get("model", "")
+            force_call = bool(
+                one_action and specs and not last and not force_last
+                and engine_model not in _TOOL_CHOICE_UNSUPPORTED)
+            if force_call:
+                body["tool_choice"] = "required"
+                if body.get("temperature") == RUN_PARAMS["temperature"]:
+                    # 0.3 existed to keep tool-call SYNTAX stable — grammar
+                    # now guarantees syntax at any temperature, and 0.3 is
+                    # below Qwen's floor for any thinking mode (it starves
+                    # reasoning and CREATES the repetition DRY then fights)
+                    body["temperature"] = 0.6
+            ctk = {}
             if effort == "off":
-                body["chat_template_kwargs"] = {"enable_thinking": False}
+                ctk["enable_thinking"] = False
             elif effort == "on":
-                body["chat_template_kwargs"] = {"enable_thinking": True}
+                ctk["enable_thinking"] = True
+            if one_action and effort != "off":
+                # Qwen3.6 agent guidance: keep prior turns' reasoning visible
+                # (reduces re-deriving the plan every turn). Templates that
+                # don't know the kwarg simply ignore it.
+                ctk["preserve_thinking"] = True
+            if ctk:
+                body["chat_template_kwargs"] = ctk
             rtext, calls, started = "", {}, {}   # started: idx -> (task, cargs)
             finish_reason = None
             try:
                 req = client.build_request("POST", "/v1/chat/completions",
                                            json=body)
                 resp = await client.send(req, stream=True)
+                if resp.status_code == 400 and "tool_choice" in body:
+                    # template/engine rejects forced calls — remember, degrade
+                    # to the parse-and-rescue path, and don't try again for
+                    # this model
+                    try:
+                        await resp.aclose()
+                    except Exception:
+                        pass
+                    _TOOL_CHOICE_UNSUPPORTED.add(engine_model)
+                    body.pop("tool_choice", None)
+                    if "temperature" in params:      # undo the grammar-era lift
+                        body["temperature"] = params["temperature"]
+                    req = client.build_request(
+                        "POST", "/v1/chat/completions", json=body)
+                    resp = await client.send(req, stream=True)
                 if resp.status_code != 200:
                     raise RuntimeError(await _upstream_error(resp))
                 async for line in resp.aiter_lines():
@@ -1359,7 +1419,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                               "Reply with the title only." + chr(10)
                               + chr(10).join(convo)}],
                               "stream": False, "temperature": 0.3,
-                              "max_tokens": 24},
+                              "max_tokens": 24, "id_slot": AUX_SLOT},
                         timeout=20.0)
                     if tresp.status_code == 200:
                         new_t = (tresp.json()["choices"][0]["message"]
@@ -1951,7 +2011,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                               run.get("workspace", ""))
 
         async def _post(payload):
-            r = await client.post("/v1/chat/completions", json=payload,
+            r = await client.post("/v1/chat/completions",
+                                  json={**payload, "id_slot": AUX_SLOT},
                                   timeout=180.0)
             r.raise_for_status()
             return r.json()
@@ -2010,7 +2071,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             resp = await client.post(
                 "/v1/chat/completions",
                 json={"messages": [{"role": "user", "content": prompt}],
-                      "stream": False, "temperature": 0.2, "max_tokens": 120},
+                      "stream": False, "temperature": 0.2, "max_tokens": 120,
+                      "id_slot": AUX_SLOT},
                 timeout=90.0)
             if resp.status_code != 200:
                 return ""

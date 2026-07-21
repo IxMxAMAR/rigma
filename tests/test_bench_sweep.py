@@ -68,7 +68,7 @@ def test_auto_calibrate_runs_once_then_is_cached(monkeypatch, tmp_path):
     monkeypatch.setattr(bench, "launch_server", counting_launch)
     monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
         pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
-    monkeypatch.setattr(bench, "quick_configs", lambda base, moe: [
+    monkeypatch.setattr(bench, "quick_configs", lambda base, moe, caps=(): [
         ("baseline", {}), ("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}})])
 
     plan = _plan()
@@ -97,7 +97,7 @@ def test_auto_calibrate_applies_winning_flags(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
     monkeypatch.setattr(bench, "run_bench", lambda port, **k: next(seq))
-    monkeypatch.setattr(bench, "quick_configs", lambda base, moe: [
+    monkeypatch.setattr(bench, "quick_configs", lambda base, moe, caps=(): [
         ("baseline", {}), ("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}})])
 
     out = bench.auto_calibrate(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf")

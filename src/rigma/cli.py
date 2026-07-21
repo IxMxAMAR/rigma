@@ -690,6 +690,10 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                                     "model's native window)"),
        reasoning: str = typer.Option(None, "--reasoning",
                                      help="Reasoning/thinking: on|off|auto"),
+       reasoning_budget: int = typer.Option(
+           None, "--reasoning-budget",
+           help="Max thinking tokens per turn (0 = end thinking "
+                "immediately, -1 = unlimited)"),
        fa: str = typer.Option(None, "--fa",
                               help="FlashAttention: on|off|auto"),
        spec: str = typer.Option(None, "--spec",
@@ -764,6 +768,10 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             raise typer.Exit(2)
         rp.flags = rp.flags.model_copy(update={"reasoning": reasoning})
         rp.origin += "+reasoning-override"
+    if reasoning_budget is not None:
+        rp.flags = rp.flags.model_copy(
+            update={"reasoning_budget": reasoning_budget})
+        rp.origin += "+rbudget-override"
     if fa is not None:
         if fa not in ("on", "off", "auto"):
             typer.echo("--fa must be on, off, or auto")
@@ -777,6 +785,14 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if spec not in allowed:
             typer.echo(f"--spec must be one of: {', '.join(allowed)}")
             raise typer.Exit(2)
+        if spec == "draft-mtp":
+            # spec-decode without the MTP tensors is a documented Vulkan
+            # driver-reset loop — refuse unless the gguf actually carries them
+            caps = getattr(reg.models.get(rp.model_slug), "capabilities", [])
+            if "mtp" not in caps:
+                typer.echo(f"{rp.model_slug} has no preserved MTP tensors — "
+                           "draft-mtp would crash the driver. Refusing.")
+                raise typer.Exit(2)
         rp.flags = rp.flags.model_copy(update={"spec_type": spec})
         rp.origin += "+spec-override"
     os_name = {"Windows": "windows", "Linux": "linux",

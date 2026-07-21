@@ -17,7 +17,7 @@ from .gguf_meta import GgufParseError, inspect_gguf
 from .models import GgufFile, ModelSpec, MoESpec
 from .runtime import rigma_home
 
-VALID_CAPS = ("tools", "vision", "thinking")
+VALID_CAPS = ("tools", "vision", "thinking", "mtp")
 _QUANT_RE = re.compile(
     r"(UD-)?(I?Q\d(?:_[A-Z0-9]+)*|F16|BF16|F32|MXFP4(?:_[A-Z0-9]+)*)",
     re.IGNORECASE)
@@ -56,6 +56,41 @@ def _write_spec(spec: ModelSpec) -> None:
     tmp = d / f"{spec.slug}.json.tmp"
     tmp.write_text(spec.model_dump_json(indent=1), encoding="utf-8")
     os.replace(tmp, d / f"{spec.slug}.json")
+
+
+def inherit_family_defaults(spec: ModelSpec) -> ModelSpec:
+    """Custom imports inherit the registry sibling's card sampling and KV
+    policy. An installed fine-tune of a registry model otherwise ran on raw
+    llama-server defaults — no DRY, no model-card temperature, and no
+    DeltaNet-aware q8_0 cache policy (audit 2026-07-21, limiting-setting #3).
+
+    Matching is by ARCHITECTURAL FINGERPRINT (kind + layer geometry), not by
+    family name: gguf arch strings ("qwen35moe") never equal registry family
+    names ("qwen3.6"), but a fine-tune of the same base model shares its
+    exact attention geometry."""
+    try:
+        from .registry import Registry
+        from .models import CachePolicy
+        blank = CachePolicy()
+        for m in Registry.load().models.values():
+            if m.custom:
+                continue
+            if (m.kind, m.n_layers, m.full_attn_layers, m.kv_heads,
+                    m.head_dim) != (spec.kind, spec.n_layers,
+                                    spec.full_attn_layers, spec.kv_heads,
+                                    spec.head_dim):
+                continue
+            update = {}
+            if not spec.default_params and m.default_params:
+                update["default_params"] = dict(m.default_params)
+            if spec.cache_type_policy == blank and \
+                    m.cache_type_policy != blank:
+                update["cache_type_policy"] = \
+                    m.cache_type_policy.model_copy()
+            return spec.model_copy(update=update) if update else spec
+    except Exception:
+        pass          # inheritance is a nicety — never block an install
+    return spec
 
 
 def _load_custom(slug: str) -> ModelSpec | None:
@@ -143,6 +178,7 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
                         quant=_quant_from_name(dest.name))],
         moe=moe, license="custom import", use_cases=["general"],
         capabilities=sorted(info.capabilities), custom=True)
+    spec = inherit_family_defaults(spec)
     # spec first, then move: if the move fails, drop the orphan spec so the
     # library never lists a model whose file isn't there
     _write_spec(spec)

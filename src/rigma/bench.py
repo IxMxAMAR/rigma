@@ -33,6 +33,17 @@ def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128) -> Be
                        prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
 
 
+def _capabilities(slug: str) -> tuple:
+    try:
+        from .registry import Registry
+        spec = Registry.load().models.get(slug)
+        if spec is not None:
+            return tuple(spec.capabilities)
+    except Exception:
+        pass
+    return ()
+
+
 def _tools_capable(slug: str) -> bool:
     """Whether the model declares the `tools` capability. Unknown → True:
     assume tools and protect quality rather than risk degrading it."""
@@ -117,7 +128,8 @@ def sweep_configs(base: ComboFlags, moe: bool) -> list[tuple[str, dict]]:
     return cfgs
 
 
-def quick_configs(base: ComboFlags, moe: bool) -> list[tuple[str, dict]]:
+def quick_configs(base: ComboFlags, moe: bool,
+                  caps: tuple | list = ()) -> list[tuple[str, dict]]:
     """The short first-load set: only the toggles that genuinely can't be
     defaulted and are worth a per-machine measurement. The rest are already
     applied automatically by the resolver. Full exhaustive set = sweep_configs
@@ -127,6 +139,16 @@ def quick_configs(base: ComboFlags, moe: bool) -> list[tuple[str, dict]]:
     cfgs.append(("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}}))
     if moe:
         cfgs.append(("gfxqueue-on", {"env": {"GGML_VK_ALLOW_GRAPHICS_QUEUE": "1"}}))
+    # MTP-preserved gguf: try self-speculation. 1.4-2.2x decode reported for
+    # Qwen3.6 MTP; on a RAM-bandwidth-bound expert-offload decode, accepted
+    # multi-token batches amortize the CPU expert fetches — exactly this box.
+    # Measured, never assumed: crowned only if faster HERE, and a config that
+    # OOMs or crashes is scored as a loss by run_sweep. Never offered without
+    # the mtp capability (spec-decode without the tensors is a documented
+    # driver-reset loop on Vulkan).
+    if "mtp" in (caps or ()):
+        cfgs.append(("spec-mtp-2", {"spec_type": "draft-mtp", "spec_n_max": 2}))
+        cfgs.append(("spec-mtp-4", {"spec_type": "draft-mtp", "spec_n_max": 4}))
     return cfgs
 
 
@@ -204,7 +226,8 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
     if plan.backend == "cpu":
         return plan   # nothing worth measuring on CPU
     run_sweep(plan, exe, model_path, port=port,
-              configs=quick_configs(plan.flags, plan.flags.n_cpu_moe > 0),
+              configs=quick_configs(plan.flags, plan.flags.n_cpu_moe > 0,
+                                    caps=_capabilities(plan.model_slug)),
               extra_args=extra_args, progress=progress, mark_calibrated=True)
     return _apply(plan)
 
