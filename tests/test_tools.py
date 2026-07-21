@@ -81,7 +81,8 @@ def test_workspace_tools_confined(tmp_path):
 def test_code_tools_gated(tmp_path):
     ctx = {"workspace": str(tmp_path), "allow_code": True}
     out = tools.run_tool("run_python", {"code": "print(6*7)"}, ctx)
-    assert out.strip() == "42"
+    assert out.splitlines()[0].startswith("exit 0")   # status always leads
+    assert "42" in out
     # without the opt-in, it refuses
     assert "not enabled" in tools.run_tool(
         "run_python", {"code": "print(1)"}, {"workspace": str(tmp_path)})
