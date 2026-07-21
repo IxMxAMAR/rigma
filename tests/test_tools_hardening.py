@@ -219,3 +219,29 @@ def test_rescue_structured_values_stay_structured():
             '</parameter></function>')
     name, args = rescue_xml_tool_call(text)
     assert args["paths"] == ["a.png", "b.png"]
+
+
+def test_tool_results_defuse_control_byte_runs(tmp_path, monkeypatch):
+    """read_file on a crash-corrupted file (NUL flood mid-text) must hand the
+    model a readable marker, not the raw bytes — a NUL run reads to a language
+    model as end-of-document and produced instant-EOS turns (2026-07-21)."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import tools
+    f = tmp_path / "bible.md"
+    f.write_bytes(b"CAST: Corwin\n" + b"\x00" * 207 + b"STORY SO FAR: ch1-7\n")
+    out = tools.run_tool("read_file", {"path": str(f)},
+                         {"workspace": str(tmp_path), "allow_code": True})
+    assert "\x00" not in out
+    assert "207 unreadable control byte(s)" in out
+    assert "CAST: Corwin" in out and "STORY SO FAR" in out
+
+
+def test_write_file_never_authors_control_bytes(tmp_path, monkeypatch):
+    """The model must not be able to write a poisoned file (echoed corruption,
+    pasted binary) — control bytes are stripped on the way to disk."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import tools
+    tools.run_tool("write_file",
+                   {"path": "out.txt", "content": "good\x00\x00\x00text"},
+                   {"workspace": str(tmp_path), "allow_code": True})
+    assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "goodtext"

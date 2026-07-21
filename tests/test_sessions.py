@@ -170,10 +170,12 @@ def test_build_messages_notes_alone_is_sole_system_message():
 
 
 def test_build_messages_missing_keys_default_sanely():
+    # both default to role:user, and consecutive user turns MERGE into one
+    # block (2026-07-21: strict templates concatenate them anyway; separate
+    # messages just invalidated the prompt cache every turn)
     s = {"messages": [{}, {"content": "only content"}]}
     out = sessions.build_messages(s)
-    assert out == [{"role": "user", "content": ""},
-                   {"role": "user", "content": "only content"}]
+    assert out == [{"role": "user", "content": "\n\nonly content"}]
 
 
 def test_search_titles_and_bodies(tmp_path, monkeypatch):
@@ -295,7 +297,10 @@ def test_build_messages_drops_empty_assistant_turns():
     out = sessions.build_messages(s)
     assert all(not (m["role"] == "assistant" and not m["content"].strip())
                for m in out)
-    assert [m["role"] for m in out] == ["system", "user", "user", "assistant"]
+    # dropping the empty assistant turn leaves user+user — which then MERGES
+    # into one block (cache-stable prefix; templates concatenate them anyway)
+    assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert "TOOL RESULT list_directory: ok" in out[1]["content"]
 
 
 def test_only_the_first_message_is_ever_system():
@@ -338,3 +343,48 @@ def test_doctrine_never_displaces_the_users_prompt():
     c = build_messages(s)[0]["content"]
     assert c.index("Ember the dragon") < c.index("TOOL RULES"), \
         "the user's persona leads; doctrine follows"
+
+
+def test_control_bytes_are_healed_out_of_model_context():
+    """A NUL flood in a persisted message (crash-corrupted file read into a
+    tool-result carrier, 2026-07-21) read to the model as end-of-document:
+    instant EOS on every turn of that chat, p=0.999 by logprob probe. Stored
+    poison must be defused when messages are built for the model."""
+    from rigma.sessions import build_messages
+    s = {"messages": [
+        {"role": "user", "content": "update my file"},
+        {"role": "assistant", "content": "on it"},
+        {"role": "user", "content": "TOOL RESULT read_file: text"
+                                    + "\x00" * 207 + "more"},
+    ]}
+    built = build_messages(s)
+    joined = "".join(str(m["content"]) for m in built)
+    assert "\x00" not in joined, "NUL bytes must never reach the model"
+    assert "207 unreadable control byte(s)" in joined, \
+        "corruption is named, not silently swallowed"
+
+
+def test_consecutive_user_messages_merge_into_one_block():
+    """Strict templates concatenate consecutive user turns into ONE block, so
+    every extra 'continue' rewrote the block and invalidated the prompt cache
+    from the 16K carrier onward (measured live: ~3.8K tokens re-prefilled per
+    turn). Merge them ourselves: stable prefix, cache survives."""
+    from rigma.sessions import build_messages
+    s = {"messages": [
+        {"role": "user", "content": "TOOL RESULT read_file: big"},
+        {"role": "user", "content": "continue"},
+        {"role": "user", "content": "continue"},
+    ]}
+    built = build_messages(s)
+    users = [m for m in built if m["role"] == "user"]
+    assert len(users) == 1
+    assert users[0]["content"].count("continue") == 2
+
+
+def test_dry_penalty_last_n_survives_validation():
+    """The whole-context-DRY cap was silently stripped by validate_params
+    (missing from PARAM_RANGES) — the fix RUN_PARAMS intended never reached
+    the engine on chat turns (Gemini audit find, 2026-07-21)."""
+    from rigma.sessions import validate_params
+    out = validate_params({"dry_penalty_last_n": 4096})
+    assert out == {"dry_penalty_last_n": 4096}
