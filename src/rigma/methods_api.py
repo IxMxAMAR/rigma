@@ -9,6 +9,8 @@ injection instead.
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import macros, methods as _methods, sessions
@@ -124,31 +126,44 @@ def register(app, *, sse, drive_turn, aux_complete, tool_ctx_for) -> None:
             macros.trust(m["id"], macro["id"])
 
         async def gen():
-            # Plan 1 buffers: every step runs to completion before a byte is
-            # yielded, so progress arrives in one burst. Deliberate -- it
-            # keeps the endpoint synchronous and testable without an engine,
-            # and macros are short. Plan 2 swaps in a live asyncio.Queue once
-            # there is a UI that can show progress.
-            queue: list[bytes] = []
+            # Live, not buffered: a step's event reaches the client the moment
+            # it is emitted. run_macro drives on its own task and pushes into
+            # a queue; None is the end-of-stream sentinel.
+            q: asyncio.Queue = asyncio.Queue()
 
             async def emit(event, data):
-                queue.append(sse(data, event))
+                await q.put(sse(data, event))
 
+            async def drive():
+                try:
+                    out = await macros.run_macro(
+                        s, m, macro, emit=emit, drive_turn=drive_turn,
+                        aux_complete=aux_complete, tool_ctx=tool_ctx_for(s),
+                        answers=body.get("answers"),
+                        selection=str(body.get("selection") or ""))
+                    await q.put(sse({"new_session_id": out["new_session_id"],
+                                     "steps": len(out["results"])},
+                                    "macro_done"))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:                  # never a bare 500
+                    await q.put(sse({"message": f"macro failed: {e}"},
+                                    "error"))
+                finally:
+                    await q.put(None)
+
+            task = asyncio.create_task(drive())
             try:
-                out = await macros.run_macro(
-                    s, m, macro, emit=emit, drive_turn=drive_turn,
-                    aux_complete=aux_complete, tool_ctx=tool_ctx_for(s),
-                    answers=body.get("answers"),
-                    selection=str(body.get("selection") or ""))
-                for chunk in queue:
+                while True:
+                    chunk = await q.get()
+                    if chunk is None:
+                        break
                     yield chunk
-                yield sse({"new_session_id": out["new_session_id"],
-                           "steps": len(out["results"])}, "macro_done")
-            except Exception as e:                      # never a bare 500
-                for chunk in queue:
-                    yield chunk
-                yield sse({"message": f"macro failed: {e}"}, "error")
-            yield b"data: [DONE]\n\n"
+                yield b"data: [DONE]\n\n"
+            finally:
+                # the client hung up mid-macro: stop the work, don't leak it
+                if not task.done():
+                    task.cancel()
 
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers=_NO_STORE)
