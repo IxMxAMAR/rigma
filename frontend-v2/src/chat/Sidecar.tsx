@@ -285,7 +285,7 @@ interface Method {
 // One-click workflow setups: prompt + sampler profile + effort + tool
 // posture + a Notes template + the how-to guide, per activity. The method
 // knowledge lives in the product, not in the user's memory.
-function MethodCard() {
+function MethodCard({ onApplied }: { onApplied?: () => void }) {
   const currentId = useChat((s) => s.currentId);
   const open = useChat((s) => s.open);
   const loadSessions = useChat((s) => s.loadSessions);
@@ -339,6 +339,7 @@ function MethodCard() {
       if (r.ok) {
         setActive(id);
         setApplied(id);
+        onApplied?.();
       }
     } catch { /* stays unapplied */ }
   };
@@ -420,11 +421,15 @@ function MethodCard() {
 
 // rendered inside the draggable FloatWindow — no layout chrome of its own
 export default function Sidecar() {
+  // applying a method rewrites prompt/params server-side; remount the cards
+  // below so they re-fetch — without this the panel looked unchanged and
+  // the apply button read as broken (owner report 2026-07-21)
+  const [rev, setRev] = useState(0);
   return (
     <>
-      <MethodCard />
-      <GroundingCard />
-      <SamplingCard />
+      <MethodCard onApplied={() => setRev((r) => r + 1)} />
+      <GroundingCard key={`g${rev}`} />
+      <SamplingCard key={`s${rev}`} />
     </>
   );
 }

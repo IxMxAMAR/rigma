@@ -13,6 +13,7 @@ export interface ChatMessage {
   tool_trace?: { name: string; args?: unknown; result?: string }[];
   variants?: unknown[];
   kind?: string;          // "tool_result" = model-context carrier, not UI
+  notice?: string;        // server-authored status line — shown, never fed
 }
 
 export interface Session {

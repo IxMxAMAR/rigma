@@ -42,11 +42,18 @@ function Launcher({ onLaunched }: { onLaunched: (id: string) => void }) {
       </h3>
       <textarea
         value={mission}
-        onChange={(e) => setMission(e.target.value)}
+        onChange={(e) => {
+          setMission(e.target.value);
+          // grow with the prompt (owner request): auto height up to a sane
+          // cap, then scroll inside — long pasted missions stay readable
+          const el = e.currentTarget;
+          el.style.height = "auto";
+          el.style.height = Math.min(el.scrollHeight, 420) + "px";
+        }}
         rows={3}
         placeholder="What should the agent do, start to finish? Name concrete deliverables."
         aria-label="Mission"
-        className="w-full rounded-md bg-surface px-3 py-2 text-[13.5px] outline-none resize-y placeholder:text-muted"
+        className="w-full rounded-md bg-surface px-3 py-2 text-[13.5px] outline-none resize-y placeholder:text-muted max-h-[420px] overflow-y-auto"
       />
       <div className="flex gap-2 mt-2">
         <input
