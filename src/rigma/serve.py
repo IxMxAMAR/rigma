@@ -296,6 +296,16 @@ def _last_trace(session):
             return m.get("tool_trace", []) or []
     return []
 
+def _round_cap(session: dict) -> int:
+    """Per-turn tool-round budget. The session default became 1000 (a
+    runaway backstop, not a leash) but the old inline clamp still cut it to
+    100 — the ceiling now honours the stored value up to the backstop."""
+    try:
+        return max(1, min(int(session.get("max_tool_rounds") or 1000), 1000))
+    except (TypeError, ValueError):
+        return 1000
+
+
 def _turn_sig(trace):
     return tuple(sorted(
         (t.get("name", ""), json.dumps(t.get("args", {}), sort_keys=True,
@@ -1036,8 +1046,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # (owner saw `iter 1` after a full run; 50 tool calls in one turn).
         one_action = bool(s.get("one_action"))
         force_last = False       # one-action: allow a final look-at-images round
-        max_rounds = (max(1, min(int(s.get("max_tool_rounds") or 50), 100))
-                      if use_tools else 1)
+        max_rounds = _round_cap(s) if use_tools else 1
+        hit_ceiling = False      # distinguishes "ran out of rounds" from
+        # "the model chose to stop" — the limit notice used to fire on BOTH,
+        # claiming a ceiling after 3 calls of a 1000-round budget (owner
+        # report 2026-07-21: 'HUH?')
         for _round in range(max_rounds):
             # `last` MUST stay False in one-action mode: tool calls are only
             # executed when `not last` (see the tool block below), so treating
@@ -1321,21 +1334,31 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 continue                       # stream the next round
             text = rtext                       # no tool calls -> this is final
             break
-        # hit the tool-call ceiling still mid-task with no final answer? never
-        # finish silently — give the user something and a clear way to resume
+        else:
+            hit_ceiling = True                 # every round used, no break
+        # ended mid-task with no final answer? never finish silently — but be
+        # TRUTHFUL about why: running out of rounds and the model going quiet
+        # after its tools are different situations with different fixes.
         # In one-action mode stopping after a single call is NORMAL, not a
         # ceiling — the notice would otherwise fire on every single action.
         if (use_tools and not failed and not text.strip() and trace
                 and not one_action):
-            text = (
-                # in a run there is no user to say "keep going" — the loop just
-                # continues, so tell the model that instead of stranding it
-                "_(Reached this turn's tool-call limit. The run continues "
-                "automatically — resume the SAME step next turn, do not start "
-                "over.)_" if s.get("run_id") else
-                "_(Reached this turn's tool-call limit while still working — "
-                "send **keep going** and I'll continue. You can raise the "
-                "limit in the chat's settings.)_")
+            if s.get("run_id"):
+                # in a run there is no user to say "keep going" — the loop
+                # just continues, so tell the model that instead
+                text = ("_(Reached this turn's tool-call limit. The run "
+                        "continues automatically — resume the SAME step next "
+                        "turn, do not start over.)_" if hit_ceiling else
+                        "_(You stopped without a reply. Your tool results "
+                        "are above — continue the SAME step next turn.)_")
+            elif hit_ceiling:
+                text = ("_(Reached this turn's tool-call limit while still "
+                        "working — send **keep going** and I'll continue. "
+                        "You can raise the limit in the chat's settings.)_")
+            else:
+                text = ("_(The model stopped after its tool calls without a "
+                        "final reply — the results are shown above. Say "
+                        "**continue** if it should keep going.)_")
             yield _sse({"delta": text})
         if not failed:
             meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}

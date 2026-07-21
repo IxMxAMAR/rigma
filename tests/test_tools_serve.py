@@ -348,3 +348,61 @@ def test_tool_results_carry_across_turns(home, upstream):
     msgs = _sessions.build_messages(_sessions.load(sid))
     assert any("TOOL RESULT calculator: 42" in str(m.get("content", ""))
                for m in msgs)
+
+
+class _QuietUpstream(BaseHTTPRequestHandler):
+    """Round 1: a tool call. Round 2: the model goes SILENT (no text, no
+    calls) — the live 'HUH?' case: 3 calls into a 1000-round budget, the
+    old notice claimed a tool-call limit was reached."""
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        body = json.loads(self.rfile.read(n))
+        has_tool_result = any(m.get("role") == "tool"
+                              for m in body.get("messages", []))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+
+        def sse(obj):
+            self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+
+        if not has_tool_result:
+            sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "type": "function",
+                 "function": {"name": "calculator",
+                              "arguments": json.dumps(
+                                  {"expression": "1+1"})}}]}}]})
+        # else: silence — stream ends with no content at all
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def quiet_upstream():
+    srv = HTTPServer(("127.0.0.1", 0), _QuietUpstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
+
+
+def test_silent_stop_is_not_reported_as_a_limit(home, quiet_upstream):
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=quiet_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200
+    assert "tool-call limit" not in r.text          # the old lie
+    assert "stopped after its tool calls" in r.text  # the truth
+
+
+def test_round_cap_honours_the_backstop():
+    from rigma.serve import _round_cap
+    assert _round_cap({"max_tool_rounds": 1000}) == 1000   # was clamped to 100
+    assert _round_cap({"max_tool_rounds": 3}) == 3         # deliberate leash kept
+    assert _round_cap({}) == 1000                          # default
+    assert _round_cap({"max_tool_rounds": 99999}) == 1000  # backstop holds
+    assert _round_cap({"max_tool_rounds": "junk"}) == 1000
