@@ -1,8 +1,14 @@
 // Right sidecar for the chat surface: grounding, sampling, system prompt.
 // Collapsible; state persists to the session via the existing PATCH API.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
-import { createDraft, type Method } from "../lib/methods";
+import {
+  createDraft,
+  exportUrl,
+  importMethod,
+  listMethods,
+  type Method,
+} from "../lib/methods";
 import { useApp } from "../store";
 import MethodBuilder from "./MethodBuilder";
 import { useChat } from "./chatStore";
@@ -285,6 +291,8 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
   const open = useChat((s) => s.open);
   const loadSessions = useChat((s) => s.loadSessions);
   const [making, setMaking] = useState(false);
+  const [importError, setImportError] = useState("");
+  const importRef = useRef<HTMLInputElement>(null);
   const [methods, setMethods] = useState<Method[]>([]);
   const [active, setActive] = useState("");
   const [expanded, setExpanded] = useState("");
@@ -306,6 +314,17 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
       .then((s) => setActive(String((s as { method?: string }).method ?? "")))
       .catch(() => {});
   }, [currentId]);
+
+  const importFile = async (f: File) => {
+    try {
+      const doc = JSON.parse(await f.text()) as unknown;
+      const saved = await importMethod(doc);
+      setMethods(await listMethods());
+      setExpanded(saved.id);
+    } catch (e) {
+      setImportError((e as Error).message || "that file is not a method");
+    }
+  };
 
   // opens a chat bound to a draft: the model there is offered the builder
   // tools and nothing else, so it can only build a method
@@ -345,13 +364,36 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
         set this chat up for what you're doing — prompt, sampling, thinking
         and a notes template in one click
       </p>
-      <button
-        onClick={() => void startDraft()}
-        disabled={making}
-        className="self-start rounded-md bg-surface hover:bg-float text-secondary px-2.5 py-1 text-[12px] disabled:opacity-40"
-      >
-        {making ? "opening…" : "+ Create method"}
-      </button>
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <button
+          onClick={() => void startDraft()}
+          disabled={making}
+          className="rounded-md bg-surface hover:bg-float text-secondary px-2.5 py-1 text-[12px] disabled:opacity-40"
+        >
+          {making ? "opening…" : "+ Create method"}
+        </button>
+        <button
+          onClick={() => importRef.current?.click()}
+          title="load a method someone shared with you"
+          className="rounded-md bg-surface hover:bg-float text-secondary px-2.5 py-1 text-[12px]"
+        >
+          Import
+        </button>
+        <input
+          ref={importRef}
+          type="file"
+          accept="application/json,.json"
+          hidden
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            e.target.value = "";
+            if (f) void importFile(f);
+          }}
+        />
+      </div>
+      {importError && (
+        <p className="text-[11px] text-red">{importError}</p>
+      )}
       <ul className="flex flex-col gap-1 mt-1">
         {methods.map((m) => {
           const open = expanded === m.id;
@@ -392,6 +434,14 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
                       {applied === m.id ? "applied ✓"
                         : active === m.id ? "re-apply" : "use this method"}
                     </button>
+                    <a
+                      href={exportUrl(m.id)}
+                      download={`${m.id}.json`}
+                      title="save this method as a file you can share"
+                      className="rounded-md bg-surface hover:bg-float text-muted px-2.5 py-1 text-[12px]"
+                    >
+                      Export
+                    </a>
                   </div>
                   {/* what the method actually CONTAINS — running its macros
                       belongs to the strip above the composer, not here */}

@@ -88,6 +88,39 @@ def register(app, *, sse, drive_turn, aux_complete, tool_ctx_for) -> None:
                 status_code=400)
         return {"deleted": mid}
 
+    @app.get("/api/methods/{mid}/export")
+    async def export_method(mid: str):
+        """The method's JSON, as a download. This IS the shareable artifact
+        -- there is no registry and no account, just a file."""
+        m = _methods.get(mid)
+        if m is None:
+            return JSONResponse({"error": "no such method"}, status_code=404)
+        return JSONResponse(m, headers={
+            "content-disposition": f'attachment; filename="{mid}.json"'})
+
+    @app.post("/api/methods/import")
+    async def import_method(body: dict):
+        """Take someone else's method file. NEVER overwrites an existing id
+        and NEVER carries trust: 'always allow' is a decision this machine's
+        owner made, and it lives in ~/.rigma/macro_trust.json, not in a
+        document that travelled here from somewhere else."""
+        doc = dict(body or {})
+        doc.pop("always_allow", None)
+        for key in ("macros", "workflows", "rules"):
+            doc[key] = [{k: v for k, v in dict(c).items()
+                         if k != "always_allow"}
+                        for c in doc.get(key) or []]
+        taken = {m["id"] for m in _methods.catalog()}
+        if not doc.get("id") or doc["id"] in taken:
+            from . import method_schema as ms
+            doc["id"] = ms.slugify(doc.get("name") or doc.get("id")
+                                   or "method", taken)
+        doc["builtin"] = False
+        saved, errs = _methods.save_user(doc)
+        if errs:
+            return JSONResponse({"errors": errs}, status_code=400)
+        return saved
+
     @app.post("/api/methods/draft")
     async def create_draft(body: dict | None = None):
         """Open a chat that can only build a method."""
