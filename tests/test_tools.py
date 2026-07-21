@@ -154,3 +154,18 @@ def test_write_file_append_mode(tmp_path):
                                   "append": True}, ctx)
     assert "append" in out.lower()
     assert (tmp_path / "ch.txt").read_text(encoding="utf-8") == "part1 part2"
+
+
+def test_run_shell_speaks_unix_on_windows(tmp_path):
+    # the model ran `ls` and cmd.exe said "not recognized" — PowerShell's
+    # aliases make Unix-trained models just work
+    import sys
+    if sys.platform != "win32":
+        import pytest
+        pytest.skip("windows-only behaviour")
+    from rigma.tools import run_tool
+    (tmp_path / "hello.txt").write_text("x", encoding="utf-8")
+    out = run_tool("run_shell", {"command": "ls"},
+                   {"workspace": str(tmp_path), "allow_code": True})
+    assert "hello.txt" in out
+    assert "not recognized" not in out

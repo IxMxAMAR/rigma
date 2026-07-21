@@ -1304,6 +1304,22 @@ def _run_python(args, ctx):
       safe=False, needs="code")
 def _run_shell(args, ctx):
     cmd = str(args.get("command", ""))
+    # Windows: run through PowerShell, not cmd.exe. Every local model is
+    # Unix-trained and reaches for ls/pwd/cat/mv/cp - which are all native
+    # PowerShell aliases, but unknown words to cmd (live 2026-07-21: the
+    # model ran `ls`, cmd said "not recognized", turn wasted). The
+    # destructive-command blocklist runs on the TEXT first either way.
+    if sys.platform == "win32":
+        text = cmd
+        if _BLOCKED_CMD.search(text):
+            return ("error: blocked — that looks like a destructive system "
+                    "command; refusing to run it")
+        if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(text):
+            return ("error: blocked — deletion is disabled for this run "
+                    "(no-delete)")
+        return _run_subprocess(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            ctx, shell=False)
     return _run_subprocess(cmd, ctx, shell=True)
 
 
