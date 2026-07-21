@@ -59,6 +59,33 @@ export async function previewMacro(
   return d;
 }
 
+export async function createDraft(): Promise<
+  { session_id: string; draft_id: string }
+> {
+  const r = await fetch("/api/methods/draft", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: "{}",
+  });
+  if (!r.ok) throw new Error("could not start a method");
+  return (await r.json()) as { session_id: string; draft_id: string };
+}
+
+export async function getDraft(did: string): Promise<Method | null> {
+  const r = await fetch(`/api/methods/draft/${did}`);
+  if (!r.ok) return null;
+  return (await r.json()) as Method;
+}
+
+export async function promoteDraft(did: string): Promise<Method> {
+  const r = await fetch(`/api/methods/draft/${did}/promote`, {
+    method: "POST",
+  });
+  const d = (await r.json()) as Method & { errors?: string[] };
+  if (!r.ok) throw new Error((d.errors ?? ["could not save"]).join("; "));
+  return d;
+}
+
 /** Streams the macro run, handing each SSE event to `onEvent`. Mirrors
  *  streamChat so the store can fold both through the same reducer. */
 export async function runMacroStream(
