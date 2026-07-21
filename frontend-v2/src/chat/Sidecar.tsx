@@ -274,10 +274,124 @@ function SamplingCard() {
   );
 }
 
+interface Method {
+  id: string;
+  name: string;
+  tagline: string;
+  guide: string[];
+}
+
+// One-click workflow setups: prompt + sampler profile + effort + tool
+// posture + a Notes template + the how-to guide, per activity. The method
+// knowledge lives in the product, not in the user's memory.
+function MethodCard() {
+  const currentId = useChat((s) => s.currentId);
+  const [methods, setMethods] = useState<Method[]>([]);
+  const [active, setActive] = useState("");
+  const [expanded, setExpanded] = useState("");
+  const [applied, setApplied] = useState("");
+
+  useEffect(() => {
+    fetch("/api/methods")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { methods: Method[] } | null) => {
+        if (d) setMethods(d.methods);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    setApplied("");
+    if (!currentId) return;
+    api.getSession(currentId)
+      .then((s) => setActive(String((s as { method?: string }).method ?? "")))
+      .catch(() => {});
+  }, [currentId]);
+
+  const apply = async (id: string) => {
+    if (!currentId) return;
+    try {
+      const r = await fetch(`/api/sessions/${currentId}/method`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+      if (r.ok) {
+        setActive(id);
+        setApplied(id);
+      }
+    } catch { /* stays unapplied */ }
+  };
+
+  return (
+    <section className="rounded-lg bg-panel p-3 flex flex-col gap-1.5">
+      <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em]">
+        method
+      </h3>
+      <p className="text-[11.5px] text-muted -mt-0.5">
+        set this chat up for what you're doing — prompt, sampling, thinking
+        and a notes template in one click
+      </p>
+      <ul className="flex flex-col gap-1 mt-1">
+        {methods.map((m) => {
+          const open = expanded === m.id;
+          return (
+            <li key={m.id} className="rounded-md bg-surface/60">
+              <button
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left"
+                onClick={() => setExpanded(open ? "" : m.id)}
+                aria-expanded={open}
+              >
+                <span className={`font-mono text-[11px] ${
+                  active === m.id ? "text-moss" : "text-muted"}`}>
+                  {active === m.id ? "●" : "○"}
+                </span>
+                <span className="text-[12.5px] text-primary">{m.name}</span>
+                <span className="flex-1 truncate text-[11px] text-muted">
+                  {m.tagline}
+                </span>
+                <span className="font-mono text-[11px] text-muted">
+                  {open ? "▾" : "▸"}
+                </span>
+              </button>
+              {open && (
+                <div className="px-2.5 pb-2 flex flex-col gap-1.5">
+                  <ul className="flex flex-col gap-1">
+                    {m.guide.map((g, i) => (
+                      <li key={i} className="text-[11.5px] text-secondary flex gap-1.5">
+                        <span className="text-muted">·</span>
+                        <span>{g}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <button
+                    onClick={() => void apply(m.id)}
+                    className="self-start rounded-md bg-amber/15 text-amber px-2.5 py-1 text-[12px] font-semibold"
+                  >
+                    {applied === m.id ? "applied ✓"
+                      : active === m.id ? "re-apply" : "use this method"}
+                  </button>
+                  {applied === m.id && (
+                    <p className="text-[11px] text-muted">
+                      prompt, sampling, effort and tools set — notes got the
+                      template only if they were empty
+                    </p>
+                  )}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 // rendered inside the draggable FloatWindow — no layout chrome of its own
 export default function Sidecar() {
   return (
     <>
+      <MethodCard />
       <GroundingCard />
       <SamplingCard />
     </>
