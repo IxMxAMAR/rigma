@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import context
+from . import methods_api
 from . import mission as _mission_mod
 from . import presets
 from . import runtime
@@ -2988,23 +2989,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             _runs.set_status(r, "stopped", "stopped by user")
         return _runs.load(rid)
 
-    @app.get("/api/methods")
-    async def list_methods():
-        """Workflow methods: one-click activity setups (This Chat panel)."""
-        from . import methods as _methods
-        return {"methods": _methods.catalog()}
+    async def _macro_drive_turn(session) -> str:
+        """One real agentic turn for a macro `prompt` step: same generator and
+        same idle watchdog as an autonomous run. Returns the assistant text."""
+        await _drain_turn(session)
+        fresh = sessions.load(session["id"]) or session
+        session["messages"] = fresh.get("messages", [])
+        return next((str(mm.get("content") or "")
+                     for mm in reversed(session["messages"])
+                     if mm.get("role") == "assistant"), "")
 
-    @app.post("/api/sessions/{sid}/method")
-    async def apply_method(sid: str, body: dict):
-        from . import methods as _methods
-        s = sessions.load(sid)
-        if s is None:
-            return JSONResponse({"error": "no such session"}, status_code=404)
-        out = _methods.apply_to_session(s, str((body or {}).get("id", "")))
-        if out is None:
-            return JSONResponse({"error": "no such method"}, status_code=404)
-        sessions.save(out)
-        return out
+    def _macro_tool_ctx(session) -> dict:
+        return {"allow_code": bool(session.get("allow_code")),
+                "workspace": session.get("workspace") or "",
+                "session_id": session.get("id", "")}
+
+    methods_api.register(app, sse=_sse, drive_turn=_macro_drive_turn,
+                         aux_complete=_aux_complete,
+                         tool_ctx_for=_macro_tool_ctx)
 
     @app.post("/api/sessions/{sid}/ritual")
     async def run_ritual(sid: str):
