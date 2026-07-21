@@ -132,6 +132,9 @@ LIVE_RESULT_MAX = 900   # per tool-result entry in the feed (display only)
 _BOOKKEEPING_TOOLS = {"manage_plan", "task_complete"}
 K_ERROR = 8             # consecutive all-error turns before "stalled"
 K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
+K_STEP_ATTEMPTS = 6     # turns spent on ONE plan step before it's marked
+                        # blocked and the run routes around it — the graded
+                        # response between "keep hammering" and "give up"
 M_FROZEN = 2            # consecutive frozen turns before "frozen"
 T_REMIND_SECS = 600     # (unused directly; cadence is turn-based below)
 K_REMIND = 8            # anti-restart checkpoint every N turns. The mission is
@@ -2081,6 +2084,63 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return await _mem.harvest_run(actions, _memory_store(), _complete_async,
                                       run_id=run_id)
 
+    async def _aux_complete(prompt: str, max_tokens: int = 120) -> str:
+        """One small fresh-context completion on the aux slot, thinking off.
+        Returns "" on any failure — aux calls are never load-bearing."""
+        try:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": prompt}],
+                      "stream": False, "temperature": 0.2,
+                      "max_tokens": max_tokens, "id_slot": AUX_SLOT,
+                      "chat_template_kwargs": {"enable_thinking": False}},
+                timeout=120.0)
+            if resp.status_code != 200:
+                return ""
+            return resp.json()["choices"][0]["message"]["content"] or ""
+        except Exception:
+            return ""
+
+    async def _content_judge(step: dict, run: dict) -> tuple[bool, str]:
+        """Acceptance check for a content_check step: a separate LLM call in a
+        FRESH context (same pattern as the memory conflict gate — the run's
+        own context never judges its own work). Ambiguity resolves to PASS:
+        a flaky judge must never brick a run."""
+        text = (await _aux_complete(
+            _mission_mod.content_judge_prompt(step, run.get("workspace", "")),
+            max_tokens=60)).strip()
+        head = text.split(None, 1)
+        verdict = (head[0] if head else "").upper().strip(".:,!")
+        if verdict == "FAIL":
+            why = head[1].strip() if len(head) > 1 else ""
+            return False, (why[:200] or "failed its acceptance check")
+        return True, ""
+
+    async def _reflect(run: dict) -> str:
+        """In-run reflection (Reflexion, adapted for a weak model): when the
+        run is demonstrably circling but still alive, a fresh-context advisor
+        reads a DISTILLED action summary — never the raw transcript, per the
+        anchoring guard — and returns a two-line diagnosis that is injected
+        through the steer queue, the register the model actually obeys."""
+        from . import runs as _runs
+        rows = _runs.read_actions(run["id"])[-6:]
+        if not rows:
+            return ""
+        lines = [f"{r.get('tool', '?')}({str(r.get('args', ''))[:80]}) -> "
+                 f"{'ok' if r.get('ok') else 'ERROR'}" for r in rows]
+        pend = _runs.pending_tasks(run["id"])
+        step_txt = pend[0]["text"] if pend else "(no pending step)"
+        text = (await _aux_complete(
+            "You are a debugging advisor for an autonomous agent that is "
+            "going in circles.\nIts current step: " + step_txt + "\n"
+            "Its recent actions (newest last):\n" + "\n".join(lines) + "\n\n"
+            "Reply with exactly two lines:\n"
+            "DIAGNOSIS: <one sentence — what is going wrong>\n"
+            "NEXT: <one concrete different action to try>")).strip()
+        if "DIAGNOSIS" not in text.upper():
+            return ""
+        return "ADVISOR: " + text[:400]
+
     async def _run_loop(run_id):
         import time as _time
 
@@ -2129,6 +2189,34 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _score_current_step(run, -2)
                         _runs.set_status(run, "stalled", "no progress / idle")
                         break
+                # In-run reflection: at HALF the error budget, or the second
+                # lazy strike — the moments the run is demonstrably circling
+                # but still alive. All learning used to be post-mortem; a
+                # struggling run could not rescue itself.
+                try:
+                    want_err = (run.get("error_streak", 0) >= K_ERROR // 2
+                                and not run.get("_reflected_err"))
+                    want_lazy = (run.get("lazy_streak", 0) >= 2
+                                 and not run.get("_reflected_lazy"))
+                    if want_err or want_lazy:
+                        run["_reflected_err" if want_err
+                            else "_reflected_lazy"] = True
+                        advice = await _reflect(run)
+                        if advice:
+                            run.setdefault("steer_queue", []).append(advice)
+                            pend_r = _runs.pending_tasks(run_id)
+                            run["_last_reflection"] = {
+                                "text": advice,
+                                "step": pend_r[0]["id"] if pend_r else None}
+                            # give the advice a fair number of turns
+                            run["error_streak"] = min(
+                                run.get("error_streak", 0), K_ERROR // 4)
+                            _runs.append_progress(
+                                run_id, "advisor: " + advice[:120],
+                                "apply the advice", run.get("workspace", ""))
+                        _runs.save(run)
+                except Exception:
+                    _log.exception("reflection failed")
                 session = sessions.load(sid)
                 if session is None:
                     _runs.set_status(run, "error", "session was deleted")
@@ -2394,6 +2482,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                  for t in trace
                                  if t.get("name") == "task_complete"), "")
                     run["summary"] = str(summ)[:2000]
+                    blocked = _runs.blocked_tasks(run_id)
+                    if blocked:
+                        # honesty over gloss: steps the run routed around are
+                        # reported, never silently absorbed into "done"
+                        run["summary"] = (run["summary"]
+                                          + "\n\nBLOCKED (not completed): "
+                                          + "; ".join(
+                                              f"#{t['id']} {t['text']} — "
+                                              f"{t.get('blocked_reason', '')}"
+                                              for t in blocked))[:2400]
                     _runs.set_status(run, "done", "task_complete (verified)")
                     break
                 run["_verify_pending"] = False
@@ -2460,7 +2558,47 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         if st_spec and st_spec.get("artifact"):
                             done_now, why = _mission_mod.verify_step(
                                 st_spec, run.get("workspace", ""))
+                        if done_now and st_spec and str(
+                                (st_spec.get("verification") or {})
+                                .get("type", "")) == "content_check":
+                            # existence passed; now the CONTENT is judged in a
+                            # fresh context — "the server decides doneness"
+                            # used to mean "the file is big enough"
+                            ok_c, why_c = await _content_judge(st_spec, run)
+                            if not ok_c:
+                                done_now = False
+                                fail = (f"step #{cur['id']}: "
+                                        f"{st_spec.get('artifact', 'the file')}"
+                                        f" exists but fails its check: {why_c}")
+                                if run.get("_last_content_fail") != fail:
+                                    run["_last_content_fail"] = fail
+                                    run.setdefault("steer_queue", []).append(
+                                        fail + " — fix the CONTENT of that "
+                                        "file, then continue.")
+                                _runs.append_progress(
+                                    run_id, "content check failed", fail,
+                                    run.get("workspace", ""))
                         if done_now:
+                            # a completed step right after advisor advice on
+                            # that same step = a technique worth keeping —
+                            # populating the memory kind that existed in
+                            # retrieval but was never written
+                            lr = run.get("_last_reflection") or {}
+                            if (str(lr.get("step")) == str(cur["id"])
+                                    and lr.get("text")
+                                    and os.environ.get("RIGMA_MEMORY") != "0"):
+                                try:
+                                    from . import memory as _mem2
+                                    tech = str(lr["text"]).replace(
+                                        "ADVISOR:", "").strip()
+                                    asyncio.ensure_future(
+                                        _mem2.add_consolidated(
+                                            _memory_store(), "technique",
+                                            "When stuck: " + tech[:280],
+                                            _aux_complete, run_id=run_id))
+                                except Exception:
+                                    pass
+                                run["_last_reflection"] = None
                             _runs.plan_complete(run_id, cur["id"])
                             _runs.append_progress(
                                 run_id, f"step #{cur['id']} complete "
@@ -2495,8 +2633,49 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 else:
                     run.update(error_streak=0, lazy_streak=0,
                                completion_checked=False,
+                               _reflected_err=False, _reflected_lazy=False,
                                last_progress_at=_time.time())
                 prev_sig = sig
+                # PER-STEP attempt budget: N turns on the same pending step
+                # without it completing -> mark it blocked and route around.
+                # The streaks are global — one impossible step used to hold
+                # the whole remaining plan hostage until 8 all-error turns
+                # killed the run entirely.
+                try:
+                    pend_now = _runs.pending_tasks(run_id)
+                    cur_id = pend_now[0]["id"] if pend_now else None
+                    if cur_id is None or cur_id != run.get("_cur_step_id"):
+                        run["_cur_step_id"], run["_step_turns"] = cur_id, 0
+                    elif trace:
+                        run["_step_turns"] = run.get("_step_turns", 0) + 1
+                        if run["_step_turns"] >= K_STEP_ATTEMPTS:
+                            last_err = next(
+                                (str(t.get("result", ""))[:160]
+                                 for t in reversed(trace)
+                                 if str(t.get("result", ""))
+                                 .startswith("error")),
+                                "no verifiable progress")
+                            _runs.plan_block(run_id, cur_id, last_err)
+                            nxt = (_runs.next_pending(run_id)
+                                   or "verify and finish")
+                            _runs.append_progress(
+                                run_id,
+                                f"step #{cur_id} BLOCKED after "
+                                f"{K_STEP_ATTEMPTS} attempts "
+                                f"({last_err[:80]})",
+                                nxt, run.get("workspace", ""))
+                            run.setdefault("steer_queue", []).append(
+                                f"Step #{cur_id} is now BLOCKED (attempted "
+                                f"{K_STEP_ATTEMPTS} times: {last_err[:120]})."
+                                f" SKIP it — do NOT retry it. Move on to: "
+                                f"{nxt}. Blocked steps are reported honestly "
+                                "at the end.")
+                            # the block IS the graded response — don't let the
+                            # global streak double-punish the same failure
+                            run["error_streak"] = 0
+                            run["_cur_step_id"], run["_step_turns"] = None, 0
+                except Exception:
+                    _log.exception("step-budget accounting failed")
                 run["iteration"] = run.get("iteration", 0) + 1
                 _runs.save(run)
         except asyncio.CancelledError:
@@ -2712,6 +2891,77 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         _runs.save(r)
         return r
 
+    @app.post("/api/runs/{rid}/restart")
+    async def restart_run(rid: str):
+        """Reattach a loop to a terminal run. Everything a run needs survives
+        on disk (run.json, plan.json, spec, transcript, artifacts) — yet a
+        crash or reboot used to convert a 19-hour job into total loss. The
+        plan is reconciled against reality first, so restarting is idempotent
+        and even a stalled run can be retried after the owner fixes the
+        environment."""
+        import time as _time
+
+        from . import runs as _runs
+        r = _runs.load(rid)
+        if r is None:
+            return JSONResponse({"error": "no such run"}, status_code=404)
+        if r.get("status") not in _runs.RESTARTABLE:
+            return JSONResponse(
+                {"error": f"run is {r.get('status')} — only "
+                          f"{', '.join(sorted(_runs.RESTARTABLE))} restart"},
+                status_code=409)
+        a = _runs.active()
+        if a is not None and a.get("id") != rid:
+            return JSONResponse({"error": "another run is active — stop it "
+                                          "first"}, status_code=409)
+        s = st.server_running()
+        if s is None or s.get("unloaded"):
+            return JSONResponse({"error": "no model is loaded — load one "
+                                          "first"}, status_code=409)
+        sess = sessions.load(r.get("session_id", ""))
+        if sess is None:
+            return JSONResponse({"error": "the run's chat session was "
+                                          "deleted"}, status_code=409)
+        # reconcile the plan against the DISK: any step whose artifact now
+        # verifies is done, whatever the plan file says — same "server
+        # decides doneness" principle as the live loop
+        recovered = []
+        for st_ in (r.get("spec") or {}).get("steps", []):
+            ok_, _why = _mission_mod.verify_step(st_, r.get("workspace", ""))
+            if ok_ and st_.get("artifact"):
+                for t in _runs.read_plan(rid):
+                    if (t.get("text") == st_.get("description")
+                            and t.get("status") == "pending"):
+                        _runs.plan_complete(rid, t["id"])
+                        recovered.append(t["id"])
+        # rehydrate volatile loop state
+        r.update(status="running", paused=False, error_streak=0,
+                 lazy_streak=0, completion_checked=False,
+                 force_completion=False, _verify_pending=False,
+                 _challenge_pending=False, _step_turns=0, _cur_step_id=None,
+                 _reflected_err=False, _reflected_lazy=False,
+                 halt_reason="")
+        # a used-up or nearly-used-up clock gets a grace hour — a restart
+        # exists to finish work, not to instantly re-die on the old deadline
+        if r.get("deadline", 0) < _time.time() + 900:
+            r["deadline"] = _time.time() + 3600
+        done = _runs.done_summary(rid)
+        nxt = _runs.next_pending(rid) or "verify the work and finish"
+        r.setdefault("steer_queue", []).append(
+            "RESUMED after an interruption. Nothing was lost."
+            + (f" Already done: {done}." if done else "")
+            + f" Continue with: {nxt}. Do NOT restart earlier steps.")
+        _runs.save(r)
+        _runs._atomic_write(_runs._active_path(), json.dumps({"id": rid}))
+        # the run's finally-block cleared the session's mission linkage
+        sess["mission"] = sess.get("mission") or _mission_mod.spec_block(
+            r.get("spec") or {}, r.get("mission", "")) or r.get("mission", "")
+        sess["run_id"] = rid
+        sessions.save(sess)
+        _run_tasks[rid] = asyncio.create_task(_run_loop(rid))
+        return {"restarted": True, "recovered_steps": recovered,
+                "next": nxt}
+
     @app.post("/api/runs/{rid}/inject")
     async def inject_run(rid: str, body: dict):
         from . import runs as _runs
@@ -2760,7 +3010,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         try:
             a = _runs.active()
             if a and a.get("status") in ("running", "paused"):
-                _runs.set_status(a, "stopped", "server restarted mid-run")
+                # 'interrupted', NOT 'stopped': the user never asked for this,
+                # and everything needed to continue is still on disk — the UI
+                # offers Resume for exactly this state
+                _runs.set_status(a, "interrupted", "server restarted mid-run")
         except Exception:
             _log.exception("startup: run reconciliation failed")
 

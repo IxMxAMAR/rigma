@@ -34,7 +34,10 @@ Rules:
   "naming.md", never an absolute path, and NEVER invent folders. The single
   exception: if the user themselves wrote an absolute path, keep it exactly.
 - `verification` says how a step is checked: "file_min_size" with a byte count
-  for anything written, "none" for pure exploration steps.
+  for anything written, "none" for pure exploration steps. When the CONTENT
+  matters (not just that a file exists), use "content_check" with a one-line
+  acceptance criterion instead, e.g.
+  {"type": "content_check", "value": "contains 25 distinct outfit prompts"}.
 - Output ONLY the JSON object. No commentary, no markdown fence.
 
 JSON shape:
@@ -73,12 +76,20 @@ def parse_spec(text: str):
         if not desc:
             continue
         ver = s.get("verification") if isinstance(s.get("verification"), dict) else {}
+        vtype = str(ver.get("type", "none"))
+        if vtype == "content_check":
+            # the value is a one-line acceptance criterion, not a byte count
+            value = str(ver.get("value", "") or "")[:200]
+        else:
+            try:
+                value = int(ver.get("value", 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
         clean.append({
             "id": i,
             "description": desc[:300],
             "artifact": str(s.get("artifact") or s.get("expected_artifact") or ""),
-            "verification": {"type": str(ver.get("type", "none")),
-                             "value": int(ver.get("value", 0) or 0)},
+            "verification": {"type": vtype, "value": value},
         })
     if not clean:
         return None
@@ -127,15 +138,17 @@ def spec_block(spec: dict, raw: str) -> str:
 
 def verify_step(step: dict, workspace: str = "") -> tuple[bool, str]:
     """Check a step's artifact ON DISK. (ok, reason) — the point is that the
-    server decides a step is done, not the model."""
+    server decides a step is done, not the model.
+
+    content_check verifies EXISTENCE here (sync, cheap); the acceptance
+    criterion itself is judged by a separate fresh-context LLM call in the
+    run loop (serve._content_judge) — never in this sync path."""
     ver = step.get("verification") or {}
     kind = str(ver.get("type", "none"))
     target = str(step.get("artifact") or "")
     if kind == "none" or not target:
         return True, ""
-    p = Path(target)
-    if not p.is_absolute() and workspace:
-        p = Path(workspace) / target
+    p = artifact_path(step, workspace)
     if not p.exists():
         return False, f"{p} does not exist"
     if kind == "file_min_size":
@@ -143,7 +156,39 @@ def verify_step(step: dict, workspace: str = "") -> tuple[bool, str]:
         want = int(ver.get("value", 0) or 0)
         if size < want:
             return False, f"{p.name} is only {size} bytes (expected >= {want})"
+    if kind == "content_check" and p.stat().st_size == 0:
+        return False, f"{p.name} is empty"
     return True, ""
+
+
+def artifact_path(step: dict, workspace: str = "") -> Path:
+    target = str(step.get("artifact") or "")
+    p = Path(target)
+    if not p.is_absolute() and workspace:
+        p = Path(workspace) / target
+    return p
+
+
+def content_judge_prompt(step: dict, workspace: str = "") -> str:
+    """The fresh-context acceptance-check prompt for a content_check step.
+    One-word verdict + one sentence; ambiguity resolves to PASS in the caller
+    (a flaky judge must never brick a run — same doctrine as the memory
+    conflict gate)."""
+    p = artifact_path(step, workspace)
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    excerpt = text[:2000] + ("\n…\n" + text[-2000:] if len(text) > 4000
+                             else text[2000:4000])
+    crit = str((step.get("verification") or {}).get("value", ""))
+    return (
+        "You are checking one file produced by an autonomous agent.\n"
+        f"The step was: {step.get('description', '')}\n"
+        f"Acceptance criterion: {crit}\n\n"
+        f"File content ({p.name}, excerpt):\n{excerpt}\n\n"
+        "Does the file meet the criterion? Reply with exactly one word, "
+        "PASS or FAIL, then one short sentence explaining why.")
 
 
 def anchor_spec(spec: dict, workspace: str = "") -> dict:

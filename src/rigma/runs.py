@@ -16,7 +16,12 @@ from pathlib import Path
 from .runtime import rigma_home
 
 # terminal statuses release the active-run pointer
-TERMINAL = {"done", "stalled", "frozen", "budget_exhausted", "stopped", "error"}
+TERMINAL = {"done", "stalled", "frozen", "budget_exhausted", "stopped",
+            "error", "interrupted"}
+# terminal states a run can be RESTARTED from (everything needed to continue
+# is on disk; "done" stays done)
+RESTARTABLE = {"interrupted", "stopped", "stalled", "frozen",
+               "budget_exhausted", "error"}
 PROFILES = {"all", "no-network", "no-delete", "confined"}
 MAX_ITERS = 2000
 BUDGET_HOURS_DEFAULT = 8.0
@@ -162,6 +167,26 @@ def plan_update(run_id: str, task_id, text: str) -> bool:
             hit = True
     write_plan(run_id, plan)
     return hit
+
+
+def plan_block(run_id: str, task_id, reason: str = "") -> bool:
+    """Mark a step blocked so the run can route AROUND it. Before this, one
+    impossible step held the whole remaining plan hostage until the global
+    error streak killed the run — the classic naive-loop failure: nothing
+    between 'keep hammering' and 'give up entirely'."""
+    plan = read_plan(run_id)
+    hit = False
+    for t in plan:
+        if str(t.get("id")) == str(task_id):
+            t["status"] = "blocked"
+            t["blocked_reason"] = str(reason)[:200]
+            hit = True
+    write_plan(run_id, plan)
+    return hit
+
+
+def blocked_tasks(run_id: str) -> list:
+    return [t for t in read_plan(run_id) if t.get("status") == "blocked"]
 
 
 def pending_tasks(run_id: str) -> list:

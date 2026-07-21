@@ -109,7 +109,11 @@ def test_a_reboot_does_not_strand_the_active_run(engine):
     c2 = _client(engine)
     r2 = c2.post("/api/runs", json={"mission": "y", "budget_hours": 1})
     assert r2.status_code == 200, r2.json()
-    assert runs.load(rid)["status"] == "stopped"
+    # "interrupted", not "stopped": the user never asked for this and the run
+    # is restartable from disk (phase 4) — the point of THIS test is only
+    # that the orphan is terminal and new runs are not blocked
+    assert runs.load(rid)["status"] == "interrupted"
+    assert runs.load(rid)["status"] in runs.RESTARTABLE
 
 
 def test_delegate_runs_in_a_fresh_context_and_returns_one_answer(engine):
