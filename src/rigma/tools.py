@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
@@ -359,9 +360,12 @@ def _fmt_results(hits, q):
 
 @tool("fetch_url",
       "Fetch a web page and return its readable text (tags stripped). Use to "
-      "read a page a search turned up.",
+      "read a page a search turned up. Long pages come back in 6000-char "
+      "pages — the reply tells you the exact offset to continue with.",
       {"type": "object", "properties": {
-          "url": {"type": "string", "description": "the http(s) URL to fetch"}},
+          "url": {"type": "string", "description": "the http(s) URL to fetch"},
+          "offset": {"type": "integer", "description": "character position to "
+                     "continue from (given by a previous truncated fetch)"}},
        "required": ["url"]})
 def _fetch_url(args, ctx):
     url = str(args.get("url", "")).strip()
@@ -372,7 +376,23 @@ def _fetch_url(args, ctx):
                   raw)
     text = _strip(re.sub(r"(?s)<[^>]+>", " ", body))
     text = re.sub(r"\s+\n", "\n", re.sub(r"[ \t]+", " ", text)).strip()
-    return text[:6000] + ("\n…(truncated)" if len(text) > 6000 else "")
+    # paged like read_file — the old hard cut left the rest of a long page
+    # literally unreadable; spell out the NEXT call, models don't infer paging
+    try:
+        off = max(0, int(args.get("offset", 0) or 0))
+    except (TypeError, ValueError):
+        off = 0
+    total = len(text)
+    page = text[off:off + 6000]
+    if not page:
+        return f"(no text at offset {off}; the page has {total} chars)"
+    end = off + len(page)
+    if end < total:
+        return page + (f"\n…(chars {off + 1}-{end} of {total} — call "
+                       f"fetch_url again with offset={end} to continue)")
+    if off:
+        return page + f"\n(chars {off + 1}-{total} of {total} — end of page)"
+    return page
 
 
 @tool("calculator",
@@ -917,6 +937,133 @@ def _grep(args, ctx):
     return "\n".join(out) if out else "no matches"
 
 
+# --- write-safety net ---------------------------------------------------------
+# Before write_file replaces or edit_file changes a file, its current content
+# is snapshotted so undo_last_change can restore it. The loud REPLACED warning
+# was post-hoc — it fired AFTER the draft was already destroyed (live
+# 2026-07-21: a 15,389-char chapter silently replaced by 8,766 chars, with no
+# recovery path). A safety net must never block the write: all failures here
+# are swallowed.
+
+def _undo_dir() -> Path:
+    from .runtime import rigma_home
+    d = rigma_home() / "undo"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _undo_index(d: Path) -> dict:
+    f = d / "index.json"
+    try:
+        return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    except Exception:
+        return {}
+
+
+def _snapshot_before_write(p: Path) -> None:
+    try:
+        if not p.is_file():
+            return
+        import hashlib
+        d = _undo_dir()
+        h = hashlib.sha1(str(p).encode("utf-8", "replace")).hexdigest()[:12]
+        snap = d / f"{h}-{p.name}"
+        snap.write_bytes(p.read_bytes())
+        idx = _undo_index(d)
+        idx[str(p)] = {"snap": snap.name, "ts": time.time()}
+        (d / "index.json").write_text(json.dumps(idx, indent=1),
+                                      encoding="utf-8")
+    except Exception:
+        pass
+
+
+@tool("undo_last_change",
+      "Restore a file to how it was BEFORE your last write_file/edit_file "
+      "changed it. Pass `path` for a specific file; omit it to undo the most "
+      "recent change. Calling it again swaps back (undo of the undo).",
+      {"type": "object", "properties": {
+          "path": {"type": "string", "description": "the file to restore "
+                   "(default: the most recently changed one)"}}},
+      safe=False, needs="code")
+def _undo_last_change(args, ctx):
+    d = _undo_dir()
+    idx = _undo_index(d)
+    if not idx:
+        return ("error: nothing to undo — no write_file/edit_file change "
+                "has been recorded")
+    raw = str(args.get("path", "") or "").strip()
+    if raw:
+        p = _ws_path(ctx, raw)
+        entry = idx.get(str(p))
+        if entry is None:
+            return f"error: no recorded change for {raw}"
+        key = str(p)
+    else:
+        key = max(idx, key=lambda k: idx[k].get("ts", 0))
+        p = Path(key)
+        entry = idx[key]
+    snap = d / entry["snap"]
+    if not snap.is_file():
+        return "error: the saved version is gone — cannot undo"
+    try:
+        current = p.read_bytes() if p.is_file() else None
+        restored = snap.read_bytes()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(restored)
+        if current is not None:
+            snap.write_bytes(current)          # swap → undo is redoable
+            idx[key]["ts"] = time.time()
+            (d / "index.json").write_text(json.dumps(idx, indent=1),
+                                          encoding="utf-8")
+        return (f"restored {p.name} to the previous version "
+                f"({len(restored)} bytes). Call undo_last_change again to "
+                "swap back if this was wrong.")
+    except OSError as e:
+        return f"error: could not restore: {e}"
+
+
+def _flexible_find(text: str, old: str):
+    """Whitespace-flexible search: same tokens, any spacing/indentation.
+    Returns a (start, end) span if exactly one match, the match count if
+    several, or None if none/unusable."""
+    toks = old.split()
+    if not toks or len(toks) > 400:
+        return None
+    try:
+        pat = re.compile(r"[ \t\r\n]+".join(re.escape(t) for t in toks))
+    except re.error:
+        return None
+    ms = []
+    for m in pat.finditer(text):
+        ms.append(m)
+        if len(ms) > 2:
+            break
+    if len(ms) == 1:
+        return ms[0].span()
+    return len(ms) if ms else None
+
+
+def _nearest_region(text: str, old: str) -> str:
+    """The closest-matching few lines of the file, so the model can correct
+    its 'old' text in ONE turn instead of burning a read_file round-trip."""
+    import difflib
+    probe = next((ln.strip() for ln in old.splitlines() if ln.strip()), "")
+    if not probe:
+        return ""
+    lines = text.splitlines()
+    best_i, best_r = -1, 0.0
+    for i, line in enumerate(lines[:5000]):
+        r = difflib.SequenceMatcher(None, probe, line.strip()).ratio()
+        if r > best_r:
+            best_i, best_r = i, r
+    if best_i < 0 or best_r < 0.55:
+        return ""
+    lo, hi = max(0, best_i - 2), min(len(lines), best_i + 3)
+    excerpt = "\n".join(f"{j + 1}: {lines[j][:160]}" for j in range(lo, hi))
+    return ("\nThe closest matching region in the file is:\n" + excerpt
+            + "\nCopy the EXACT text from there into 'old'.")
+
+
 @tool("edit_file",
       "Replace an exact string in a workspace file with a new string (the old "
       "string must appear exactly once). Use for surgical edits.",
@@ -931,17 +1078,42 @@ def _edit_file(args, ctx):
         return f"error: no such file: {args.get('path')}"
     text = p.read_text(encoding="utf-8")
     old = str(args.get("old", ""))
-    n = text.count(old)
-    if n == 0:
-        return ("error: the 'old' string wasn't found EXACTLY — check for "
-                "mismatched indentation/whitespace or stray markdown backticks; "
-                "read_file first to copy the exact text")
+    new = str(args.get("new", ""))
+    n = text.count(old) if old else 0
+    if n == 1:
+        _snapshot_before_write(p)
+        p.write_text(text.replace(old, new, 1), encoding="utf-8")
+        return f"edited {args.get('path')}"
     if n > 1:
-        return (f"error: the 'old' string appears {n} times — add surrounding "
-                "lines to make it unique")
-    p.write_text(text.replace(old, str(args.get("new", "")), 1),
-                 encoding="utf-8")
-    return f"edited {args.get('path')}"
+        # say WHERE, so extending `old` with surrounding lines is a one-turn
+        # fix instead of a guess
+        locs, start = [], 0
+        while len(locs) < 8:
+            i = text.find(old, start)
+            if i < 0:
+                break
+            locs.append(text[:i].count("\n") + 1)
+            start = i + 1
+        return (f"error: the 'old' string appears {n} times (lines "
+                f"{', '.join(map(str, locs))}) — add surrounding lines to "
+                "make it unique")
+    # not found exactly: models reproduce copied text with drifted whitespace,
+    # so retry with flexible spacing before giving up (same philosophy as
+    # _fuzzy_file for filenames)
+    m = _flexible_find(text, old)
+    if isinstance(m, tuple):
+        _snapshot_before_write(p)
+        p.write_text(text[:m[0]] + new + text[m[1]:], encoding="utf-8")
+        return (f"edited {args.get('path')} (note: your 'old' text differed "
+                "from the file in whitespace/indentation only — matched it "
+                "flexibly and applied the edit)")
+    if isinstance(m, int):
+        return (f"error: the 'old' string matches {m}+ places (ignoring "
+                "whitespace) — add surrounding lines to make it unique")
+    return ("error: the 'old' string wasn't found EXACTLY — check for "
+            "mismatched indentation/whitespace or stray markdown backticks."
+            + (_nearest_region(text, old)
+               or "\nread_file first to copy the exact text"))
 
 
 @tool("read_file",
@@ -1134,6 +1306,8 @@ def _write_file(args, ctx):
             f.write(content)
         return (f"appended {len(content)} chars to {args.get('path')} "
                 f"(file is now {old_len + len(content)} chars)")
+    if existed:
+        _snapshot_before_write(p)      # replaced content is recoverable now
     p.write_text(content, encoding="utf-8")
     if existed:
         # Loud on purpose. Live 2026-07-21: the model wrote a 15,389-char
@@ -1141,8 +1315,9 @@ def _write_file(args, ctx):
         # "wrote 8766 chars" gave it no way to notice it had just destroyed
         # its own draft. The replaced size is the signal.
         return (f"wrote {len(content)} chars to {args.get('path')} — REPLACED "
-                f"the previous {old_len}-char version, which is now GONE. If "
-                "you meant to continue the file, use append=true next time.")
+                f"the previous {old_len}-char version. If that was a mistake, "
+                "call undo_last_change to restore it; if you meant to "
+                "continue the file, use append=true next time.")
     return f"wrote {len(content)} chars to {args.get('path')}"
 
 
