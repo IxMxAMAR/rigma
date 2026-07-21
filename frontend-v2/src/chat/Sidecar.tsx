@@ -2,6 +2,7 @@
 // Collapsible; state persists to the session via the existing PATCH API.
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { type MacroDef, type Method } from "../lib/methods";
 import { useApp } from "../store";
 import { useChat } from "./chatStore";
 
@@ -274,19 +275,6 @@ function SamplingCard() {
   );
 }
 
-interface MacroDef {
-  id: string;
-  label: string;
-  hint?: string;
-}
-
-interface Method {
-  id: string;
-  name: string;
-  tagline: string;
-  guide: string[];
-  macros?: MacroDef[];
-}
 
 // One-click workflow setups: prompt + sampler profile + effort + tool
 // posture + a Notes template + the how-to guide, per activity. The method
