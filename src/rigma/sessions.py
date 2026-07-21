@@ -57,6 +57,37 @@ def _path(session_id: str) -> Path:
     return chats_dir() / f"{session_id}.json"
 
 
+# one-time legacy import, tracked per db path (tests re-home per test)
+_imported: set[str] = set()
+
+
+def _import_legacy() -> None:
+    """Pull pre-SQLite chat files into the database ONCE, leaving the files
+    in place as a backup (never written again). Idempotent and cheap: one
+    id-set query, then only unknown files are parsed."""
+    from . import db
+    key = str(db.db_path())
+    if key in _imported:
+        return
+    _imported.add(key)
+    try:
+        d = rigma_home() / "sessions" / "chats"
+        if not d.is_dir():
+            return
+        known = db.known_ids()
+        for f in d.glob("*.json"):
+            if f.stem in known:
+                continue
+            try:
+                raw = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue          # corrupt file: skip, never fatal
+            if raw.get("id"):
+                db.upsert_session(raw)
+    except Exception:
+        pass                      # import is a nicety; the db still works
+
+
 def create(title: str = "New chat", system_prompt: str = "") -> dict:
     now = time.time()
     session = {**json.loads(json.dumps(_SESSION_DEFAULTS)),
@@ -68,18 +99,20 @@ def create(title: str = "New chat", system_prompt: str = "") -> dict:
 
 
 def save(session: dict) -> None:
+    from . import db
+    _import_legacy()
     session["updated_at"] = time.time()
-    p = _path(session["id"])
-    # unique tmp name: concurrent saves of the same session (turn finishing
-    # while a param edit lands from a thread) must not tear each other's file
-    tmp = p.with_suffix(f".{secrets.token_hex(4)}.tmp")
-    tmp.write_text(json.dumps(session, indent=2), encoding="utf-8")
-    tmp.replace(p)   # atomic on same volume - no torn session files
+    db.upsert_session(session)
 
 
 def load(session_id: str) -> dict | None:
+    from . import db
+    _import_legacy()
+    body = db.get_session_body(session_id)
+    if body is None:
+        return None
     try:
-        raw = json.loads(_path(session_id).read_text(encoding="utf-8"))
+        raw = json.loads(body)
     except Exception:
         return None
     # migration: sessions written by older Rigma versions lack newer fields
@@ -93,24 +126,21 @@ def load(session_id: str) -> dict | None:
 
 
 def delete(session_id: str) -> bool:
-    p = _path(session_id)
-    if not p.exists():
-        return False
-    p.unlink()
-    return True
+    from . import db
+    _import_legacy()
+    hit = db.delete_session(session_id)
+    # a legacy file left in place would resurrect the chat at next import
+    try:
+        _path(session_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+    return hit
 
 
 def list_sessions() -> list[dict]:
-    out = []
-    for f in chats_dir().glob("*.json"):
-        s = load(f.stem)
-        if s is None:  # corrupt file: skip, never fatal
-            continue
-        out.append({"id": s["id"], "title": s.get("title", ""),
-                    "updated_at": s.get("updated_at", 0),
-                    "use_rag": bool(s.get("use_rag")),
-                    "message_count": len(s.get("messages", []))})
-    return sorted(out, key=lambda s: s["updated_at"], reverse=True)
+    from . import db
+    _import_legacy()
+    return db.list_summaries()
 
 
 # The tool doctrine: rules of engagement appended to every tool-enabled
@@ -300,31 +330,19 @@ def effective_params(session: dict, preset: dict | None = None,
 
 
 def search(query: str) -> list[dict]:
-    """Summaries (+ first matching snippet) for sessions whose title or
-    message bodies contain the query, case-insensitively."""
-    q = query.strip().lower()
-    if not q:
+    """Summaries (+ matching snippet) for sessions whose title or message
+    bodies contain the query. One indexed FTS/LIKE query instead of the old
+    parse-every-file-per-keystroke scan."""
+    from . import db
+    _import_legacy()
+    hits = db.search_sessions(query)
+    if not hits:
         return []
+    by_id = {s["id"]: s for s in list_sessions()}
     out = []
-    for summary in list_sessions():
-        s = load(summary["id"])
-        if s is None:
-            continue
-        snippet = ""
-        if q in s.get("title", "").lower():
-            snippet = s.get("title", "")
-        else:
-            for m in s.get("messages", []):
-                content = m.get("content", "")
-                if isinstance(content, list):   # vision parts
-                    content = " ".join(p.get("text", "") for p in content
-                                       if isinstance(p, dict))
-                pos = content.lower().find(q)
-                if pos != -1:
-                    lo = max(0, pos - 40)
-                    snippet = content[lo:pos + len(q) + 60].strip()
-                    break
-        if snippet:
+    for sid, snippet in hits:
+        summary = by_id.get(sid)
+        if summary:
             out.append({**summary, "snippet": snippet})
     return out
 
