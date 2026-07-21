@@ -102,20 +102,32 @@ def asks(steps: list[dict]) -> list[str]:
 
 # --- safety ---------------------------------------------------------------
 
-def is_effectful(steps: list[dict]) -> bool:
+def is_effectful(steps: list[dict], *, allow_code: bool = True) -> bool:
     """True if running this unattended could change something the user cares
     about. Conservative by construction: anything not on the read-only
-    allowlist counts, including every MCP tool."""
+    allowlist counts, including every MCP tool.
+
+    A `chat` prompt step counts too, and that is the subtle one. It drives a
+    REAL agentic turn, so the model may reach for write_file or run_shell on
+    its own -- a macro made only of prompts is not read-only just because it
+    declares no tool step. The gate is `allow_code`, because every write and
+    exec tool is registered needs="code"; with it off the turn physically
+    cannot be offered one. An `aux` prompt is always safe: fresh context, no
+    tools, and it never enters the transcript.
+    """
     for step in steps or []:
         kind = step.get("kind")
         if kind == "new_chat":
             return True
         if kind == "tool" and step.get("name") not in ms.SAFE_TOOLS:
             return True
+        if kind == "prompt" and step.get("to", "chat") == "chat" \
+                and allow_code:
+            return True
     return False
 
 
-def preview_line(macro: dict, ctx: dict) -> str:
+def preview_line(macro: dict, ctx: dict, *, allow_code: bool = True) -> str:
     """The confirm-bar sentence, generated FROM THE STEPS after substitution
     so it names the real files rather than a template."""
     bits: list[str] = []
@@ -127,6 +139,8 @@ def preview_line(macro: dict, ctx: dict) -> str:
             bits.append(f"{s['name']}" + (f" on {target}" if target else ""))
         elif kind == "new_chat":
             bits.append("open a new chat")
+        elif kind == "prompt" and s.get("to", "chat") == "chat" and allow_code:
+            bits.append("let the model use its tools")
     what = ", ".join(dict.fromkeys(bits)) or "read-only steps"
     return f"{macro.get('label') or macro.get('id')}: will run {what}"
 
