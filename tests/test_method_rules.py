@@ -49,10 +49,15 @@ def test_there_is_still_exactly_one_system_message():
 
 
 def test_a_method_without_rules_changes_nothing():
+    # every BUILT-IN ships a standing rule now, so use a rule-less user method
+    methods.save_user({
+        "id": "bare", "name": "Bare", "tagline": "t",
+        "apply": {"system_prompt": "just the prompt", "params": {},
+                  "effort": "auto", "use_tools": False, "allow_code": False,
+                  "notes_template": ""}})
     s = sessions.create("t")
-    methods.apply_to_session(s, "coding")
-    before = sessions.build_messages(s)[0]["content"]
-    assert "METHOD RULES" not in before
+    methods.apply_to_session(s, "bare")
+    assert "METHOD RULES" not in sessions.build_messages(s)[0]["content"]
 
 
 def test_an_unknown_method_id_is_survivable():
