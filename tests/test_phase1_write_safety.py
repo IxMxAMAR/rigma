@@ -43,7 +43,7 @@ def test_edit_miss_shows_nearest_region(tmp_path):
         "path": "b.txt", "old": "the quick brown wolf jumps",
         "new": "x"}, ctx)
     assert out.startswith("error")
-    assert "closest matching region" in out
+    assert "closest" in out and "region" in out
     assert "quick brown fox" in out               # the actual file text
     assert "2:" in out                            # with line numbers
 
@@ -255,3 +255,58 @@ def test_exact_star_edits_in_code_still_exact(tmp_path):
         "path": "m.py", "old": "a * b", "new": "a * b * c"}, ctx)
     assert out.startswith("edited")              # exact path, no healing
     assert (ws / "m.py").read_text(encoding="utf-8") == "x = a * b * c\n"
+
+
+# --- lexical drift (live autopsy 2026-07-21: 93% word overlap, 0 matches) -----
+def test_edit_heals_slight_word_drift(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "w.txt").write_text(
+        "She walked to the ancient tank at dawn, counting her breaths.\n"
+        "The city slept behind her, unaware of the morning's weight.\n"
+        "A letter waited in her pocket, unsent for three years now.\n",
+        encoding="utf-8")
+    # one word swapped ('old' for 'ancient'), one dropped ('now')
+    out = tools.run_tool("edit_file", {
+        "path": "w.txt",
+        "old": "She walked to the old tank at dawn, counting her breaths.\n"
+               "The city slept behind her, unaware of the morning's weight.\n"
+               "A letter waited in her pocket, unsent for three years.",
+        "new": "REPLACED PASSAGE"}, ctx)
+    assert not out.startswith("error"), out
+    assert "similarity" in out                     # correction is loud
+    assert "undo_last_change" in out               # escape hatch is named
+    assert (ws / "w.txt").read_text(encoding="utf-8").strip() \
+        == "REPLACED PASSAGE"
+
+
+def test_fuzzy_never_accepts_half_imagined_text(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "x.txt").write_text(
+        "Chapter seven begins at the river crossing before sunrise.\n"
+        "Ananya counts the boats and finds one missing from the line.\n",
+        encoding="utf-8")
+    # ~half the words are invented — must refuse (below 50% nothing in the
+    # file is a meaningful "closest region"; the honest answer is re-read)
+    before = (ws / "x.txt").read_text(encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "x.txt",
+        "old": "Chapter seven begins with the storm breaking over the "
+               "temple gates while soldiers gather in the courtyard",
+        "new": "x"}, ctx)
+    assert out.startswith("error")
+    assert "read_file" in out                      # points at the recovery
+    assert (ws / "x.txt").read_text(encoding="utf-8") == before
+
+
+def test_fuzzy_refuses_ambiguous_near_twins(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "t.txt").write_text(
+        "The guard walked the north wall at midnight tonight.\n"
+        "unrelated middle line here\n"
+        "The guard walked the south wall at midnight tonight.\n",
+        encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "t.txt",
+        "old": "The guard walked the east wall at midnight tonight.",
+        "new": "x"}, ctx)
+    assert out.startswith("error")                 # two candidates too close
