@@ -205,6 +205,25 @@ def build_messages(session: dict, default_prompt: str = "",
             "progress.md yourself — the latest steps are provided for you.")
     if prompt:
         sections.append(prompt)
+    # Standing rules from the applied method. They join the ONE leading
+    # system block -- a second system message anywhere makes strict Qwen3
+    # templates raise, which llama-server returns as HTTP 400. Kept SHORT
+    # and imperative on purpose: a 9-rule doctrine measurably sent this
+    # model into 15.7K-char deliberation spirals with no reply at all
+    # (2026-07-21 live A/B).
+    if session.get("method"):
+        try:
+            from . import methods as _methods
+            _m = _methods.get(str(session["method"])) or {}
+            standing = [str(r.get("text") or "").strip()
+                        for r in _m.get("rules") or []
+                        if r.get("kind") == "standing"
+                        and str(r.get("text") or "").strip()]
+        except Exception:
+            standing = []      # a deleted or corrupt method never breaks a chat
+        if standing:
+            sections.append("METHOD RULES:\n"
+                            + "\n".join(f"- {t}" for t in standing))
     notes = session.get("notes", "")
     if notes:
         sections.append("Story notes (authoritative):\n" + notes)
