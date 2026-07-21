@@ -97,11 +97,20 @@ def sanitize_schema(schema: dict) -> dict:
 
 def tool_specs(allow_code: bool = False, has_rag: bool = False,
                workspace: str | None = None, has_vision: bool = False,
-               has_run: bool = False, profile: str = "all") -> list[dict]:
+               has_run: bool = False, profile: str = "all",
+               builder_only: bool = False) -> list[dict]:
     """OpenAI-format tool definitions to hand the model, filtered to what this
-    session/run actually permits."""
+    session/run actually permits.
+
+    `builder_only` is the creation chat: it is offered the method-builder
+    tools and NOTHING else. Withholding the rest is the safety property --
+    the model there cannot wander into write_file because write_file is not
+    on the wire, not because a prompt asked it not to.
+    """
     out = []
     for t in _REGISTRY.values():
+        if builder_only != (t.needs == "method_builder"):
+            continue
         if t.needs == "code" and not allow_code:
             continue
         if t.needs == "rag" and not has_rag:
@@ -121,8 +130,10 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
             "parameters": sanitize_schema(t.parameters)}})
     # MCP tools ride the same surface, namespaced mcp__server__tool. Gated
     # like code (they run arbitrary local servers) and excluded under the
-    # restrictive profiles — an MCP server may reach anything.
-    if allow_code and profile not in ("no-network", "confined"):
+    # restrictive profiles — an MCP server may reach anything. A creation
+    # chat gets none of them: builder_only means builder tools, full stop.
+    if allow_code and not builder_only \
+            and profile not in ("no-network", "confined"):
         try:
             from . import mcp_client
             if mcp_client.load_config():        # no config -> zero overhead
@@ -2273,3 +2284,267 @@ def _run_subprocess(cmd, ctx, shell=False, python_src=None, timeout=30):
 
 def _strip(s: str) -> str:
     return html.unescape(re.sub(r"(?s)<[^>]+>", "", s)).strip()
+
+
+# ---------------------------------------------------------------------------
+# METHOD BUILDER
+#
+# The creation chat's entire toolset. Each one loads the draft named by
+# ctx["method_draft_id"], changes one thing, validates what it changed, and
+# says what happened in a sentence.
+#
+# Validation lives HERE rather than at save time on purpose: an error the
+# model reads immediately after its own call is one it can fix in the same
+# turn, which is the whole lesson of edit_file's healing ladder. State what
+# failed, name the place, prescribe the next action.
+# ---------------------------------------------------------------------------
+
+def _draft(ctx):
+    """(draft, error_string). Exactly one of the two is None."""
+    from . import method_drafts
+    did = (ctx or {}).get("method_draft_id") or ""
+    if not did:
+        return None, ("error: this chat is not building a method — there is "
+                      "no draft to change")
+    d = method_drafts.load(did)
+    if d is None:
+        return None, f"error: the draft '{did}' is gone"
+    return d, None
+
+
+def _save_draft(d):
+    from . import method_drafts
+    return method_drafts.save(d)
+
+
+def _check_component(draft, key, component):
+    """Validate a draft that has `component` added under `key`, and return
+    only the errors that concern it — a half-built method is full of other
+    complaints (no name yet, no prompt yet) and reporting those here would
+    tell the model to fix something it has not reached."""
+    from . import method_schema as _ms
+    trial = {**draft, key: [*(draft.get(key) or []), component]}
+    trial = _ms.normalize(trial)
+    cid = trial[key][-1]["id"]
+    kind = key[:-1]
+    errs = [e for e in _ms.validate(trial, set(_REGISTRY))
+            if f"'{cid}'" in e or e.startswith(f"{kind} '{cid}'")]
+    return trial, cid, errs
+
+
+@tool("create_method",
+      "Name the method you are building. Call this first.",
+      {"type": "object", "properties": {
+          "name": {"type": "string"},
+          "tagline": {"type": "string",
+                      "description": "one short line on what it is for"}},
+       "required": ["name"]},
+      safe=False, needs="method_builder")
+def _create_method(args, ctx):
+    d, err = _draft(ctx)
+    if err:
+        return err
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return "error: a method needs a name — call create_method with one"
+    d["name"] = name
+    d["tagline"] = str(args.get("tagline") or "").strip()
+    _save_draft(d)
+    return f"named it '{name}'. Next: set_method_prompt."
+
+
+@tool("set_method_prompt",
+      "Set the system prompt this method applies to a chat. Keep it SHORT "
+      "and imperative — long rule lists make small models deliberate instead "
+      "of act.",
+      {"type": "object", "properties": {"text": {"type": "string"}},
+       "required": ["text"]},
+      safe=False, needs="method_builder")
+def _set_method_prompt(args, ctx):
+    d, err = _draft(ctx)
+    if err:
+        return err
+    text = str(args.get("text") or "").strip()
+    if not text:
+        return "error: the prompt is empty — say what the model should be"
+    d.setdefault("apply", {})["system_prompt"] = text
+    _save_draft(d)
+    note = ""
+    if len(text) > 1200:
+        # measured on this owner's 35B: long imperative prompts produce
+        # deliberation spirals and empty replies
+        note = (" (that is long for a local model — shorter and more "
+                "decisive works better)")
+    return f"prompt set, {len(text)} chars{note}."
+
+
+@tool("set_var",
+      "Declare a fill-in the method's steps can use as {{key}} — a file "
+      "path, a folder, a name.",
+      {"type": "object", "properties": {
+          "key": {"type": "string", "description": "a-z, 0-9, underscore"},
+          "label": {"type": "string"},
+          "default": {"type": "string"},
+          "kind": {"type": "string", "enum": ["text", "path", "number"]}},
+       "required": ["key", "label"]},
+      safe=False, needs="method_builder")
+def _set_var(args, ctx):
+    d, err = _draft(ctx)
+    if err:
+        return err
+    from . import method_schema as _ms
+    key = str(args.get("key") or "").strip()
+    if not _ms._ID_RE.match(key):
+        return (f"error: '{key}' is not a usable variable name — use lower "
+                "case letters, digits and underscores")
+    kind = str(args.get("kind") or "text")
+    if kind not in _ms.VAR_KINDS:
+        return (f"error: kind '{kind}' is not one of "
+                + ", ".join(_ms.VAR_KINDS))
+    d.setdefault("vars", {})[key] = {
+        "label": str(args.get("label") or key),
+        "default": str(args.get("default") or ""), "kind": kind}
+    _save_draft(d)
+    return f"variable {{{{{key}}}}} declared. Steps can use it now."
+
+
+@tool("define_rule",
+      "Add a rule. A standing rule is always-on guidance. A trigger rule "
+      "fires automatically: on = when, do = what.",
+      {"type": "object", "properties": {
+          "kind": {"type": "string", "enum": ["standing", "trigger"]},
+          "text": {"type": "string", "description": "for a standing rule"},
+          "on": {"type": "object", "description":
+                 "for a trigger: {event, tool?, path_glob?, n?}"},
+          "do": {"type": "object", "description":
+                 "for a trigger: {mode: nudge|run, text?, macro?}"}},
+       "required": ["kind"]},
+      safe=False, needs="method_builder")
+def _define_rule(args, ctx):
+    d, err = _draft(ctx)
+    if err:
+        return err
+    kind = str(args.get("kind") or "")
+    rule = {"kind": kind}
+    if kind == "standing":
+        rule["text"] = str(args.get("text") or "")
+    elif kind == "trigger":
+        rule["on"] = args.get("on") or {}
+        rule["do"] = args.get("do") or {"mode": "nudge"}
+    else:
+        return "error: kind must be 'standing' or 'trigger'"
+    trial, cid, errs = _check_component(d, "rules", rule)
+    if errs:
+        return "error: " + "; ".join(errs)
+    _save_draft(trial)
+    return f"rule '{cid}' added."
+
+
+def _define_steps(args, ctx, key):
+    d, err = _draft(ctx)
+    if err:
+        return err
+    label = str(args.get("label") or "").strip()
+    if not label:
+        return f"error: this {key[:-1]} needs a label — it becomes the button"
+    steps = args.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return (f"error: a {key[:-1]} needs a non-empty 'steps' list. Each "
+                "step is {kind: tool|prompt|settings|note|new_chat, ...}")
+    comp = {"label": label, "hint": str(args.get("hint") or ""),
+            "steps": steps}
+    trial, cid, errs = _check_component(d, key, comp)
+    if errs:
+        return "error: " + "; ".join(errs)
+    _save_draft(trial)
+    return (f"{key[:-1]} '{cid}' added with {len(steps)} step(s), "
+            f"labelled '{label}'.")
+
+
+@tool("define_macro",
+      "Add a button. steps is a list of "
+      "{kind: tool|prompt|settings|note|new_chat, ...}. A `tool` step names a "
+      "real tool; a `prompt` step talks to the model (to: 'aux' keeps it out "
+      "of the chat). Use {{var}}, {{last_reply}}, {{step:0}}, {{ask:Label}}, "
+      "{{transcript}}, {{title_next}}, {{selection}}.",
+      {"type": "object", "properties": {
+          "label": {"type": "string", "description": "the button text"},
+          "hint": {"type": "string"},
+          "steps": {"type": "array", "items": {"type": "object"}}},
+       "required": ["label", "steps"]},
+      safe=False, needs="method_builder")
+def _define_macro(args, ctx):
+    return _define_steps(args, ctx, "macros")
+
+
+@tool("define_workflow",
+      "Add a named multi-step sequence. Same step kinds as define_macro.",
+      {"type": "object", "properties": {
+          "label": {"type": "string"},
+          "hint": {"type": "string"},
+          "steps": {"type": "array", "items": {"type": "object"}}},
+       "required": ["label", "steps"]},
+      safe=False, needs="method_builder")
+def _define_workflow(args, ctx):
+    return _define_steps(args, ctx, "workflows")
+
+
+@tool("remove_component",
+      "Delete a rule, macro or workflow from the method by its id.",
+      {"type": "object", "properties": {"id": {"type": "string"}},
+       "required": ["id"]},
+      safe=False, needs="method_builder")
+def _remove_component(args, ctx):
+    d, err = _draft(ctx)
+    if err:
+        return err
+    cid = str(args.get("id") or "")
+    for key in ("rules", "macros", "workflows"):
+        items = d.get(key) or []
+        keep = [c for c in items if c.get("id") != cid]
+        if len(keep) != len(items):
+            d[key] = keep
+            _save_draft(d)
+            return f"removed '{cid}'."
+    have = [c.get("id") for key in ("rules", "macros", "workflows")
+            for c in d.get(key) or []]
+    return (f"error: nothing here is called '{cid}'. This method has: "
+            + (", ".join(have) if have else "no components yet"))
+
+
+@tool("preview_method",
+      "Show the method as it stands. Changes nothing.",
+      {"type": "object", "properties": {}},
+      safe=False, needs="method_builder")
+def _preview_method(args, ctx):
+    d, err = _draft(ctx)
+    if err:
+        return err
+    prompt_len = len(str((d.get("apply") or {}).get("system_prompt") or ""))
+    lines = [f"{d.get('name') or '(unnamed)'} — {d.get('tagline') or ''}",
+             f"prompt: {prompt_len} chars"]
+    if d.get("vars"):
+        lines.append("vars: " + ", ".join(d["vars"]))
+    for key in ("rules", "macros", "workflows"):
+        got = d.get(key) or []
+        if got:
+            lines.append(f"{key}: " + ", ".join(
+                str(c.get("label") or c.get("id")) for c in got))
+    return "\n".join(lines)
+
+
+@tool("save_method",
+      "Finish and save the method. Call this when the user is happy with it.",
+      {"type": "object", "properties": {}},
+      safe=False, needs="method_builder")
+def _save_method(args, ctx):
+    from . import method_drafts
+    d, err = _draft(ctx)
+    if err:
+        return err
+    saved, errs = method_drafts.promote(d["id"])
+    if errs:
+        return ("error: not saved yet — " + "; ".join(errs)
+                + ". Fix that, then call save_method again.")
+    return (f"saved '{saved['name']}'. It is in the Methods list now, and "
+            "its buttons appear above the message box when applied.")
