@@ -2,7 +2,7 @@
 // Collapsible; state persists to the session via the existing PATCH API.
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
-import { type MacroDef, type Method } from "../lib/methods";
+import { type Method } from "../lib/methods";
 import { useApp } from "../store";
 import { useChat } from "./chatStore";
 
@@ -281,45 +281,10 @@ function SamplingCard() {
 // knowledge lives in the product, not in the user's memory.
 function MethodCard({ onApplied }: { onApplied?: () => void }) {
   const currentId = useChat((s) => s.currentId);
-  const open = useChat((s) => s.open);
-  const loadSessions = useChat((s) => s.loadSessions);
   const [methods, setMethods] = useState<Method[]>([]);
   const [active, setActive] = useState("");
   const [expanded, setExpanded] = useState("");
   const [applied, setApplied] = useState("");
-  const [macroBusy, setMacroBusy] = useState("");
-
-  // Plan 2 replaces this with the MacroStrip above the composer and an inline
-  // ConfirmBar. Until then the buttons live here so the book method keeps the
-  // one-click move it had as a "ritual".
-  const runMacro = async (macro: MacroDef) => {
-    if (!currentId || macroBusy) return;
-    setMacroBusy(macro.id);
-    try {
-      const pre = await fetch(`/api/sessions/${currentId}/macro/preview`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ macro_id: macro.id }),
-      });
-      const p = (await pre.json()) as
-        { needs_confirm?: boolean; preview?: string };
-      if (p.needs_confirm && !window.confirm(`${p.preview}\n\nRun it?`)) {
-        setMacroBusy("");
-        return;
-      }
-      const r = await fetch(`/api/sessions/${currentId}/macro`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ macro_id: macro.id, confirm: "run" }),
-      });
-      const text = await r.text();
-      const m = /"new_session_id":\s*"([^"]+)"/.exec(text);
-      await loadSessions();
-      if (m) await open(m[1]);
-      else if (currentId) await open(currentId);
-    } catch { /* chat stays where it is */ }
-    setMacroBusy("");
-  };
 
   useEffect(() => {
     fetch("/api/methods")
@@ -403,18 +368,37 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
                       {applied === m.id ? "applied ✓"
                         : active === m.id ? "re-apply" : "use this method"}
                     </button>
-                    {active === m.id && (m.macros ?? []).map((mac) => (
-                      <button
-                        key={mac.id}
-                        onClick={() => void runMacro(mac)}
-                        disabled={!!macroBusy}
-                        title={mac.hint}
-                        className="rounded-md bg-moss/15 text-moss px-2.5 py-1 text-[12px] font-semibold disabled:opacity-50"
-                      >
-                        {macroBusy === mac.id ? "working…" : mac.label}
-                      </button>
-                    ))}
                   </div>
+                  {/* what the method actually CONTAINS — running its macros
+                      belongs to the strip above the composer, not here */}
+                  {(m.rules?.length || m.macros?.length ||
+                    m.workflows?.length) ? (
+                    <div className="flex flex-col gap-1 pt-1">
+                      {m.rules && m.rules.length > 0 && (
+                        <p className="text-[11px] text-muted">
+                          <span className="font-mono">rules</span>{" "}
+                          {m.rules.length}
+                        </p>
+                      )}
+                      {m.macros && m.macros.length > 0 && (
+                        <p className="text-[11px] text-muted">
+                          <span className="font-mono">macros</span>{" "}
+                          {m.macros.map((x) => x.label).join(", ")}
+                        </p>
+                      )}
+                      {m.workflows && m.workflows.length > 0 && (
+                        <p className="text-[11px] text-muted">
+                          <span className="font-mono">workflows</span>{" "}
+                          {m.workflows.map((x) => x.label).join(", ")}
+                        </p>
+                      )}
+                      {active === m.id && m.macros && m.macros.length > 0 && (
+                        <p className="text-[11px] text-muted">
+                          the buttons are above the message box
+                        </p>
+                      )}
+                    </div>
+                  ) : null}
                   {applied === m.id && (
                     <p className="text-[11px] text-muted">
                       prompt, sampling, effort and tools set — notes got the
