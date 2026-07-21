@@ -644,9 +644,11 @@ def test_feed_marks_display_truncation(engine, tmp_path):
                if a["kind"] == "result"]
     assert results, "the sample result should be in the feed"
     long_one = max(results, key=len)
-    assert len(long_one) <= _s.LIVE_RESULT_MAX + 40
+    # slack covers the truncation suffix, which grew when it was
+    # reworded to deny the owner's model-sees-less doubt
+    assert len(long_one) <= _s.LIVE_RESULT_MAX + 60
     if len(long_one) > _s.LIVE_RESULT_MAX:
-        assert "display truncated" in long_one
+        assert "display clipped" in long_one
     # and the model itself received the untruncated list
     blob = "\n".join(m["content"] for m in
                      __import__("rigma.sessions", fromlist=["x"]).load(

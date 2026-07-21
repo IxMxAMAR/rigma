@@ -38,10 +38,13 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # own local machine) — empty workspace resolves to home
                      "prefill": "", "use_tools": True, "allow_code": True,
                      "workspace": "", "auto_compact": True,
-                     # per-turn agentic tool-call ceiling (safety backstop, not a
-                     # feature limit) — big tasks (view 20 images, write files)
-                     # need many; raise it for even longer autonomous runs
-                     "max_tool_rounds": 50, "one_action": False, "messages": []}
+                     # per-turn tool-round backstop. 1000 = effectively
+                     # unlimited (owner call 2026-07-21: a whole-story verify
+                     # legitimately needs more than 50, and in chat the user
+                     # is present with a stop button); it exists only to stop
+                     # a true runaway loop.
+                     "max_tool_rounds": 1000, "one_action": False,
+                     "messages": []}
 
 
 def chats_dir() -> Path:
@@ -82,6 +85,10 @@ def load(session_id: str) -> dict | None:
     # migration: sessions written by older Rigma versions lack newer fields
     for k, v in _SESSION_DEFAULTS.items():
         raw.setdefault(k, json.loads(json.dumps(v)))
+    # stored 50 is the OLD default leash, not a choice anyone made - lift it
+    # to the new backstop (a deliberately lowered value survives untouched)
+    if raw.get("max_tool_rounds") == 50:
+        raw["max_tool_rounds"] = 1000
     return raw
 
 
