@@ -9,6 +9,7 @@ Spec: docs/superpowers/specs/2026-07-21-custom-methods-design.md
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
@@ -156,3 +157,113 @@ def trust(method_id: str, macro_id: str) -> None:
     p = trust_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(all_, indent=2), encoding="utf-8")
+
+
+# --- the interpreter ------------------------------------------------------
+
+async def run_macro(session: dict, method: dict, macro: dict, *,
+                    emit, drive_turn, aux_complete, tool_ctx: dict,
+                    answers: dict | None = None,
+                    selection: str = "") -> dict:
+    """Execute one step list. Model-facing work is injected (`drive_turn`,
+    `aux_complete`) so this is testable without an engine, and so the caller
+    keeps ownership of the SSE plumbing and the idle watchdog.
+
+    A step that returns an engine/tool error STOPS the macro: a scripted
+    sequence that carries on past a failed read is how you get a write step
+    that appends the word 'error' to someone's story bible.
+    """
+    from . import sessions, tools as toolkit
+    results: list[str] = []
+    new_session_id: str | None = None
+    steps = macro.get("steps") or []
+    dirty = False
+
+    for i, raw in enumerate(steps):
+        ctx = build_context(session, method, answers=answers,
+                            selection=selection, results=results)
+        step = substitute(raw, ctx)
+        kind = step.get("kind")
+        await emit("macro_step", {"index": i, "kind": kind,
+                                  "label": macro.get("label", ""),
+                                  "total": len(steps)})
+
+        if kind == "tool":
+            name = str(step.get("name") or "")
+            args = step.get("args") or {}
+            call_id = f"{macro.get('id', 'm')}{i}"
+            await emit("tool", {"id": call_id, "name": name, "args": args})
+            # cached_run -> run_tool: the ONE choke point where every result
+            # passes _defuse_control_bytes. Never call a handler directly.
+            result = await asyncio.to_thread(
+                toolkit.cached_run, name, args, tool_ctx)
+            await emit("tool_result", {"id": call_id, "name": name,
+                                       "result": result[:900]})
+            results.append(result)
+            if result.lstrip().lower().startswith("error"):
+                await emit("error", {"message": f"step {i} ({name}) failed: "
+                                                f"{result[:200]}"})
+                break
+
+        elif kind == "prompt":
+            text = str(step.get("text") or "")
+            if step.get("to") == "aux":
+                # fresh context on the aux slot: no transcript pollution and
+                # it cannot evict the conversation's prompt cache
+                results.append(await aux_complete(text, 400))
+            else:
+                session.setdefault("messages", []).append(
+                    {"role": "user", "content": text})
+                dirty = True
+                results.append(await drive_turn(session))
+
+        elif kind == "settings":
+            st = step.get("set") or {}
+            if "effort" in st and st["effort"] in ms.EFFORTS:
+                session["effort"] = st["effort"]
+            if isinstance(st.get("params"), dict):
+                session["params"] = {**(session.get("params") or {}),
+                                     **sessions.validate_params(st["params"])}
+            for f in ("use_tools", "allow_code"):
+                if f in st:
+                    session[f] = bool(st[f])
+            results.append("")
+            dirty = True
+
+        elif kind == "note":
+            text = str(step.get("text") or "")
+            if step.get("op") == "replace":
+                session["notes"] = text
+            else:
+                cur = str(session.get("notes") or "")
+                session["notes"] = (cur + ("\n" if cur and not
+                                           cur.endswith("\n") else "") + text)
+            results.append("")
+            dirty = True
+
+        elif kind == "new_chat":
+            if dirty:
+                sessions.save(session)
+                dirty = False
+            nxt = sessions.create(str(step.get("title") or "New chat"))
+            for f in step.get("carry") or []:
+                if f in ms.CARRY_FIELDS:
+                    nxt[f] = copy.deepcopy(session.get(f))
+            if nxt.get("method"):
+                # re-apply so prompt/params/effort match the method, then put
+                # the carried notes back -- apply only fills EMPTY notes, so
+                # ordering here is what keeps a carried bible intact
+                carried_notes = nxt.get("notes")
+                from . import methods as _methods
+                _methods.apply_to_session(nxt, nxt["method"])
+                if carried_notes:
+                    nxt["notes"] = carried_notes
+            # keep the macro's title through auto-titling
+            nxt["title_source"] = "auto" if step.get("title") else ""
+            sessions.save(nxt)
+            new_session_id = nxt["id"]
+            results.append(nxt["id"])
+
+    if dirty:
+        sessions.save(session)
+    return {"results": results, "new_session_id": new_session_id}
