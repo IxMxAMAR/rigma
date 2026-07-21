@@ -13,9 +13,25 @@ import asyncio
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import macros, methods as _methods, sessions
+from . import macros, method_drafts, methods as _methods, sessions
 
 _NO_STORE = {"cache-control": "no-store"}
+
+# SHORT and action-first, and that is a measured constraint rather than a
+# style preference. Live A/B on the owner's 35B (2026-07-21): no system
+# message -> 3K chars of thinking and a clean tool call; a 9-rule doctrine ->
+# 15.7K chars of spiralling and NO reply at all; a 5-rule rewrite -> 870
+# chars, a reply and the call. Every meta-rule is something to reason ABOUT
+# before acting, and either/or framings are the worst offenders.
+# tests/test_creation_chat.py pins the length so this cannot creep back.
+BUILDER_PROMPT = (
+    "You are building a Method with the user. "
+    "Ask ONE question, then call a builder tool. "
+    "Never explain the schema, just build it. "
+    "Keep any prompt you write short and imperative. "
+    "When they are happy, call save_method.")
+
+GREETING = ("Hello — let's build your method. What kind of work is it for?")
 
 
 def register(app, *, sse, drive_turn, aux_complete, tool_ctx_for) -> None:
@@ -71,6 +87,43 @@ def register(app, *, sse, drive_turn, aux_complete, tool_ctx_for) -> None:
                           "method with the same id to override it instead"},
                 status_code=400)
         return {"deleted": mid}
+
+    @app.post("/api/methods/draft")
+    async def create_draft(body: dict | None = None):
+        """Open a chat that can only build a method."""
+        d = method_drafts.new_draft()
+        s = sessions.create("New method")
+        s["method_draft_id"] = d["id"]
+        s["system_prompt"] = BUILDER_PROMPT
+        s["use_tools"] = True
+        # allow_code is irrelevant here -- builder_only withholds every
+        # non-builder tool anyway -- but leave it off so nothing about this
+        # session reads as permission to touch the disk.
+        s["allow_code"] = False
+        # one_action turns on serve.py's existing force_call path, so this
+        # chat inherits tool_choice:"required" AND its per-model 400 fallback
+        s["one_action"] = True
+        s["effort"] = "off"
+        # Pre-seeded, not generated: instant, deterministic, un-rambleable,
+        # and it still reads as the model's voice in the transcript.
+        s["messages"] = [{"role": "assistant", "content": GREETING}]
+        s["title_source"] = "user"
+        sessions.save(s)
+        return {"session_id": s["id"], "draft_id": d["id"]}
+
+    @app.get("/api/methods/draft/{did}")
+    async def get_draft(did: str):
+        d = method_drafts.load(did)
+        if d is None:
+            return JSONResponse({"error": "no such draft"}, status_code=404)
+        return d
+
+    @app.post("/api/methods/draft/{did}/promote")
+    async def promote_draft(did: str):
+        saved, errs = method_drafts.promote(did)
+        if errs:
+            return JSONResponse({"errors": errs}, status_code=400)
+        return saved
 
     @app.post("/api/sessions/{sid}/method")
     async def apply_method(sid: str, body: dict):

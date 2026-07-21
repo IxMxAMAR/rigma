@@ -56,6 +56,9 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # a true runaway loop.
                      "max_tool_rounds": 1000, "one_action": False,
                      "method": "",       # applied workflow method (methods.py)
+                     # set only in a method-creation chat: binds the session
+                     # to a draft AND withholds every non-builder tool
+                     "method_draft_id": "",
                      "messages": []}
 
 

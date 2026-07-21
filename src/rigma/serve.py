@@ -936,15 +936,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 pass
             run_id = s.get("run_id", "")
             run_profile = s.get("run_profile", "all")
+            # a method-creation chat is offered the builder tools and NOTHING
+            # else, so the model there cannot wander into the real toolset
+            builder_only = bool(s.get("method_draft_id"))
             tctx = {"allow_code": bool(s.get("allow_code")),
                     "workspace": s.get("workspace") or str(_Path.home()),
                     "has_vision": has_vision,
-                    "run_id": run_id, "profile": run_profile}
+                    "run_id": run_id, "profile": run_profile,
+                    "method_draft_id": s.get("method_draft_id", "")}
             specs = toolkit.tool_specs(
                 allow_code=tctx["allow_code"],
                 has_rag=bool(rag.recorded_sidecar_port()),
                 workspace=tctx["workspace"], has_vision=has_vision,
-                has_run=bool(run_id), profile=run_profile)
+                has_run=bool(run_id), profile=run_profile,
+                builder_only=builder_only)
             _sem = asyncio.Semaphore(8)   # cap concurrent tool subprocesses / IO
 
             # read-only exploration set for the delegate helper. No writes, no
