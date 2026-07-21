@@ -22,8 +22,49 @@ def rigma_home() -> Path:
 
 
 def _engines_manifest() -> dict:
-    return json.loads(resources.files("rigma").joinpath("data/engines.json")
-                      .read_text(encoding="utf-8"))
+    """The engine pin. Resolution order:
+      1. ~/.rigma/engines.json — refreshed from the registry repo (LM
+         Studio's pattern: engine updates decoupled from app releases;
+         llama.cpp ships weekly, pip releases don't)
+      2. the copy packaged in the wheel — always present, always works
+
+    A downloaded manifest must parse and carry version+assets or it is
+    ignored; corruption can never brick engine bootstrap."""
+    packaged = json.loads(resources.files("rigma")
+                          .joinpath("data/engines.json")
+                          .read_text(encoding="utf-8"))
+    local = rigma_home() / "engines.json"
+    try:
+        cand = json.loads(local.read_text(encoding="utf-8"))
+        if (isinstance(cand, dict) and cand.get("version")
+                and isinstance(cand.get("assets"), dict)):
+            return cand
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    return packaged
+
+
+ENGINES_MANIFEST_URL = ("https://raw.githubusercontent.com/IxMxAMAR/"
+                        "rigma-registry/master/engines.json")
+
+
+def update_engines_manifest(url: str = ENGINES_MANIFEST_URL) -> bool:
+    """Fetch a newer engine pin into ~/.rigma/engines.json. Best-effort:
+    False (never an exception) when offline or the payload is unusable."""
+    try:
+        r = httpx.get(url, follow_redirects=True, timeout=30)
+        r.raise_for_status()
+        cand = r.json()
+        if not (isinstance(cand, dict) and cand.get("version")
+                and isinstance(cand.get("assets"), dict)):
+            return False
+        p = rigma_home() / "engines.json"
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cand, indent=1), encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except Exception:
+        return False
 
 
 def _fetch(url: str, dest: Path) -> None:

@@ -246,8 +246,10 @@ def _profile(reg: Registry):
 
 @app.command()
 def update():
-    """Fetch the latest community combo registry from GitHub."""
+    """Fetch the latest community combo registry (and engine pin) from
+    GitHub."""
     from .registry import update_registry
+    from .runtime import _engines_manifest, update_engines_manifest
 
     before = Registry.load()
     dest = update_registry()
@@ -255,6 +257,14 @@ def update():
     typer.echo(f"registry updated -> {dest}")
     typer.echo(f"models {len(before.models)} -> {len(after.models)}; "
                f"combos {len(before.combos)} -> {len(after.combos)}")
+    # engine pin rides the same update: llama.cpp ships weekly, pip doesn't
+    old_v = _engines_manifest().get("version", "?")
+    if update_engines_manifest():
+        new_v = _engines_manifest().get("version", "?")
+        typer.echo(f"engine pin: {old_v} -> {new_v}"
+                   + ("" if new_v != old_v else " (unchanged)"))
+    else:
+        typer.echo(f"engine pin: {old_v} (no newer pin published)")
 
 
 @app.command()
