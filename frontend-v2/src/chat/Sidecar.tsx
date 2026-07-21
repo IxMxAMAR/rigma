@@ -279,6 +279,7 @@ interface Method {
   name: string;
   tagline: string;
   guide: string[];
+  ritual?: { kind: string; label: string };
 }
 
 // One-click workflow setups: prompt + sampler profile + effort + tool
@@ -286,10 +287,29 @@ interface Method {
 // knowledge lives in the product, not in the user's memory.
 function MethodCard() {
   const currentId = useChat((s) => s.currentId);
+  const open = useChat((s) => s.open);
+  const loadSessions = useChat((s) => s.loadSessions);
   const [methods, setMethods] = useState<Method[]>([]);
   const [active, setActive] = useState("");
   const [expanded, setExpanded] = useState("");
   const [applied, setApplied] = useState("");
+  const [ritualBusy, setRitualBusy] = useState(false);
+
+  const runRitual = async () => {
+    if (!currentId || ritualBusy) return;
+    setRitualBusy(true);
+    try {
+      const r = await fetch(`/api/sessions/${currentId}/ritual`, {
+        method: "POST",
+      });
+      const d = (await r.json()) as { new_session_id?: string };
+      if (r.ok && d.new_session_id) {
+        await loadSessions();
+        await open(d.new_session_id);
+      }
+    } catch { /* chat stays where it is */ }
+    setRitualBusy(false);
+  };
 
   useEffect(() => {
     fetch("/api/methods")
@@ -364,13 +384,24 @@ function MethodCard() {
                       </li>
                     ))}
                   </ul>
-                  <button
-                    onClick={() => void apply(m.id)}
-                    className="self-start rounded-md bg-amber/15 text-amber px-2.5 py-1 text-[12px] font-semibold"
-                  >
-                    {applied === m.id ? "applied ✓"
-                      : active === m.id ? "re-apply" : "use this method"}
-                  </button>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={() => void apply(m.id)}
+                      className="rounded-md bg-amber/15 text-amber px-2.5 py-1 text-[12px] font-semibold"
+                    >
+                      {applied === m.id ? "applied ✓"
+                        : active === m.id ? "re-apply" : "use this method"}
+                    </button>
+                    {m.ritual && active === m.id && (
+                      <button
+                        onClick={() => void runRitual()}
+                        disabled={ritualBusy}
+                        className="rounded-md bg-moss/15 text-moss px-2.5 py-1 text-[12px] font-semibold disabled:opacity-50"
+                      >
+                        {ritualBusy ? "working…" : m.ritual.label}
+                      </button>
+                    )}
+                  </div>
                   {applied === m.id && (
                     <p className="text-[11px] text-muted">
                       prompt, sampling, effort and tools set — notes got the

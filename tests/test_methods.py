@@ -1,5 +1,8 @@
 """Workflow methods: one-click activity setups (owner request 2026-07-21)."""
+import json
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from fastapi.testclient import TestClient
@@ -78,3 +81,63 @@ def test_endpoints_roundtrip():
                        json={"id": "nope"}).status_code == 404
     assert client.post("/api/sessions/zzz/method",
                        json={"id": "coding"}).status_code == 404
+
+
+class _AuxUpstream(BaseHTTPRequestHandler):
+    """Answers every non-streaming completion with a fixed bible line."""
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        self.rfile.read(n)
+        payload = json.dumps({"choices": [{"message": {
+            "content": "Ananya reached the tank at dawn."}}]}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def aux_upstream():
+    srv = HTTPServer(("127.0.0.1", 0), _AuxUpstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
+
+
+def test_book_ritual_updates_bible_and_spawns_next_chapter(aux_upstream):
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=aux_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}/method", json={"id": "book"})
+    client.post(f"/api/sessions/{sid}", json={
+        "title": "Chapter 3",
+        "messages": [{"role": "user", "content": "write ch3"},
+                     {"role": "assistant",
+                      "content": "The chapter prose goes here." * 20}]})
+    r = client.post(f"/api/sessions/{sid}/ritual")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["title"] == "Chapter 4"
+    assert "tank at dawn" in d["bible_entry"]
+    # old chat's bible grew
+    old = client.get(f"/api/sessions/{sid}").json()
+    assert "tank at dawn" in old["notes"]
+    # the new chat carries method + bible and its title survives auto-titling
+    new = client.get(f"/api/sessions/{d['new_session_id']}").json()
+    assert new["method"] == "book"
+    assert "tank at dawn" in new["notes"]
+    assert new["title"] == "Chapter 4"
+
+
+def test_ritual_404s_without_one(aux_upstream):
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=aux_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}/method", json={"id": "coding"})
+    assert client.post(f"/api/sessions/{sid}/ritual").status_code == 404

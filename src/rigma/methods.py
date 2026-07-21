@@ -76,9 +76,14 @@ METHODS: list[dict] = [
             "Set the workspace to the manuscript folder",
             "Chapters live in files; the chat is scratch space",
             "Continuity questions: ask it to delegate, not re-read chapters",
-            "End of chapter: have it add 2-3 lines to STORY SO FAR, then "
-            "start a fresh chat for the next one",
+            "Done with a chapter? Hit 'Finish chapter' below — the bible "
+            "updates itself and a fresh chat opens for the next one",
         ],
+        # the ritual is what makes this a METHOD, not a preset: the workflow
+        # move itself is a button (owner critique 2026-07-21: "this is
+        # simply a system preset")
+        "ritual": {"kind": "book_next_chapter",
+                   "label": "Finish chapter — update bible, start next"},
     },
     {
         "id": "roleplay",
