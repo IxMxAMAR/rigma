@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import FloatWindow from "../FloatWindow";
 import { Attach, Close, Download, Duplicate } from "../Icon";
+import MacroStrip from "./MacroStrip";
 import ModelPicker from "./ModelPicker";
 import { useApp } from "../store";
 import Sidecar from "./Sidecar";
@@ -175,6 +176,7 @@ function Composer() {
     <div className="shrink-0 px-6 pb-5 pt-2">
       <div className="max-w-[760px] mx-auto">
       <ContextMeter />
+      <MacroStrip />
       {images.length > 0 && (
         <div className="flex gap-2 pb-2">
           {images.map((u, i) => (

@@ -209,6 +209,12 @@ function Working({ label }: { label: string }) {
 function LiveTurn({ turn }: { turn: StreamingTurn }) {
   return (
     <div className="flex flex-col gap-2">
+      {turn.macro && (
+        <p className="font-mono text-[11px] text-muted">
+          {turn.macro.label} — step {turn.macro.index + 1} of{" "}
+          {turn.macro.total}
+        </p>
+      )}
       <Thinking text={turn.thinking} live={turn.text === ""} />
       {turn.chips.length > 0 && (
         <div className="flex flex-col gap-1">
