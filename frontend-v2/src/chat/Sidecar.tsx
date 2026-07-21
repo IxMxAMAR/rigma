@@ -2,8 +2,9 @@
 // Collapsible; state persists to the session via the existing PATCH API.
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
-import { type Method } from "../lib/methods";
+import { createDraft, type Method } from "../lib/methods";
 import { useApp } from "../store";
+import MethodBuilder from "./MethodBuilder";
 import { useChat } from "./chatStore";
 
 interface RagStatus {
@@ -281,6 +282,9 @@ function SamplingCard() {
 // knowledge lives in the product, not in the user's memory.
 function MethodCard({ onApplied }: { onApplied?: () => void }) {
   const currentId = useChat((s) => s.currentId);
+  const open = useChat((s) => s.open);
+  const loadSessions = useChat((s) => s.loadSessions);
+  const [making, setMaking] = useState(false);
   const [methods, setMethods] = useState<Method[]>([]);
   const [active, setActive] = useState("");
   const [expanded, setExpanded] = useState("");
@@ -302,6 +306,19 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
       .then((s) => setActive(String((s as { method?: string }).method ?? "")))
       .catch(() => {});
   }, [currentId]);
+
+  // opens a chat bound to a draft: the model there is offered the builder
+  // tools and nothing else, so it can only build a method
+  const startDraft = async () => {
+    if (making) return;
+    setMaking(true);
+    try {
+      const d = await createDraft();
+      await loadSessions();
+      await open(d.session_id);
+    } catch { /* the panel stays as it is */ }
+    setMaking(false);
+  };
 
   const apply = async (id: string) => {
     if (!currentId) return;
@@ -328,6 +345,13 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
         set this chat up for what you're doing — prompt, sampling, thinking
         and a notes template in one click
       </p>
+      <button
+        onClick={() => void startDraft()}
+        disabled={making}
+        className="self-start rounded-md bg-surface hover:bg-float text-secondary px-2.5 py-1 text-[12px] disabled:opacity-40"
+      >
+        {making ? "opening…" : "+ Create method"}
+      </button>
       <ul className="flex flex-col gap-1 mt-1">
         {methods.map((m) => {
           const open = expanded === m.id;
@@ -421,6 +445,23 @@ export default function Sidecar() {
   // below so they re-fetch — without this the panel looked unchanged and
   // the apply button read as broken (owner report 2026-07-21)
   const [rev, setRev] = useState(0);
+  const currentId = useChat((s) => s.currentId);
+  const [draftId, setDraftId] = useState("");
+
+  // a creation chat carries method_draft_id; the builder panel replaces the
+  // usual cards there, because none of them apply while building
+  useEffect(() => {
+    setDraftId("");
+    if (!currentId) return;
+    api.getSession(currentId)
+      .then((s) =>
+        setDraftId(String((s as { method_draft_id?: string })
+          .method_draft_id ?? "")))
+      .catch(() => {});
+  }, [currentId]);
+
+  if (draftId) return <MethodBuilder draftId={draftId} />;
+
   return (
     <>
       <MethodCard onApplied={() => setRev((r) => r + 1)} />
