@@ -16,6 +16,12 @@ template lands only in an empty Notes field.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+from . import method_schema as ms
+from .runtime import rigma_home
+
 METHODS: list[dict] = [
     {
         "id": "coding",
@@ -203,13 +209,77 @@ METHODS: list[dict] = [
 ]
 
 
+def methods_dir() -> Path:
+    d = rigma_home() / "methods"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def builtins() -> list[dict]:
+    """Normalized COPIES of the module literals. normalize() never mutates
+    its input, so METHODS stays the pristine source and a bad save can't
+    poison the catalog for the life of the process."""
+    return [ms.normalize({**m, "builtin": True}) for m in METHODS]
+
+
+def user_methods() -> list[dict]:
+    """Every readable user method. A corrupt file is skipped, never fatal --
+    the user should lose one broken method, not the whole Methods panel."""
+    out = []
+    for f in sorted(methods_dir().glob("*.json")):
+        try:
+            raw = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(raw, dict) and raw.get("id"):
+            out.append(ms.normalize({**raw, "builtin": False}))
+    return out
+
+
 def catalog() -> list[dict]:
-    """The full method list, UI-ready."""
-    return METHODS
+    """Built-ins then user methods, UI-ready. A user method that reuses a
+    built-in's id REPLACES it in place -- that is how 'clone and edit a
+    built-in' presents as editing the thing you cloned rather than as a
+    confusing duplicate row."""
+    merged = builtins()
+    by_id = {m["id"]: i for i, m in enumerate(merged)}
+    for u in user_methods():
+        if u["id"] in by_id:
+            merged[by_id[u["id"]]] = u
+        else:
+            merged.append(u)
+    return merged
 
 
 def get(method_id: str) -> dict | None:
-    return next((m for m in METHODS if m["id"] == method_id), None)
+    return next((m for m in catalog() if m["id"] == method_id), None)
+
+
+def tool_names() -> set[str]:
+    """Every tool a step may name. Imported lazily: tools.py pulls in the
+    whole tool stack and methods.py is imported by the CLI."""
+    from . import tools as toolkit
+    return set(toolkit._REGISTRY)
+
+
+def save_user(doc: dict) -> tuple[dict | None, list[str]]:
+    """Validate and persist a user method. Returns (saved, []) or
+    (None, errors) -- errors are phrased for a model to self-correct."""
+    full = ms.normalize({**doc, "builtin": False})
+    errs = ms.validate(full, tool_names())
+    if errs:
+        return None, errs
+    (methods_dir() / f"{full['id']}.json").write_text(
+        json.dumps(full, indent=2), encoding="utf-8")
+    return full, []
+
+
+def delete_user(method_id: str) -> bool:
+    f = methods_dir() / f"{method_id}.json"
+    if not f.is_file():
+        return False
+    f.unlink()
+    return True
 
 
 def apply_to_session(session: dict, method_id: str) -> dict | None:
