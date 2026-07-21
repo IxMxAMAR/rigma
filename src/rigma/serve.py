@@ -3008,58 +3008,6 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                          aux_complete=_aux_complete,
                          tool_ctx_for=_macro_tool_ctx)
 
-    @app.post("/api/sessions/{sid}/ritual")
-    async def run_ritual(sid: str):
-        """Execute the active method's workflow move. book_next_chapter:
-        the model distils the finished chapter into 2-3 bible lines (aux
-        slot, fresh context), STORY SO FAR grows, and a new chapter chat
-        spawns carrying bible/workspace/params. The ritual is what makes a
-        method more than a preset."""
-        from . import methods as _methods
-        s = sessions.load(sid)
-        if s is None:
-            return JSONResponse({"error": "no such session"}, status_code=404)
-        m = _methods.get(s.get("method", ""))
-        ritual = (m or {}).get("ritual")
-        if not ritual:
-            return JSONResponse({"error": "this chat's method has no ritual"},
-                                status_code=404)
-        # distil the chapter from the chat's own prose — the model does the
-        # summarising, never the server
-        prose = "\n".join(
-            str(mm.get("content", ""))[:2000]
-            for mm in s.get("messages", [])[-12:]
-            if mm.get("role") == "assistant"
-            and isinstance(mm.get("content"), str))[-8000:]
-        summary = ""
-        if prose.strip():
-            summary = (await _aux_complete(
-                "A chapter of a novel was just finished in the conversation "
-                "excerpts below. Write 2-3 short sentences for the story "
-                "bible's STORY SO FAR: what HAPPENED in this chapter (events "
-                "and changes only, no praise, no analysis). Reply with the "
-                "sentences only.\n\n" + prose, max_tokens=160)).strip()
-        entry = "- " + (summary or "(chapter finished — fill in what "
-                                   "happened)")
-        notes = str(s.get("notes") or "")
-        s["notes"] = (notes + ("\n" if notes and not notes.endswith("\n")
-                               else "") + entry)
-        sessions.save(s)
-        # next chapter number from the old title when it has one
-        nxt = sessions.create("Next chapter")
-        mt = re.search(r"(?i)chapter\s+(\d+)", str(s.get("title") or ""))
-        if mt:
-            nxt["title"] = f"Chapter {int(mt.group(1)) + 1}"
-        _methods.apply_to_session(nxt, s["method"])
-        nxt.update(notes=s["notes"], workspace=s.get("workspace", ""),
-                   params={**nxt.get("params", {}),
-                           **(s.get("params") or {})},
-                   use_rag=bool(s.get("use_rag")),
-                   title_source="auto")     # keep the chapter title
-        sessions.save(nxt)
-        return {"new_session_id": nxt["id"], "bible_entry": entry,
-                "title": nxt["title"]}
-
     @app.get("/api/mcp")
     async def mcp_status():
         """Configured/running MCP servers + the tools they contribute."""
