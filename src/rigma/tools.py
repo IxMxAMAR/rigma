@@ -1079,49 +1079,70 @@ def _undo_last_change(args, ctx):
         return f"error: could not restore: {e}"
 
 
-# 1:1 character normalisations ONLY — same string length, so a span found in
-# normalised space maps directly onto the original text. Story prose is full
-# of curly quotes / em-dashes / NBSP that a model silently retypes as ASCII
-# (live 2026-07-21: repeated edit_file failures on a fiction index file).
-_PUNCT_MAP = str.maketrans({
-    "‘": "'", "’": "'",          # ‘ ’
-    "“": '"', "”": '"',          # “ ”
-    "–": "-", "—": "-",          # – —
-    " ": " ",                          # NBSP
-    "…": ".",                          # … (1 char -> 1 char, lossy but 1:1)
-})
+# Forgiving-match normalisation. Models silently "clean up" text they quote
+# back: curly quotes -> straight, en/em-dash -> hyphen, markdown decoration
+# (**bold**, *italics*, `code`) dropped entirely, ellipsis vs three dots,
+# hard-break trailing spaces lost. All observed live 2026-07-21 on a fiction
+# index in Markdown. The normaliser keeps an index map so every match in
+# normalised space converts EXACTLY back to a span of the original text.
+_NORM_WS = {chr(32), chr(9), chr(13), chr(10), chr(160)}   # space tab CR LF NBSP
+_NORM_DROP = set("*`")             # markdown emphasis / code marks
+_NORM_CHAR = {"‘": "'", "’": "'", "“": '"', "”": '"',
+              "–": "-", "—": "-", "…": "."}
+
+
+def _norm_map(s: str):
+    """(normalised string, per-char [start, end) spans in the original)."""
+    out, starts, ends = [], [], []
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch in _NORM_WS:
+            j = i
+            while j < n and s[j] in _NORM_WS:
+                j += 1
+            out.append(" ")
+            starts.append(i)
+            ends.append(j)
+            i = j
+            continue
+        if ch in _NORM_DROP:
+            i += 1
+            continue
+        mapped = _NORM_CHAR.get(ch, ch)
+        if mapped == ".":
+            j = i
+            while j < n and _NORM_CHAR.get(s[j], s[j]) == ".":
+                j += 1
+            out.append(".")
+            starts.append(i)
+            ends.append(j)
+            i = j
+            continue
+        out.append(mapped)
+        starts.append(i)
+        ends.append(i + 1)
+        i += 1
+    return "".join(out), starts, ends
 
 
 def _flexible_find(text: str, old: str):
-    """Forgiving search, escalating: exact after punctuation normalisation,
-    then whitespace-flexible on the normalised strings. All normalisations
-    are 1:1 per character, so every span maps back onto the original text.
-    Returns a (start, end) span if exactly one match, the match count if
-    several, or None if none/unusable."""
-    ntext = text.translate(_PUNCT_MAP)
-    nold = old.translate(_PUNCT_MAP)
-    # punctuation-only drift: exact match in normalised space
-    n = ntext.count(nold) if nold else 0
-    if n == 1:
-        i = ntext.find(nold)
-        return (i, i + len(nold))
-    if n > 1:
-        return n
-    toks = nold.split()
-    if not toks or len(toks) > 1500:
+    """Forgiving search: whitespace runs, punctuation style, markdown
+    decoration and dot-runs are all treated as equal — but the match must
+    still be UNIQUE, and the returned span maps exactly back onto the
+    original text. Returns (start, end), the match count if several, or
+    None if none/unusable."""
+    ntext, starts, ends = _norm_map(text)
+    nold, _, _ = _norm_map(old.strip())
+    if len(nold) < 3:
         return None
-    try:
-        pat = re.compile(r"[ \t\r\n]+".join(re.escape(t) for t in toks))
-    except re.error:
+    count = ntext.count(nold)
+    if count == 0:
         return None
-    ms = []
-    for m in pat.finditer(ntext):
-        ms.append(m)
-        if len(ms) > 2:
-            break
-    if len(ms) == 1:
-        return ms[0].span()
-    return len(ms) if ms else None
+    if count > 1:
+        return count
+    i = ntext.find(nold)
+    return (starts[i], ends[i + len(nold) - 1])
 
 
 def _nearest_region(text: str, old: str) -> str:

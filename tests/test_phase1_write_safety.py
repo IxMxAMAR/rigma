@@ -197,3 +197,61 @@ def test_edit_large_block_flexible_match(tmp_path):
         "path": "spec.txt", "old": old, "new": "REPLACED BLOCK"}, ctx)
     assert not out.startswith("error"), out[:200]
     assert "REPLACED BLOCK" in (ws / "spec.txt").read_text(encoding="utf-8")
+
+
+# --- markdown decoration drift (live 2026-07-21, round 2: index in .md) -------
+def test_edit_heals_dropped_bold_marks(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "spec.md").write_text(
+        "## STATUS\n\n**Chapters written:** 1–6 + side-bridge\n",
+        encoding="utf-8")
+    # model quotes the line without the ** and with an ascii dash
+    out = tools.run_tool("edit_file", {
+        "path": "spec.md",
+        "old": "Chapters written: 1-6 + side-bridge",
+        "new": "**Chapters written:** 1–7"}, ctx)
+    assert not out.startswith("error"), out
+    text = (ws / "spec.md").read_text(encoding="utf-8")
+    assert "1–7" in text and "side-bridge" not in text
+    assert "## STATUS" in text                    # rest untouched
+
+
+def test_edit_heals_dropped_italics_and_ellipsis(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "s.md").write_text(
+        'Chapter 6 ends with: *"Tomorrow, we’ll go to the tank…"*\n',
+        encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "s.md",
+        "old": 'Chapter 6 ends with: "Tomorrow, we\'ll go to the tank..."',
+        "new": 'Chapter 6 ends with: *"The tank waits…"*'}, ctx)
+    assert not out.startswith("error"), out
+    assert "The tank waits" in (ws / "s.md").read_text(encoding="utf-8")
+
+
+def test_edit_heals_trailing_hardbreak_spaces(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "h.md").write_text("line one  \nline two\n", encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "h.md", "old": "line one\nline two",
+        "new": "line one  \nline 2"}, ctx)
+    assert not out.startswith("error"), out
+    assert "line 2" in (ws / "h.md").read_text(encoding="utf-8")
+
+
+def test_markdown_healing_still_refuses_ambiguity(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "amb.md").write_text(
+        "**alpha beta**\nmid\n*alpha beta*\n", encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "amb.md", "old": "alpha beta", "new": "x"}, ctx)
+    assert out.startswith("error")               # 2 normalised matches
+
+
+def test_exact_star_edits_in_code_still_exact(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "m.py").write_text("x = a * b\n", encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "m.py", "old": "a * b", "new": "a * b * c"}, ctx)
+    assert out.startswith("edited")              # exact path, no healing
+    assert (ws / "m.py").read_text(encoding="utf-8") == "x = a * b * c\n"
