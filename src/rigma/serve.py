@@ -2871,6 +2871,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             _runs.set_status(r, "stopped", "stopped by user")
         return _runs.load(rid)
 
+    @app.get("/api/mcp")
+    async def mcp_status():
+        """Configured/running MCP servers + the tools they contribute."""
+        from . import mcp_client
+        try:
+            if not mcp_client.load_config():
+                return {"configured": [], "running": [], "failed": {},
+                        "tools": [],
+                        "hint": f"add servers in {mcp_client.config_path()}"}
+            return await asyncio.to_thread(
+                lambda: mcp_client.manager().status())
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     @app.post("/api/runs/{rid}/pause")
     async def pause_run(rid: str):
         from . import runs as _runs
@@ -2981,6 +2995,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r.setdefault("steer_queue", []).append(note)
         _runs.save(r)
         return {"queued": True}
+
+    @app.on_event("shutdown")
+    async def _stop_mcp():
+        try:
+            from . import mcp_client
+            if mcp_client._manager is not None:
+                mcp_client._manager.stop_all()
+        except Exception:
+            pass
 
     @app.on_event("shutdown")
     async def _stop_run_tasks():
