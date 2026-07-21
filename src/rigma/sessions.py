@@ -11,7 +11,7 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   "preset_id", "params", "notes", "digest", "effort",
                   "authors_note", "authors_note_depth", "prefill",
                   "use_tools", "allow_code", "workspace", "auto_compact",
-                  "max_tool_rounds", "one_action")
+                  "max_tool_rounds", "one_action", "method")
 EFFORT_LEVELS = ("", "off", "auto", "on")
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
@@ -44,6 +44,7 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # is present with a stop button); it exists only to stop
                      # a true runaway loop.
                      "max_tool_rounds": 1000, "one_action": False,
+                     "method": "",       # applied workflow method (methods.py)
                      "messages": []}
 
 

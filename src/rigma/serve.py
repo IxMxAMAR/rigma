@@ -2901,6 +2901,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             _runs.set_status(r, "stopped", "stopped by user")
         return _runs.load(rid)
 
+    @app.get("/api/methods")
+    async def list_methods():
+        """Workflow methods: one-click activity setups (This Chat panel)."""
+        from . import methods as _methods
+        return {"methods": _methods.catalog()}
+
+    @app.post("/api/sessions/{sid}/method")
+    async def apply_method(sid: str, body: dict):
+        from . import methods as _methods
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        out = _methods.apply_to_session(s, str((body or {}).get("id", "")))
+        if out is None:
+            return JSONResponse({"error": "no such method"}, status_code=404)
+        sessions.save(out)
+        return out
+
     @app.get("/api/mcp")
     async def mcp_status():
         """Configured/running MCP servers + the tools they contribute."""
