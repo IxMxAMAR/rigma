@@ -157,7 +157,7 @@ def test_sweep_filters_q4_kv_for_tools_models(monkeypatch, tmp_path):
     monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
     monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
         pp_tps=10, tg_tps=50, prompt_tokens=8, gen_tokens=8))
-    monkeypatch.setattr(bench, "sweep_configs", lambda base, moe: [
+    monkeypatch.setattr(bench, "sweep_configs", lambda base, moe, caps=(): [
         ("baseline", {}),
         ("kv-q4", {"cache_type_k": "q4_0", "cache_type_v": "q4_0"})])
     # unknown slug -> capabilities unknown -> assume tools, protect quality
