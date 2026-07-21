@@ -59,6 +59,9 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # set only in a method-creation chat: binds the session
                      # to a draft AND withholds every non-builder tool
                      "method_draft_id": "",
+                     # trigger rules: one-line reminders queued for the next
+                     # turn, and the loop-guard bookkeeping (see triggers.py)
+                     "pending_nudges": [], "trigger_state": {},
                      "messages": []}
 
 
@@ -320,6 +323,15 @@ def build_messages(session: dict, default_prompt: str = "",
         # "Unable to generate parser for this template"
         msgs.insert(max(0, len(msgs) - depth),
                     {"role": "user", "content": f"[Author's note: {an}]"})
+    # Trigger nudges: one short line each, appended as ONE user message at
+    # the end where recency makes them actually land. role MUST be user for
+    # the same reason as the author's note above. The caller clears them
+    # after the turn — build_messages is read-only on the session.
+    nudges = [str(n).strip() for n in session.get("pending_nudges") or []
+              if str(n).strip()]
+    if nudges:
+        msgs.append({"role": "user",
+                     "content": "\n".join(f"[{n}]" for n in nudges)})
     return head + msgs
 
 
