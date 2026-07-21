@@ -242,6 +242,23 @@ def _strip_think(text: str) -> str:
     return text.strip()
 
 
+def _shape_log(entry: dict) -> None:
+    """Structure-only turn diagnostics — roles, sizes, counts, sampler values,
+    NEVER a character of message content. One JSON line per event, appended to
+    ~/.rigma/logs/turn-shape.jsonl, so a silent-EOS turn can be diagnosed from
+    its shape alone (live hunt 2026-07-21: every synthetic replay of the
+    failing turn succeeded — the difference hides in the real payload, and
+    the owner's words must stay unread)."""
+    try:
+        import time as _time
+        d = st.rigma_home() / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "turn-shape.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": round(_time.time(), 3), **entry}) + "\n")
+    except Exception:
+        pass                      # diagnostics must never break a turn
+
+
 def _clip(text: str, limit: int) -> str:
     """Trim long tool output, telling the model it was trimmed so it can narrow
     its next call instead of assuming it saw everything."""
@@ -1115,6 +1132,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 ctk["preserve_thinking"] = True
             if ctk:
                 body["chat_template_kwargs"] = ctk
+            _shape_log({
+                "ev": "req", "sid": s["id"], "round": _round,
+                "msgs": [{"r": m_.get("role"),
+                          "n": len(str(m_.get("content") or "")),
+                          **({"calls": len(m_["tool_calls"])}
+                             if m_.get("tool_calls") else {})}
+                         for m_ in turn_msgs],
+                "params": {k: v for k, v in body.items()
+                           if k not in ("messages", "tools")},
+                "n_tools": len(specs or []), "ctk": ctk})
             rtext, calls, started = "", {}, {}   # started: idx -> (task, cargs)
             finish_reason = None
             try:
@@ -1216,6 +1243,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if resp is not None:
                     await resp.aclose()
                     resp = None
+            _shape_log({
+                "ev": "res", "sid": s["id"], "round": _round,
+                "failed": failed, "finish": finish_reason,
+                "prompt_n": timings.get("prompt_n"),
+                "predicted_n": timings.get("predicted_n"),
+                "tps": timings.get("predicted_per_second"),
+                "think_n": len(thinking), "text_n": len(rtext),
+                "calls": [c.get("name") for c in calls.values()]})
             if failed:
                 for task, _ in started.values():
                     task.cancel()              # don't leak eager tool tasks
@@ -1368,6 +1403,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 notice = ("_(The model stopped after its tool calls without "
                           "a final reply — the results are shown above. Say "
                           "**continue** if it should keep going.)_")
+            yield _sse({"delta": notice})
+        elif (not failed and not text.strip() and not trace
+                and not one_action):
+            # THINKING-ONLY TURN. The model reasoned and then ended without an
+            # answer and without calling anything. Nothing is persisted (no
+            # text, no trace), so this used to vanish mid-air: the owner saw
+            # "generating" for 8s and then an empty screen, with no record and
+            # no reason (live report 2026-07-21). Silence is the worst possible
+            # reply — say what happened. Stream-only, never persisted: an empty
+            # assistant message is exactly the shape that poisons later turns.
+            notice = ("_(The model spent this turn reasoning and ended without "
+                      "a reply — no tools ran and nothing was saved. Say "
+                      "**continue** to try again"
+                      + (", or set thinking effort lower in this chat's "
+                         "settings if it keeps happening" if thinking else "")
+                      + ".)_")
             yield _sse({"delta": notice})
         if not failed:
             meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}
@@ -3101,7 +3152,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             "RESUMED after an interruption. Nothing was lost."
             + (f" Already done: {done}." if done else "")
             + f" Continue with: {nxt}. Do NOT restart earlier steps.")
-        _runs.save(r)
+        # the ONE deliberate terminal -> running transition (runs.save keeps
+        # terminal sticky so a stale loop snapshot can never do this by accident)
+        _runs.save(r, revive=True)
         _runs._atomic_write(_runs._active_path(), json.dumps({"id": rid}))
         # the run's finally-block cleared the session's mission linkage
         sess["mission"] = sess.get("mission") or _mission_mod.spec_block(

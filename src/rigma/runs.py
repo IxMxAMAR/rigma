@@ -84,7 +84,30 @@ def create(mission: str, session_id: str, workspace: str = "",
     return run
 
 
-def save(run: dict) -> None:
+def save(run: dict, revive: bool = False) -> None:
+    """Persist a run. Terminal is STICKY.
+
+    The loop loads the run once per iteration, then awaits the engine for a
+    long time; it holds a snapshot that says "running" the whole while. If a
+    halt lands during that await — /stop, a budget trip, a crash — the loop's
+    next save used to write that snapshot back and un-halt the run. The task
+    was already dying, so the result was a zombie: "running" on disk with
+    nothing driving it, refusing both resume and restart ("run is running"),
+    clearable only by restarting the server (which is why boot has an
+    orphan reaper). Diagnosed from an intermittent restart failure, 2026-07-21.
+
+    A writer that does not know the run halted does not get to un-halt it: the
+    on-disk status wins and the rest of the snapshot (iteration counters, token
+    accounting) still persists. `revive=True` is the single deliberate
+    exception — restart_run, which reattaches a loop on purpose.
+    """
+    if not revive and run.get("status") not in TERMINAL:
+        cur = load(run["id"])
+        if cur is not None and cur.get("status") in TERMINAL:
+            # tell the caller the truth too, so a loop still holding this dict
+            # sees the halt on its next check instead of running on stale state
+            run["status"] = cur["status"]
+            run["halt_reason"] = cur.get("halt_reason", "")
     _atomic_write(run_dir(run["id"]) / "run.json",
                   json.dumps(run, indent=2))
 

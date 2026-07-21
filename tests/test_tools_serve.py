@@ -410,6 +410,52 @@ def test_silent_stop_is_not_reported_as_a_limit(home, quiet_upstream):
                    for m in msgs)
 
 
+class _ThinkOnlyUpstream(BaseHTTPRequestHandler):
+    """The model reasons and then ends: reasoning_content only — no text, no
+    tool calls. Live 2026-07-21: the owner saw 'generating' for 8 seconds and
+    then the turn vanished without a trace or a word of explanation."""
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        self.rfile.read(n)
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        chunk = {"choices": [{"delta": {"reasoning_content": "hmm, well"},
+                              "finish_reason": "stop"}]}
+        self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def think_only_upstream():
+    srv = HTTPServer(("127.0.0.1", 0), _ThinkOnlyUpstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
+
+
+def test_thinking_only_turn_is_told_not_swallowed(home, think_only_upstream):
+    """A thinking-only turn must say what happened instead of vanishing —
+    but stay UNPERSISTED: an empty assistant message is exactly the shape
+    that poisons later turns, and there is nothing worth saving."""
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=think_only_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200
+    assert "spent this turn reasoning" in r.text     # the user is told
+    from rigma import sessions as _sessions
+    saved = _sessions.load(sid)
+    # nothing persisted beyond the user's own message: no empty assistant
+    # turn, and the notice never becomes anyone's words
+    assert [m["role"] for m in saved["messages"]] == ["user"]
+
+
 def test_round_cap_honours_the_backstop():
     from rigma.serve import _round_cap
     assert _round_cap({"max_tool_rounds": 1000}) == 1000   # was clamped to 100

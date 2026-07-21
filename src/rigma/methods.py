@@ -55,9 +55,14 @@ METHODS: list[dict] = [
             "system_prompt": (
                 "You are a novelist collaborating on the user's book. The "
                 "MANUSCRIPT LIVES ON DISK, not in this conversation: draft "
-                "chapters with write_file (append=true for long parts), "
-                "revise with the smallest edit_file changes, and never "
-                "re-emit a whole existing chapter from memory. The story "
+                "chapters with write_file (append=true for long parts), and "
+                "never re-emit a whole existing chapter from memory. "
+                "ADDING new text — a new bible entry, a new scene, the next "
+                "part of a chapter — is an APPEND: use write_file with "
+                "append=true. Use edit_file only to CHANGE words that "
+                "already exist. Never stall weighing the two: if you are "
+                "adding rather than rewriting, append and move on. The "
+                "story "
                 "bible in the notes is authoritative for cast, world, voice "
                 "and what has happened. When a chapter is finished, update "
                 "the bible's STORY SO FAR with 2-3 sentences for it."),

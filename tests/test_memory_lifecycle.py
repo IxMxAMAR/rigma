@@ -100,10 +100,15 @@ def test_a_reboot_does_not_strand_the_active_run(engine):
     _wait(c, rid, timeout=25)      # let the first loop actually END —
     # in production a reboot kills it; in this shared-process test it would
     # otherwise keep driving the run and overwrite the state we forge next
+    import json as _json
     r = runs.load(rid)
     r["status"] = "running"        # forge what a crash leaves behind
-    runs.save(r)
-    import json as _json
+    # raw write, like active.json below: a power cut does not *set* "running",
+    # it leaves run.json already saying so because nothing got to update it.
+    # save() would refuse this on purpose now — terminal is sticky, so a stale
+    # writer cannot un-halt a run (the zombie-run race) — and only a genuine
+    # restart may revive one. Forging raw disk bytes is what a crash does.
+    runs._atomic_write(runs.run_dir(rid) / "run.json", _json.dumps(r, indent=2))
     runs._active_path().write_text(_json.dumps({"id": rid}), encoding="utf-8")
     # a NEW app instance boots (the TestClient context manager runs startup)
     c2 = _client(engine)
