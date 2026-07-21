@@ -115,6 +115,10 @@ function Bubble({ m }: { m: ChatMessage }) {
         {text.split("\n")[0]}
       </div>
     );
+  // finished turns keep their tool chips: the trace is persisted precisely
+  // so it can re-render (chips used to vanish the moment a reply completed —
+  // owner assumed it was a design choice; it was a v2 parity gap)
+  const trace = (!isUser && m.tool_trace) || [];
   return (
     <div className={isUser ? "flex justify-end" : ""}>
       <div
@@ -124,6 +128,17 @@ function Bubble({ m }: { m: ChatMessage }) {
             : "max-w-full text-[14px]"
         }
       >
+        {trace.length > 0 && (
+          <div className="flex flex-col gap-1 mb-2">
+            {trace.map((t, i) => (
+              <ChipRow
+                key={i}
+                chip={{ id: `trace-${i}`, name: t.name, args: t.args,
+                        result: t.result, state: "done" }}
+              />
+            ))}
+          </div>
+        )}
         {images.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-2">
             {images.map((src, i) => (
@@ -262,6 +277,9 @@ export default function Transcript() {
         )}
         {messages.slice(-shown).map((m, i) => {
           const abs = Math.max(0, messages.length - shown) + i;
+          // tool-result carriers exist for the MODEL's next-turn context;
+          // the user sees the same data as persistent chips on the reply
+          if (m.kind === "tool_result") return null;
           const isLastAssistant =
             abs === messages.length - 1 && m.role === "assistant";
           return (
