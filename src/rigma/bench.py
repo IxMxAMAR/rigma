@@ -109,7 +109,14 @@ def reset_all_calibration() -> int:
     return n
 
 
-def sweep_configs(base: ComboFlags, moe: bool) -> list[tuple[str, dict]]:
+SPEC_CROWN_MARGIN = 1.15   # a speculation config must beat the best
+                           # non-spec row by >=15% to be crowned: the short
+                           # predictable-text bench flatters draft acceptance,
+                           # so a narrow bench win is a real-world loss
+
+
+def sweep_configs(base: ComboFlags, moe: bool,
+                  caps: tuple | list = ()) -> list[tuple[str, dict]]:
     """Flag-override sets to A/B on this machine. Baseline first; each entry is
     a partial ComboFlags update. Axes come from the RDNA4 findings: FA gates the
     fast KV path, symmetric KV precision, prefill batch, Vulkan coopmat, and
@@ -125,6 +132,13 @@ def sweep_configs(base: ComboFlags, moe: bool) -> list[tuple[str, dict]]:
         if base.n_cpu_moe > 0:
             cfgs.append(("moe-less-offload",
                          {"n_cpu_moe": max(0, base.n_cpu_moe - 1)}))
+    # speculation trials: exhaustive sweep ONLY, and gated by
+    # SPEC_CROWN_MARGIN in run_sweep — the short bench flatters acceptance.
+    # Never offered without the mtp capability (spec-decode without the
+    # tensors is a documented Vulkan driver-reset loop).
+    if "mtp" in (caps or ()):
+        cfgs.append(("spec-mtp-2", {"spec_type": "draft-mtp", "spec_n_max": 2}))
+        cfgs.append(("spec-mtp-4", {"spec_type": "draft-mtp", "spec_n_max": 4}))
     return cfgs
 
 
@@ -139,16 +153,12 @@ def quick_configs(base: ComboFlags, moe: bool,
     cfgs.append(("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}}))
     if moe:
         cfgs.append(("gfxqueue-on", {"env": {"GGML_VK_ALLOW_GRAPHICS_QUEUE": "1"}}))
-    # MTP-preserved gguf: try self-speculation. 1.4-2.2x decode reported for
-    # Qwen3.6 MTP; on a RAM-bandwidth-bound expert-offload decode, accepted
-    # multi-token batches amortize the CPU expert fetches — exactly this box.
-    # Measured, never assumed: crowned only if faster HERE, and a config that
-    # OOMs or crashes is scored as a loss by run_sweep. Never offered without
-    # the mtp capability (spec-decode without the tensors is a documented
-    # driver-reset loop on Vulkan).
-    if "mtp" in (caps or ()):
-        cfgs.append(("spec-mtp-2", {"spec_type": "draft-mtp", "spec_n_max": 2}))
-        cfgs.append(("spec-mtp-4", {"spec_type": "draft-mtp", "spec_n_max": 4}))
+    # NOTE: spec-mtp trials deliberately NOT in the auto first-load set.
+    # Live lesson 2026-07-21: the 96-token bench summarises highly
+    # predictable filler, which inflates MTP draft acceptance — draft-mtp
+    # measured 44.7 t/s and was crowned, then real varied chat ran at 36.8
+    # (rejected drafts are pure overhead). Speculation lives in the explicit
+    # exhaustive sweep, where the margin gate below applies.
     return cfgs
 
 
@@ -162,7 +172,8 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     engine already killed) — this never touches a live server."""
     is_moe = plan.flags.n_cpu_moe > 0
     if configs is None:
-        configs = sweep_configs(plan.flags, is_moe)
+        configs = sweep_configs(plan.flags, is_moe,
+                                caps=_capabilities(plan.model_slug))
     # Never let the sweep crown q4_0 KV on a tools-capable model: llama.cpp's
     # own function-calling docs warn extreme KV quantization significantly
     # degrades tool calling, and the sweep scores tokens/sec only — it would
@@ -196,6 +207,16 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
             srv.stop()
     rows.sort(key=lambda r: r["tg_tps"], reverse=True)
     best = next((r for r in rows if r["ok"]), None)
+    # margin gate for speculation: real-world draft acceptance is LOWER than
+    # on the predictable bench text (live 2026-07-21: crowned 44.7 bench ->
+    # 36.8 live). A spec config must beat the best non-spec row decisively
+    # or the non-spec winner is crowned instead.
+    if best is not None and best["flags"].get("spec_type"):
+        plain = next((r for r in rows
+                      if r["ok"] and not r["flags"].get("spec_type")), None)
+        if plain is not None and \
+                best["tg_tps"] < plain["tg_tps"] * SPEC_CROWN_MARGIN:
+            best = plain
     if best is not None and (best["flags"] or mark_calibrated):
         key = f"{plan.model_slug}:{plan.gguf.quant}:{plan.backend}"
         save_calibration(key, {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"]},

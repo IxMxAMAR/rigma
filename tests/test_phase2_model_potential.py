@@ -16,17 +16,25 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
-# --- MTP capability drives the spec trial -------------------------------------
-def test_quick_configs_add_mtp_trials_only_with_capability():
+# --- MTP capability drives the spec trial (EXHAUSTIVE sweep only — live
+# 2026-07-21: the short predictable bench inflates draft acceptance; a
+# crowned 44.7 bench ran at 36.8 live, so auto first-load never tries spec) --
+def test_sweep_configs_add_mtp_trials_only_with_capability():
     base = ComboFlags(ctx=8192, n_cpu_moe=4)
-    labels = [k for k, _ in bench.quick_configs(base, moe=True, caps=("mtp",))]
+    labels = [k for k, _ in bench.sweep_configs(base, moe=True, caps=("mtp",))]
     assert "spec-mtp-2" in labels and "spec-mtp-4" in labels
-    labels_no = [k for k, _ in bench.quick_configs(base, moe=True)]
+    labels_no = [k for k, _ in bench.sweep_configs(base, moe=True)]
     assert not any("spec" in x for x in labels_no)
 
 
+def test_quick_configs_never_include_spec_trials():
+    base = ComboFlags(ctx=8192, n_cpu_moe=4)
+    labels = [k for k, _ in bench.quick_configs(base, moe=True, caps=("mtp",))]
+    assert not any("spec" in x for x in labels)
+
+
 def test_mtp_trial_flags_are_launchable():
-    cfgs = dict(bench.quick_configs(ComboFlags(ctx=8192), moe=True,
+    cfgs = dict(bench.sweep_configs(ComboFlags(ctx=8192), moe=True,
                                     caps=["mtp"]))
     flags = ComboFlags(ctx=8192).model_copy(update=cfgs["spec-mtp-2"])
     plan = RunPlan(model_slug="m",
@@ -36,6 +44,38 @@ def test_mtp_trial_flags_are_launchable():
     i = args.index("--spec-type")
     assert args[i + 1] == "draft-mtp"
     assert args[args.index("--spec-draft-n-max") + 1] == "2"
+
+
+def test_spec_crown_needs_decisive_margin(monkeypatch, tmp_path):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    results = {"baseline": 40.0, "spec-mtp-4": 44.0}   # +10% < 15% margin
+    seq = {"i": 0}
+    labels_in_order = []
+
+    def fake_bench(port, **k):
+        label = labels_in_order[seq["i"]]
+        seq["i"] += 1
+        return bench.BenchResult(pp_tps=100, tg_tps=results[label],
+                                 prompt_tokens=8, gen_tokens=8)
+
+    cfgs = [("baseline", {}),
+            ("spec-mtp-4", {"spec_type": "draft-mtp", "spec_n_max": 4})]
+    labels_in_order.extend(k for k, _ in cfgs)
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    monkeypatch.setattr(bench, "run_bench", fake_bench)
+    plan = RunPlan(model_slug="m",
+                   gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                   backend="vulkan", flags=ComboFlags(ctx=8192),
+                   origin="test")
+    bench.run_sweep(plan, tmp_path / "s.exe", tmp_path / "m.gguf",
+                    port=11601, configs=cfgs, mark_calibrated=True)
+    crowned = bench.load_calibration()["m:Q4:vulkan"]["flags"]
+    assert "spec_type" not in crowned      # narrow bench win never crowns spec
 
 
 def test_gguf_meta_detects_nextn_layers(monkeypatch):

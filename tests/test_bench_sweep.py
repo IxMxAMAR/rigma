@@ -35,7 +35,7 @@ def test_run_sweep_picks_best_and_saves(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
     monkeypatch.setattr(bench, "run_bench", lambda port, **k: next(seq))
-    monkeypatch.setattr(bench, "sweep_configs", lambda base, moe: [
+    monkeypatch.setattr(bench, "sweep_configs", lambda base, moe, caps=(): [
         ("baseline", {}), ("fa-off", {"flash_attn": "off"})])
 
     rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
@@ -139,7 +139,7 @@ def test_run_sweep_skips_failed_launch(monkeypatch, tmp_path):
     monkeypatch.setattr(bench, "launch_server", flaky_launch)
     monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
         pp_tps=10, tg_tps=42, prompt_tokens=8, gen_tokens=8))
-    monkeypatch.setattr(bench, "sweep_configs", lambda base, moe: [
+    monkeypatch.setattr(bench, "sweep_configs", lambda base, moe, caps=(): [
         ("baseline", {}), ("kv-q8", {"cache_type_k": "q8_0", "cache_type_v": "q8_0"})])
 
     rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf")
