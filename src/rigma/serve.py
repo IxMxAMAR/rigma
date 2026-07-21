@@ -2721,6 +2721,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         note = str((body or {}).get("message", "")).strip()
         if not note:
             return JSONResponse({"error": "message required"}, status_code=400)
+        if r.get("pending_question"):
+            # the model paused itself with ask_user — this message IS the
+            # answer: frame it as one, clear the question, wake the run
+            q = r["pending_question"].get("q", "")
+            note = f"ANSWER to your question ({q[:200]}): {note}"
+            r["pending_question"] = None
+            r["paused"] = False
         r.setdefault("steer_queue", []).append(note)
         _runs.save(r)
         return {"queued": True}
