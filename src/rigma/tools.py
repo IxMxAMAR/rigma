@@ -1875,6 +1875,48 @@ def _view_sample(args, ctx):
     return _view_images({"paths": chosen}, ctx)
 
 
+_MAX_HEALS = 20
+
+
+def heal_python_escapes(code: str) -> tuple[str, int]:
+    """Re-escape control characters that the JSON layer decoded INSIDE a
+    Python string literal. Returns (code, repairs_made).
+
+    The model writes  print('a\\nb')  with one backslash in its JSON `code`
+    argument. JSON decodes that to a real newline, so the source arrives as
+    two lines and the literal is unterminated. This is the single most common
+    python failure on a local model (owner report 2026-07-21) and it is
+    mechanically detectable: compile() says exactly which line opened a
+    literal it never closed, so rejoin that line with the next one and put
+    the escape back.
+
+    Deliberately narrow. It heals ONLY `unterminated string literal`, which
+    means legitimate multi-line code is untouched (real newlines between
+    statements are not a syntax error) and so are triple-quoted strings
+    (their error message is `unterminated triple-quoted string literal`).
+    """
+    healed = 0
+    for _ in range(_MAX_HEALS):
+        try:
+            compile(code, "<string>", "exec")
+            return code, healed
+        except SyntaxError as e:
+            if "unterminated string literal" not in (e.msg or ""):
+                break                      # not our bug: leave it alone
+            lines = code.split("\n")
+            i = (e.lineno or 0) - 1
+            if not 0 <= i < len(lines) - 1:
+                break                      # nothing to rejoin it with
+            head = lines[i]
+            # a CR that rode in the same way gets its escape back too
+            if head.endswith("\r"):
+                head = head[:-1] + "\\r"
+            lines[i:i + 2] = [head + "\\n" + lines[i + 1]]
+            code = "\n".join(lines)
+            healed += 1
+    return code, healed
+
+
 @tool("run_python",
       "Run a short Python 3 snippet and return its stdout/stderr (first line "
       "= exit code). For calculations, data wrangling, quick checks. 30s "
@@ -1886,8 +1928,26 @@ def _view_sample(args, ctx):
       safe=False, needs="code")
 def _run_python(args, ctx):
     code = str(args.get("code", ""))
-    return _run_subprocess(["python", "-I", "-c", code], ctx,
-                           python_src=code)
+    code, healed = heal_python_escapes(code)
+    # Refuse to RUN code that cannot compile: a traceback from the interpreter
+    # reads to the model as "my logic was wrong" and it rewrites the whole
+    # snippet, usually reintroducing the same escaping mistake. Naming the
+    # line and the cause is what makes it a one-turn fix.
+    try:
+        compile(code, "<string>", "exec")
+    except SyntaxError as e:
+        return (f"error: that code does not compile — {e.msg} (line "
+                f"{e.lineno}). It was NOT run. If your code contains a "
+                "string like 'a\\nb', write the backslash TWICE in the JSON "
+                "argument ('a\\\\nb') — a single backslash becomes a real "
+                "newline and splits the literal.")
+    out = _run_subprocess(["python", "-I", "-c", code], ctx, python_src=code)
+    if healed:
+        out = (f"(note: {healed} string literal(s) in your code had been "
+               "split by a single-escaped newline; they were repaired and "
+               "the code ran. Write \\\\n, not \\n, inside JSON string "
+               "arguments.)\n" + out)
+    return out
 
 
 @tool("run_shell",
