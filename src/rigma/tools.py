@@ -1079,19 +1079,43 @@ def _undo_last_change(args, ctx):
         return f"error: could not restore: {e}"
 
 
+# 1:1 character normalisations ONLY — same string length, so a span found in
+# normalised space maps directly onto the original text. Story prose is full
+# of curly quotes / em-dashes / NBSP that a model silently retypes as ASCII
+# (live 2026-07-21: repeated edit_file failures on a fiction index file).
+_PUNCT_MAP = str.maketrans({
+    "‘": "'", "’": "'",          # ‘ ’
+    "“": '"', "”": '"',          # “ ”
+    "–": "-", "—": "-",          # – —
+    " ": " ",                          # NBSP
+    "…": ".",                          # … (1 char -> 1 char, lossy but 1:1)
+})
+
+
 def _flexible_find(text: str, old: str):
-    """Whitespace-flexible search: same tokens, any spacing/indentation.
+    """Forgiving search, escalating: exact after punctuation normalisation,
+    then whitespace-flexible on the normalised strings. All normalisations
+    are 1:1 per character, so every span maps back onto the original text.
     Returns a (start, end) span if exactly one match, the match count if
     several, or None if none/unusable."""
-    toks = old.split()
-    if not toks or len(toks) > 400:
+    ntext = text.translate(_PUNCT_MAP)
+    nold = old.translate(_PUNCT_MAP)
+    # punctuation-only drift: exact match in normalised space
+    n = ntext.count(nold) if nold else 0
+    if n == 1:
+        i = ntext.find(nold)
+        return (i, i + len(nold))
+    if n > 1:
+        return n
+    toks = nold.split()
+    if not toks or len(toks) > 1500:
         return None
     try:
         pat = re.compile(r"[ \t\r\n]+".join(re.escape(t) for t in toks))
     except re.error:
         return None
     ms = []
-    for m in pat.finditer(text):
+    for m in pat.finditer(ntext):
         ms.append(m)
         if len(ms) > 2:
             break
@@ -1162,11 +1186,16 @@ def _edit_file(args, ctx):
         _snapshot_before_write(p)
         p.write_text(text[:m[0]] + new + text[m[1]:], encoding="utf-8")
         return (f"edited {args.get('path')} (note: your 'old' text differed "
-                "from the file in whitespace/indentation only — matched it "
-                "flexibly and applied the edit)")
+                "from the file only in whitespace or punctuation style "
+                "(curly quotes “”, em-dashes —) — matched it flexibly and "
+                "applied the edit)")
     if isinstance(m, int):
         return (f"error: the 'old' string matches {m}+ places (ignoring "
                 "whitespace) — add surrounding lines to make it unique")
+    if len(old) > 6000:
+        return (f"error: the 'old' text wasn't found, and at {len(old)} "
+                "chars it is too big to match reliably — pick the SMALLEST "
+                "unique snippet around the change instead of a huge block")
     return ("error: the 'old' string wasn't found EXACTLY — check for "
             "mismatched indentation/whitespace or stray markdown backticks."
             + (_nearest_region(text, old)

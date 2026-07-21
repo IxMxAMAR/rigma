@@ -143,3 +143,57 @@ def test_fetch_url_short_page_has_no_noise(monkeypatch):
                         lambda url, **k: (200, "<p>tiny page</p>"))
     out = tools.run_tool("fetch_url", {"url": "http://x.test/small"}, {})
     assert out.strip() == "tiny page"
+
+
+# --- punctuation drift (live 2026-07-21: repeated edit failures on fiction) ---
+def test_edit_heals_curly_quote_drift(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "story.txt").write_text(
+        "She said, “It’s over — forever.”\nHe left.\n",
+        encoding="utf-8")
+    # the model retypes the passage with ASCII quotes and hyphen
+    out = tools.run_tool("edit_file", {
+        "path": "story.txt",
+        "old": 'She said, "It\'s over - forever."',
+        "new": 'She whispered, "It’s over — forever."'}, ctx)
+    assert not out.startswith("error"), out
+    text = (ws / "story.txt").read_text(encoding="utf-8")
+    assert "whispered" in text
+    assert "He left." in text                    # rest untouched
+
+
+def test_edit_heals_combined_punct_and_whitespace_drift(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "index.txt").write_text(
+        "Chapter 5 — “The Fall”\n   status: done\n",
+        encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "index.txt",
+        "old": 'Chapter 5 - "The Fall"\nstatus: done',
+        "new": "Chapter 5 — “The Fall”\n   status: revised"}, ctx)
+    assert not out.startswith("error"), out
+    assert "revised" in (ws / "index.txt").read_text(encoding="utf-8")
+
+
+def test_edit_punct_healing_never_matches_wrong_place(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "a.txt").write_text("alpha — one\nalpha — one\n",
+                              encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "a.txt", "old": "alpha - one", "new": "x"}, ctx)
+    assert out.startswith("error")               # ambiguous stays ambiguous
+
+
+def test_edit_large_block_flexible_match(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    body = "\n".join(f"line {i} of the long spec — detail"
+                     for i in range(600))
+    (ws / "spec.txt").write_text(body, encoding="utf-8")
+    # a ~600-token old with drifted dashes: the old 400-token cap skipped
+    # flexible matching entirely for blocks like this
+    old = "\n".join(f"line {i} of the long spec - detail"
+                    for i in range(100, 200))
+    out = tools.run_tool("edit_file", {
+        "path": "spec.txt", "old": old, "new": "REPLACED BLOCK"}, ctx)
+    assert not out.startswith("error"), out[:200]
+    assert "REPLACED BLOCK" in (ws / "spec.txt").read_text(encoding="utf-8")
