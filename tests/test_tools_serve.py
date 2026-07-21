@@ -323,3 +323,28 @@ def test_truncated_tool_call_is_not_executed(tmp_path, monkeypatch):
             "a truncated write must never reach the disk"
     finally:
         srv.shutdown()
+
+
+def test_tool_results_carry_across_turns(home, upstream):
+    # Live-proven 2026-07-21 on the real 35B: 3/3 perfect edits with the
+    # file in context, 0/3 when it was read in a previous turn — chat used
+    # to DROP tool results at turn end (runs carried them; chat didn't), so
+    # the next turn edited files from memory.
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    client.post(f"/api/sessions/{sid}/chat", json={"message": "what is 6*7?"})
+    saved = client.get(f"/api/sessions/{sid}").json()
+    carriers = [m for m in saved["messages"]
+                if m.get("kind") == "tool_result"]
+    assert len(carriers) == 1
+    assert carriers[0]["role"] == "user"
+    assert "TOOL RESULT calculator: 42" in carriers[0]["content"]
+    assert carriers[0]["tools"][0] == {"name": "calculator", "ok": True}
+    # the NEXT turn's model-visible context actually contains the result
+    from rigma import sessions as _sessions
+    msgs = _sessions.build_messages(_sessions.load(sid))
+    assert any("TOOL RESULT calculator: 42" in str(m.get("content", ""))
+               for m in msgs)

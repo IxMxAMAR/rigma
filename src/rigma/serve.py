@@ -1396,6 +1396,36 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         "prompt_tokens": usage.get("prompt_tokens"),
                         "model": (st.read_state() or {}).get("model", "")}
                 s["messages"].append(msg)
+                # CARRY TOOL RESULTS ACROSS TURNS in chat, exactly as runs
+                # do. build_messages sanitises to role/content, so tool_trace
+                # never re-enters context — on the NEXT turn the model could
+                # not see what any tool returned this turn, and it edited
+                # files from MEMORY of a read made two turns ago. Live-proven
+                # 2026-07-21 on the real 35B: 3/3 perfect edits with the file
+                # in context, 0/3 without (one hallucinated edit, two forced
+                # re-reads). Newest results win the budget; the UI renders
+                # these compactly (TOOL RESULT prefix).
+                if trace and not s.get("one_action"):
+                    budget, kept = 24_000, []
+                    for t in reversed(trace):
+                        r = _clip(str(t.get("result", "")), RESULT_MAX)
+                        if kept and budget - len(r) < 0:
+                            break
+                        budget -= len(r)
+                        kept.append((t, r))
+                    kept.reverse()
+                    omitted = len(trace) - len(kept)
+                    body_lines = [f"TOOL RESULT {t.get('name')}: {r}"
+                                  for t, r in kept]
+                    if omitted:
+                        body_lines.append(f"({omitted} earlier tool "
+                                          "result(s) from this turn omitted)")
+                    s["messages"].append({
+                        "role": "user", "kind": "tool_result",
+                        "tools": [{"name": t.get("name"),
+                                   "ok": not str(t.get("result", ""))
+                                   .startswith("error")} for t, _ in kept],
+                        "content": "\n".join(body_lines)})
             sessions.save(s)
             _bump_stats(timings)
             # Auto-title once the conversation has a shape (owner request
