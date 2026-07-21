@@ -33,6 +33,19 @@ def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128) -> Be
                        prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
 
 
+def _tools_capable(slug: str) -> bool:
+    """Whether the model declares the `tools` capability. Unknown → True:
+    assume tools and protect quality rather than risk degrading it."""
+    try:
+        from .registry import Registry
+        spec = Registry.load().models.get(slug)
+        if spec is not None:
+            return "tools" in spec.capabilities
+    except Exception:
+        pass
+    return True
+
+
 def calibration_path() -> Path:
     return rigma_home() / "calibration.json"
 
@@ -128,6 +141,15 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     is_moe = plan.flags.n_cpu_moe > 0
     if configs is None:
         configs = sweep_configs(plan.flags, is_moe)
+    # Never let the sweep crown q4_0 KV on a tools-capable model: llama.cpp's
+    # own function-calling docs warn extreme KV quantization significantly
+    # degrades tool calling, and the sweep scores tokens/sec only — it would
+    # trade a silent quality regression for a speed win. (Mirrors the
+    # registry's DeltaNet q8_0 cache policy.)
+    if _tools_capable(plan.model_slug):
+        configs = [(label, o) for label, o in configs
+                   if o.get("cache_type_k") != "q4_0"
+                   and o.get("cache_type_v") != "q4_0"]
     rows: list[dict] = []
     for label, override in configs:
         flags = plan.flags.model_copy(update=override)

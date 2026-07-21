@@ -616,6 +616,7 @@ def _search_docs(args, ctx):
       "work through them — the system reminds you of pending steps every turn.",
       {"type": "object", "properties": {
           "action": {"type": "string",
+                     "enum": ["add", "complete", "update", "list"],
                      "description": "add | complete | update | list"},
           "task": {"type": "string",
                    "description": "step text (for add and update)"},
@@ -747,11 +748,13 @@ def _ws_path(ctx, rel: str) -> Path:
 
 
 @tool("http_request",
-      "Make an HTTP request to any API (GET or POST with headers/JSON body) "
-      "and return the response. Use for APIs, not just reading web pages.",
+      "Make an HTTP request to an API (GET or POST with headers/JSON body) "
+      "and return the response. Use for APIs, not just reading web pages. "
+      "Only GET and POST are allowed.",
       {"type": "object", "properties": {
           "url": {"type": "string"},
-          "method": {"type": "string", "description": "GET or POST"},
+          "method": {"type": "string", "enum": ["GET", "POST"],
+                     "description": "GET or POST"},
           "headers": {"type": "object"},
           "json": {"type": "object", "description": "JSON body for POST"}},
        "required": ["url"]})
@@ -760,10 +763,17 @@ def _http_request(args, ctx):
     if not re.match(r"^https?://", url):
         return "error: url must start with http:// or https://"
     method = str(args.get("method", "GET")).upper()
+    # This tool auto-runs (safe tier). The safe tier means "no side effects" —
+    # so state-changing verbs are refused here: the old code would happily send
+    # PUT/PATCH/DELETE while the description said "GET or POST", which is
+    # exactly the hole a prompt-injected page would use.
+    if method not in ("GET", "POST"):
+        return (f"error: method {method} is not allowed — this tool only "
+                "does GET and POST")
     try:
         status, body = _bounded_get(
             url, method=method, headers=args.get("headers") or None,
-            json=args.get("json") if method in ("POST", "PUT", "PATCH") else None,
+            json=args.get("json") if method == "POST" else None,
             raise_status=False)
     except Exception as e:
         return f"error: {e}"
@@ -806,9 +816,15 @@ def _remember(args, ctx):
     from .runtime import rigma_home
     f = rigma_home() / "model_memory.json"
     mem = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-    mem[str(args.get("key"))] = str(args.get("value"))
+    key = str(args.get("key"))
+    old = mem.get(key)
+    mem[key] = str(args.get("value"))
     f.write_text(json.dumps(mem, indent=1), encoding="utf-8")
-    return f"remembered '{args.get('key')}'"
+    if old is not None and old != mem[key]:
+        # same failure class write_file was fixed for: silent replacement
+        return (f"remembered '{key}' — REPLACED the previous value "
+                f"(was: {old[:200]})")
+    return f"remembered '{key}'"
 
 
 @tool("recall",
@@ -824,7 +840,12 @@ def _recall(args, ctx):
     key = args.get("key")
     if key:
         return mem.get(str(key), f"(nothing remembered for '{key}')")
-    return "\n".join(f"{k}: {v}" for k, v in mem.items()) or "(empty)"
+    body = "\n".join(f"{k}: {v}" for k, v in mem.items()) or "(empty)"
+    if len(body) > 4000:      # unbounded dump would eat the context window
+        body = (body[:4000]
+                + f"\n…(clipped — {len(mem)} entries total; pass a `key` "
+                  "to read one in full)")
+    return body
 
 
 @tool("find_files",
@@ -856,17 +877,20 @@ def _find_files(args, ctx):
 
 @tool("grep",
       "Search file contents for a regex inside the workspace. Returns matching "
-      "lines with file:line.",
+      "lines with file:line (long lines are clipped to 200 chars).",
       {"type": "object", "properties": {
           "pattern": {"type": "string"},
           "glob": {"type": "string", "description": "limit to files matching "
-                   "this glob (default all text files)"}},
+                   "this glob (default all text files)"},
+          "ignore_case": {"type": "boolean",
+                          "description": "case-insensitive match (default false)"}},
        "required": ["pattern"]},
       needs="workspace")
 def _grep(args, ctx):
     root = _ws_path(ctx, ".")
     try:
-        rx = re.compile(str(args.get("pattern", "")))
+        rx = re.compile(str(args.get("pattern", "")),
+                        re.IGNORECASE if args.get("ignore_case") else 0)
     except re.error as e:
         return f"error: bad regex: {e}"
     glob = str(args.get("glob", "") or "**/*")
@@ -885,7 +909,9 @@ def _grep(args, ctx):
                                + line.strip()[:200])
                     seen += 1
                     if seen >= 100:
-                        return "\n".join(out) + "\n…(more matches)"
+                        return ("\n".join(out)
+                                + "\n…(stopped at 100 matches — narrow the "
+                                  "pattern or add a `glob` to see the rest)")
         except OSError:
             continue
     return "\n".join(out) if out else "no matches"
@@ -952,8 +978,16 @@ def _read_file(args, ctx):
                     + (tail or "(nothing logged yet)")
                     + "\n\nContinue from here. Do NOT restart earlier steps.")
         return f"error: no such file: {args.get('path')}"
-    if p.stat().st_size > 400_000:
-        return "error: file too large to read"
+    size = p.stat().st_size
+    if size > 8_000_000:
+        return (f"error: file too large to read ({size // 1000} KB) — use grep "
+                "to find the relevant lines instead")
+    if size > 400_000 and not (args.get("offset") or args.get("limit")):
+        # big file, whole-file request: refuse with a recovery path instead of
+        # dead-ending — the old bare "too large" left the model nowhere to go
+        return (f"error: file is large ({size // 1000} KB) — read it in pages: "
+                "call read_file with offset=1 and limit=800, or use grep to "
+                "jump to the relevant lines")
     text = p.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
     try:
@@ -1194,9 +1228,14 @@ def _view_image(args, ctx):
 
 @tool("view_images",
       "Look at SEVERAL images at once (up to 8) — the efficient way to review "
-      "or compare a batch, e.g. to understand a style across many pictures. Pass "
-      "a list of file paths (absolute or workspace-relative). For 20 images, "
-      "call this a few times in batches rather than one-by-one.",
+      "or compare a batch, e.g. to understand a style across many pictures. "
+      "TWO modes: pass `paths` (a list of image files), OR pass `folder` alone "
+      "to view a random sample from it without retyping any path. For 20 "
+      "images, call this a few times in batches rather than one-by-one.",
+      # NOTHING is required: `paths` OR `folder` activates its mode. `paths`
+      # used to be required, which contradicted folder mode — under grammar/
+      # strict enforcement the model was forced to emit paths and could never
+      # invoke folder mode correctly.
       {"type": "object", "properties": {
           "folder": {"type": "string", "description": "view a RANDOM SAMPLE "
                      "from this folder — use this instead of retyping paths"},
@@ -1204,7 +1243,7 @@ def _view_image(args, ctx):
                     "from `folder` (1-8, default 4)"},
           "paths": {"type": "array", "items": {"type": "string"},
                     "description": "up to 8 image file paths"}},
-       "required": ["paths"]},
+       "required": []},
       needs="vision")
 def _view_images(args, ctx):
     paths = args.get("paths") or []
@@ -1283,9 +1322,10 @@ def _view_sample(args, ctx):
 
 
 @tool("run_python",
-      "Run a short Python 3 snippet and return its stdout/stderr. For "
-      "calculations, data wrangling, quick checks. 30s limit; output is capped "
-      "at ~8000 chars, so print summaries/samples rather than everything.",
+      "Run a short Python 3 snippet and return its stdout/stderr (first line "
+      "= exit code). For calculations, data wrangling, quick checks. 30s "
+      "limit; output is capped at ~8000 chars, so print summaries/samples "
+      "rather than everything.",
       {"type": "object", "properties": {
           "code": {"type": "string", "description": "the Python source to run"}},
        "required": ["code"]},
@@ -1297,8 +1337,11 @@ def _run_python(args, ctx):
 
 
 @tool("run_shell",
-      "Run a shell command and return its output. Use sparingly. 30s limit; "
-      "output capped at ~8000 chars.",
+      "Run a shell command and return its output (first line = exit code, "
+      "stderr labelled). On Windows this is POWERSHELL: ls/cat/mv/cp/pwd work "
+      "as aliases, but `&&`, `2>/dev/null` and `export` do NOT — use `;`, "
+      "`2>$null` and `$env:NAME=...`. Working dir = the workspace root. "
+      "30s limit; output capped at ~8000 chars.",
       {"type": "object", "properties": {
           "command": {"type": "string"}}, "required": ["command"]},
       safe=False, needs="code")
@@ -1324,10 +1367,15 @@ def _run_shell(args, ctx):
 
 
 # destructive system commands refused even when code-exec is allowed — these
-# protect against the MODEL's mistakes (a hallucinated `format`), not the owner
+# protect against the MODEL's mistakes (a hallucinated `format`), not the owner.
+# `format` matches only the drive-wiping form (`format d:`) — the bare word
+# false-positived on `git log --format=…` and PowerShell's Format-Table, and a
+# small model told "blocked — destructive" abandons a perfectly good approach
+# (the Python blocklist below learned this same lesson first).
 _BLOCKED_CMD = re.compile(
-    r"(?i)(\b(format|diskpart|takeown|icacls|shutdown|restart-computer|mkfs|"
-    r"fdisk|reg\s+delete)\b|rm\s+-rf\s+[/~]|del\s+/[sq].*[\\/]|rd\s+/s\s+\w:)")
+    r"(?i)(\b(diskpart|takeown|icacls|shutdown|restart-computer|mkfs|"
+    r"fdisk|reg\s+delete)\b|\bformat\s+[a-z]:|rm\s+-rf\s+[/~]|"
+    r"del\s+/[sq].*[\\/]|rd\s+/s\s+\w:)")
 # deletion verbs, blocked only under the no-delete run profile
 _DELETE_CMD = re.compile(
     r"(?i)\b(del|erase|rm|rmdir|rd|remove-item|unlink)\b")
@@ -1399,7 +1447,13 @@ def _run_subprocess(cmd, ctx, shell=False, python_src=None):
             stdout, stderr = "", ""
         return "error: timed out after 30s (process tree killed)"
     out = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
-    out = out.strip() or f"(no output, exit {p.returncode})"
+    out = out.strip()
+    # ALWAYS lead with the exit code. It used to appear only when output was
+    # empty — so a failing script that printed anything looked identical to
+    # success, and a weak model cannot infer failure it was never shown.
+    status = ("exit 0 (ok)" if p.returncode == 0
+              else f"exit {p.returncode} (FAILED)")
+    out = status + ("\n" + out if out else " — no output")
     return out[:8000] + ("\n…(truncated)" if len(out) > 8000 else "")
 
 
