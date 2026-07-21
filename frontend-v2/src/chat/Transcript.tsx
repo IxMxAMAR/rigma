@@ -93,8 +93,19 @@ function Bubble({ m }: { m: ChatMessage }) {
     typeof m.content === "string"
       ? m.content
       : m.content
-          .map((p) => (p.type === "text" ? String(p.text ?? "") : "[image]"))
+          .filter((p) => p.type === "text")
+          .map((p) => String(p.text ?? ""))
           .join(" ");
+  // attached images render as real thumbnails, not a "[image]" placeholder
+  // (owner report 2026-07-21) — the data URIs are right there in the parts
+  const images =
+    typeof m.content === "string"
+      ? []
+      : m.content
+          .filter((p) => p.type === "image_url")
+          .map((p) =>
+            String((p as { image_url?: { url?: string } }).image_url?.url ?? ""))
+          .filter(Boolean);
   // server-side bookkeeping messages (TOOL RESULT …) are machine chatter in
   // an agentic chat; render them compactly, not as fake user turns
   const isMachine = isUser && /^(TOOL RESULT |### RUN STATE)/.test(text);
@@ -113,6 +124,18 @@ function Bubble({ m }: { m: ChatMessage }) {
             : "max-w-full text-[14px]"
         }
       >
+        {images.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2">
+            {images.map((src, i) => (
+              <img
+                key={i}
+                src={src}
+                alt={`attachment ${i + 1}`}
+                className="max-h-48 max-w-full rounded-md object-contain"
+              />
+            ))}
+          </div>
+        )}
         {isUser ? text : <Markdown text={text} />}
       </div>
     </div>
