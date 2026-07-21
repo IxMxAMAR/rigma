@@ -61,7 +61,10 @@ export default function WorkspacePanel() {
     void refresh();
   };
   return (
-    <div className="px-2 pt-3 border-t border-white/5 mx-2 min-h-0 flex flex-col">
+    // flex-1: take the sidebar's leftover height instead of hugging the
+    // list and leaving a dead gap above the footer (owner report 2026-07-21:
+    // "I have to scroll — what is all this space below it for?")
+    <div className="px-2 pt-3 border-t border-white/5 mx-2 min-h-0 flex-1 flex flex-col">
       <div className="flex items-center gap-1.5 px-2 pb-0.5">
         <button
           onClick={() => { setDraft(data?.path ?? ""); setEditing(!editing); }}
@@ -107,7 +110,7 @@ export default function WorkspacePanel() {
       ) : data.entries.length === 0 ? (
         <div className="px-2 font-mono text-[11px] text-muted">empty</div>
       ) : (
-        <ul className="overflow-y-auto max-h-[30vh] pb-1">
+        <ul className="overflow-y-auto flex-1 min-h-0 pb-1">
           {data.entries.map((e) => (
             <li key={e.name}
                 className="flex items-baseline gap-2 px-2 py-0.5 rounded hover:bg-white/5"
