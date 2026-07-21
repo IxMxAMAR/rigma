@@ -274,12 +274,18 @@ function SamplingCard() {
   );
 }
 
+interface MacroDef {
+  id: string;
+  label: string;
+  hint?: string;
+}
+
 interface Method {
   id: string;
   name: string;
   tagline: string;
   guide: string[];
-  ritual?: { kind: string; label: string };
+  macros?: MacroDef[];
 }
 
 // One-click workflow setups: prompt + sampler profile + effort + tool
@@ -293,22 +299,38 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
   const [active, setActive] = useState("");
   const [expanded, setExpanded] = useState("");
   const [applied, setApplied] = useState("");
-  const [ritualBusy, setRitualBusy] = useState(false);
+  const [macroBusy, setMacroBusy] = useState("");
 
-  const runRitual = async () => {
-    if (!currentId || ritualBusy) return;
-    setRitualBusy(true);
+  // Plan 2 replaces this with the MacroStrip above the composer and an inline
+  // ConfirmBar. Until then the buttons live here so the book method keeps the
+  // one-click move it had as a "ritual".
+  const runMacro = async (macro: MacroDef) => {
+    if (!currentId || macroBusy) return;
+    setMacroBusy(macro.id);
     try {
-      const r = await fetch(`/api/sessions/${currentId}/ritual`, {
+      const pre = await fetch(`/api/sessions/${currentId}/macro/preview`, {
         method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ macro_id: macro.id }),
       });
-      const d = (await r.json()) as { new_session_id?: string };
-      if (r.ok && d.new_session_id) {
-        await loadSessions();
-        await open(d.new_session_id);
+      const p = (await pre.json()) as
+        { needs_confirm?: boolean; preview?: string };
+      if (p.needs_confirm && !window.confirm(`${p.preview}\n\nRun it?`)) {
+        setMacroBusy("");
+        return;
       }
+      const r = await fetch(`/api/sessions/${currentId}/macro`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ macro_id: macro.id, confirm: "run" }),
+      });
+      const text = await r.text();
+      const m = /"new_session_id":\s*"([^"]+)"/.exec(text);
+      await loadSessions();
+      if (m) await open(m[1]);
+      else if (currentId) await open(currentId);
     } catch { /* chat stays where it is */ }
-    setRitualBusy(false);
+    setMacroBusy("");
   };
 
   useEffect(() => {
@@ -393,15 +415,17 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
                       {applied === m.id ? "applied ✓"
                         : active === m.id ? "re-apply" : "use this method"}
                     </button>
-                    {m.ritual && active === m.id && (
+                    {active === m.id && (m.macros ?? []).map((mac) => (
                       <button
-                        onClick={() => void runRitual()}
-                        disabled={ritualBusy}
+                        key={mac.id}
+                        onClick={() => void runMacro(mac)}
+                        disabled={!!macroBusy}
+                        title={mac.hint}
                         className="rounded-md bg-moss/15 text-moss px-2.5 py-1 text-[12px] font-semibold disabled:opacity-50"
                       >
-                        {ritualBusy ? "working…" : m.ritual.label}
+                        {macroBusy === mac.id ? "working…" : mac.label}
                       </button>
-                    )}
+                    ))}
                   </div>
                   {applied === m.id && (
                     <p className="text-[11px] text-muted">

@@ -1,8 +1,5 @@
 """Workflow methods: one-click activity setups (owner request 2026-07-21)."""
-import json
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from fastapi.testclient import TestClient
@@ -83,61 +80,53 @@ def test_endpoints_roundtrip():
                        json={"id": "coding"}).status_code == 404
 
 
-class _AuxUpstream(BaseHTTPRequestHandler):
-    """Answers every non-streaming completion with a fixed bible line."""
-    def do_POST(self):
-        n = int(self.headers.get("content-length", 0))
-        self.rfile.read(n)
-        payload = json.dumps({"choices": [{"message": {
-            "content": "Ananya reached the tank at dawn."}}]}).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, *a):
-        pass
-
-
-@pytest.fixture
-def aux_upstream():
-    srv = HTTPServer(("127.0.0.1", 0), _AuxUpstream)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield srv.server_address[1]
-    srv.shutdown()
-
-
-def test_book_ritual_updates_bible_and_spawns_next_chapter(aux_upstream):
+def test_finish_chapter_macro_replaces_the_ritual(monkeypatch):
+    """The hardcoded book_next_chapter ritual is gone; the same move is now
+    an ordinary macro made of aux-prompt -> note -> new_chat."""
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
                    ui_pid=os.getpid())
-    client = TestClient(build_app(upstream_port=aux_upstream))
+
+    async def fake_aux(prompt, max_tokens=120):
+        assert "STORY SO FAR" in prompt
+        return "Ananya reached the tank at dawn."
+
+    import rigma.methods_api as mapi
+    real_register = mapi.register
+
+    def patched(app, **kw):
+        return real_register(app, **{**kw, "aux_complete": fake_aux})
+    monkeypatch.setattr(mapi, "register", patched)
+
+    client = TestClient(build_app(upstream_port=1))
     sid = client.post("/api/sessions", json={}).json()["id"]
     client.post(f"/api/sessions/{sid}/method", json={"id": "book"})
     client.post(f"/api/sessions/{sid}", json={
         "title": "Chapter 3",
         "messages": [{"role": "user", "content": "write ch3"},
-                     {"role": "assistant",
-                      "content": "The chapter prose goes here." * 20}]})
-    r = client.post(f"/api/sessions/{sid}/ritual")
-    assert r.status_code == 200, r.text
-    d = r.json()
-    assert d["title"] == "Chapter 4"
-    assert "tank at dawn" in d["bible_entry"]
-    # old chat's bible grew
+                     {"role": "assistant", "content": "the chapter prose"}]})
+    with client.stream("POST", f"/api/sessions/{sid}/macro",
+                       json={"macro_id": "finish_chapter",
+                             "confirm": "run"}) as r:
+        assert r.status_code == 200
+        body = "".join(r.iter_text())
+    assert "macro_done" in body
     old = client.get(f"/api/sessions/{sid}").json()
     assert "tank at dawn" in old["notes"]
-    # the new chat carries method + bible and its title survives auto-titling
-    new = client.get(f"/api/sessions/{d['new_session_id']}").json()
-    assert new["method"] == "book"
-    assert "tank at dawn" in new["notes"]
-    assert new["title"] == "Chapter 4"
+    # and the next chapter chat exists, carrying the bible and the numbering
+    import re as _re
+    nid = _re.search(r'"new_session_id":\s*"([^"]+)"', body).group(1)
+    nxt = client.get(f"/api/sessions/{nid}").json()
+    assert nxt["method"] == "book" and "tank at dawn" in nxt["notes"]
+    assert nxt["title"] == "Chapter 4"
 
 
-def test_ritual_404s_without_one(aux_upstream):
+def test_the_ritual_endpoint_is_gone():
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
                    ui_pid=os.getpid())
-    client = TestClient(build_app(upstream_port=aux_upstream))
+    client = TestClient(build_app(upstream_port=1))
     sid = client.post("/api/sessions", json={}).json()["id"]
-    client.post(f"/api/sessions/{sid}/method", json={"id": "coding"})
     assert client.post(f"/api/sessions/{sid}/ritual").status_code == 404
+
+
+def test_no_method_declares_a_ritual_any_more():
+    assert all("ritual" not in m for m in methods.catalog())
