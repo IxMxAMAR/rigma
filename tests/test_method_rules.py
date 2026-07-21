@@ -65,3 +65,24 @@ def test_an_unknown_method_id_is_survivable():
     s["method"] = "deleted_yesterday"
     msgs = sessions.build_messages(s)
     assert isinstance(msgs, list)
+
+
+def test_pending_nudges_ride_as_one_trailing_user_message():
+    s = sessions.create("t")
+    s["messages"] = [{"role": "user", "content": "hi"},
+                     {"role": "assistant", "content": "hello"}]
+    s["pending_nudges"] = ["update the bible", "check continuity"]
+    msgs = sessions.build_messages(s)
+    assert msgs[-1]["role"] == "user"
+    assert "update the bible" in msgs[-1]["content"]
+    assert "check continuity" in msgs[-1]["content"]
+    # never a second system message — strict templates 400 on that
+    assert [m["role"] for m in msgs].count("system") <= 1
+
+
+def test_no_nudges_means_no_extra_message():
+    s = sessions.create("t")
+    s["messages"] = [{"role": "user", "content": "hi"}]
+    before = len(sessions.build_messages(s))
+    s["pending_nudges"] = []
+    assert len(sessions.build_messages(s)) == before

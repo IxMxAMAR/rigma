@@ -909,6 +909,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
         msgs = sessions.build_messages(s, _default_prompt(), preset)
+        # nudges are consumed by the turn that just read them: a reminder
+        # that re-injects every turn is nagging, not a trigger
+        s["pending_nudges"] = []
         # steer the reply's opening: llama-server continues from a trailing
         # assistant message AND echoes that prefix back in its output, so we
         # must NOT also add it ourselves. Prefill doesn't combine with tools.
@@ -1519,6 +1522,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                    "ok": not str(t.get("result", ""))
                                    .startswith("error")} for t, _ in kept],
                         "content": "\n".join(body_lines)})
+            # TRIGGER RULES. Evaluated after the turn, never during it: a
+            # trigger that fired mid-turn would be reacting to a tool call
+            # the model had not finished reasoning about. Nudges ride on the
+            # session and build_messages injects them as ONE user message
+            # next turn; a mute is a NOTICE, never assistant content.
+            try:
+                trig_notices = _fire_triggers(s, trace, user_spoke=not cont)
+                if trig_notices and s["messages"]:
+                    last_msg = s["messages"][-1]
+                    if last_msg.get("role") == "assistant":
+                        last_msg["notice"] = "\n".join(
+                            filter(None, [last_msg.get("notice"),
+                                          *trig_notices]))
+            except Exception:
+                pass          # a trigger must never cost the user their turn
             sessions.save(s)
             _bump_stats(timings)
             # Auto-title once the conversation has a shape (owner request
@@ -2994,6 +3012,51 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             _runs.set_status(r, "stopped", "stopped by user")
         return _runs.load(rid)
 
+    def _fire_triggers(session, trace, *, user_spoke: bool) -> list[str]:
+        """Run the method's trigger rules for the turn that just ended.
+        Mutates `session` (pending nudges, trigger state) and returns any
+        notices the caller must attach to msg["notice"]. Pure logic lives in
+        triggers.py; this is only the plumbing that feeds it real events."""
+        from . import methods as _methods, triggers as _trig
+        m = _methods.get(str(session.get("method") or ""))
+        if not m or not any(r.get("kind") == "trigger"
+                            for r in m.get("rules") or []):
+            return []                       # the overwhelmingly common case
+        state = session.get("trigger_state") or _trig.new_state()
+        turn = len([mm for mm in session.get("messages") or []
+                    if mm.get("role") == "assistant"])
+        events = [{"kind": "tool_ran", "tool": t.get("name"),
+                   "path": str((t.get("args") or {}).get("path") or ""),
+                   "turn": turn, "by_trigger": False, "user_spoke": user_spoke}
+                  for t in trace or []]
+        events.append({"kind": "turn_ended", "tool": "", "path": "",
+                       "turn": turn, "by_trigger": False,
+                       "user_spoke": user_spoke})
+        notices, nudges = [], list(session.get("pending_nudges") or [])
+        for ev in events:
+            actions, state = _trig.evaluate(m, ev, state)
+            for a in actions:
+                if a.get("notice"):
+                    notices.append(a["notice"])
+                if a["mode"] == "nudge" and a.get("text"):
+                    if a["text"] not in nudges:
+                        nudges.append(a["text"])
+                elif a["mode"] == "run":
+                    # A trigger that RUNS a macro still obeys the confirm
+                    # policy, and honouring that needs the user present --
+                    # so surface it as an offer rather than acting alone.
+                    macro = next((x for x in m.get("macros") or []
+                                  if x.get("id") == a.get("macro")), None)
+                    if macro:
+                        notices.append(
+                            f"Rule '{a['rule']}' suggests running "
+                            f"'{macro.get('label')}' — the button is above "
+                            "the message box.")
+            user_spoke = False      # only the first event of a turn counts
+        session["trigger_state"] = state
+        session["pending_nudges"] = nudges[-3:]
+        return notices
+
     async def _macro_drive_turn(session) -> str:
         """One real agentic turn for a macro `prompt` step: same generator and
         same idle watchdog as an autonomous run. Returns the assistant text."""
@@ -3012,6 +3075,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     methods_api.register(app, sse=_sse, drive_turn=_macro_drive_turn,
                          aux_complete=_aux_complete,
                          tool_ctx_for=_macro_tool_ctx)
+    # the trigger hook is a closure inside build_app; expose it so a test can
+    # drive the REAL wiring instead of trusting it matches triggers.py's
+    # unit tests
+    app.state.fire_triggers = _fire_triggers
 
     @app.get("/api/mcp")
     async def mcp_status():
