@@ -59,6 +59,23 @@ export async function previewMacro(
   return d;
 }
 
+/** Take someone else's method file. The server never overwrites an existing
+ *  id and never carries their trust decisions across. */
+export async function importMethod(doc: unknown): Promise<Method> {
+  const r = await fetch("/api/methods/import", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify(doc),
+  });
+  const d = (await r.json()) as Method & { errors?: string[] };
+  if (!r.ok) throw new Error((d.errors ?? ["import failed"]).join("; "));
+  return d;
+}
+
+export function exportUrl(mid: string): string {
+  return `/api/methods/${mid}/export`;
+}
+
 export async function createDraft(): Promise<
   { session_id: string; draft_id: string }
 > {

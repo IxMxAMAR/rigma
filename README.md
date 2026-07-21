@@ -59,6 +59,43 @@ numbers to [rigma-registry](https://github.com/IxMxAMAR/rigma-registry)). Verifi
 |---|---|---|---|
 | RX 9070 XT 16GB + 16GB RAM (Windows) | Qwen3.6-35B-A3B UD-Q3_K_XL, ctx 32K, n_cpu_moe 10 | Vulkan (llama.cpp b9867) | **verified 2026-07-06**: 57.1 t/s gen, 689 t/s prefill @ 4K prompt |
 
+## Methods (set a chat up for the work, then automate it)
+
+A **Method** configures a whole activity in one click — system prompt, sampler
+profile, thinking effort, tool posture and a Notes template — and then goes
+further: it carries **rules**, **macros** and **workflows** you can author
+yourself.
+
+Six ship built in: Coding, Writing a book, Roleplay, Research, Learning,
+Organizing files.
+
+- **Macro** — a button above the message box. *Finish chapter* summarises the
+  chapter into your story bible and opens the next one.
+- **Rule** — either standing guidance folded into the system prompt, or a
+  trigger that fires on its own (*after a chapter file changes, remind me to
+  update the bible*).
+- **Workflow** — a named multi-step sequence.
+
+All three are the same thing underneath: a **step list**. A step is one of
+`tool`, `prompt`, `settings`, `note` or `new_chat`, and steps can carry
+placeholders — `{{var}}`, `{{last_reply}}`, `{{step:0}}`, `{{ask:Label}}`,
+`{{transcript}}`, `{{title_next}}`, `{{selection}}`.
+
+**Make your own:** hit **+ Create method** in the Methods panel. That opens a
+chat where the model has only the method-building tools, so it can do nothing
+but help you build one — it asks a question, calls a tool, and the method takes
+shape beside the chat as it goes. Hit **Save method** when you like it.
+
+**Safety.** A macro that only reads runs straight away. Anything that writes,
+moves, runs a command, or lets the model loose with its tools asks first, with
+a one-line preview naming the real files — *Finish chapter: will run write_file
+on story_bible.md*. Choose **Always allow** and it stops asking for that macro.
+That choice is stored on your machine and is never part of a shared method.
+
+**Sharing.** A method is a JSON file in `~/.rigma/methods/`. Export it, send
+it, import theirs. Importing never overwrites one of yours and never carries
+someone else's "always allow".
+
 ## RAG (chat with your documents)
 
 Rigma pairs with [Raggity](https://github.com/IxMxAMAR/raggity) (AGPL-3.0, runs as a separate
