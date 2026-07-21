@@ -25,6 +25,10 @@ interface Run extends RunSummary {
 }
 
 const ACTIVE = new Set(["running", "paused"]);
+// terminal states the server can reattach a loop to — mirrors runs.RESTARTABLE
+const RESTARTABLE = new Set([
+  "interrupted", "stopped", "stalled", "frozen", "budget_exhausted", "error",
+]);
 
 function Launcher({ onLaunched }: { onLaunched: (id: string) => void }) {
   const [mission, setMission] = useState("");
@@ -288,6 +292,22 @@ export default function AutonomousSurface() {
                     {h.status}
                   </span>
                   <span className="flex-1 truncate text-secondary">{h.mission}</span>
+                  {RESTARTABLE.has(h.status) && !active && (
+                    <button
+                      onClick={() => {
+                        void fetch(`/api/runs/${h.id}/restart`, { method: "POST" })
+                          .then((r) => r.json())
+                          .then(() => {
+                            activeId.current = h.id;
+                            void pollActive();
+                          })
+                          .catch(() => {});
+                      }}
+                      className="shrink-0 rounded-md bg-amber/15 text-amber px-2 py-0.5 text-[11.5px] font-semibold"
+                    >
+                      resume
+                    </button>
+                  )}
                   <span className="font-mono text-[11px] text-muted shrink-0">{h.id.slice(0, 15)}</span>
                 </li>
               ))}
