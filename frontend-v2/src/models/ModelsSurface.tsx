@@ -231,11 +231,16 @@ export default function ModelsSurface() {
             ~/.rigma/models.
           </p>
         )}
+        {/* grid = CSS column flow (masonry-ish): short cards pack under each
+            other instead of leaving row-aligned holes next to tall ones */}
         <div className={view === "grid"
-          ? "grid grid-cols-1 lg:grid-cols-2 gap-4 items-start"
+          ? "columns-1 lg:columns-2 gap-4"
           : "flex flex-col gap-4"}>
           {cards.map((c) => (
-            <Card key={c.slug} card={c} onAction={refresh} />
+            <div key={c.slug}
+                 className={view === "grid" ? "break-inside-avoid mb-4" : ""}>
+              <Card card={c} onAction={refresh} />
+            </div>
           ))}
         </div>
       </div>
