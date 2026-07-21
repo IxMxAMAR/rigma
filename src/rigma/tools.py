@@ -1285,8 +1285,14 @@ def _nearest_region(text: str, old: str) -> str:
       "string must appear exactly once). Use for surgical edits.",
       {"type": "object", "properties": {
           "path": {"type": "string"}, "old": {"type": "string"},
-          "new": {"type": "string"}},
-       "required": ["path", "old", "new"]},
+          "new": {"type": "string"},
+          "start_line": {"type": "integer", "description": "first line to "
+                         "replace (1-indexed). Use INSTEAD of 'old' after "
+                         "read_file with numbered=true — exact, and needs no "
+                         "quoting"},
+          "end_line": {"type": "integer", "description": "last line to "
+                       "replace, inclusive. Use with start_line"}},
+       "required": ["path", "new"]},
       safe=False, needs="code")
 def _edit_file(args, ctx):
     p = _ws_path(ctx, str(args.get("path", "")))
@@ -1295,6 +1301,48 @@ def _edit_file(args, ctx):
     text = p.read_text(encoding="utf-8")
     old = str(args.get("old", ""))
     new = str(args.get("new", ""))
+
+    # --- deterministic route: replace a line RANGE, no matching at all -----
+    # The matching ladder below exists because the model must reproduce prose
+    # verbatim and cannot (it rewords while quoting -- 3 of 4 real edit_file
+    # calls failed that way on 2026-07-21). Line numbers are a handle that
+    # needs no quoting, so this path simply cannot miss.
+    has_range = args.get("start_line") is not None \
+        or args.get("end_line") is not None
+    if has_range:
+        if old:
+            return ("error: pass EITHER 'old' or start_line/end_line, not "
+                    "both — they are two different ways to say the same "
+                    "thing and I cannot tell which you meant")
+        try:
+            s = int(args.get("start_line"))
+            e = int(args.get("end_line", s))
+        except (TypeError, ValueError):
+            return ("error: start_line and end_line must be whole numbers "
+                    "(1-indexed, end_line inclusive)")
+        lines = text.split("\n")
+        # a trailing newline yields a final "" element that is not a line
+        count = len(lines) - 1 if lines and lines[-1] == "" else len(lines)
+        if s < 1 or e < s:
+            return (f"error: bad line range {s}-{e} — start_line must be 1 "
+                    "or more and end_line must not be before it")
+        if e > count:
+            return (f"error: line range {s}-{e} runs past the end — "
+                    f"{args.get('path')} has {count} lines. Call read_file "
+                    "with numbered=true to see the real numbers.")
+        _snapshot_before_write(p)
+        lines[s - 1:e] = new.split("\n")
+        p.write_text("\n".join(lines), encoding="utf-8")
+        return (f"edited {args.get('path')} — replaced lines {s}-{e}. "
+                "undo_last_change reverts it.")
+
+    # a model that read with numbered=true pastes the numbers back into
+    # `old`; strip them rather than failing on a mismatch it cannot see
+    if old:
+        stripped = _strip_line_numbers(old)
+        if stripped != old and stripped in text:
+            old = stripped
+
     n = text.count(old) if old else 0
     if n == 1:
         _snapshot_before_write(p)
@@ -1347,7 +1395,10 @@ def _edit_file(args, ctx):
             "mismatched indentation/whitespace or stray markdown backticks."
             + (_region_lines(text, region, ratio) if region else
                (_nearest_region(text, old)
-                or "\nread_file first to copy the exact text")))
+                or "\nread_file first to copy the exact text"))
+            + "\nOr stop quoting altogether: call read_file with "
+              "numbered=true, then edit_file with start_line/end_line and "
+              "the new text. That cannot miss.")
 
 
 @tool("read_file",
@@ -1361,7 +1412,12 @@ def _edit_file(args, ctx):
           "offset": {"type": "integer", "description": "first line to read "
                      "(1-indexed, default 1)"},
           "limit": {"type": "integer", "description": "how many lines "
-                    "(default 800, max 2000)"}},
+                    "(default 800, max 2000)"},
+          "numbered": {"type": "boolean", "description": "prefix each line "
+                       "with its line number. Use this when you intend to "
+                       "edit the file: you can then call edit_file with "
+                       "start_line/end_line and never have to quote the old "
+                       "text exactly"}},
        "required": ["path"]},
       needs="workspace")
 def _read_file(args, ctx):
@@ -1407,6 +1463,11 @@ def _read_file(args, ctx):
     chunk = lines[offset - 1: offset - 1 + limit]
     if not chunk:
         return (f"(no lines at offset {offset}; the file has {len(lines)} lines)")
+    if args.get("numbered"):
+        # opt-in ONLY: numbering the default output would put line numbers
+        # into prose the model later re-emits (a bible entry, a chapter).
+        # Asked for explicitly, it is the handle that makes edit_file exact.
+        chunk = [f"{offset + i:>6}|{ln}" for i, ln in enumerate(chunk)]
     body = "\n".join(chunk)
     clipped = len(body) > 20000               # hard char cap per page
     if clipped:                               # (one enormous line hits this)
@@ -1873,6 +1934,20 @@ def _view_sample(args, ctx):
         return (f"error: the sample has {len(sample)} files; `first` must be "
                 f"between 1 and {len(sample)}")
     return _view_images({"paths": chosen}, ctx)
+
+
+_LINENO_PREFIX = re.compile(r"^\s*\d+\|", re.M)
+
+
+def _strip_line_numbers(s: str) -> str:
+    """Drop the "  47|" prefixes read_file(numbered=true) adds, but only if
+    EVERY non-empty line carries one -- otherwise a genuine table or a code
+    block using pipes would be mangled."""
+    lines = [ln for ln in s.split("\n") if ln.strip()]
+    if not lines or not all(_LINENO_PREFIX.match(ln) for ln in lines):
+        return s
+    return "\n".join(_LINENO_PREFIX.sub("", ln, count=1)
+                     for ln in s.split("\n"))
 
 
 _MAX_HEALS = 20
