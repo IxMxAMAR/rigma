@@ -580,7 +580,9 @@ DELEGATE_SENTINEL = "\x00__RIGMA_DELEGATE__\x00"
           "path": {"type": "string",
                    "description": "optional folder/file to focus on"}},
        "required": ["question"]},
-      needs="run")
+      # workspace-gated, not run-gated: the context-firewall benefit applies
+      # equally to a long interactive chat on a small-context model
+      needs="workspace")
 def _delegate(args, ctx):
     # never runs — serve.py intercepts on the sentinel. Returning it from the
     # handler keeps every non-serve caller (tests, cached_run) safe: they get
@@ -701,6 +703,36 @@ def _task_complete(args, ctx):
     # verify-once / finish logic; the handler just acknowledges to the model
     return ("You signalled completion. The system will now ask you to verify "
             "the work before ending.")
+
+
+@tool("ask_user",
+      "Ask the OWNER one clarifying question and pause the run until they "
+      "answer. Use when the mission is genuinely ambiguous and guessing "
+      "wrong would waste hours — not for permission to proceed (you have "
+      "it). Their answer arrives as a steering message.",
+      {"type": "object", "properties": {
+          "question": {"type": "string",
+                       "description": "the ONE question the owner must "
+                                      "answer before you can continue"}},
+       "required": ["question"]},
+      needs="run")
+def _ask_user(args, ctx):
+    rid = ctx.get("run_id")
+    if not rid:
+        return "error: only available inside an autonomous run"
+    q = str(args.get("question", "")).strip()
+    if not q:
+        return "error: `question` text is required"
+    from . import runs
+    run = runs.load(rid)
+    if run is None:
+        return "error: run not found"
+    run["pending_question"] = {"q": q[:2000], "ts": time.time()}
+    run["paused"] = True
+    runs.save(run)
+    return ("Your question was sent to the owner and the run is PAUSED. "
+            "When they answer, the run resumes and their answer arrives as "
+            "a steering message. Do not repeat the question.")
 
 
 # ---- gated tools (filesystem + code) ----------------------------------------
@@ -1321,6 +1353,147 @@ def _write_file(args, ctx):
     return f"wrote {len(content)} chars to {args.get('path')}"
 
 
+# --- file organisation --------------------------------------------------------
+# First-class move/copy: the product's real missions (photo organising) were
+# faking this through PowerShell with long paths — the exact retyping failure
+# sample_files exists to avoid. Sources accept explicit paths OR the last
+# sample by reference; every name gets fuzzy recovery; nothing is ever
+# overwritten (collision-safe renaming).
+
+def _transfer_sources(args, ctx) -> tuple[list, list]:
+    paths = args.get("paths") or []
+    if isinstance(paths, str):
+        paths = [paths]
+    if not paths and ctx.get("run_id"):
+        from . import runs
+        sample = runs.get_last_sample(ctx["run_id"]) or []
+        if sample:
+            try:
+                first = max(1, int(args.get("first", 1) or 1))
+            except (TypeError, ValueError):
+                first = 1
+            try:
+                n = max(1, min(int(args.get("count", len(sample))
+                               or len(sample)), 50))
+            except (TypeError, ValueError):
+                n = len(sample)
+            paths = sample[first - 1: first - 1 + n]
+    found, errs = [], []
+    for raw in list(paths)[:50]:
+        try:
+            p = _read_path(ctx, str(raw))
+        except ValueError as e:
+            errs.append(str(e))
+            continue
+        if not p.is_file():
+            fixed, note = _fuzzy_file(p)
+            if fixed is not None:
+                p = fixed
+        if p.is_file():
+            found.append(p)
+        else:
+            errs.append(f"no such file: {raw}")
+    return found, errs
+
+
+def _free_name(dest_dir: Path, name: str) -> Path:
+    """First non-colliding name in dest: name.ext, name (2).ext, …"""
+    p = dest_dir / name
+    if not p.exists():
+        return p
+    stem, suffix = p.stem, p.suffix
+    for i in range(2, 1000):
+        cand = dest_dir / f"{stem} ({i}){suffix}"
+        if not cand.exists():
+            return cand
+    raise OSError(f"1000 name collisions for {name} — clean up {dest_dir}")
+
+
+def _do_transfer(args, ctx, move: bool):
+    import shutil
+    past = "moved" if move else "copied"
+    if move and ctx.get("profile") == "no-delete":
+        return ("error: blocked — moving deletes the original and deletion "
+                "is disabled for this run (no-delete). Use copy_files.")
+    dest_raw = str(args.get("dest", "")).strip()
+    if not dest_raw:
+        return "error: `dest` folder is required"
+    try:
+        dest = _read_path(ctx, dest_raw)
+    except ValueError as e:
+        return f"error: {e}"
+    srcs, errs = _transfer_sources(args, ctx)
+    if not srcs:
+        return ("error: no source files — pass `paths`, or call sample_files "
+                "first and reference the sample"
+                + ("; ".join([""] + errs) if errs else ""))
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"error: cannot create dest folder: {e}"
+    done, renamed = [], 0
+    for src in srcs:
+        try:
+            target = _free_name(dest, src.name)
+            if target.name != src.name:
+                renamed += 1
+            if move:
+                shutil.move(str(src), str(target))
+            else:
+                shutil.copy2(str(src), str(target))
+            done.append(target.name)
+        except OSError as e:
+            errs.append(f"{src.name}: {e}")
+    note = ""
+    if renamed:
+        note += f" ({renamed} renamed to avoid overwriting existing files)"
+    if errs:
+        note += " — errors: " + "; ".join(errs[:6])
+    shown = ", ".join(done[:10]) + ("…" if len(done) > 10 else "")
+    return (f"{past} {len(done)} file(s) to {dest}{note}\n{shown}"
+            if done else f"error: nothing {past} — " + "; ".join(errs[:6]))
+
+
+@tool("move_files",
+      "MOVE files into a folder (creates it if needed; never overwrites — "
+      "collisions are auto-renamed). Sources: pass `paths`, OR — right after "
+      "sample_files — pass nothing to move the whole sample, or `first` + "
+      "`count` for a slice of it. Prefer this over shell commands: filenames "
+      "are recovered even if slightly mistyped.",
+      {"type": "object", "properties": {
+          "dest": {"type": "string", "description": "destination folder "
+                   "(absolute, or relative to the workspace)"},
+          "paths": {"type": "array", "items": {"type": "string"},
+                    "description": "files to move (up to 50)"},
+          "first": {"type": "integer", "description": "1-based index into "
+                    "the last sample (when using the sample)"},
+          "count": {"type": "integer", "description": "how many from the "
+                    "sample (default: all of it)"}},
+       "required": ["dest"]},
+      safe=False, needs="code")
+def _move_files(args, ctx):
+    return _do_transfer(args, ctx, move=True)
+
+
+@tool("copy_files",
+      "COPY files into a folder (creates it if needed; never overwrites — "
+      "collisions are auto-renamed). Same sources as move_files: `paths`, or "
+      "the last sample_files sample (all of it, or `first` + `count`).",
+      {"type": "object", "properties": {
+          "dest": {"type": "string", "description": "destination folder "
+                   "(absolute, or relative to the workspace)"},
+          "paths": {"type": "array", "items": {"type": "string"},
+                    "description": "files to copy (up to 50)"},
+          "first": {"type": "integer", "description": "1-based index into "
+                    "the last sample (when using the sample)"},
+          "count": {"type": "integer", "description": "how many from the "
+                    "sample (default: all of it)"}},
+       "required": ["dest"]},
+      safe=False, needs="code")
+def _copy_files(args, ctx):
+    return _do_transfer(args, ctx, move=False)
+
+
 # by EXTENSION, not mimetypes.guess_type — the latter doesn't know .webp/.avif
 # on Windows, so ComfyUI's webp outputs were wrongly rejected as "not an image"
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif",
@@ -1516,12 +1689,20 @@ def _run_python(args, ctx):
       "stderr labelled). On Windows this is POWERSHELL: ls/cat/mv/cp/pwd work "
       "as aliases, but `&&`, `2>/dev/null` and `export` do NOT — use `;`, "
       "`2>$null` and `$env:NAME=...`. Working dir = the workspace root. "
-      "30s limit; output capped at ~8000 chars.",
+      "Default 30s limit (set `timeout` up to 300 for slow commands; for "
+      "anything longer use start_job). Output capped at ~8000 chars.",
       {"type": "object", "properties": {
-          "command": {"type": "string"}}, "required": ["command"]},
+          "command": {"type": "string"},
+          "timeout": {"type": "integer", "description":
+                      "seconds to wait before killing it (1-300, default 30)"}},
+       "required": ["command"]},
       safe=False, needs="code")
 def _run_shell(args, ctx):
     cmd = str(args.get("command", ""))
+    try:
+        tmo = max(1, min(int(args.get("timeout", 30) or 30), 300))
+    except (TypeError, ValueError):
+        tmo = 30
     # Windows: run through PowerShell, not cmd.exe. Every local model is
     # Unix-trained and reaches for ls/pwd/cat/mv/cp - which are all native
     # PowerShell aliases, but unknown words to cmd (live 2026-07-21: the
@@ -1537,8 +1718,124 @@ def _run_shell(args, ctx):
                     "(no-delete)")
         return _run_subprocess(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            ctx, shell=False)
-    return _run_subprocess(cmd, ctx, shell=True)
+            ctx, shell=False, timeout=tmo)
+    return _run_subprocess(cmd, ctx, shell=True, timeout=tmo)
+
+
+# --- background jobs ----------------------------------------------------------
+# The hard 30s kill meant the model could not pip-install, run a test suite,
+# start a server, or wait on a render — mission mode dead-ended on anything
+# slow. Proven pattern (Claude Code's run_in_background/BashOutput/KillShell):
+# small integer ids, tail-returning output, explicit kill.
+_JOBS: dict[int, dict] = {}
+_JOB_MAX_BUF = 64_000        # chars of rolling output kept per job
+_JOB_LIMIT = 8               # concurrent jobs — a runaway-spawn backstop
+
+
+def _job_pump(job: dict, stream, label: str) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            tagged = line if label == "out" else f"[stderr] {line}"
+            job["buf"] = (job["buf"] + tagged)[-_JOB_MAX_BUF:]
+    except Exception:
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+@tool("start_job",
+      "Start a LONG-RUNNING command in the background (installs, builds, "
+      "test suites, servers, renders) and return a job id immediately. "
+      "Check on it with job_output, stop it with kill_job. Same PowerShell "
+      "rules as run_shell.",
+      {"type": "object", "properties": {
+          "command": {"type": "string"}}, "required": ["command"]},
+      safe=False, needs="code")
+def _start_job(args, ctx):
+    cmd = str(args.get("command", ""))
+    if not cmd.strip():
+        return "error: `command` is required"
+    if _BLOCKED_CMD.search(cmd):
+        return ("error: blocked — that looks like a destructive system "
+                "command; refusing to run it")
+    if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(cmd):
+        return "error: blocked — deletion is disabled for this run (no-delete)"
+    live = [j for j in _JOBS.values() if j["proc"].poll() is None]
+    if len(live) >= _JOB_LIMIT:
+        return (f"error: {_JOB_LIMIT} jobs already running — kill_job one "
+                "first, or wait for one to finish")
+    if sys.platform == "win32":
+        argv = ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd]
+        shell = False
+    else:
+        argv, shell = cmd, True
+    try:
+        proc = _launch_killable(argv, shell, ctx.get("workspace") or None)
+    except Exception as e:
+        return f"error: could not start job: {e}"
+    jid = max(_JOBS, default=0) + 1
+    job = {"proc": proc, "buf": "", "cmd": cmd[:500], "started": time.time()}
+    _JOBS[jid] = job
+    import threading
+    for stream, label in ((proc.stdout, "out"), (proc.stderr, "err")):
+        threading.Thread(target=_job_pump, args=(job, stream, label),
+                         daemon=True).start()
+    return (f"started job {jid} (pid {proc.pid}). It runs in the background — "
+            f"continue other work and check it with job_output(id={jid}).")
+
+
+@tool("job_output",
+      "Check on a background job: running or finished (with exit code), plus "
+      "the latest output. Pass the id start_job gave you; omit it to list "
+      "all jobs.",
+      {"type": "object", "properties": {
+          "id": {"type": "integer", "description": "the job id"}}},
+      safe=False, needs="code")
+def _job_output(args, ctx):
+    if args.get("id") in (None, ""):
+        if not _JOBS:
+            return "(no jobs started yet)"
+        rows = []
+        for jid, j in sorted(_JOBS.items()):
+            rc = j["proc"].poll()
+            state = "running" if rc is None else f"exited {rc}"
+            rows.append(f"job {jid}: {state} — {j['cmd'][:80]}")
+        return "\n".join(rows)
+    try:
+        jid = int(args.get("id"))
+        job = _JOBS[jid]
+    except (TypeError, ValueError, KeyError):
+        return f"error: no such job: {args.get('id')}"
+    rc = job["proc"].poll()
+    head = (f"job {jid}: still running "
+            f"({int(time.time() - job['started'])}s elapsed)" if rc is None
+            else ("job {}: exited {} ({})".format(
+                jid, rc, "ok" if rc == 0 else "FAILED")))
+    tail = job["buf"][-4000:]
+    if not tail.strip():
+        tail = "(no output yet)" if rc is None else "(no output)"
+    return head + "\n" + tail
+
+
+@tool("kill_job",
+      "Stop a background job (kills its whole process tree).",
+      {"type": "object", "properties": {
+          "id": {"type": "integer", "description": "the job id to kill"}},
+       "required": ["id"]},
+      safe=False, needs="code")
+def _kill_job(args, ctx):
+    try:
+        jid = int(args.get("id"))
+        job = _JOBS[jid]
+    except (TypeError, ValueError, KeyError):
+        return f"error: no such job: {args.get('id')}"
+    if job["proc"].poll() is not None:
+        return f"job {jid} already exited ({job['proc'].poll()})"
+    _kill_tree(job["proc"].pid)
+    return f"job {jid} killed"
 
 
 # destructive system commands refused even when code-exec is allowed — these
@@ -1591,7 +1888,7 @@ def _kill_tree(pid: int) -> None:
         pass
 
 
-def _run_subprocess(cmd, ctx, shell=False, python_src=None):
+def _run_subprocess(cmd, ctx, shell=False, python_src=None, timeout=30):
     if python_src is not None:
         # PYTHON source: never scan it with the shell wordlist (see _BLOCKED_PY)
         if _BLOCKED_PY.search(python_src):
@@ -1613,14 +1910,15 @@ def _run_subprocess(cmd, ctx, shell=False, python_src=None):
         return f"error: could not start process: {e}"
     try:
         # stdin=DEVNULL (in _launch_killable) so input()/bare `cat` can't hang
-        stdout, stderr = p.communicate(timeout=30)
+        stdout, stderr = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_tree(p.pid)                       # kill the WHOLE tree, not just p
         try:
             stdout, stderr = p.communicate(timeout=5)
         except Exception:
             stdout, stderr = "", ""
-        return "error: timed out after 30s (process tree killed)"
+        return (f"error: timed out after {timeout}s (process tree killed) — "
+                "for long-running work use start_job instead")
     out = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
     out = out.strip()
     # ALWAYS lead with the exit code. It used to appear only when output was

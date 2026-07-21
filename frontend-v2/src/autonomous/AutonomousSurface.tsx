@@ -21,6 +21,7 @@ interface Run extends RunSummary {
   summary?: string;
   activity?: { kind: string; text: string }[];
   log_tail?: string;
+  pending_question?: { q: string } | null;
 }
 
 const ACTIVE = new Set(["running", "paused"]);
@@ -134,6 +135,17 @@ function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
         </div>
       </div>
       <p className="text-[13px] text-secondary mb-3">{run.mission}</p>
+      {run.pending_question?.q && (
+        <div className="rounded-md bg-amber/10 border border-amber/30 p-3 mb-3">
+          <div className="font-mono text-[11px] text-amber uppercase tracking-[0.08em] mb-1">
+            the agent is asking you
+          </div>
+          <p className="text-[13px] text-primary mb-2">{run.pending_question.q}</p>
+          <p className="text-[11.5px] text-muted">
+            Answer in the box below — sending resumes the run.
+          </p>
+        </div>
+      )}
       {plan.length > 0 && (
         <ul className="flex flex-col gap-1 mb-3">
           {plan.map((s) => (
