@@ -1341,25 +1341,34 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # after its tools are different situations with different fixes.
         # In one-action mode stopping after a single call is NORMAL, not a
         # ceiling — the notice would otherwise fire on every single action.
+        # `notice`, NOT `text`: a server-authored notice persisted as the
+        # ASSISTANT'S OWN WORDS poisoned the chat — the model re-read itself
+        # declaring it couldn't continue and answered every later prompt
+        # with instant EOS (live corruption 2026-07-21, one chat bricked).
+        # The notice reaches the USER (stream + UI field) but never the model.
+        notice = ""
         if (use_tools and not failed and not text.strip() and trace
                 and not one_action):
             if s.get("run_id"):
                 # in a run there is no user to say "keep going" — the loop
-                # just continues, so tell the model that instead
-                text = ("_(Reached this turn's tool-call limit. The run "
-                        "continues automatically — resume the SAME step next "
-                        "turn, do not start over.)_" if hit_ceiling else
-                        "_(You stopped without a reply. Your tool results "
-                        "are above — continue the SAME step next turn.)_")
+                # just continues, so tell the model that instead. Runs feed
+                # driving lines, not history notices, so text stays safe here
+                notice = ("_(Reached this turn's tool-call limit. The run "
+                          "continues automatically — resume the SAME step "
+                          "next turn, do not start over.)_" if hit_ceiling
+                          else
+                          "_(You stopped without a reply. Your tool results "
+                          "are above — continue the SAME step next turn.)_")
             elif hit_ceiling:
-                text = ("_(Reached this turn's tool-call limit while still "
-                        "working — send **keep going** and I'll continue. "
-                        "You can raise the limit in the chat's settings.)_")
+                notice = ("_(Reached this turn's tool-call limit while "
+                          "still working — send **keep going** and I'll "
+                          "continue. You can raise the limit in the chat's "
+                          "settings.)_")
             else:
-                text = ("_(The model stopped after its tool calls without a "
-                        "final reply — the results are shown above. Say "
-                        "**continue** if it should keep going.)_")
-            yield _sse({"delta": text})
+                notice = ("_(The model stopped after its tool calls without "
+                          "a final reply — the results are shown above. Say "
+                          "**continue** if it should keep going.)_")
+            yield _sse({"delta": notice})
         if not failed:
             meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}
             if usage.get("prompt_tokens"):
@@ -1402,6 +1411,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     body_text = "→ " + ", ".join(
                         str(t.get("name", "?")) for t in trace)
                 msg = {"role": "assistant", "content": body_text}
+                if notice:
+                    # UI-only field: build_messages never forwards it, so
+                    # the model can't read its own refusal back as gospel
+                    msg["notice"] = notice
                 if thinking:
                     msg["thinking"] = thinking
                 if trace:

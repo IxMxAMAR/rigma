@@ -152,6 +152,9 @@ function Bubble({ m }: { m: ChatMessage }) {
           </div>
         )}
         {isUser ? text : <Markdown text={text} />}
+        {m.notice && (
+          <p className="text-[12px] italic text-muted mt-1.5">{m.notice}</p>
+        )}
       </div>
     </div>
   );

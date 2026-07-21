@@ -397,6 +397,17 @@ def test_silent_stop_is_not_reported_as_a_limit(home, quiet_upstream):
     assert r.status_code == 200
     assert "tool-call limit" not in r.text          # the old lie
     assert "stopped after its tool calls" in r.text  # the truth
+    # ...and the notice is USER-facing only: persisted OUT of the assistant's
+    # words, so the model never re-reads its own refusal as gospel (a chat
+    # was bricked into instant-EOS exactly this way, live 2026-07-21)
+    from rigma import sessions as _sessions
+    saved = _sessions.load(sid)
+    last = [m for m in saved["messages"] if m["role"] == "assistant"][-1]
+    assert "stopped after its tool calls" not in str(last.get("content", ""))
+    assert "stopped after its tool calls" in str(last.get("notice", ""))
+    msgs = _sessions.build_messages(saved)
+    assert not any("stopped after its tool calls" in str(m.get("content", ""))
+                   for m in msgs)
 
 
 def test_round_cap_honours_the_backstop():
