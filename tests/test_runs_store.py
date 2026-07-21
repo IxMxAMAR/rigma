@@ -88,6 +88,39 @@ def test_budget_exceeded_reasons():
     assert "token budget" in runs.budget_exceeded(r)
 
 
+def test_stale_snapshot_cannot_resurrect_a_stopped_run():
+    """The lost update that made zombie runs (live repro 2026-07-21).
+
+    The loop loads the run ONCE per iteration and then awaits the engine for
+    a long time. If /stop lands during that await, the loop's end-of-iteration
+    save wrote its stale snapshot back — status "running" — over the "stopped"
+    on disk. The task was already dead, so the run showed "running" forever
+    and refused BOTH resume and restart ("run is running"); only a server
+    restart cleared it. Terminal is sticky: a save that does not know the run
+    halted must not un-halt it."""
+    r = runs.create("m", "s")
+    rid = r["id"]
+    stale = runs.load(rid)                       # snapshot taken while running
+    runs.set_status(runs.load(rid), "stopped", "stopped by user")
+    stale["iteration"] = 5                       # real bookkeeping to preserve
+    runs.save(stale)                             # the loop's blind write-back
+    back = runs.load(rid)
+    assert back["status"] == "stopped", "a stale save resurrected a stopped run"
+    assert back["halt_reason"] == "stopped by user"
+    assert back["iteration"] == 5, "bookkeeping from the last turn must survive"
+
+
+def test_restart_may_deliberately_revive_a_terminal_run():
+    """The one legitimate terminal -> running transition stays possible."""
+    r = runs.create("m", "s")
+    rid = r["id"]
+    runs.set_status(runs.load(rid), "stopped", "stopped by user")
+    back = runs.load(rid)
+    back.update(status="running", halt_reason="")
+    runs.save(back, revive=True)
+    assert runs.load(rid)["status"] == "running"
+
+
 def test_log_tool_action_writes_a_server_authored_line():
     r = runs.create("m", "s")
     runs.log_tool_action(r["id"], "write_file",

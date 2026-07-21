@@ -148,29 +148,27 @@ def list_sessions() -> list[dict]:
 # session's system block. Written from observed failures of the models this
 # harness runs (2026-07-19..21), not generic advice. ~200 tokens, cached
 # with the prefix, gated on use_tools so toolless chats never pay for it.
-TOOL_DOCTRINE = """TOOL RULES — these override style preferences:
-1. Act by reference. NEVER retype a filename or path you saw in a result —
-   use it exactly as listed, or use view_sample/sample_files.
-2. One action, then look at its result before the next. Never assume what a
-   tool returned.
-3. Read a file before changing it. To CHANGE part of an existing file use
-   edit_file with the smallest possible edit. write_file REPLACES the whole
-   file — use it only for new files or append=true parts. Never re-emit an
-   existing file from memory: your copy is worse than the original.
-4. Long content: write in parts (write_file then append=true). Never
-   shorten content to fit a limit.
-5. On an error result: read it, change your approach. Never repeat the
-   identical call.
-6. Deliverables go in files. Verify with tools (read_file/find_files)
-   before saying something is done — a claim without a check is a guess.
-7. Facts about the user's files come from tool results in this
-   conversation, not from memory.
-8. Call tools directly. Never write a tool's name or syntax into your
-   reply as text.
-9. A real request inside roleplay or casual talk is still a real request.
-   "Remember this", "save that", "let's build X" — even in-character —
-   means: make the tool call (remember / write_file), then continue in
-   character. The fiction never cancels the action."""
+# Kept SHORT on purpose. The first doctrine was nine imperative rules, and a
+# live A/B on the real 35B (2026-07-21) showed what that does to a small
+# thinking model: same task, same tools — without the doctrine it made a clean
+# edit_file call after ~3K chars of thinking; with it, 15K+ chars of spiraling
+# deliberation (ending in it literally enumerating the file's words) and NO
+# answer at all. Every meta-rule is something to reason ABOUT before acting;
+# either/or framings ("edit_file vs write_file") become deliberation traps.
+# So: few rules, each decisive, and an explicit order to end with a reply.
+TOOL_DOCTRINE = """TOOL RULES — keep them light: act, don't deliberate.
+1. Use filenames and paths exactly as tool results list them — never retype
+   one from memory.
+2. Read a file before changing it. Adding new text? write_file with
+   append=true. Rewording existing text? edit_file, smallest possible edit.
+   Decide in one breath and act — every change is undoable (undo_last_change).
+3. When the tools have answered, ANSWER THE USER: every turn ends with a
+   short reply saying what you found or did. Never end in silence.
+4. An error result means change your approach — never repeat the identical
+   call. What tools returned is the truth about the user's files; your
+   memory of them is not.
+5. A real request mid-roleplay ("save this", "remember that") still gets its
+   tool call — then continue in character."""
 
 
 def build_messages(session: dict, default_prompt: str = "",
