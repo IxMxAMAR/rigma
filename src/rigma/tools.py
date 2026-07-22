@@ -833,6 +833,61 @@ def _fuzzy_file(p: Path):
     return None, ""
 
 
+# characters that are illegal in a Windows filename and are never what a model
+# legitimately means when NAMING a file to write. `*` and `?` are the ones it
+# reaches for when it has given up finding a path and started globbing; the
+# rest round out the Windows-reserved set. `:` is left to _ws_path (drive
+# letters / absolute-path rejection) so we don't false-positive on those.
+_ILLEGAL_PATH = set('*?"<>|')
+
+
+def _bad_write_char(rel: str):
+    """The first illegal character in a path a WRITE would create, or None."""
+    return next((c for c in str(rel) if c in _ILLEGAL_PATH), None)
+
+
+def _glob_under(root: Path, rel: str) -> list[Path]:
+    """Resolve a glob pattern under `root`, but only files, and only inside
+    the workspace (a `..` in the pattern can't escape). Returns real paths."""
+    try:
+        hits = [p for p in root.glob(rel)
+                if p.is_file() and p.is_relative_to(root)]
+    except (ValueError, OSError):
+        return []
+    return sorted(hits)
+
+
+def _nearest_hint(root: Path, rel: str) -> str:
+    """A missing path taught the model nothing when it just said 'no such
+    file'. Walk from the workspace root down `rel`, stop at the deepest
+    component that actually exists, and show what is REALLY there -- with the
+    closest name to what they asked for named first. This is what turns a
+    guessing loop (wildcard-yngine, wildcard-engin, wild-card-engine) into a
+    one-shot correction."""
+    import difflib
+    cur = root
+    parts = [p for p in Path(rel).parts if p not in ("", ".")]
+    for i, part in enumerate(parts):
+        nxt = (cur / part)
+        if nxt.exists():
+            cur = nxt
+            continue
+        # `part` is where it diverged: show cur's entries, closest first
+        entries = sorted(cur.iterdir(), key=lambda x: x.name.lower())
+        names = [e.name for e in entries]
+        close = difflib.get_close_matches(part, names, n=3, cutoff=0.5)
+        rest = [n for n in names if n not in close]
+        shown = (close + rest)[:20]
+        where = "/".join(parts[:i]) or "the workspace root"
+        listing = ", ".join(
+            (n + "/" if (cur / n).is_dir() else n) for n in shown)
+        tail = "" if len(names) <= 20 else f" (+{len(names) - 20} more)"
+        did_you = (f" Did you mean '{close[0]}'?" if close else "")
+        return (f"error: no such path: {rel} — '{part}' is not in {where}."
+                f"{did_you} What's there: {listing}{tail}")
+    return f"error: no such file: {rel}"
+
+
 def _read_path(ctx, raw: str) -> Path:
     """Resolve a path for READ-ONLY tools, allowing ABSOLUTE paths.
 
@@ -1434,14 +1489,16 @@ def _edit_file(args, ctx):
 def _read_file(args, ctx):
     raw = str(args.get("path", ""))
     p = _read_path(ctx, raw)
+    _read_note = ""
     if not p.is_file():
-        fixed, _note = _fuzzy_file(p)
+        fixed, _read_note = _fuzzy_file(p)
         if fixed is not None:
             p = fixed
     if not p.is_file():
         # Inside a run the model hunts for its own progress log and loops on
         # "no such file" (the real one lives in the run dir, not the workspace).
-        # Hand it the actual progress instead of an error.
+        # Hand it the actual progress instead of an error. Checked FIRST so
+        # the folder/glob branches below can't shadow it.
         rid = ctx.get("run_id")
         if rid and Path(raw).name.lower() in ("progress.md", "progress.txt"):
             from . import runs
@@ -1450,7 +1507,38 @@ def _read_file(args, ctx):
                     "to read it from disk):\n"
                     + (tail or "(nothing logged yet)")
                     + "\n\nContinue from here. Do NOT restart earlier steps.")
-        return f"error: no such file: {args.get('path')}"
+        # A DIRECTORY is not an error to read -- it's the model saying "what's
+        # in here?". Answer that (live 2026-07-21: read_file on a folder said
+        # "no such file" and the model started guessing filenames blind).
+        if p.is_dir():
+            return _folder_listing(p)
+        # A GLOB in the path: the model gave up on the exact name and reached
+        # for a pattern. Resolve it. One hit -> just read it; several -> show
+        # them; none -> point at the tool that's actually for patterns.
+        if any(ch in raw for ch in "*?[") and ctx.get("workspace"):
+            root = Path(ctx["workspace"]).resolve()
+            hits = _glob_under(root, raw)
+            if len(hits) == 1:
+                p = hits[0]
+                _read_note = (f" (your pattern '{raw}' matched one file: "
+                              f"{hits[0].relative_to(root)})")
+            elif len(hits) > 1:
+                rels = ", ".join(str(h.relative_to(root)) for h in hits[:12])
+                return (f"error: the pattern '{raw}' matched {len(hits)} "
+                        f"files: {rels}. Read one by its exact path.")
+            else:
+                return (f"error: the pattern '{raw}' matched no files. Use "
+                        "find_files to search, then read_file with an exact "
+                        "path.")
+        # last resort: name what's REALLY at the deepest folder that exists,
+        # so a wrong directory component is a one-turn fix, not a guessing loop
+        if not p.is_file() and ctx.get("workspace"):
+            try:
+                return _nearest_hint(Path(ctx["workspace"]).resolve(), raw)
+            except Exception:
+                pass
+        if not p.is_file():
+            return f"error: no such file: {args.get('path')}"
     size = p.stat().st_size
     if size > 8_000_000:
         return (f"error: file too large to read ({size // 1000} KB) — use grep "
@@ -1497,7 +1585,37 @@ def _read_file(args, ctx):
                      f"call read_file with offset={end + 1} to continue")
     elif offset > 1:
         notes.append(f"lines {offset}-{end} of {len(lines)} — end of file")
-    return body + ("\n…(" + "; ".join(notes) + ")" if notes else "")
+    return (_read_note + body
+            + ("\n…(" + "; ".join(notes) + ")" if notes else ""))
+
+
+def _folder_listing(p: Path) -> str:
+    """Shared by list_directory and read_file's directory-redirect: a compact
+    listing that summarises big folders instead of dumping every name."""
+    items = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+    if not items:
+        return "(this is a folder, and it is empty)"
+    lead = "(that is a folder — its contents:)\n"
+    if len(items) <= _LIST_MAX:
+        body = "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
+                         for x in items)
+        return lead + body + f"\n({len(items)} entries)"
+    from collections import Counter
+    files = [x for x in items if x.is_file()]
+    dirs = [x for x in items if x.is_dir()]
+    kinds = ", ".join(f"{n}× {e}" for e, n in
+                      Counter((x.suffix.lower() or "(no ext)")
+                              for x in files).most_common(8))
+    out = [lead.rstrip(),
+           f"{len(items)} entries in {p} — too many to list in full.",
+           f"{len(files)} files ({kinds}); {len(dirs)} folders."]
+    if dirs:
+        out.append("folders: " + ", ".join(d.name for d in dirs[:10]))
+    out.append("example files:\n"
+               + "\n".join("📄 " + x.name for x in files[:15]))
+    out.append("To work with this folder use sample_files (random sample) or "
+               "find_files (glob). Do NOT dump the whole listing.")
+    return "\n".join(out)
 
 
 @tool("list_directory",
@@ -1601,7 +1719,20 @@ def _sample_files(args, ctx):
        "required": ["path", "content"]},
       safe=False, needs="code")
 def _write_file(args, ctx):
-    p = _ws_path(ctx, str(args.get("path", "")))
+    raw = str(args.get("path", ""))
+    # Refuse a dangerous path BEFORE touching the disk. Live 2026-07-21: the
+    # model gave up finding a file, then called write_file with a literal '*'
+    # in the path (comfyui-wild*ngine/__init__.py) and 7943 chars of content.
+    # On Windows that raised a raw WinError the model read as a system fault;
+    # on a valid-but-wrong path it would have created a stray file. A '*' or
+    # '?' means it is still guessing, not writing.
+    bad = _bad_write_char(raw)
+    if bad is not None:
+        hint = (" — that looks like a search pattern. Use find_files to "
+                "locate the real path, then write to it exactly."
+                if bad in "*?" else "")
+        return (f"error: '{bad}' can't be in a file path you write to.{hint}")
+    p = _ws_path(ctx, raw)
     p.parent.mkdir(parents=True, exist_ok=True)
     content = str(args.get("content", ""))
     if _CTRL_RUN.search(content):
