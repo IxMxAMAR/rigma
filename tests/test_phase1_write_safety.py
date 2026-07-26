@@ -39,13 +39,63 @@ def test_edit_miss_shows_nearest_region(tmp_path):
     ctx, ws = _ctx(tmp_path)
     (ws / "b.txt").write_text(
         "alpha\nthe quick brown fox jumps\ngamma\n", encoding="utf-8")
+    # a genuine miss: below _FUZZY_ACCEPT, so nothing is written and the model
+    # is shown what the file really says
     out = tools.run_tool("edit_file", {
-        "path": "b.txt", "old": "the quick brown wolf jumps",
+        "path": "b.txt", "old": "the quick red dog walks",
         "new": "x"}, ctx)
     assert out.startswith("error")
     assert "closest" in out and "region" in out
     assert "quick brown fox" in out               # the actual file text
     assert "2:" in out                            # with line numbers
+    assert "fox" in (ws / "b.txt").read_text(encoding="utf-8")   # untouched
+
+
+# --- the _FUZZY_ACCEPT bar itself --------------------------------------------
+# 2026-07-22 dropped it 0.85 -> 0.75. These pin what that actually changed, so
+# the bar can't drift again without a test saying so.
+
+def test_edit_accepts_one_swapped_word_and_says_so(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "b.txt").write_text(
+        "alpha\nthe quick brown fox jumps\ngamma\n", encoding="utf-8")
+    # one word wrong out of five (~80%) — under the old 0.85 bar this was a
+    # hard error; it is exactly the "model reworded while quoting" case the
+    # fuzzy path exists for, so now it applies
+    out = tools.run_tool("edit_file", {
+        "path": "b.txt", "old": "the quick brown wolf jumps",
+        "new": "REPLACED"}, ctx)
+    assert not out.startswith("error")
+    assert "differed slightly" in out          # never silent about guessing
+    assert "80%" in out                        # and says how close it was
+    assert "undo_last_change" in out           # and how to take it back
+    assert "REPLACED" in (ws / "b.txt").read_text(encoding="utf-8")
+
+
+def test_fuzzy_edit_is_undoable(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "b.txt").write_text(
+        "alpha\nthe quick brown fox jumps\ngamma\n", encoding="utf-8")
+    tools.run_tool("edit_file", {"path": "b.txt",
+                                 "old": "the quick brown wolf jumps",
+                                 "new": "REPLACED"}, ctx)
+    tools.run_tool("undo_last_change", {"path": "b.txt"}, ctx)
+    assert "quick brown fox" in (ws / "b.txt").read_text(encoding="utf-8")
+
+
+def test_fuzzy_refuses_when_two_regions_are_equally_close(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    # the MARGIN, not the threshold, is the safety property: with the accept
+    # bar this low, "beat every other candidate" is what stops the wrong
+    # paragraph being rewritten
+    before = ("the quick brown fox jumps over\n\n"
+              "the quick brown cat jumps over\n")
+    (ws / "d.txt").write_text(before, encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "d.txt", "old": "the quick brown pig jumps over",
+        "new": "CLOBBERED"}, ctx)
+    assert out.startswith("error")
+    assert (ws / "d.txt").read_text(encoding="utf-8") == before
 
 
 def test_edit_multimatch_reports_line_numbers(tmp_path):

@@ -20,11 +20,19 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Callable
+
+# Serialises the read-modify-write inside edit_file/write_file. Re-entrant so a
+# tool that legitimately nests file work on one thread can't deadlock itself.
+# It is NOT cross-process: it guards this server's own concurrent turns (a
+# queued prompt, a run loop and a chat turn can all be live at once), not an
+# editor someone has open beside it.
+_FILE_LOCK = threading.RLock()
 
 
 @dataclass
@@ -150,7 +158,66 @@ _XML_CALL = re.compile(r"<function=([\w.-]+)>(.*?)(?:</function>|$)", re.S)
 _XML_PARAM = re.compile(r"<parameter=([\w.-]+)>\s*(.*?)\s*(?:</parameter>|$)", re.S)
 
 
-def rescue_xml_tool_call(text: str):
+_FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S | re.I)
+_REACT_CALL = re.compile(
+    r"Action:\s*([\w.-]+)\s*Action\s*Input:\s*(\{.*?\})", re.S | re.I)
+
+# Shapes a lost tool-call wrapper leaves behind: the bare argument object, with
+# no name anywhere. Only UNAMBIGUOUS key sets — an object that could be two
+# different calls is not rescued, because guessing WHICH tool to run is how a
+# rescue turns into damage. Order matters: edit before write, since an edit
+# payload also carries a path.
+_ARG_SHAPES = (
+    (lambda d: "path" in d and "new" in d
+     and ("old" in d or "start_line" in d or "line" in d), "edit_file"),
+    (lambda d: "path" in d and "content" in d and "new" not in d,
+     "write_file"),
+    (lambda d: "path" in d and "content" not in d
+     and ("offset" in d or "limit" in d), "read_file"),
+    (lambda d: set(d) == {"code"}, "run_python"),
+    (lambda d: set(d) == {"command"}, "run_shell"),
+)
+
+
+def _call_from_json_obj(data):
+    """(name, args) for one already-parsed JSON object, or None."""
+    if not isinstance(data, dict):
+        return None
+
+    def _as_dict(v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v, strict=False)
+            except Exception:
+                return None
+        return v if isinstance(v, dict) else None
+
+    # {"name": ..., "arguments"/"parameters": {...}}
+    if "name" in data and ("arguments" in data or "parameters" in data):
+        a = _as_dict(data.get("arguments") or data.get("parameters") or {})
+        if a is not None:
+            return resolve_tool_name(data["name"]) or data["name"], a
+    # {"function": {"name": ..., "arguments": {...}}}
+    f = data.get("function")
+    if isinstance(f, dict) and "name" in f:
+        a = _as_dict(f.get("arguments") or f.get("parameters") or {})
+        if a is not None:
+            return resolve_tool_name(f["name"]) or f["name"], a
+    # {"tool": ..., "kwargs"/"args"/"input": {...}}
+    if isinstance(data.get("tool"), str):
+        a = _as_dict(data.get("kwargs") or data.get("args")
+                     or data.get("arguments") or data.get("input") or {})
+        if a is not None:
+            return resolve_tool_name(data["tool"]) or data["tool"], a
+    # no name at all: infer the tool from an unambiguous argument shape
+    if not any(k in data for k in ("name", "function", "tool")):
+        for matches, tool in _ARG_SHAPES:
+            if matches(data):
+                return tool, data
+    return None
+
+
+def rescue_tool_call(text: str):
     """Parse a tool call the ENGINE's parser missed out of raw reply text.
 
     Live-verified failure mode (2026-07-20, HauhauCS Qwen IQ3_M + v21.3
@@ -162,24 +229,68 @@ def rescue_xml_tool_call(text: str):
     the server's parser as the only reader: if a reply contains an
     unmistakable call shape, salvage it.
 
-    Returns (name, args) or (None, None). Deliberately strict about the
-    OUTER shape (must see <function=...>) and lenient inside it.
+    Four shapes, each UNMISTAKABLE on its own:
+      1. <function=name><parameter=k>v</parameter></function>  (Qwen XML)
+      2. a fenced ```json block holding a call object
+      3. a reply that IS one bare JSON object, nothing else
+      4. ReAct's "Action: name / Action Input: {...}"
+
+    What is deliberately NOT scanned: JSON found loose in the middle of prose.
+    A reply that explains a call ("you'd pass {"path": "a.txt", "content":
+    "hi"}") is discussing one, not making one, and executing it would be a
+    write the model never asked for. Shape 3 requires the object to be the
+    ENTIRE reply, which is the difference between the two.
+
+    Returns (name, args) or (None, None).
     """
-    if not text or "<function=" not in text:
+    if not text:
         return None, None
-    m = _XML_CALL.search(text)
-    if not m:
-        return None, None
-    name, body = m.group(1), m.group(2)
-    args = {}
-    for pm in _XML_PARAM.finditer(body):
-        val = pm.group(2)
-        # values are strings on the wire; let JSON-looking ones be structured
+
+    # 1. XML (strict about the OUTER shape, lenient inside it)
+    if "<function=" in text:
+        m = _XML_CALL.search(text)
+        if m:
+            name, body = m.group(1), m.group(2)
+            args = {}
+            for pm in _XML_PARAM.finditer(body):
+                val = pm.group(2)
+                # values are strings on the wire; let JSON-looking ones be
+                # structured
+                try:
+                    args[pm.group(1)] = json.loads(val)
+                except (ValueError, TypeError):
+                    args[pm.group(1)] = val
+            return name, args
+
+    # 2/3. a fenced json block, or a reply that is nothing but one JSON object
+    blobs = [m.group(1) for m in _FENCED_JSON.finditer(text)]
+    bare = text.strip()
+    if bare.startswith("{") and bare.endswith("}"):
+        blobs.append(bare)
+    for blob in blobs:
         try:
-            args[pm.group(1)] = json.loads(val)
-        except (ValueError, TypeError):
-            args[pm.group(1)] = val
-    return name, args
+            got = _call_from_json_obj(json.loads(blob, strict=False))
+        except Exception:
+            continue
+        if got:
+            return got
+
+    # 4. ReAct: both markers must be present, so prose can't trip it
+    m = _REACT_CALL.search(text)
+    if m:
+        try:
+            args = json.loads(m.group(2).strip(), strict=False)
+            if isinstance(args, dict):
+                nm = m.group(1).strip()
+                return resolve_tool_name(nm) or nm, args
+        except Exception:
+            pass
+
+    return None, None
+
+
+# the pre-2026-07-22 name, kept so nothing importing it breaks
+rescue_xml_tool_call = rescue_tool_call
 
 
 def repair_json_args(raw: str):
@@ -215,6 +326,15 @@ def repair_json_args(raw: str):
             return v, " (your JSON was malformed and had to be repaired)"
     except Exception:
         pass
+    # a Python repr instead of JSON: single quotes, True/False/None. Common
+    # from models that have seen more Python than wire formats.
+    try:
+        import ast
+        v = ast.literal_eval(s)
+        if isinstance(v, dict):
+            return v, " (your arguments were Python, not JSON)"
+    except Exception:
+        pass
     # last resort: pull out the first {...} block
     m = re.search(r"\{.*\}", s, re.S)
     if m:
@@ -245,9 +365,31 @@ def resolve_tool_name(name: str):
     for stripped in (cand.removesuffix("_tool"), cand.removeprefix("functions.")):
         if stripped in _REGISTRY:
             return stripped
+    if _TOOL_ALIASES.get(cand) in _REGISTRY:
+        return _TOOL_ALIASES[cand]
     import difflib
     close = difflib.get_close_matches(cand, list(_REGISTRY), n=1, cutoff=0.7)
     return close[0] if close else None
+
+
+# Other harnesses' names for the same tools. Resolved here rather than
+# REGISTERED: a registered alias would also be advertised by specs(), so the
+# model would see `read` and `read_file` as two separate tools and pay context
+# for the duplicate. Aliasing under the hood costs nothing on the wire and
+# still lets a model trained elsewhere call what it knows. difflib can't cover
+# these — "read" vs "read_file" scores 0.62, under its 0.7 cutoff.
+_TOOL_ALIASES = {
+    "read": "read_file",
+    "edit": "edit_file",
+    "write": "write_file",
+    "ls": "list_directory",
+    "dir": "list_directory",
+    "find": "find_files",
+    "bash": "run_shell",
+    "sh": "run_shell",
+    "shell": "run_shell",
+    "python": "run_python",
+}
 
 
 _CTRL_RUN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
@@ -280,6 +422,92 @@ def _defuse_control_bytes(text: str) -> str:
                   "file corruption?]", text)
 
 
+# Names other harnesses (and models trained on them) use for the SAME argument.
+# Applied per-tool against the tool's own schema, so `content` can mean the new
+# text for edit_file without also being aliased onto a tool that has its own
+# `content` parameter. A global alias table leaks across tools; this doesn't.
+_ARG_ALIASES = {
+    "path": ("file", "filename", "filepath", "file_path", "target",
+             "dir", "directory", "folder"),
+    "command": ("cmd", "script", "exec", "shell_command"),
+    "pattern": ("glob", "regex", "search", "term", "query"),
+    "content": ("text", "data", "body", "contents"),
+    "code": ("source", "src", "program"),
+    "new": ("new_text", "new_string", "replacement", "content", "text"),
+    "old": ("old_text", "old_string", "original", "search_text", "find"),
+    "query": ("q", "search", "term", "prompt"),
+}
+
+
+def normalize_tool_args(name: str, args: dict) -> dict:
+    """Map a model's argument names onto the ones THIS tool declares.
+
+    Weak local models reach for whatever name they saw in training — `file`
+    for `path`, `cmd` for `command`, `new_string` for `new` — and a missing
+    required argument costs a whole turn on a model that takes minutes per
+    turn. The tool's own JSON schema is the authority on which names are real,
+    so an alias is only ever filled in for a parameter the tool actually has.
+    """
+    args = dict(args or {})
+    t = _REGISTRY.get(name)
+    if t is None:
+        return args
+    schema = t.parameters or {}
+    props = list((schema.get("properties") or {}))
+    if not props:
+        return args
+    required = [k for k in (schema.get("required") or []) if k in props]
+
+    # A bare single value under some invented key ({"input": "notes.md"}):
+    # if the tool takes exactly one thing, that's what it meant.
+    if len(args) == 1 and not (set(args) & set(props)):
+        (only,) = args.values()
+        if isinstance(only, (str, int, float)) and len(required) == 1:
+            return {required[0]: only}
+
+    for canon, alts in _ARG_ALIASES.items():
+        if canon not in props or args.get(canon) not in (None, ""):
+            continue
+        for alt in alts:
+            # An alias the tool DECLARES is not a stand-in — grep takes both
+            # `pattern` (the regex) and `glob` (which files), so copying glob
+            # into pattern would search for the file filter as if it were the
+            # regex. A real parameter always means itself.
+            if alt in props or alt == canon:
+                continue
+            if args.get(alt) not in (None, ""):
+                args[canon] = args[alt]
+                break
+
+    # a single line number where the tool wants a range
+    if "start_line" in props and args.get("start_line") is None:
+        one = args.get("line", args.get("line_number"))
+        if one is not None:
+            args["start_line"] = one
+            args.setdefault("end_line", one)
+    return args
+
+
+def _long_path(p: Path) -> Path:
+    """Windows only: give a >=260-char path the \\\\?\\ extended-length prefix.
+
+    Without it the Win32 API refuses the path outright, so a workspace nested
+    deep enough makes every file tool fail with a raw WinError the model can
+    do nothing about. Short paths are returned untouched — the prefix confuses
+    anything that later prints or re-parses them."""
+    if os.name != "nt":
+        return p
+    try:
+        s = str(p)
+        if s.startswith("\\\\?\\") or len(s) < 260:
+            return p
+        if s.startswith("\\\\"):                    # UNC: \\server\share\...
+            return Path("\\\\?\\UNC\\" + s[2:])
+        return Path("\\\\?\\" + s)
+    except Exception:
+        return p
+
+
 def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
     """Execute a tool by name. Returns a plain-text result the model reads;
     never raises — errors come back as text so the model can react."""
@@ -309,6 +537,7 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
         return f"error: no such tool '{name}'"
     if resolved != name:
         name = resolved       # near-miss repaired (Read_File -> read_file)
+    args = normalize_tool_args(name, args or {})
     ctx = ctx or {}
     prof = ctx.get("profile", "all")
     if prof == "no-network" and name in _NETWORK_TOOLS:
@@ -899,7 +1128,7 @@ def _read_path(ctx, raw: str) -> Path:
     everything workspace-relative."""
     raw = str(raw or "").strip()
     if Path(raw).is_absolute() and ctx.get("profile") != "confined":
-        return Path(raw).resolve()
+        return _long_path(Path(raw).resolve())
     return _ws_path(ctx, raw or ".")
 
 
@@ -920,7 +1149,9 @@ def _ws_path(ctx, rel: str) -> Path:
     p = (root / rel).resolve()
     if p != root and not p.is_relative_to(root):
         raise ValueError("path is outside the workspace — stay within it")
-    return p
+    # long-path prefix LAST: `\\?\C:\...` is not is_relative_to `C:\...`, so
+    # applying it before the containment check above would defeat the check
+    return _long_path(p)
 
 
 @tool("http_request",
@@ -1249,8 +1480,13 @@ def _flexible_find(text: str, old: str):
 # lightly REWRITES words while quoting (swaps a synonym, drops a filler).
 # String matching cannot heal word changes; bounded fuzzy matching can
 # (Aider ships the same for the same reason).
-_FUZZY_ACCEPT = 0.85     # similarity a region must reach to be edited
-_FUZZY_MARGIN = 0.04     # ...and beat the runner-up by, so we never guess
+# 2026-07-22: 0.85 was still rejecting real quotes on the owner's prose, so it
+# drops to 0.75 — with the uniqueness MARGIN raised in step, because the looser
+# the accept bar, the more the "did it beat every other candidate" test is what
+# stops a wrong region being rewritten. The margin is the real safety property
+# here, not the threshold.
+_FUZZY_ACCEPT = 0.75     # similarity a region must reach to be edited
+_FUZZY_MARGIN = 0.05     # ...and beat the runner-up by, so we never guess
 
 
 def _fuzzy_region(text: str, old: str):
@@ -1361,12 +1597,34 @@ def _nearest_region(text: str, old: str) -> str:
        "required": ["path", "new"]},
       safe=False, needs="code")
 def _edit_file(args, ctx):
+    # The ladder below is read -> compare -> write, which is not atomic. Two
+    # tool calls landing on the same file (a queued prompt, a run loop and a
+    # chat turn) would both read the ORIGINAL and the second write would drop
+    # the first edit with no error anywhere. One writer at a time.
+    with _FILE_LOCK:
+        return _edit_file_locked(args, ctx)
+
+
+def _edit_file_locked(args, ctx):
     p = _ws_path(ctx, str(args.get("path", "")))
     if not p.is_file():
         return f"error: no such file: {args.get('path')}"
-    text = p.read_text(encoding="utf-8")
-    old = str(args.get("old", ""))
-    new = str(args.get("new", ""))
+    # Read and write BYTES, so line endings are ours to decide rather than
+    # something the text layer does behind our back. Two bugs live here:
+    # write_text() translates every "\n" to os.linesep, so editing one line of
+    # an LF file on Windows silently rewrote EVERY line ending in it; and a
+    # model that quotes "\r\n" in `old` could never match a file the text
+    # layer had already normalised to "\n". Normalise in memory, restore the
+    # file's own convention on the way out.
+    raw_text = p.read_bytes().decode("utf-8")
+    crlf = "\r\n" in raw_text
+    text = raw_text.replace("\r\n", "\n")
+    old = str(args.get("old", "")).replace("\r\n", "\n")
+    new = str(args.get("new", "")).replace("\r\n", "\n")
+
+    def _put(s: str) -> None:
+        p.write_bytes((s.replace("\n", "\r\n") if crlf else s)
+                      .encode("utf-8"))
 
     # --- deterministic route: replace a line RANGE, no matching at all -----
     # The matching ladder below exists because the model must reproduce prose
@@ -1398,7 +1656,7 @@ def _edit_file(args, ctx):
                     "with numbered=true to see the real numbers.")
         _snapshot_before_write(p)
         lines[s - 1:e] = new.split("\n")
-        p.write_text("\n".join(lines), encoding="utf-8")
+        _put("\n".join(lines))
         return (f"edited {args.get('path')} — replaced lines {s}-{e}. "
                 "undo_last_change reverts it.")
 
@@ -1412,7 +1670,7 @@ def _edit_file(args, ctx):
     n = text.count(old) if old else 0
     if n == 1:
         _snapshot_before_write(p)
-        p.write_text(text.replace(old, new, 1), encoding="utf-8")
+        _put(text.replace(old, new, 1))
         return f"edited {args.get('path')}"
     if n > 1:
         # say WHERE, so extending `old` with surrounding lines is a one-turn
@@ -1433,7 +1691,7 @@ def _edit_file(args, ctx):
     m = _flexible_find(text, old)
     if isinstance(m, tuple):
         _snapshot_before_write(p)
-        p.write_text(text[:m[0]] + new + text[m[1]:], encoding="utf-8")
+        _put(text[:m[0]] + new + text[m[1]:])
         return (f"edited {args.get('path')} (note: your 'old' text differed "
                 "from the file only in whitespace or punctuation style "
                 "(curly quotes “”, em-dashes —) — matched it flexibly and "
@@ -1451,7 +1709,7 @@ def _edit_file(args, ctx):
     span, ratio, region = _fuzzy_region(text, old)
     if span is not None:
         _snapshot_before_write(p)
-        p.write_text(text[:span[0]] + new + text[span[1]:], encoding="utf-8")
+        _put(text[:span[0]] + new + text[span[1]:])
         return (f"edited {args.get('path')} (note: your 'old' wording "
                 f"differed slightly from the file — matched the closest "
                 f"region at {int(ratio * 100)}% similarity and replaced the "
@@ -1719,6 +1977,13 @@ def _sample_files(args, ctx):
        "required": ["path", "content"]},
       safe=False, needs="code")
 def _write_file(args, ctx):
+    # same reason as _edit_file: snapshot, size-check and write are separate
+    # steps and must not interleave with another writer on the same file
+    with _FILE_LOCK:
+        return _write_file_locked(args, ctx)
+
+
+def _write_file_locked(args, ctx):
     raw = str(args.get("path", ""))
     # Refuse a dangerous path BEFORE touching the disk. Live 2026-07-21: the
     # model gave up finding a file, then called write_file with a literal '*'
