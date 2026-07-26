@@ -8,6 +8,7 @@ import platform
 import re
 import subprocess
 import threading
+from contextlib import asynccontextmanager
 from importlib import resources
 
 import httpx
@@ -234,9 +235,15 @@ def _strip_think(text: str) -> str:
     """Remove reasoning blocks that leak into normal content. Qwen3.6 emits
     <think>…</think>; when the server doesn't split it into reasoning_content it
     lands in the answer. Also handles an UNTERMINATED opening tag, which happens
-    when generation is cut off mid-thought."""
+    when generation is cut off mid-thought.
+
+    Also strips ChatML thought blocks (<|im_start|>think ... <|im_end|>): some
+    GGUF templates emit the raw control tokens as TEXT when the server doesn't
+    recognise them, which puts the whole reasoning trace in the answer."""
     if not text or "<" not in text:
         return text
+    text = re.sub(r"<\|im_start\|>\s*(?:think|thought)\b.*?(?:<\|im_end\|>|\Z)",
+                  "", text, flags=re.S | re.I)
     for tag in _THINK_TAGS:
         text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.S | re.I)
         text = re.sub(rf"<{tag}>.*\Z", "", text, flags=re.S | re.I)
@@ -501,7 +508,31 @@ def _driving_message(run, session):
 
 def build_app(upstream_port: int, default_prompt: str | None = None,
               registry=None) -> FastAPI:
-    app = FastAPI(title="rigma", docs_url=None, redoc_url=None)
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        """Startup/shutdown. Replaces @app.on_event, which FastAPI deprecated.
+
+        The four steps are defined further down this function, beside the
+        state each one touches; names in a closure resolve when the closure
+        RUNS, and lifespan runs long after build_app has returned, so they are
+        all bound by then."""
+        await _reconcile_orphaned_runs()
+        keepalive = _start_keepalive()
+        try:
+            yield
+        finally:
+            # every step guarded: one failing teardown must not skip the rest
+            if keepalive is not None:
+                keepalive.cancel()
+            try:
+                await _stop_run_tasks()
+            except Exception:
+                _log.exception("shutdown: run-task teardown failed")
+            _stop_mcp()
+
+    app = FastAPI(title="rigma", docs_url=None, redoc_url=None,
+                  lifespan=_lifespan)
     base = f"http://127.0.0.1:{upstream_port}"
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
     ingest_state = {"busy": False, "error": ""}
@@ -3207,8 +3238,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         _runs.save(r)
         return {"queued": True}
 
-    @app.on_event("shutdown")
-    async def _stop_mcp():
+    def _stop_mcp():
         try:
             from . import mcp_client
             if mcp_client._manager is not None:
@@ -3216,7 +3246,6 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception:
             pass
 
-    @app.on_event("shutdown")
     async def _stop_run_tasks():
         """Cancel background run loops when the app goes down. Without this an
         orphaned loop keeps driving a run against an engine that is gone."""
@@ -3231,7 +3260,6 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             await asyncio.wait(tasks, timeout=10)
         _run_tasks.clear()
 
-    @app.on_event("startup")
     async def _reconcile_orphaned_runs():
         """A run that says "running" at boot is lying: _run_tasks is empty at
         startup, so no task is driving it. Before this hook existed, any
@@ -3251,12 +3279,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception:
             _log.exception("startup: run reconciliation failed")
 
-    @app.on_event("startup")
-    async def _keepalive_task():
-        import os
+    def _start_keepalive():
+        """The idle auto-unload poller, or None when it's switched off.
+
+        Returns the task so lifespan can cancel it: an un-cancelled loop keeps
+        polling (and can unload an engine) while the app is shutting down."""
         mins = float(os.environ.get("RIGMA_KEEP_ALIVE_MIN", "0") or 0)
         if mins <= 0:
-            return   # opt-in: 0 disables idle auto-unload
+            return None   # opt-in: 0 disables idle auto-unload
 
         async def _loop():
             from . import server_ops
@@ -3274,7 +3304,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             pass
                         finally:
                             switch_lock.release()
-        asyncio.create_task(_loop())
+        return asyncio.create_task(_loop())
 
     @app.api_route("/v1/{path:path}",
                    methods=["GET", "POST", "OPTIONS", "DELETE"])
