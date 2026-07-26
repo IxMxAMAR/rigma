@@ -184,7 +184,9 @@ TOOL_DOCTRINE = """TOOL RULES — keep them light: act, don't deliberate.
 4. An error result means change your approach — never repeat the identical
    call. What tools returned is the truth about the user's files; your
    memory of them is not.
-5. A real request mid-roleplay ("save this", "remember that") still gets its
+5. STRICT TOOL CALLING: You must use the exact tool names provided (e.g. 'write_file', not 'WriteFile').
+   Output the tool call strictly following the required format. Do NOT invent tools.
+6. A real request mid-roleplay ("save this", "remember that") still gets its
    tool call — then continue in character."""
 
 
