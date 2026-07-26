@@ -26,6 +26,22 @@ export interface StreamingTurn {
   macro: { label: string; index: number; total: number } | null;
 }
 
+/** Marks a reply the user cut short, so the transcript never reads as if the
+ *  model chose to end there. */
+export const STOPPED_SUFFIX = "\n\n_(stopped — partial reply)_";
+
+/** Did the server already persist this stopped turn? The abort can land after
+ *  the turn finished writing, and appending then would duplicate the reply.
+ *  Compared on a prefix: the saved copy has the suffix and may have had
+ *  <think> blocks stripped, so it is never character-identical. */
+export function alreadySaved(msgs: ChatMessage[], partial: string): boolean {
+  const last = msgs[msgs.length - 1];
+  if (!last || last.role !== "assistant") return false;
+  const saved = typeof last.content === "string" ? last.content : "";
+  const head = partial.trim().slice(0, 64);
+  return head.length > 0 && saved.includes(head);
+}
+
 export const emptyTurn = (): StreamingTurn => ({
   text: "",
   thinking: "",
@@ -234,6 +250,7 @@ export const useChat = create<ChatState>((set, get) => ({
       }));
     const ctl = new AbortController();
     set({ streaming: emptyTurn(), abort: ctl });
+    let stopped = false;
     try {
       await streamChat(
         id,
@@ -245,13 +262,18 @@ export const useChat = create<ChatState>((set, get) => ({
         ctl.signal,
       );
     } catch (e) {
-      if ((e as Error).name !== "AbortError")
+      if ((e as Error).name === "AbortError") stopped = true;
+      else
         set((st) => ({
           streaming: st.streaming
             ? { ...st.streaming, error: (e as Error).message }
             : null,
         }));
     }
+    // Read the partial BEFORE the reload below clears it. A stopped turn never
+    // reaches the server's persist step, so what was on screen is the only
+    // copy — throwing it away was the whole complaint about Stop.
+    const partial = stopped ? get().streaming : null;
     // reload the authoritative transcript; the streamed turn was a preview
     try {
       const s = await api.getSession(id);
@@ -263,6 +285,20 @@ export const useChat = create<ChatState>((set, get) => ({
         const variants = [...(last.variants ?? []), ...pv.variants, pv.content]
           .filter(Boolean);
         msgs = [...msgs.slice(0, -1), { ...last, variants }];
+        await api.updateSession(id, { messages: msgs }).catch(() => {});
+      }
+      // Keep a stopped turn's text — but only if the server didn't already
+      // save it (the abort can land after the turn finished persisting, and
+      // appending then would duplicate the reply).
+      const text = partial?.text?.trim();
+      if (text && !alreadySaved(msgs, text)) {
+        msgs = [...msgs, {
+          role: "assistant",
+          content: partial!.text + STOPPED_SUFFIX,
+          ...(partial!.thinking ? { thinking: partial!.thinking } : {}),
+        } as ChatMessage];
+        // ONE writer for this: stop() only aborts, so nothing else is racing
+        // this PUT with a different idea of the transcript
         await api.updateSession(id, { messages: msgs }).catch(() => {});
       }
       set({ messages: msgs, streaming: null, abort: null,
@@ -316,6 +352,9 @@ export const useChat = create<ChatState>((set, get) => ({
   removeImage: (i) =>
     set((st) => ({ images: st.images.filter((_, j) => j !== i) })),
 
+  // Stop ABORTS, and only aborts. Persisting the partial is send()'s job,
+  // where the transcript reload already lives — two writers racing over the
+  // same message list is how a stopped reply ends up duplicated or lost.
   stop: () => {
     get().abort?.abort();
   },

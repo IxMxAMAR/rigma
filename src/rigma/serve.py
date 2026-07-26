@@ -22,6 +22,7 @@ from . import presets
 from . import runtime
 from . import server_ops
 from . import sessions
+from . import skills
 from . import state as st
 
 _log = logging.getLogger(__name__)
@@ -936,6 +937,28 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": "no such preset"}, status_code=404)
         return {"ok": True}
 
+    # --- global skills -------------------------------------------------
+    @app.get("/api/skills")
+    async def list_skills():
+        return skills.list_skills()
+
+    @app.post("/api/skills")
+    async def save_skill(body: dict | None = None):
+        body = body or {}
+        try:
+            return skills.save_skill(body.get("name", ""),
+                                     body.get("content", ""))
+        except skills.SkillNameError as e:
+            # the name becomes a filename, so a bad one is refused, not
+            # silently rewritten into some other file
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    @app.delete("/api/skills/{name}")
+    async def delete_skill(name: str):
+        if not skills.delete_skill(name):
+            return JSONResponse({"error": "no such skill"}, status_code=404)
+        return {"ok": True}
+
     async def _llm_turn(s: dict, cont: bool = False):
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
@@ -1031,7 +1054,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     calls = m.get("tool_calls") or []
                     if not calls:
                         ans = (m.get("content") or "").strip()
-                        r_name, r_args = toolkit.rescue_xml_tool_call(ans)
+                        r_name, r_args = toolkit.rescue_tool_call(ans)
                         if r_name and r_name in _DELEGATE_TOOLS:
                             calls = [{"id": f"rescued-{_hop}", "type":
                                       "function", "function": {
@@ -1302,7 +1325,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # every miss wasted a full turn until the watchdog stalled the
                 # run. If the reply contains an unmistakable call shape, parse
                 # it ourselves rather than treating the turn as prose.
-                r_name, r_args = toolkit.rescue_xml_tool_call(rtext)
+                r_name, r_args = toolkit.rescue_tool_call(rtext)
                 if r_name and r_name in {s["function"]["name"] for s in specs}:
                     yield _sse({"note": f"rescued {r_name} from raw text"},
                                event="think")
@@ -2013,6 +2036,39 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         task.add_done_callback(ingest_tasks.discard)
         return JSONResponse({"sources": srcs, "indexing": True}, status_code=202)
 
+    # A prompt typed while a reply is still streaming. Held in MEMORY on
+    # purpose: the session file is being written by the in-flight turn, so a
+    # queue stored there loses the race against that turn's own save — and a
+    # prompt waiting behind a generation means nothing once the server has
+    # restarted.
+    _streaming: set[str] = set()
+    _queued: dict[str, list] = {}
+
+    def _apply_skill(text: str) -> str:
+        """`/name` (or `/skill:name`) pulls a global skill in front of the ask.
+
+        A message that merely STARTS with a slash and names no skill is left
+        exactly as typed — a path like /etc/hosts, or a bare "/", is ordinary
+        text, not a failed command. get_skill rejects any name that isn't a
+        plain filename, so "/../secret" reads nothing."""
+        t = text.strip()
+        if not t.startswith("/"):
+            return text
+        rest = t[1:]
+        if rest[:6].lower() == "skill:":
+            rest = rest[6:]
+        # A skill name may contain spaces, so try the WHOLE remainder as a
+        # name before splitting: "/My Skill" is an invocation with no ask.
+        head, _, tail = rest.partition(" ")
+        for name, ask in ([(rest, "")] + ([(head, tail)] if tail else [])):
+            content = skills.get_skill(name)
+            if content is None:
+                continue
+            name, ask = name.strip(), ask.strip()
+            return (f"--- SKILL: {name} ---\n{content}\n--- END SKILL ---\n\n"
+                    + (ask or f"Apply the '{name}' skill above."))
+        return text
+
     @app.post("/api/sessions/{sid}/chat")
     async def chat_turn(sid: str, body: dict):
         activity["last"] = _now()   # keep-alive
@@ -2021,6 +2077,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
         message = body.get("message")
+        if isinstance(message, str):
+            message = _apply_skill(message)
 
         def _has_img(content):
             return (isinstance(content, list) and
@@ -2046,6 +2104,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                               "vision-capable model (⚙ → Server) or "
                               "delete the image message"},
                     status_code=400)
+        # Queued AFTER the vision guard above, so a queued message is held to
+        # the same rules as an immediate one, and BEFORE it joins the history,
+        # so the transcript keeps the order the model actually saw.
+        if message and sid in _streaming:
+            _queued.setdefault(sid, []).append(message)
+
+            async def _ack():
+                yield _sse({"queued": len(_queued[sid]),
+                            "note": "queued behind the running reply"},
+                           event="info")
+            return StreamingResponse(_ack(), media_type="text/event-stream",
+                                     headers=_NO_STORE)
         if message:
             s["messages"].append({"role": "user", "content": message})
             if s.get("title") == "New chat":
@@ -2072,8 +2142,36 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 await asyncio.to_thread(rag.ensure_sidecar)
             except Exception as e:
                 _log.warning("grounded chat: sidecar unavailable (%s)", e)
-        gen = _llm_turn(s, cont=bool(body.get("continue")))
-        return StreamingResponse(gen, media_type="text/event-stream",
+        async def _drain():
+            """This turn, then anything typed while it was running.
+
+            The empty-queue check and the discard below sit in one unbroken
+            stretch of synchronous code: asyncio only switches coroutines at
+            an await, so no request can slip in between "queue is empty" and
+            "no longer streaming" and have its prompt silently dropped."""
+            _streaming.add(sid)
+            try:
+                cur, cont = s, bool(body.get("continue"))
+                while True:
+                    async for chunk in _llm_turn(cur, cont=cont):
+                        yield chunk
+                    pending = _queued.get(sid)
+                    if not pending:
+                        break
+                    nxt = pending.pop(0)
+                    cur = sessions.load(sid) or cur
+                    cur["messages"].append({"role": "user", "content": nxt})
+                    sessions.save(cur)
+                    cont = False       # a queued prompt is a new turn
+                    yield _sse({"note": "starting the queued prompt"},
+                               event="info")
+            finally:
+                _streaming.discard(sid)
+                # anything still queued can no longer be delivered: this is
+                # the only generator that would have run it
+                _queued.pop(sid, None)
+
+        return StreamingResponse(_drain(), media_type="text/event-stream",
                                  headers=_NO_STORE)
 
     # ================= Autonomous Mode (Runs) =========================

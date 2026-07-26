@@ -96,6 +96,32 @@ That choice is stored on your machine and is never part of a shared method.
 it, import theirs. Importing never overwrites one of yours and never carries
 someone else's "always allow".
 
+## Skills (instructions you pull in mid-chat)
+
+A **Skill** is a block of instructions you write once and drop into any chat by
+typing `/name` — no method to apply, no settings to change. Where a Method
+configures a whole activity, a Skill is a single reusable briefing: house style,
+a checklist, the shape of a file format you keep explaining.
+
+```
+/wildcard write me three variants
+```
+
+The skill's text goes in front of your ask for that turn only. Manage them in
+the **Skills** panel, or write them by hand: each one is a `.md` file in
+`~/.rigma/skills/`, so they live in your editor and your git repo like anything
+else. `/skill:name` works too, and a message that merely starts with a slash and
+names no skill — a path, a lone `/` — is sent exactly as you typed it.
+
+## In the chat
+
+- **Type ahead.** Send a follow-up while a reply is still streaming and it
+  queues; the model starts on it the moment the current turn ends. The queue is
+  in memory, so it never survives a restart — a prompt waiting behind a
+  generation stops meaning anything once the server is gone.
+- **Stop keeps what you got.** Stopping a reply aborts the request *and* keeps
+  the text already on screen, marked as a partial, instead of discarding it.
+
 ## RAG (chat with your documents)
 
 Rigma pairs with [Raggity](https://github.com/IxMxAMAR/raggity) (AGPL-3.0, runs as a separate

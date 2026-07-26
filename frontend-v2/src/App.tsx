@@ -9,6 +9,8 @@ import ChatSurface from "./chat/ChatSurface";
 import EngineSurface from "./engine/EngineSurface";
 import MemorySurface from "./memory/MemorySurface";
 import ModelsSurface from "./models/ModelsSurface";
+import SkillsSurface from "./skills/SkillsSurface";
+import WorkflowsSurface from "./workflows/WorkflowsSurface";
 import SettingsSurface from "./settings/SettingsSurface";
 import Palette from "./Palette";
 import WorkspacePanel from "./WorkspacePanel";
@@ -184,6 +186,8 @@ function Canvas() {
   if (surface === "models") return <ModelsSurface />;
   if (surface === "autonomous") return <AutonomousSurface />;
   if (surface === "memory") return <MemorySurface />;
+  if (surface === "skills") return <SkillsSurface />;
+  if (surface === "workflows") return <WorkflowsSurface />;
   if (surface === "settings") return <SettingsSurface />;
   // Remaining surfaces: a deliberate, designed empty state each —
   // CONSTITUTION §7: "an empty screen is an invitation to act", never blank.
