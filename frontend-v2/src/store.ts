@@ -9,6 +9,8 @@ export type Surface =
   | "models"
   | "engine"
   | "memory"
+  | "skills"
+  | "workflows"
   | "settings";
 
 export const SURFACES: { id: Surface; label: string; hint: string }[] = [
@@ -17,6 +19,8 @@ export const SURFACES: { id: Surface; label: string; hint: string }[] = [
   { id: "models", label: "Models", hint: "the hangar — install and manage" },
   { id: "engine", label: "Engine", hint: "load, switch, telemetry" },
   { id: "memory", label: "Memory", hint: "what the agent has learned" },
+  { id: "skills", label: "Skills", hint: "instructions you can pull in with /" },
+  { id: "workflows", label: "Workflows", hint: "methods, macros and rules" },
   { id: "settings", label: "Settings", hint: "presets and preferences" },
 ];
 

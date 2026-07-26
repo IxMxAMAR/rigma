@@ -1,7 +1,10 @@
 // The regression suite for the wrong-row bug class (caught live twice on
 // 2026-07-21). These tests pin the id-keyed contract of the pure reducer.
 import { describe, expect, it } from "vitest";
-import { applyEvent, emptyTurn, type StreamingTurn } from "./chatStore";
+import {
+  alreadySaved, applyEvent, emptyTurn, STOPPED_SUFFIX, type StreamingTurn,
+} from "./chatStore";
+import type { ChatMessage } from "../lib/api";
 import { makeSseParser } from "../lib/sse";
 
 const feed = (turn: StreamingTurn, evs: [string, unknown][]) =>
@@ -133,5 +136,51 @@ describe("macro turns", () => {
   it("a plain chat turn never grows a macro banner", () => {
     const t = feed(emptyTurn(), [["message", { delta: "hi" }]]);
     expect(t.macro).toBeNull();
+  });
+});
+
+// Stop used to throw the partial reply away: the turn never reaches the
+// server's persist step, so what was on screen was the only copy. send() now
+// appends it — exactly once, which is what alreadySaved() decides.
+describe("stopped-turn persistence", () => {
+  const asst = (content: string): ChatMessage =>
+    ({ role: "assistant", content }) as ChatMessage;
+  const user = (content: string): ChatMessage =>
+    ({ role: "user", content }) as ChatMessage;
+
+  it("appends when the server saved nothing", () => {
+    expect(alreadySaved([user("go")], "The answer begins here")).toBe(false);
+  });
+
+  it("does not append twice when the abort landed after the save", () => {
+    // the race: stop() fires while the turn is already persisting
+    const partial = "The answer begins here and keeps going";
+    const saved = [user("go"), asst(partial + STOPPED_SUFFIX)];
+    expect(alreadySaved(saved, partial)).toBe(true);
+  });
+
+  it("still matches when the saved copy was reworked around the text", () => {
+    // <think> stripping and the suffix mean the two are never identical
+    const partial = "Here is the plan you asked for, step one";
+    const saved = [asst("Here is the plan you asked for, step one — more")];
+    expect(alreadySaved(saved, partial)).toBe(true);
+  });
+
+  it("a trailing USER message never counts as the saved reply", () => {
+    expect(alreadySaved([asst("older"), user("go")], "anything")).toBe(false);
+  });
+
+  it("empty or whitespace-only partials are never appended", () => {
+    expect(alreadySaved([], "")).toBe(false);
+    expect(alreadySaved([asst("x")], "   ")).toBe(false);
+  });
+
+  it("an empty transcript is safe to check", () => {
+    expect(alreadySaved([], "text")).toBe(false);
+  });
+
+  it("the marker says the user stopped it, not the model", () => {
+    expect(STOPPED_SUFFIX).toMatch(/stopped/i);
+    expect(STOPPED_SUFFIX).toMatch(/partial/i);
   });
 });
