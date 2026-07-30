@@ -31,6 +31,16 @@ rigma = "rigma.cli:app"
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+# Selected EXPLICITLY rather than inherited. ruff 0.16.0 widened its default
+# rule set and CI (which installs the newest ruff) went from 0 errors to 370
+# without a line of this repo changing — 163 of them BLE001 and 55 S110, i.e.
+# the deliberate "a tool never raises; errors come back as text the model can
+# react to" contract that run_tool is built on. The lint contract is this
+# project's to choose, so it is written down here and a future default change
+# cannot break the build.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pytest.ini_options]
 markers = ["hardware: requires real GPU/network; excluded in CI"]
 addopts = "-q"
