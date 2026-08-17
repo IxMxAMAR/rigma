@@ -70,8 +70,19 @@ def _distinct_quants(files: list[str]) -> list[str]:
     for stem, fallback in zip(stems, labels):
         core = stem[len(pre):len(stem) - len(suf)] if len(pre) + len(suf) < len(stem) \
             else stem
-        core = core.strip("-_. ")
-        out.append((core or fallback).upper()[:24])
+        core = core.strip("-_. ").upper()
+        if fallback == "GGUF":
+            # no real tag anywhere in the name (APEX's I-Compact / I-Quality):
+            # the differing part of the filename IS the label
+            out.append(core[:24] or fallback)
+            continue
+        # There IS a tag, and two files share it (jaromer ships both
+        # RVN-Q4_K_M.gguf and Qwen3.8-27B-Heretic-Q4_K_M.gguf). Keep the TAG at
+        # the FRONT and hang the distinguishing part off it: truncating a bare
+        # core to 24 chars ate the "_M" off "QWEN3.8-27B-HERETIC-Q4_K_M", which
+        # left the row unpriceable as well as unreadable.
+        extra = core.replace(fallback, "").strip("-_. ")
+        out.append(f"{fallback} ({extra[:14]})" if extra else fallback)
     if len(set(out)) == len(out):
         return out
     # still ambiguous (same stem in different subdirs): keep the path, which is
