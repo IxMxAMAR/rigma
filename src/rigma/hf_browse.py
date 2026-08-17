@@ -15,7 +15,8 @@ import re
 import httpx
 
 from .gguf_meta import GgufParseError, inspect_gguf
-from .hangar import HangarError, _quant_from_name, _slugify, _write_spec
+from .hangar import (HangarError, _distinct_quants, _quant_from_name,
+                     _slugify, _write_spec)
 from .models import GgufFile, ModelSpec, MoESpec
 
 HF = "https://huggingface.co"
@@ -147,36 +148,6 @@ def remote_inspect(repo: str, file: str):
             raise HangarError(f"couldn't parse {file}: {e}") from e
 
 
-def _distinct_quants(files: list[str]) -> list[str]:
-    """A label per gguf that actually distinguishes them.
-
-    _quant_from_name looks for Q4_K_M/IQ3_M-style tags. Repos that name their
-    variants some other way — SC117's APEX ships I-Compact / I-Quality /
-    I-Balanced — all collapse to "GGUF", so the picker showed three identical
-    rows AND flagged every one of them as recommended (the badge compares on
-    this label). Fall back to whatever part of the filename actually differs."""
-    import os as _os
-    from pathlib import Path as _P
-    labels = [_quant_from_name(f) for f in files]
-    if len(set(labels)) == len(labels):
-        return labels                       # real quant tags: leave them alone
-    stems = [_P(f).stem for f in files]
-    pre = _os.path.commonprefix(stems)
-    suf = _os.path.commonprefix([s[::-1] for s in stems])[::-1]
-    out = []
-    for stem, fallback in zip(stems, labels):
-        core = stem[len(pre):len(stem) - len(suf)] if len(pre) + len(suf) < len(stem) \
-            else stem
-        core = core.strip("-_. ")
-        out.append((core or fallback).upper()[:24])
-    if len(set(out)) == len(out):
-        return out
-    # still ambiguous (same stem in different subdirs): keep the path, which is
-    # the only thing left that differs
-    return [str(_P(f).with_suffix("")).replace("\\", "/").upper()[-24:]
-            for f in files]
-
-
 def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
     rf = repo_files(repo)
     if not rf["ggufs"]:
@@ -234,7 +205,7 @@ def inspect_repo(repo: str, registry=None, profile=None) -> dict:
     per quant against THIS machine, before any download."""
     from .probe import probe_hardware
     from .registry import Registry
-    from .resolve import _grow_ctx, fit_gguf
+    from .resolve import quant_verdicts, recommended_quant
     spec, rf = _spec_from_repo(repo)
     reg = registry if registry is not None else Registry.load()
     prof = profile if profile is not None else probe_hardware(reg.gpus)
@@ -245,51 +216,14 @@ def inspect_repo(repo: str, registry=None, profile=None) -> dict:
         from . import state as st
         from .server_ops import _free_current
         prof = _free_current(prof, st.read_state() or {}, reg)
-    from .resolve import _budgets
-    usable_vram, _ = _budgets(prof)
-    mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
-    quants = []
-    for g in spec.ggufs:
-        flags = None
-        for ctx in (8192, 4096, 2048):
-            flags = fit_gguf(spec, g, prof, ctx, [])
-            if flags:
-                flags = _grow_ctx(spec, g, prof, flags, [])
-                break
-        # speed tier: how much of the model sits on the GPU. Weights that
-        # spill to RAM run on the CPU every token, so a bigger quant that only
-        # "fits" via heavy offload is SLOWER, not better.
-        speed = "no"
-        if flags:
-            file_mb = g.bytes / 2**20 + mm_mb
-            if file_mb <= usable_vram:
-                speed = "gpu"            # fully on GPU — fast
-            elif file_mb <= usable_vram * 1.15:
-                speed = "light"          # mostly on GPU — still quick
-            else:
-                speed = "offload"        # heavy RAM offload — runs, but slow
-        quants.append({"file": g.file, "quant": g.quant, "bytes": g.bytes,
-                       "fit": ({"ok": True, "ctx": flags.ctx,
-                                "n_cpu_moe": flags.n_cpu_moe, "speed": speed}
-                               if flags else {"ok": False})})
+    quants = [{"file": g.file, "quant": g.quant, "bytes": g.bytes, "fit": v}
+              for g, v in zip(spec.ggufs, quant_verdicts(spec, prof))]
     return {"repo": repo, "name": spec.slug, "family": spec.family,
             "kind": spec.kind, "native_ctx": spec.native_ctx,
             "capabilities": spec.capabilities,
             "already": spec.slug in reg.models,
             "mmproj": rf["mmproj"], "split_skipped": rf["split_skipped"],
-            "ggufs": quants, "recommended": _recommend(quants)}
-
-
-def _recommend(quants: list[dict]) -> str | None:
-    """Best QUALITY that still runs at GPU speed. quants are largest-first, so
-    quality descends down the list; prefer a quant that fits on the GPU (or
-    only lightly offloads) over a bigger one that spills to RAM and crawls."""
-    fast = [q for q in quants
-            if q["fit"].get("ok") and q["fit"].get("speed") in ("gpu", "light")]
-    if fast:
-        return fast[0]["quant"]      # largest fast-enough = best quality @ speed
-    fits = [q for q in quants if q["fit"].get("ok")]
-    return fits[-1]["quant"] if fits else None   # else the least-offloaded
+            "ggufs": quants, "recommended": recommended_quant(quants)}
 
 
 def add_model(repo: str, registry=None) -> ModelSpec:

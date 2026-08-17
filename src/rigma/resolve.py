@@ -158,6 +158,56 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     return best
 
 
+def quant_verdicts(spec: ModelSpec, profile: HardwareProfile) -> list[dict]:
+    """Per-quant "does it fit, at what context, how fast" for one model.
+
+    ONE implementation, deliberately: this ran only inside hf_browse's
+    pre-download browser, so the Models page — the page you actually pick a
+    quant from — showed a bare size and nothing else. Two copies of this
+    arithmetic would drift, and a fit verdict that disagrees with itself
+    between two screens is worse than none.
+
+    Each verdict is {ok, ctx, n_cpu_moe, speed}. `speed` is how much of the
+    model sits on the GPU, because weights spilled to RAM run on the CPU every
+    token: a bigger quant that only "fits" via heavy offload is SLOWER, not
+    better, and the size column alone hides that completely.
+    """
+    usable_vram, _ = _budgets(profile)
+    mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
+    out = []
+    for g in spec.ggufs:
+        flags = None
+        for ctx in (8192, 4096, 2048):
+            flags = fit_gguf(spec, g, profile, ctx, [])
+            if flags:
+                flags = _grow_ctx(spec, g, profile, flags, [])
+                break
+        speed = "no"
+        if flags:
+            on_gpu_mb = g.bytes / 2**20 + mm_mb
+            if on_gpu_mb <= usable_vram:
+                speed = "gpu"            # fully on GPU — fast
+            elif on_gpu_mb <= usable_vram * 1.15:
+                speed = "light"          # mostly on GPU — still quick
+            else:
+                speed = "offload"        # heavy RAM offload — runs, but slow
+        out.append({"ok": True, "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe,
+                    "speed": speed} if flags else {"ok": False, "speed": "no"})
+    return out
+
+
+def recommended_quant(quants: list[dict]) -> str | None:
+    """Best QUALITY that still runs at GPU speed. `quants` are largest-first, so
+    quality descends down the list; prefer a quant that fits on the GPU (or only
+    lightly offloads) over a bigger one that spills to RAM and crawls."""
+    fast = [q for q in quants
+            if q["fit"].get("ok") and q["fit"].get("speed") in ("gpu", "light")]
+    if fast:
+        return fast[0]["quant"]      # largest fast-enough = best quality @ speed
+    fits = [q for q in quants if q["fit"].get("ok")]
+    return fits[-1]["quant"] if fits else None   # else the least-offloaded
+
+
 def _calculate(profile: HardwareProfile, registry: Registry,
                use_case: str) -> RunPlan | None:
     explain: list[str] = []

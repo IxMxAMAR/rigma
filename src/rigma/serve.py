@@ -1892,10 +1892,35 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     # ---- model manager (Hangar) ---------------------------------------------
 
+    # Hardware profile for the Models page's fit verdicts. Cached: this page
+    # polls every 1.5s while a pull runs, and probing costs ~40ms of subprocess
+    # work that cannot change meaningfully between two polls.
+    _fit_profile: dict = {"at": 0.0, "prof": None}
+
+    def _profile_for_fit():
+        if _fit_profile["prof"] is not None and _now() - _fit_profile["at"] < 20:
+            return _fit_profile["prof"]
+        try:
+            from .probe import probe_hardware
+            from .registry import Registry
+            from .server_ops import _free_current
+            reg = registry if registry is not None else Registry.load()
+            prof = probe_hardware(reg.gpus)
+            # pressing `run` SWITCHES model (the current one unloads first), so
+            # credit the loaded model's RAM back — otherwise everything reads
+            # "too big" purely because an engine is already resident
+            prof = _free_current(prof, st.read_state() or {}, reg)
+            _fit_profile.update(at=_now(), prof=prof)
+            return prof
+        except Exception:
+            _log.exception("models: hardware probe failed; fit omitted")
+            return None
+
     @app.get("/api/models")
     async def models_list():
         from . import hangar
-        out = await asyncio.to_thread(hangar.list_models, registry)
+        prof = await asyncio.to_thread(_profile_for_fit)
+        out = await asyncio.to_thread(hangar.list_models, registry, prof)
         now = _now()
 
         def _with_rate(item):
