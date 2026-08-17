@@ -20,6 +20,10 @@ export interface ServerInfo {
   unloaded?: boolean;
   kv_cache?: string;
   native_ctx?: number;
+  /** this launch deliberately left the vision projector off */
+  no_vision?: boolean;
+  /** the model HAS a projector, so the vision toggle means something */
+  has_mmproj?: boolean;
   calibrating?: unknown;
   engine_version?: string;
   last_tg?: number | null;
@@ -179,6 +183,14 @@ export const engineApi = {
   server: () => j<ServerInfo>("GET", "/api/server"),
   switchOptions: () => j<SwitchOption[]>("GET", "/api/server/switch-options"),
   switchTo: (model: string) => j<unknown>("POST", "/api/server/switch", { model }),
+  /** Relaunch the RUNNING model with different engine settings. Every one of
+   *  these stops the engine and starts it again — see EngineCard's warning. */
+  relaunchWith: (o: { ctx: number; kv?: string; vision?: boolean }) =>
+    j<unknown>("POST", "/api/server/ctx", {
+      ctx: o.ctx,
+      ...(o.kv ? { kv: o.kv } : {}),
+      ...(o.vision === undefined ? {} : { vision: o.vision }),
+    }),
   relaunch: (ctx: number, kv?: string) =>
     j<unknown>("POST", "/api/server/ctx", kv ? { ctx, kv } : { ctx }),
   load: () => j<unknown>("POST", "/api/server/load", {}),

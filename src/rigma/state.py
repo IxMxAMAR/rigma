@@ -16,13 +16,17 @@ def state_path() -> Path:
 def write_state(model_slug: str, quant: str, public_port: int,
                 engine_pid: int, ui_pid: int, backend: str = "unknown",
                 use_case: str = "general", ctx: int = 0,
-                unloaded: bool = False, kv_cache: str = "") -> None:
+                unloaded: bool = False, kv_cache: str = "",
+                no_vision: bool = False) -> None:
     state_path().parent.mkdir(parents=True, exist_ok=True)
     state_path().write_text(json.dumps({
         "model": model_slug, "quant": quant, "public_port": public_port,
         "engine_pid": engine_pid, "ui_pid": ui_pid, "backend": backend,
         "use_case": use_case, "ctx": ctx, "started_at": time.time(),
         "unloaded": unloaded, "kv_cache": kv_cache,
+        # the vision projector was deliberately left off this launch; sticky,
+        # so a later ctx change doesn't silently reload it and eat the VRAM
+        "no_vision": no_vision,
     }, indent=2), encoding="utf-8")
 
 

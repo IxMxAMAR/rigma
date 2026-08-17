@@ -245,18 +245,20 @@ def test_ctx_endpoint_relaunches_at_requested_size(home, upstream,
     seen = {}
 
     def fake_switch(model, reg=None, prof=None, ctx=None,
-                    force_calibrate=False, kv=None):
-        seen.update(model=model, ctx=ctx, kv=kv)
+                    force_calibrate=False, kv=None, vision=None):
+        seen.update(model=model, ctx=ctx, kv=kv, vision=vision)
         return {"model": model, "ctx": ctx, "unloaded": False}
     monkeypatch.setattr(server_ops, "perform_switch", fake_switch)
     client = TestClient(build_app(upstream_port=upstream))
     r = client.post("/api/server/ctx", json={"ctx": 131072})
     assert r.status_code == 200 and r.json()["ctx"] == 131072
-    assert seen == {"model": "m", "ctx": 131072, "kv": None}
+    # vision=None means "keep whatever the last launch used"
+    assert seen == {"model": "m", "ctx": 131072, "kv": None,
+                    "vision": None}
     assert client.post("/api/server/ctx", json={"ctx": 12}).status_code == 400
     assert client.post("/api/server/ctx", json={}).status_code == 400
     def boom(model, reg=None, prof=None, ctx=None,
-             force_calibrate=False, kv=None):
+             force_calibrate=False, kv=None, vision=None):
         raise RuntimeError("ctx 999,999 doesn't fit — tops out around 262,144")
     monkeypatch.setattr(server_ops, "perform_switch", boom)
     r = client.post("/api/server/ctx", json={"ctx": 999999})
@@ -343,3 +345,30 @@ def test_prefill_prepended_if_engine_does_not_echo(home, tmp_path, monkeypatch):
     asst = [m for m in saved["messages"] if m["role"] == "assistant"][-1]
     assert asst["content"] == "Sure: How be ye?"   # prepended once
     srv.shutdown()
+
+
+def test_vision_toggle_refuses_a_model_with_no_projector(home, upstream,
+                                                         monkeypatch):
+    """Turning off something that isn't on is a 400 with a reason, not a
+    pointless engine restart."""
+    import os
+
+    from rigma import server_ops
+    from rigma import state as st
+
+    st.write_state("m", "Q4", upstream, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=8192)
+    monkeypatch.setattr(st, "server_running", lambda: st.read_state())
+    called = []
+    monkeypatch.setattr(server_ops, "perform_switch",
+                        lambda *a, **k: called.append((a, k)) or st.read_state())
+    client = TestClient(build_app(upstream_port=upstream))
+
+    r = client.post("/api/server/ctx", json={"ctx": 8192, "vision": False})
+    assert r.status_code == 400
+    assert "no vision projector" in r.json()["error"]
+    assert called == []          # the engine was never touched
+
+    # omitting `vision` keeps whatever the last launch used
+    assert client.post("/api/server/ctx", json={"ctx": 16384}).status_code == 200
+    assert called[-1][0][6] is None
