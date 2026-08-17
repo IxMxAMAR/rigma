@@ -172,8 +172,6 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile) -> list[dict]:
     token: a bigger quant that only "fits" via heavy offload is SLOWER, not
     better, and the size column alone hides that completely.
     """
-    usable_vram, _ = _budgets(profile)
-    mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
     out = []
     for g in spec.ggufs:
         flags = None
@@ -182,17 +180,28 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile) -> list[dict]:
             if flags:
                 flags = _grow_ctx(spec, g, profile, flags, [])
                 break
-        speed = "no"
-        if flags:
-            on_gpu_mb = g.bytes / 2**20 + mm_mb
-            if on_gpu_mb <= usable_vram:
-                speed = "gpu"            # fully on GPU — fast
-            elif on_gpu_mb <= usable_vram * 1.15:
-                speed = "light"          # mostly on GPU — still quick
-            else:
-                speed = "offload"        # heavy RAM offload — runs, but slow
+        if flags is None:
+            out.append({"ok": False, "speed": "no", "offload_pct": 100})
+            continue
+        # The spill fraction comes from the PLAN the resolver actually made —
+        # ngl for dense, n_cpu_moe for MoE — not from comparing the file to
+        # VRAM. The old file-size guess called a quant "gpu" while the very
+        # same verdict carried ngl=56 of 65 layers: it ignored the KV cache,
+        # which is precisely what a big context window spends VRAM on.
+        spill = 0.0
+        if spec.moe is None:
+            if spec.n_layers > 0 and flags.ngl < spec.n_layers:
+                spill = (spec.n_layers - max(0, flags.ngl)) / spec.n_layers
+        elif spec.n_layers > 0 and flags.n_cpu_moe > 0:
+            # only the EXPERT weights of those layers leave the GPU, and expert
+            # activation is sparse, so the same fraction costs far less here
+            spill = (min(flags.n_cpu_moe, spec.n_layers) / spec.n_layers
+                     * spec.moe.expert_weight_fraction)
+        speed = "gpu" if spill <= 0.001 else ("light" if spill <= 0.15
+                                              else "offload")
         out.append({"ok": True, "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe,
-                    "speed": speed} if flags else {"ok": False, "speed": "no"})
+                    "ngl": flags.ngl, "kv": f"{flags.cache_type_k}",
+                    "offload_pct": round(spill * 100), "speed": speed})
     return out
 
 

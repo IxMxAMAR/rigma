@@ -34,23 +34,38 @@ const SPEED: Record<string, { dot: string; text: string; label: string; hint: st
   no:      { dot: "bg-red/70", text: "text-red",  label: "too big", hint: "does not fit this machine, even at minimum context" },
 };
 
-function FitCell({ fit }: { fit?: QuantRow["fit"] }) {
-  // no verdict at all (probe failed) — say nothing rather than imply "won't fit"
-  if (!fit || fit.speed === undefined) return <span className="w-[104px] shrink-0" />;
-  const s = SPEED[fit.speed] ?? SPEED.no;
+/** Context this quant can actually hold here — its own column, because it is
+ *  the number people compare across quants and it must line up to be read. */
+function CtxCell({ fit }: { fit?: QuantRow["fit"] }) {
+  const has = fit?.ok && fit.ctx;
   return (
-    <span className="w-[104px] shrink-0 flex items-center gap-1 font-mono text-[11px]"
-          title={s.hint}>
+    <span
+      className={`w-[46px] shrink-0 text-right font-mono text-[11px] whitespace-nowrap ${
+        has ? "text-secondary" : "text-muted/50"}`}
+      title={has
+        ? `fits ${fit!.ctx!.toLocaleString()} tokens of context at this quant` +
+          (fit!.kv ? ` (${fit!.kv} KV cache)` : "")
+        : "no context — this quant does not fit"}
+    >
+      {has ? K(fit!.ctx!) : "—"}
+    </span>
+  );
+}
+
+/** Where the weights end up. Driven by the resolver's own plan (ngl /
+ *  n_cpu_moe), so it cannot claim "gpu" for a quant it decided to offload. */
+function RunsCell({ fit }: { fit?: QuantRow["fit"] }) {
+  if (!fit || fit.speed === undefined) return <span className="w-[74px] shrink-0" />;
+  const s = SPEED[fit.speed] ?? SPEED.no;
+  const off = fit.offload_pct ?? 0;
+  return (
+    <span
+      className="w-[74px] shrink-0 flex items-center gap-1 font-mono text-[11px] whitespace-nowrap"
+      title={`${s.hint}${off > 0 && fit.ok ? ` — ${off}% of the weights sit in system RAM` : ""}` +
+             (fit.n_cpu_moe ? `; ${fit.n_cpu_moe} layers' experts on CPU` : "")}
+    >
       <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${s.dot}`} />
       <span className={s.text}>{s.label}</span>
-      {fit.ok && fit.ctx ? (
-        <span className="text-muted">· {K(fit.ctx)} ctx</span>
-      ) : null}
-      {fit.ok && fit.n_cpu_moe ? (
-        <span className="text-muted" title={`${fit.n_cpu_moe} expert layers on CPU`}>
-          · {fit.n_cpu_moe}L
-        </span>
-      ) : null}
     </span>
   );
 }
@@ -68,7 +83,7 @@ function QualityCell({ q }: { q: QuantRow }) {
   const k = q.quality;
   if (!k) {
     return (
-      <span className="w-[92px] shrink-0 font-mono text-[11px] text-muted/50"
+      <span className="w-[96px] shrink-0 font-mono text-[11px] text-muted/50"
             title={"No published quality figure for this file's naming — it " +
                    "does not use a standard llama.cpp quant name, so any " +
                    "percentage here would be made up."}>
@@ -79,7 +94,7 @@ function QualityCell({ q }: { q: QuantRow }) {
   const pct = k.ppl_pct < 0.1 ? "<0.1" : k.ppl_pct.toFixed(k.ppl_pct < 10 ? 1 : 0);
   return (
     <span
-      className="w-[92px] shrink-0 font-mono text-[11px] flex items-center gap-1"
+      className="w-[96px] shrink-0 font-mono text-[11px] flex items-center gap-1 whitespace-nowrap"
       title={`${k.note}. Typical +${k.ppl_pct}% perplexity vs BF16 at ${k.bpw} ` +
              `bits/weight (~${Math.round((k.bpw / 16) * 100)}% of BF16 size).\n\n` +
              "Reference figure for the quant FORMAT, mostly measured on 7B-13B " +
@@ -116,7 +131,8 @@ function QuantLine({ card, q, onAction, best }: {
       <span className="font-mono text-[12px] text-muted w-[52px] shrink-0 text-right">{gb(q.bytes)}</span>
       {downloading ? <PullBar q={q} /> : (
         <>
-          <FitCell fit={q.fit} />
+          <CtxCell fit={q.fit} />
+          <RunsCell fit={q.fit} />
           <QualityCell q={q} />
         </>
       )}
@@ -194,10 +210,13 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
         <span className="w-1.5 shrink-0" />
         <span className="w-24 shrink-0">quant</span>
         <span className="w-[52px] shrink-0 text-right">size</span>
-        <span className="w-[104px] shrink-0" title="whether it fits this machine, and how much of it lands on the GPU">
-          runs here
+        <span className="w-[46px] shrink-0 text-right" title="context window this quant can hold on this machine">
+          ctx
         </span>
-        <span className="w-[92px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
+        <span className="w-[74px] shrink-0" title="where the weights end up: fully on the GPU, or partly in system RAM">
+          runs
+        </span>
+        <span className="w-[96px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
           vs bf16
         </span>
       </div>
