@@ -94,6 +94,78 @@ def test_inspect_hybrid_kv_array_counts_full_attn_layers(tmp_path):
     assert info.spec_fields["full_attn_layers"] == 3
 
 
+def _qwen35(interval, blocks=65):
+    """Qwen3.5/3.8 shape: SSM layers interleaved with full-attention ones, and
+    the pattern declared as ONE NUMBER — with a SCALAR kv head count, not the
+    per-layer table the other hybrids use."""
+    kvs = [
+        _kv_str(b"general.architecture", b"qwen35"),
+        _kv_u32(b"qwen35.block_count", blocks),
+        _kv_u32(b"qwen35.context_length", 262144),
+        _kv_u32(b"qwen35.embedding_length", 5120),
+        _kv_u32(b"qwen35.attention.head_count", 24),
+        _kv_u32(b"qwen35.attention.head_count_kv", 4),      # scalar!
+        _kv_u32(b"qwen35.attention.key_length", 256),
+        _kv_u32(b"qwen35.ssm.state_size", 128),
+    ]
+    if interval:
+        kvs.append(_kv_u32(b"qwen35.full_attention_interval", interval))
+    return kvs
+
+
+def test_full_attention_interval_is_honoured_with_a_scalar_kv_count(tmp_path):
+    """Live 2026-07-30: Qwen3.8-27B read as 65-of-65 full-attention layers,
+    overestimating its KV cache 4x and pinning it to 8K on a 16GB card. The
+    hybrid branches above only fire when head_count_kv is a LIST; this model
+    ships a scalar plus `full_attention_interval`, so it fell through to
+    "every layer is full attention"."""
+    info = inspect_gguf(_write(tmp_path, _qwen35(interval=4)))
+    assert info.spec_fields["n_layers"] == 65
+    assert info.spec_fields["full_attn_layers"] == 16      # 65 // 4, not 65
+    assert info.spec_fields["kv_heads"] == 4
+    assert info.spec_fields["head_dim"] == 256
+
+
+def test_a_scalar_kv_count_without_an_interval_is_still_all_full_attention(
+        tmp_path):
+    # the ordinary dense case must not regress into claiming a hybrid
+    info = inspect_gguf(_write(tmp_path, _qwen35(interval=None)))
+    assert info.spec_fields["full_attn_layers"] == 65
+
+
+@pytest.mark.parametrize("interval,blocks,want", [
+    (1, 40, 40),      # interval 1 = every layer, i.e. not hybrid at all
+    (2, 40, 20),
+    (4, 64, 16),
+    (6, 60, 10),
+    (8, 4, 1),        # never zero, or KV per token becomes 0 and everything "fits"
+])
+def test_interval_layer_counts(tmp_path, interval, blocks, want):
+    info = inspect_gguf(_write(tmp_path, _qwen35(interval, blocks)))
+    assert info.spec_fields["full_attn_layers"] == want
+
+
+def test_the_interval_fix_shrinks_the_kv_cache_it_was_overstating(tmp_path):
+    """The fix is only worth anything if it moves the number that gates
+    context. 4x less cache per token is 4x more context in the same VRAM."""
+    from rigma.models import CachePolicy, GgufFile, ModelSpec
+    from rigma.resolve import kv_bytes_per_token
+
+    def spec_for(kvs):
+        f = inspect_gguf(_write(tmp_path, kvs)).spec_fields
+        return ModelSpec(slug="s", family="f", kind="dense",
+                         n_layers=f["n_layers"],
+                         full_attn_layers=f["full_attn_layers"],
+                         kv_heads=f["kv_heads"], head_dim=f["head_dim"],
+                         native_ctx=f["native_ctx"],
+                         cache_type_policy=CachePolicy(),
+                         ggufs=[GgufFile(repo="r", file="a.gguf", bytes=1,
+                                         quant="Q4_K_M")])
+    fixed = kv_bytes_per_token(spec_for(_qwen35(4)), "q8_0", "q8_0")
+    naive = kv_bytes_per_token(spec_for(_qwen35(None)), "q8_0", "q8_0")
+    assert naive / fixed == pytest.approx(65 / 16, rel=0.01)
+
+
 def test_inspect_moe_detected(tmp_path):
     kvs = DENSE[:-2] + [_kv_u32(b"qwen3.expert_count", 64),
                         _kv_u32(b"qwen3.expert_used_count", 8)]

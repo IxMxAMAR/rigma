@@ -142,7 +142,24 @@ def inspect_gguf(src, fallback_name: str = "") -> GgufInfo:
             full_attn = sum(1 for h in kv if int(h) > 0)
             kv_heads = max((int(h) for h in kv), default=0)
     else:
-        full_attn, kv_heads = n_layers, int(kv)
+        # A SCALAR kv head count does not mean every layer is full attention.
+        # Qwen3.5/3.8 interleave SSM (linear-attention) layers and declare the
+        # pattern as ONE NUMBER instead of a per-layer table:
+        #     qwen35.full_attention_interval = 4
+        #     qwen35.attention.head_count_kv = 4      <- scalar
+        #     qwen35.ssm.state_size          = 128    <- the other 3-in-4
+        # Only every Nth layer keeps a cache that grows with context; an SSM
+        # layer's state is a fixed size. Reading the scalar as "all 65 layers
+        # are full attention" overestimated KV by 4x and pinned Qwen3.8-27B at
+        # 8K on a 16GB card when its real appetite allows far more (owner
+        # report 2026-07-30 — the same failure Gemma's sliding-window pattern
+        # got fixed for above, arriving in a different shape).
+        interval = int(g("full_attention_interval", 0) or 0)
+        if interval > 1 and n_layers > 0:
+            full_attn = max(1, n_layers // interval)
+        else:
+            full_attn = n_layers
+        kv_heads = int(kv)
     head_dim = int(g("attention.key_length", 0)) or (
         int(g("embedding_length", 0)) // heads if heads else 0)
     template = str(meta.get("tokenizer.chat_template", ""))
