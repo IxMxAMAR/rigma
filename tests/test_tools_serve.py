@@ -463,3 +463,39 @@ def test_round_cap_honours_the_backstop():
     assert _round_cap({}) == 1000                          # default
     assert _round_cap({"max_tool_rounds": 99999}) == 1000  # backstop holds
     assert _round_cap({"max_tool_rounds": "junk"}) == 1000
+
+
+def test_a_chat_trace_entry_records_its_own_outcome(home, upstream):
+    """A chat trace entry is {name, args, result}; a run action is
+    {tool, args, ok, ts}. Anything reading tool history written against the run
+    shape sees `act.get("ok", True)` on a chat entry and concludes every call
+    succeeded — before the tool/name mismatch is even reached. Nine places in
+    this codebase re-derive success by string-matching the result text instead,
+    which is the same fact spelled nine ways.
+
+    The entry states its own outcome, so a reader does not have to guess."""
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    client.post(f"/api/sessions/{sid}/chat", json={"message": "what is 6 times 7?"})
+
+    saved = client.get(f"/api/sessions/{sid}").json()
+    last = [m for m in saved["messages"] if m["role"] == "assistant"][-1]
+    entry = last["tool_trace"][0]
+    assert entry["name"] == "calculator"
+    assert entry["ok"] is True
+    assert isinstance(entry["ts"], (int, float)) and entry["ts"] > 0
+
+
+def test_call_ok_prefers_the_recorded_flag_over_the_result_text():
+    """Old sessions on disk have no `ok`, so the string check has to stay as a
+    fallback. But a tool whose successful output legitimately begins with the
+    word "error" — grep hitting a log line, read_file on a stack trace — was
+    being counted as a failure by every one of those nine sites."""
+    from rigma.serve import call_ok
+    assert call_ok({"name": "grep", "result": "error: disk full", "ok": True})
+    assert not call_ok({"name": "grep", "result": "found 3 matches", "ok": False})
+    # no flag recorded (a session written before this existed): fall back
+    assert not call_ok({"name": "grep", "result": "error: nope"})
+    assert call_ok({"name": "grep", "result": "found 3 matches"})

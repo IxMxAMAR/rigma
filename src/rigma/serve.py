@@ -337,10 +337,31 @@ def _turn_sig(trace):
         (t.get("name", ""), json.dumps(t.get("args", {}), sort_keys=True,
                                        default=str)) for t in trace))
 
+
+def call_ok(entry: dict) -> bool:
+    """Did this tool call succeed?
+
+    A chat trace entry used to be {name, args, result} while a run action is
+    {tool, args, ok, ts}, so anything reading tool history written against the
+    run shape saw `entry.get("ok", True)` on a chat entry and concluded every
+    call had succeeded. Nine places re-derived the answer by string-matching the
+    result text instead — the same fact spelled nine ways, each free to drift.
+
+    Prefers the flag the entry recorded. Falls back to the string check for
+    entries written before the flag existed, so sessions already on disk keep
+    working. The fallback is also wrong in a way the flag is not: a SUCCESSFUL
+    result that happens to begin with "error" — grep matching a log line,
+    read_file on a stack trace — read as a failure everywhere.
+    """
+    got = entry.get("ok")
+    if got is not None:
+        return bool(got)
+    return not str(entry.get("result", "")).startswith("error")
+
 def _dynamic_line(trace):
     if not trace:
         return "Take a concrete action now — call a tool to advance the plan."
-    errs = [t for t in trace if str(t.get("result", "")).startswith("error")]
+    errs = [t for t in trace if not call_ok(t)]
     if errs and len(errs) == len(trace):
         return (f"Your last tool call failed: {str(errs[-1].get('result',''))[:160]}. "
                 "Read that error and change your approach — different "
@@ -1385,7 +1406,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                             "result": _shown},
                                            event="tool_result")
                                 trace.append({"name": name, "args": {},
-                                              "result": result})
+                                              "result": result,
+                                              "ok": not str(result)
+                                              .startswith("error"),
+                                              "ts": _now()})
                                 msgs.append({"role": "tool",
                                              "tool_call_id": c["id"],
                                              "content": result})
@@ -1408,7 +1432,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _shown = _shown[:900] + " …(display clipped — the model sees the full text)"
                     yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
                                 "result": _shown}, event="tool_result")
-                    trace.append({"name": name, "args": cargs, "result": result})
+                    trace.append({"name": name, "args": cargs, "result": result,
+                                  "ok": not str(result).startswith("error"),
+                                  "ts": _now()})
                     msgs.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": result})
                     if imgs:
@@ -1572,9 +1598,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                           "result(s) from this turn omitted)")
                     s["messages"].append({
                         "role": "user", "kind": "tool_result",
-                        "tools": [{"name": t.get("name"),
-                                   "ok": not str(t.get("result", ""))
-                                   .startswith("error")} for t, _ in kept],
+                        "tools": [{"name": t.get("name"), "ok": call_ok(t)}
+                                  for t, _ in kept],
                         "content": "\n".join(body_lines)})
             # TRIGGER RULES. Evaluated after the turn, never during it: a
             # trigger that fired mid-turn would be reacting to a tool call
@@ -2765,7 +2790,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 for t in trace:
                     _runs.append_action(
                         run_id, t.get("name"), t.get("args"),
-                        not str(t.get("result", "")).startswith("error"))
+                        call_ok(t))
                     _runs.log_tool_action(run_id, t.get("name"), t.get("args"),
                                           str(t.get("result", "")),
                                           run.get("workspace", ""))
@@ -2793,8 +2818,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             # ever reaches the model.
                             "kind": "tool_result",
                             "tools": [{"name": t.get("name"),
-                                       "ok": not str(t.get("result", ""))
-                                       .startswith("error")} for t in trace],
+                                       "ok": call_ok(t)} for t in trace],
                             "content": "\n".join(
                                 f"TOOL RESULT {t.get('name')}: "
                                 + _clip(str(t.get("result", "")), RESULT_MAX)
@@ -2918,7 +2942,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             pass
                 productive = [t for t in trace
                               if t.get("name") not in _BOOKKEEPING_TOOLS
-                              and not str(t.get("result", "")).startswith("error")]
+                              and call_ok(t)]
                 # ADVANCE THE PLAN OURSELVES. The model rarely calls
                 # manage_plan(complete), so a finished step stays pending and the
                 # driving line repeats "Do this now: #1 ..." forever — the owner
@@ -3004,8 +3028,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # writing anything, and the watchdog reads it as healthy.
                 if not trace:
                     run["lazy_streak"] = run.get("lazy_streak", 0) + 1
-                elif all(str(t.get("result", "")).startswith("error")
-                         for t in trace):
+                elif all(not call_ok(t) for t in trace):
                     run["error_streak"] = run.get("error_streak", 0) + 1
                 elif not productive and run.get("iteration", 0) > 0:
                     # iteration 0 is legitimately plan-building, so exempt it
@@ -3034,8 +3057,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             last_err = next(
                                 (str(t.get("result", ""))[:160]
                                  for t in reversed(trace)
-                                 if str(t.get("result", ""))
-                                 .startswith("error")),
+                                 if not call_ok(t)),
                                 "no verifiable progress")
                             _runs.plan_block(run_id, cur_id, last_err)
                             nxt = (_runs.next_pending(run_id)
