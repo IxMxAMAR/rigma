@@ -44,6 +44,24 @@ def _capabilities(slug: str) -> tuple:
     return ()
 
 
+def _sweepable_caps(plan) -> tuple:
+    """Capabilities the sweep may act on, with `mtp` decided by the FILE.
+
+    A sweep runs real llama-server launches, so a capability that the model
+    advertises but this quant does not carry is not a wasted row — it is a
+    driver reset mid-sweep. The gguf being benched is on disk by definition,
+    so the tensor table can always be consulted."""
+    caps = set(_capabilities(plan.model_slug))
+    caps.discard("mtp")
+    try:
+        from .hangar import file_has_mtp
+        if file_has_mtp(plan.gguf) is True:
+            caps.add("mtp")
+    except Exception:
+        pass          # unverifiable stays out: absence of proof is not proof
+    return tuple(caps)
+
+
 def _tools_capable(slug: str) -> bool:
     """Whether the model declares the `tools` capability. Unknown → True:
     assume tools and protect quality rather than risk degrading it."""
@@ -134,8 +152,9 @@ def sweep_configs(base: ComboFlags, moe: bool,
                          {"n_cpu_moe": max(0, base.n_cpu_moe - 1)}))
     # speculation trials: exhaustive sweep ONLY, and gated by
     # SPEC_CROWN_MARGIN in run_sweep — the short bench flatters acceptance.
-    # Never offered without the mtp capability (spec-decode without the
-    # tensors is a documented Vulkan driver-reset loop).
+    # `caps` here is the FILE's answer (see run_sweep), not the model's: MTP is
+    # dropped or kept per quant, and trialling draft-mtp against a quant without
+    # the tensors resets the Vulkan driver mid-sweep.
     if "mtp" in (caps or ()):
         cfgs.append(("spec-mtp-2", {"spec_type": "draft-mtp", "spec_n_max": 2}))
         cfgs.append(("spec-mtp-4", {"spec_type": "draft-mtp", "spec_n_max": 4}))
@@ -173,7 +192,7 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     is_moe = plan.flags.n_cpu_moe > 0
     if configs is None:
         configs = sweep_configs(plan.flags, is_moe,
-                                caps=_capabilities(plan.model_slug))
+                                caps=_sweepable_caps(plan))
     # Never let the sweep crown q4_0 KV on a tools-capable model: llama.cpp's
     # own function-calling docs warn extreme KV quantization significantly
     # degrades tool calling, and the sweep scores tokens/sec only — it would

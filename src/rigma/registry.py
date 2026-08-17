@@ -97,8 +97,17 @@ class Registry:
                 except Exception:
                     continue   # a broken custom spec must not brick startup
                 if spec.slug not in models:
-                    models[spec.slug] = spec.model_copy(
-                        update={"custom": True})
+                    # Heal HERE, not on the Models page: geometry feeds the
+                    # launcher, the fit calculator and the bench as well as the
+                    # UI, and a page that healed only its own view would show
+                    # numbers the engine never used.
+                    spec = spec.model_copy(update={"custom": True})
+                    try:
+                        from .hangar import heal_spec
+                        spec = heal_spec(spec)
+                    except Exception:
+                        pass       # healing is a repair, never a load barrier
+                    models[spec.slug] = spec
         combos = {}
         for f in sorted((path / "combos").rglob("*.json")):
             rel = f.relative_to(path / "combos").as_posix()

@@ -17,7 +17,7 @@ import httpx
 from .gguf_meta import GgufParseError, inspect_gguf
 from .hangar import (HangarError, _distinct_quants, _quant_from_name,
                      _slugify, _write_spec)
-from .models import GgufFile, ModelSpec, MoESpec
+from .models import GgufFile, ModelSpec
 
 HF = "https://huggingface.co"
 _SPLIT_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
@@ -136,16 +136,31 @@ def repo_files(repo: str) -> dict:
 
 def remote_inspect(repo: str, file: str):
     """gguf_meta over a ranged read; escalates if the header is padded out
-    by a giant vocab array."""
+    by a giant vocab array.
+
+    Escalates for a cut-off TENSOR TABLE too, not just unreadable KVs. The
+    table is what proves whether a draft head is really in the file, and it sits
+    after the vocab: unsloth's Qwen3.8-27B parses fine at 8MB but its 866-tensor
+    table only completes at 32MB. Stopping at the first successful KV parse
+    would have reported "no MTP" for a file that has it — an absence that was
+    never observed."""
+    last = None
     for cap in _RANGE_STEPS_MB:
         blob = _fetch_head(repo, file, cap)
         try:
-            return inspect_gguf(io.BytesIO(blob), fallback_name=file)
+            info = inspect_gguf(io.BytesIO(blob), fallback_name=file)
         except GgufParseError as e:
             if "truncated" in str(e) and cap != _RANGE_STEPS_MB[-1] \
                     and len(blob) >= cap * 2**20:
                 continue   # header really is bigger than this range
             raise HangarError(f"couldn't parse {file}: {e}") from e
+        last = info
+        if not info.tensors_truncated or cap == _RANGE_STEPS_MB[-1] \
+                or len(blob) < cap * 2**20:
+            return info
+    if last is None:
+        raise HangarError(f"couldn't read {file}")
+    return last
 
 
 def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
@@ -158,13 +173,13 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
     # probe cheapest header first; skip odd non-model ggufs (live find
     # 2026-07-17: bartowski repos ship imatrix data as .gguf) and fall
     # forward to the next smallest before giving up
-    info = None
+    info, probed = None, ""
     for probe in sorted(rf["ggufs"], key=lambda g: g["bytes"])[:3]:
         cand = remote_inspect(repo, probe["file"])
         f = cand.spec_fields
         if not cand.is_mmproj and f["n_layers"] > 0 and f["kv_heads"] > 0 \
                 and f["head_dim"] > 0:
-            info = cand
+            info, probed = cand, probe["file"]
             break
     if info is None:
         raise HangarError("no gguf in that repo carries usable model "
@@ -172,30 +187,28 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
     f = info.spec_fields
     caps = sorted(set(info.capabilities)
                   | ({"vision"} if rf["mmproj"] else set()))
-    moe = None
-    if f["kind"] == "moe":
-        big = rf["ggufs"][0]["bytes"]
-        est_b = max(1.0, round(big / 2**30 * 2, 1))
-        moe = MoESpec(total_b=est_b, active_b=max(0.5, round(est_b * 0.1, 1)),
-                      expert_weight_fraction=0.85)
+    from .hangar import moe_from_probe, spec_fields_from_probe
+    moe = moe_from_probe(f, rf["ggufs"][0]["bytes"])
     mm = None
     if rf["mmproj"]:
         mm = GgufFile(repo=repo, file=rf["mmproj"]["file"],
                       bytes=rf["mmproj"]["bytes"],
                       quant=_quant_from_name(rf["mmproj"]["file"]))
+    # MTP was verified on the file we probed; the others in the repo are
+    # unknown until they are read. Claiming the probe's answer for all of them
+    # is the per-model-claim-about-a-per-file-property bug this fixes.
     spec = ModelSpec(
         slug=_slugify(info.name), family=info.arch or "custom",
-        kind=f["kind"], n_layers=f["n_layers"],
-        full_attn_layers=f["full_attn_layers"], kv_heads=f["kv_heads"],
-        head_dim=f["head_dim"], native_ctx=max(2048, f["native_ctx"]),
-        ggufs=[GgufFile(repo=repo, file=g["file"], bytes=g["bytes"],
-                        quant=q)
+        kind=f["kind"],
+        ggufs=[GgufFile(repo=repo, file=g["file"], bytes=g["bytes"], quant=q,
+                        mtp=f.get("mtp") if g["file"] == probed else None)
                for g, q in zip(rf["ggufs"],
                                _distinct_quants([g["file"]
                                                  for g in rf["ggufs"]]))],
         moe=moe, mmproj=mm, license="see model card", use_cases=["general"],
         capabilities=caps, custom=True,
-        sources=[f"{HF}/{repo}"])
+        sources=[f"{HF}/{repo}"],
+        **spec_fields_from_probe(f))
     from .hangar import inherit_family_defaults
     return inherit_family_defaults(spec), rf
 
@@ -211,7 +224,8 @@ def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",
     no preview at all.
     """
     from .probe import probe_hardware
-    from .quant_quality import quality_of, total_loss
+    from .quant_quality import (label_overstates, measured_bpw, quality_of,
+                                total_loss)
     from .registry import Registry
     from .resolve import quant_verdicts, recommended_quant
     spec, rf = _spec_from_repo(repo)
@@ -231,6 +245,10 @@ def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",
         quants.append({"file": g.file, "quant": g.quant, "bytes": g.bytes,
                        "fit": v, "quality": quality_of(g.quant),
                        "total": total_loss(g.quant, k),
+                       "mtp": g.mtp,
+                       "bpw": measured_bpw(g.bytes, spec.params),
+                       "label_drift": label_overstates(g.quant, g.bytes,
+                                                       spec.params),
                        # a pre-add row can't be on disk; keeps the shape
                        # identical to /api/models so one component renders both
                        "on_disk": False, "pullable": True})
@@ -238,6 +256,9 @@ def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",
             "kind": spec.kind, "native_ctx": spec.native_ctx,
             "capabilities": spec.capabilities,
             "already": spec.slug in reg.models,
+            "params": spec.params, "n_layers": spec.n_layers,
+            "full_attn_layers": spec.full_attn_layers,
+            "mtp_layers": spec.mtp_layers, "has_template": spec.has_template,
             "mmproj": rf["mmproj"], "split_skipped": rf["split_skipped"],
             "ggufs": quants, "recommended": recommended_quant(quants)}
 

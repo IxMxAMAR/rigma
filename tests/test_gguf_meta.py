@@ -32,14 +32,22 @@ def _kv_arr_str(key: bytes, vals: list[bytes]) -> bytes:
             + struct.pack("<I", T_STR) + struct.pack("<Q", len(vals)) + body)
 
 
-def _gguf(kvs: list[bytes]) -> bytes:
-    return (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
-            + struct.pack("<Q", len(kvs)) + b"".join(kvs))
+def _tensor(name: bytes, dims: list[int], ttype: int = 0) -> bytes:
+    """One tensor-info record: name, rank, dims, ggml type, data offset."""
+    return (_s(name) + struct.pack("<I", len(dims))
+            + b"".join(struct.pack("<Q", d) for d in dims)
+            + struct.pack("<I", ttype) + struct.pack("<Q", 0))
 
 
-def _write(tmp_path, kvs, name="m.gguf"):
+def _gguf(kvs: list[bytes], tensors: list[bytes] | None = None) -> bytes:
+    tensors = tensors or []
+    return (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", len(tensors))
+            + struct.pack("<Q", len(kvs)) + b"".join(kvs) + b"".join(tensors))
+
+
+def _write(tmp_path, kvs, name="m.gguf", tensors=None):
     p = tmp_path / name
-    p.write_bytes(_gguf(kvs))
+    p.write_bytes(_gguf(kvs, tensors))
     return p
 
 
@@ -259,3 +267,104 @@ def test_no_swa_pattern_still_counts_nonzero_kv_layers(tmp_path):
     info = inspect_gguf(_write(tmp_path, kvs))
     assert info.spec_fields["full_attn_layers"] == 3
     assert info.spec_fields["kv_heads"] == 2
+
+
+# --- MTP: the tensor table decides, not the header ---------------------------
+_MTP_KVS = [
+    _kv_str(b"general.architecture", b"qwen35moe"),
+    _kv_str(b"general.name", b"Test MTP"),
+    _kv_u32(b"qwen35moe.block_count", 5),          # 4 real layers + 1 MTP block
+    _kv_u32(b"qwen35moe.context_length", 4096),
+    _kv_u32(b"qwen35moe.embedding_length", 512),
+    _kv_u32(b"qwen35moe.attention.head_count", 8),
+    _kv_u32(b"qwen35moe.attention.head_count_kv", 2),
+    _kv_u32(b"qwen35moe.attention.key_length", 64),
+    _kv_u32(b"qwen35moe.expert_count", 8),
+    _kv_u32(b"qwen35moe.expert_used_count", 2),
+    _kv_u32(b"qwen35moe.nextn_predict_layers", 1),
+    _kv_str(b"tokenizer.chat_template", b"tool <think>"),
+]
+_MTP_TENSORS = [
+    _tensor(b"blk.0.attn_q.weight", [512, 512]),
+    _tensor(b"blk.4.attn_q.weight", [512, 512]),
+    _tensor(b"blk.4.nextn.eh_proj.weight", [1024, 512]),
+]
+
+
+def test_mtp_verified_from_tensor_table(tmp_path):
+    info = inspect_gguf(_write(tmp_path, _MTP_KVS, tensors=_MTP_TENSORS))
+    assert info.spec_fields["mtp"] is True
+    assert "mtp" in info.capabilities
+    assert "tools" in info.capabilities        # existing detection untouched
+
+
+def test_header_claims_mtp_but_tensors_do_not_carry_it(tmp_path):
+    """nextn_predict_layers is copied from the source config and survives a
+    conversion that dropped the tensors. Trusting it promises llama.cpp a draft
+    head that isn't there — which resets the GPU driver instead of erroring."""
+    stripped = [t for t in _MTP_TENSORS if b"nextn" not in t]
+    info = inspect_gguf(_write(tmp_path, _MTP_KVS, tensors=stripped))
+    assert info.spec_fields["mtp"] is False
+    assert "mtp" not in info.capabilities      # the file overrules the header
+
+
+def test_mtp_block_is_not_counted_as_a_decoder_layer(tmp_path):
+    """block_count includes the MTP block. Counting it made one model read as
+    two: the same architecture reported 65 layers where the MTP block was kept
+    and 64 where it was dropped."""
+    info = inspect_gguf(_write(tmp_path, _MTP_KVS, tensors=_MTP_TENSORS))
+    assert info.spec_fields["n_layers"] == 4       # 5 blocks - 1 MTP block
+    assert info.spec_fields["mtp_layers"] == 1
+
+
+def test_no_tensor_table_leaves_mtp_unknown_not_absent(tmp_path):
+    """A ranged read cut short cannot tell 'no MTP' from 'not read that far'."""
+    import io
+    blob = _gguf(_MTP_KVS, _MTP_TENSORS)
+    truncated = blob[:len(blob) - 20]
+    info = inspect_gguf(io.BytesIO(truncated))
+    assert info.spec_fields["mtp"] is None
+    assert info.tensors_truncated is True
+    assert "mtp" in info.capabilities          # falls back to the header claim
+
+
+def test_parameter_and_expert_counts_come_from_tensor_dims(tmp_path):
+    tensors = [
+        _tensor(b"blk.0.attn_q.weight", [10, 10]),        # 100
+        _tensor(b"blk.0.ffn_down_exps.weight", [10, 10, 4]),   # 400 expert
+    ]
+    info = inspect_gguf(_write(tmp_path, _MTP_KVS, tensors=tensors))
+    assert info.spec_fields["params"] == 500
+    assert info.spec_fields["expert_params"] == 400
+
+
+# --- an absent chat template is not a finding about the model ----------------
+def test_missing_chat_template_is_reported_not_silently_empty(tmp_path):
+    kvs = [k for k in _MTP_KVS if b"chat_template" not in k]
+    info = inspect_gguf(_write(tmp_path, kvs, tensors=_MTP_TENSORS))
+    assert info.spec_fields["has_template"] is False
+    assert "tools" not in info.capabilities
+    assert "thinking" not in info.capabilities
+
+
+def test_template_present_but_featureless_is_distinguishable(tmp_path):
+    kvs = [k for k in _MTP_KVS if b"chat_template" not in k]
+    kvs.append(_kv_str(b"tokenizer.chat_template", b"{{ messages }}"))
+    info = inspect_gguf(_write(tmp_path, kvs, tensors=_MTP_TENSORS))
+    assert info.spec_fields["has_template"] is True   # evidence exists...
+    assert "tools" not in info.capabilities           # ...and says no tools
+
+
+@pytest.mark.parametrize("template,cap", [
+    (b"<think>", "thinking"),
+    (b"reasoning_content", "thinking"),
+    (b"enable_thinking", "thinking"),
+    (b"<|channel|>analysis", "thinking"),
+    (b"tool_calls", "tools"),
+    (b"function_call", "tools"),
+])
+def test_capability_needles_cover_real_template_dialects(tmp_path, template, cap):
+    kvs = [k for k in _MTP_KVS if b"chat_template" not in k]
+    kvs.append(_kv_str(b"tokenizer.chat_template", template))
+    info = inspect_gguf(_write(tmp_path, kvs, tensors=_MTP_TENSORS))
+    assert cap in info.capabilities

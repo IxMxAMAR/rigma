@@ -433,3 +433,65 @@ def test_spilled_counts_moe_experts_not_whole_layers():
     moe_f = ComboFlags(ctx=8192, ngl=99, n_cpu_moe=13)
     assert _spilled(dense, dense_f) == pytest.approx(13 / 65)
     assert _spilled(moe, moe_f) == pytest.approx(13 / 65 * 0.85)
+
+
+# --- measured bits per weight -------------------------------------------------
+def test_measured_bpw_is_arithmetic_on_two_counted_quantities():
+    from rigma.quant_quality import measured_bpw
+    # 1 GB file, 2B parameters -> 4 bits each
+    assert measured_bpw(2_000_000_000, 4_000_000_000) == 4.0
+
+
+def test_measured_bpw_needs_both_terms():
+    from rigma.quant_quality import measured_bpw
+    assert measured_bpw(0, 1_000) is None
+    assert measured_bpw(1_000, 0) is None
+
+
+def test_a_label_with_no_known_format_still_reports_what_it_spends():
+    """SC117's APEX quants are named I-Balanced / I-Quality / I-Compact, so
+    quality_of returns None and the Models page rendered an em dash for the one
+    MTP-capable model on this machine — three rows with no way to choose between
+    them. Bits per weight is measured, not a quality figure invented from a
+    size, so it can be shown where the reference table has nothing."""
+    from rigma.quant_quality import measured_bpw, quality_of
+    assert quality_of("I-COMPACT") is None
+    assert measured_bpw(17_016_624_544, 35_505_251_456) == 3.83
+
+
+def test_label_overstating_the_file_is_flagged():
+    """The APEX I-Compact stamps general.file_type = 15 (Q4_K_M, 4.85 bpw) into
+    a file that spends 3.83 — a custom mix inheriting its base ftype's name."""
+    from rigma.quant_quality import label_overstates
+    flag = label_overstates("Q4_K_M", 17_016_624_544, 35_505_251_456)
+    assert flag is not None
+    assert flag["measured_bpw"] == 3.83
+    assert flag["label_bpw"] == 4.85
+    assert flag["drift_pct"] < 0
+
+
+def test_an_honest_label_is_not_flagged():
+    from rigma.quant_quality import label_overstates
+    # 4.85 bpw of a 10B model = 6.06 GB; the label describes the file
+    assert label_overstates("Q4_K_M", int(4.85 * 10_000_000_000 / 8),
+                            10_000_000_000) is None
+
+
+def test_unknown_labels_have_nothing_to_contradict():
+    from rigma.quant_quality import label_overstates
+    assert label_overstates("I-COMPACT", 17_016_624_544, 35_505_251_456) is None
+
+
+def test_size_vs_bf16_prefers_the_measurement_over_the_nominal_bpw():
+    from rigma.quant_quality import size_vs_bf16
+    nominal = size_vs_bf16("Q4_K_M", 17_016_624_544)
+    measured = size_vs_bf16("Q4_K_M", 17_016_624_544, 35_505_251_456)
+    assert nominal == round(4.85 / 16, 4)
+    assert measured == round(3.83 / 16, 4)
+
+
+def test_bpw_is_never_converted_into_a_quality_percentage():
+    """A percentage would need a perplexity run. Bits per weight is the size of
+    the budget, not the quality it buys — the module must not blur that."""
+    from rigma.quant_quality import quality_of
+    assert quality_of("I-COMPACT") is None      # still None, bpw notwithstanding

@@ -18,6 +18,13 @@ from .models import GgufFile, ModelSpec, MoESpec
 from .runtime import rigma_home
 
 VALID_CAPS = ("tools", "vision", "thinking", "mtp")
+# Bump when the probe learns something a stored spec would have got wrong.
+#   1  layer geometry from gguf_meta, capabilities from the chat template
+#   2  hybrid attention read from full_attention_interval (Qwen3.5/3.8)
+#   3  MTP block excluded from n_layers; MTP verified from the tensor table;
+#      exact parameter/expert counts; "no chat template" told apart from
+#      "no capabilities"
+PROBE_VERSION = 3
 _QUANT_RE = re.compile(
     r"(UD-)?(I?Q\d(?:_[A-Z0-9]+)*|F16|BF16|F32|MXFP4(?:_[A-Z0-9]+)*)",
     re.IGNORECASE)
@@ -91,6 +98,48 @@ def _distinct_quants(files: list[str]) -> list[str]:
             for f in files]
 
 
+def moe_from_probe(f: dict, biggest_bytes: int) -> MoESpec | None:
+    """MoE sizing, measured from the tensor table when the table was readable.
+
+    The old figures were a rule of thumb over the file size — `size_gb * 2` for
+    total parameters, a flat 10% of that for active, and a hardcoded 0.85 expert
+    weight fraction. On the APEX 35B that produced 48.4B total (real: 35.5B, 36%
+    over), 4.8B active (real: 3.5B — the model's own name says A3B) and 0.85
+    against a measured 0.93. That fraction is not cosmetic: `_spilled` and the
+    offload math multiply by it, so every --n-cpu-moe decision inherited the
+    error. Sum the expert tensors instead; the estimate stays only as the
+    fallback for a remote probe whose tensor table was cut off.
+    """
+    if f.get("kind") != "moe":
+        return None
+    params = int(f.get("params", 0) or 0)
+    experts = int(f.get("expert_params", 0) or 0)
+    used, total = int(f.get("expert_used", 0) or 0), int(f.get("experts", 0) or 0)
+    if params > 0 and experts > 0 and total > 0:
+        active = params - experts + experts * (used / total)
+        return MoESpec(total_b=round(params / 1e9, 2),
+                       active_b=round(max(active, 0.0) / 1e9, 2),
+                       expert_weight_fraction=round(experts / params, 3))
+    est_b = max(1.0, round(biggest_bytes / 2**30 * 2, 1))
+    return MoESpec(total_b=est_b, active_b=max(0.5, round(est_b * 0.1, 1)),
+                   expert_weight_fraction=0.85)
+
+
+def spec_fields_from_probe(f: dict) -> dict:
+    """The probed facts every ModelSpec carries, in one place so install,
+    remote-add and healing cannot drift apart."""
+    return {"n_layers": f["n_layers"],
+            "full_attn_layers": f["full_attn_layers"],
+            "kv_heads": f["kv_heads"], "head_dim": f["head_dim"],
+            "native_ctx": max(2048, f["native_ctx"]),
+            "params": int(f.get("params", 0) or 0),
+            "mtp_layers": int(f.get("mtp_layers", 0) or 0),
+            "full_attention_interval":
+                int(f.get("full_attention_interval", 0) or 0),
+            "has_template": bool(f.get("has_template", True)),
+            "probe_version": PROBE_VERSION}
+
+
 def _write_spec(spec: ModelSpec) -> None:
     d = custom_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -132,6 +181,89 @@ def inherit_family_defaults(spec: ModelSpec) -> ModelSpec:
     except Exception:
         pass          # inheritance is a nicety — never block an install
     return spec
+
+
+def heal_spec(spec: ModelSpec) -> ModelSpec:
+    """Re-derive a stored spec's probed facts when the probe has since improved.
+
+    Quant LABELS already heal on read (_distinct_quants). Geometry did not, so a
+    model added before a fix kept the wrong numbers forever and the only cure was
+    for the user to delete and re-add it — which they cannot be expected to know.
+    The APEX 35B on this machine was stored as 41-of-41 full-attention layers;
+    the file says 10-of-40, a 4x overstatement of its KV cache that had been
+    quietly capping its context since it was added.
+
+    Only re-probes when the gguf is actually on disk, and only for custom specs
+    (registry entries are hand-authored and researched — never overwrite those).
+    Capabilities are ADDED, never removed, except `mtp`, which the tensor table
+    can positively disprove; a capability the user set by hand must survive.
+    """
+    if not spec.custom:
+        return spec
+    mdir = models_dir()
+    stale = spec.probe_version < PROBE_VERSION
+    # a quant downloaded after the last heal still needs its own MTP answer
+    unprobed = [g for g in spec.ggufs
+                if g.mtp is None and (mdir / g.file).is_file()]
+    if not stale and not unprobed:
+        return spec                        # nothing to do: the common path
+    probed = {}
+    targets = {g.file for g in unprobed}
+    if stale:
+        local = next((g for g in spec.ggufs if (mdir / g.file).is_file()), None)
+        if local is not None:
+            targets.add(local.file)
+    for name in targets:
+        try:
+            probed[name] = inspect_gguf(mdir / name)
+        except (GgufParseError, OSError, ValueError):
+            continue               # unreadable file must not break the library
+    update: dict = {}
+    if probed:
+        update["ggufs"] = [
+            g.model_copy(update={"mtp": probed[g.file].spec_fields.get("mtp")})
+            if g.file in probed else g for g in spec.ggufs]
+    info = next((probed[g.file] for g in spec.ggufs if g.file in probed), None)
+    f = info.spec_fields if info else None
+    if stale and info and f and f.get("n_layers", 0) > 0 \
+            and f.get("kv_heads", 0) > 0:
+        caps = set(spec.capabilities) | set(info.capabilities)
+        if f.get("mtp") is False:
+            caps.discard("mtp")    # the file demonstrably has no draft head
+        update.update(spec_fields_from_probe(f))
+        update["capabilities"] = sorted(caps)
+        if spec.kind == "moe":
+            moe = moe_from_probe(f, max((g.bytes for g in spec.ggufs),
+                                        default=0))
+            if moe is not None:
+                update["moe"] = moe
+    if not update:
+        return spec
+    healed = spec.model_copy(update=update)
+    try:
+        _write_spec(healed)        # persist so the next read is free
+    except OSError:
+        pass                       # a read-only home still gets healed in memory
+    return healed
+
+
+def file_has_mtp(gguf: GgufFile) -> bool | None:
+    """Does THIS quant carry the draft head? True/False/None (can't tell yet).
+
+    Reads the file when it is on disk and the spec has not recorded an answer —
+    which is exactly the situation at launch, the one moment the question has to
+    be right. Asking llama.cpp for draft-mtp against a file without the tensors
+    is a Vulkan driver reset, so "we never checked" must not read as yes.
+    """
+    if gguf.mtp is not None:
+        return gguf.mtp
+    path = models_dir() / gguf.file
+    if not path.is_file():
+        return None
+    try:
+        return inspect_gguf(path).spec_fields.get("mtp")
+    except (GgufParseError, OSError, ValueError):
+        return None
 
 
 def _load_custom(slug: str) -> ModelSpec | None:
@@ -199,11 +331,7 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
             "gguf header is missing attention metadata — Rigma can't "
             "compute memory fit for this file")
     size = src.stat().st_size
-    moe = None
-    if f["kind"] == "moe":
-        est_b = max(1.0, round(size / 2**30 * 2, 1))   # ~2B params/GB at Q4
-        moe = MoESpec(total_b=est_b, active_b=max(0.5, round(est_b * 0.1, 1)),
-                      expert_weight_fraction=0.85)
+    moe = moe_from_probe(f, size)
     dest = models_dir() / src.name
     if dest.exists():
         # same filename may back a DIFFERENT model (generic quantizer names) —
@@ -212,13 +340,11 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
                           "folder — rename the file and try again")
     spec = ModelSpec(
         slug=slug, family=info.arch or "custom", kind=f["kind"],
-        n_layers=f["n_layers"], full_attn_layers=f["full_attn_layers"],
-        kv_heads=f["kv_heads"], head_dim=f["head_dim"],
-        native_ctx=max(2048, f["native_ctx"]),
         ggufs=[GgufFile(repo="local", file=dest.name, bytes=size,
-                        quant=_quant_from_name(dest.name))],
+                        quant=_quant_from_name(dest.name), mtp=f.get("mtp"))],
         moe=moe, license="custom import", use_cases=["general"],
-        capabilities=sorted(info.capabilities), custom=True)
+        capabilities=sorted(info.capabilities), custom=True,
+        **spec_fields_from_probe(f))
     spec = inherit_family_defaults(spec)
     # spec first, then move: if the move fails, drop the orphan spec so the
     # library never lists a model whose file isn't there
@@ -270,7 +396,8 @@ def list_models(registry=None, profile=None, *, kv: str = "",
                                       grow=grow)
             except Exception:
                 pass         # a fit we can't compute must not blank the page
-        from .quant_quality import quality_of, total_loss
+        from .quant_quality import (label_overstates, measured_bpw, quality_of,
+                                    total_loss)
         quants = []
         for g, label, fit in zip(spec.ggufs, labels, fits):
             on_disk = (mdir / g.file).exists()
@@ -289,6 +416,14 @@ def list_models(registry=None, profile=None, *, kv: str = "",
                            "fit": fit,
                            "quality": quality_of(label),
                            "total": total_loss(label, k),
+                           # per FILE, not per model: whether this artefact
+                           # carries the draft head. None = not read yet.
+                           "mtp": g.mtp,
+                           # measured, so a repo that names its files
+                           # I-Compact still says what it spends
+                           "bpw": measured_bpw(g.bytes, spec.params),
+                           "label_drift": label_overstates(label, g.bytes,
+                                                           spec.params),
                            "pull": _PULLS.get(f"{slug}::{g.file}")})
         mm = None
         if spec.mmproj is not None:
@@ -315,6 +450,13 @@ def list_models(registry=None, profile=None, *, kv: str = "",
             "custom": spec.custom, "capabilities": spec.capabilities,
             "native_ctx": spec.native_ctx, "quants": quants, "mmproj": mm,
             "recommended": best, "source": source,
+            "params": spec.params,
+            "n_layers": spec.n_layers,
+            "full_attn_layers": spec.full_attn_layers,
+            "mtp_layers": spec.mtp_layers,
+            # False => the capability list above is missing evidence, not a
+            # finding. The UI must say so rather than render an empty row.
+            "has_template": spec.has_template,
             "running": bool(state and state.get("model") == slug)})
     du = shutil.disk_usage(mdir)
     return {"models": models,
