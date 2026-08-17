@@ -48,6 +48,17 @@ _TABLE: dict[str, tuple[float, float, str]] = {
     "IQ4_XS":     ( 4.25, 1.70, "leanest good 4-bit"),
     "Q4_1":       ( 4.78, 2.10, "legacy — prefer Q4_K_M"),
     "Q4_0":       ( 4.34, 2.70, "legacy — prefer Q4_K_S"),
+    # bartowski's "_L"/"_XL" variants keep embeddings and the output tensor at
+    # Q8_0 while the rest matches the base format. Slightly bigger, slightly
+    # better than the base — those two tensors are disproportionately sensitive.
+    "Q6_K_L":     ( 6.80, 0.08, "Q6_K with q8_0 embed/output"),
+    "Q5_K_L":     ( 5.90, 0.28, "Q5_K_M with q8_0 embed/output"),
+    "Q4_K_L":     ( 5.10, 0.70, "Q4_K_M with q8_0 embed/output"),
+    "Q3_K_XL":    ( 4.10, 2.40, "Q3_K_L with q8_0 embed/output"),
+    "Q2_K_L":     ( 2.90, 9.00, "Q2_K with q8_0 embed/output"),
+    "IQ3_XS":     ( 3.30, 6.20, "degraded"),
+    "IQ2_S":      ( 2.50, 14.0, "heavy damage"),
+    "IQ2_XS":     ( 2.31, 16.0, "heavy damage"),
     "Q3_K_L":     ( 4.27, 2.60, "noticeable drift on long output"),
     "Q3_K_M":     ( 3.91, 3.60, "noticeable drift on long output"),
     "UD-Q3_K_XL": ( 4.10, 2.40, "dynamic — much better than plain Q3"),
@@ -89,6 +100,15 @@ def quality_of(quant: str) -> dict | None:
     row = _TABLE.get(key)
     if row is None and key.startswith("UD-"):
         row = _TABLE.get(key[3:])          # fall back to the plain format
+    if row is None:
+        # an unlisted "_L"/"_XL" variant reads as its base format rather than
+        # as nothing: every quanter invents suffixes, and enumerating them all
+        # is a losing race. The base is a safe (slightly pessimistic) stand-in.
+        for suffix in ("_XL", "_L"):
+            if key.endswith(suffix):
+                row = _TABLE.get(key[: -len(suffix)])
+                if row:
+                    break
     if row is None:
         return None
     bpw, ppl, note = row

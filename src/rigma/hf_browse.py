@@ -200,10 +200,18 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
     return inherit_family_defaults(spec), rf
 
 
-def inspect_repo(repo: str, registry=None, profile=None) -> dict:
+def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",
+                 vision: bool = True, grow: str = "speed") -> dict:
     """Everything the browser UI needs: header-derived facts + a fit verdict
-    per quant against THIS machine, before any download."""
+    per quant against THIS machine, before any download.
+
+    kv/vision/grow are the Models page explorer's knobs, threaded through so the
+    table you see BEFORE adding a repo is the same table you get after — a
+    pre-download view that disagreed with the post-add one would be worse than
+    no preview at all.
+    """
     from .probe import probe_hardware
+    from .quant_quality import quality_of, total_loss
     from .registry import Registry
     from .resolve import quant_verdicts, recommended_quant
     spec, rf = _spec_from_repo(repo)
@@ -216,8 +224,17 @@ def inspect_repo(repo: str, registry=None, profile=None) -> dict:
         from . import state as st
         from .server_ops import _free_current
         prof = _free_current(prof, st.read_state() or {}, reg)
-    quants = [{"file": g.file, "quant": g.quant, "bytes": g.bytes, "fit": v}
-              for g, v in zip(spec.ggufs, quant_verdicts(spec, prof))]
+    verdicts = quant_verdicts(spec, prof, kv=kv, vision=vision, grow=grow)
+    quants = []
+    for g, v in zip(spec.ggufs, verdicts):
+        k = v.get("kv") or spec.cache_type_policy.k
+        vv = v.get("kv_v") or spec.cache_type_policy.v
+        quants.append({"file": g.file, "quant": g.quant, "bytes": g.bytes,
+                       "fit": v, "quality": quality_of(g.quant),
+                       "total": total_loss(g.quant, k, vv),
+                       # a pre-add row can't be on disk; keeps the shape
+                       # identical to /api/models so one component renders both
+                       "on_disk": False, "pullable": True})
     return {"repo": repo, "name": spec.slug, "family": spec.family,
             "kind": spec.kind, "native_ctx": spec.native_ctx,
             "capabilities": spec.capabilities,

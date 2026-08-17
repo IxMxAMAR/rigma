@@ -209,14 +209,25 @@ def test_hf_endpoints_delegate_and_map_errors(home, upstream, monkeypatch):
     monkeypatch.setattr(hf_browse, "search",
                         lambda q, limit=12: [{"repo": "a/b", "downloads": 1,
                                               "likes": 0, "updated": ""}])
-    monkeypatch.setattr(hf_browse, "inspect_repo",
-                        lambda rid, reg=None: {"repo": rid, "ggufs": []})
+    # the explorer's knobs are forwarded to inspect_repo, so the pre-add table
+    # cannot disagree with the post-add one — capture them to prove it
+    seen: dict = {}
+
+    def _inspect(rid, reg=None, prof=None, *, kv="", vision=True,
+                 grow="speed"):
+        seen.update(kv=kv, vision=vision, grow=grow)
+        return {"repo": rid, "ggufs": []}
+
+    monkeypatch.setattr(hf_browse, "inspect_repo", _inspect)
     monkeypatch.setattr(hf_browse, "add_model", lambda rid, reg=None: (_ for _ in ()).throw(
         HangarError("that repo is gated — accept its license")))
     client = TestClient(build_app(upstream_port=upstream))
     assert client.get("/api/hf/search?q=x").json()[0]["repo"] == "a/b"
     assert client.get("/api/hf/search?q=").json() == []
     assert client.get("/api/hf/repo?id=a/b").json()["repo"] == "a/b"
+    assert seen == {"kv": "", "vision": True, "grow": "speed"}   # defaults
+    client.get("/api/hf/repo?id=a/b&kv=q4_0&vision=0&grow=context")
+    assert seen == {"kv": "q4_0", "vision": False, "grow": "context"}
     r = client.post("/api/hf/add", json={"repo": "a/b"})
     assert r.status_code == 400 and "gated" in r.json()["error"]
     assert client.post("/api/hf/add", json={}).status_code == 400

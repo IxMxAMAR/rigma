@@ -1868,12 +1868,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": str(e)}, status_code=502)
 
     @app.get("/api/hf/repo")
-    async def hf_repo(id: str):
+    async def hf_repo(id: str, kv: str = "", vision: int = 1,
+                      grow: str = "speed"):
+        """The same table the Models page shows, BEFORE anything is downloaded —
+        header read over a ranged request, so it costs megabytes not gigabytes.
+        Takes the explorer's knobs so the preview cannot disagree with the
+        post-add view."""
         from . import hangar
         from . import hf_browse
+        prof = await asyncio.to_thread(_profile_for_fit)
         try:
-            return await asyncio.to_thread(hf_browse.inspect_repo, id,
-                                           registry)
+            return await asyncio.to_thread(
+                lambda: hf_browse.inspect_repo(id, registry, prof, kv=kv,
+                                               vision=bool(vision), grow=grow))
         except hangar.HangarError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
 
