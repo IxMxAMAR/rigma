@@ -133,6 +133,33 @@ SPEC_CROWN_MARGIN = 1.15   # a speculation config must beat the best
                            # so a narrow bench win is a real-world loss
 
 
+def crowned_row(rows: list[dict]) -> dict | None:
+    """The config a sweep actually crowns. ONE rule, two readers.
+
+    `run_sweep` saves the winner; `rigma sweep` prints it. They used to decide
+    separately, and the CLI's version had no margin gate and required non-empty
+    flags — so it could announce "winner: spec-mtp-2 … saved to calibration"
+    while calibration.json held the baseline.
+
+    The margin gate: real-world draft acceptance is LOWER than on the bench's
+    predictable filler (live 2026-07-21: crowned at 44.7 t/s, ran at 36.8). A
+    speculation config must beat the best non-spec row decisively or the
+    non-spec row is crowned instead.
+
+    Sorts a copy, so the answer does not depend on whether the caller sorted.
+    """
+    ok = sorted((r for r in rows if r.get("ok")),
+                key=lambda r: r.get("tg_tps", 0.0), reverse=True)
+    best = next(iter(ok), None)
+    if best is not None and (best.get("flags") or {}).get("spec_type"):
+        plain = next((r for r in ok
+                      if not (r.get("flags") or {}).get("spec_type")), None)
+        if plain is not None and \
+                best["tg_tps"] < plain["tg_tps"] * SPEC_CROWN_MARGIN:
+            best = plain
+    return best
+
+
 def sweep_configs(base: ComboFlags, moe: bool,
                   caps: tuple | list = ()) -> list[tuple[str, dict]]:
     """Flag-override sets to A/B on this machine. Baseline first; each entry is
@@ -225,17 +252,7 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
         finally:
             srv.stop()
     rows.sort(key=lambda r: r["tg_tps"], reverse=True)
-    best = next((r for r in rows if r["ok"]), None)
-    # margin gate for speculation: real-world draft acceptance is LOWER than
-    # on the predictable bench text (live 2026-07-21: crowned 44.7 bench ->
-    # 36.8 live). A spec config must beat the best non-spec row decisively
-    # or the non-spec winner is crowned instead.
-    if best is not None and best["flags"].get("spec_type"):
-        plain = next((r for r in rows
-                      if r["ok"] and not r["flags"].get("spec_type")), None)
-        if plain is not None and \
-                best["tg_tps"] < plain["tg_tps"] * SPEC_CROWN_MARGIN:
-            best = plain
+    best = crowned_row(rows)
     if best is not None and (best["flags"] or mark_calibrated):
         key = f"{plan.model_slug}:{plan.gguf.quant}:{plan.backend}"
         save_calibration(key, {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"]},

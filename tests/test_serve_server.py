@@ -1,4 +1,3 @@
-import json
 import os
 
 import pytest
@@ -22,8 +21,10 @@ def test_server_info_fields_and_verdict(tmp_path, monkeypatch, client):
     state.write_state("m", "q", 18500, engine_pid=os.getpid(),
                       ui_pid=os.getpid(), backend="vulkan",
                       use_case="creative", ctx=4096)
-    (tmp_path / "calibration.json").write_text(json.dumps(
-        {"m:q:vulkan": {"tg_tps": 50.0}}), encoding="utf-8")
+    # built with the real writer on purpose: a hand-written fixture here is how
+    # expected_tg stayed broken while its test stayed green (see test_server_ops)
+    from rigma import bench
+    bench.save_calibration("m:q:vulkan", {"tg_tps": 50.0, "pp_tps": 600.0})
     info = client.get("/api/server").json()
     assert info["model"] == "m" and info["ctx"] == 4096
     assert info["use_case"] == "creative"

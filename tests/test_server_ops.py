@@ -17,12 +17,40 @@ def test_verdict_matrix():
     assert server_ops.verdict(45.0, 50.0) == "healthy"
 
 
-def test_expected_tg_reads_calibration(tmp_path, monkeypatch):
+def test_expected_tg_reads_what_the_writer_actually_wrote(tmp_path, monkeypatch):
+    """Build the fixture with the real writer, not by hand.
+
+    `bench.save_calibration` is the only thing that writes calibration.json and
+    it nests the numbers under "measured" (bench.py:93). `expected_tg` read a
+    flat `["tg_tps"]` that no writer has ever produced, so it returned None for
+    every real calibration on this machine and the engine-room verdict at
+    serve.py was permanently "unknown". The previous version of this test passed
+    only because it hand-wrote a shape the writer does not emit — which is
+    exactly how the bug survived.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import bench
+    bench.save_calibration("m:q:vulkan", {"tg_tps": 57.1, "pp_tps": 689.0})
+    assert server_ops.expected_tg("m", "q", "vulkan") == 57.1
+    assert server_ops.expected_tg("m", "q", "cuda") is None
+
+
+def test_expected_tg_still_reads_a_legacy_flat_entry(tmp_path, monkeypatch):
+    """Entries written before the nesting existed must keep working."""
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     (tmp_path / "calibration.json").write_text(json.dumps(
         {"m:q:vulkan": {"tg_tps": 57.1, "pp_tps": 600}}), encoding="utf-8")
     assert server_ops.expected_tg("m", "q", "vulkan") == 57.1
-    assert server_ops.expected_tg("m", "q", "cuda") is None
+
+
+def test_expected_tg_is_none_when_nothing_was_measured(tmp_path, monkeypatch):
+    """A calibration entry can exist with flags but no measurement — a sweep
+    where the baseline won writes no `measured` block. That must read as
+    unknown, not crash and not fabricate a number."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    (tmp_path / "calibration.json").write_text(json.dumps(
+        {"m:q:vulkan": {"flags": {"flash_attn": "off"}}}), encoding="utf-8")
+    assert server_ops.expected_tg("m", "q", "vulkan") is None
 
 
 def test_log_tail_newest_and_clamped(tmp_path, monkeypatch):
