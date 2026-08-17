@@ -146,6 +146,9 @@ export interface ModelCard {
   mmproj?: (QuantRow & { quant?: string }) | null;
   /** best quality that still runs at GPU speed here — resolve.recommended_quant */
   recommended?: string | null;
+  /** the HF repo this came from. The slug is the gguf's own general.name and
+   *  is often nothing like the repo, so the card shows both. */
+  source?: string;
   running: boolean;
 }
 

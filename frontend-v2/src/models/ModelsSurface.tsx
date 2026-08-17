@@ -289,6 +289,17 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
       <div className="font-mono text-[11.5px] text-muted mb-2">
         {card.kind} · {Math.round(card.native_ctx / 1024)}K native
         {card.capabilities.length > 0 && ` · ${card.capabilities.join(" ")}`}
+        {card.source && (
+          <>
+            {" · "}
+            <a href={`https://huggingface.co/${card.source}`} target="_blank"
+               rel="noreferrer" className="hover:text-amber underline"
+               title={"where this came from. The name above is the gguf's own "
+                      + "general.name, which is often nothing like the repo."}>
+              {card.source}
+            </a>
+          </>
+        )}
       </div>
       <div className="flex items-center gap-2 px-3 pb-1 font-mono text-[10px]
                       text-muted uppercase tracking-[0.06em]">

@@ -250,6 +250,35 @@ def add_model(repo: str, registry=None) -> ModelSpec:
     spec, _ = _spec_from_repo(repo)
     reg = registry if registry is not None else Registry.load()
     if spec.slug in reg.models:
-        raise HangarError(f"{spec.slug} is already in your library")
+        raise HangarError(_already_msg(repo, spec.slug, reg.models[spec.slug]))
     _write_spec(spec)
     return spec
+
+
+def _already_msg(repo: str, slug: str, existing) -> str:
+    """Why a repo you have never added can be refused under a name you have
+    never seen.
+
+    A model is keyed by the `general.name` INSIDE its gguf, not by the repo it
+    came from — which is what makes two mirrors of one model dedupe instead of
+    filling the library with copies. The cost is that the slug can look
+    unrelated to what you typed: 0bserverx/Qwen3.8-27B-Heretic-Abliterated-
+    Uncensored-GGUF calls itself "Qwen38 Ara v5" internally, so it lands at
+    qwen38-ara-v5 and the old message named only that (owner, 2026-07-30).
+    """
+    srcs = [s.rsplit("/", 2)[-2] + "/" + s.rsplit("/", 1)[-1]
+            if s.startswith("http") else s
+            for s in (getattr(existing, "sources", None) or [])]
+    from_repo = next((g.repo for g in (getattr(existing, "ggufs", None) or [])
+                      if g.repo and g.repo != "local"), "")
+    known = srcs[0] if srcs else from_repo
+    if known and known.rstrip("/").lower().endswith(repo.lower()):
+        return (f"you have already added that repo — it is in your library as "
+                f"'{slug}'")
+    where = f" (added from {known})" if known else ""
+    return (f"'{slug}' is already in your library{where}, and this repo "
+            f"contains the same model. Rigma names a model by the "
+            f"`general.name` written inside its gguf — here that is "
+            f"'{getattr(existing, 'family', '') or slug}' — so two uploads of "
+            f"one model share a name instead of becoming duplicates. Remove "
+            f"'{slug}' first if you want this upload instead.")
