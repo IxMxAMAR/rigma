@@ -66,9 +66,16 @@ export interface ModelCard {
   running: boolean;
 }
 
+// Mirrors hf_browse.search() EXACTLY — see tests/test_hf_browse.py, which
+// pins this shape. The repo id arrives as `repo`, not `id`: the endpoint
+// renames Hugging Face's own `id` field on the way out. No index signature
+// here on purpose — with one, `h.id` type-checked fine and rendered as
+// undefined, which is how HF adding shipped broken.
 export interface HfHit {
-  id: string;
-  [k: string]: unknown;
+  repo: string;
+  downloads: number;
+  likes: number;
+  updated: string;
 }
 
 export const engineApi = {
