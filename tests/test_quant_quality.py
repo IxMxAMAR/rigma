@@ -372,3 +372,47 @@ def test_state_without_the_key_reads_as_vision_on(tmp_path, monkeypatch):
     st.state_path().write_text(json.dumps({"model": "m", "ctx": 8192}),
                                encoding="utf-8")
     assert not bool((st.read_state() or {}).get("no_vision"))
+
+
+def test_when_offloading_is_forced_the_cache_minimises_it():
+    """Once nothing can be fully resident, cache precision stops being free.
+
+    Live 2026-07-30: at 64K the resolver took f16 because it was first in the
+    ladder and merely fit, spilling 22% of a dense model's weights; q8_0 spills
+    8%. That trades ~0.06% perplexity against a PCIe round trip per offloaded
+    layer on EVERY token — backwards.
+    """
+    from rigma.resolve import _spilled, fit_gguf
+    spec, prof = _hybrid_spec(12.5), _prof()
+    small = fit_gguf(spec, spec.ggufs[0], prof, 8192, [])
+    big = fit_gguf(spec, spec.ggufs[0], prof, 65536, [])
+    assert small and big
+    # the small window still fits entirely, so it keeps the precise cache
+    assert small.cache_type_k == "f16"
+    assert _spilled(spec, small) == 0.0
+    # the big one cannot, so it buys layers back with cache precision
+    assert big.cache_type_k == "q8_0"
+    assert _spilled(spec, big) < 0.20
+
+
+def test_a_fully_resident_fit_still_prefers_the_precise_cache():
+    """The minimise-offload rule must not leak into the strict pass — a cache
+    that fits on the GPU is free, and quality wins there."""
+    from rigma.resolve import _spilled, fit_gguf
+    spec, prof = _hybrid_spec(6.0), _prof()
+    f = fit_gguf(spec, spec.ggufs[0], prof, 8192, [])
+    assert f.cache_type_k == "f16" and _spilled(spec, f) == 0.0
+
+
+def test_spilled_counts_moe_experts_not_whole_layers():
+    from rigma.models import MoESpec
+    from rigma.resolve import _spilled
+    dense = _hybrid_spec(10.0)
+    moe = _hybrid_spec(10.0)
+    moe.moe = MoESpec(total_b=35.0, active_b=3.0, expert_weight_fraction=0.85)
+    from rigma.models import ComboFlags
+    # 13 of 65 layers offloaded either way
+    dense_f = ComboFlags(ctx=8192, ngl=52)
+    moe_f = ComboFlags(ctx=8192, ngl=99, n_cpu_moe=13)
+    assert _spilled(dense, dense_f) == pytest.approx(13 / 65)
+    assert _spilled(moe, moe_f) == pytest.approx(13 / 65 * 0.85)

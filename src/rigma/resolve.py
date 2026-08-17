@@ -53,12 +53,42 @@ def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     # real tokens/sec. Doing this in one pass picked f16-with-offload over
     # q8_0-fully-resident, which is strictly the worse trade.
     for strict in (True, False):
+        best = None
         for k, v in _cache_candidates(spec):
             got = _fit_with_cache(spec, gguf, profile, ctx, k, v,
                                   usable_vram, usable_ram, explain, strict)
-            if got is not None:
-                return got
+            if got is None:
+                continue
+            if strict:
+                return got      # fully resident: the most precise cache wins
+            # Offloading is unavoidable at this ctx, so now the cache's job is
+            # to MINIMISE it. Taking the first that merely fits picked f16 and
+            # spilled 22% of a dense model's weights, where q8_0 spills 8% —
+            # ~0.06% perplexity against a PCIe round trip on every token, for
+            # every offloaded layer. The pass above already guaranteed nothing
+            # here can be fully resident, so precision is no longer free.
+            if best is None or _spilled(spec, got) < _spilled(spec, best):
+                best = got
+        if best is not None:
+            if best.cache_type_k != spec.cache_type_policy.k:
+                explain.append(
+                    f"cache {best.cache_type_k} over "
+                    f"{spec.cache_type_policy.k}: keeps "
+                    f"{_spilled(spec, best):.0%} of the weights off system RAM")
+            return best
     return None
+
+
+def _spilled(spec: ModelSpec, flags: ComboFlags) -> float:
+    """Fraction of the model left in system RAM under this plan. Dense counts
+    layers; MoE counts only the expert share of an offloaded layer, since
+    sparse activation makes that far cheaper."""
+    n = spec.n_layers or 0
+    if not n:
+        return 0.0
+    if spec.moe is None:
+        return max(0, n - min(flags.ngl, n)) / n
+    return (min(flags.n_cpu_moe, n) / n) * spec.moe.expert_weight_fraction
 
 
 def _cache_candidates(spec: ModelSpec):
