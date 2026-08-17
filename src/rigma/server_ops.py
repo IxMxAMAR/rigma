@@ -165,12 +165,18 @@ KV_CACHE_TYPES = ("f16", "q8_0", "q5_1", "q4_0")
 
 def perform_switch(model: str, registry=None, profile=None,
                    ctx: int | None = None, force_calibrate: bool = False,
-                   kv: str | None = None) -> dict:
+                   kv: str | None = None, vision: bool | None = None) -> dict:
     """Stop the running engine and launch `model` in its place; with `ctx`,
     relaunch (same model allowed) at a requested context size; with `kv`,
     force the KV-cache quantisation (f16/q8_0/q5_1/q4_0). Growing the cache
     (q8_0 -> f16) may not fit — the launch failure path reports it honestly
     and leaves the UI manageable.
+
+    `vision=False` runs a vision model text-only. The projector is loaded
+    alongside the weights and cannot be offloaded, so it costs VRAM for the
+    whole session whether or not an image is ever sent — 888MB on
+    Qwen3.8-27B, which on a 16GB card is 4x the context window. Choosing to
+    drop it is the single largest context lever such a model has.
 
     Raises RuntimeError with a user-facing message on any failure; a failure
     after the old engine died clears state (one requested plan, one honest
@@ -224,9 +230,13 @@ def perform_switch(model: str, registry=None, profile=None,
     # vision projector: attach it if it's on disk, otherwise run text-only
     # rather than refusing — a vision model still works for text, and the user
     # can download the projector separately to turn vision on
+    # `vision` is remembered across relaunches: a ctx change must not silently
+    # switch vision back on and eat the VRAM the user just freed.
+    if vision is None:
+        vision = not bool((st.read_state() or {}).get("no_vision"))
     mm = getattr(reg_full.models.get(model), "mmproj", None)
     extra = (["--mmproj", str(rigma_home() / "models" / mm.file)]
-             if mm is not None and _model_on_disk(mm) else None)
+             if vision and mm is not None and _model_on_disk(mm) else None)
     # Some ggufs ship a chat template that llama.cpp cannot use — Apriel-1.6's
     # decensored build self-assigns `{%- set messages = messages ... -%}`, which
     # minja evaluates as unbounded recursion and the process dies with
@@ -278,8 +288,9 @@ def perform_switch(model: str, registry=None, profile=None,
                    engine_pid=sp.proc.pid,
                    ui_pid=int(s.get("ui_pid", os.getpid())),
                    backend=rp.backend, use_case=s.get("use_case", "general"),
-                   ctx=rp.flags.ctx, kv_cache=rp.flags.cache_type_k or "")
-    return st.read_state()
+                   ctx=rp.flags.ctx, kv_cache=rp.flags.cache_type_k or "",
+                   no_vision=not vision)
+    return st.read_state() or {}
 
 
 def _await_port_free(port: int, tries: int = 10, delay: float = 0.3) -> None:

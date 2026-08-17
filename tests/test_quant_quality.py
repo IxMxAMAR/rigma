@@ -345,3 +345,30 @@ def test_prefixed_files_keep_their_distinct_formats():
     files = ["RVN-Q6_K.gguf", "RVN-Q5_K_M.gguf", "RVN-IQ4_XS.gguf"]
     # no collision here, so the plain tags come through untouched
     assert hangar._distinct_quants(files) == ["Q6_K", "Q5_K_M", "IQ4_XS"]
+
+
+# --- running a vision model text-only ----------------------------------------
+
+def test_no_vision_is_persisted_and_sticky(tmp_path, monkeypatch):
+    """A later ctx change must not silently reload the projector and eat the
+    VRAM the user just freed, so the choice lives in state, not in the call."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import state as st
+    st.write_state("m", "Q4", 11500, engine_pid=1, ui_pid=2, ctx=8192,
+                   no_vision=True)
+    assert st.read_state()["no_vision"] is True
+    st.write_state("m", "Q4", 11500, engine_pid=1, ui_pid=2, ctx=8192)
+    assert st.read_state()["no_vision"] is False      # default stays off
+
+
+def test_state_without_the_key_reads_as_vision_on(tmp_path, monkeypatch):
+    """State files written before this existed have no `no_vision` key; they
+    must not be read as "vision was turned off"."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    import json
+
+    from rigma import state as st
+    st.state_path().parent.mkdir(parents=True, exist_ok=True)
+    st.state_path().write_text(json.dumps({"model": "m", "ctx": 8192}),
+                               encoding="utf-8")
+    assert not bool((st.read_state() or {}).get("no_vision"))

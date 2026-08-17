@@ -1704,7 +1704,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                      s.get("backend", "unknown"))
         info = {k: s.get(k) for k in ("model", "quant", "backend", "use_case",
                                       "ctx", "started_at", "public_port",
-                                      "unloaded", "kv_cache")}
+                                      "unloaded", "kv_cache", "no_vision")}
         info.update(server_ops.ram_snapshot())
         info["calibrating"] = server_ops.read_calib_marker()
         info["engine_version"] = server_ops.engine_version()
@@ -1716,6 +1716,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         info["expected_tg"] = exp
         info["verdict"] = server_ops.verdict(telemetry["tg"], exp)
         info["openai_base"] = f"http://127.0.0.1:{s['public_port']}/v1"
+        # whether this model HAS a projector at all, so the UI can offer the
+        # toggle only where it means something instead of showing a dead
+        # control on every text model
+        try:
+            info["has_mmproj"] = bool(
+                registry and getattr(registry.models.get(s["model"]),
+                                     "mmproj", None))
+        except Exception:
+            info["has_mmproj"] = False
         return info
 
     @app.get("/api/server/stats")
@@ -1788,10 +1797,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": f"kv must be one of "
                           f"{', '.join(server_ops.KV_CACHE_TYPES)}"},
                 status_code=400)
+        # vision: omit to keep the current setting; it is sticky across
+        # relaunches so a ctx change can't silently reload the projector
+        vision = body.get("vision")
+        vision = None if vision is None else bool(vision)
+        if vision is False:
+            from .registry import Registry
+            reg = registry if registry is not None else Registry.load()
+            if getattr(reg.models.get(s["model"]), "mmproj", None) is None:
+                switch_lock.release()
+                return JSONResponse(
+                    {"error": f"{s['model']} has no vision projector — there "
+                              "is nothing to turn off"}, status_code=400)
         try:
             new_state = await asyncio.to_thread(
                 server_ops.perform_switch, s["model"], registry, None, want,
-                False, kv)
+                False, kv, vision)
             telemetry["tg"] = None
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)

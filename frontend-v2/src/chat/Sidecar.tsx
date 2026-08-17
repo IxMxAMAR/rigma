@@ -9,9 +9,147 @@ import {
   listMethods,
   type Method,
 } from "../lib/methods";
+import { engineApi, type ServerInfo } from "../lib/engineApi";
 import { useApp } from "../store";
 import MethodBuilder from "./MethodBuilder";
 import { useChat } from "./chatStore";
+
+const CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 262144];
+const KV_TYPES = ["f16", "q8_0", "q5_1", "q4_0"];
+
+/** Engine settings, in the panel where they are actually needed.
+ *
+ * These were only on the Engine page, which is a different screen from the
+ * chat whose context window they set — and the sampling card sat next to a
+ * note telling you to go there. They live here now, but under their own
+ * heading and their own warning, because they are NOT per-chat: one engine
+ * serves every session, and each of these stops it and starts it again.
+ */
+function EngineCard() {
+  const [srv, setSrv] = useState<ServerInfo | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const streaming = useChat((s) => s.streaming);
+
+  const load = useCallback(() => {
+    engineApi.server().then(setSrv).catch(() => setSrv(null));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  if (!srv || srv.unloaded) return null;
+
+  const apply = async (what: string, o: {
+    ctx?: number; kv?: string; vision?: boolean;
+  }) => {
+    if (streaming) {
+      setErr("a reply is still generating — stop it first, or wait: "
+             + "relaunching now would cut it off mid-sentence.");
+      return;
+    }
+    const ctx = o.ctx ?? srv.ctx ?? 0;
+    if (!window.confirm(
+      `${what}\n\nThis RESTARTS the engine:\n` +
+      "  • the model unloads and reloads — tens of seconds on a large quant\n" +
+      "  • every chat is served by this one engine, not just this one\n" +
+      "  • your conversations are on disk and are NOT lost\n" +
+      "  • a setting that doesn't fit will fail the launch, and Rigma says " +
+      "so rather than starting something you didn't ask for\n\nGo ahead?")) {
+      return;
+    }
+    setBusy(what);
+    setErr(null);
+    try {
+      await engineApi.relaunchWith({ ctx, kv: o.kv, vision: o.vision });
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(null);
+    load();
+  };
+
+  const row = "flex items-center gap-2 text-[12.5px]";
+  const label = "w-24 text-secondary";
+  const input = "flex-1 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none disabled:opacity-40";
+  const native = srv.native_ctx || 262144;
+
+  return (
+    <section className="rounded-lg bg-panel p-3 flex flex-col gap-1.5">
+      <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em]">
+        engine — affects every chat
+      </h3>
+
+      <label className={row} title="The context window: how much of the
+conversation the model can see. Bigger windows cost VRAM, which competes with
+the model's own weights.">
+        <span className={label}>context</span>
+        <select className={input} value={String(srv.ctx ?? "")}
+                disabled={!!busy}
+                aria-label="Context window"
+                onChange={(e) => void apply(
+                  `Context → ${Math.round(Number(e.target.value) / 1024)}K`,
+                  { ctx: Number(e.target.value) })}>
+          {CTX_STEPS.filter((c) => c <= native).concat(
+            srv.ctx && !CTX_STEPS.includes(srv.ctx) ? [srv.ctx] : [])
+            .sort((a, b) => a - b)
+            .map((c) => (
+              <option key={c} value={c}>{Math.round(c / 1024)}K</option>
+            ))}
+        </select>
+      </label>
+
+      <label className={row} title="KV cache precision. Halving it roughly
+doubles the context that fits, but cache error is written per token and every
+later token attends over it, so it compounds over a long conversation.">
+        <span className={label}>kv cache</span>
+        <select className={input} value={srv.kv_cache || ""}
+                disabled={!!busy}
+                aria-label="KV cache precision"
+                onChange={(e) => void apply(`KV cache → ${e.target.value}`,
+                                            { kv: e.target.value })}>
+          {!srv.kv_cache && <option value="">auto</option>}
+          {KV_TYPES.map((k) => <option key={k} value={k}>{k}</option>)}
+        </select>
+      </label>
+
+      {srv.has_mmproj && (
+        <label className={row} title="The vision projector is loaded with the
+weights and cannot be offloaded, so it costs VRAM for the whole session whether
+or not you ever send an image. Turning it off frees that VRAM for context —
+often the single biggest context lever a vision model has.">
+          <span className={label}>vision</span>
+          <span className="flex-1 flex items-center gap-2">
+            <input type="checkbox" className="accent-amber"
+                   disabled={!!busy}
+                   checked={!srv.no_vision}
+                   onChange={(e) => void apply(
+                     e.target.checked ? "Vision ON" : "Vision OFF (text-only)",
+                     { vision: e.target.checked })} />
+            <span className="text-muted font-mono text-[11px]">
+              {srv.no_vision ? "text-only — projector not loaded"
+                : "images enabled"}
+            </span>
+          </span>
+        </label>
+      )}
+
+      {busy && (
+        <p className="font-mono text-[11.5px] text-amber">
+          {busy} — relaunching the engine…
+        </p>
+      )}
+      {err && (
+        <div className="rounded-md bg-red/10 text-red px-2.5 py-1.5 font-mono text-[11.5px]">
+          {err}
+        </div>
+      )}
+      <p className="text-muted text-[11.5px] leading-snug">
+        Each of these restarts the engine. Chats are on disk and survive it; a
+        reply in progress does not. See every quant's context and VRAM budget
+        on the <span className="text-secondary">Models</span> page.
+      </p>
+    </section>
+  );
+}
 
 interface RagStatus {
   running: boolean;
@@ -260,15 +398,11 @@ function SamplingCard() {
       {num("repeat_penalty", "repeat pen.", 0.01, 2)}
       {num("max_tokens", "max tokens", 1024, maxTok, true)}
       <p className="text-[10.5px] text-muted leading-snug">
-        max tokens caps one reply. The context window (the “of{" "}
-        {Math.round(maxTok / 1024)}K” bar) is set on the{" "}
-        <button
-          className="text-amber hover:underline"
-          onClick={() => useApp.getState().setSurface("engine")}
-        >
-          Engine page
-        </button>{" "}
-        and needs a model relaunch.
+        max tokens caps ONE reply. The context window (the “of{" "}
+        {Math.round(maxTok / 1024)}K” bar) is a different thing — how much of
+        the conversation the model can see — and it is in{" "}
+        <span className="text-secondary">engine</span> just below, because
+        changing it restarts the engine.
       </p>
       {dirty && (
         <button
@@ -512,11 +646,16 @@ export default function Sidecar() {
 
   if (draftId) return <MethodBuilder draftId={draftId} />;
 
+  // Order is deliberate and owner-chosen (2026-07-30): what you touch every
+  // turn first, what you set up occasionally next, what you configure once
+  // last. Methods used to lead — six cards of setup above the two controls
+  // actually reached for mid-conversation.
   return (
     <>
+      <SamplingCard key={`s${rev}`} />
+      <EngineCard key={`e${rev}`} />
       <MethodCard onApplied={() => setRev((r) => r + 1)} />
       <GroundingCard key={`g${rev}`} />
-      <SamplingCard key={`s${rev}`} />
     </>
   );
 }
