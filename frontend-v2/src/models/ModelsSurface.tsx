@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   DEFAULT_FIT, engineApi, eta, gb,
-  type FitConfig, type HfHit, type ModelCard, type QuantRow,
+  type FitConfig, type HfHit, type HfRepoDetail, type ModelCard,
+  type QuantRow,
 } from "../lib/engineApi";
 
 function PullBar({ q }: { q: QuantRow }) {
@@ -214,7 +215,30 @@ function QuantLine({ card, q, onAction, best }: {
 
 function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const anyOnDisk = card.quants.some((q) => q.on_disk);
+  const onDiskGb = card.quants.filter((q) => q.on_disk)
+    .reduce((n, q) => n + q.bytes, 0)
+    + (card.mmproj?.on_disk ? card.mmproj.bytes : 0);
+
+  // Only custom (Hangar-added) models can be removed outright — a registry
+  // model would just reappear on the next `rigma update`, so for those the
+  // per-file × is the whole story and delete_model refuses with a 409.
+  const remove = async () => {
+    const files = anyOnDisk
+      ? `\n\nThis also deletes ${gb(onDiskGb)} of downloaded files.`
+      : "";
+    if (!window.confirm(`Remove ${card.slug} from your library?${files}`)) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await engineApi.deleteModel(card.slug);
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+    onAction();
+  };
   return (
     <section className="rounded-lg bg-panel p-4">
       <div className="flex items-center gap-2 mb-1">
@@ -243,7 +267,25 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
             {busy ? "switching…" : "run"}
           </button>
         )}
+        {card.custom && !card.running && (
+          <button
+            disabled={busy}
+            onClick={() => void remove()}
+            title={anyOnDisk
+              ? `remove from library and delete ${gb(onDiskGb)} on disk`
+              : "remove from library"}
+            aria-label={`remove ${card.slug}`}
+            className={`${anyOnDisk ? "" : "ml-auto "}shrink-0 rounded-md px-2 py-0.5 font-mono text-[11.5px] text-muted hover:text-red hover:bg-surface disabled:opacity-40`}
+          >
+            remove
+          </button>
+        )}
       </div>
+      {err && (
+        <div className="rounded-md bg-red/10 text-red px-2.5 py-1.5 font-mono text-[11.5px] mb-2">
+          {err}
+        </div>
+      )}
       <div className="font-mono text-[11.5px] text-muted mb-2">
         {card.kind} · {Math.round(card.native_ctx / 1024)}K native
         {card.capabilities.length > 0 && ` · ${card.capabilities.join(" ")}`}
@@ -281,12 +323,85 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
   );
 }
 
-function HfSearch({ onAdded }: { onAdded: () => void }) {
+/** The same columns as an installed card, for a repo nothing has been
+ *  downloaded from yet. Answering "is this worth 15GB" BEFORE spending the
+ *  15GB is the entire point of the ranged header read. */
+function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
+  const [d, setD] = useState<HfRepoDetail | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    setD(null);
+    setErr(null);
+    engineApi.hfRepo(id, cfg)
+      .then((r) => { if (live) setD(r); })
+      .catch((e) => { if (live) setErr((e as Error).message); });
+    return () => { live = false; };
+  }, [id, cfg]);
+
+  if (err) {
+    return <div className="px-3 py-2 font-mono text-[11.5px] text-red">{err}</div>;
+  }
+  if (!d) {
+    return (
+      <div className="px-3 py-2 font-mono text-[11.5px] text-muted">
+        reading gguf headers…
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-md bg-canvas/60 px-2 py-2 mt-1">
+      <div className="font-mono text-[11px] text-muted px-1 pb-1.5">
+        {d.kind} · {Math.round(d.native_ctx / 1024)}K native
+        {d.capabilities.length > 0 && ` · ${d.capabilities.join(" ")}`}
+        {d.mmproj && " · vision projector"}
+        {d.already && <span className="text-amber"> · already in your library</span>}
+        {d.split_skipped > 0 &&
+          ` · ${d.split_skipped} split file(s) skipped (not supported)`}
+      </div>
+      <div className="flex items-center gap-2 px-3 pb-1 font-mono text-[10px]
+                      text-muted uppercase tracking-[0.06em]">
+        <span className="w-24 shrink-0">quant</span>
+        <span className="w-[52px] shrink-0 text-right">size</span>
+        <span className="w-[46px] shrink-0 text-right">ctx</span>
+        <span className="w-[74px] shrink-0">runs</span>
+        <span className="w-[96px] shrink-0">vs bf16</span>
+      </div>
+      <ul className="flex flex-col">
+        {d.ggufs.map((q) => (
+          <li key={q.file}
+              className="flex items-center gap-2 px-3 py-1 rounded hover:bg-surface/50">
+            <span className={`font-mono text-[12px] w-24 shrink-0 truncate ${
+              q.fit?.ok === false ? "text-muted" : ""}`} title={q.file}>
+              {q.quant}
+            </span>
+            <span className="font-mono text-[11.5px] text-muted w-[52px] shrink-0 text-right">
+              {gb(q.bytes)}
+            </span>
+            <CtxCell fit={q.fit} />
+            <RunsCell fit={q.fit} />
+            <QualityCell q={q} />
+            {d.recommended === q.quant && (
+              <span className="shrink-0 font-mono text-[10px] text-amber bg-amber/10 rounded px-1.5"
+                    title="best quality that still runs at GPU speed here">
+                best here
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function HfSearch({ onAdded, cfg }: { onAdded: () => void; cfg: FitConfig }) {
   const [q, setQ] = useState("");
   const [hits, setHits] = useState<HfHit[]>([]);
   const [state, setState] = useState<"idle" | "busy" | "err">("idle");
   const [adding, setAdding] = useState<string | null>(null);
   const [addErr, setAddErr] = useState<string | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
   const timer = useRef<number | null>(null);
 
   const search = (text: string) => {
@@ -329,8 +444,25 @@ function HfSearch({ onAdded }: { onAdded: () => void }) {
       )}
       <ul className="mt-2 flex flex-col gap-1">
         {hits.slice(0, 8).map((h) => (
-          <li key={h.repo} className="flex items-center gap-2 rounded-md hover:bg-surface px-2 py-1.5">
+          <li key={h.repo} className="rounded-md hover:bg-surface/60 px-2 py-1.5">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setOpen(open === h.repo ? null : h.repo)}
+              aria-expanded={open === h.repo}
+              aria-label={`inspect ${h.repo} before adding`}
+              title="see every quant's fit and quality before downloading"
+              className="shrink-0 w-4 font-mono text-[11px] text-muted hover:text-amber"
+            >
+              {open === h.repo ? "▾" : "▸"}
+            </button>
             <span className="font-mono text-[12.5px] flex-1 truncate" title={h.repo}>{h.repo}</span>
+            {typeof h.downloads === "number" && (
+              <span className="shrink-0 font-mono text-[10.5px] text-muted"
+                    title={`${h.downloads.toLocaleString()} downloads`}>
+                {h.downloads > 1e6 ? `${(h.downloads / 1e6).toFixed(1)}M`
+                  : `${Math.round(h.downloads / 1e3)}K`}
+              </span>
+            )}
             <button
               disabled={adding === h.repo}
               onClick={async () => {
@@ -351,6 +483,8 @@ function HfSearch({ onAdded }: { onAdded: () => void }) {
             >
               {adding === h.repo ? "adding…" : "add"}
             </button>
+          </div>
+          {open === h.repo && <RepoPreview id={h.repo} cfg={cfg} />}
           </li>
         ))}
       </ul>
@@ -469,7 +603,7 @@ export default function ModelsSurface() {
       <div className="max-w-[1200px] mx-auto flex flex-col gap-4">
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0">
-            <HfSearch onAdded={refresh} />
+            <HfSearch onAdded={refresh} cfg={cfg} />
           </div>
           <div className="shrink-0 flex rounded-md bg-panel p-0.5 font-mono text-[12px]"
                role="group" aria-label="View">

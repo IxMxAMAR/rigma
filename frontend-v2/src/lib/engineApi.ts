@@ -157,6 +157,24 @@ export interface HfHit {
   updated: string;
 }
 
+/** hf_browse.inspect_repo — the pre-download view. Quant rows are shaped like
+ *  QuantRow on purpose, so one component renders both this and /api/models. */
+export interface HfRepoDetail {
+  repo: string;
+  name: string;
+  family: string;
+  kind: string;
+  native_ctx: number;
+  capabilities: string[];
+  /** already in the library — the add button becomes a no-op */
+  already: boolean;
+  mmproj?: { file: string; bytes: number } | null;
+  /** multi-part .gguf files skipped; they aren't supported yet */
+  split_skipped: number;
+  ggufs: QuantRow[];
+  recommended?: string | null;
+}
+
 export const engineApi = {
   server: () => j<ServerInfo>("GET", "/api/server"),
   switchOptions: () => j<SwitchOption[]>("GET", "/api/server/switch-options"),
@@ -180,7 +198,15 @@ export const engineApi = {
     j<unknown>("DELETE", `/api/models/${slug}/files/${encodeURIComponent(file)}`),
   hfSearch: (q: string) =>
     j<HfHit[]>("GET", `/api/hf/search?q=${encodeURIComponent(q)}`),
+  /** The full quant table for a repo BEFORE downloading anything — the header
+   *  is read over a ranged request, so it costs megabytes not gigabytes. */
+  hfRepo: (id: string, cfg?: FitConfig) => {
+    const q = fitQuery(cfg);
+    return j<HfRepoDetail>(
+      "GET", `/api/hf/repo?id=${encodeURIComponent(id)}${q.replace("?", "&")}`);
+  },
   hfAdd: (repo: string) => j<unknown>("POST", "/api/hf/add", { repo }),
+  deleteModel: (slug: string) => j<unknown>("DELETE", `/api/models/${slug}`),
 };
 
 export const gb = (n: number) => (n / 2 ** 30).toFixed(1) + " GB";
