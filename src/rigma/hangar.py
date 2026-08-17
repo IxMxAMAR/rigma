@@ -305,11 +305,17 @@ def list_models(registry=None, profile=None, *, kv: str = "",
                 best = recommended_quant(quants)
             except Exception:
                 pass
+        # Where it came from. The slug is the gguf's OWN general.name, which is
+        # often nothing like the repo you typed ("Qwen38 Ara v5" for
+        # 0bserverx/Qwen3.8-27B-Heretic-...), so without this the card cannot
+        # be traced back to what was added.
+        source = next((g.repo for g in spec.ggufs
+                       if g.repo and g.repo != "local"), "")
         models.append({
             "slug": slug, "family": spec.family, "kind": spec.kind,
             "custom": spec.custom, "capabilities": spec.capabilities,
             "native_ctx": spec.native_ctx, "quants": quants, "mmproj": mm,
-            "recommended": best,
+            "recommended": best, "source": source,
             "running": bool(state and state.get("model") == slug)})
     du = shutil.disk_usage(mdir)
     return {"models": models,

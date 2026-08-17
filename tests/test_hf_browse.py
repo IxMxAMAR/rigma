@@ -129,7 +129,7 @@ def test_add_model_registers_pullable_spec(fake_hf, home):
     got = reg.models["web-tune-7b"]
     assert got.ggufs[0].repo == "cool/WebTune-GGUF"   # real repo -> pullable
     assert got.mmproj is not None
-    with pytest.raises(HangarError, match="already in your library"):
+    with pytest.raises(HangarError, match="already added that repo"):
         hf_browse.add_model("cool/WebTune-GGUF")
 
 
@@ -327,3 +327,30 @@ def test_quant_labels_are_always_distinguishable():
     assert dq(["Rocinante-X-12B-v1b-Q6_K.gguf"]) == ["Q6_K"]
     # same stem in different folders still resolves to distinct labels
     assert len(set(dq(["a/model.gguf", "b/model.gguf"]))) == 2
+
+
+def test_already_added_names_the_repo_you_typed(fake_hf, home):
+    """Re-adding the SAME repo must say so plainly."""
+    hf_browse.add_model("cool/WebTune-GGUF")
+    with pytest.raises(HangarError) as e:
+        hf_browse.add_model("cool/WebTune-GGUF")
+    msg = str(e.value)
+    assert "already added that repo" in msg
+    assert "web-tune-7b" in msg              # names where it landed
+
+
+def test_a_mirror_is_refused_with_the_reason_it_collided(fake_hf, home,
+                                                         monkeypatch):
+    """A DIFFERENT repo carrying the same model refused under a slug the user
+    never typed. Live 2026-07-30: adding 0bserverx/Qwen3.8-27B-Heretic-... was
+    rejected as "qwen38-ara-v5 is already in your library" — a name found
+    nowhere in the input, because the slug comes from the gguf's own
+    general.name."""
+    hf_browse.add_model("cool/WebTune-GGUF")
+    with pytest.raises(HangarError) as e:
+        hf_browse.add_model("someone-else/WebTune-mirror-GGUF")
+    msg = str(e.value)
+    assert "general.name" in msg              # explains WHERE the slug is from
+    assert "cool/WebTune-GGUF" in msg         # and who already holds it
+    assert "same model" in msg
+    assert "Remove" in msg                    # and what to do about it
