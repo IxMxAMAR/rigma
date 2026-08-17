@@ -372,6 +372,59 @@ def list_local():
 
 
 @app.command()
+def reprobe(model: str = typer.Argument(
+        None, help="Model slug (see `rigma list`); omit for every custom model"),
+        offline: bool = typer.Option(
+            False, "--offline",
+            help="only read files already on disk, never the repo")):
+    """Re-read a model's gguf and correct what an older probe got wrong.
+
+    Registry loads heal from files already on disk automatically. This is for
+    the case they cannot reach: a model added but never downloaded, still
+    carrying the geometry an older probe wrote."""
+    from . import hangar
+    from .registry import Registry
+    slugs = ([model] if model
+             else [s for s, m in Registry.load().models.items() if m.custom])
+    if not slugs:
+        typer.echo("no custom models to re-probe")
+        raise typer.Exit(0)
+    bad = 0
+    for slug in slugs:
+        try:
+            spec = hangar.reprobe(slug, allow_remote=not offline)
+        except hangar.HangarError as e:
+            typer.echo(f"{slug:28} {e}")
+            bad += 1
+            continue
+        caps = " ".join(spec.capabilities) or "none"
+        typer.echo(f"{slug:28} {spec.full_attn_layers}/{spec.n_layers} layers"
+                   + (f" +{spec.mtp_layers} mtp" if spec.mtp_layers else "")
+                   + (f", {spec.params / 1e9:.1f}B params" if spec.params else "")
+                   + f", caps: {caps}"
+                   + ("" if spec.has_template else "  [no chat template]"))
+    if bad and len(slugs) == 1:
+        raise typer.Exit(1)
+
+
+@app.command()
+def rename(model: str = typer.Argument(..., help="Model slug (see `rigma list`)"),
+           new: str = typer.Argument(..., help="what to call it instead")):
+    """Rename a custom model, carrying its template and calibration with it.
+
+    A model is keyed by the `general.name` inside its gguf, which some
+    quantisers never set — so a real model can land in the library as
+    `base-model` with nothing tying it to the repo it came from."""
+    from . import hangar
+    try:
+        spec = hangar.rename_model(model, new)
+    except hangar.HangarError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1)
+    typer.echo(f"{model} -> {spec.slug}")
+
+
+@app.command()
 def rm(model: str = typer.Argument(..., help="Model slug (see `rigma list`)"),
        yes: bool = typer.Option(False, "--yes", "-y")):
     """Delete a model's files from disk (ollama rm parity)."""
