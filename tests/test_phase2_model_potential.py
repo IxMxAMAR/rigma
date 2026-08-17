@@ -78,27 +78,71 @@ def test_spec_crown_needs_decisive_margin(monkeypatch, tmp_path):
     assert "spec_type" not in crowned      # narrow bench win never crowns spec
 
 
-def test_gguf_meta_detects_nextn_layers(monkeypatch):
-    # the real key observed live: qwen35moe.nextn_predict_layers = 1 on the
-    # MTP-preserved gguf, absent on the plain quant
-    from rigma import gguf_meta
+def test_speculation_is_only_trialled_when_the_file_carries_the_head(tmp_path,
+                                                                     monkeypatch):
+    """A sweep runs real llama-server launches, so offering draft-mtp against a
+    quant without the nextn tensors is not a wasted row — it is the documented
+    Vulkan driver reset. The model's capability list cannot answer this: MTP is
+    kept or dropped per artefact, so the FILE has to be read (parser coverage
+    lives in test_gguf_meta.py)."""
+    from rigma import bench, hangar
+    from rigma.models import ComboFlags, GgufFile
+    from rigma.resolve import RunPlan
 
-    def fake_meta(src):
-        return {"general.architecture": "qwen35moe",
-                "general.name": "test-mtp",
-                "qwen35moe.block_count": 4,
-                "qwen35moe.attention.head_count": 8,
-                "qwen35moe.attention.head_count_kv": 2,
-                "qwen35moe.attention.key_length": 64,
-                "qwen35moe.context_length": 4096,
-                "qwen35moe.expert_count": 8,
-                "qwen35moe.nextn_predict_layers": 1,
-                "tokenizer.chat_template": "tool <think>"}
+    monkeypatch.setattr(hangar, "models_dir", lambda: tmp_path)
+    monkeypatch.setattr(bench, "_capabilities", lambda slug: ("tools", "mtp"))
 
-    monkeypatch.setattr(gguf_meta, "read_metadata", fake_meta)
-    info = gguf_meta.inspect_gguf("x.gguf")
-    assert "mtp" in info.capabilities
-    assert "tools" in info.capabilities     # existing detection untouched
+    def plan_for(name):
+        return RunPlan(model_slug="m",
+                       gguf=GgufFile(repo="r", file=name, bytes=1, quant="Q4"),
+                       backend="vulkan", flags=ComboFlags(ctx=8192),
+                       origin="test")
+
+    def labels(name):
+        caps = bench._sweepable_caps(plan_for(name))
+        return [lb for lb, _ in bench.sweep_configs(ComboFlags(ctx=8192), True,
+                                                    caps)]
+
+    _write_qwen35_gguf(tmp_path / "with.gguf", nextn=True)
+    _write_qwen35_gguf(tmp_path / "without.gguf", nextn=False)
+    assert any(lb.startswith("spec-mtp") for lb in labels("with.gguf"))
+    assert not any(lb.startswith("spec-mtp") for lb in labels("without.gguf"))
+    # never downloaded => unverifiable => not offered
+    assert not any(lb.startswith("spec-mtp") for lb in labels("absent.gguf"))
+
+
+def _write_qwen35_gguf(path, *, nextn: bool):
+    """Minimal real gguf: a header the parser accepts plus a tensor table that
+    either does or does not carry the MTP projections."""
+    import struct
+
+    def s(b):
+        return struct.pack("<Q", len(b)) + b
+
+    def kv_u32(k, v):
+        return s(k) + struct.pack("<I", 4) + struct.pack("<I", v)
+
+    def tensor(name, dims):
+        return (s(name) + struct.pack("<I", len(dims))
+                + b"".join(struct.pack("<Q", d) for d in dims)
+                + struct.pack("<I", 0) + struct.pack("<Q", 0))
+
+    kvs = [s(b"general.architecture") + struct.pack("<I", 8) + s(b"qwen35moe"),
+           kv_u32(b"qwen35moe.block_count", 5),
+           kv_u32(b"qwen35moe.context_length", 4096),
+           kv_u32(b"qwen35moe.embedding_length", 512),
+           kv_u32(b"qwen35moe.attention.head_count", 8),
+           kv_u32(b"qwen35moe.attention.head_count_kv", 2),
+           kv_u32(b"qwen35moe.attention.key_length", 64),
+           kv_u32(b"qwen35moe.expert_count", 8),
+           kv_u32(b"qwen35moe.nextn_predict_layers", 1)]
+    tensors = [tensor(b"blk.0.attn_q.weight", [8, 8])]
+    if nextn:
+        tensors.append(tensor(b"blk.4.nextn.eh_proj.weight", [8, 8]))
+    path.write_bytes(b"GGUF" + struct.pack("<I", 3)
+                     + struct.pack("<Q", len(tensors))
+                     + struct.pack("<Q", len(kvs))
+                     + b"".join(kvs) + b"".join(tensors))
 
 
 # --- custom imports inherit the registry sibling's defaults -------------------

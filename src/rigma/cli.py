@@ -797,11 +797,19 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             raise typer.Exit(2)
         if spec == "draft-mtp":
             # spec-decode without the MTP tensors is a documented Vulkan
-            # driver-reset loop — refuse unless the gguf actually carries them
-            caps = getattr(reg.models.get(rp.model_slug), "capabilities", [])
-            if "mtp" not in caps:
-                typer.echo(f"{rp.model_slug} has no preserved MTP tensors — "
-                           "draft-mtp would crash the driver. Refusing.")
+            # driver-reset loop — refuse unless THIS gguf actually carries them.
+            # The model's capability list is the wrong thing to ask: MTP
+            # survives or is dropped per artefact, so a repo can advertise it
+            # and still hand you a quant without the tensors. The file is on
+            # disk by the time we launch, so the real answer is always available.
+            from .hangar import file_has_mtp
+            has = file_has_mtp(rp.gguf)
+            if has is not True:
+                why = ("carries no MTP tensors" if has is False
+                       else "has not been downloaded, so its MTP tensors "
+                            "cannot be verified")
+                typer.echo(f"{rp.gguf.file} {why} — draft-mtp would reset the "
+                           "GPU driver rather than fail cleanly. Refusing.")
                 raise typer.Exit(2)
         rp.flags = rp.flags.model_copy(update={"spec_type": spec})
         rp.origin += "+spec-override"

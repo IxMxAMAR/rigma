@@ -71,6 +71,11 @@ class GgufFile(BaseModel):
     bytes: int
     quant: str
     sha256: str | None = None
+    # Does THIS file carry the multi-token-prediction tensors? Per-file, not
+    # per-model: whether a draft head survives is a decision the quantiser makes
+    # per artefact, and asking llama.cpp for draft-mtp without them resets the
+    # Vulkan driver rather than erroring. None = not probed yet.
+    mtp: bool | None = None
 
 
 class UseCase(BaseModel):
@@ -100,6 +105,25 @@ class ModelSpec(BaseModel):
     # model-card recommended sampling (e.g. Qwen: temp .7 + DRY for quantized
     # builds). Weakest layer: session > preset > these.
     default_params: dict[str, float] = Field(default_factory=dict)
+    # ---- probed facts (custom imports; registry specs are hand-authored) ----
+    # Exact parameter count, summed from the tensor table's dims. Identical
+    # across every quant of a model, so one probe prices them all: bits-per-
+    # weight = bytes*8/params is then arithmetic on two measured quantities
+    # rather than a guess from the filename.
+    params: int = 0
+    # Extra decoder blocks that exist only to draft tokens. NOT part of n_layers
+    # — see gguf_meta for why block_count is the wrong number to store.
+    mtp_layers: int = 0
+    # Every Nth layer keeps a growing KV cache (Qwen3.5/3.8 hybrid attention).
+    # Stored so a spec written by an older probe can be re-derived without the
+    # multi-GB file being on disk.
+    full_attention_interval: int = 0
+    # False = the gguf shipped no tokenizer.chat_template, so an empty
+    # capability list is missing evidence rather than a finding about the model.
+    has_template: bool = True
+    # Bumped when the probe learns to read something it used to get wrong;
+    # specs below PROBE_VERSION are re-derived on read (hangar.heal_spec).
+    probe_version: int = 0
 
 
 class ComboFlags(BaseModel):

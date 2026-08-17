@@ -180,11 +180,65 @@ def total_loss(quant: str, kv: str) -> dict | None:
             "basis": "reference"}
 
 
-def size_vs_bf16(quant: str, nbytes: int) -> float | None:
-    """This file as a fraction of what BF16 would weigh, from the format's bits
-    per weight. Exact arithmetic on a nominal bpw — so it is a good size ratio
-    and says NOTHING about quality on its own."""
+def size_vs_bf16(quant: str, nbytes: int, params: int = 0) -> float | None:
+    """This file as a fraction of what BF16 would weigh.
+
+    Measured when the parameter count is known — bytes and parameters are both
+    counted, so the ratio is arithmetic on two facts. Falls back to the format's
+    nominal bits-per-weight, which is a good size ratio and says NOTHING about
+    quality on its own."""
+    m = measured_bpw(nbytes, params)
+    if m is not None:
+        return round(m / 16.0, 4)
     q = quality_of(quant)
     if not q or not q["bpw"] or nbytes <= 0:
         return None
     return round(q["bpw"] / 16.0, 4)
+
+
+def measured_bpw(nbytes: int, params: int) -> float | None:
+    """Bits per weight this file actually spends: bytes x 8 / parameters.
+
+    Both terms are counted, never guessed — the size comes from the filesystem
+    or the HF tree, the parameter count from summing the tensor table's dims
+    (identical across every quant of a model, so one probe prices them all).
+
+    This is the honest answer for a file whose LABEL says nothing. SC117's APEX
+    quants are named I-Balanced / I-Quality / I-Compact, so `quality_of` returns
+    None and the Models page rendered an em dash for the one MTP-capable model
+    on this machine — three rows offering no way to choose between them. It is
+    not a quality figure and is not converted into one: a percentage would need
+    a perplexity run (see `rigma bench --ppl` in the backlog). It is the size of
+    the budget, which is the thing you are actually spending.
+    """
+    if nbytes <= 0 or params <= 0:
+        return None
+    return round(nbytes * 8 / params, 2)
+
+
+# How far a file may sit from its label's nominal bpw before the label is
+# describing something other than this file. Quantisers legitimately vary a few
+# percent (embeddings and the output tensor are often kept wider), so the gate
+# is deliberately loose — it fires on misdescription, not on variation.
+_BPW_TOLERANCE = 0.15
+
+
+def label_overstates(quant: str, nbytes: int, params: int) -> dict | None:
+    """Flag a label whose nominal bits-per-weight the file does not spend.
+
+    Custom mixes inherit a base ftype and keep its name: the APEX I-Compact
+    stamps `general.file_type = 15` (Q4_K_M, 4.85 bpw) into a file that spends
+    3.83. Anything trusting the label — including a reader who knows what
+    Q4_K_M usually costs — is off by a quarter. Returns None when the label is
+    unknown (nothing to contradict) or the file matches it.
+    """
+    m = measured_bpw(nbytes, params)
+    q = quality_of(quant)
+    if m is None or not q or not q["bpw"]:
+        return None
+    nominal = q["bpw"]
+    drift = (m - nominal) / nominal
+    if abs(drift) < _BPW_TOLERANCE:
+        return None
+    return {"measured_bpw": m, "label_bpw": nominal,
+            "drift_pct": round(drift * 100, 1)}

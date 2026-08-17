@@ -290,3 +290,136 @@ def test_pull_progress_reads_live_bytes(home):
         assert hangar.pull_progress("other.gguf", 100) == 0
     finally:
         hangar._PULLS.pop("slugX::big.gguf", None)
+
+
+# --- healing a spec written by an older probe ---------------------------------
+def _hybrid_gguf(path, *, nextn: bool = True, template: bool = True):
+    """Qwen3.5/3.8 shape: scalar kv head count + full_attention_interval, and a
+    tensor table that may or may not carry the MTP projections."""
+    def tensor(name, dims):
+        return (_s(name) + struct.pack("<I", len(dims))
+                + b"".join(struct.pack("<Q", d) for d in dims)
+                + struct.pack("<I", 0) + struct.pack("<Q", 0))
+    kvs = [
+        _kv_str(b"general.architecture", b"qwen35"),
+        _kv_str(b"general.name", b"Hybrid Tune"),
+        _kv_u32(b"qwen35.block_count", 9),          # 8 real + 1 MTP block
+        _kv_u32(b"qwen35.context_length", 262144),
+        _kv_u32(b"qwen35.embedding_length", 512),
+        _kv_u32(b"qwen35.attention.head_count", 8),
+        _kv_u32(b"qwen35.attention.head_count_kv", 2),
+        _kv_u32(b"qwen35.attention.key_length", 64),
+        _kv_u32(b"qwen35.full_attention_interval", 4),
+        _kv_u32(b"qwen35.nextn_predict_layers", 1),
+    ]
+    if template:
+        kvs.append(_kv_str(b"tokenizer.chat_template", b"{% if tools %}x{% endif %}"))
+    tensors = [tensor(b"blk.0.attn_q.weight", [8, 8])]
+    if nextn:
+        tensors.append(tensor(b"blk.8.nextn.eh_proj.weight", [8, 8]))
+    path.write_bytes(b"GGUF" + struct.pack("<I", 3)
+                     + struct.pack("<Q", len(tensors))
+                     + struct.pack("<Q", len(kvs))
+                     + b"".join(kvs) + b"".join(tensors))
+    return path
+
+
+def _stale_spec(home, fname, **over):
+    """A spec as an older probe would have written it: every layer counted as
+    full attention, the MTP block counted as a decoder layer, no probe_version."""
+    import json
+    d = home / "custom" / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    spec = {"slug": "hybrid-tune", "family": "qwen35", "kind": "dense",
+            "n_layers": 9, "full_attn_layers": 9, "kv_heads": 2,
+            "head_dim": 64, "native_ctx": 262144,
+            "ggufs": [{"repo": "local", "file": fname, "bytes": 4096,
+                       "quant": "Q4_K_M"}],
+            "capabilities": ["vision"], "custom": True}
+    spec.update(over)
+    (d / "hybrid-tune.json").write_text(json.dumps(spec), encoding="utf-8")
+    return spec
+
+
+def test_heal_reprobes_a_spec_written_before_the_probe_improved(home, tmp_path):
+    """Quant labels already healed on read; geometry did not, so a model added
+    before a fix kept the wrong numbers forever and the only cure was to delete
+    and re-add it. The APEX 35B on the owner's machine was stored as 41-of-41
+    full-attention layers when the file says 10-of-40 — a 4x overstatement of
+    its KV cache that had been capping its context since the day it was added."""
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf")
+    _stale_spec(home, "h.gguf")
+    spec = Registry.load().models["hybrid-tune"]
+    assert spec.full_attn_layers == 2      # 8 real layers // interval 4
+    assert spec.n_layers == 8              # the MTP block is not a decoder layer
+    assert spec.mtp_layers == 1
+    assert spec.probe_version == hangar.PROBE_VERSION
+    assert "tools" in spec.capabilities    # newly detected...
+    assert "vision" in spec.capabilities   # ...without dropping a hand-set one
+
+
+def test_heal_persists_so_the_next_load_is_free(home, tmp_path):
+    import json
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf")
+    _stale_spec(home, "h.gguf")
+    Registry.load()
+    on_disk = json.loads(
+        (home / "custom" / "models" / "hybrid-tune.json").read_text())
+    assert on_disk["full_attn_layers"] == 2
+    assert on_disk["probe_version"] == hangar.PROBE_VERSION
+
+
+def test_heal_cannot_run_without_the_file_and_says_nothing_false(home):
+    """Nothing downloaded yet: leave the spec alone rather than invent a
+    correction. It heals on the next load after a pull."""
+    _stale_spec(home, "not-downloaded.gguf")
+    spec = Registry.load().models["hybrid-tune"]
+    assert spec.full_attn_layers == 9       # untouched
+    assert spec.probe_version == 0          # still owed a re-probe
+
+
+def test_heal_drops_an_mtp_capability_the_file_disproves(home):
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf", nextn=False)
+    _stale_spec(home, "h.gguf", capabilities=["mtp", "vision"])
+    spec = Registry.load().models["hybrid-tune"]
+    assert "mtp" not in spec.capabilities   # header claimed it, tensors deny it
+    assert "vision" in spec.capabilities
+    assert spec.ggufs[0].mtp is False
+
+
+def test_heal_records_mtp_per_file(home):
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf", nextn=True)
+    _stale_spec(home, "h.gguf")
+    spec = Registry.load().models["hybrid-tune"]
+    assert spec.ggufs[0].mtp is True
+    assert "mtp" in spec.capabilities
+
+
+def test_registry_models_are_never_rewritten_by_healing(home, tmp_path):
+    """Registry entries are hand-authored and researched. Healing only ever
+    touches custom imports."""
+    from rigma.models import GgufFile, ModelSpec
+    spec = ModelSpec(slug="curated", family="qwen3.6", kind="moe", n_layers=40,
+                     full_attn_layers=10, kv_heads=2, head_dim=256,
+                     native_ctx=262144, custom=False,
+                     ggufs=[GgufFile(repo="r", file="x.gguf", bytes=1,
+                                     quant="Q4_K_M")])
+    assert hangar.heal_spec(spec) is spec
+
+
+def test_missing_chat_template_is_surfaced_not_shown_as_no_capabilities(home,
+                                                                       tmp_path):
+    """jaromer's Qwen3.8-27B ships no tokenizer.chat_template, so it listed no
+    capabilities at all next to unsloth's build of the same base model listing
+    four. An empty list was the absence of evidence, presented as a finding."""
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf", template=False)
+    _stale_spec(home, "h.gguf", capabilities=[])
+    listed = hangar.list_models(Registry.load())["models"]
+    row = next(m for m in listed if m["slug"] == "hybrid-tune")
+    assert row["has_template"] is False
+    assert row["capabilities"] == ["mtp"]   # from tensors, not from a template
