@@ -130,3 +130,30 @@ def test_slugify_dedupes_against_taken():
     assert ms.slugify("Finish chapter", set()) == "finish_chapter"
     assert ms.slugify("Finish chapter", {"finish_chapter"}) == "finish_chapter_2"
     assert ms.slugify("!!!", set()) == "item"
+
+
+def test_a_valid_method_with_a_minimal_apply_block_can_actually_be_applied(
+        tmp_path, monkeypatch):
+    """validate() requires only apply.system_prompt and apply.effort, but
+    apply_to_session subscripts six keys (methods.py:512-519). A document that
+    passes validation and saves cleanly therefore KeyErrors when applied.
+
+    Nothing hits this by hand — the UI builder always emits a full apply block —
+    but anything that BUILDS a method document programmatically produces exactly
+    this shape, which is why it matters before any capture feature exists.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import methods
+    doc = {"id": "partial", "name": "Partial",
+           "apply": {"system_prompt": "be terse", "effort": "auto"}}
+    saved, errs = methods.save_user(doc)
+    assert errs == [], f"the document is valid: {errs}"
+    assert saved is not None
+
+    out = methods.apply_to_session({"messages": []}, "partial")
+    assert out is not None
+    assert out["system_prompt"] == "be terse"
+    assert out["params"] == {}          # absent means empty, not a crash
+    assert out["effort"] == "auto"
+    assert out["notes"] == ""
+    assert out["method"] == "partial"

@@ -650,8 +650,12 @@ def sweep(use_case: str = typer.Option("general", "--use-case"),
         mark = "" if r["ok"] else "  (failed)"
         typer.echo(f"  {r['label']:<18} {r['tg_tps']:>6.1f}   "
                    f"{r['pp_tps']:>8.0f}{mark}")
-    best = next((r for r in rows if r["ok"] and r["flags"]), None)
-    if best:
+    # ask bench what it crowned rather than recomputing. The old line here used
+    # its own rule (fastest row WITH flags, no speculation margin gate), so this
+    # could announce a winner that calibration.json does not contain.
+    from .bench import crowned_row
+    best = crowned_row(rows)
+    if best and best["flags"]:
         typer.echo(f"\nwinner: {best['label']} {best['flags']} "
                    f"-> saved to calibration; `rigma up` will use it")
     else:

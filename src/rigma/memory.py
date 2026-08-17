@@ -475,9 +475,17 @@ def score_memories(store: MemoryStore, ids: list[str], delta: int,
                    run_id: str = "") -> None:
     """The librarian's ledger. +1 when a step a memory was injected into
     succeeds, -2 when it fails: a rule must earn its place repeatedly but can
-    be discredited quickly. Time decay retires unused memories; only THIS
-    retires wrong ones — a bad rule that keeps matching keeps being retrieved,
-    and without outcome scoring, being wrong made it more prominent.
+    be discredited quickly. This is the ONLY thing that retires a wrong rule —
+    a bad rule that keeps matching keeps being retrieved, and without outcome
+    scoring, being wrong made it more prominent.
+
+    NO TIME DECAY EXISTS. An earlier version of this docstring said "time decay
+    retires unused memories"; it does not, and never has. `born` is written
+    (see `MemoryStore.add`) and read nowhere, and `last_seen` is read only as
+    the fourth tiebreak when evicting at the cap. An unused memory is retired by
+    nothing but the cap and the Memory UI's delete button. Said plainly here
+    because a comment describing a safeguard that does not exist is worse than
+    no comment: it is the reason nobody went looking (audit 2026-08-18).
 
     Graduation rides on the same signal: a draft that helped a run OTHER than
     the one that wrote it has proven it generalises, which is the exact claim

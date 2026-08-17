@@ -24,11 +24,24 @@ def engine_version() -> str:
 
 
 def expected_tg(model: str, quant: str, backend: str) -> float | None:
-    """Calibrated decode speed for the running combo, if bench ever ran."""
+    """Calibrated decode speed for the running combo, if bench ever ran.
+
+    The number lives under "measured" — that is the shape `bench.save_calibration`
+    writes, and it is the only writer of this file. This read used a flat
+    `["tg_tps"]` that no writer has ever produced, so it returned None for every
+    real calibration on disk and the engine-room verdict was permanently
+    "unknown". The unit test passed throughout, because it hand-wrote the flat
+    shape instead of calling the writer.
+
+    The flat branch is kept for entries written before the nesting existed;
+    without it, fixing the read would silently retire every old calibration.
+    """
     try:
         cal = json.loads((rigma_home() / "calibration.json")
                          .read_text(encoding="utf-8"))
-        return float(cal[f"{model}:{quant}:{backend}"]["tg_tps"])
+        entry = cal[f"{model}:{quant}:{backend}"]
+        got = entry.get("measured", entry).get("tg_tps")
+        return None if got is None else float(got)
     except Exception:
         return None
 

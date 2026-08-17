@@ -2986,8 +2986,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 _runs.next_pending(run_id) or "verify and finish",
                                 run.get("workspace", ""))
                             # the step succeeded: credit the memories that were
-                            # injected into it. This is what eventually retires
-                            # wrong rules — time decay only drops UNUSED ones.
+                            # injected into it. This is the ONLY thing that ever
+                            # retires a wrong rule — there is no time decay, and
+                            # an unused memory is dropped by nothing but the cap
+                            # (see memory.score_memories).
                             ids = (run.get("step_injected") or {}).get(
                                 str(cur["id"]))
                             if ids and os.environ.get("RIGMA_MEMORY") != "0":

@@ -30,6 +30,23 @@ TRIGGER_MODES = ("nudge", "run")
 CARRY_FIELDS = ("notes", "method", "workspace", "params", "use_rag",
                 "system_prompt")
 SETTINGS_FIELDS = ("effort", "params", "use_tools", "allow_code")
+
+# Every key `methods.apply_to_session` subscripts. validate() requires only
+# apply.system_prompt and apply.effort, so a document that passes validation and
+# saves cleanly could still KeyError the moment it was applied. Nothing built by
+# the UI hits it — the builder always emits a full block — but anything that
+# constructs a method programmatically produces exactly this shape. Defaults
+# mirror a fresh session (sessions.py:45-50) so applying a partial method leaves
+# the session as it would have been.
+_APPLY_DEFAULTS = {"system_prompt": "", "params": {}, "effort": "",
+                   "use_tools": True, "allow_code": True, "notes_template": ""}
+
+
+def _with_apply_defaults(apply: dict) -> dict:
+    out = {k: (dict(v) if isinstance(v, dict) else v)
+           for k, v in _APPLY_DEFAULTS.items()}
+    out.update(apply)
+    return out
 EFFORTS = ("", "off", "auto", "on")
 VAR_KINDS = ("text", "path", "number")
 
@@ -86,7 +103,7 @@ def normalize(doc: dict) -> dict:
         "builtin": bool(doc.get("builtin", False)),
         "version": int(doc.get("version", 1) or 1),
         "extends": doc.get("extends") or None,
-        "apply": dict(doc.get("apply") or {}),
+        "apply": _with_apply_defaults(doc.get("apply") or {}),
         "guide": list(doc.get("guide") or []),
         "vars": {k: dict(v) for k, v in (doc.get("vars") or {}).items()},
     }
