@@ -21,8 +21,79 @@ function PullBar({ q }: { q: QuantRow }) {
   );
 }
 
-function QuantLine({ card, q, onAction }: {
-  card: ModelCard; q: QuantRow; onAction: () => void;
+const K = (n: number) =>
+  n >= 1024 * 1024 ? `${Math.round(n / 1024 / 1024)}M` : `${Math.round(n / 1024)}K`;
+
+/** How much of the quant sits on the GPU — the thing size alone can't tell you.
+ *  A 22GB Q6 that "fits" by spilling half to RAM is slower than a 13GB Q3 that
+ *  doesn't, so the tier is ranked by SPEED, not by file size. */
+const SPEED: Record<string, { dot: string; text: string; label: string; hint: string }> = {
+  gpu:     { dot: "bg-moss",  text: "text-moss",  label: "gpu",     hint: "fully on the GPU — fastest" },
+  light:   { dot: "bg-moss/60", text: "text-secondary", label: "light", hint: "mostly on the GPU — still quick" },
+  offload: { dot: "bg-amber", text: "text-amber", label: "offload", hint: "spills to system RAM — runs, but slow" },
+  no:      { dot: "bg-red/70", text: "text-red",  label: "too big", hint: "does not fit this machine, even at minimum context" },
+};
+
+function FitCell({ fit }: { fit?: QuantRow["fit"] }) {
+  // no verdict at all (probe failed) — say nothing rather than imply "won't fit"
+  if (!fit || fit.speed === undefined) return <span className="w-[104px] shrink-0" />;
+  const s = SPEED[fit.speed] ?? SPEED.no;
+  return (
+    <span className="w-[104px] shrink-0 flex items-center gap-1 font-mono text-[11px]"
+          title={s.hint}>
+      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${s.dot}`} />
+      <span className={s.text}>{s.label}</span>
+      {fit.ok && fit.ctx ? (
+        <span className="text-muted">· {K(fit.ctx)} ctx</span>
+      ) : null}
+      {fit.ok && fit.n_cpu_moe ? (
+        <span className="text-muted" title={`${fit.n_cpu_moe} expert layers on CPU`}>
+          · {fit.n_cpu_moe}L
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+const TIER: Record<string, string> = {
+  lossless: "text-moss", excellent: "text-moss", great: "text-secondary",
+  good: "text-secondary", fair: "text-amber", poor: "text-amber",
+  damaged: "text-red",
+};
+
+/** Quality given up vs BF16. Reference figures for the FORMAT, never a
+ *  measurement of this model — hence the "≈" and the tooltip. A blank cell is
+ *  the honest rendering for a repo whose own naming has no published data. */
+function QualityCell({ q }: { q: QuantRow }) {
+  const k = q.quality;
+  if (!k) {
+    return (
+      <span className="w-[92px] shrink-0 font-mono text-[11px] text-muted/50"
+            title={"No published quality figure for this file's naming — it " +
+                   "does not use a standard llama.cpp quant name, so any " +
+                   "percentage here would be made up."}>
+        —
+      </span>
+    );
+  }
+  const pct = k.ppl_pct < 0.1 ? "<0.1" : k.ppl_pct.toFixed(k.ppl_pct < 10 ? 1 : 0);
+  return (
+    <span
+      className="w-[92px] shrink-0 font-mono text-[11px] flex items-center gap-1"
+      title={`${k.note}. Typical +${k.ppl_pct}% perplexity vs BF16 at ${k.bpw} ` +
+             `bits/weight (~${Math.round((k.bpw / 16) * 100)}% of BF16 size).\n\n` +
+             "Reference figure for the quant FORMAT, mostly measured on 7B-13B " +
+             "LLaMA-family models — NOT measured on this model. Larger models " +
+             "lose less, so on a 27B treat it as a pessimistic upper bound."}
+    >
+      <span className={TIER[k.tier] ?? "text-secondary"}>≈{pct}%</span>
+      <span className="text-muted">{k.tier}</span>
+    </span>
+  );
+}
+
+function QuantLine({ card, q, onAction, best }: {
+  card: ModelCard; q: QuantRow; onAction: () => void; best?: string;
 }) {
   const [busy, setBusy] = useState(false);
   const downloading = q.pull?.status === "downloading";
@@ -33,15 +104,29 @@ function QuantLine({ card, q, onAction }: {
     onAction();
   };
   return (
-    <li className="flex items-center gap-3 px-3 py-1.5 rounded-md hover:bg-surface/70">
-      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${q.on_disk ? "bg-moss" : "bg-float"}`} />
-      <span className="font-mono text-[12.5px] w-20 shrink-0">{q.quant}</span>
-      <span className="font-mono text-[12px] text-muted w-16 shrink-0">{gb(q.bytes)}</span>
-      {downloading ? (
-        <PullBar q={q} />
-      ) : (
-        <span className="flex-1" />
+    <li className="flex items-center gap-2 px-3 py-1.5 rounded-md hover:bg-surface/70">
+      <span
+        className={`w-1.5 h-1.5 rounded-full shrink-0 ${q.on_disk ? "bg-moss" : "bg-float"}`}
+        title={q.on_disk ? "on disk" : "not downloaded"}
+      />
+      <span className={`font-mono text-[12.5px] w-24 shrink-0 truncate ${
+        q.fit?.ok === false ? "text-muted" : ""}`} title={q.file}>
+        {q.quant}
+      </span>
+      <span className="font-mono text-[12px] text-muted w-[52px] shrink-0 text-right">{gb(q.bytes)}</span>
+      {downloading ? <PullBar q={q} /> : (
+        <>
+          <FitCell fit={q.fit} />
+          <QualityCell q={q} />
+        </>
       )}
+      {!downloading && best === q.quant && (
+        <span className="shrink-0 font-mono text-[10.5px] text-amber bg-amber/10 rounded px-1.5 py-0.5"
+              title="best quality that still runs at GPU speed here">
+          best here
+        </span>
+      )}
+      {!downloading && <span className="flex-1" />}
       {!q.on_disk && q.pullable && !downloading && (
         <button
           disabled={busy}
@@ -104,9 +189,22 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
         {card.kind} · {Math.round(card.native_ctx / 1024)}K native
         {card.capabilities.length > 0 && ` · ${card.capabilities.join(" ")}`}
       </div>
+      <div className="flex items-center gap-2 px-3 pb-1 font-mono text-[10px]
+                      text-muted uppercase tracking-[0.06em]">
+        <span className="w-1.5 shrink-0" />
+        <span className="w-24 shrink-0">quant</span>
+        <span className="w-[52px] shrink-0 text-right">size</span>
+        <span className="w-[104px] shrink-0" title="whether it fits this machine, and how much of it lands on the GPU">
+          runs here
+        </span>
+        <span className="w-[92px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
+          vs bf16
+        </span>
+      </div>
       <ul className="flex flex-col">
         {card.quants.map((q) => (
-          <QuantLine key={q.file} card={card} q={q} onAction={onAction} />
+          <QuantLine key={q.file} card={card} q={q} onAction={onAction}
+                     best={card.recommended ?? undefined} />
         ))}
         {card.mmproj && (
           <QuantLine

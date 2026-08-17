@@ -50,6 +50,36 @@ def _quant_from_name(fname: str) -> str:
     return m.group(0).upper() if m else "GGUF"
 
 
+def _distinct_quants(files: list[str]) -> list[str]:
+    """A label per gguf that actually distinguishes them.
+
+    _quant_from_name looks for Q4_K_M/IQ3_M-style tags. Repos that name their
+    variants some other way — SC117's APEX ships I-Compact / I-Quality /
+    I-Balanced — all collapse to "GGUF", so the picker showed three identical
+    rows AND flagged every one of them as recommended (the badge compares on
+    this label). Fall back to whatever part of the filename actually differs."""
+    import os as _os
+    from pathlib import Path as _P
+    labels = [_quant_from_name(f) for f in files]
+    if len(set(labels)) == len(labels):
+        return labels                       # real quant tags: leave them alone
+    stems = [_P(f).stem for f in files]
+    pre = _os.path.commonprefix(stems)
+    suf = _os.path.commonprefix([s[::-1] for s in stems])[::-1]
+    out = []
+    for stem, fallback in zip(stems, labels):
+        core = stem[len(pre):len(stem) - len(suf)] if len(pre) + len(suf) < len(stem) \
+            else stem
+        core = core.strip("-_. ")
+        out.append((core or fallback).upper()[:24])
+    if len(set(out)) == len(out):
+        return out
+    # still ambiguous (same stem in different subdirs): keep the path, which is
+    # the only thing left that differs
+    return [str(_P(f).with_suffix("")).replace("\\", "/").upper()[-24:]
+            for f in files]
+
+
 def _write_spec(spec: ModelSpec) -> None:
     d = custom_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -203,7 +233,7 @@ def _running_files(state: dict | None, reg) -> set[str]:
     return out
 
 
-def list_models(registry=None) -> dict:
+def list_models(registry=None, profile=None) -> dict:
     from . import state as st
     from .registry import Registry
     reg = registry if registry is not None else Registry.load()
@@ -212,15 +242,36 @@ def list_models(registry=None) -> dict:
     models, used = [], 0
     for slug in sorted(reg.models):
         spec = reg.models[slug]
+        # Labels are derived HERE, not trusted from the spec. A spec written
+        # before _distinct_quants existed has "GGUF" baked into every entry —
+        # the APEX model shipped three rows all reading "GGUF", indistinguishable
+        # (owner report 2026-07-30). Deriving on read heals those in place
+        # instead of needing every stored spec rewritten.
+        labels = _distinct_quants([g.file for g in spec.ggufs])
+        # fit verdict per quant, against THIS machine. Without it the page
+        # offered 21 quants with nothing but a size to choose between them.
+        fits: list[dict] = [{} for _ in spec.ggufs]
+        if profile is not None:
+            try:
+                from .resolve import quant_verdicts
+                fits = quant_verdicts(spec, profile)
+            except Exception:
+                pass         # a fit we can't compute must not blank the page
+        from .quant_quality import quality_of
         quants = []
-        for g in spec.ggufs:
+        for g, label, fit in zip(spec.ggufs, labels, fits):
             on_disk = (mdir / g.file).exists()
             used += g.bytes if on_disk else 0
-            quants.append({"file": g.file, "quant": g.quant,
+            # reference quality for the FORMAT — None when the repo uses its own
+            # naming (I-Compact etc.), because no published figure exists for
+            # those and inventing one from a file size would be fabrication
+            quants.append({"file": g.file, "quant": label,
                            "bytes": g.bytes, "on_disk": on_disk,
                            # HF-added models have a real repo (downloadable);
                            # drag-dropped ones are "local" (only exist here)
                            "pullable": g.repo != "local",
+                           "fit": fit,
+                           "quality": quality_of(label),
                            "pull": _PULLS.get(f"{slug}::{g.file}")})
         mm = None
         if spec.mmproj is not None:
@@ -229,10 +280,18 @@ def list_models(registry=None) -> dict:
             mm = {"file": spec.mmproj.file, "bytes": spec.mmproj.bytes,
                   "on_disk": mm_on, "pullable": spec.mmproj.repo != "local",
                   "pull": _PULLS.get(f"{slug}::{spec.mmproj.file}")}
+        best = None
+        if profile is not None:
+            try:
+                from .resolve import recommended_quant
+                best = recommended_quant(quants)
+            except Exception:
+                pass
         models.append({
             "slug": slug, "family": spec.family, "kind": spec.kind,
             "custom": spec.custom, "capabilities": spec.capabilities,
             "native_ctx": spec.native_ctx, "quants": quants, "mmproj": mm,
+            "recommended": best,
             "running": bool(state and state.get("model") == slug)})
     du = shutil.disk_usage(mdir)
     return {"models": models,

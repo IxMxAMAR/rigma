@@ -45,12 +45,37 @@ export interface Pull {
   error?: string;
 }
 
+/** Whether this quant runs on THIS machine, from resolve.quant_verdicts.
+ *  `speed` is how much of it sits on the GPU: weights spilled to RAM run on
+ *  the CPU every token, so a bigger quant that only fits via heavy offload is
+ *  slower, not better. Empty object when the hardware probe failed. */
+export interface Fit {
+  ok?: boolean;
+  ctx?: number;
+  n_cpu_moe?: number;
+  speed?: "gpu" | "light" | "offload" | "no";
+}
+
+/** Reference quality for the quant FORMAT — see src/rigma/quant_quality.py.
+ *  `ppl_pct` is the typical % perplexity increase over BF16 for this format,
+ *  NOT a measurement of this model. null when the repo names its files its own
+ *  way (I-Compact etc.) and no published figure exists. */
+export interface Quality {
+  bpw: number;
+  ppl_pct: number;
+  tier: string;
+  note: string;
+  basis: string;
+}
+
 export interface QuantRow {
   file: string;
   quant: string;
   bytes: number;
   on_disk: boolean;
   pullable: boolean;
+  fit?: Fit;
+  quality?: Quality | null;
   pull?: Pull | null;
 }
 
@@ -63,6 +88,8 @@ export interface ModelCard {
   native_ctx: number;
   quants: QuantRow[];
   mmproj?: (QuantRow & { quant?: string }) | null;
+  /** best quality that still runs at GPU speed here — resolve.recommended_quant */
+  recommended?: string | null;
   running: boolean;
 }
 
