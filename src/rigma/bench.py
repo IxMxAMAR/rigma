@@ -87,7 +87,7 @@ def load_calibration() -> dict:
 
 
 def save_calibration(key: str, measured: dict, flags: dict | None = None,
-                     calibrated: bool = False) -> None:
+                     calibrated: bool = False, ctx: int = 0) -> None:
     cal = load_calibration()
     entry = cal.get(key, {})
     entry["measured"] = measured
@@ -95,6 +95,15 @@ def save_calibration(key: str, measured: dict, flags: dict | None = None,
         entry["flags"] = flags
     if calibrated:
         entry["calibrated"] = True   # one-time first-load tune has run
+    # What the numbers were measured ON. An entry used to carry a day-granularity
+    # date and nothing else, so there was no way to tell that a calibration
+    # predated an engine bump or was measured at a different context — it simply
+    # kept being applied. `schema` marks entries that carry this; anything
+    # without it is from before and is read leniently.
+    entry["schema"] = 2
+    entry["engine"] = _engine_version()
+    if ctx:
+        entry["ctx"] = ctx
     entry["date"] = datetime.date.today().isoformat()
     cal[key] = entry
     calibration_path().parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +140,56 @@ SPEC_CROWN_MARGIN = 1.15   # a speculation config must beat the best
                            # non-spec row by >=15% to be crowned: the short
                            # predictable-text bench flatters draft acceptance,
                            # so a narrow bench win is a real-world loss
+
+
+def rows_log_path() -> Path:
+    return rigma_home() / "logs" / "bench-rows.jsonl"
+
+
+def _log_row(entry: dict) -> None:
+    """One measurement, appended. Separated so a test can make it fail."""
+    p = rows_log_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, default=str) + "\n")
+
+
+def _log_rows(plan, rows: list[dict], best: dict | None) -> None:
+    """Keep every measurement a sweep made, not only the one it crowned.
+
+    A sweep loads a real engine per config and benches it — the most expensive
+    numbers Rigma produces. Only the winner's two floats reached
+    calibration.json; every losing row was returned, printed once, and dropped.
+    And because calibration is only written when the winner has flags, an
+    explicit sweep where the BASELINE won recorded nothing at all, not even the
+    baseline speed it had just spent several model loads measuring.
+
+    Append-only, structure-only, and wrapped: this is bookkeeping, and a sweep
+    that lost its log is still a sweep. Same shape as serve._shape_log.
+    """
+    try:
+        won = (best or {}).get("label")
+        stamp = datetime.date.today().isoformat()
+        for r in rows:
+            _log_row({"date": stamp, "model": plan.model_slug,
+                      "quant": plan.gguf.quant, "backend": plan.backend,
+                      "ctx": plan.flags.ctx, "engine": _engine_version(),
+                      "label": r.get("label"), "flags": r.get("flags") or {},
+                      "tg_tps": r.get("tg_tps"), "pp_tps": r.get("pp_tps"),
+                      "ok": bool(r.get("ok")), "error": r.get("error", ""),
+                      "crowned": r.get("label") == won})
+    except Exception:
+        pass          # a sweep that lost its log is still a sweep
+
+
+def _engine_version() -> str:
+    """Which llama.cpp build produced these numbers. A calibration measured on
+    one engine is not evidence about another, and nothing recorded this."""
+    try:
+        from .server_ops import engine_version
+        return engine_version()
+    except Exception:
+        return ""
 
 
 def crowned_row(rows: list[dict]) -> dict | None:
@@ -253,10 +312,12 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
             srv.stop()
     rows.sort(key=lambda r: r["tg_tps"], reverse=True)
     best = crowned_row(rows)
+    _log_rows(plan, rows, best)
     if best is not None and (best["flags"] or mark_calibrated):
         key = f"{plan.model_slug}:{plan.gguf.quant}:{plan.backend}"
         save_calibration(key, {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"]},
-                         flags=best["flags"], calibrated=mark_calibrated)
+                         flags=best["flags"], calibrated=mark_calibrated,
+                         ctx=plan.flags.ctx)
     return rows
 
 

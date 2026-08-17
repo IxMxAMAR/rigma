@@ -146,3 +146,124 @@ def test_run_sweep_skips_failed_launch(monkeypatch, tmp_path):
     baseline = next(r for r in rows if r["label"] == "baseline")
     assert baseline["ok"] is False
     assert rows[0]["label"] == "kv-q8" and rows[0]["tg_tps"] == 42
+
+
+def _fake_sweep(monkeypatch, results, configs):
+    """Drive run_sweep without launching anything."""
+    seq = iter(results)
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: next(seq))
+    monkeypatch.setattr(bench, "sweep_configs",
+                        lambda base, moe, caps=(): configs)
+
+
+def _rows_log(home):
+    import json
+    p = home / "logs" / "bench-rows.jsonl"
+    if not p.is_file():
+        return []
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x]
+
+
+def test_a_sweep_keeps_every_measurement_not_just_the_winner(monkeypatch,
+                                                             tmp_path):
+    """A sweep launches a real engine per config and measures it. Only the
+    winner's two floats survived into calibration.json; the losing rows were
+    returned, printed, and dropped. Those are the most expensive numbers Rigma
+    ever produces — each one is a real model load."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    _fake_sweep(monkeypatch,
+                [bench.BenchResult(pp_tps=100, tg_tps=50, prompt_tokens=8,
+                                   gen_tokens=8),
+                 bench.BenchResult(pp_tps=120, tg_tps=70, prompt_tokens=8,
+                                   gen_tokens=8)],
+                [("baseline", {}), ("fa-off", {"flash_attn": "off"})])
+    bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                    port=11601)
+    logged = _rows_log(tmp_path)
+    assert {r["label"] for r in logged} == {"baseline", "fa-off"}
+    by = {r["label"]: r for r in logged}
+    assert by["baseline"]["tg_tps"] == 50      # the LOSER is kept
+    assert by["fa-off"]["crowned"] is True
+    assert by["baseline"]["crowned"] is False
+    assert by["baseline"]["model"] == "m" and by["baseline"]["backend"] == "vulkan"
+
+
+def test_a_sweep_the_baseline_wins_still_records_what_it_measured(monkeypatch,
+                                                                  tmp_path):
+    """`if best["flags"] or mark_calibrated` means an explicit sweep where the
+    baseline wins writes NOTHING — not even the baseline speed it just spent
+    two engine loads measuring."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    _fake_sweep(monkeypatch,
+                [bench.BenchResult(pp_tps=100, tg_tps=70, prompt_tokens=8,
+                                   gen_tokens=8),
+                 bench.BenchResult(pp_tps=120, tg_tps=50, prompt_tokens=8,
+                                   gen_tokens=8)],
+                [("baseline", {}), ("fa-off", {"flash_attn": "off"})])
+    bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                    port=11601)
+    assert bench.load_calibration() == {}          # unchanged: correct
+    logged = _rows_log(tmp_path)
+    assert len(logged) == 2                        # but the numbers survive
+    assert {r["label"] for r in logged} == {"baseline", "fa-off"}
+
+
+def test_a_failed_config_is_recorded_as_a_loss_with_its_error(monkeypatch,
+                                                              tmp_path):
+    """A config that OOMs is a measurement too — it says this machine cannot
+    run that combination."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+
+    def _boom(*a, **k):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(bench, "launch_server", _boom)
+    # NOT a q4 KV config: run_sweep drops those for tools-capable models on
+    # purpose, so using one here would test the filter, not the log
+    monkeypatch.setattr(bench, "sweep_configs",
+                        lambda base, moe, caps=(): [("batch-big", {"batch": 16384})])
+    bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                    port=11601)
+    logged = _rows_log(tmp_path)
+    assert len(logged) == 1
+    assert logged[0]["ok"] is False
+    assert "out of memory" in logged[0]["error"]
+
+
+def test_the_rows_log_never_breaks_a_sweep(monkeypatch, tmp_path):
+    """Logging is bookkeeping. If the log cannot be written the sweep must
+    still return its rows and still save calibration."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    _fake_sweep(monkeypatch,
+                [bench.BenchResult(pp_tps=120, tg_tps=70, prompt_tokens=8,
+                                   gen_tokens=8)],
+                [("fa-off", {"flash_attn": "off"})])
+    monkeypatch.setattr(bench, "_log_row",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601)
+    assert rows and rows[0]["label"] == "fa-off"
+    assert bench.load_calibration()["m:Q4:vulkan"]["flags"]["flash_attn"] == "off"
+
+
+def test_a_calibration_entry_says_what_it_was_measured_on(monkeypatch, tmp_path):
+    """A calibration entry carried a day-granularity date and nothing else. It
+    could not tell you which engine build or context it was measured at, so
+    there was no way to know it had gone stale after an engine bump."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    _fake_sweep(monkeypatch,
+                [bench.BenchResult(pp_tps=120, tg_tps=70, prompt_tokens=8,
+                                   gen_tokens=8)],
+                [("fa-off", {"flash_attn": "off"})])
+    bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                    port=11601)
+    entry = bench.load_calibration()["m:Q4:vulkan"]
+    assert entry["schema"] == 2
+    assert entry["ctx"] == 8192
+    assert "engine" in entry
