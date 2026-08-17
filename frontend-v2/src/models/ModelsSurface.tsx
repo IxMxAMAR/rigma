@@ -126,6 +126,7 @@ function HfSearch({ onAdded }: { onAdded: () => void }) {
   const [hits, setHits] = useState<HfHit[]>([]);
   const [state, setState] = useState<"idle" | "busy" | "err">("idle");
   const [adding, setAdding] = useState<string | null>(null);
+  const [addErr, setAddErr] = useState<string | null>(null);
   const timer = useRef<number | null>(null);
 
   const search = (text: string) => {
@@ -155,20 +156,40 @@ function HfSearch({ onAdded }: { onAdded: () => void }) {
       />
       {state === "busy" && <div className="font-mono text-[11.5px] text-muted mt-2">searching…</div>}
       {state === "err" && <div className="font-mono text-[11.5px] text-red mt-2">search failed — offline?</div>}
+      {q.trim() !== "" && state === "idle" && hits.length === 0 && (
+        <div className="font-mono text-[11.5px] text-muted mt-2">
+          no GGUF repos match that — check the spelling, or paste the exact
+          owner/name from the model's Hugging Face page
+        </div>
+      )}
+      {addErr && (
+        <div className="rounded-md bg-red/10 text-red px-2.5 py-1.5 font-mono text-[11.5px] mt-2">
+          {addErr}
+        </div>
+      )}
       <ul className="mt-2 flex flex-col gap-1">
         {hits.slice(0, 8).map((h) => (
-          <li key={h.id} className="flex items-center gap-2 rounded-md hover:bg-surface px-2 py-1.5">
-            <span className="font-mono text-[12.5px] flex-1 truncate">{h.id}</span>
+          <li key={h.repo} className="flex items-center gap-2 rounded-md hover:bg-surface px-2 py-1.5">
+            <span className="font-mono text-[12.5px] flex-1 truncate" title={h.repo}>{h.repo}</span>
             <button
-              disabled={adding === h.id}
+              disabled={adding === h.repo}
               onClick={async () => {
-                setAdding(h.id);
-                try { await engineApi.hfAdd(h.id); onAdded(); } catch { /* row stays */ }
+                setAdding(h.repo);
+                setAddErr(null);
+                // Say so when it fails. Swallowing the error left the button
+                // looking inert and gave no way to tell a bad repo from a
+                // dead network.
+                try {
+                  await engineApi.hfAdd(h.repo);
+                  onAdded();
+                } catch (e) {
+                  setAddErr(`could not add ${h.repo}: ${(e as Error).message}`);
+                }
                 setAdding(null);
               }}
               className="shrink-0 rounded-md bg-amber/15 text-amber px-2.5 py-0.5 text-[12px] font-semibold disabled:opacity-40"
             >
-              {adding === h.id ? "adding…" : "add"}
+              {adding === h.repo ? "adding…" : "add"}
             </button>
           </li>
         ))}

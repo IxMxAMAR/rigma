@@ -1,4 +1,5 @@
 """Bazaar: HF search / remote header inspect / fit verdicts / add-to-library."""
+import pathlib
 import struct
 
 import pytest
@@ -74,6 +75,30 @@ def test_search_shapes_results(fake_hf):
     out = hf_browse.search("webtune")
     assert out == [{"repo": "cool/WebTune-GGUF", "downloads": 1234,
                     "likes": 56, "updated": "2026-07-01"}]
+
+
+def test_search_result_keys_match_what_the_v2_ui_reads():
+    """The repo id ships as `repo`, never `id`.
+
+    Live 2026-07-30: the v2 Models surface read `hit.id` — a key this endpoint
+    does not return, because it RENAMES Hugging Face's own `id` on the way
+    out. Every result rendered as a blank row with a dead `add` button, and
+    HF model adding was broken in the whole v2 UI. TypeScript missed it
+    because HfHit carried an index signature; nothing on the Python side
+    said which name the UI was entitled to. This does.
+    """
+    src = (pathlib.Path(__file__).parent.parent / "frontend-v2" / "src")
+    api_ts = (src / "lib" / "engineApi.ts").read_text(encoding="utf-8")
+    hit = api_ts.split("export interface HfHit", 1)[1].split("}", 1)[0]
+    assert "repo:" in hit, "HfHit must declare `repo` — the key search() returns"
+    assert "id:" not in hit, "HfHit must not declare `id`; the API renames it"
+    # an index signature makes any typo type-check and render as undefined
+    assert "[k: string]" not in hit, "HfHit must not carry an index signature"
+
+    ui = (src / "models" / "ModelsSurface.tsx").read_text(encoding="utf-8")
+    body = ui.split("function HfSearch", 1)[1]
+    assert "h.repo" in body
+    assert "h.id" not in body, "the Models surface is reading a key that does not exist"
 
 
 def test_repo_files_skips_split_and_picks_f16_mmproj(fake_hf):
