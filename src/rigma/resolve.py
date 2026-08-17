@@ -294,10 +294,14 @@ def _configured(spec: ModelSpec, *, kv: str = "",
         return spec
     s = spec.model_copy(deep=True)
     if kv:
-        k, _, v = kv.partition(",")
-        s.cache_type_policy.k = k.strip() or s.cache_type_policy.k
-        s.cache_type_policy.v = (v.strip() or k.strip()
-                                 or s.cache_type_policy.v)
+        # ONE type: K and V always match (ComboFlags._symmetric_kv — llama.cpp's
+        # fused flash-attention needs ctk == ctv). A "k,v" pair used to be
+        # parsed here and then silently normalised downstream, so an asymmetric
+        # request looked honoured and wasn't. The API rejects that form now;
+        # this only has to not crash on one.
+        k = kv.split(",", 1)[0].strip()
+        if k:
+            s.cache_type_policy.k = s.cache_type_policy.v = k
         # asked for explicitly, so do not quietly fall back to q8_0 — that made
         # f16 / q5_1 / q4_0 all report the identical verdict
         s.cache_type_policy.pinned = True
@@ -318,7 +322,7 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
     return {"file_mb": round(file_mb), "mmproj_mb": round(mm_mb),
             "kv_mb": round(kv_mb), "budget_mb": round(usable_vram),
             "over_mb": round(file_mb + mm_mb + kv_mb - usable_vram),
-            "ctx": ctx, "kv_type": k if k == v else f"{k}/{v}"}
+            "ctx": ctx, "kv_type": k}
 
 
 def recommended_quant(quants: list[dict]) -> str | None:

@@ -372,3 +372,16 @@ def test_vision_toggle_refuses_a_model_with_no_projector(home, upstream,
     # omitting `vision` keeps whatever the last launch used
     assert client.post("/api/server/ctx", json={"ctx": 16384}).status_code == 200
     assert called[-1][0][6] is None
+
+
+def test_explorer_refuses_an_asymmetric_kv_request(home, upstream):
+    """Accepting "q8_0,q4_0" and normalising it silently would show a verdict
+    for a configuration rigma will never launch."""
+    client = TestClient(build_app(upstream_port=upstream))
+    for path in ("/api/models?kv=q8_0,q4_0", "/api/hf/repo?id=a/b&kv=q8_0,q4_0"):
+        r = client.get(path)
+        assert r.status_code == 400, path
+        assert "same cache type" in r.json()["error"]
+    # a single valid type is still fine
+    assert client.get("/api/models?kv=q4_0").status_code == 200
+    assert client.get("/api/models?kv=nonsense").status_code == 400

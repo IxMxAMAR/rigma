@@ -281,7 +281,6 @@ def list_models(registry=None, profile=None, *, kv: str = "",
             # `total` folds in the KV cache actually chosen, so the number is
             # against the true reference: BF16 weights + f16 cache.
             k = fit.get("kv") or spec.cache_type_policy.k
-            v = fit.get("kv_v") or spec.cache_type_policy.v
             quants.append({"file": g.file, "quant": label,
                            "bytes": g.bytes, "on_disk": on_disk,
                            # HF-added models have a real repo (downloadable);
@@ -289,7 +288,7 @@ def list_models(registry=None, profile=None, *, kv: str = "",
                            "pullable": g.repo != "local",
                            "fit": fit,
                            "quality": quality_of(label),
-                           "total": total_loss(label, k, v),
+                           "total": total_loss(label, k),
                            "pull": _PULLS.get(f"{slug}::{g.file}")})
         mm = None
         if spec.mmproj is not None:

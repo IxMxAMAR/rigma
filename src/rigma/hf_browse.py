@@ -228,10 +228,9 @@ def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",
     quants = []
     for g, v in zip(spec.ggufs, verdicts):
         k = v.get("kv") or spec.cache_type_policy.k
-        vv = v.get("kv_v") or spec.cache_type_policy.v
         quants.append({"file": g.file, "quant": g.quant, "bytes": g.bytes,
                        "fit": v, "quality": quality_of(g.quant),
-                       "total": total_loss(g.quant, k, vv),
+                       "total": total_loss(g.quant, k),
                        # a pre-add row can't be on disk; keeps the shape
                        # identical to /api/models so one component renders both
                        "on_disk": False, "pullable": True})
