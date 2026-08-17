@@ -52,6 +52,34 @@ def _slugify(name: str) -> str:
     return s or "custom-model"
 
 
+# A model is keyed by the `general.name` inside its gguf, which is what makes
+# two mirrors of one model dedupe instead of filling the library with copies.
+# Some quantisers never set it and the conversion default survives: the Apriel
+# 1.6 decensored build calls itself "base-model", so it sits in the library as
+# `base-model` with nothing to connect it to what was added. Worse, the name is
+# not unique — the NEXT model that self-describes the same way is refused as a
+# duplicate of a model it has nothing to do with.
+_GENERIC_NAMES = {
+    "base-model", "base", "model", "models", "gguf", "ggml-model", "output",
+    "unnamed", "merged", "merged-model", "merge", "finetune", "fine-tune",
+    "checkpoint", "pytorch-model", "converted", "llama", "mistral", "unsloth",
+    # what _slugify itself returns when the name had nothing usable in it
+    "custom-model",
+}
+
+
+def model_slug(gguf_name: str, fallback: str) -> str:
+    """Slug from the gguf's own name, unless that name says nothing.
+
+    The fallback is whatever the user actually pointed at — the repo id, or the
+    filename for a local install. Never silently: `_already_msg` explains the
+    slug/repo relationship when a collision is reported."""
+    s = _slugify(gguf_name)
+    if s in _GENERIC_NAMES or len(s) < 3:
+        return _slugify(fallback) or s
+    return s
+
+
 def _quant_from_name(fname: str) -> str:
     m = _QUANT_RE.search(fname)
     return m.group(0).upper() if m else "GGUF"
@@ -218,33 +246,127 @@ def heal_spec(spec: ModelSpec) -> ModelSpec:
             probed[name] = inspect_gguf(mdir / name)
         except (GgufParseError, OSError, ValueError):
             continue               # unreadable file must not break the library
-    update: dict = {}
-    if probed:
-        update["ggufs"] = [
-            g.model_copy(update={"mtp": probed[g.file].spec_fields.get("mtp")})
-            if g.file in probed else g for g in spec.ggufs]
+    if not probed:
+        return spec
+    fields = {name: got.spec_fields for name, got in probed.items()}
     info = next((probed[g.file] for g in spec.ggufs if g.file in probed), None)
     f = info.spec_fields if info else None
     if stale and info and f and f.get("n_layers", 0) > 0 \
             and f.get("kv_heads", 0) > 0:
-        caps = set(spec.capabilities) | set(info.capabilities)
-        if f.get("mtp") is False:
-            caps.discard("mtp")    # the file demonstrably has no draft head
-        update.update(spec_fields_from_probe(f))
-        update["capabilities"] = sorted(caps)
-        if spec.kind == "moe":
-            moe = moe_from_probe(f, max((g.bytes for g in spec.ggufs),
-                                        default=0))
-            if moe is not None:
-                update["moe"] = moe
-    if not update:
+        healed = _with_probe(spec, info, fields)     # geometry + caps + files
+    else:
+        healed = spec.model_copy(update={"ggufs": [   # just the per-file answer
+            g.model_copy(update={"mtp": fields[g.file].get("mtp")})
+            if g.file in fields else g for g in spec.ggufs]})
+    if healed == spec:
         return spec
-    healed = spec.model_copy(update=update)
     try:
         _write_spec(healed)        # persist so the next read is free
     except OSError:
         pass                       # a read-only home still gets healed in memory
     return healed
+
+
+def reprobe(slug: str, *, allow_remote: bool = True) -> ModelSpec:
+    """Re-derive a spec's probed facts on demand, reading the repo if needed.
+
+    `heal_spec` runs on every registry load and so must never touch the network;
+    it can only work from a gguf already on disk. That leaves a model added but
+    not yet downloaded stuck with whatever an older probe wrote — Qwen3.8-27B
+    kept its 65-layer geometry (the MTP block counted as a decoder layer) with
+    no way to correct it short of removing and re-adding the repo. This is the
+    explicit version: the user asks, so the ranged header read is theirs to
+    spend. Local file first, because it is free and it is the better evidence.
+    """
+    spec = _load_custom(slug)
+    if spec is None:
+        raise HangarError(f"{slug} is not a custom model — registry specs are "
+                          "hand-authored and are not re-probed")
+    healed = heal_spec(spec.model_copy(update={"probe_version": 0}))
+    if healed.probe_version >= PROBE_VERSION:
+        return healed
+    if not allow_remote:
+        raise HangarError(f"nothing of {slug} is downloaded, so there is no "
+                          "file to read")
+    remote = next((g for g in spec.ggufs if g.repo and g.repo != "local"), None)
+    if remote is None:
+        raise HangarError(f"{slug} was installed from a local file that is no "
+                          "longer on disk — nothing left to read")
+    from .hf_browse import remote_inspect
+    info = remote_inspect(remote.repo, remote.file)
+    f = info.spec_fields
+    if not f or f.get("n_layers", 0) <= 0 or f.get("kv_heads", 0) <= 0:
+        raise HangarError(f"{remote.file} carries no usable model metadata")
+    updated = _with_probe(spec, info, {remote.file: f})
+    _write_spec(updated)
+    return updated
+
+
+def _with_probe(spec: ModelSpec, info, probed: dict) -> ModelSpec:
+    """Fold a fresh probe into a spec. Capabilities are ADDED, never removed,
+    except `mtp`, which a read tensor table can positively disprove — a
+    capability the user set by hand has to survive a re-probe."""
+    f = info.spec_fields
+    caps = set(spec.capabilities) | set(info.capabilities)
+    if f.get("mtp") is False:
+        caps.discard("mtp")
+    update = dict(spec_fields_from_probe(f))
+    update["capabilities"] = sorted(caps)
+    update["ggufs"] = [g.model_copy(update={"mtp": probed[g.file].get("mtp")})
+                       if g.file in probed else g for g in spec.ggufs]
+    if spec.kind == "moe":
+        moe = moe_from_probe(f, max((g.bytes for g in spec.ggufs), default=0))
+        if moe is not None:
+            update["moe"] = moe
+    return spec.model_copy(update=update)
+
+
+def rename_model(slug: str, new_slug: str) -> ModelSpec:
+    """Rename a custom model, carrying everything else keyed by its slug.
+
+    A slug is not just a label: the repaired chat template lives at
+    templates/<slug>.jinja and calibration rows are keyed "<slug>:<quant>:
+    <backend>". Renaming by hand — the only option before this — silently
+    orphaned both, so a model that had been tuned and given a working template
+    came back untuned and on its embedded template.
+    """
+    from . import state as st
+    from .registry import Registry
+    spec = _load_custom(slug)
+    if spec is None:
+        raise HangarError("only custom models can be renamed")
+    new_slug = _slugify(new_slug)
+    if not new_slug:
+        raise HangarError("that name has no usable characters in it")
+    if new_slug == slug:
+        return spec
+    if new_slug in Registry.load().models:
+        raise HangarError(f"a model named {new_slug} already exists")
+    state = st.read_state()
+    if state and state.get("model") == slug:
+        raise HangarError(f"{slug} is running — stop or switch models first")
+    home = rigma_home()
+    renamed = spec.model_copy(update={"slug": new_slug})
+    _write_spec(renamed)
+    tmpl = home / "templates" / f"{slug}.jinja"
+    if tmpl.is_file():
+        os.replace(tmpl, home / "templates" / f"{new_slug}.jinja")
+    calib = home / "calibration.json"
+    if calib.is_file():
+        try:
+            import json
+            rows = json.loads(calib.read_text(encoding="utf-8"))
+            moved = {(f"{new_slug}:{k.split(':', 1)[1]}"
+                      if k.startswith(f"{slug}:") else k): v
+                     for k, v in rows.items()}
+            if moved != rows:
+                tmp = calib.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(moved, indent=1), encoding="utf-8")
+                os.replace(tmp, calib)
+        except (OSError, ValueError):
+            pass          # a lost calibration row costs one re-tune, not data
+    (custom_dir() / f"{slug}.json").unlink(missing_ok=True)
+    return renamed
 
 
 def file_has_mtp(gguf: GgufFile) -> bool | None:
@@ -322,7 +444,7 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
         return updated
 
     from .registry import Registry
-    slug = _slugify(info.name)
+    slug = model_slug(info.name, src.stem)
     if slug in Registry.load().models:
         raise HangarError(f"a model named {slug} already exists")
     f = info.spec_fields

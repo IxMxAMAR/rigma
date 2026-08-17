@@ -423,3 +423,104 @@ def test_missing_chat_template_is_surfaced_not_shown_as_no_capabilities(home,
     row = next(m for m in listed if m["slug"] == "hybrid-tune")
     assert row["has_template"] is False
     assert row["capabilities"] == ["mtp"]   # from tensors, not from a template
+
+
+# --- a gguf that does not say what it is --------------------------------------
+def test_generic_gguf_names_fall_back_to_what_the_user_pointed_at():
+    """A model is keyed by the `general.name` inside its gguf, which is what
+    makes two mirrors of one model dedupe. Some quantisers never set it: the
+    Apriel 1.6 decensored build calls itself "base-model", so it sat in the
+    library under that name with nothing tying it to the repo. Worse, the name
+    is not unique — the next model that self-describes the same way is refused
+    as a duplicate of something unrelated."""
+    assert hangar.model_slug("base-model", "Apriel-1.6-15b-Thinker-GGUF") == \
+        "apriel-1.6-15b-thinker-gguf"
+    assert hangar.model_slug("model", "Spicy-Tune-8B") == "spicy-tune-8b"
+    assert hangar.model_slug("", "Fallback-Repo") == "fallback-repo"
+
+
+def test_a_real_gguf_name_is_still_preferred_over_the_repo():
+    # the dedupe property must survive: two mirrors of one model share its name
+    assert hangar.model_slug("Qwen3.8 27B", "some-mirror-repo") == "qwen3.8-27b"
+
+
+# --- renaming carries everything else keyed by the slug -----------------------
+def test_rename_carries_the_repaired_template(home, tmp_path):
+    """A slug is not just a label: the repaired chat template lives at
+    templates/<slug>.jinja. Renaming by hand orphaned it, so a model that had
+    been given a working template came back on its broken embedded one."""
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf")
+    _stale_spec(home, "h.gguf")
+    (home / "templates").mkdir(parents=True, exist_ok=True)
+    (home / "templates" / "hybrid-tune.jinja").write_text("TEMPLATE", encoding="utf-8")
+    hangar.rename_model("hybrid-tune", "something-meaningful")
+    assert not (home / "templates" / "hybrid-tune.jinja").exists()
+    assert (home / "templates" / "something-meaningful.jinja").read_text(
+        encoding="utf-8") == "TEMPLATE"
+    assert "something-meaningful" in Registry.load().models
+    assert "hybrid-tune" not in Registry.load().models
+
+
+def test_rename_carries_the_calibration_rows(home):
+    """Calibration is keyed "<slug>:<quant>:<backend>". A rename that dropped
+    them silently un-tuned a model that had been measured."""
+    import json
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf")
+    _stale_spec(home, "h.gguf")
+    (home / "calibration.json").write_text(json.dumps({
+        "hybrid-tune:Q4_K_M:vulkan": {"flags": {"flash_attn": "off"}},
+        "other-model:Q4_K_M:vulkan": {"flags": {}},
+    }), encoding="utf-8")
+    hangar.rename_model("hybrid-tune", "renamed")
+    rows = json.loads((home / "calibration.json").read_text(encoding="utf-8"))
+    assert "renamed:Q4_K_M:vulkan" in rows
+    assert "hybrid-tune:Q4_K_M:vulkan" not in rows
+    assert "other-model:Q4_K_M:vulkan" in rows      # untouched
+
+
+def test_rename_refuses_to_collide(home):
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf")
+    _stale_spec(home, "h.gguf")
+    existing = next(iter(Registry.load().models))
+    with pytest.raises(HangarError, match="already exists"):
+        hangar.rename_model("hybrid-tune", existing)
+
+
+def test_rename_refuses_while_the_model_is_running(home, monkeypatch):
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf")
+    _stale_spec(home, "h.gguf")
+    from rigma import state as st
+    monkeypatch.setattr(st, "read_state", lambda: {"model": "hybrid-tune"})
+    with pytest.raises(HangarError, match="running"):
+        hangar.rename_model("hybrid-tune", "renamed")
+
+
+# --- explicit re-probe reaches what the automatic heal cannot -----------------
+def test_reprobe_offline_says_so_when_nothing_is_downloaded(home):
+    """heal_spec is local-file-only on purpose (it runs on every registry
+    load). --offline keeps that contract and reports honestly instead of
+    silently doing nothing."""
+    _stale_spec(home, "never-downloaded.gguf")
+    with pytest.raises(HangarError, match="downloaded"):
+        hangar.reprobe("hybrid-tune", allow_remote=False)
+
+
+def test_reprobe_prefers_the_local_file_over_the_network(home, monkeypatch):
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf")
+    _stale_spec(home, "h.gguf")
+
+    def _boom(*a, **k):
+        raise AssertionError("reprobe hit the network with the file on disk")
+    monkeypatch.setattr("rigma.hf_browse.remote_inspect", _boom)
+    spec = hangar.reprobe("hybrid-tune")
+    assert spec.full_attn_layers == 2 and spec.n_layers == 8
+
+
+def test_reprobe_refuses_registry_models(home):
+    with pytest.raises(HangarError, match="hand-authored"):
+        hangar.reprobe("definitely-not-a-custom-model")

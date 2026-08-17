@@ -2069,6 +2069,33 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": str(e)}, status_code=409)
         return {"ok": True}
 
+    @app.post("/api/models/{slug}/reprobe")
+    async def models_reprobe(slug: str):
+        """Re-read the gguf and correct the stored geometry/capabilities.
+
+        Explicit because it may cost a ranged header read over the network —
+        the automatic heal on registry load is local-file-only on purpose."""
+        from . import hangar
+        try:
+            spec = await asyncio.to_thread(hangar.reprobe, slug)
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        return {"slug": spec.slug, "capabilities": spec.capabilities,
+                "n_layers": spec.n_layers,
+                "full_attn_layers": spec.full_attn_layers,
+                "mtp_layers": spec.mtp_layers, "params": spec.params,
+                "has_template": spec.has_template}
+
+    @app.post("/api/models/{slug}/rename")
+    async def models_rename(slug: str, body: dict):
+        from . import hangar
+        try:
+            spec = await asyncio.to_thread(hangar.rename_model, slug,
+                                           str(body.get("slug", "")))
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=409)
+        return {"slug": spec.slug}
+
     @app.patch("/api/models/{slug}")
     async def models_patch(slug: str, body: dict):
         from . import hangar

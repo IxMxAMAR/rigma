@@ -16,7 +16,7 @@ import httpx
 
 from .gguf_meta import GgufParseError, inspect_gguf
 from .hangar import (HangarError, _distinct_quants, _quant_from_name,
-                     _slugify, _write_spec)
+                     _write_spec, model_slug)
 from .models import GgufFile, ModelSpec
 
 HF = "https://huggingface.co"
@@ -198,7 +198,8 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
     # unknown until they are read. Claiming the probe's answer for all of them
     # is the per-model-claim-about-a-per-file-property bug this fixes.
     spec = ModelSpec(
-        slug=_slugify(info.name), family=info.arch or "custom",
+        slug=model_slug(info.name, repo.rsplit("/", 1)[-1]),
+        family=info.arch or "custom",
         kind=f["kind"],
         ggufs=[GgufFile(repo=repo, file=g["file"], bytes=g["bytes"], quant=q,
                         mtp=f.get("mtp") if g["file"] == probed else None)
