@@ -53,6 +53,12 @@ export interface Fit {
   ok?: boolean;
   ctx?: number;
   n_cpu_moe?: number;
+  /** GPU layers the resolver planned (dense); 99 = all */
+  ngl?: number;
+  /** KV cache type it settled on, e.g. "f16" | "q8_0" */
+  kv?: string;
+  /** % of weights left in system RAM — 0 means fully GPU-resident */
+  offload_pct?: number;
   speed?: "gpu" | "light" | "offload" | "no";
 }
 
