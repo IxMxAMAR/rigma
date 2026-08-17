@@ -125,12 +125,22 @@ function QualityCell({ q }: { q: QuantRow }) {
     );
   }
   if (!k) {
+    // No published figure for this naming — but the file's own bits-per-weight
+    // is still countable, and an em dash on every row of a repo that names its
+    // quants I-Balanced / I-Quality / I-Compact left nothing to choose between
+    // them. bpw is measured, not a quality percentage, and is labelled as such.
     return (
       <span className="w-[96px] shrink-0 font-mono text-[11px] text-muted/50"
             title={"No published quality figure for this file's naming — it " +
                    "does not use a standard llama.cpp quant name, so any " +
-                   "percentage here would be made up."}>
-        —
+                   "percentage here would be made up.\n\n" +
+                   (q.bpw
+                     ? `What it does spend is ${q.bpw} bits per weight, ` +
+                       "measured: this file's bytes divided by the model's " +
+                       "parameter count. That is the size of the budget, not " +
+                       "the quality it buys — those need a perplexity run."
+                     : "")}>
+        {q.bpw ? <span className="text-secondary">{q.bpw} bpw</span> : "—"}
       </span>
     );
   }
@@ -147,6 +157,50 @@ function QualityCell({ q }: { q: QuantRow }) {
       <span className={TIER[k.tier] ?? "text-secondary"}>≈{pct}%</span>
       <span className="text-muted">{k.tier}</span>
     </span>
+  );
+}
+
+/** Whether THIS file carries the speculative-decoding draft head.
+ *
+ *  Per file, never per model: MTP is kept or dropped by the quantiser per
+ *  artefact, so a card that wears one "mtp" chip over twenty quants is making a
+ *  claim it cannot support. Only a positive, verified answer earns a mark —
+ *  silence covers both "no head" and "not read yet", and the tooltip says
+ *  which. Asking llama.cpp for draft-mtp against a file without the tensors
+ *  resets the GPU driver, so an optimistic guess here is expensive. */
+function MtpMark({ q }: { q: QuantRow }) {
+  if (q.mtp !== true) return <span className="w-8 shrink-0" />;
+  return (
+    <span className="w-8 shrink-0 font-mono text-[10px] text-moss/90"
+          title={"This file carries the MTP tensors (blk.N.nextn.*), read from " +
+                 "its tensor table — so speculative decoding (--spec draft-mtp) " +
+                 "can actually run on it.\n\nVerified in the file, not inferred " +
+                 "from the repo name or the header."}>
+      mtp
+    </span>
+  );
+}
+
+/** A gguf with no chat template at all.
+ *
+ *  The capability line above renders `capabilities.join(" ")`, so a quantiser
+ *  that dropped tokenizer.chat_template produces a card that silently says
+ *  nothing — indistinguishable from a model that genuinely has no tools and no
+ *  thinking. It is worse than cosmetic: with no template in the file,
+ *  llama-server falls back to a generic one, so the model is being prompted in
+ *  a format it was not trained on, and nothing anywhere says so. */
+function NoTemplateNotice({ card }: { card: ModelCard }) {
+  if (card.has_template !== false) return null;
+  return (
+    <div className="rounded-md bg-amber/10 text-amber px-2.5 py-1.5 font-mono text-[11.5px] mb-2"
+         title={"llama.cpp falls back to a generic chat template when the gguf " +
+                "carries none. Drop a .jinja file at " +
+                "~/.rigma/templates/" + card.slug + ".jinja and Rigma passes it " +
+                "to the engine with --chat-template-file."}>
+      no chat template in this gguf — the capability list below is blank because
+      there is nothing to read, not because the model lacks the features. It is
+      running on the engine's fallback format.
+    </div>
   );
 }
 
@@ -177,6 +231,7 @@ function QuantLine({ card, q, onAction, best }: {
           <CtxCell fit={q.fit} />
           <RunsCell fit={q.fit} />
           <QualityCell q={q} />
+          <MtpMark q={q} />
         </>
       )}
       {!downloading && best === q.quant && (
@@ -285,6 +340,7 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
           {err}
         </div>
       )}
+      <NoTemplateNotice card={card} />
       <div className="font-mono text-[11.5px] text-muted mb-2">
         {card.kind} · {Math.round(card.native_ctx / 1024)}K native
         {card.capabilities.length > 0 && ` · ${card.capabilities.join(" ")}`}
@@ -313,6 +369,9 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
         </span>
         <span className="w-[96px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
           vs bf16
+        </span>
+        <span className="w-8 shrink-0" title="carries the MTP draft head, so speculative decoding can run on it">
+          spec
         </span>
       </div>
       <ul className="flex flex-col">
@@ -365,6 +424,14 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
       <div className="font-mono text-[11px] text-muted px-1 pb-1.5">
         {d.kind} · {Math.round(d.native_ctx / 1024)}K native
         {d.capabilities.length > 0 && ` · ${d.capabilities.join(" ")}`}
+        {d.has_template === false && (
+          <span className="text-amber"
+                title={"This repo's ggufs carry no tokenizer.chat_template, so " +
+                       "there is nothing to read capabilities from and the " +
+                       "engine would prompt it with a generic fallback format."}>
+            {" · no chat template"}
+          </span>
+        )}
         {d.mmproj && " · vision projector"}
         {d.already && <span className="text-amber"> · already in your library</span>}
         {d.split_skipped > 0 &&
@@ -392,6 +459,7 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
             <CtxCell fit={q.fit} />
             <RunsCell fit={q.fit} />
             <QualityCell q={q} />
+            <MtpMark q={q} />
             {d.recommended === q.quant && (
               <span className="shrink-0 font-mono text-[10px] text-amber bg-amber/10 rounded px-1.5"
                     title="best quality that still runs at GPU speed here">

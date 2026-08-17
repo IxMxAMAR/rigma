@@ -133,9 +133,32 @@ export interface QuantRow {
   quality?: Quality | null;
   total?: TotalLoss | null;
   pull?: Pull | null;
+  /** Does THIS file carry the multi-token-prediction draft head? Per FILE:
+   *  whether MTP survives is the quantiser's decision per artefact, so the
+   *  model-level capability cannot answer it. null = not read yet. */
+  mtp?: boolean | null;
+  /** Bits per weight this file actually spends — bytes x 8 / parameters, both
+   *  counted. The honest cell for a repo whose own naming (I-Compact) has no
+   *  published quality figure. NOT a quality percentage. */
+  bpw?: number | null;
+  /** Set when the label's nominal bits/weight is not what the file spends —
+   *  a custom mix that kept its base format's name. */
+  label_drift?: { measured_bpw: number; label_bpw: number; drift_pct: number } | null;
 }
 
-export interface ModelCard {
+/** Facts probed from the gguf itself, shared by the library card and the
+ *  pre-download repo view so the two cannot disagree. */
+export interface ProbedFacts {
+  params?: number;
+  n_layers?: number;
+  full_attn_layers?: number;
+  mtp_layers?: number;
+  /** false = the gguf shipped no tokenizer.chat_template, so an empty
+   *  capability list is missing evidence rather than a finding. */
+  has_template?: boolean;
+}
+
+export interface ModelCard extends ProbedFacts {
   slug: string;
   family: string;
   kind: string;
@@ -166,7 +189,7 @@ export interface HfHit {
 
 /** hf_browse.inspect_repo — the pre-download view. Quant rows are shaped like
  *  QuantRow on purpose, so one component renders both this and /api/models. */
-export interface HfRepoDetail {
+export interface HfRepoDetail extends ProbedFacts {
   repo: string;
   name: string;
   family: string;
