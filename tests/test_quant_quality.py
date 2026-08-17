@@ -298,3 +298,50 @@ def test_overrides_never_mutate_the_shared_spec():
     quant_verdicts(spec, _prof(), kv="q4_0", vision=False)
     assert spec.mmproj is not None
     assert spec.cache_type_policy.k == "f16"
+
+
+# --- labels carrying a quanter's own decoration -------------------------------
+
+def test_a_prefixed_label_still_finds_its_format():
+    """jaromer ships RVN-Q6_K.gguf. Demanding an exact table match left every
+    row of that repo showing an em dash (owner, 2026-07-30). Enumerating every
+    quanter's invented prefix is a losing race, so the format token is found
+    INSIDE the label."""
+    for label, want in [("RVN-Q6_K", "Q6_K"), ("Q4_K_M (RVN)", "Q4_K_M"),
+                        ("FOO-IQ4_XS-BAR", "IQ4_XS"),
+                        ("Q3_K_M (QWEN3.8-27B-HE)", "Q3_K_M")]:
+        got, exp = quality_of(label), quality_of(want)
+        assert got is not None, label
+        assert got["ppl_pct"] == exp["ppl_pct"], (label, want)
+
+
+def test_longest_token_wins_so_bf16_is_not_read_as_f16():
+    # "F16" is a substring of "BF16"; they happen to share a loss figure, so
+    # compare the bits instead — a shorter-first search would be a silent bug
+    assert quality_of("RVN-BF16")["bpw"] == quality_of("BF16")["bpw"]
+    assert quality_of("RVN-Q2_K_L")["bpw"] == quality_of("Q2_K_L")["bpw"]
+    assert quality_of("RVN-Q2_K_L")["bpw"] != quality_of("Q2_K")["bpw"]
+
+
+def test_a_name_with_no_format_token_is_still_unpriced():
+    # the honest-answer guarantee must survive the substring search
+    for label in ("GGUF", "COMPACT", "QUALITY", "BALANCED", "APEX", "mmproj"):
+        assert quality_of(label) is None, label
+
+
+def test_a_colliding_tag_keeps_the_tag_at_the_front():
+    """Two files reducing to the same tag (RVN-Q4_K_M.gguf and
+    Qwen3.8-27B-Heretic-Q4_K_M.gguf) used to fall back to a bare filename core,
+    and truncating that to 24 chars ate the "_M" — leaving the row unreadable
+    AND unpriceable."""
+    labels = hangar._distinct_quants(
+        ["RVN-Q4_K_M.gguf", "Qwen3.8-27B-Heretic-Q4_K_M.gguf"])
+    assert len(set(labels)) == 2
+    assert all(x.startswith("Q4_K_M") for x in labels), labels
+    assert all(quality_of(x) is not None for x in labels)
+
+
+def test_prefixed_files_keep_their_distinct_formats():
+    files = ["RVN-Q6_K.gguf", "RVN-Q5_K_M.gguf", "RVN-IQ4_XS.gguf"]
+    # no collision here, so the plain tags come through untouched
+    assert hangar._distinct_quants(files) == ["Q6_K", "Q5_K_M", "IQ4_XS"]

@@ -79,6 +79,10 @@ _TABLE: dict[str, tuple[float, float, str]] = {
 }
 # fmt: on
 
+# longest first, so a substring search finds BF16 before F16 and UD-Q3_K_XL
+# before Q3_K_XL
+_BY_LEN = sorted(_TABLE, key=len, reverse=True)
+
 # ppl_pct -> a word, so the UI can colour it without re-deciding the thresholds
 _TIERS = ((0.15, "lossless"), (0.6, "excellent"), (1.2, "great"),
           (2.5, "good"), (5.0, "fair"), (10.0, "poor"))
@@ -98,17 +102,17 @@ def quality_of(quant: str) -> dict | None:
     guessing from the size would be fabrication."""
     key = (quant or "").strip().upper()
     row = _TABLE.get(key)
-    if row is None and key.startswith("UD-"):
-        row = _TABLE.get(key[3:])          # fall back to the plain format
     if row is None:
-        # an unlisted "_L"/"_XL" variant reads as its base format rather than
-        # as nothing: every quanter invents suffixes, and enumerating them all
-        # is a losing race. The base is a safe (slightly pessimistic) stand-in.
-        for suffix in ("_XL", "_L"):
-            if key.endswith(suffix):
-                row = _TABLE.get(key[: -len(suffix)])
-                if row:
-                    break
+        # A label may carry the quanter's own decoration — jaromer ships
+        # RVN-Q6_K.gguf, and a colliding tag makes _distinct_quants produce
+        # "Q4_K_M (RVN)". Find the LONGEST known format token inside the label
+        # instead of demanding an exact match: enumerating every quanter's
+        # invented prefix and suffix is a losing race. Longest-first matters —
+        # BF16 must win over F16, Q2_K_L over Q2_K, UD-Q3_K_XL over Q3_K_XL.
+        for cand in _BY_LEN:
+            if cand in key:
+                row = _TABLE[cand]
+                break
     if row is None:
         return None
     bpw, ppl, note = row
