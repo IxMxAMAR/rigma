@@ -360,3 +360,57 @@ def test_fuzzy_refuses_ambiguous_near_twins(tmp_path):
         "old": "The guard walked the east wall at midnight tonight.",
         "new": "x"}, ctx)
     assert out.startswith("error")                 # two candidates too close
+
+
+# --- short quotes: the case that produced a bare error with no help ----------
+# Live 2026-08-18 (owner screenshot): three consecutive edit_file failures on a
+# character sheet, each returning the bare "wasn't found EXACTLY" with NO
+# region hint. Measured against the real file afterwards: an `old` of 2-3 words
+# with ONE word drifted misses every rung — _flexible_find needs 3+ normalised
+# chars, _fuzzy_region needs 3+ words AND 0.75 similarity (a 3-word quote with
+# one word wrong scores ~0.67), and _nearest_region compares the probe against
+# a WHOLE line with SequenceMatcher.ratio(), which is dominated by the length
+# difference. 37 of 37 dash-bearing lines produced "NOTHING". A character sheet
+# is made of short fields, so this is the common case, not the exotic one.
+
+def test_a_short_drifted_quote_still_gets_a_region_hint(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "sheet.txt").write_text(
+        "Name: Seraphine Vale\n"
+        "Age: twenty-four winters\n"
+        "Focus: the silver thread\n", encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "sheet.txt", "old": "Age: thirty",   # 2 words, one drifted
+        "new": "Age: thirty"}, ctx)
+    assert out.startswith("error")
+    assert "closest" in out and "region" in out, \
+        "a short quote must still be told where to look"
+    assert "twenty-four" in out                   # the file's real text
+    assert "2:" in out                            # with a line number
+    # and nothing was written on a guess
+    assert "thirty" not in (ws / "sheet.txt").read_text(encoding="utf-8")
+
+
+def test_a_short_quote_hint_does_not_fire_on_nothing(tmp_path):
+    """A hint pointing at an unrelated line is worse than no hint — it sends
+    the model to rewrite the wrong place. Genuinely absent text gets the plain
+    error and the line-range advice."""
+    ctx, ws = _ctx(tmp_path)
+    (ws / "sheet.txt").write_text(
+        "Name: Seraphine Vale\nAge: twenty-four winters\n", encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "sheet.txt", "old": "Quartermaster requisition form",
+        "new": "x"}, ctx)
+    assert out.startswith("error")
+    assert "closest" not in out
+    assert "start_line" in out          # still steered to the route that works
+
+
+def test_a_single_word_miss_gets_a_hint_too(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "sheet.txt").write_text(
+        "Name: Seraphine Vale\nAge: twenty-four winters\n", encoding="utf-8")
+    out = tools.run_tool("edit_file", {
+        "path": "sheet.txt", "old": "Seraphina", "new": "Seraphine"}, ctx)
+    assert out.startswith("error")
+    assert "closest" in out and "Seraphine Vale" in out

@@ -1561,6 +1561,45 @@ def _region_lines(text: str, span: tuple, ratio: float) -> str:
             + excerpt + "\nCopy the EXACT text from there into 'old'.")
 
 
+def _word_affinity(old_words: list[str], line: str) -> float:
+    """How much of `old`'s wording this line carries, per word.
+
+    SequenceMatcher.ratio() over a whole line is dominated by LENGTH: a 2-word
+    quote compared against a 60-character line scores near zero even when one
+    of its two words is sitting right there. That is why a short `old` used to
+    fall past every rung to a bare "wasn't found EXACTLY" with no region shown
+    (live 2026-08-18: 37 of 37 short drifted quotes on the owner's character
+    sheet produced no hint at all, and the model burned three calls guessing).
+
+    Scoring per WORD instead removes the length bias, and matching each word
+    fuzzily catches the single-character typo — "Seraphina" for "Seraphine" —
+    that exact and token-set comparisons both miss.
+    """
+    import difflib
+    lw = [x for x in re.findall(r"\S+", line.lower()) if len(x) >= 4]
+    if not lw:
+        return 0.0
+    strong = 0
+    for w in old_words:
+        best = max(difflib.SequenceMatcher(None, w, x).ratio() for x in lw)
+        if best >= _HINT_WORD_MATCH:
+            strong += 1
+    return strong / len(old_words)
+
+
+# A word counts as "present" only when it is NEARLY the same word. Averaging
+# raw similarity does not work: SequenceMatcher scores ~0.5 between arbitrary
+# English words purely from shared letters, so an averaged score fired on 7 of
+# 10 deliberately unrelated probes when this was first measured — the hint
+# would have pointed at the wrong line more often than the right one. 0.8
+# accepts a typo ("Seraphina"/"Seraphine" = 0.89) and rejects coincidence.
+_HINT_WORD_MATCH = 0.8
+# ...and at least this share of the quote's words must be present. A hint is
+# advisory and never edits, but one aimed at an unrelated line is worse than
+# none, because it sends the model to rewrite the wrong place.
+_HINT_AFFINITY = 0.5
+
+
 def _nearest_region(text: str, old: str) -> str:
     """The closest-matching few lines of the file, so the model can correct
     its 'old' text in ONE turn instead of burning a read_file round-trip."""
@@ -1575,7 +1614,20 @@ def _nearest_region(text: str, old: str) -> str:
         if r > best_r:
             best_i, best_r = i, r
     if best_i < 0 or best_r < 0.55:
-        return ""
+        # Whole-line similarity failed. For a SHORT quote that is expected
+        # rather than meaningful, so ask the length-independent question
+        # instead: does some line carry these words?
+        old_words = [w for w in re.findall(r"\S+", old.lower())[:12]
+                     if len(w) >= 3]
+        if not old_words:
+            return ""
+        best_i, best_a = -1, 0.0
+        for i, line in enumerate(lines[:5000]):
+            a = _word_affinity(old_words, line)
+            if a > best_a:
+                best_i, best_a = i, a
+        if best_i < 0 or best_a < _HINT_AFFINITY:
+            return ""
     lo, hi = max(0, best_i - 2), min(len(lines), best_i + 3)
     excerpt = "\n".join(f"{j + 1}: {lines[j][:160]}" for j in range(lo, hi))
     return ("\nThe closest matching region in the file is:\n" + excerpt
