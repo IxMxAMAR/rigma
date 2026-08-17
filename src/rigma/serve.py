@@ -1917,10 +1917,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return None
 
     @app.get("/api/models")
-    async def models_list():
+    async def models_list(kv: str = "", vision: int = 1, grow: str = "speed"):
+        """`kv`, `vision` and `grow` are the explorer's knobs — see
+        resolve.quant_verdicts. They only change what the fit math ASSUMES;
+        nothing is launched or written, so the page can be driven freely."""
         from . import hangar
         prof = await asyncio.to_thread(_profile_for_fit)
-        out = await asyncio.to_thread(hangar.list_models, registry, prof)
+        out = await asyncio.to_thread(
+            lambda: hangar.list_models(registry, prof, kv=kv,
+                                       vision=bool(vision), grow=grow))
+        out["config"] = {"kv": kv, "vision": bool(vision), "grow": grow}
         now = _now()
 
         def _with_rate(item):

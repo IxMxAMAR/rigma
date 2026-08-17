@@ -167,3 +167,134 @@ def test_the_models_page_and_the_hf_page_use_one_fit_implementation():
     assert hasattr(resolve, "quant_verdicts")
     assert "quant_verdicts" in inspect.getsource(hf_browse.inspect_repo)
     assert "quant_verdicts" in inspect.getsource(hangar.list_models)
+
+
+# --- combined loss and the explorer knobs ------------------------------------
+
+def test_total_loss_composes_weights_and_cache():
+    from rigma.quant_quality import kv_loss, total_loss
+    t = total_loss("Q4_K_M", "f16")
+    assert t["kv_pct"] == 0.0
+    assert t["total_pct"] == pytest.approx(t["weights_pct"], abs=0.01)
+    # a lossy cache must make the TOTAL worse than the weights alone
+    worse = total_loss("Q4_K_M", "q4_0")
+    assert worse["total_pct"] > t["total_pct"]
+    # ratios, not a plain sum
+    w, c = worse["weights_pct"] / 100, worse["kv_pct"] / 100
+    assert worse["total_pct"] == pytest.approx(((1 + w) * (1 + c) - 1) * 100,
+                                               abs=0.01)
+    # K is weighted above V, so the split sits between the two symmetric cases
+    assert kv_loss("q8_0") < kv_loss("q8_0", "q4_0") < kv_loss("q4_0")
+
+
+def test_bf16_weights_with_f16_cache_is_the_zero_point():
+    from rigma.quant_quality import total_loss
+    assert total_loss("BF16", "f16")["total_pct"] == 0.0
+
+
+def test_total_loss_is_none_for_an_unknown_label_or_cache():
+    from rigma.quant_quality import total_loss
+    assert total_loss("I-COMPACT", "q8_0") is None
+    assert total_loss("Q4_K_M", "not_a_cache") is None
+
+
+def _prof():
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    return HardwareProfile(
+        gpus=[GpuInfo(vendor="amd", name="RX", vram_mb=16304,
+                      backends=["vulkan"])],
+        ram_mb=32768, ram_free_mb=24000, cpu=CpuInfo(cores=16),
+        os="windows", disk_free_gb=400.0)
+
+
+def _hybrid_spec(file_gb, mmproj_gb=0.0):
+    from rigma.models import CachePolicy, GgufFile, ModelSpec
+    mm = (GgufFile(repo="r", file="mm.gguf", bytes=int(mmproj_gb * 2**30),
+                   quant="mmproj") if mmproj_gb else None)
+    return ModelSpec(
+        slug="t", family="t", kind="dense", n_layers=65, full_attn_layers=16,
+        kv_heads=4, head_dim=256, native_ctx=262144,
+        cache_type_policy=CachePolicy(),
+        ggufs=[GgufFile(repo="r", file="a.gguf",
+                        bytes=int(file_gb * 2**30), quant="Q3_K_M")],
+        mmproj=mm)
+
+
+def test_dropping_vision_frees_context():
+    """The projector is permanently resident and counted whether or not an image
+    is ever sent — 888MB on Qwen3.8-27B, which was 4x the context."""
+    from rigma.resolve import quant_verdicts
+    spec, prof = _hybrid_spec(12.5, mmproj_gb=0.87), _prof()
+    with_v = quant_verdicts(spec, prof)[0]
+    without = quant_verdicts(spec, prof, vision=False)[0]
+    assert without["ctx"] > with_v["ctx"]
+    assert without["budget"]["mmproj_mb"] == 0
+    assert with_v["budget"]["mmproj_mb"] > 800
+
+
+def test_a_cheaper_cache_buys_context():
+    from rigma.resolve import kv_bytes_per_token, quant_verdicts
+    spec, prof = _hybrid_spec(11.0), _prof()
+    f16 = quant_verdicts(spec, prof, kv="f16")[0]
+    q40 = quant_verdicts(spec, prof, kv="q4_0")[0]
+    assert q40["ctx"] > f16["ctx"]
+    # per TOKEN it is cheaper; in absolute MB it is not, because the cheaper
+    # cache is immediately spent on a bigger window
+    assert (kv_bytes_per_token(spec, "q4_0", "q4_0")
+            < kv_bytes_per_token(spec, "f16", "f16"))
+
+
+def test_an_explicit_cache_choice_is_not_silently_replaced():
+    """Without the pin, _cache_candidates falls back to q8_0 and f16 / q5_1 /
+    q4_0 all reported the identical verdict — the explorer answered a question
+    nobody asked."""
+    from rigma.resolve import quant_verdicts
+    spec, prof = _hybrid_spec(11.0), _prof()
+    for want in ("f16", "q8_0", "q5_1", "q4_0"):
+        v = quant_verdicts(spec, prof, kv=want)[0]
+        assert v["kv"] == want and v["kv_v"] == want, (want, v)
+
+
+def test_k_and_v_are_always_symmetric():
+    """ComboFlags._symmetric_kv normalises them on purpose: llama.cpp's fused
+    flash-attention kernel only fires when ctk == ctv, and a mismatch silently
+    drops to a slow non-fused path (RDNA4, 2026-07-17). So an asymmetric
+    request must come back symmetric rather than appear to be honoured."""
+    from rigma.resolve import quant_verdicts
+    v = quant_verdicts(_hybrid_spec(11.0), _prof(), kv="q8_0,q4_0")[0]
+    assert v["kv"] == v["kv_v"]
+
+
+def test_context_policy_spends_layers_but_stays_bounded():
+    """The budget is measured from the START, not per doubling — a per-rung
+    allowance is spent again at every rung and quietly offloaded 26 layers."""
+    from rigma.resolve import _GROW_LAYER_BUDGET, quant_verdicts
+    spec, prof = _hybrid_spec(13.6), _prof()
+    speed = quant_verdicts(spec, prof, grow="speed")[0]
+    ctxp = quant_verdicts(spec, prof, grow="context")[0]
+    assert ctxp["ctx"] >= speed["ctx"]
+    assert ctxp["offload_pct"] <= round(_GROW_LAYER_BUDGET * 100) + 1
+
+
+def test_the_ngl_sentinel_is_not_differenced_raw():
+    """ngl=99 means "all layers", so 99 -> 62 of 65 is 3 layers lost, not 37.
+    Differencing the sentinel made the context policy refuse every trade."""
+    from rigma.resolve import quant_verdicts
+    v = quant_verdicts(_hybrid_spec(12.5), _prof(), grow="context")[0]
+    assert v["offload_pct"] <= 20, v
+
+
+def test_budget_rows_add_up():
+    from rigma.resolve import quant_verdicts
+    b = quant_verdicts(_hybrid_spec(12.5, 0.87), _prof())[0]["budget"]
+    total = b["file_mb"] + b["mmproj_mb"] + b["kv_mb"]
+    assert b["over_mb"] == pytest.approx(total - b["budget_mb"], abs=2)
+
+
+def test_overrides_never_mutate_the_shared_spec():
+    """kv/vision come from a query string; the registry object is process-wide."""
+    from rigma.resolve import quant_verdicts
+    spec = _hybrid_spec(11.0, 0.87)
+    quant_verdicts(spec, _prof(), kv="q4_0", vision=False)
+    assert spec.mmproj is not None
+    assert spec.cache_type_policy.k == "f16"
