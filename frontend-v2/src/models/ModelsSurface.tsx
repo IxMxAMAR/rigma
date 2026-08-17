@@ -117,8 +117,7 @@ function QualityCell({ q }: { q: QuantRow }) {
                (k ? `${k.note}. ${k.bpw} bits/weight.\n\n` : "") +
                "Reference figures for the FORMATS, mostly from 7B-13B " +
                "LLaMA-family evals — NOT measured on this model. Larger models " +
-               "lose less, so treat it as a pessimistic upper bound. The K:V " +
-               "split of the cache term is weighted 2:1, an approximation."}
+               "lose less, so treat it as a pessimistic upper bound."}
       >
         <span className={TIER[t.tier] ?? "text-secondary"}>≈{pct}%</span>
         <span className="text-muted">{t.tier}</span>

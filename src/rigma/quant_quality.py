@@ -133,9 +133,13 @@ def quality_of(quant: str) -> dict | None:
 #     history — so it compounds with sequence length, which is exactly when
 #     you wanted the long context.
 #
-# K is weighted more heavily than V below because K feeds the softmax: K error
-# perturbs WHICH token is attended to, while V error only blurs the value
-# retrieved. llama.cpp practice is to hold K at q8_0 and quantise V harder.
+# ONE figure per cache type, not a K/V pair. Rigma always runs K and V at the
+# same precision — ComboFlags._symmetric_kv enforces it, because llama.cpp's
+# fused flash-attention kernel only fires when ctk == ctv and a mismatch
+# silently drops to a much slower path (RDNA4, 2026-07-17). An earlier version
+# of this module carried a 2:1 K-over-V weighting for asymmetric pairs; that
+# arithmetic could never run, and the tooltip describing it was telling the
+# user about a trade the program does not offer.
 _KV_PPL = {
     "f16":  0.00,
     "bf16": 0.00,
@@ -145,21 +149,14 @@ _KV_PPL = {
     "q4_1": 0.90,
     "q4_0": 1.80,
 }
-_K_WEIGHT = 2 / 3      # K carries two-thirds of the cache's contribution
 
 
-def kv_loss(k: str, v: str | None = None) -> float | None:
-    """Reference % perplexity increase for a KV cache type, vs an f16 cache.
-    Asymmetric pairs are weighted K:V = 2:1 — an approximation, and flagged as
-    one wherever it is shown."""
-    v = v or k
-    a, b = _KV_PPL.get((k or "").lower()), _KV_PPL.get((v or "").lower())
-    if a is None or b is None:
-        return None
-    return round(a * _K_WEIGHT + b * (1 - _K_WEIGHT), 3)
+def kv_loss(kv: str) -> float | None:
+    """Reference % perplexity increase for a KV cache type, vs an f16 cache."""
+    return _KV_PPL.get((kv or "").lower())
 
 
-def total_loss(quant: str, kv_k: str, kv_v: str | None = None) -> dict | None:
+def total_loss(quant: str, kv: str) -> dict | None:
     """Everything given up vs the true reference: BF16 weights + f16 cache.
 
     The two sources are independent, so their perplexity RATIOS compose rather
@@ -170,9 +167,11 @@ def total_loss(quant: str, kv_k: str, kv_v: str | None = None) -> dict | None:
     This is the number worth comparing across rows — a Q3 model with a q4_0
     cache and a Q6 model with an f16 cache are two different totals, and the
     weight column alone cannot tell you which you are actually running.
+
+    One cache argument, because K and V always match — see _KV_PPL.
     """
     w = quality_of(quant)
-    c = kv_loss(kv_k, kv_v)
+    c = kv_loss(kv)
     if w is None or c is None:
         return None
     total = ((1 + w["ppl_pct"] / 100) * (1 + c / 100) - 1) * 100

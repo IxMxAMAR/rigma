@@ -4,6 +4,8 @@ Owner report 2026-07-30: 21 quants offered with nothing but a file size to
 choose between them, no "does this fit my VRAM", no context per quant, and one
 model whose three rows all read "GGUF".
 """
+import pathlib
+
 import pytest
 
 from rigma import hangar
@@ -183,8 +185,7 @@ def test_total_loss_composes_weights_and_cache():
     w, c = worse["weights_pct"] / 100, worse["kv_pct"] / 100
     assert worse["total_pct"] == pytest.approx(((1 + w) * (1 + c) - 1) * 100,
                                                abs=0.01)
-    # K is weighted above V, so the split sits between the two symmetric cases
-    assert kv_loss("q8_0") < kv_loss("q8_0", "q4_0") < kv_loss("q4_0")
+    assert kv_loss("q8_0") < kv_loss("q4_0")
 
 
 def test_bf16_weights_with_f16_cache_is_the_zero_point():
@@ -258,11 +259,27 @@ def test_an_explicit_cache_choice_is_not_silently_replaced():
 def test_k_and_v_are_always_symmetric():
     """ComboFlags._symmetric_kv normalises them on purpose: llama.cpp's fused
     flash-attention kernel only fires when ctk == ctv, and a mismatch silently
-    drops to a slow non-fused path (RDNA4, 2026-07-17). So an asymmetric
-    request must come back symmetric rather than appear to be honoured."""
+    drops to a slow non-fused path (RDNA4, 2026-07-17). Every verdict must come
+    back symmetric — an asymmetric one could never be launched."""
     from rigma.resolve import quant_verdicts
-    v = quant_verdicts(_hybrid_spec(11.0), _prof(), kv="q8_0,q4_0")[0]
-    assert v["kv"] == v["kv_v"]
+    for kv in ("", "f16", "q8_0", "q4_0"):
+        for v in quant_verdicts(_hybrid_spec(11.0), _prof(), kv=kv):
+            if v["ok"]:
+                assert v["kv"] == v["kv_v"], (kv, v)
+
+
+def test_kv_loss_takes_one_cache_type():
+    """The module used to weight an asymmetric K:V pair 2:1 and the tooltip
+    described it — arithmetic that could never run, about a trade rigma does
+    not offer."""
+    import inspect
+
+    from rigma import quant_quality
+    assert len(inspect.signature(quant_quality.kv_loss).parameters) == 1
+    assert "_K_WEIGHT" not in dir(quant_quality)
+    ui = (pathlib.Path(__file__).parent.parent / "frontend-v2" / "src"
+          / "models" / "ModelsSurface.tsx").read_text(encoding="utf-8")
+    assert "2:1" not in ui, "the tooltip still describes a weighting that cannot apply"
 
 
 def test_context_policy_spends_layers_but_stays_bounded():

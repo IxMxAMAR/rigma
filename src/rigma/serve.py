@@ -1897,6 +1897,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         post-add view."""
         from . import hangar
         from . import hf_browse
+        bad = _bad_kv(kv)
+        if bad:
+            return JSONResponse({"error": bad}, status_code=400)
         prof = await asyncio.to_thread(_profile_for_fit)
         try:
             return await asyncio.to_thread(
@@ -1944,12 +1947,33 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             _log.exception("models: hardware probe failed; fit omitted")
             return None
 
+    def _bad_kv(kv: str):
+        """The explorer takes ONE cache type. K and V are always the same —
+        ComboFlags._symmetric_kv enforces it because llama.cpp's fused
+        flash-attention kernel only fires when ctk == ctv. Accepting "q8_0,q4_0"
+        and normalising it silently would show a verdict for a configuration
+        rigma will not run."""
+        if "," in kv:
+            return ("K and V always use the same cache type here — llama.cpp's "
+                    "fused flash-attention only fires when they match. Pass one "
+                    "of: " + ", ".join(server_ops_kv_types()))
+        if kv and kv not in server_ops_kv_types():
+            return "kv must be one of " + ", ".join(server_ops_kv_types())
+        return None
+
+    def server_ops_kv_types():
+        from . import server_ops
+        return server_ops.KV_CACHE_TYPES
+
     @app.get("/api/models")
     async def models_list(kv: str = "", vision: int = 1, grow: str = "speed"):
         """`kv`, `vision` and `grow` are the explorer's knobs — see
         resolve.quant_verdicts. They only change what the fit math ASSUMES;
         nothing is launched or written, so the page can be driven freely."""
         from . import hangar
+        bad = _bad_kv(kv)
+        if bad:
+            return JSONResponse({"error": bad}, status_code=400)
         prof = await asyncio.to_thread(_profile_for_fit)
         out = await asyncio.to_thread(
             lambda: hangar.list_models(registry, prof, kv=kv,
