@@ -71,6 +71,8 @@ def _cache_candidates(spec: ModelSpec):
     bottleneck — but dropping context to 8K to protect it very much is a real
     cost. Trying it before giving up context is close to free."""
     k, v = spec.cache_type_policy.k, spec.cache_type_policy.v
+    if spec.cache_type_policy.pinned:
+        return [(k, v)]          # explorer: answer the question that was asked
     out = [(k, v)]
     if (k, v) != ("q8_0", "q8_0"):
         out.append(("q8_0", "q8_0"))
@@ -129,12 +131,13 @@ def _backend(profile: HardwareProfile) -> str:
 
 
 def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
-              flags: ComboFlags, explain: list[str]) -> ComboFlags:
+              flags: ComboFlags, explain: list[str],
+              layer_budget: float = 0.0) -> ComboFlags:
     """Calculator plans only: double ctx while it still fits, up to native.
 
     CTX_DEFAULT is a starting probe, not a ceiling (owner finding 2026-07-16:
     the old cap silently wasted VRAM that could hold 4-8x more context)."""
-    best = flags
+    best = start = flags
     ctx = best.ctx * 2
     while ctx <= spec.native_ctx:
         grown = fit_gguf(spec, gguf, profile, ctx, explain)
@@ -146,11 +149,28 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         # as long as it still fits (the 35B is verified healthy at 262K ctx
         # with expert offload: 56.7 t/s). Guarding MoE here capped qwen3.6 at
         # 32K when it runs fine at 256K (owner, 2026-07-18).
-        if grown.ngl < best.ngl or (spec.moe is None
-                                    and grown.n_cpu_moe > best.n_cpu_moe):
+        # layer_budget > 0 buys the doubling anyway, up to that share of the
+        # layers. The default 0.0 is the historical rule: never trade a layer.
+        # It was set when a KV cache cost 4x what a hybrid-attention model's
+        # actually does, and it silently reports the smaller window — UD-Q3_K_XL
+        # missed 16K by 46MB and simply displayed 8K (owner, 2026-07-30).
+        #
+        # Measured against `start`, not the previous step: a per-doubling budget
+        # is spent again at every rung, so 8K->64K quietly offloaded 26 layers
+        # on a 15% allowance. And ngl is a SENTINEL (99 = "all"), so it has to
+        # be clamped to n_layers before differencing or "all -> 62 of 65" reads
+        # as 37 layers lost instead of 3.
+        cap = spec.n_layers or 99
+        lost = max(0, min(start.ngl, cap) - min(grown.ngl, cap))
+        allowed = int(cap * layer_budget)
+        if (lost > allowed) or (spec.moe is None
+                                and grown.n_cpu_moe > best.n_cpu_moe):
             explain.append(f"grow-to-fit: stop at ctx {best.ctx} "
                            f"(ctx {ctx} would push weights off the GPU)")
             break
+        if lost:
+            explain.append(f"grow-to-fit: spending {lost} of {cap} GPU layers "
+                           f"to reach ctx {ctx} (budget {allowed})")
         explain.append(f"grow-to-fit: ctx {best.ctx} -> {ctx} "
                        f"(n_cpu_moe {best.n_cpu_moe} -> {grown.n_cpu_moe})")
         best = grown
@@ -158,30 +178,48 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     return best
 
 
-def quant_verdicts(spec: ModelSpec, profile: HardwareProfile) -> list[dict]:
-    """Per-quant "does it fit, at what context, how fast" for one model.
+def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
+                   kv: str = "", vision: bool = True,
+                   grow: str = "speed") -> list[dict]:
+    """Per-quant verdicts, with the three things that were fixed constants.
 
+    Every number this returned was computed under one hidden configuration —
+    the spec's own cache policy, the vision projector always resident, and a
+    growth rule that never trades a GPU layer for context. Each of those is a
+    real choice with a real cost, and presenting one of them as the answer made
+    the page read as a wall (owner, 2026-07-30).
+
+      kv      "" keeps the spec's policy ladder; or force f16/q8_0/q5_1/q4_0,
+              or "k,v" for an asymmetric pair such as "q8_0,q4_0".
+      vision  False drops the mmproj. It is permanently resident and counted
+              whether or not an image is ever sent — 888MB on Qwen3.8-27B,
+              which is 4x the context on a 16GB card.
+      grow    "speed" stops growing context at the first GPU layer it would
+              cost (the long-standing default). "context" spends up to
+              _GROW_LAYER_BUDGET of the layers for each doubling.
     ONE implementation, deliberately: this ran only inside hf_browse's
     pre-download browser, so the Models page — the page you actually pick a
     quant from — showed a bare size and nothing else. Two copies of this
     arithmetic would drift, and a fit verdict that disagrees with itself
     between two screens is worse than none.
-
-    Each verdict is {ok, ctx, n_cpu_moe, speed}. `speed` is how much of the
-    model sits on the GPU, because weights spilled to RAM run on the CPU every
-    token: a bigger quant that only "fits" via heavy offload is SLOWER, not
-    better, and the size column alone hides that completely.
     """
+    spec = _configured(spec, kv=kv, vision=vision)
+    usable_vram, _ = _budgets(profile)
+    mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
     out = []
     for g in spec.ggufs:
         flags = None
         for ctx in (8192, 4096, 2048):
             flags = fit_gguf(spec, g, profile, ctx, [])
             if flags:
-                flags = _grow_ctx(spec, g, profile, flags, [])
+                flags = _grow_ctx(spec, g, profile, flags, [],
+                                  layer_budget=(_GROW_LAYER_BUDGET
+                                                if grow == "context" else 0.0))
                 break
         if flags is None:
-            out.append({"ok": False, "speed": "no", "offload_pct": 100})
+            out.append({"ok": False, "speed": "no", "offload_pct": 100,
+                        "budget": _budget_rows(spec, g, mm_mb, 8192,
+                                               usable_vram)})
             continue
         # The spill fraction comes from the PLAN the resolver actually made —
         # ngl for dense, n_cpu_moe for MoE — not from comparing the file to
@@ -200,9 +238,57 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile) -> list[dict]:
         speed = "gpu" if spill <= 0.001 else ("light" if spill <= 0.15
                                               else "offload")
         out.append({"ok": True, "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe,
-                    "ngl": flags.ngl, "kv": f"{flags.cache_type_k}",
-                    "offload_pct": round(spill * 100), "speed": speed})
+                    "ngl": flags.ngl, "kv": flags.cache_type_k,
+                    "kv_v": flags.cache_type_v,
+                    "offload_pct": round(spill * 100), "speed": speed,
+                    "budget": _budget_rows(spec, g, mm_mb, flags.ctx,
+                                           usable_vram,
+                                           flags.cache_type_k,
+                                           flags.cache_type_v)})
     return out
+
+
+# How much of the model the "context" growth policy may push off the GPU for
+# each doubling of the window. 0.15 = up to 15% of the layers; the "speed"
+# policy uses 0.0, which is the historical behaviour (never trade a layer).
+_GROW_LAYER_BUDGET = 0.15
+
+
+def _configured(spec: ModelSpec, *, kv: str = "",
+                vision: bool = True) -> ModelSpec:
+    """A copy of `spec` with the cache policy and vision projector overridden.
+
+    A copy, not a mutation: these come from a query string and must not leak
+    into the registry object the rest of the process is sharing."""
+    if not kv and vision:
+        return spec
+    s = spec.model_copy(deep=True)
+    if kv:
+        k, _, v = kv.partition(",")
+        s.cache_type_policy.k = k.strip() or s.cache_type_policy.k
+        s.cache_type_policy.v = (v.strip() or k.strip()
+                                 or s.cache_type_policy.v)
+        # asked for explicitly, so do not quietly fall back to q8_0 — that made
+        # f16 / q5_1 / q4_0 all report the identical verdict
+        s.cache_type_policy.pinned = True
+    if not vision:
+        s.mmproj = None
+    return s
+
+
+def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
+                 usable_vram: float, k: str = "", v: str = "") -> dict:
+    """Where the VRAM actually goes, in MB. The whole point of the explorer is
+    that a single "8K" tells you nothing about WHY — this is the arithmetic
+    behind it, so a 46MB near-miss reads as a near-miss."""
+    k = k or spec.cache_type_policy.k
+    v = v or spec.cache_type_policy.v
+    kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20
+    file_mb = gguf.bytes / 2**20
+    return {"file_mb": round(file_mb), "mmproj_mb": round(mm_mb),
+            "kv_mb": round(kv_mb), "budget_mb": round(usable_vram),
+            "over_mb": round(file_mb + mm_mb + kv_mb - usable_vram),
+            "ctx": ctx, "kv_type": k if k == v else f"{k}/{v}"}
 
 
 def recommended_quant(quants: list[dict]) -> str | None:

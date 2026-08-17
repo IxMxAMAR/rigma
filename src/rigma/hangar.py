@@ -233,7 +233,8 @@ def _running_files(state: dict | None, reg) -> set[str]:
     return out
 
 
-def list_models(registry=None, profile=None) -> dict:
+def list_models(registry=None, profile=None, *, kv: str = "",
+                vision: bool = True, grow: str = "speed") -> dict:
     from . import state as st
     from .registry import Registry
     reg = registry if registry is not None else Registry.load()
@@ -254,17 +255,22 @@ def list_models(registry=None, profile=None) -> dict:
         if profile is not None:
             try:
                 from .resolve import quant_verdicts
-                fits = quant_verdicts(spec, profile)
+                fits = quant_verdicts(spec, profile, kv=kv, vision=vision,
+                                      grow=grow)
             except Exception:
                 pass         # a fit we can't compute must not blank the page
-        from .quant_quality import quality_of
+        from .quant_quality import quality_of, total_loss
         quants = []
         for g, label, fit in zip(spec.ggufs, labels, fits):
             on_disk = (mdir / g.file).exists()
             used += g.bytes if on_disk else 0
             # reference quality for the FORMAT — None when the repo uses its own
             # naming (I-Compact etc.), because no published figure exists for
-            # those and inventing one from a file size would be fabrication
+            # those and inventing one from a file size would be fabrication.
+            # `total` folds in the KV cache actually chosen, so the number is
+            # against the true reference: BF16 weights + f16 cache.
+            k = fit.get("kv") or spec.cache_type_policy.k
+            v = fit.get("kv_v") or spec.cache_type_policy.v
             quants.append({"file": g.file, "quant": label,
                            "bytes": g.bytes, "on_disk": on_disk,
                            # HF-added models have a real repo (downloadable);
@@ -272,6 +278,7 @@ def list_models(registry=None, profile=None) -> dict:
                            "pullable": g.repo != "local",
                            "fit": fit,
                            "quality": quality_of(label),
+                           "total": total_loss(label, k, v),
                            "pull": _PULLS.get(f"{slug}::{g.file}")})
         mm = None
         if spec.mmproj is not None:

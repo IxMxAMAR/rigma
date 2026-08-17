@@ -96,6 +96,67 @@ def quality_of(quant: str) -> dict | None:
             "basis": "reference"}
 
 
+# KV-cache quantisation, same footing as the weight table above: published
+# reference figures for the FORMAT, as a % perplexity increase over an f16
+# cache. Much smaller numbers than the weight table because the cache is a
+# smaller share of the error budget — but they behave differently, and the
+# difference matters when choosing:
+#
+#   * weight error is baked in once, offline, with per-block scales and
+#     importance weighting from imatrix calibration;
+#   * cache error is applied per token AS IT IS WRITTEN, with plain
+#     round-to-nearest, and every later token attends over the whole degraded
+#     history — so it compounds with sequence length, which is exactly when
+#     you wanted the long context.
+#
+# K is weighted more heavily than V below because K feeds the softmax: K error
+# perturbs WHICH token is attended to, while V error only blurs the value
+# retrieved. llama.cpp practice is to hold K at q8_0 and quantise V harder.
+_KV_PPL = {
+    "f16":  0.00,
+    "bf16": 0.00,
+    "q8_0": 0.06,
+    "q5_1": 0.35,
+    "q5_0": 0.60,
+    "q4_1": 0.90,
+    "q4_0": 1.80,
+}
+_K_WEIGHT = 2 / 3      # K carries two-thirds of the cache's contribution
+
+
+def kv_loss(k: str, v: str | None = None) -> float | None:
+    """Reference % perplexity increase for a KV cache type, vs an f16 cache.
+    Asymmetric pairs are weighted K:V = 2:1 — an approximation, and flagged as
+    one wherever it is shown."""
+    v = v or k
+    a, b = _KV_PPL.get((k or "").lower()), _KV_PPL.get((v or "").lower())
+    if a is None or b is None:
+        return None
+    return round(a * _K_WEIGHT + b * (1 - _K_WEIGHT), 3)
+
+
+def total_loss(quant: str, kv_k: str, kv_v: str | None = None) -> dict | None:
+    """Everything given up vs the true reference: BF16 weights + f16 cache.
+
+    The two sources are independent, so their perplexity RATIOS compose rather
+    than add: (1+w)(1+c) - 1. At these magnitudes that is within a whisker of
+    w + c, but it stays correct if either term gets large (a 2-bit weight quant
+    with a q4_0 cache is not a small correction).
+
+    This is the number worth comparing across rows — a Q3 model with a q4_0
+    cache and a Q6 model with an f16 cache are two different totals, and the
+    weight column alone cannot tell you which you are actually running.
+    """
+    w = quality_of(quant)
+    c = kv_loss(kv_k, kv_v)
+    if w is None or c is None:
+        return None
+    total = ((1 + w["ppl_pct"] / 100) * (1 + c / 100) - 1) * 100
+    return {"weights_pct": w["ppl_pct"], "kv_pct": c,
+            "total_pct": round(total, 2), "tier": tier_for(total),
+            "basis": "reference"}
+
+
 def size_vs_bf16(quant: str, nbytes: int) -> float | None:
     """This file as a fraction of what BF16 would weigh, from the format's bits
     per weight. Exact arithmetic on a nominal bpw — so it is a good size ratio

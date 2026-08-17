@@ -2,7 +2,8 @@
 // HF search-and-add. Polls fast only while a download is actually running.
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  engineApi, eta, gb, type HfHit, type ModelCard, type QuantRow,
+  DEFAULT_FIT, engineApi, eta, gb,
+  type FitConfig, type HfHit, type ModelCard, type QuantRow,
 } from "../lib/engineApi";
 
 function PullBar({ q }: { q: QuantRow }) {
@@ -34,6 +35,27 @@ const SPEED: Record<string, { dot: string; text: string; label: string; hint: st
   no:      { dot: "bg-red/70", text: "text-red",  label: "too big", hint: "does not fit this machine, even at minimum context" },
 };
 
+/** The arithmetic behind a single "8K". A bare number cannot show that a
+ *  doubling was missed by 46MB, or that 888MB of it went to a vision projector
+ *  you may not want. */
+function budgetHint(fit?: QuantRow["fit"]): string {
+  const b = fit?.budget;
+  if (!b) {
+    return fit?.ok ? "fits this machine" : "does not fit this machine";
+  }
+  const L = [
+    `weights        ${b.file_mb.toLocaleString()} MB`,
+    ...(b.mmproj_mb ? [`vision proj    ${b.mmproj_mb.toLocaleString()} MB  (always resident)`] : []),
+    `KV @ ${K(b.ctx)} ${b.kv_type}   ${b.kv_mb.toLocaleString()} MB`,
+    `──`,
+    `VRAM budget    ${b.budget_mb.toLocaleString()} MB`,
+    b.over_mb > 0
+      ? `OVER by        ${b.over_mb.toLocaleString()} MB → that much spills to RAM`
+      : `headroom       ${(-b.over_mb).toLocaleString()} MB`,
+  ];
+  return L.join("\n");
+}
+
 /** Context this quant can actually hold here — its own column, because it is
  *  the number people compare across quants and it must line up to be read. */
 function CtxCell({ fit }: { fit?: QuantRow["fit"] }) {
@@ -42,10 +64,7 @@ function CtxCell({ fit }: { fit?: QuantRow["fit"] }) {
     <span
       className={`w-[46px] shrink-0 text-right font-mono text-[11px] whitespace-nowrap ${
         has ? "text-secondary" : "text-muted/50"}`}
-      title={has
-        ? `fits ${fit!.ctx!.toLocaleString()} tokens of context at this quant` +
-          (fit!.kv ? ` (${fit!.kv} KV cache)` : "")
-        : "no context — this quant does not fit"}
+      title={budgetHint(fit)}
     >
       {has ? K(fit!.ctx!) : "—"}
     </span>
@@ -80,7 +99,31 @@ const TIER: Record<string, string> = {
  *  measurement of this model — hence the "≈" and the tooltip. A blank cell is
  *  the honest rendering for a repo whose own naming has no published data. */
 function QualityCell({ q }: { q: QuantRow }) {
+  const t = q.total;
   const k = q.quality;
+  // Prefer the TOTAL: weights alone understates what you are running. A Q3 with
+  // a q4_0 cache and a Q3 with an f16 cache are two different numbers, and the
+  // weight column is identical for both.
+  if (t) {
+    const pct = t.total_pct < 0.1 ? "<0.1" : t.total_pct.toFixed(t.total_pct < 10 ? 1 : 0);
+    return (
+      <span
+        className="w-[96px] shrink-0 font-mono text-[11px] flex items-center gap-1 whitespace-nowrap"
+        title={`≈${t.total_pct}% worse than BF16 weights + f16 cache.\n` +
+               `  weights (${q.quant}): ≈${t.weights_pct}%\n` +
+               `  KV cache: ≈${t.kv_pct}%\n` +
+               `  composed as ratios, not added.\n\n` +
+               (k ? `${k.note}. ${k.bpw} bits/weight.\n\n` : "") +
+               "Reference figures for the FORMATS, mostly from 7B-13B " +
+               "LLaMA-family evals — NOT measured on this model. Larger models " +
+               "lose less, so treat it as a pessimistic upper bound. The K:V " +
+               "split of the cache term is weighted 2:1, an approximation."}
+      >
+        <span className={TIER[t.tier] ?? "text-secondary"}>≈{pct}%</span>
+        <span className="text-muted">{t.tier}</span>
+      </span>
+    );
+  }
   if (!k) {
     return (
       <span className="w-[96px] shrink-0 font-mono text-[11px] text-muted/50"
@@ -315,8 +358,87 @@ function HfSearch({ onAdded }: { onAdded: () => void }) {
   );
 }
 
+/** The knobs the fit math used to hide. Each one is a real choice with a real
+ *  cost, and the page previously picked one silently and showed the result as
+ *  if it were the only answer. Nothing here launches or saves anything — it
+ *  changes what the arithmetic ASSUMES, so it is safe to play with. */
+function FitControls({ cfg, onChange }: {
+  cfg: FitConfig; onChange: (c: FitConfig) => void;
+}) {
+  const sel = "rounded bg-surface px-1.5 py-0.5 font-mono text-[11px] outline-none";
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-lg bg-panel px-4 py-2">
+      <span className="font-mono text-[10px] text-muted uppercase tracking-[0.08em]">
+        assume
+      </span>
+
+      <label className="flex items-center gap-1.5 font-mono text-[11px] text-secondary"
+             title={"KV cache precision. Halving it roughly doubles the context " +
+                    "that fits — but unlike weight error, cache error is applied " +
+                    "per token as it is written and every later token attends " +
+                    "over the degraded history, so it compounds with sequence " +
+                    "length.\n\nK and V are always the same type here: " +
+                    "llama.cpp's fused flash-attention kernel only fires when " +
+                    "they match, and a mismatch silently drops to a much slower " +
+                    "path (measured on RDNA4)."}>
+        kv cache
+        <select className={sel} value={cfg.kv}
+                onChange={(e) => onChange({ ...cfg, kv: e.target.value })}
+                aria-label="KV cache precision">
+          <option value="">model default</option>
+          <option value="f16">f16 (no loss)</option>
+          <option value="q8_0">q8_0</option>
+          <option value="q5_1">q5_1</option>
+          <option value="q4_0">q4_0</option>
+        </select>
+      </label>
+
+      <label className="flex items-center gap-1.5 font-mono text-[11px] text-secondary"
+             title={"The vision projector is permanently resident and counted " +
+                    "against VRAM whether or not you ever send an image. " +
+                    "Un-tick to see the text-only budget."}>
+        <input type="checkbox" checked={cfg.vision} className="accent-amber"
+               onChange={(e) => onChange({ ...cfg, vision: e.target.checked })} />
+        vision projector
+      </label>
+
+      <label className="flex items-center gap-1.5 font-mono text-[11px] text-secondary"
+             title={"speed: never move a GPU layer to RAM to gain context (the " +
+                    "default). context: spend up to 15% of the layers for a " +
+                    "bigger window — every offloaded layer costs time on EVERY " +
+                    "token of a dense model."}>
+        prefer
+        <select className={sel} value={cfg.grow}
+                onChange={(e) => onChange({ ...cfg,
+                  grow: e.target.value as FitConfig["grow"] })}
+                aria-label="Growth policy">
+          <option value="speed">speed</option>
+          <option value="context">context</option>
+        </select>
+      </label>
+
+      {(cfg.kv || !cfg.vision || cfg.grow !== "speed") && (
+        <button onClick={() => onChange(DEFAULT_FIT)}
+                className="font-mono text-[11px] text-amber hover:underline">
+          reset
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function ModelsSurface() {
   const [cards, setCards] = useState<ModelCard[]>([]);
+  const [cfg, setCfg] = useState<FitConfig>(() => {
+    try {
+      const raw = localStorage.getItem("rigma.fitConfig");
+      return raw ? { ...DEFAULT_FIT, ...JSON.parse(raw) } : DEFAULT_FIT;
+    } catch { return DEFAULT_FIT; }
+  });
+  const setCfgPersist = (c: FitConfig) => {
+    setCfg(c);
+    localStorage.setItem("rigma.fitConfig", JSON.stringify(c));
+  };
   const [view, setView] = useState<"grid" | "list">(
     () => (localStorage.getItem("rigma.modelsView") === "list" ? "list" : "grid"));
   const setViewPersist = (v: "grid" | "list") => {
@@ -325,9 +447,9 @@ export default function ModelsSurface() {
   };
   const refresh = useCallback(async () => {
     try {
-      setCards((await engineApi.models()).models);
+      setCards((await engineApi.models(cfg)).models);
     } catch { /* keep last */ }
-  }, []);
+  }, [cfg]);
 
   useEffect(() => {
     void refresh();
@@ -363,6 +485,7 @@ export default function ModelsSurface() {
             ))}
           </div>
         </div>
+        <FitControls cfg={cfg} onChange={setCfgPersist} />
         {cards.length === 0 && (
           <p className="text-secondary text-[13.5px] text-center pt-12">
             No models yet — search Hugging Face above, or drop a GGUF into

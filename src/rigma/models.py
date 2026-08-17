@@ -57,6 +57,12 @@ class CachePolicy(BaseModel):
     k: str = "f16"
     v: str = "f16"
     reason: str = ""
+    # True = use exactly these types, no q8_0 fallback. Set only by the Models
+    # page explorer, where the whole point is to answer "what if the cache were
+    # q4_0" — silently falling back to q8_0 made every choice show the same
+    # answer. Never set on a stored spec; a real launch keeps the ladder so a
+    # too-large f16 cache degrades instead of failing.
+    pinned: bool = False
 
 
 class GgufFile(BaseModel):

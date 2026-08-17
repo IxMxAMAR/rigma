@@ -74,14 +74,60 @@ export interface Quality {
   basis: string;
 }
 
+/** Everything given up vs the true reference — BF16 weights AND an f16 cache.
+ *  The two sources compose as ratios, so this is not simply weights + kv. */
+export interface TotalLoss {
+  weights_pct: number;
+  kv_pct: number;
+  total_pct: number;
+  tier: string;
+  basis: string;
+}
+
+/** Where the VRAM goes, in MB — the arithmetic behind a single "8K". */
+export interface Budget {
+  file_mb: number;
+  mmproj_mb: number;
+  kv_mb: number;
+  budget_mb: number;
+  /** positive = this much OVER the budget, so weights spill to RAM */
+  over_mb: number;
+  ctx: number;
+  kv_type: string;
+}
+
+/** The explorer's knobs. These only change what the fit math ASSUMES — nothing
+ *  is launched or saved, so the page can be driven freely. */
+export interface FitConfig {
+  /** "" = the model's own policy ladder; "q4_0"; or "q8_0,q4_0" for split K/V */
+  kv: string;
+  /** false drops the vision projector, which is otherwise always resident */
+  vision: boolean;
+  /** "speed" never trades a GPU layer for context; "context" spends up to 15% */
+  grow: "speed" | "context";
+}
+
+export const DEFAULT_FIT: FitConfig = { kv: "", vision: true, grow: "speed" };
+
+export function fitQuery(c?: FitConfig): string {
+  if (!c) return "";
+  const p = new URLSearchParams();
+  if (c.kv) p.set("kv", c.kv);
+  if (!c.vision) p.set("vision", "0");
+  if (c.grow !== "speed") p.set("grow", c.grow);
+  const s = p.toString();
+  return s ? `?${s}` : "";
+}
+
 export interface QuantRow {
   file: string;
   quant: string;
   bytes: number;
   on_disk: boolean;
   pullable: boolean;
-  fit?: Fit;
+  fit?: Fit & { budget?: Budget };
   quality?: Quality | null;
+  total?: TotalLoss | null;
   pull?: Pull | null;
 }
 
@@ -125,7 +171,9 @@ export const engineApi = {
     return r.ok ? r.text() : "";
   },
 
-  models: () => j<{ models: ModelCard[]; [k: string]: unknown }>("GET", "/api/models"),
+  models: (cfg?: FitConfig) =>
+    j<{ models: ModelCard[]; [k: string]: unknown }>(
+      "GET", `/api/models${fitQuery(cfg)}`),
   pull: (slug: string, file: string) =>
     j<unknown>("POST", `/api/models/${slug}/pull`, { file }),
   deleteFile: (slug: string, file: string) =>
