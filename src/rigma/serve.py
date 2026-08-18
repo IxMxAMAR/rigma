@@ -276,6 +276,51 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit] + f"\n…(trimmed at {limit} chars — narrow your query)"
 
 
+# Compaction posts the WHOLE session as one non-streaming request, so the engine
+# must prefill all of it before a single byte comes back. The timeout was a flat
+# 120 seconds, which on the owner's machine (measured prefill 104 tok/s) buys
+# about 12,500 tokens — while auto-compaction only fires at 0.92 * 65,536 =
+# 60,293. The threshold was FIVE TIMES what the timeout could process, so
+# compaction was only ever attempted on sessions guaranteed to time out: 33
+# sessions, 0 digests, and a manual attempt that sat at "Compacting..." for two
+# minutes and died. The existing tests never caught it because the fake upstream
+# answers instantly.
+#
+# Derive it from the payload and the machine's own measured prefill instead.
+COMPACT_MIN_TIMEOUT = 120.0    # a small session still gets a sane minimum
+COMPACT_MAX_TIMEOUT = 3600.0   # ...and a wedged engine cannot hang forever
+COMPACT_TIMEOUT_SAFETY = 2.0   # prefill estimates are estimates
+_COMPACT_NEW_TOKENS = 1024     # rough size of a digest, for the generate leg
+# Floors used when nothing has been measured yet. Deliberately pessimistic: the
+# cost of guessing too high is a longer patience window, the cost of guessing
+# too low is the bug above.
+_ASSUMED_PP_TPS = 25.0
+_ASSUMED_TG_TPS = 5.0
+
+
+def compact_timeout(chars: int, pp_tps: float = 0.0,
+                    tg_tps: float = 0.0) -> float:
+    """How long to allow a compaction request, given how much it must read."""
+    toks = max(1.0, chars / CHARS_PER_TOKEN)
+    prefill = toks / max(1.0, pp_tps or _ASSUMED_PP_TPS)
+    generate = _COMPACT_NEW_TOKENS / max(1.0, tg_tps or _ASSUMED_TG_TPS)
+    want = (prefill + generate) * COMPACT_TIMEOUT_SAFETY
+    return min(COMPACT_MAX_TIMEOUT, max(COMPACT_MIN_TIMEOUT, want))
+
+
+def measured_rates() -> tuple[float, float]:
+    """(prefill, decode) tok/s for the running combo, from calibration."""
+    try:
+        from . import state as st
+        from .bench import load_calibration
+        s = st.read_state() or {}
+        key = f"{s.get('model')}:{s.get('quant')}:{s.get('backend')}"
+        m = (load_calibration().get(key) or {}).get("measured") or {}
+        return float(m.get("pp_tps") or 0.0), float(m.get("tg_tps") or 0.0)
+    except Exception:
+        return 0.0, 0.0
+
+
 def compact_budget(session: dict, engine_ctx: int) -> int:
     """Context budget to compact against: small for autonomous runs (their
     durable state lives on disk), the engine's full window for normal chats.
@@ -878,13 +923,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     p.get("text", "") if p.get("type") == "text" else "[image]"
                     for p in content if isinstance(p, dict))
             parts.append(f"{m.get('role', 'user')}: {content}")
+        payload = _COMPACT_PROMPT + "\n\n" + "\n".join(parts)
+        # The engine must prefill ALL of this before replying, so the patience
+        # has to scale with it — see compact_timeout. A flat 120s made the
+        # feature impossible on exactly the sessions it exists to serve.
+        pp, tg = measured_rates()
+        budget = compact_timeout(len(payload), pp, tg)
+        _log.info("compact: %d chars, allowing %.0fs (prefill %.0f tok/s)",
+                  len(payload), budget, pp or _ASSUMED_PP_TPS)
         resp = await client.post(
             "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content":
-                                _COMPACT_PROMPT + "\n\n" + "\n".join(parts)}],
+            json={"messages": [{"role": "user", "content": payload}],
                   "stream": False, "temperature": 0.3,
                   "id_slot": AUX_SLOT},
-            timeout=120.0)
+            timeout=budget)
         if resp.status_code != 200:
             raise RuntimeError(await _upstream_error(resp))
         digest = (resp.json()["choices"][0]["message"]["content"] or "").strip()

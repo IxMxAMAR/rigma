@@ -243,3 +243,45 @@ def test_user_rename_is_never_overwritten(home, upstream):
     for m in ("a", "b", "c"):
         client.post(f"/api/sessions/{sid}/chat", json={"message": m})
     assert sessions.load(sid)["title"] == "My Novel"
+
+
+# --- the timeout that made compaction impossible ------------------------------
+# Live 2026-08-18. Compaction posts the WHOLE session as one non-streaming
+# request with a hardcoded timeout=120.0 (serve.py). On the owner's machine the
+# measured prefill for the running model is 104 tok/s, so 120 seconds buys about
+# 12,500 tokens of prefill — while auto-compaction only fires at 0.92 * 65,536 =
+# 60,293 tokens. The trigger threshold was FIVE TIMES larger than the timeout
+# could process, so compaction could only ever be attempted on sessions
+# guaranteed to time out. 33 sessions, 0 digests, and a manual attempt that sat
+# at "Compacting..." for exactly two minutes and died.
+#
+# The existing tests never caught it because the fake upstream answers instantly.
+
+def test_compact_timeout_scales_with_the_payload():
+    from rigma.serve import compact_timeout
+    small = compact_timeout(4_000, pp_tps=104.0)
+    big = compact_timeout(230_000, pp_tps=104.0)      # the owner's session
+    assert big > small
+    # 57.5K tokens at 104 tok/s is ~550s of prefill alone; 120 cannot work
+    assert big > 550, f"{big}s would still time out before prefill finishes"
+
+
+def test_compact_timeout_uses_the_machines_measured_prefill():
+    """A slower machine needs longer, and we HAVE the measurement now."""
+    from rigma.serve import compact_timeout
+    assert compact_timeout(230_000, pp_tps=20.0) > \
+        compact_timeout(230_000, pp_tps=400.0)
+
+
+def test_compact_timeout_is_conservative_when_nothing_was_measured():
+    """No calibration yet must not mean a 120s timeout again."""
+    from rigma.serve import compact_timeout
+    assert compact_timeout(230_000, pp_tps=0.0) > 550
+
+
+def test_compact_timeout_has_a_floor_and_a_ceiling():
+    """A tiny session still gets a sane minimum; a wedged engine must not hang
+    the request forever."""
+    from rigma.serve import compact_timeout
+    assert compact_timeout(10, pp_tps=104.0) >= 120
+    assert compact_timeout(50_000_000, pp_tps=1.0) <= 3600
