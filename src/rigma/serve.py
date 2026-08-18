@@ -931,7 +931,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 return JSONResponse({"error": str(e)}, status_code=400)
         if "effort" in body and body["effort"] not in sessions.EFFORT_LEVELS:
             return JSONResponse(
-                {"error": "effort: must be one of off/auto/on (or blank)"},
+                {"error": "effort: must be one of "
+                 + "/".join(x or "blank" for x in sessions.EFFORT_LEVELS)},
                 status_code=400)
         s = sessions.load(sid)
         if s is None:
@@ -1316,6 +1317,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             ctk = {}
             if effort == "off":
                 ctk["enable_thinking"] = False
+            elif effort in sessions.QWEN_EFFORTS:
+                # a named level implies thinking is ON; the template turns the
+                # level into its own steering text, so nothing is injected here
+                ctk["enable_thinking"] = True
+                ctk["reasoning_effort"] = effort
             elif effort == "on":
                 ctk["enable_thinking"] = True
             if one_action and effort != "off":
