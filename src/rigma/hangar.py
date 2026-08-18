@@ -168,6 +168,21 @@ def spec_fields_from_probe(f: dict) -> dict:
             "probe_version": PROBE_VERSION}
 
 
+def template_override(slug: str) -> bool:
+    """Is a repaired chat template installed for this model?
+
+    Both `cli.up` and `server_ops.switch_model` pass templates/<slug>.jinja to
+    llama-server with --chat-template-file when it exists. The Models page did
+    not look, so a model whose gguf ships no template kept being described as
+    "running on the engine's fallback format" long after a proper one had been
+    dropped in for it — a warning that had become false (owner, 2026-08-19).
+    """
+    try:
+        return (rigma_home() / "templates" / f"{slug}.jinja").is_file()
+    except OSError:
+        return False
+
+
 def _write_spec(spec: ModelSpec) -> None:
     d = custom_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -628,6 +643,8 @@ def list_models(registry=None, profile=None, *, kv: str = "",
             # False => the capability list above is missing evidence, not a
             # finding. The UI must say so rather than render an empty row.
             "has_template": spec.has_template,
+            # a repaired template standing in for a missing one
+            "template_override": template_override(slug),
             "running": bool(state and state.get("model") == slug)})
     du = shutil.disk_usage(mdir)
     return {"models": models,

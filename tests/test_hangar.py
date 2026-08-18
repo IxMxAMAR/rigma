@@ -581,3 +581,40 @@ def test_dry_baseline_covers_more_than_the_repeat_window(home):
                                      quant="Q4_K_M")])
     p = hangar.inherit_family_defaults(spec).default_params
     assert p.get("dry_penalty_last_n", 0) >= 1024
+
+
+# --- a repaired chat template is part of the model's story --------------------
+# The Models page warns "no chat template in this gguf ... running on the
+# engine's fallback format". True when the gguf ships none AND nothing replaces
+# it — but Rigma already supports dropping a repaired template at
+# templates/<slug>.jinja, and both cli.up and server_ops.switch_model pass it to
+# llama-server with --chat-template-file. The page did not look there, so after
+# a template was installed for the owner's model the warning kept saying the
+# model ran on a fallback it no longer used (live 2026-08-19).
+
+def test_a_model_reports_its_installed_template_override(home, tmp_path):
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf", template=False)
+    _stale_spec(home, "h.gguf", capabilities=[])
+    listed = hangar.list_models(Registry.load())["models"]
+    row = next(m for m in listed if m["slug"] == "hybrid-tune")
+    assert row["has_template"] is False
+    assert row["template_override"] is False       # nothing installed yet
+
+    (home / "templates").mkdir(parents=True, exist_ok=True)
+    (home / "templates" / "hybrid-tune.jinja").write_text(
+        "{{ messages }}", encoding="utf-8")
+    listed = hangar.list_models(Registry.load())["models"]
+    row = next(m for m in listed if m["slug"] == "hybrid-tune")
+    assert row["template_override"] is True, \
+        "the page must know a repaired template is in use"
+
+
+def test_a_model_whose_gguf_has_a_template_says_so_either_way(home):
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf", template=True)
+    _stale_spec(home, "h.gguf")
+    row = next(m for m in hangar.list_models(Registry.load())["models"]
+               if m["slug"] == "hybrid-tune")
+    assert row["has_template"] is True
+    assert row["template_override"] is False
