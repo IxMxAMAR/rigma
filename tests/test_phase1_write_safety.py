@@ -414,3 +414,46 @@ def test_a_single_word_miss_gets_a_hint_too(tmp_path):
         "path": "sheet.txt", "old": "Seraphina", "new": "Seraphine"}, ctx)
     assert out.startswith("error")
     assert "closest" in out and "Seraphine Vale" in out
+
+
+# --- near-duplicate filenames ------------------------------------------------
+# Live 2026-08-18: the model wrote chapter 3 twice under names differing by ONE
+# character — Chapter_03_Jeegisha.txt and Chapter_03_Jegisha.txt — leaving the
+# owner's chapter split across two files with no warning. Both tools behaved
+# correctly; nothing told the model it had just created a near-twin of a file
+# already sitting beside it. Advisory only: never block, never redirect a write.
+
+def test_creating_a_near_duplicate_filename_says_so(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "Chapter_03_Jeegisha.txt").write_text("part one", encoding="utf-8")
+    out = tools.run_tool("write_file", {
+        "path": "Chapter_03_Jegisha.txt", "content": "part two"}, ctx)
+    assert not out.startswith("error")            # the write still happens
+    assert "Chapter_03_Jeegisha.txt" in out, "the near-twin must be named"
+    assert (ws / "Chapter_03_Jegisha.txt").exists()
+
+
+def test_an_unrelated_new_filename_gets_no_warning(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "Chapter_03_Jeegisha.txt").write_text("part one", encoding="utf-8")
+    out = tools.run_tool("write_file", {
+        "path": "Story_Bible_State.txt", "content": "notes"}, ctx)
+    assert "already exists" not in out and "Jeegisha" not in out
+
+
+def test_overwriting_an_existing_file_is_not_a_near_duplicate(tmp_path):
+    """Rewriting a file you already have is normal and already reported."""
+    ctx, ws = _ctx(tmp_path)
+    (ws / "Chapter_03_Jeegisha.txt").write_text("part one", encoding="utf-8")
+    out = tools.run_tool("write_file", {
+        "path": "Chapter_03_Jeegisha.txt", "content": "rewritten"}, ctx)
+    assert "REPLACED" in out
+    assert "did you mean" not in out
+
+
+def test_appending_never_warns(tmp_path):
+    ctx, ws = _ctx(tmp_path)
+    (ws / "Chapter_03_Jeegisha.txt").write_text("part one", encoding="utf-8")
+    out = tools.run_tool("write_file", {
+        "path": "Chapter_03_Jegisha.txt", "content": "x", "append": True}, ctx)
+    assert not out.startswith("error")
