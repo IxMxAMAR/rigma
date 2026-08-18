@@ -1899,12 +1899,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         model = str((body or {}).get("model", "")).strip()
         if not model:
             return JSONResponse({"error": "model required"}, status_code=400)
+        # optional: pin WHICH downloaded quant to load. Without it the resolver
+        # chooses, which gave no way to pick between two quants on disk.
+        want_quant = str((body or {}).get("quant", "")).strip() or None
         if not switch_lock.acquire(blocking=False):
             return JSONResponse({"error": "a switch is already in progress"},
                                 status_code=409)
         try:
-            new_state = await asyncio.to_thread(server_ops.perform_switch,
-                                                model, registry)
+            new_state = await asyncio.to_thread(server_ops.perform_switch, model, registry,
+                                          quant=want_quant)
             telemetry["tg"] = None
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)

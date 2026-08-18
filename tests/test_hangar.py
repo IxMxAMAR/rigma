@@ -650,3 +650,22 @@ def test_the_dry_baseline_still_catches_a_stanza_loop():
     p = params_from_probe()
     assert p["dry_allowed_length"] < 70
     assert p["dry_penalty_last_n"] >= 1024
+
+
+def test_a_quant_row_says_whether_it_is_the_one_running(home, monkeypatch):
+    """The card showed RUNNING but not WHICH quant, and with two on disk there
+    was no way to tell them apart (owner, 2026-08-19)."""
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h-Q4_K_M.gguf")
+    _stale_spec(home, "h-Q4_K_M.gguf")
+    from rigma import state as st
+    monkeypatch.setattr(st, "read_state",
+                        lambda: {"model": "hybrid-tune", "quant": "Q4_K_M"})
+    row = next(m for m in hangar.list_models(Registry.load())["models"]
+               if m["slug"] == "hybrid-tune")
+    on = [q for q in row["quants"] if q["running"]]
+    assert len(on) == 1 and on[0]["quant"] == "Q4_K_M"
+    monkeypatch.setattr(st, "read_state", lambda: {"model": "other"})
+    row = next(m for m in hangar.list_models(Registry.load())["models"]
+               if m["slug"] == "hybrid-tune")
+    assert not any(q["running"] for q in row["quants"])

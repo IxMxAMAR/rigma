@@ -228,8 +228,11 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
   return (
     <li className="flex items-center gap-2 px-3 py-1.5 rounded-md hover:bg-surface/70">
       <span
-        className={`w-1.5 h-1.5 rounded-full shrink-0 ${q.on_disk ? "bg-moss" : "bg-float"}`}
-        title={q.on_disk ? "on disk" : "not downloaded"}
+        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+          q.running ? "bg-amber ring-2 ring-amber/30"
+                    : q.on_disk ? "bg-moss" : "bg-float"}`}
+        title={q.running ? "LOADED — this is the quant the engine is running"
+                         : q.on_disk ? "on disk" : "not downloaded"}
       />
       <span className={`font-mono text-[12.5px] w-24 shrink-0 truncate ${
         q.fit?.ok === false ? "text-muted" : ""}`} title={q.file}>
@@ -250,7 +253,24 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
           best here
         </span>
       )}
+      {!downloading && q.running && (
+        <span className="shrink-0 font-mono text-[10.5px] text-amber bg-amber/15 rounded px-1.5 py-0.5"
+              title="the engine has this exact quant loaded right now">
+          loaded
+        </span>
+      )}
       {!downloading && <span className="flex-1" />}
+      {q.on_disk && !q.running && !downloading && (
+        <button
+          disabled={busy}
+          onClick={() => void run(() => engineApi.switchTo(card.slug, q.quant))}
+          className="shrink-0 rounded-md bg-moss/15 text-moss px-2.5 py-0.5 text-[12px] font-semibold disabled:opacity-40"
+          title={"Stop the engine and load THIS quant. Two quants on disk had "
+                 + "no way to choose between them."}
+        >
+          load
+        </button>
+      )}
       {!q.on_disk && q.pullable && !downloading && (
         <button
           disabled={busy}

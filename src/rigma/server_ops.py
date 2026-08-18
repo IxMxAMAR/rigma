@@ -178,7 +178,8 @@ KV_CACHE_TYPES = ("f16", "q8_0", "q5_1", "q4_0")
 
 def perform_switch(model: str, registry=None, profile=None,
                    ctx: int | None = None, force_calibrate: bool = False,
-                   kv: str | None = None, vision: bool | None = None) -> dict:
+                   kv: str | None = None, vision: bool | None = None,
+                   quant: str | None = None) -> dict:
     """Stop the running engine and launch `model` in its place; with `ctx`,
     relaunch (same model allowed) at a requested context size; with `kv`,
     force the KV-cache quantisation (f16/q8_0/q5_1/q4_0). Growing the cache
@@ -201,8 +202,10 @@ def perform_switch(model: str, registry=None, profile=None,
         raise RuntimeError("not running")
     if kv is not None and kv not in KV_CACHE_TYPES:
         raise RuntimeError(f"kv must be one of {', '.join(KV_CACHE_TYPES)}")
+    # `quant` joins ctx/kv as a reason to relaunch the SAME model: swapping
+    # between two downloaded quants is the whole point of asking for one.
     if (model == s.get("model") and not s.get("unloaded") and ctx is None
-            and kv is None and not force_calibrate):
+            and kv is None and quant is None and not force_calibrate):
         raise RuntimeError(f"{model} is already running")
     from .registry import Registry
     reg_full = registry if registry is not None else Registry.load()
@@ -216,6 +219,23 @@ def perform_switch(model: str, registry=None, profile=None,
     # resolve against on-disk quants only — the resolver may prefer a quant
     # that was never downloaded (live repro 2026-07-17: switch-back refused
     # while a perfectly usable quant sat on disk)
+    # An explicit quant narrows the choice to exactly one file. Without this the
+    # resolver picked, so a user with two quants on disk could not ask for the
+    # smaller one — the trade you make when you want more context (owner,
+    # 2026-08-19). Matched leniently: the label shown in the UI carries the
+    # quanter's decoration, e.g. "Q3_K_M (RVN)".
+    if quant:
+        want = str(quant).strip().lower()
+        picked = [g for g in on_disk if g.quant.lower() == want]
+        if not picked:
+            picked = [g for g in on_disk if want in g.quant.lower()
+                      or g.quant.lower() in want]
+        if not picked:
+            have = ", ".join(sorted(g.quant for g in on_disk)) or "none"
+            raise RuntimeError(
+                f"{model} has no downloaded quant matching {quant!r} — "
+                f"on disk: {have}")
+        on_disk = picked[:1]
     trimmed = Registry(reg_full.gpus,
                        {**reg_full.models,
                         model: spec_full.model_copy(update={"ggufs": on_disk})},

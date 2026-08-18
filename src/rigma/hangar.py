@@ -624,6 +624,11 @@ def list_models(registry=None, profile=None, *, kv: str = "",
                            "bpw": measured_bpw(g.bytes, spec.params),
                            "label_drift": label_overstates(label, g.bytes,
                                                            spec.params),
+                           # WHICH quant is loaded, not just which model —
+                           # with two on disk the card could not tell them apart
+                           "running": bool(
+                               state and state.get("model") == slug
+                               and state.get("quant") == label),
                            "pull": _PULLS.get(f"{slug}::{g.file}")})
         mm = None
         if spec.mmproj is not None:

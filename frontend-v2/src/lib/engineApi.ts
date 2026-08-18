@@ -144,6 +144,8 @@ export interface QuantRow {
   /** Set when the label's nominal bits/weight is not what the file spends —
    *  a custom mix that kept its base format's name. */
   label_drift?: { measured_bpw: number; label_bpw: number; drift_pct: number } | null;
+  /** this exact quant is the one the engine has loaded right now */
+  running?: boolean;
 }
 
 /** Facts probed from the gguf itself, shared by the library card and the
@@ -211,7 +213,8 @@ export interface HfRepoDetail extends ProbedFacts {
 export const engineApi = {
   server: () => j<ServerInfo>("GET", "/api/server"),
   switchOptions: () => j<SwitchOption[]>("GET", "/api/server/switch-options"),
-  switchTo: (model: string) => j<unknown>("POST", "/api/server/switch", { model }),
+  switchTo: (model: string, quant?: string) =>
+    j<unknown>("POST", "/api/server/switch", quant ? { model, quant } : { model }),
   /** Relaunch the RUNNING model with different engine settings. Every one of
    *  these stops the engine and starts it again — see EngineCard's warning. */
   relaunchWith: (o: { ctx: number; kv?: string; vision?: boolean }) =>
