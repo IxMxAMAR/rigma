@@ -618,3 +618,35 @@ def test_a_model_whose_gguf_has_a_template_says_so_either_way(home):
                if m["slug"] == "hybrid-tune")
     assert row["has_template"] is True
     assert row["template_override"] is False
+
+
+# --- DRY must not eat filenames ----------------------------------------------
+# Live 2026-08-19, and my own regression. The DRY baseline added earlier that
+# day used dry_allowed_length 2, which penalises ANY repeated run longer than
+# two tokens. A filename is 8-12 tokens, so once Chapter_02_Shubhashini.txt was
+# in context, re-typing it was punished and the model emitted a MUTATION
+# instead: Shubhash -> Shabhash -> Shaubha, and .txt -> .ttf. Tool calling fell
+# apart, and the owner reasonably asked whether something had been downgraded.
+#
+# The loop DRY was added to stop was a ~70-token stanza repeated ~200 times.
+# A far larger allowed_length still catches that by a wide margin while leaving
+# filenames, paths, character names and quoted lines alone. The project already
+# knew the adjacent lesson: RUN_PARAMS pairs DRY with temperature 0.3 because
+# "the call syntax must be boring" — but a writing chat cannot use temp 0.3, so
+# the allowed_length is the lever that has to carry it.
+
+def test_the_dry_baseline_does_not_penalise_a_filename_sized_repeat():
+    from rigma.hangar import params_from_probe
+    p = params_from_probe()
+    assert p["dry_multiplier"] > 0, "repetition protection must still exist"
+    assert p["dry_allowed_length"] >= 12, (
+        "a repeated filename is ~8-12 tokens; penalising it makes the model "
+        "invent variants instead of re-typing the name")
+
+
+def test_the_dry_baseline_still_catches_a_stanza_loop():
+    """The failure it exists for was a ~70-token block repeated ~200 times."""
+    from rigma.hangar import params_from_probe
+    p = params_from_probe()
+    assert p["dry_allowed_length"] < 70
+    assert p["dry_penalty_last_n"] >= 1024
