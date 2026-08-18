@@ -283,7 +283,13 @@ def _inspect(f, fallback: str) -> GgufInfo:
               "expert_params": tx.expert_params,
               "expert_used": int(g("expert_used_count", 0) or 0),
               "experts": experts,
-              "has_template": has_template}
+              "has_template": has_template,
+              # the model's OWN recommended sampling, which it ships and Rigma
+              # was not reading. Qwen3.8 gguf files carry general.sampling.*
+              # = top_k 20, top_p 0.95, temp 1.0 — exactly the published
+              # thinking-mode preset. Guessing at these when the file states
+              # them is the same mistake as reading a quant off its filename.
+              "sampling": _declared_sampling(meta)}
     return GgufInfo(name=name, arch=arch, is_mmproj=False,
                     capabilities=caps, spec_fields=fields,
                     tensors_truncated=tx.truncated)
@@ -297,6 +303,20 @@ _TOOL_MARKS = ("tool", "function_call", "functioncall")
 _THINK_MARKS = ("<think>", "</think>", "thinking", "<|thinking|>", "[think]",
                 "reasoning_content", "reasoning_effort", "<|channel|>",
                 "◁think▷")
+
+
+_SAMPLING_KEYS = (("temp", "temperature"), ("top_p", "top_p"),
+                  ("top_k", "top_k"), ("min_p", "min_p"))
+
+
+def _declared_sampling(meta: dict) -> dict:
+    """Sampling the gguf states for itself, under general.sampling.*."""
+    out = {}
+    for key, name in _SAMPLING_KEYS:
+        v = meta.get(f"general.sampling.{key}")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[name] = float(v)
+    return out
 
 
 def _capabilities(meta: dict, tx: TensorIndex) -> tuple[list[str], bool]:

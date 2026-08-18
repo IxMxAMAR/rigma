@@ -176,7 +176,39 @@ def _write_spec(spec: ModelSpec) -> None:
     os.replace(tmp, d / f"{spec.slug}.json")
 
 
-def inherit_family_defaults(spec: ModelSpec) -> ModelSpec:
+# Repetition control every model gets, on top of whatever sampling it declares.
+#
+# Qwen3.8's PUBLISHED thinking preset is temp 1.0 / top_p 0.95 / top_k 20 with
+# presence_penalty 0.0 and repetition_penalty 1.0 — deliberately no repetition
+# control at all (huggingface.co/Qwen/Qwen3.8-27B, and Unsloth's local-run
+# guide agrees). That is a fine choice for short answers and a loaded gun for a
+# long one. Live 2026-08-18: a dense 27B import wrote 81,544 characters in one
+# write_file call, the same ~280-character stanza about 200 times.
+#
+# Qwen's own lever for this is presence_penalty (they suggest 0-2, and use 1.5
+# in the instruct preset), but it penalises ANY repeated token — character
+# names, place names — and they warn it causes language mixing. DRY penalises
+# repeated SEQUENCES, which is precisely "stop reciting that stanza" without
+# taxing ordinary prose, and it is what every curated model in this registry
+# already uses.
+#
+# dry_penalty_last_n matters as much as the multiplier: the observed cycle was
+# ~70 tokens against llama.cpp's default 64-token repeat window, so a
+# token-level penalty could not have seen it even switched on.
+_DRY_BASELINE = {"dry_multiplier": 0.8, "dry_base": 1.75,
+                 "dry_allowed_length": 2.0, "dry_penalty_last_n": 4096.0}
+
+
+def params_from_probe(f: dict | None = None) -> dict:
+    """The model's own declared sampling, plus the repetition control its
+    published preset leaves out."""
+    out = dict((f or {}).get("sampling") or {})
+    out.update(_DRY_BASELINE)
+    return out
+
+
+def inherit_family_defaults(spec: ModelSpec,
+                            probe: dict | None = None) -> ModelSpec:
     """Custom imports inherit the registry sibling's card sampling and KV
     policy. An installed fine-tune of a registry model otherwise ran on raw
     llama-server defaults — no DRY, no model-card temperature, and no
@@ -185,7 +217,13 @@ def inherit_family_defaults(spec: ModelSpec) -> ModelSpec:
     Matching is by ARCHITECTURAL FINGERPRINT (kind + layer geometry), not by
     family name: gguf arch strings ("qwen35moe") never equal registry family
     names ("qwen3.6"), but a fine-tune of the same base model shares its
-    exact attention geometry."""
+    exact attention geometry.
+
+    When nothing matches, the model does NOT fall through to nothing — it gets
+    its own declared sampling plus _DRY_BASELINE. The empty case was the whole
+    bug: an import matching no curated geometry ran with no repetition control
+    whatsoever."""
+    update: dict = {}
     try:
         from .registry import Registry
         from .models import CachePolicy
@@ -198,17 +236,18 @@ def inherit_family_defaults(spec: ModelSpec) -> ModelSpec:
                                     spec.full_attn_layers, spec.kv_heads,
                                     spec.head_dim):
                 continue
-            update = {}
             if not spec.default_params and m.default_params:
                 update["default_params"] = dict(m.default_params)
             if spec.cache_type_policy == blank and \
                     m.cache_type_policy != blank:
                 update["cache_type_policy"] = \
                     m.cache_type_policy.model_copy()
-            return spec.model_copy(update=update) if update else spec
+            break
     except Exception:
         pass          # inheritance is a nicety — never block an install
-    return spec
+    if not (update.get("default_params") or spec.default_params):
+        update["default_params"] = params_from_probe(probe)
+    return spec.model_copy(update=update) if update else spec
 
 
 def heal_spec(spec: ModelSpec) -> ModelSpec:
@@ -228,6 +267,16 @@ def heal_spec(spec: ModelSpec) -> ModelSpec:
     """
     if not spec.custom:
         return spec
+    # Repair that needs NO file first: a spec with no sampling defaults runs on
+    # llama-server's bare defaults, which carry no repetition control at all.
+    # Both models the owner added from Hugging Face stored {}, and one has no
+    # quant downloaded — so this must not wait on a probe.
+    if not spec.default_params:
+        spec = spec.model_copy(update={"default_params": params_from_probe()})
+        try:
+            _write_spec(spec)
+        except OSError:
+            pass
     mdir = models_dir()
     stale = spec.probe_version < PROBE_VERSION
     # a quant downloaded after the last heal still needs its own MTP answer
@@ -467,7 +516,7 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
         moe=moe, license="custom import", use_cases=["general"],
         capabilities=sorted(info.capabilities), custom=True,
         **spec_fields_from_probe(f))
-    spec = inherit_family_defaults(spec)
+    spec = inherit_family_defaults(spec, f)
     # spec first, then move: if the move fails, drop the orphan spec so the
     # library never lists a model whose file isn't there
     _write_spec(spec)

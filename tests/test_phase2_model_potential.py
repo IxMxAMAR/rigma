@@ -192,7 +192,14 @@ def test_inheritance_never_overwrites_explicit_values(monkeypatch):
     assert out.default_params["temperature"] == 1.1   # explicit wins
 
 
-def test_no_geometry_match_returns_unchanged(monkeypatch):
+def test_no_geometry_match_keeps_the_card_but_still_gets_repetition_control(
+        monkeypatch):
+    """This used to assert the spec came back UNCHANGED. That contract was the
+    bug: a model matching no curated geometry inherited nothing and ran on
+    llama-server's bare defaults — repeat_penalty 1.0 and DRY off. Live
+    2026-08-18 that produced 81,544 characters of the same stanza repeated
+    ~200 times. No match now means "your own sampling plus repetition
+    control", never "nothing"."""
     from rigma import hangar
 
     class _FakeReg:
@@ -201,7 +208,31 @@ def test_no_geometry_match_returns_unchanged(monkeypatch):
     monkeypatch.setattr("rigma.registry.Registry", type(
         "R", (), {"load": staticmethod(lambda path=None: _FakeReg())}))
     fresh = _spec("orphan", custom=True, family="x")
-    assert hangar.inherit_family_defaults(fresh) is fresh
+    out = hangar.inherit_family_defaults(fresh)
+    assert out.default_params.get("dry_multiplier")
+    # nothing ELSE is invented — the cache policy is still left alone
+    assert out.cache_type_policy == fresh.cache_type_policy
+    assert out.slug == fresh.slug and out.n_layers == fresh.n_layers
+
+
+def test_a_declared_sampling_block_is_carried_into_the_card(monkeypatch):
+    """Qwen3.8 ggufs state their own preset in general.sampling.* (top_k 20,
+    top_p 0.95, temp 1.0 — the published thinking-mode values). Rigma was not
+    reading it, so a model shipping its own recommendation ran on the engine's
+    generic defaults instead."""
+    from rigma import hangar
+
+    class _FakeReg:
+        models = {}
+
+    monkeypatch.setattr("rigma.registry.Registry", type(
+        "R", (), {"load": staticmethod(lambda path=None: _FakeReg())}))
+    probe = {"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20.0}}
+    out = hangar.inherit_family_defaults(_spec("o2", custom=True, family="x"),
+                                         probe)
+    assert out.default_params["top_k"] == 20.0
+    assert out.default_params["top_p"] == 0.95
+    assert out.default_params.get("dry_multiplier")   # plus what it omits
 
 
 # --- cache hygiene + reasoning budget in server args --------------------------
