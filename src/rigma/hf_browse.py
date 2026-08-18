@@ -211,7 +211,7 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
         sources=[f"{HF}/{repo}"],
         **spec_fields_from_probe(f))
     from .hangar import inherit_family_defaults
-    return inherit_family_defaults(spec), rf
+    return inherit_family_defaults(spec, f), rf
 
 
 def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",

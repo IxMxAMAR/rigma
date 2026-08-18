@@ -524,3 +524,60 @@ def test_reprobe_prefers_the_local_file_over_the_network(home, monkeypatch):
 def test_reprobe_refuses_registry_models(home):
     with pytest.raises(HangarError, match="hand-authored"):
         hangar.reprobe("definitely-not-a-custom-model")
+
+
+# --- every model gets repetition control, even one nothing curated matches ---
+# Live 2026-08-18: a dense 27B added from Hugging Face wrote 81,544 characters
+# in ONE write_file call - the same ~280-character stanza about 200 times. Its
+# spec carried default_params = {}, so llama-server's bare defaults applied:
+# repeat_penalty 1.0 (off) and dry_multiplier 0.0 (off). Worse, repeat_last_n
+# defaults to 64 tokens while the repeating cycle was ~70 tokens, so a
+# token-level penalty could not have seen it even switched on. DRY matches
+# repeated SEQUENCES over a long window and is the mechanism that works.
+# Every curated registry model already sets dry_multiplier 0.8; only imports
+# that matched no curated geometry fell through to nothing.
+
+def test_an_import_with_no_curated_sibling_still_gets_dry(home, tmp_path):
+    from rigma.models import GgufFile, ModelSpec
+    spec = ModelSpec(slug="orphan", family="nothing-like-it", kind="dense",
+                     n_layers=97, full_attn_layers=97, kv_heads=7,
+                     head_dim=111, native_ctx=8192, custom=True,
+                     ggufs=[GgufFile(repo="r", file="o.gguf", bytes=1,
+                                     quant="Q4_K_M")])
+    out = hangar.inherit_family_defaults(spec)
+    assert out.default_params.get("dry_multiplier"), \
+        "a model with no sampling defaults runs with no repetition control"
+
+
+def test_a_model_that_already_has_defaults_is_left_alone():
+    from rigma.models import GgufFile, ModelSpec
+    mine = {"temperature": 0.75, "dry_multiplier": 0.5}
+    spec = ModelSpec(slug="opinionated", family="x", kind="dense", n_layers=97,
+                     full_attn_layers=97, kv_heads=7, head_dim=111,
+                     native_ctx=8192, custom=True, default_params=dict(mine),
+                     ggufs=[GgufFile(repo="r", file="o.gguf", bytes=1,
+                                     quant="Q4_K_M")])
+    assert hangar.inherit_family_defaults(spec).default_params == mine
+
+
+def test_healing_repairs_a_stored_spec_that_has_no_defaults(home):
+    """The two models already in the owner's library were added before this
+    and carry {}. The repair must not need the multi-GB gguf on disk — one of
+    them has no quant downloaded at all."""
+    _stale_spec(home, "never-downloaded.gguf", probe_version=hangar.PROBE_VERSION)
+    spec = Registry.load().models["hybrid-tune"]
+    assert spec.default_params.get("dry_multiplier"), \
+        "healing must fix sampling defaults without a file to probe"
+
+
+def test_dry_baseline_covers_more_than_the_repeat_window(home):
+    """The failure was a ~70-token cycle against a 64-token repeat window.
+    Whatever baseline we ship must look back further than that."""
+    from rigma.models import GgufFile, ModelSpec
+    spec = ModelSpec(slug="orphan2", family="x", kind="dense", n_layers=97,
+                     full_attn_layers=97, kv_heads=7, head_dim=111,
+                     native_ctx=8192, custom=True,
+                     ggufs=[GgufFile(repo="r", file="o.gguf", bytes=1,
+                                     quant="Q4_K_M")])
+    p = hangar.inherit_family_defaults(spec).default_params
+    assert p.get("dry_penalty_last_n", 0) >= 1024
