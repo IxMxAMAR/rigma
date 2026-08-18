@@ -2035,6 +2035,39 @@ def _write_file(args, ctx):
         return _write_file_locked(args, ctx)
 
 
+# How similar two filenames must be before we mention one while creating the
+# other. Live 2026-08-18: the model wrote chapter 3 twice under names differing
+# by a single character (Chapter_03_Jeegisha.txt / Chapter_03_Jegisha.txt) and
+# nothing said a word, leaving the owner's chapter split across two files. The
+# tools were behaving correctly — write_file echoes the path it was given and
+# find_files lists what matches — but "correct" is not the same as "helpful"
+# when the mistake costs a manuscript.
+#
+# Advisory ONLY. It never blocks a write and never redirects one: the model is
+# allowed to create Chapter_03_v2.txt on purpose. It just gets told the twin is
+# there, which turns a silent split into a one-turn correction.
+_NEAR_NAME = 0.86
+
+
+def _near_duplicate(p) -> str:
+    """An existing sibling whose name is nearly the one being created."""
+    import difflib
+    try:
+        if not p.parent.is_dir():
+            return ""
+        new = p.name.lower()
+        best, score = "", 0.0
+        for other in p.parent.iterdir():
+            if not other.is_file() or other.name == p.name:
+                continue
+            r = difflib.SequenceMatcher(None, new, other.name.lower()).ratio()
+            if r > score:
+                best, score = other.name, r
+        return best if score >= _NEAR_NAME else ""
+    except OSError:
+        return ""
+
+
 def _write_file_locked(args, ctx):
     raw = str(args.get("path", ""))
     # Refuse a dangerous path BEFORE touching the disk. Live 2026-07-21: the
@@ -2076,7 +2109,11 @@ def _write_file_locked(args, ctx):
                 f"the previous {old_len}-char version. If that was a mistake, "
                 "call undo_last_change to restore it; if you meant to "
                 "continue the file, use append=true next time.")
-    return f"wrote {len(content)} chars to {args.get('path')}"
+    twin = _near_duplicate(p) if not existed else ""
+    note = (f" — NOTE: {twin} already exists here and the two names "
+            "differ by very little. If you meant that file, use it; "
+            "otherwise ignore this." if twin else "")
+    return f"wrote {len(content)} chars to {args.get('path')}{note}"
 
 
 # --- file organisation --------------------------------------------------------
