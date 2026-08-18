@@ -616,3 +616,48 @@ def test_workspace_open_is_scoped_to_the_session(tmp_path, monkeypatch):
     c.post(f"/api/sessions/{s['id']}", json={"workspace": str(ws)})
     r = c.post(f"/api/sessions/{s['id']}/workspace/open")
     assert r.status_code == 200 and opened == [str(ws)]
+
+
+def test_qwen_thinking_levels_reach_the_template(tmp_path, monkeypatch,
+                                                 oai_upstream):
+    """Qwen3.8 ships four reasoning levels (low/medium/high/xhigh) and its
+    template reads `reasoning_effort` out of chat_template_kwargs — verified
+    against the owner's live engine 2026-08-19: a plain turn renders a 79-char
+    prompt, reasoning_effort=xhigh renders 316. Rigma only ever sent a binary
+    enable_thinking, so the levels were unreachable from the UI.
+
+    b9867 still has no reasoning_effort PARSER of its own; what consumes this is
+    the chat template. Sending it is harmless to templates that ignore it."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    c.post(f"/api/sessions/{s['id']}", json={"title": "levels"})
+
+    for level in ("low", "medium", "high", "xhigh"):
+        assert c.post(f"/api/sessions/{s['id']}",
+                      json={"effort": level}).status_code == 200, level
+        c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi"})
+        sent = oai_upstream.last()
+        ctk = sent["chat_template_kwargs"]
+        assert ctk["reasoning_effort"] == level
+        assert ctk["enable_thinking"] is True, "a level implies thinking is on"
+
+    # nonsense is still refused
+    assert c.post(f"/api/sessions/{s['id']}",
+                  json={"effort": "ludicrous"}).status_code == 400
+
+
+def test_off_and_on_still_send_no_reasoning_effort(tmp_path, monkeypatch,
+                                                   oai_upstream):
+    """The existing binary behaviour must not change: a template that has never
+    heard of reasoning_effort should not start receiving one."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    c = TestClient(build_app(upstream_port=oai_upstream.port, default_prompt=""))
+    s = c.post("/api/sessions", json={}).json()
+    c.post(f"/api/sessions/{s['id']}", json={"title": "binary"})
+    for eff, want in (("off", False), ("on", True)):
+        c.post(f"/api/sessions/{s['id']}", json={"effort": eff})
+        c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi"})
+        sent = oai_upstream.last()
+        assert sent["chat_template_kwargs"]["enable_thinking"] is want
+        assert "reasoning_effort" not in sent["chat_template_kwargs"]

@@ -13,7 +13,13 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   "authors_note", "authors_note_depth", "prefill",
                   "use_tools", "allow_code", "workspace", "auto_compact",
                   "max_tool_rounds", "one_action", "method")
-EFFORT_LEVELS = ("", "off", "auto", "on")
+# "" / off / auto / on are Rigma's own binary thinking switch. The four
+# named levels are Qwen3.8's published reasoning efforts, which its chat
+# template reads from `reasoning_effort` — verified against a live engine
+# 2026-08-19 (a plain turn renders 79 prompt chars, xhigh renders 316).
+# A template that has never heard of the kwarg simply ignores it.
+QWEN_EFFORTS = ("low", "medium", "high", "xhigh")
+EFFORT_LEVELS = ("", "off", "auto", "on") + QWEN_EFFORTS
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
                 "min_p": (0.0, 1.0), "repeat_penalty": (0.5, 2.0),
