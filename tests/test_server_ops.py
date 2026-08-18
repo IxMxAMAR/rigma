@@ -217,3 +217,95 @@ def test_repaired_chat_template_is_passed_to_the_engine(tmp_path, monkeypatch):
     found = (rigma_home() / "templates" / "my-model.jinja")
     assert found.is_file()
     assert not (rigma_home() / "templates" / "other-model.jinja").is_file()
+
+
+# --- choosing WHICH downloaded quant to run ----------------------------------
+# Owner, 2026-08-19: "I have 2 downloaded and I do not get to choose which one I
+# want to load and neither does it tell me which one is loaded." Both true.
+# perform_switch took model/ctx/kv/vision and let the resolver pick the quant,
+# so with two quants on disk there was no way to ask for the smaller one — the
+# very thing you want when trading quality for context.
+
+def _dual_quant_world(tmp_path):
+    a = GgufFile(repo="r", file="big.gguf", bytes=10, quant="Q3_K_L")
+    b = GgufFile(repo="r", file="small.gguf", bytes=10, quant="Q3_K_M")
+    spec = ModelSpec(slug="dual", family="f", kind="dense", n_layers=2,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=32768, ggufs=[a, b],
+                     cache_type_policy=CachePolicy())
+    reg = Registry([], {"dual": spec}, {})
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=16000, backends=["vulkan"])
+    profile = HardwareProfile(gpus=[gpu], ram_mb=16000, ram_free_mb=8000,
+                              cpu=CpuInfo(cores=8), os="windows",
+                              disk_free_gb=100.0)
+    (tmp_path / "models").mkdir(exist_ok=True)
+    for f in ("big.gguf", "small.gguf"):
+        (tmp_path / "models" / f).write_text("x")   # BOTH downloaded
+    return reg, profile
+
+
+def _stub_launch(monkeypatch, tmp_path):
+    monkeypatch.setattr("rigma.state.kill_pid", lambda pid: None)
+    monkeypatch.setattr("rigma.runtime.ensure_engine",
+                        lambda backend, os_name: tmp_path / "llama-server.exe")
+    monkeypatch.setattr("rigma.runtime.launch_server",
+                        lambda exe, plan, mp, port=0, timeout=300.0,
+                        extra_args=None: SimpleNamespace(
+                            proc=SimpleNamespace(pid=4242)))
+
+
+def test_perform_switch_can_be_asked_for_a_specific_quant(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    reg, profile = _dual_quant_world(tmp_path)
+    _stub_launch(monkeypatch, tmp_path)
+    state.write_state("other", "Q0", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    new = server_ops.perform_switch("dual", registry=reg, profile=profile,
+                                    quant="Q3_K_M")
+    assert new["quant"] == "Q3_K_M", "the requested quant must be the one loaded"
+
+
+def test_without_a_quant_the_resolver_still_chooses(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    reg, profile = _dual_quant_world(tmp_path)
+    _stub_launch(monkeypatch, tmp_path)
+    state.write_state("other", "Q0", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    new = server_ops.perform_switch("dual", registry=reg, profile=profile)
+    assert new["quant"] in ("Q3_K_L", "Q3_K_M")
+
+
+def test_an_unknown_quant_is_refused_by_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    reg, profile = _dual_quant_world(tmp_path)
+    _stub_launch(monkeypatch, tmp_path)
+    state.write_state("other", "Q0", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    with pytest.raises(RuntimeError, match="Q9_K_XXL"):
+        server_ops.perform_switch("dual", registry=reg, profile=profile,
+                                  quant="Q9_K_XXL")
+
+
+def test_switching_quant_on_the_running_model_is_allowed(tmp_path, monkeypatch):
+    """The owner's actual case: Q3_K_L loaded, Q3_K_M also on disk, wanting the
+    smaller one for more context. Without this the same-model guard refused it
+    as "already running" — true of the model, false of the request."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    reg, profile = _dual_quant_world(tmp_path)
+    _stub_launch(monkeypatch, tmp_path)
+    state.write_state("dual", "Q3_K_L", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    new = server_ops.perform_switch("dual", registry=reg, profile=profile,
+                                    quant="Q3_K_M")
+    assert new["quant"] == "Q3_K_M"
+
+
+def test_the_same_model_with_no_change_requested_is_still_refused(tmp_path,
+                                                                  monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    reg, profile = _dual_quant_world(tmp_path)
+    _stub_launch(monkeypatch, tmp_path)
+    state.write_state("dual", "Q3_K_L", 18500, engine_pid=os.getpid(),
+                      ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    with pytest.raises(RuntimeError, match="already running"):
+        server_ops.perform_switch("dual", registry=reg, profile=profile)

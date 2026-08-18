@@ -30,6 +30,12 @@ function EngineCard() {
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const streaming = useChat((s) => s.streaming);
+  // Staged, not applied. Every control used to relaunch the engine the instant
+  // it changed, so reaching a config that differs in context AND cache cost two
+  // full reloads of a 13GB model to get to one setup (owner, 2026-08-19). The
+  // endpoint has always accepted all three together; only the UI insisted on
+  // one at a time.
+  const [want, setWant] = useState<{ctx?: number; kv?: string; vision?: boolean}>({});
 
   const load = useCallback(() => {
     engineApi.server().then(setSrv).catch(() => setSrv(null));
@@ -60,6 +66,7 @@ function EngineCard() {
     setErr(null);
     try {
       await engineApi.relaunchWith({ ctx, kv: o.kv, vision: o.vision });
+      setWant({});          // applied — stop showing it as pending
     } catch (e) {
       setErr((e as Error).message);
     }
@@ -82,12 +89,11 @@ function EngineCard() {
 conversation the model can see. Bigger windows cost VRAM, which competes with
 the model's own weights.">
         <span className={label}>context</span>
-        <select className={input} value={String(srv.ctx ?? "")}
+        <select className={input} value={String(want.ctx ?? srv.ctx ?? "")}
                 disabled={!!busy}
                 aria-label="Context window"
-                onChange={(e) => void apply(
-                  `Context → ${Math.round(Number(e.target.value) / 1024)}K`,
-                  { ctx: Number(e.target.value) })}>
+                onChange={(e) =>
+                  setWant((w) => ({ ...w, ctx: Number(e.target.value) }))}>
           {CTX_STEPS.filter((c) => c <= native).concat(
             srv.ctx && !CTX_STEPS.includes(srv.ctx) ? [srv.ctx] : [])
             .sort((a, b) => a - b)
@@ -101,16 +107,37 @@ the model's own weights.">
 doubles the context that fits, but cache error is written per token and every
 later token attends over it, so it compounds over a long conversation.">
         <span className={label}>kv cache</span>
-        <select className={input} value={srv.kv_cache || ""}
+        <select className={input} value={want.kv ?? (srv.kv_cache || "")}
                 disabled={!!busy}
                 aria-label="KV cache precision"
-                onChange={(e) => void apply(`KV cache → ${e.target.value}`,
-                                            { kv: e.target.value })}>
+                onChange={(e) => setWant((w) => ({ ...w, kv: e.target.value }))}>
           {!srv.kv_cache && <option value="">auto</option>}
           {KV_TYPES.map((k) => <option key={k} value={k}>{k}</option>)}
         </select>
       </label>
 
+      {(want.ctx !== undefined || want.kv !== undefined
+        || want.vision !== undefined) && (
+        <button
+          disabled={!!busy}
+          onClick={() => {
+            const bits = [
+              want.ctx !== undefined ? `context → ${Math.round(want.ctx / 1024)}K` : "",
+              want.kv !== undefined ? `kv → ${want.kv || "auto"}` : "",
+              want.vision !== undefined ? (want.vision ? "vision on" : "vision off") : "",
+            ].filter(Boolean);
+            void apply(bits.join(", "), {
+              ctx: want.ctx, kv: want.kv, vision: want.vision,
+            });
+          }}
+          className="mt-1 rounded-md bg-amber/15 text-amber px-2.5 py-1 text-[12px] font-semibold disabled:opacity-40"
+          title={"Applies everything you changed in ONE relaunch. Changing "
+                 + "these one at a time used to reload the model once per "
+                 + "setting."}
+        >
+          {busy ? "relaunching…" : "apply — one relaunch"}
+        </button>
+      )}
       {srv.has_mmproj && (
         <label className={row} title="The vision projector is loaded with the
 weights and cannot be offloaded, so it costs VRAM for the whole session whether
@@ -120,10 +147,9 @@ often the single biggest context lever a vision model has.">
           <span className="flex-1 flex items-center gap-2">
             <input type="checkbox" className="accent-amber"
                    disabled={!!busy}
-                   checked={!srv.no_vision}
-                   onChange={(e) => void apply(
-                     e.target.checked ? "Vision ON" : "Vision OFF (text-only)",
-                     { vision: e.target.checked })} />
+                   checked={want.vision ?? !srv.no_vision}
+                   onChange={(e) =>
+                     setWant((w) => ({ ...w, vision: e.target.checked }))} />
             <span className="text-muted font-mono text-[11px]">
               {srv.no_vision ? "text-only — projector not loaded"
                 : "images enabled"}
@@ -276,6 +302,11 @@ function SamplingCard() {
   const [dirty, setDirty] = useState(false);
   const [presets, setPresets] = useState<PresetRow[]>([]);
   const [presetId, setPresetId] = useState("");
+  // How hard the model thinks. Qwen3.8 publishes four reasoning levels and its
+  // chat template reads `reasoning_effort`; Rigma could only send a binary
+  // enable_thinking, and the UI could not send even that — the field was not
+  // rendered anywhere. Applies per chat and needs NO engine restart.
+  const [effort, setEffort] = useState("");
 
   useEffect(() => {
     fetch("/api/presets")
@@ -298,6 +329,7 @@ function SamplingCard() {
       setParams(loaded);
       setPrompt(raw.system_prompt ?? "");
       setPresetId(raw.preset_id ?? "");
+      setEffort(String((s as unknown as { effort?: string }).effort ?? ""));
       setDirty(false);
     }).catch(() => {});
   }, [currentId]);
@@ -365,6 +397,33 @@ function SamplingCard() {
       <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em]">
         this chat
       </h3>
+      <label className="flex items-center gap-2 text-[12.5px]"
+             title={"How hard the model thinks before answering. "
+                    + "Qwen3.8 publishes four levels; its template turns the "
+                    + "level into its own steering text. medium injects no "
+                    + "instruction at all, which is why it costs nothing. "
+                    + "Applies to THIS chat and takes effect on the next "
+                    + "message — no engine restart."}>
+        <span className="w-24 text-secondary">thinking</span>
+        <select
+          value={effort}
+          aria-label="Thinking effort"
+          onChange={async (e) => {
+            const v = e.target.value;
+            setEffort(v);
+            if (currentId)
+              await api.updateSession(currentId, { effort: v }).catch(() => {});
+          }}
+          className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"
+        >
+          <option value="">model default</option>
+          <option value="off">off — no thinking</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh — slowest, most careful</option>
+        </select>
+      </label>
       <label className="flex items-center gap-2 text-[12.5px]">
         <span className="w-24 text-secondary">preset</span>
         <select
