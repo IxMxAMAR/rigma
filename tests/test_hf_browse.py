@@ -291,20 +291,28 @@ def test_mtp_preserved_models_are_not_filtered_as_aux():
     standalone draft head is auxiliary. This made
     SC117/...-MTP-Preserved-APEX-GGUF report "no single-file gguf in that repo"
     when it has three."""
-    from rigma.hf_browse import _is_aux_gguf as aux
-    # real filenames from repos that must WORK
+    from rigma.hf_browse import _is_aux_gguf as aux, _is_aux_mtp
+    # a TINY file beside a big one — the size a real draft head is
+    def head(name, size=240_000_000, biggest=26_000_000_000):
+        return _is_aux_mtp(name, size, biggest)
+
+    # real filenames from repos that must WORK: "mtp" mid-name is a descriptor
     assert not aux("Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-"
                    "APEX-I-Compact.gguf")
     assert not aux("Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf")      # unsloth official
     assert not aux("Huihui-Qwen3.6-35B-A3B-abliterated-MTP-Q4_K.gguf")
-    # genuine auxiliary heads must still be skipped
-    assert aux("mtp.gguf")
-    assert aux("Qwen3-30B-mtp.gguf")
-    assert aux("model-mtp-head.gguf")
-    assert aux("model_mtp_head.gguf")
+    assert not head("Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf")
+    # genuine auxiliary heads must still be skipped — at draft-head SIZE
+    assert head("mtp.gguf")
+    assert head("Qwen3-30B-mtp.gguf")
+    assert head("model-mtp-head.gguf")
+    assert head("model_mtp_head.gguf")
     # a head can also be named like an mmproj, with mtp as a PREFIX
-    assert aux("mtp-gemma-4-26B-A4B-it.gguf")
-    # unrelated markers unchanged
+    assert head("mtp-gemma-4-26B-A4B-it.gguf")
+    # ...but the SAME name at model size is a model (0bserverx, 2026-08-19)
+    assert not head("Qwen3-30B-mtp.gguf", size=13_000_000_000,
+                    biggest=50_500_000_000)
+    # unrelated markers unchanged, and still name-only
     assert aux("something-imatrix.gguf") and aux("foo-draft.gguf")
     assert not aux("Rocinante-X-12B-v1b-Q6_K.gguf")
 
@@ -354,3 +362,61 @@ def test_a_mirror_is_refused_with_the_reason_it_collided(fake_hf, home,
     assert "cool/WebTune-GGUF" in msg         # and who already holds it
     assert "same model" in msg
     assert "Remove" in msg                    # and what to do about it
+
+
+# --- an MTP file can be a whole model, not a draft head ----------------------
+# Live 2026-08-19: 0bserverx republished the owner's model with MTP variants
+# named RVN-IQ3_M-mtp.gguf, RVN-Q8_0-mtp.gguf and so on — full models with the
+# draft head baked in, 0.4 GB larger than their plain siblings. The name filter
+# treated anything ending in "-mtp.gguf" as a standalone draft head and hid 26
+# of the repo's 53 files, including a 50.5 GB BF16. Exactly the files that make
+# speculative decoding possible were the ones made invisible.
+#
+# A real standalone head is TINY next to the models it drafts for — the Gemma
+# case that motivated the filter was a 240 MB head beside a 26 GB model. Size is
+# the discriminator the name cannot be.
+
+def _tree(monkeypatch, files):
+    from rigma import hf_browse
+    monkeypatch.setattr(hf_browse, "_get_json",
+                        lambda path, params=None: [
+                            {"path": p, "size": s} for p, s in files])
+
+
+def test_a_gigabyte_scale_mtp_file_is_a_model_not_a_head(monkeypatch):
+    from rigma import hf_browse
+    _tree(monkeypatch, [
+        ("RVN-BF16.gguf", 53_800_000_000),
+        ("RVN-IQ3_M.gguf", 12_600_000_000),
+        ("RVN-IQ3_M-mtp.gguf", 13_000_000_000),
+        ("RVN-Q8_0-mtp.gguf", 27_100_000_000),
+    ])
+    names = [g["file"] for g in hf_browse.repo_files("r")["ggufs"]]
+    assert "RVN-IQ3_M-mtp.gguf" in names
+    assert "RVN-Q8_0-mtp.gguf" in names
+
+
+def test_a_tiny_standalone_draft_head_is_still_filtered(monkeypatch):
+    """The case the filter was written for: a 240 MB head beside a 26 GB model,
+    which if listed becomes a phantom 0.2 GB 'quant' AND, being smallest, gets
+    picked as the header-probe source."""
+    from rigma import hf_browse
+    _tree(monkeypatch, [
+        ("gemma-4-26B-A4B-Q4_K_M.gguf", 26_000_000_000),
+        ("mtp-gemma-4-26B-A4B-it.gguf", 240_000_000),
+        ("gemma-4-26B-A4B-mtp.gguf", 240_000_000),
+    ])
+    names = [g["file"] for g in hf_browse.repo_files("r")["ggufs"]]
+    assert names == ["gemma-4-26B-A4B-Q4_K_M.gguf"]
+
+
+def test_imatrix_and_other_aux_files_are_unaffected(monkeypatch):
+    from rigma import hf_browse
+    _tree(monkeypatch, [
+        ("model-Q4_K_M.gguf", 16_000_000_000),
+        ("model-imatrix.gguf", 5_000_000),
+        ("model-draft.gguf", 500_000_000),
+        ("model-eagle.gguf", 400_000_000),
+    ])
+    names = [g["file"] for g in hf_browse.repo_files("r")["ggufs"]]
+    assert names == ["model-Q4_K_M.gguf"]

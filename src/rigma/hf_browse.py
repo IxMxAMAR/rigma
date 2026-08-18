@@ -41,11 +41,31 @@ _AUX_MTP_RE = re.compile(
     re.I)
 
 
+# A standalone draft head is TINY beside the models it drafts for: the Gemma
+# case this filter was written for was a 240MB head next to a 26GB model, 0.9%
+# of it. A full model that happens to carry the head is the same order of size
+# as its plain sibling — 0bserverx ships RVN-IQ3_M.gguf at 12.6GB and
+# RVN-IQ3_M-mtp.gguf at 13.0GB, the head adding 0.4GB (owner, 2026-08-19).
+# Name alone cannot tell those apart, and guessing wrong hid 26 of that repo's
+# 53 files, including a 50.5GB BF16 — the MTP builds being exactly the ones that
+# make speculative decoding possible.
+_AUX_MTP_MAX_SHARE = 0.10
+
+
 def _is_aux_gguf(name: str) -> bool:
+    """Name-only markers: importance-matrix data and non-MTP draft heads."""
     n = name.lower()
-    if any(m in n for m in _AUX_MARKERS):
-        return True
-    return bool(_AUX_MTP_RE.search(n))
+    return any(m in n for m in _AUX_MARKERS)
+
+
+def _is_aux_mtp(name: str, size: int, biggest: int) -> bool:
+    """An MTP-named file that is small enough to be a draft head rather than a
+    model. Size decides; the name only selects candidates."""
+    if not _AUX_MTP_RE.search(name.lower()):
+        return False
+    if not biggest or not size:
+        return True          # no size to judge by: keep the old, safe answer
+    return size < _AUX_MTP_MAX_SHARE * biggest
 
 
 def _headers() -> dict:
@@ -115,16 +135,19 @@ def repo_files(repo: str) -> dict:
     tree = _get_json(f"/api/models/{repo}/tree/main",
                      {"recursive": "true"})
     ggufs, mmprojs, split = [], [], 0
-    for f in tree:
-        p = str(f.get("path", ""))
-        if not p.lower().endswith(".gguf"):
-            continue
+    cand = [(str(f.get("path", "")), int(f.get("size", 0) or 0)) for f in tree
+            if str(f.get("path", "")).lower().endswith(".gguf")]
+    # the MTP test is relative, so the yardstick has to be measured first
+    biggest = max((sz for _, sz in cand), default=0)
+    for p, sz in cand:
         if _SPLIT_RE.search(p):
             split += 1
             continue
-        if _is_aux_gguf(p):   # imatrix / MTP / draft head — not a model
+        if _is_aux_gguf(p):            # imatrix / draft / eagle / medusa
             continue
-        entry = {"file": p, "bytes": int(f.get("size", 0) or 0)}
+        if _is_aux_mtp(p, sz, biggest):   # a genuine standalone draft head
+            continue
+        entry = {"file": p, "bytes": sz}
         (mmprojs if "mmproj" in p.lower() else ggufs).append(entry)
     ggufs.sort(key=lambda g: -g["bytes"])    # registry order: largest first
     mm = None
