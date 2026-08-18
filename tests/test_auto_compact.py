@@ -285,3 +285,96 @@ def test_compact_timeout_has_a_floor_and_a_ceiling():
     from rigma.serve import compact_timeout
     assert compact_timeout(10, pp_tps=104.0) >= 120
     assert compact_timeout(50_000_000, pp_tps=1.0) <= 3600
+
+
+# --- compaction folds in bounded chunks ---------------------------------------
+# One call over the whole session is self-defeating: the thing that reduces
+# context had to read all of it first, in a single request that could not
+# finish. Fold instead — summarise a bounded slice, carry the result into the
+# next slice. Each call is small enough to complete, progress is observable, and
+# a session that is too big for one request is no longer too big to compact.
+
+def test_chunks_never_split_a_message():
+    from rigma.serve import compact_chunks
+    msgs = [{"role": "user", "content": "a" * 5000},
+            {"role": "assistant", "content": "b" * 5000},
+            {"role": "user", "content": "c" * 5000}]
+    chunks = compact_chunks(msgs, budget=6000)
+    assert sum(len(c) for c in chunks) == 3          # every message appears once
+    for c in chunks:
+        assert c, "no empty chunk"
+
+
+def test_a_small_session_is_still_one_call():
+    from rigma.serve import compact_chunks
+    msgs = [{"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"}]
+    assert len(compact_chunks(msgs, budget=24000)) == 1
+
+
+def test_a_big_session_is_split_into_several_bounded_chunks():
+    from rigma.serve import compact_chunks
+    msgs = [{"role": "user", "content": "x" * 4000} for _ in range(30)]
+    chunks = compact_chunks(msgs, budget=24000)
+    assert len(chunks) >= 4, "120,000 chars must not go in one request"
+    for c in chunks:
+        size = sum(len(str(m.get("content") or "")) for m in c)
+        # one oversized message is allowed through alone; otherwise stay bounded
+        assert size <= 24000 or len(c) == 1
+
+
+def test_one_enormous_message_still_gets_its_own_chunk():
+    """The owner's 20,000-token chapter arrives as ONE message. It cannot be
+    split, but it must not drag other messages into an oversized request."""
+    from rigma.serve import compact_chunks
+    msgs = [{"role": "user", "content": "s" * 100},
+            {"role": "assistant", "content": "L" * 200_000},
+            {"role": "user", "content": "t" * 100}]
+    chunks = compact_chunks(msgs, budget=24000)
+    big = [c for c in chunks if any(len(str(m.get("content"))) > 100_000 for m in c)]
+    assert len(big) == 1 and len(big[0]) == 1, "the giant message travels alone"
+
+
+def test_chunking_handles_vision_parts_without_crashing():
+    from rigma.serve import compact_chunks
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "look"},
+                                         {"type": "image_url"}]}]
+    assert len(compact_chunks(msgs, budget=24000)) == 1
+
+
+def test_a_failed_fold_leaves_the_session_untouched(home, monkeypatch):
+    """The archive is the user's manuscript. A compaction that dies half way
+    must not leave messages moved and no digest to replace them."""
+    import httpx
+    from fastapi.testclient import TestClient
+    from rigma.serve import build_app
+    from rigma import sessions
+
+    calls = {"n": 0}
+
+    class _Boom:
+        async def post(self, *a, **k):
+            calls["n"] += 1
+            if calls["n"] >= 2:            # succeed once, then fail
+                raise httpx.ReadTimeout("engine gave up")
+            req = httpx.Request("POST", "http://x")
+            return httpx.Response(200, request=req, json={
+                "choices": [{"message": {"content": "partial digest"}}]})
+
+    app = build_app(upstream_port=1)
+    client = TestClient(app)
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    s = sessions.load(sid)
+    s["messages"] = [{"role": "user", "content": "y" * 30_000}
+                     for _ in range(4)]
+    sessions.save(s)
+    before = len(sessions.load(sid)["messages"])
+
+    import rigma.serve as srv
+    monkeypatch.setattr(srv.httpx, "AsyncClient", lambda *a, **k: _Boom())
+    r = client.post(f"/api/sessions/{sid}/compact", json={"keep": 1})
+    assert r.status_code >= 400                      # reported, not silent
+    after = sessions.load(sid)
+    assert len(after["messages"]) == before          # nothing moved
+    assert not (after.get("digest") or "")           # no half-written digest
+    assert not after.get("archive")
