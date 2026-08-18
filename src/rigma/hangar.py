@@ -210,8 +210,22 @@ def _write_spec(spec: ModelSpec) -> None:
 # dry_penalty_last_n matters as much as the multiplier: the observed cycle was
 # ~70 tokens against llama.cpp's default 64-token repeat window, so a
 # token-level penalty could not have seen it even switched on.
+#
+# dry_allowed_length is the number that matters, and 2 (llama.cpp's default) is
+# actively harmful here. It penalises ANY repeated run longer than two tokens,
+# and a filename is 8-12: once Chapter_02_Shubhashini.txt is in context, the
+# model is punished for re-typing it and emits a MUTATION instead. Live
+# 2026-08-19 that produced Shubhash -> Shabhash -> Shaubha and .txt -> .ttf, and
+# tool calling fell apart within a turn. Paths, character names and quoted lines
+# are all repeated on purpose; only a LOOP is repetition.
+#
+# 16 leaves those alone and still catches the failure DRY is here for by a wide
+# margin — that was a ~70-token stanza repeated ~200 times, where the penalty
+# grows exponentially with match length past the allowance. RUN_PARAMS keeps 2
+# because it also pins temperature to 0.3 ("the call syntax must be boring"); a
+# writing chat cannot do that, so the allowance has to carry it alone.
 _DRY_BASELINE = {"dry_multiplier": 0.8, "dry_base": 1.75,
-                 "dry_allowed_length": 2.0, "dry_penalty_last_n": 4096.0}
+                 "dry_allowed_length": 16.0, "dry_penalty_last_n": 4096.0}
 
 
 def params_from_probe(f: dict | None = None) -> dict:
