@@ -298,6 +298,49 @@ _ASSUMED_PP_TPS = 25.0
 _ASSUMED_TG_TPS = 5.0
 
 
+# Characters of session content per summarisation request. ~6K tokens, which at
+# even a slow 25 tok/s prefill is a couple of minutes — small enough that any
+# single call finishes, and small enough that the wait is reportable.
+COMPACT_CHUNK_CHARS = 24_000
+
+
+def message_chars(m: dict) -> int:
+    """Size of one message, tolerating vision `parts` content."""
+    c = m.get("content", "")
+    if isinstance(c, str):
+        return len(c)
+    if isinstance(c, list):
+        return sum(len(p.get("text", "")) if isinstance(p, dict) else 0
+                   for p in c)
+    return len(str(c or ""))
+
+
+def compact_chunks(messages: list, budget: int = COMPACT_CHUNK_CHARS) -> list:
+    """Split messages into groups that each fit one summarisation request.
+
+    A message is never split — half a tool result summarises to nonsense — so a
+    single oversized message travels alone rather than dragging its neighbours
+    into a request that cannot complete. That case is not hypothetical: the
+    owner's model wrote a 20,000-token chapter into ONE message.
+    """
+    out: list[list] = []
+    cur: list = []
+    size = 0
+    for m in messages:
+        n = message_chars(m)
+        if cur and size + n > budget:
+            out.append(cur)
+            cur, size = [], 0
+        cur.append(m)
+        size += n
+        if size >= budget:            # oversized single message: close it out
+            out.append(cur)
+            cur, size = [], 0
+    if cur:
+        out.append(cur)
+    return out or [[]]
+
+
 def compact_timeout(chars: int, pp_tps: float = 0.0,
                     tg_tps: float = 0.0) -> float:
     """How long to allow a compaction request, given how much it must read."""
@@ -913,35 +956,49 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         recent = msgs[-keep:] if keep else []
         if not old:
             return None
-        parts = []
-        if s.get("digest"):
-            parts.append("Previous summary:\n" + s["digest"])
-        for m in old:
+        def _render(m: dict) -> str:
             content = m.get("content", "")
             if not isinstance(content, str):   # vision parts: keep the text
                 content = " ".join(
                     p.get("text", "") if p.get("type") == "text" else "[image]"
                     for p in content if isinstance(p, dict))
-            parts.append(f"{m.get('role', 'user')}: {content}")
-        payload = _COMPACT_PROMPT + "\n\n" + "\n".join(parts)
-        # The engine must prefill ALL of this before replying, so the patience
-        # has to scale with it — see compact_timeout. A flat 120s made the
-        # feature impossible on exactly the sessions it exists to serve.
+            return f"{m.get('role', 'user')}: {content}"
+
+        # FOLD, don't swallow. Summarising the whole session in one request made
+        # the feature impossible: the thing that reduces context had to prefill
+        # all of it first, in a single call that could not finish on any session
+        # big enough to need it. Each chunk is bounded, so each call completes;
+        # the running digest carries meaning forward across them.
         pp, tg = measured_rates()
-        budget = compact_timeout(len(payload), pp, tg)
-        _log.info("compact: %d chars, allowing %.0fs (prefill %.0f tok/s)",
-                  len(payload), budget, pp or _ASSUMED_PP_TPS)
-        resp = await client.post(
-            "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": payload}],
-                  "stream": False, "temperature": 0.3,
-                  "id_slot": AUX_SLOT},
-            timeout=budget)
-        if resp.status_code != 200:
-            raise RuntimeError(await _upstream_error(resp))
-        digest = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        chunks = compact_chunks(old)
+        digest = (s.get("digest") or "").strip()
+        for i, chunk in enumerate(chunks, 1):
+            if not chunk:
+                continue
+            head = ("Previous summary:\n" + digest + "\n\n") if digest else ""
+            payload = (_COMPACT_PROMPT + "\n\n" + head
+                       + "\n".join(_render(m) for m in chunk))
+            budget = compact_timeout(len(payload), pp, tg)
+            _log.info("compact: chunk %d/%d, %d chars, allowing %.0fs",
+                      i, len(chunks), len(payload), budget)
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": payload}],
+                      "stream": False, "temperature": 0.3,
+                      "id_slot": AUX_SLOT},
+                timeout=budget)
+            if resp.status_code != 200:
+                raise RuntimeError(await _upstream_error(resp))
+            got = (resp.json()["choices"][0]["message"]["content"]
+                   or "").strip()
+            if not got:
+                raise RuntimeError("summarizer returned an empty digest")
+            digest = got
         if not digest:
             raise RuntimeError("summarizer returned an empty digest")
+        # Nothing above touched `s`. A failure part-way through a fold leaves the
+        # session exactly as it was — the archive is the user's manuscript and a
+        # half-applied compaction is worse than none.
         s["digest"] = digest
         # bounded: a run compacts often (small ctx budget) and re-serialises the
         # whole session on every save, so an unbounded archive is real write
