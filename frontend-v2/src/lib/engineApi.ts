@@ -156,6 +156,9 @@ export interface ProbedFacts {
   /** false = the gguf shipped no tokenizer.chat_template, so an empty
    *  capability list is missing evidence rather than a finding. */
   has_template?: boolean;
+  /** a repaired chat template is installed at ~/.rigma/templates/<slug>.jinja
+   *  and passed to llama-server, so the model is NOT on a fallback format */
+  template_override?: boolean;
 }
 
 export interface ModelCard extends ProbedFacts {

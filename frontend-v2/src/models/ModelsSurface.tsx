@@ -191,21 +191,31 @@ function MtpMark({ q }: { q: QuantRow }) {
  *  a format it was not trained on, and nothing anywhere says so. */
 function NoTemplateNotice({ card }: { card: ModelCard }) {
   if (card.has_template !== false) return null;
+  // A repaired template standing in for the missing one changes the story
+  // completely: the model is NOT on a fallback format. Saying otherwise was a
+  // warning that had quietly become false (owner, 2026-08-19).
+  const fixed = card.template_override === true;
   return (
-    <div className="rounded-md bg-amber/10 text-amber px-2.5 py-1.5 font-mono text-[11.5px] mb-2"
+    <div className={`rounded-md px-2.5 py-1.5 font-mono text-[11.5px] mb-2 ${
+      fixed ? "bg-moss/10 text-moss" : "bg-amber/10 text-amber"}`}
          title={"llama.cpp falls back to a generic chat template when the gguf " +
-                "carries none. Drop a .jinja file at " +
-                "~/.rigma/templates/" + card.slug + ".jinja and Rigma passes it " +
-                "to the engine with --chat-template-file."}>
-      no chat template in this gguf — the capability list below is blank because
-      there is nothing to read, not because the model lacks the features. It is
-      running on the engine's fallback format.
+                "carries none. Rigma passes ~/.rigma/templates/" + card.slug +
+                ".jinja to the engine with --chat-template-file when that file " +
+                "exists."}>
+      {fixed
+        ? <>no chat template in this gguf, so a replacement is installed and in
+            use. The capability list below is still blank because it is read
+            from the gguf — that says nothing about what the model can do.</>
+        : <>no chat template in this gguf — the capability list below is blank
+            because there is nothing to read, not because the model lacks the
+            features. It is running on the engine's fallback format.</>}
     </div>
   );
 }
 
-function QuantLine({ card, q, onAction, best }: {
+function QuantLine({ card, q, onAction, best, showSpec }: {
   card: ModelCard; q: QuantRow; onAction: () => void; best?: string;
+  showSpec?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   const downloading = q.pull?.status === "downloading";
@@ -231,7 +241,7 @@ function QuantLine({ card, q, onAction, best }: {
           <CtxCell fit={q.fit} />
           <RunsCell fit={q.fit} />
           <QualityCell q={q} />
-          <MtpMark q={q} />
+          {showSpec && <MtpMark q={q} />}
         </>
       )}
       {!downloading && best === q.quant && (
@@ -271,6 +281,10 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const anyOnDisk = card.quants.some((q) => q.on_disk);
+  // Only show the spec column where something can fill it. A header over a
+  // column that is empty for every row on every card is a promise of data that
+  // never arrives — most models carry no MTP head at all.
+  const anySpec = card.quants.some((q) => q.mtp === true);
   const onDiskGb = card.quants.filter((q) => q.on_disk)
     .reduce((n, q) => n + q.bytes, 0)
     + (card.mmproj?.on_disk ? card.mmproj.bytes : 0);
@@ -370,14 +384,16 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
         <span className="w-[96px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
           vs bf16
         </span>
-        <span className="w-8 shrink-0" title="carries the MTP draft head, so speculative decoding can run on it">
-          spec
-        </span>
+        {anySpec && (
+          <span className="w-8 shrink-0" title="carries the MTP draft head, so speculative decoding can run on it">
+            spec
+          </span>
+        )}
       </div>
       <ul className="flex flex-col">
         {card.quants.map((q) => (
           <QuantLine key={q.file} card={card} q={q} onAction={onAction}
-                     best={card.recommended ?? undefined} />
+                     best={card.recommended ?? undefined} showSpec={anySpec} />
         ))}
         {card.mmproj && (
           <QuantLine
