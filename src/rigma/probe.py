@@ -5,6 +5,8 @@ import os
 import platform
 import re
 import shutil
+import subprocess
+import time
 
 import psutil
 
@@ -40,6 +42,82 @@ def classify_gpu(raw: dict, gpu_table: list[dict], os_name: str) -> GpuInfo:
                         "intel": ["vulkan"]}.get(vendor, ["vulkan"])
     return GpuInfo(vendor=vendor, name=name, vram_mb=vram,
                    slug=_slugify(name, vram), backends=default_backends)
+
+
+_PID_INSTANCE = re.compile(r"^pid_(\d+)_luid_", re.I)
+
+
+def _sum_other_processes(samples, exclude: set[int]) -> float | None:
+    """MiB of VRAM held by processes other than `exclude`.
+
+    Windows names GPU memory counter instances `pid_<N>_luid_<hi>_<lo>_phys_<n>`.
+    Anything that does not parse as one is an aggregate row, not a process, and
+    double-counts if summed.
+
+    None (not 0) when there was nothing to read: "unmeasured" and "the desktop
+    is using nothing" are very different claims, and only one of them is safe
+    to plan a 13GB allocation against.
+
+    NOTE: kept for the exclude-by-pid logic, but `gpu_used_mb` no longer uses
+    the per-process counter — see the comment there.
+    """
+    total, seen = 0.0, False
+    for name, value in samples:
+        m = _PID_INSTANCE.match(str(name))
+        if not m:
+            continue
+        seen = True
+        if int(m.group(1)) in exclude:
+            continue
+        total += float(value) / 2**20
+    return total if seen else None
+
+
+_PS_ADAPTER = (
+    r"$s=(Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage' "
+    r"-EA SilentlyContinue).CounterSamples;"
+    r"$t=0; foreach($x in $s){$t+=$x.CookedValue}; $t")
+
+
+_VRAM_CACHE: dict[str, tuple[float, float | None]] = {}
+_VRAM_TTL_S = 10.0
+
+
+def gpu_used_mb() -> float | None:
+    """Dedicated VRAM in use on the adapter right now, across ALL processes.
+
+    Adapter-level on purpose. The PER-PROCESS counter is not trustworthy:
+    measured 2026-08-21 on this machine, one browser instance reported
+    359,777 MiB of dedicated VRAM on a 16GB card. Summing those gives a number
+    that would refuse to run anything. The adapter total read 3,955 MiB at the
+    same moment, which matches what the desktop actually holds.
+
+    Why this matters at all: Windows overcommits VRAM instead of refusing an
+    allocation, so a model planned against a fixed "the desktop uses 1200MB"
+    assumption gets paged to system RAM with no error anywhere (measured:
+    4,107 MiB paged, 29% of the weights, decode at 21% of card bandwidth).
+
+    Every failure path returns None and the caller keeps the old constant —
+    this is cheap to be wrong about, and expensive to be confidently wrong.
+    """
+    if _os_name() != "windows":
+        return None                     # Linux path not implemented yet
+    # probe_hardware runs on every /api/models request; a 1.3s PowerShell call
+    # per request would cost more than the bug this fixes. The desktop's VRAM
+    # footprint does not move fast enough for a stale-by-10s answer to matter.
+    hit = _VRAM_CACHE.get("adapter")
+    if hit and time.monotonic() - hit[0] < _VRAM_TTL_S:
+        return hit[1]
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             _PS_ADAPTER],
+            capture_output=True, text=True, timeout=20)
+        got: float | None = float((out.stdout or "").strip()) / 2**20
+    except Exception:
+        got = None
+    _VRAM_CACHE["adapter"] = (time.monotonic(), got)
+    return got
 
 
 # --- Vulkan enumeration (ctypes; no SDK needed, the ICD ships with GPU drivers) ---
@@ -157,4 +235,5 @@ def probe_hardware(gpu_table: list[dict],
         cpu=CpuInfo(cores=os.cpu_count() or 1, name=platform.processor() or ""),
         os=os_name,
         disk_free_gb=shutil.disk_usage(os.path.expanduser("~")).free / 2**30,
+        vram_used_mb=gpu_used_mb(),
     )

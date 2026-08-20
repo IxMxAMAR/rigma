@@ -85,6 +85,54 @@ def _quant_from_name(fname: str) -> str:
     return m.group(0).upper() if m else "GGUF"
 
 
+_TOKEN_SPLIT = re.compile(r"[-_.]+")
+
+
+def quant_variants(files: list[str]) -> list[tuple[str, list[str]]]:
+    """Split each gguf name into (base label, variant tags).
+
+    Big repos do not ship a flat list of quants — they ship a GRID. 0bserverx's
+    Qwen3.8-27B publishes 103 ggufs that are really 22 quants crossed with
+    -multilingual, -mtp and -vision. Flat, that is a 103-row wall nobody can
+    read; as a grid it is 23 rows and three checkboxes (owner, 2026-08-21).
+
+    A variant is a token that FOLLOWS the quant tag. Everything before the tag
+    is the uploader's prefix ("RVN-"), which is not an axis — it is the same on
+    nearly every file. When a repo mixes prefixes, the minority ones are named
+    in full so two files sharing a quant tag stay distinguishable.
+    """
+    import os as _os
+    from collections import Counter
+    from pathlib import Path as _P
+    stems = [_P(f).stem for f in files]
+    tags = [_quant_from_name(f) for f in files]
+    # For names carrying no quant tag at all (SC117's APEX ships I-Compact /
+    # I-Quality / I-Balanced) there is nothing to anchor on, so the label is
+    # whatever part of the filename actually differs from its siblings.
+    pre = _os.path.commonprefix(stems)
+    suf = _os.path.commonprefix([x[::-1] for x in stems])[::-1]
+    heads, variants = [], []
+    for stem, tag in zip(stems, tags):
+        cut = stem.upper().rfind(tag) if tag != "GGUF" else -1
+        head, tail = (stem, "") if cut < 0 else (stem[:cut],
+                                                 stem[cut + len(tag):])
+        heads.append(head.strip("-_. "))
+        variants.append([t.lower() for t in _TOKEN_SPLIT.split(tail) if t])
+    seen = Counter(h for h in heads if h)
+    main = seen.most_common(1)[0][0] if seen else ""
+    bases = []
+    for stem, tag, head in zip(stems, tags, heads):
+        if tag == "GGUF":
+            core = (stem[len(pre):len(stem) - len(suf)]
+                    if len(pre) + len(suf) < len(stem) else stem)
+            bases.append(core.strip("-_. ").upper() or "GGUF")
+        elif head and head != main:
+            bases.append(f"{tag} ({head})")     # minority prefix, kept in full
+        else:
+            bases.append(tag)
+    return list(zip(bases, variants))
+
+
 def _distinct_quants(files: list[str]) -> list[str]:
     """A label per gguf that actually distinguishes them.
 
@@ -93,37 +141,31 @@ def _distinct_quants(files: list[str]) -> list[str]:
     I-Balanced — all collapse to "GGUF", so the picker showed three identical
     rows AND flagged every one of them as recommended (the badge compares on
     this label). Fall back to whatever part of the filename actually differs."""
-    import os as _os
     from pathlib import Path as _P
     labels = [_quant_from_name(f) for f in files]
     if len(set(labels)) == len(labels):
         return labels                       # real quant tags: leave them alone
     stems = [_P(f).stem for f in files]
-    pre = _os.path.commonprefix(stems)
-    suf = _os.path.commonprefix([s[::-1] for s in stems])[::-1]
-    out = []
-    for stem, fallback in zip(stems, labels):
-        core = stem[len(pre):len(stem) - len(suf)] if len(pre) + len(suf) < len(stem) \
-            else stem
-        core = core.strip("-_. ").upper()
-        if fallback == "GGUF":
-            # no real tag anywhere in the name (APEX's I-Compact / I-Quality):
-            # the differing part of the filename IS the label
-            out.append(core[:24] or fallback)
-            continue
-        # There IS a tag, and two files share it (jaromer ships both
-        # RVN-Q4_K_M.gguf and Qwen3.8-27B-Heretic-Q4_K_M.gguf). Keep the TAG at
-        # the FRONT and hang the distinguishing part off it: truncating a bare
-        # core to 24 chars ate the "_M" off "QWEN3.8-27B-HERETIC-Q4_K_M", which
-        # left the row unpriceable as well as unreadable.
-        extra = core.replace(fallback, "").strip("-_. ")
-        out.append(f"{fallback} ({extra[:14]})" if extra else fallback)
+    # There IS a tag and two files share it, so something else in the name has
+    # to earn its place. quant_variants knows which part: whatever follows the
+    # tag. "RVN-Q3_K_M-multilingual-mtp" becomes "Q3_K_M · multilingual+mtp"
+    # — the tag stays at the FRONT, where it is readable and priceable, and
+    # nothing is truncated. The old code cut `extra` to 14 chars, which made
+    # "RVN--MULTILINGUAL" and "RVN--MULTILINGUAL-MTP" collide (2026-08-21).
+    # ASCII on purpose: these labels are echoed by the CLI, and a Windows
+    # console on cp437 raises UnicodeEncodeError on anything else.
+    out = [f"{base} [{'+'.join(v)}]" if v else base
+           for base, v in quant_variants(files)]
     if len(set(out)) == len(out):
         return out
-    # still ambiguous (same stem in different subdirs): keep the path, which is
-    # the only thing left that differs
-    return [str(_P(f).with_suffix("")).replace("\\", "/").upper()[-24:]
-            for f in files]
+    # Same stem in different subdirs, or names differing only past the tag.
+    # Keep the HEAD and elide the middle: the previous version sliced the LAST
+    # 24 characters, rendering "RVN-IQ3_M-multilingual-mtp" as
+    # "N-IQ3_M-MULTILINGUAL-MTP". A label starting mid-word is unreadable in a
+    # way a long one is not (owner, 2026-08-21).
+    paths = [str(_P(f).with_suffix("")).replace(chr(92), "/").upper()
+             for f in files]
+    return [q if len(q) <= 30 else f"{q[:16]}...{q[-11:]}" for q in paths]
 
 
 def moe_from_probe(f: dict, biggest_bytes: int) -> MoESpec | None:
@@ -345,7 +387,8 @@ def heal_spec(spec: ModelSpec) -> ModelSpec:
     return healed
 
 
-def reprobe(slug: str, *, allow_remote: bool = True) -> ModelSpec:
+def reprobe(slug: str, *, allow_remote: bool = True,
+            refresh_files: bool = True) -> ModelSpec:
     """Re-derive a spec's probed facts on demand, reading the repo if needed.
 
     `heal_spec` runs on every registry load and so must never touch the network;
@@ -361,12 +404,26 @@ def reprobe(slug: str, *, allow_remote: bool = True) -> ModelSpec:
         raise HangarError(f"{slug} is not a custom model — registry specs are "
                           "hand-authored and are not re-probed")
     healed = heal_spec(spec.model_copy(update={"probe_version": 0}))
+    remote = next((g for g in spec.ggufs if g.repo and g.repo != "local"), None)
+    # The INVENTORY is a separate question from the GEOMETRY, and refreshing it
+    # must not be gated on the geometry being stale: the owner's model had
+    # current geometry and a file list 76 ggufs out of date, so the freshness
+    # check below returned before anything looked at the repo (2026-08-21).
+    if refresh_files and allow_remote and remote is not None:
+        from .hf_browse import repo_files
+        merged = merge_repo_files(healed, repo_files(remote.repo))
+        # Compare labels too, not just filenames: `_distinct_quants` derives a
+        # label from the whole set, so a refresh that adds no file can still
+        # legitimately rename rows — and a write gated on filenames alone left
+        # 103 stale labels on disk (2026-08-21).
+        if [(g.file, g.quant) for g in merged.ggufs]                 != [(g.file, g.quant) for g in healed.ggufs]                 or merged.mmproj != healed.mmproj:
+            healed = merged
+            _write_spec(healed)
     if healed.probe_version >= PROBE_VERSION:
         return healed
     if not allow_remote:
         raise HangarError(f"nothing of {slug} is downloaded, so there is no "
                           "file to read")
-    remote = next((g for g in spec.ggufs if g.repo and g.repo != "local"), None)
     if remote is None:
         raise HangarError(f"{slug} was installed from a local file that is no "
                           "longer on disk — nothing left to read")
@@ -375,9 +432,61 @@ def reprobe(slug: str, *, allow_remote: bool = True) -> ModelSpec:
     f = info.spec_fields
     if not f or f.get("n_layers", 0) <= 0 or f.get("kv_heads", 0) <= 0:
         raise HangarError(f"{remote.file} carries no usable model metadata")
-    updated = _with_probe(spec, info, {remote.file: f})
+    updated = _with_probe(healed, info, {remote.file: f})
     _write_spec(updated)
     return updated
+
+
+def merge_repo_files(spec: ModelSpec, rf: dict, *,
+                     on_disk: set[str] | None = None) -> ModelSpec:
+    """Fold a fresh repo listing into a spec's gguf list.
+
+    `reprobe` re-reads a model's GEOMETRY; this re-reads its INVENTORY. They are
+    different questions and a repo answers the second one long after you added
+    it: 0bserverx/Qwen3.8-27B-Heretic went from 27 ggufs to 103 by publishing
+    -mtp and -multilingual builds, and none of them were reachable, because
+    `add_model` refuses a repo already in the library (2026-08-21).
+
+    Four rules, each one a way this could quietly lose something:
+
+    * a gguf ON DISK is never dropped, even if the repo deleted it — forgetting
+      it orphans gigabytes and cuts the running server loose from its own spec;
+    * one that was never downloaded IS dropped, so the list tracks the repo;
+    * `mtp` flags already probed are carried over. Each cost a ranged header
+      read, and re-reading 103 of them to learn what we know is minutes of
+      network for nothing. A NEW file stays None — unknown, never assumed,
+      because llama.cpp resets the Vulkan driver if asked for draft-mtp on a
+      file without the tensors;
+    * labels are re-derived over the WHOLE new set, since `_distinct_quants`
+      names a file by what distinguishes it from its siblings — adding a file
+      can legitimately rename one that was already there.
+    """
+    if on_disk is None:
+        on_disk = {p.name for p in models_dir().glob("*.gguf")}
+    repo = next((g.repo for g in spec.ggufs if g.repo and g.repo != "local"), "")
+    known = {g.file: g for g in spec.ggufs}
+    listed = [g["file"] for g in (rf.get("ggufs") or [])]
+    sizes = {g["file"]: g["bytes"] for g in (rf.get("ggufs") or [])}
+    kept = [f for f in known
+            if f not in sizes and (f in on_disk or known[f].repo == "local")]
+    files = listed + kept
+    ggufs = []
+    for fname, label in zip(files, _distinct_quants(files)):
+        prev = known.get(fname)
+        if prev is not None:
+            ggufs.append(prev.model_copy(update={
+                "quant": label, "bytes": sizes.get(fname, prev.bytes)}))
+        else:
+            ggufs.append(GgufFile(repo=repo, file=fname,
+                                  bytes=sizes.get(fname, 0), quant=label))
+    update: dict = {"ggufs": ggufs}
+    mm = rf.get("mmproj")
+    if mm and (spec.mmproj is None or spec.mmproj.file != mm["file"]):
+        update["mmproj"] = GgufFile(repo=repo, file=mm["file"],
+                                    bytes=mm["bytes"],
+                                    quant=_quant_from_name(mm["file"]))
+        update["capabilities"] = sorted(set(spec.capabilities) | {"vision"})
+    return spec.model_copy(update=update)
 
 
 def _with_probe(spec: ModelSpec, info, probed: dict) -> ModelSpec:
@@ -564,7 +673,14 @@ def _running_files(state: dict | None, reg) -> set[str]:
     spec = reg.models.get(state.get("model", ""))
     if spec is None:
         return set()
-    out = {g.file for g in spec.ggufs if g.quant == state.get("quant")}
+    # The FILE is the identity. A quant LABEL is derived from the whole file
+    # list, so publishing siblings can rename a row that did not change — and
+    # matching on it un-marked the model the engine was actually holding
+    # (2026-08-21). State written before this carries no file: fall back.
+    want = state.get("gguf") or ""
+    out = {g.file for g in spec.ggufs if g.file == want} if want else set()
+    if not out:
+        out = {g.file for g in spec.ggufs if g.quant == state.get("quant")}
     if spec.mmproj is not None:
         out.add(spec.mmproj.file)
     return out
@@ -576,6 +692,7 @@ def list_models(registry=None, profile=None, *, kv: str = "",
     from .registry import Registry
     reg = registry if registry is not None else Registry.load()
     state = st.read_state()
+    held = _running_files(state, reg)
     mdir = models_dir()
     models, used = [], 0
     for slug in sorted(reg.models):
@@ -586,6 +703,11 @@ def list_models(registry=None, profile=None, *, kv: str = "",
         # (owner report 2026-07-30). Deriving on read heals those in place
         # instead of needing every stored spec rewritten.
         labels = _distinct_quants([g.file for g in spec.ggufs])
+        # The grid behind the list: 103 files that are really 26 quants crossed
+        # with -multilingual/-mtp/-vision. The UI groups on `base` and filters
+        # on `variants`, so the card is 26 rows and three chips instead of a
+        # 103-row wall (owner, 2026-08-21).
+        axes = quant_variants([g.file for g in spec.ggufs])
         # fit verdict per quant, against THIS machine. Without it the page
         # offered 21 quants with nothing but a size to choose between them.
         fits: list[dict] = [{} for _ in spec.ggufs]
@@ -599,7 +721,8 @@ def list_models(registry=None, profile=None, *, kv: str = "",
         from .quant_quality import (label_overstates, measured_bpw, quality_of,
                                     total_loss)
         quants = []
-        for g, label, fit in zip(spec.ggufs, labels, fits):
+        for g, label, (base, variants), fit in zip(spec.ggufs, labels,
+                                                   axes, fits):
             on_disk = (mdir / g.file).exists()
             used += g.bytes if on_disk else 0
             # reference quality for the FORMAT — None when the repo uses its own
@@ -625,10 +748,17 @@ def list_models(registry=None, profile=None, *, kv: str = "",
                            "label_drift": label_overstates(label, g.bytes,
                                                            spec.params),
                            # WHICH quant is loaded, not just which model —
-                           # with two on disk the card could not tell them apart
-                           "running": bool(
-                               state and state.get("model") == slug
-                               and state.get("quant") == label),
+                           # with two on disk the card could not tell them
+                           # apart. Keyed on the FILE: labels are derived from
+                           # the whole set and move when the repo publishes
+                           # siblings, which silently un-marked the running
+                           # row (2026-08-21). `held` covers the fallback for
+                           # state written before the file was recorded.
+                           "running": g.file in held,
+                           # what this row IS, split from what makes it a
+                           # variant of its siblings
+                           "base": base,
+                           "variants": variants,
                            "pull": _PULLS.get(f"{slug}::{g.file}")})
         mm = None
         if spec.mmproj is not None:

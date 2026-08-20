@@ -297,14 +297,157 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
   );
 }
 
+/** How many rows a card shows before it asks permission to keep going. Below
+ *  this a list is scannable; above it the card stops being a card. */
+const COLLAPSE_AT = 12;
+
+/** The variant axes present across a set of rows, in the order a reader meets
+ *  them. Most repos have none and get no chips at all. */
+function axesOf(rows: QuantRow[]): string[] {
+  const seen: string[] = [];
+  for (const r of rows)
+    for (const v of r.variants ?? [])
+      if (!seen.includes(v)) seen.push(v);
+  return seen;
+}
+
+/** One chip per variant the repo actually ships. Off means "hide those rows",
+ *  which is what makes 103 files readable as 26. */
+function VariantChips({ axes, on, toggle, counts }: {
+  axes: string[]; on: Set<string>; toggle: (a: string) => void;
+  counts: Record<string, number>;
+}) {
+  return (
+    <div className="flex items-center gap-1.5 px-3 pb-2 flex-wrap">
+      <span className="font-mono text-[10px] text-muted uppercase tracking-[0.06em] mr-0.5">
+        variants
+      </span>
+      {axes.map((a) => (
+        <button
+          key={a}
+          onClick={() => toggle(a)}
+          aria-pressed={on.has(a)}
+          title={on.has(a)
+            ? `hide the ${counts[a]} ${a} builds`
+            : `this repo also ships ${counts[a]} ${a} builds — show them`}
+          className={`rounded-md px-2 py-0.5 font-mono text-[11px] border transition-colors ${
+            on.has(a)
+              ? "bg-amber/15 text-amber border-amber/40"
+              : "bg-surface text-muted border-transparent hover:text-secondary"}`}
+        >
+          {a}
+          <span className="ml-1.5 opacity-60">{counts[a]}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** The quant list: variant chips, the column header, and the rows themselves.
+ *  Shared by the library card and the pre-download repo view so the two cannot
+ *  disagree about what a row means. */
+/** Variant filtering + collapse, shared by the library card and the
+ *  pre-download repo view. Both render a quant list; only the row markup
+ *  differs, so the rule for WHICH rows appear lives here once. */
+function useQuantView(rows: QuantRow[]) {
+  const axes = axesOf(rows);
+  const [on, setOn] = useState<Set<string>>(new Set());
+  const [all, setAll] = useState(false);
+  const toggle = (a: string) => setOn((prev) => {
+    const next = new Set(prev);
+    if (next.has(a)) next.delete(a); else next.add(a);
+    return next;
+  });
+  const counts: Record<string, number> = {};
+  for (const a of axes) counts[a] = rows.filter(
+    (r) => (r.variants ?? []).includes(a)).length;
+
+  // A row survives the filter when every variant it carries is switched on.
+  // Anything ON DISK or RUNNING ignores the filter completely — hiding a file
+  // the user already downloaded, or the one the engine is holding, would be a
+  // filter that lies about what they have.
+  const visible = rows.filter((r) => {
+    if (r.on_disk || r.running) return true;
+    return (r.variants ?? []).every((v) => on.has(v));
+  });
+  const shown = all || visible.length <= COLLAPSE_AT
+    ? visible : visible.slice(0, COLLAPSE_AT);
+  return { axes, on, toggle, counts, visible, shown, all, setAll,
+           hidden: visible.length - shown.length };
+}
+
+/** "show 78 more" / "collapse" — only when there is something to hide. */
+function MoreRows({ v }: { v: ReturnType<typeof useQuantView> }) {
+  if (v.hidden > 0)
+    return (
+      <button
+        onClick={() => v.setAll(true)}
+        className="mt-1 mx-3 self-start rounded-md bg-surface px-2.5 py-1 font-mono text-[11.5px] text-secondary hover:text-amber"
+      >
+        show {v.hidden} more {v.hidden === 1 ? "quant" : "quants"}
+      </button>
+    );
+  if (v.all && v.visible.length > COLLAPSE_AT)
+    return (
+      <button
+        onClick={() => v.setAll(false)}
+        className="mt-1 mx-3 self-start rounded-md bg-surface px-2.5 py-1 font-mono text-[11.5px] text-muted hover:text-secondary"
+      >
+        collapse
+      </button>
+    );
+  return null;
+}
+
+function QuantTable({ card, rows, onAction, best, extra }: {
+  card: ModelCard; rows: QuantRow[]; onAction: () => void;
+  best?: string; extra?: React.ReactNode;
+}) {
+  const v = useQuantView(rows);
+  const { axes, on, toggle, counts, shown } = v;
+  const anySpec = rows.some((q) => q.mtp === true);
+
+  return (
+    <>
+      {axes.length > 0 && (
+        <VariantChips axes={axes} on={on} toggle={toggle} counts={counts} />
+      )}
+      <div className="flex items-center gap-2 px-3 pb-1 font-mono text-[10px]
+                      text-muted uppercase tracking-[0.06em]">
+        <span className="w-1.5 shrink-0" />
+        <span className="w-24 shrink-0">quant</span>
+        <span className="w-[52px] shrink-0 text-right">size</span>
+        <span className="w-[46px] shrink-0 text-right" title="context window this quant can hold on this machine">
+          ctx
+        </span>
+        <span className="w-[74px] shrink-0" title="where the weights end up: fully on the GPU, or partly in system RAM">
+          runs
+        </span>
+        <span className="w-[96px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
+          vs bf16
+        </span>
+        {anySpec && (
+          <span className="w-8 shrink-0" title="carries the MTP draft head, so speculative decoding can run on it">
+            spec
+          </span>
+        )}
+      </div>
+      <ul className="flex flex-col">
+        {shown.map((q) => (
+          <QuantLine key={q.file} card={card} q={q} onAction={onAction}
+                     best={best} showSpec={anySpec} />
+        ))}
+        {extra}
+      </ul>
+      <MoreRows v={v} />
+    </>
+  );
+}
+
 function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const anyOnDisk = card.quants.some((q) => q.on_disk);
-  // Only show the spec column where something can fill it. A header over a
-  // column that is empty for every row on every card is a promise of data that
-  // never arrives — most models carry no MTP head at all.
-  const anySpec = card.quants.some((q) => q.mtp === true);
   const onDiskGb = card.quants.filter((q) => q.on_disk)
     .reduce((n, q) => n + q.bytes, 0)
     + (card.mmproj?.on_disk ? card.mmproj.bytes : 0);
@@ -390,40 +533,20 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
           </>
         )}
       </div>
-      <div className="flex items-center gap-2 px-3 pb-1 font-mono text-[10px]
-                      text-muted uppercase tracking-[0.06em]">
-        <span className="w-1.5 shrink-0" />
-        <span className="w-24 shrink-0">quant</span>
-        <span className="w-[52px] shrink-0 text-right">size</span>
-        <span className="w-[46px] shrink-0 text-right" title="context window this quant can hold on this machine">
-          ctx
-        </span>
-        <span className="w-[74px] shrink-0" title="where the weights end up: fully on the GPU, or partly in system RAM">
-          runs
-        </span>
-        <span className="w-[96px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
-          vs bf16
-        </span>
-        {anySpec && (
-          <span className="w-8 shrink-0" title="carries the MTP draft head, so speculative decoding can run on it">
-            spec
-          </span>
-        )}
-      </div>
-      <ul className="flex flex-col">
-        {card.quants.map((q) => (
-          <QuantLine key={q.file} card={card} q={q} onAction={onAction}
-                     best={card.recommended ?? undefined} showSpec={anySpec} />
-        ))}
-        {card.mmproj && (
+      <QuantTable
+        card={card}
+        rows={card.quants}
+        onAction={onAction}
+        best={card.recommended ?? undefined}
+        extra={card.mmproj ? (
           <QuantLine
             key={card.mmproj.file}
             card={card}
             q={{ ...card.mmproj, quant: "mmproj" } as QuantRow}
             onAction={onAction}
           />
-        )}
-      </ul>
+        ) : undefined}
+      />
     </section>
   );
 }
@@ -444,6 +567,10 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
       .catch((e) => { if (live) setErr((e as Error).message); });
     return () => { live = false; };
   }, [id, cfg]);
+
+  // BEFORE the early returns — hook order has to be identical on every render,
+  // and this component bails out early on both error and loading.
+  const v = useQuantView(d?.ggufs ?? []);
 
   if (err) {
     return <div className="px-3 py-2 font-mono text-[11.5px] text-red">{err}</div>;
@@ -473,6 +600,10 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
         {d.split_skipped > 0 &&
           ` · ${d.split_skipped} split file(s) skipped (not supported)`}
       </div>
+      {v.axes.length > 0 && (
+        <VariantChips axes={v.axes} on={v.on} toggle={v.toggle}
+                      counts={v.counts} />
+      )}
       <div className="flex items-center gap-2 px-3 pb-1 font-mono text-[10px]
                       text-muted uppercase tracking-[0.06em]">
         <span className="w-24 shrink-0">quant</span>
@@ -482,7 +613,7 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
         <span className="w-[96px] shrink-0">vs bf16</span>
       </div>
       <ul className="flex flex-col">
-        {d.ggufs.map((q) => (
+        {v.shown.map((q) => (
           <li key={q.file}
               className="flex items-center gap-2 px-3 py-1 rounded hover:bg-surface/50">
             <span className={`font-mono text-[12px] w-24 shrink-0 truncate ${
@@ -505,6 +636,7 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
           </li>
         ))}
       </ul>
+      <MoreRows v={v} />
     </div>
   );
 }

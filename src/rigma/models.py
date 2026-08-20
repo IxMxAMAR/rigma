@@ -31,6 +31,11 @@ class HardwareProfile(BaseModel):
     cpu: CpuInfo
     os: str  # "windows" | "linux" | "darwin"
     disk_free_gb: float
+    # VRAM every process on the machine currently holds, measured. None when
+    # unmeasurable. Windows overcommits VRAM rather than refusing, so planning
+    # against a fixed "the desktop uses 1200MB" gets the difference silently
+    # paged to system RAM (measured 2026-08-21: 4,107MB, 29% of the weights).
+    vram_used_mb: float | None = None
 
     @property
     def primary_gpu(self) -> GpuInfo | None:

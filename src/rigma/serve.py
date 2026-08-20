@@ -1865,6 +1865,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                      "mmproj", None))
         except Exception:
             info["has_mmproj"] = False
+        # Which backends this GPU can run, and which engine builds are already
+        # unpacked. Without the second half the UI would offer ROCm with no hint
+        # that choosing it means a ~1.2GB download first.
+        try:
+            info["backends"] = server_ops.available_backends(registry)
+        except Exception:
+            info["backends"] = []
+        # What the DESKTOP is holding. Windows overcommits VRAM rather than
+        # refusing, so this is the difference between a plan that is resident
+        # and one that is silently paged over PCIe — and it is the one number
+        # the user can act on directly, by closing something.
+        try:
+            info["vram"] = server_ops.vram_snapshot(registry)
+        except Exception:
+            info["vram"] = None
         return info
 
     @app.get("/api/server/stats")
@@ -1940,6 +1955,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": f"kv must be one of "
                           f"{', '.join(server_ops.KV_CACHE_TYPES)}"},
                 status_code=400)
+        backend = (body.get("backend") or "").strip() or None
+        if backend is not None:
+            avail = {b["name"] for b in server_ops.available_backends(registry)}
+            if backend not in avail:
+                switch_lock.release()
+                return JSONResponse(
+                    {"error": f"this GPU cannot run {backend} — it supports "
+                              f"{', '.join(sorted(avail)) or 'nothing detected'}"},
+                    status_code=400)
         # vision: omit to keep the current setting; it is sticky across
         # relaunches so a ctx change can't silently reload the projector
         vision = body.get("vision")
@@ -1955,7 +1979,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         try:
             new_state = await asyncio.to_thread(
                 server_ops.perform_switch, s["model"], registry, None, want,
-                False, kv, vision)
+                False, kv, vision, None, backend)
             telemetry["tg"] = None
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)

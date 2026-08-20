@@ -30,6 +30,18 @@ export interface ServerInfo {
   expected_tg?: number | null;
   verdict?: string;
   openai_base?: string;
+  /** Compute backends THIS GPU can run. `ready` means the engine build is
+   *  already unpacked; choosing one that isn't costs a ~1.2GB download, so the
+   *  UI has to say so before it relaunches. */
+  backends?: { name: string; ready: boolean; buildable: boolean }[];
+  /** Where the card's memory has gone. `desktop_mb` is what OTHER processes
+   *  hold; on Windows that is the difference between a resident model and one
+   *  the driver silently pages over PCIe, and it is the only number here the
+   *  user can act on. null when it could not be measured. */
+  vram?: {
+    total_mb: number; desktop_mb: number | null; usable_mb: number;
+    assumed_mb: number; pressured: boolean;
+  } | null;
   [k: string]: unknown;
 }
 
@@ -146,6 +158,14 @@ export interface QuantRow {
   label_drift?: { measured_bpw: number; label_bpw: number; drift_pct: number } | null;
   /** this exact quant is the one the engine has loaded right now */
   running?: boolean;
+  /** The quant format alone — "Q3_K_M" — with the repo's variant suffixes
+   *  split off into `variants`. Big repos ship a GRID, not a list: 0bserverx's
+   *  Qwen3.8-27B is 103 files that are 26 quants x multilingual x mtp x vision.
+   *  The card groups rows on this and filters them on `variants`. */
+  base?: string;
+  /** e.g. ["multilingual", "mtp"]. Empty for the plain build, and empty for
+   *  every row in the great majority of repos, which ship no variants. */
+  variants?: string[];
 }
 
 /** Facts probed from the gguf itself, shared by the library card and the
@@ -217,11 +237,13 @@ export const engineApi = {
     j<unknown>("POST", "/api/server/switch", quant ? { model, quant } : { model }),
   /** Relaunch the RUNNING model with different engine settings. Every one of
    *  these stops the engine and starts it again — see EngineCard's warning. */
-  relaunchWith: (o: { ctx: number; kv?: string; vision?: boolean }) =>
+  relaunchWith: (o: { ctx: number; kv?: string; vision?: boolean;
+                      backend?: string }) =>
     j<unknown>("POST", "/api/server/ctx", {
       ctx: o.ctx,
       ...(o.kv ? { kv: o.kv } : {}),
       ...(o.vision === undefined ? {} : { vision: o.vision }),
+      ...(o.backend ? { backend: o.backend } : {}),
     }),
   relaunch: (ctx: number, kv?: string) =>
     j<unknown>("POST", "/api/server/ctx", kv ? { ctx, kv } : { ctx }),

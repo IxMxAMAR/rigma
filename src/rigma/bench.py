@@ -102,12 +102,59 @@ def save_calibration(key: str, measured: dict, flags: dict | None = None,
     # without it is from before and is read leniently.
     entry["schema"] = 2
     entry["engine"] = _engine_version()
+    # What the desktop was holding when this was measured. Without it there is
+    # nothing in the entry to distinguish 9.95 tok/s from 37.59 for the same
+    # model on the same engine (measured 2026-08-21).
+    try:
+        from .probe import gpu_used_mb
+        used = gpu_used_mb()
+        if used is not None:
+            entry["vram_used_mb"] = round(used)
+    except Exception:
+        pass
     if ctx:
         entry["ctx"] = ctx
     entry["date"] = datetime.date.today().isoformat()
     cal[key] = entry
     calibration_path().parent.mkdir(parents=True, exist_ok=True)
     calibration_path().write_text(json.dumps(cal, indent=2), encoding="utf-8")
+
+
+# How much the desktop's VRAM footprint may drift before a calibration stops
+# meaning anything. Measured 2026-08-21: 2,828MB of drift changed the same model
+# on the same engine from 9.95 to 37.59 tok/s, because Windows silently paged a
+# third of the weights to system RAM. A few hundred MB is ordinary desktop
+# noise; anything more changes what the number means.
+VRAM_DRIFT_TOLERANCE_MB = 700
+
+
+def calibration_stale(entry: dict, vram_used_mb: float | None,
+                      engine: str = "", ctx: int = 0) -> str | None:
+    """Why this calibration should not be trusted, or None if it should.
+
+    Speed on a fixed model+quant+engine is not a constant: it depends on whether
+    the weights actually fit in VRAM, and on Windows that depends on what ELSE
+    is holding VRAM. A calibration taken while a browser held 4GB describes a
+    machine that no longer exists once the browser closes.
+    """
+    if not entry:
+        return None
+    if engine and entry.get("engine") and entry["engine"] != engine:
+        return f"measured on engine {entry['engine']}, now on {engine}"
+    if ctx and entry.get("ctx") and entry["ctx"] != ctx:
+        return f"measured at ctx {entry['ctx']:,}, now {ctx:,}"
+    was = entry.get("vram_used_mb")
+    # Entries written before this was recorded, and machines where it cannot be
+    # read, are read leniently: no reading is not a reading of zero, and
+    # invalidating every old entry at once helps nobody.
+    if was is None or vram_used_mb is None:
+        return None
+    drift = abs(float(vram_used_mb) - float(was))
+    if drift > VRAM_DRIFT_TOLERANCE_MB:
+        return (f"measured with {was:,.0f} MiB of VRAM held by other apps, "
+                f"now {vram_used_mb:,.0f} MiB — a {drift:,.0f} MiB shift changes "
+                "whether the model fits on the GPU at all")
+    return None
 
 
 def is_calibrated(model: str, quant: str, backend: str) -> bool:
