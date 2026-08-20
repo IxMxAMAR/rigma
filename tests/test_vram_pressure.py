@@ -85,3 +85,64 @@ def test_the_measurement_is_cached_between_calls(monkeypatch):
     second = probe.gpu_used_mb()
     assert first == second == 2000
     assert len(calls) == 1, f"measured {len(calls)} times, should have cached"
+
+
+def test_the_running_engine_is_credited_back_by_its_OWN_file():
+    """`_free_current` credited back the LARGEST gguf in the spec as a stand-in
+    for the running one. That was harmless while a model listed a handful of
+    files; after the 2026-08-21 file-list refresh the same model listed 103,
+    including a 50GB BF16 — so it credited back three times the card's capacity,
+    concluded the GPU was empty, and went straight back to planning against VRAM
+    that does not exist. state["gguf"] names the actual file; use it."""
+    from rigma.models import CpuInfo, GgufFile, GpuInfo, HardwareProfile, ModelSpec
+    from rigma.server_ops import _free_current
+
+    spec = ModelSpec(slug="m", family="qwen35", kind="dense", n_layers=64,
+                     full_attn_layers=16, kv_heads=4, head_dim=256,
+                     native_ctx=262144, custom=True,
+                     ggufs=[GgufFile(repo="a/b", file="small.gguf",
+                                     bytes=13_301_433_856, quant="Q3_K_M"),
+                            GgufFile(repo="a/b", file="huge-BF16.gguf",
+                                     bytes=54_000_000_000, quant="BF16")])
+
+    class _Reg:
+        models = {"m": spec}
+
+    prof = HardwareProfile(
+        os="windows", cpu=CpuInfo(cores=16),
+        gpus=[GpuInfo(vendor="amd", name="RX 9070 XT", vram_mb=16304,
+                      arch="rdna4", slug="s", backends=["vulkan"])],
+        ram_mb=32133, ram_free_mb=20000, disk_free_gb=500.0,
+        vram_used_mb=15212)
+
+    state = {"model": "m", "quant": "Q3_K_M", "gguf": "small.gguf"}
+    out = _free_current(prof, state, _Reg())
+    # 15,212 held minus the 12,686 MiB file that is actually loaded
+    assert 2000 < out.vram_used_mb < 3200, (
+        f"credited back the wrong file: {out.vram_used_mb}")
+
+
+def test_crediting_falls_back_to_the_largest_when_the_file_is_unknown():
+    """State written before the filename was recorded has no `gguf`. Guessing
+    the largest is still better than crediting nothing, which would make a
+    ctx change on the running model plan against its own occupied card."""
+    from rigma.models import CpuInfo, GgufFile, GpuInfo, HardwareProfile, ModelSpec
+    from rigma.server_ops import _free_current
+
+    spec = ModelSpec(slug="m", family="qwen35", kind="dense", n_layers=64,
+                     full_attn_layers=16, kv_heads=4, head_dim=256,
+                     native_ctx=262144, custom=True,
+                     ggufs=[GgufFile(repo="a/b", file="only.gguf",
+                                     bytes=13_301_433_856, quant="Q3_K_M")])
+
+    class _Reg:
+        models = {"m": spec}
+
+    prof = HardwareProfile(
+        os="windows", cpu=CpuInfo(cores=16),
+        gpus=[GpuInfo(vendor="amd", name="RX 9070 XT", vram_mb=16304,
+                      arch="rdna4", slug="s", backends=["vulkan"])],
+        ram_mb=32133, ram_free_mb=20000, disk_free_gb=500.0,
+        vram_used_mb=15212)
+    out = _free_current(prof, {"model": "m", "quant": "Q3_K_M"}, _Reg())
+    assert 2000 < out.vram_used_mb < 3200

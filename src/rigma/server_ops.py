@@ -127,9 +127,17 @@ def _free_current(profile, state: dict, reg):
     spec = reg.models.get(state.get("model", ""))
     if spec is None or not spec.ggufs:
         return profile
-    # over-credit is safe (32GB RAM); fit_gguf then computes the real split
-    freed_mb = max(g.bytes for g in spec.ggufs) / 2**20
-    if spec.mmproj:
+    # The file the engine ACTUALLY holds. `state["gguf"]` records it since
+    # 2026-08-21; the largest-gguf guess below is the fallback for state written
+    # before that. The guess was harmless while a model listed a handful of
+    # files and became dangerous the moment one listed 103: this model's repo
+    # includes a 50GB BF16, so crediting the largest handed back three times the
+    # card's capacity, made the GPU look empty, and put the planner straight
+    # back to assuming VRAM that does not exist.
+    running = next((g for g in spec.ggufs if g.file == state.get("gguf")), None)
+    freed_mb = ((running.bytes if running is not None
+                 else max(g.bytes for g in spec.ggufs)) / 2**20)
+    if spec.mmproj and not state.get("no_vision"):
         freed_mb += spec.mmproj.bytes / 2**20
     update = {"ram_free_mb": profile.ram_free_mb + int(freed_mb)}
     # The engine we are about to kill still holds its VRAM. Credit it back, or
@@ -137,7 +145,11 @@ def _free_current(profile, state: dict, reg):
     # shrinks to fit a card that is about to be freed. Never below zero, and
     # never below what an unloaded desktop would read.
     if profile.vram_used_mb is not None and not state.get("unloaded"):
-        update["vram_used_mb"] = max(0.0, profile.vram_used_mb - freed_mb)
+        # VRAM must never be over-credited the way RAM safely can: the whole
+        # point of measuring it is to stop planning against memory the card
+        # does not have. Cap the credit at what is actually held.
+        update["vram_used_mb"] = max(0.0, profile.vram_used_mb
+                                     - min(freed_mb, profile.vram_used_mb))
     return profile.model_copy(update=update)
 
 
