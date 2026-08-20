@@ -195,15 +195,21 @@ def _dense(size_gb, layers=48, kv_heads=8, head_dim=128, ctx=262400):
                         bytes=int(size_gb * 2**30), quant="Q6_K")])
 
 
-def test_q8_cache_is_tried_before_giving_up_context():
-    # 48L x 8kv x 128hd = 192 KiB/token at f16. An 11GB model on 16GB leaves
-    # ~3GB, so 16k@f16 (3072MB) misses by ~50MB and used to fall back to 8k.
-    # q8_0 halves the cache, which is far cheaper than losing half the window.
+def test_a_smaller_cache_is_tried_before_giving_up_context():
+    # 48L x 8kv x 128hd = 192 KiB/token at f16, so 16k costs 3,072MB of cache.
+    # Sized so f16 misses the budget by ~60MB: the point is that the resolver
+    # spends cache precision rather than half the context window.
+    #
+    # Was _dense(11.0) against a 900MB compute-buffer reserve. That reserve was
+    # measured at 43-81MB on 2026-08-21 and cut to 400, which handed this
+    # scenario enough room for f16 to simply fit — a better outcome, but no
+    # longer a test of the ladder. Resized to keep exercising it.
     from rigma import resolve
-    spec = _dense(11.0)
+    spec = _dense(11.5)
     flags = resolve.fit_gguf(spec, spec.ggufs[0], _box(), 16384, [])
-    assert flags is not None, "16k should fit once q8_0 is considered"
-    assert flags.cache_type_k == "q8_0" and flags.cache_type_v == "q8_0"
+    assert flags is not None, "16k should fit once the cache can be quantised"
+    assert flags.cache_type_k != "f16", "gave up context instead of cache bits"
+    assert flags.cache_type_k == flags.cache_type_v
     assert flags.ngl == 99, "weights must stay fully on the GPU"
 
 

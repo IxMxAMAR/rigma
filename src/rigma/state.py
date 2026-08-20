@@ -17,7 +17,7 @@ def write_state(model_slug: str, quant: str, public_port: int,
                 engine_pid: int, ui_pid: int, backend: str = "unknown",
                 use_case: str = "general", ctx: int = 0,
                 unloaded: bool = False, kv_cache: str = "",
-                no_vision: bool = False) -> None:
+                no_vision: bool = False, gguf: str = "") -> None:
     state_path().parent.mkdir(parents=True, exist_ok=True)
     state_path().write_text(json.dumps({
         "model": model_slug, "quant": quant, "public_port": public_port,
@@ -27,6 +27,10 @@ def write_state(model_slug: str, quant: str, public_port: int,
         # the vision projector was deliberately left off this launch; sticky,
         # so a later ctx change doesn't silently reload it and eat the VRAM
         "no_vision": no_vision,
+        # which FILE is loaded. `quant` is a derived label and moves when the
+        # repo gains siblings; the filename does not, so it is what the Models
+        # page matches the running row on.
+        "gguf": gguf,
     }, indent=2), encoding="utf-8")
 
 

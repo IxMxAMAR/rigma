@@ -7,7 +7,13 @@ from .registry import Registry
 
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
 RAM_RESERVE_MB = 2048
-COMPUTE_BUFFER_MB = 900
+# llama.cpp's own scratch allocation, on top of weights and KV. Measured
+# 2026-08-21 on a dense 27B at ubatch 512, across four fully-resident rungs:
+# 43, 44, 55 and 81 MiB. The old 900 was a guess made when the Windows desktop
+# reserve was also a guess, and the two were covering for each other; with the
+# desktop now measured, this can be an estimate of the thing it names. Still
+# ~5x the largest observation, because MoE and larger batches allocate more.
+COMPUTE_BUFFER_MB = 400
 CACHE_BYTES = {"f16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q4_0": 0.5625}
 CTX_DEFAULT = {"coding": 32768}
 CTX_FLOOR = 8192
@@ -34,12 +40,34 @@ def kv_bytes_per_token(spec: ModelSpec, k: str, v: str) -> float:
     return per_side * CACHE_BYTES[k] + per_side * CACHE_BYTES[v]
 
 
-def _budgets(profile: HardwareProfile) -> tuple[float, float]:
+def _budgets(profile: HardwareProfile,
+             other_vram_mb: float | None = None) -> tuple[float, float]:
+    """Usable VRAM and RAM for a plan.
+
+    `other_vram_mb` is what the desktop is measured to be holding. Without it
+    the reserve is a constant, and on Windows that constant was a fiction:
+    1200MB budgeted against 3,955MB actually held by a browser and an editor.
+    Windows does not refuse the resulting overcommit — it pages the difference
+    to system RAM, so the plan reports 0% offload while 29% of the weights ride
+    PCIe on every token (measured 2026-08-21, decode at 21% of card bandwidth).
+
+    The constant stays a FLOOR. A measurement may only make the budget
+    smaller, never larger: it is a snapshot, the user can open something a
+    second later, and being optimistic here is what caused the bug.
+    """
     # llama.cpp splits tensors across all GPUs, so budget the SUM of their
     # VRAM (reserving per-card overhead), not just the primary
     gpus = profile.gpus or []
     total_vram = sum(g.vram_mb for g in gpus)
-    reserve = VRAM_RESERVE_MB[profile.os] * max(1, len(gpus)) + COMPUTE_BUFFER_MB
+    floor = VRAM_RESERVE_MB[profile.os] * max(1, len(gpus))
+    # A reading at or above the card's own capacity is a broken counter, not a
+    # busy desktop (Windows' per-process counter once reported 359,777MB on a
+    # 16GB card). Discard it rather than budget zero.
+    measured = (profile.vram_used_mb if other_vram_mb is None
+                else other_vram_mb) or 0.0
+    if measured >= total_vram:
+        measured = 0.0
+    reserve = max(floor, measured) + COMPUTE_BUFFER_MB
     vram = total_vram - reserve
     return max(vram, 0), max(profile.ram_free_mb - RAM_RESERVE_MB, 0)
 
@@ -104,8 +132,16 @@ def _cache_candidates(spec: ModelSpec):
     if spec.cache_type_policy.pinned:
         return [(k, v)]          # explorer: answer the question that was asked
     out = [(k, v)]
-    if (k, v) != ("q8_0", "q8_0"):
-        out.append(("q8_0", "q8_0"))
+    # Down to q5_1 and q4_0 before giving up and spilling weights. The ladder
+    # used to stop at q8_0, so a 27B at 64K "did not fit" and nine of its
+    # sixty-four layers went to the CPU — while q5_1 fit on the GPU with room
+    # to spare and ran at 38.27 tok/s. Measured on the same machine the same
+    # day, offloading half a gigabyte cost 60% of throughput (32.47 -> 15.86
+    # tok/s) and 80% of prefill. One more step of cache quantisation costs a
+    # fraction of a percent of perplexity. The trade is not close.
+    for step in (("q8_0", "q8_0"), ("q5_1", "q5_1"), ("q4_0", "q4_0")):
+        if step != (k, v):
+            out.append(step)
     return out
 
 
@@ -155,9 +191,30 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     return None
 
 
-def _backend(profile: HardwareProfile) -> str:
+def _backend(profile: HardwareProfile, override: str | None = None) -> str:
+    """Which compute backend to launch on.
+
+    The card's table row lists what it CAN run, best-first, and taking [0] was
+    the whole selection policy — so an RX 9070 XT, whose row has read
+    ["vulkan", "rocm"] since it was added, could never run ROCm. ROCm 7 brought
+    rocWMMA flash-attention to RDNA4 and the answer for dense models is now an
+    open question, which cannot be measured without being selectable first
+    (owner request, 2026-08-21).
+
+    An override the card does not list is an ERROR, never a quiet fallback:
+    launching Vulkan while the UI says ROCm would file the resulting benchmark
+    under the wrong backend, which is worse than not running it.
+    """
     gpu = profile.primary_gpu
-    return gpu.backends[0] if gpu and gpu.backends else "cpu"
+    if not gpu or not gpu.backends:
+        return "cpu"
+    if not override:
+        return gpu.backends[0]
+    if override not in gpu.backends:
+        raise ResolveError(
+            f"{gpu.name} cannot run {override} on {profile.os} — it supports "
+            f"{', '.join(gpu.backends)}")
+    return override
 
 
 def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
@@ -338,7 +395,7 @@ def recommended_quant(quants: list[dict]) -> str | None:
 
 
 def _calculate(profile: HardwareProfile, registry: Registry,
-               use_case: str) -> RunPlan | None:
+               use_case: str, backend: str | None = None) -> RunPlan | None:
     explain: list[str] = []
     pool = [m for m in registry.models.values() if use_case in m.use_cases] or \
         list(registry.models.values())
@@ -384,7 +441,8 @@ def _calculate(profile: HardwareProfile, registry: Registry,
                 if flags:
                     flags = _grow_ctx(spec, gguf, profile, flags, explain)
                     return RunPlan(model_slug=spec.slug, gguf=gguf,
-                                   backend=_backend(profile), flags=flags,
+                                   backend=_backend(profile, backend),
+                                   flags=flags,
                                    origin="calculator", explain=explain)
                 ctx //= 2
     return None
@@ -422,11 +480,15 @@ def fallback_plans(plan: RunPlan, registry: Registry,
 
 
 def resolve(profile: HardwareProfile, registry: Registry,
-            use_case: str = "general", model_override: str | None = None) -> RunPlan:
+            use_case: str = "general", model_override: str | None = None,
+            backend_override: str | None = None) -> RunPlan:
     if not registry.models:
         raise ResolveError("registry has no models")
     gpu = profile.primary_gpu
-    if gpu and model_override is None:
+    # A curated combo pins its own backend, so honouring an explicit request
+    # means skipping the combo path — otherwise asking for ROCm would silently
+    # return a Vulkan combo and the UI would report a backend it never ran.
+    if gpu and model_override is None and not backend_override:
         hit = registry.find_combo(gpu.vendor, gpu.slug, round(gpu.vram_mb / 1024),
                                   profile.ram_tier_gb, use_case)
         if hit:
@@ -446,7 +508,7 @@ def resolve(profile: HardwareProfile, registry: Registry,
         registry = Registry(registry.gpus,
                             {model_override: registry.models[model_override]},
                             registry.combos)
-    plan = _calculate(profile, registry, use_case)
+    plan = _calculate(profile, registry, use_case, backend_override)
     if plan:
         return _apply_calibration(plan)
     # absolute floor: smallest model, smallest quant, CPU

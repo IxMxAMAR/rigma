@@ -35,7 +35,8 @@ function EngineCard() {
   // full reloads of a 13GB model to get to one setup (owner, 2026-08-19). The
   // endpoint has always accepted all three together; only the UI insisted on
   // one at a time.
-  const [want, setWant] = useState<{ctx?: number; kv?: string; vision?: boolean}>({});
+  const [want, setWant] = useState<{ctx?: number; kv?: string;
+                                    vision?: boolean; backend?: string}>({});
 
   const load = useCallback(() => {
     engineApi.server().then(setSrv).catch(() => setSrv(null));
@@ -45,7 +46,7 @@ function EngineCard() {
   if (!srv || srv.unloaded) return null;
 
   const apply = async (what: string, o: {
-    ctx?: number; kv?: string; vision?: boolean;
+    ctx?: number; kv?: string; vision?: boolean; backend?: string;
   }) => {
     if (streaming) {
       setErr("a reply is still generating — stop it first, or wait: "
@@ -65,7 +66,8 @@ function EngineCard() {
     setBusy(what);
     setErr(null);
     try {
-      await engineApi.relaunchWith({ ctx, kv: o.kv, vision: o.vision });
+      await engineApi.relaunchWith({ ctx, kv: o.kv, vision: o.vision,
+                                    backend: o.backend });
       setWant({});          // applied — stop showing it as pending
     } catch (e) {
       setErr((e as Error).message);
@@ -116,8 +118,47 @@ later token attends over it, so it compounds over a long conversation.">
         </select>
       </label>
 
+      {srv.vram?.pressured && srv.vram.desktop_mb != null && (
+        <div className="rounded-md bg-amber/10 px-2.5 py-1.5 text-[11.5px] leading-snug"
+             title={"Windows does not refuse a VRAM allocation it cannot fit — "
+                    + "it pages the difference to system RAM, where every token "
+                    + "has to cross PCIe to reach it. llama.cpp still reports "
+                    + "every layer as being on the GPU, because the driver said "
+                    + "yes."}>
+          <span className="text-amber font-semibold">
+            other apps hold {(srv.vram.desktop_mb / 1024).toFixed(1)} GB of VRAM
+          </span>
+          <span className="text-secondary">
+            {" — leaving "}{(srv.vram.usable_mb / 1024).toFixed(1)} GB of{" "}
+            {(srv.vram.total_mb / 1024).toFixed(1)} GB for the model. Closing a
+            browser is often the fastest speed-up available.
+          </span>
+        </div>
+      )}
+
+      {(srv.backends?.length ?? 0) > 1 && (
+        <label className={row} title="Which compute backend llama.cpp runs on.
+The GPU's table row has always listed more than one; Rigma simply took the
+first. Which is fastest depends on the model's shape, so this is a question to
+measure rather than assume.">
+          <span className={label}>backend</span>
+          <select className={input}
+                  value={want.backend ?? (srv.backend || "")}
+                  disabled={!!busy}
+                  aria-label="Compute backend"
+                  onChange={(e) =>
+                    setWant((w) => ({ ...w, backend: e.target.value }))}>
+            {(srv.backends ?? []).filter((b) => b.buildable).map((b) => (
+              <option key={b.name} value={b.name}>
+                {b.name}{b.ready ? "" : "  (downloads ~1.2GB)"}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
       {(want.ctx !== undefined || want.kv !== undefined
-        || want.vision !== undefined) && (
+        || want.vision !== undefined || want.backend !== undefined) && (
         <button
           disabled={!!busy}
           onClick={() => {
@@ -125,9 +166,11 @@ later token attends over it, so it compounds over a long conversation.">
               want.ctx !== undefined ? `context → ${Math.round(want.ctx / 1024)}K` : "",
               want.kv !== undefined ? `kv → ${want.kv || "auto"}` : "",
               want.vision !== undefined ? (want.vision ? "vision on" : "vision off") : "",
+              want.backend !== undefined ? `backend → ${want.backend}` : "",
             ].filter(Boolean);
             void apply(bits.join(", "), {
               ctx: want.ctx, kv: want.kv, vision: want.vision,
+              backend: want.backend,
             });
           }}
           className="mt-1 rounded-md bg-amber/15 text-amber px-2.5 py-1 text-[12px] font-semibold disabled:opacity-40"

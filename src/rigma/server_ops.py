@@ -41,7 +41,18 @@ def expected_tg(model: str, quant: str, backend: str) -> float | None:
                          .read_text(encoding="utf-8"))
         entry = cal[f"{model}:{quant}:{backend}"]
         got = entry.get("measured", entry).get("tg_tps")
-        return None if got is None else float(got)
+        if got is None:
+            return None
+        # Speed on a fixed model+quant+engine is not a constant: it depends on
+        # whether the weights fit in VRAM, and on Windows that depends on what
+        # ELSE holds VRAM. Measured 2026-08-21, the same combo ran at 9.95 and
+        # 37.59 tok/s purely because the desktop's footprint changed by 2.8GB.
+        # An expectation carried across that is worse than no expectation.
+        from .bench import calibration_stale
+        from .probe import gpu_used_mb
+        if calibration_stale(entry, gpu_used_mb()) is not None:
+            return None
+        return float(got)
     except Exception:
         return None
 
@@ -107,9 +118,10 @@ def _free_current(profile, state: dict, reg):
     absurdly small ceiling (live repro 2026-07-18: 35B ctx change said 'tops
     out at 8,192' while it was running fine at 32K).
 
-    Only RAM is credited: `_budgets` derives the VRAM budget from the card's
-    static total capacity (not live-free), so VRAM is never starved — crediting
-    it would over-report and risk an OOM launch."""
+    VRAM is credited the same way now that the budget accounts for what the
+    desktop actually holds (2026-08-21). Without it the outgoing engine's own
+    13GB would count as "someone else's", and a ctx change on the running model
+    would plan against a card that looks entirely full."""
     if not state:
         return profile
     spec = reg.models.get(state.get("model", ""))
@@ -119,11 +131,18 @@ def _free_current(profile, state: dict, reg):
     freed_mb = max(g.bytes for g in spec.ggufs) / 2**20
     if spec.mmproj:
         freed_mb += spec.mmproj.bytes / 2**20
-    return profile.model_copy(update={
-        "ram_free_mb": profile.ram_free_mb + int(freed_mb)})
+    update = {"ram_free_mb": profile.ram_free_mb + int(freed_mb)}
+    # The engine we are about to kill still holds its VRAM. Credit it back, or
+    # the measured "desktop" footprint includes our own model and the plan
+    # shrinks to fit a card that is about to be freed. Never below zero, and
+    # never below what an unloaded desktop would read.
+    if profile.vram_used_mb is not None and not state.get("unloaded"):
+        update["vram_used_mb"] = max(0.0, profile.vram_used_mb - freed_mb)
+    return profile.model_copy(update=update)
 
 
-def _resolve_for(slug: str, state: dict, registry, profile):
+def _resolve_for(slug: str, state: dict, registry, profile,
+                 backend: str | None = None):
     from .probe import probe_hardware
     from .registry import Registry
     from .resolve import resolve
@@ -131,7 +150,7 @@ def _resolve_for(slug: str, state: dict, registry, profile):
     p = profile if profile is not None else probe_hardware(reg.gpus)
     p = _free_current(p, state, reg)   # count the outgoing engine as freed
     return resolve(p, reg, use_case=state.get("use_case", "general"),
-                   model_override=slug), reg, p
+                   model_override=slug, backend_override=backend), reg, p
 
 
 def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
@@ -176,10 +195,73 @@ def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
 KV_CACHE_TYPES = ("f16", "q8_0", "q5_1", "q4_0")
 
 
+def vram_snapshot(registry=None) -> dict | None:
+    """Card capacity, what the desktop holds, and what is left for a model.
+
+    Exists because the alternative is invisible. llama.cpp reports every layer
+    as "on GPU" whenever the driver accepted the allocation, and on Windows the
+    driver accepts allocations it intends to page — so a model can be 29% in
+    system RAM with nothing anywhere saying so (measured 2026-08-21).
+    """
+    from .probe import probe_hardware
+    from .registry import Registry
+    from .resolve import COMPUTE_BUFFER_MB, VRAM_RESERVE_MB, _budgets
+    reg = registry if registry is not None else Registry.load()
+    prof = probe_hardware(reg.gpus)
+    total = sum(g.vram_mb for g in prof.gpus)
+    if not total:
+        return None
+    usable, _ = _budgets(prof)
+    floor = VRAM_RESERVE_MB[prof.os]
+    desktop = prof.vram_used_mb
+    return {
+        "total_mb": total,
+        # None when unmeasurable — the UI must not render "0 MB held" then
+        "desktop_mb": None if desktop is None else round(desktop),
+        "usable_mb": round(usable),
+        "assumed_mb": floor + COMPUTE_BUFFER_MB,
+        # only worth telling the user about when it is worse than assumed
+        "pressured": desktop is not None and desktop > floor,
+    }
+
+
+def available_backends(registry=None) -> list[dict]:
+    """Backends this GPU can run, with whether the engine build is on disk.
+
+    The gpu table has always listed more than one for AMD and NVIDIA cards —
+    the resolver simply took the first. Surfacing the rest is what makes the
+    choice real, and `ready` is what stops the UI offering ROCm without saying
+    it costs a ~1.2GB download first.
+    """
+    import platform
+
+    from .probe import probe_hardware
+    from .registry import Registry
+    from .runtime import _engines_manifest, rigma_home
+    reg = registry if registry is not None else Registry.load()
+    gpu = probe_hardware(reg.gpus).primary_gpu
+    names = list(gpu.backends) if gpu and gpu.backends else []
+    if "cpu" not in names:
+        names.append("cpu")          # always available, always last resort
+    os_name = {"Windows": "windows", "Linux": "linux",
+               "Darwin": "darwin"}[platform.system()]
+    try:
+        man = _engines_manifest()
+    except Exception:
+        return [{"name": n, "ready": False, "buildable": False} for n in names]
+    root = rigma_home() / "engines" / man["version"]
+    return [{"name": n,
+             # a build we have no pinned asset for cannot be offered at all
+             "buildable": f"{os_name}/{n}" in man.get("assets", {}),
+             "ready": (root / n / ".ready").exists()}
+            for n in names]
+
+
 def perform_switch(model: str, registry=None, profile=None,
                    ctx: int | None = None, force_calibrate: bool = False,
                    kv: str | None = None, vision: bool | None = None,
-                   quant: str | None = None) -> dict:
+                   quant: str | None = None,
+                   backend: str | None = None) -> dict:
     """Stop the running engine and launch `model` in its place; with `ctx`,
     relaunch (same model allowed) at a requested context size; with `kv`,
     force the KV-cache quantisation (f16/q8_0/q5_1/q4_0). Growing the cache
@@ -204,8 +286,11 @@ def perform_switch(model: str, registry=None, profile=None,
         raise RuntimeError(f"kv must be one of {', '.join(KV_CACHE_TYPES)}")
     # `quant` joins ctx/kv as a reason to relaunch the SAME model: swapping
     # between two downloaded quants is the whole point of asking for one.
+    # `backend` joins ctx/kv/quant as a reason to relaunch the SAME model —
+    # switching Vulkan<->ROCm is exactly a same-model relaunch.
     if (model == s.get("model") and not s.get("unloaded") and ctx is None
-            and kv is None and quant is None and not force_calibrate):
+            and kv is None and quant is None and backend is None
+            and not force_calibrate):
         raise RuntimeError(f"{model} is already running")
     from .registry import Registry
     reg_full = registry if registry is not None else Registry.load()
@@ -240,7 +325,7 @@ def perform_switch(model: str, registry=None, profile=None,
                        {**reg_full.models,
                         model: spec_full.model_copy(update={"ggufs": on_disk})},
                        reg_full.combos, reg_full.use_cases)
-    rp, _, p = _resolve_for(model, s, trimmed, profile)
+    rp, _, p = _resolve_for(model, s, trimmed, profile, backend)
     if rp.model_slug != model or not _model_on_disk(rp.gguf):
         raise RuntimeError(f"{model} does not fit this machine right now")
     if ctx is not None:
@@ -315,14 +400,15 @@ def perform_switch(model: str, registry=None, profile=None,
                        engine_pid=-1, ui_pid=int(s.get("ui_pid", os.getpid())),
                        backend=s.get("backend", "unknown"),
                        use_case=s.get("use_case", "general"),
-                       ctx=int(s.get("ctx", 0)), unloaded=True)
+                       ctx=int(s.get("ctx", 0)), unloaded=True,
+                       gguf=s.get("gguf", ""))
         raise
     st.write_state(rp.model_slug, rp.gguf.quant, int(s["public_port"]),
                    engine_pid=sp.proc.pid,
                    ui_pid=int(s.get("ui_pid", os.getpid())),
                    backend=rp.backend, use_case=s.get("use_case", "general"),
                    ctx=rp.flags.ctx, kv_cache=rp.flags.cache_type_k or "",
-                   no_vision=not vision)
+                   no_vision=not vision, gguf=rp.gguf.file)
     return st.read_state() or {}
 
 
@@ -355,7 +441,8 @@ def perform_unload() -> dict:
                    engine_pid=-1, ui_pid=int(s.get("ui_pid", os.getpid())),
                    backend=s.get("backend", "unknown"),
                    use_case=s.get("use_case", "general"),
-                   ctx=int(s.get("ctx", 0)), unloaded=True)
+                   ctx=int(s.get("ctx", 0)), unloaded=True,
+                   gguf=s.get("gguf", ""))
     return st.read_state()
 
 

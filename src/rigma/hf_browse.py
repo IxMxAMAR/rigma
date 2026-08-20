@@ -264,7 +264,10 @@ def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",
         prof = _free_current(prof, st.read_state() or {}, reg)
     verdicts = quant_verdicts(spec, prof, kv=kv, vision=vision, grow=grow)
     quants = []
-    for g, v in zip(spec.ggufs, verdicts):
+    # same grid the library card groups on, so one component renders both
+    from .hangar import quant_variants
+    axes = quant_variants([g.file for g in spec.ggufs])
+    for g, (base, variants), v in zip(spec.ggufs, axes, verdicts):
         k = v.get("kv") or spec.cache_type_policy.k
         quants.append({"file": g.file, "quant": g.quant, "bytes": g.bytes,
                        "fit": v, "quality": quality_of(g.quant),
@@ -275,6 +278,7 @@ def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",
                                                        spec.params),
                        # a pre-add row can't be on disk; keeps the shape
                        # identical to /api/models so one component renders both
+                       "base": base, "variants": variants,
                        "on_disk": False, "pullable": True})
     return {"repo": repo, "name": spec.slug, "family": spec.family,
             "kind": spec.kind, "native_ctx": spec.native_ctx,

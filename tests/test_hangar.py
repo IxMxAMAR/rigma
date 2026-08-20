@@ -669,3 +669,290 @@ def test_a_quant_row_says_whether_it_is_the_one_running(home, monkeypatch):
     row = next(m for m in hangar.list_models(Registry.load())["models"]
                if m["slug"] == "hybrid-tune")
     assert not any(q["running"] for q in row["quants"])
+
+
+# --- refreshing the FILE LIST of a model already in the library --------------
+# Live 2026-08-21: 0bserverx/Qwen3.8-27B-Heretic republished with 103 ggufs
+# (was 27) after adding -mtp and -multilingual builds. `reprobe` re-read the
+# GEOMETRY of one file and never looked at the file list, and `add_model`
+# refuses a repo already in the library, so 25 MTP builds were unreachable by
+# any route short of deleting the model and losing its calibration.
+def _repo_spec(home, files, *, mmproj=None, slug="hybrid-tune"):
+    """A spec as `add_model` wrote it, pointing at a real HF repo."""
+    import json
+    d = home / "custom" / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    spec = {"slug": slug, "family": "qwen35", "kind": "dense",
+            "n_layers": 8, "full_attn_layers": 2, "kv_heads": 2,
+            "head_dim": 64, "native_ctx": 262144, "probe_version": 3,
+            "ggufs": [dict(repo="acme/spicy", **g) for g in files],
+            "capabilities": [], "custom": True}
+    if mmproj:
+        spec["mmproj"] = dict(repo="acme/spicy", **mmproj)
+    (d / f"{slug}.json").write_text(json.dumps(spec), encoding="utf-8")
+    return spec
+
+
+def _rf(names_bytes, mmproj=None):
+    return {"ggufs": [{"file": f, "bytes": b} for f, b in names_bytes],
+            "mmproj": mmproj, "split_skipped": 0}
+
+
+def test_refresh_picks_up_ggufs_the_repo_added_after_the_model_was_added():
+    """The whole point: -mtp builds published later become reachable."""
+    from rigma.models import GgufFile, ModelSpec
+    old = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                    full_attn_layers=2, kv_heads=2, head_dim=64,
+                    native_ctx=262144, custom=True,
+                    ggufs=[GgufFile(repo="acme/spicy", file="RVN-Q3_K_M.gguf",
+                                    bytes=100, quant="Q3_K_M")])
+    new = hangar.merge_repo_files(
+        old, _rf([("RVN-Q3_K_M.gguf", 100), ("RVN-Q3_K_M-mtp.gguf", 142)]),
+        on_disk=set())
+    assert [g.file for g in new.ggufs] == ["RVN-Q3_K_M.gguf",
+                                           "RVN-Q3_K_M-mtp.gguf"]
+
+
+def test_refresh_never_drops_a_gguf_that_is_on_disk():
+    """A repo can delete an upload you already downloaded. Forgetting the file
+    would orphan gigabytes and break the running server's own spec entry."""
+    from rigma.models import GgufFile, ModelSpec
+    old = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                    full_attn_layers=2, kv_heads=2, head_dim=64,
+                    native_ctx=262144, custom=True,
+                    ggufs=[GgufFile(repo="acme/spicy", file="gone.gguf",
+                                    bytes=100, quant="Q3_K_M")])
+    new = hangar.merge_repo_files(old, _rf([("kept.gguf", 100)]),
+                                  on_disk={"gone.gguf"})
+    assert {g.file for g in new.ggufs} == {"gone.gguf", "kept.gguf"}
+
+
+def test_refresh_forgets_a_removed_gguf_that_was_never_downloaded():
+    """The mirror of the rule above — nothing local, nothing to protect."""
+    from rigma.models import GgufFile, ModelSpec
+    old = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                    full_attn_layers=2, kv_heads=2, head_dim=64,
+                    native_ctx=262144, custom=True,
+                    ggufs=[GgufFile(repo="acme/spicy", file="gone.gguf",
+                                    bytes=100, quant="Q3_K_M")])
+    new = hangar.merge_repo_files(old, _rf([("kept.gguf", 100)]), on_disk=set())
+    assert [g.file for g in new.ggufs] == ["kept.gguf"]
+
+
+def test_refresh_preserves_mtp_flags_already_probed():
+    """Each flag cost a ranged header read. Re-reading 103 of them to learn
+    what we already know is minutes of network for nothing."""
+    from rigma.models import GgufFile, ModelSpec
+    old = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                    full_attn_layers=2, kv_heads=2, head_dim=64,
+                    native_ctx=262144, custom=True,
+                    ggufs=[GgufFile(repo="acme/spicy", file="a.gguf", bytes=100,
+                                    quant="Q3_K_M", mtp=False)])
+    new = hangar.merge_repo_files(old, _rf([("a.gguf", 100), ("b.gguf", 142)]),
+                                  on_disk=set())
+    by = {g.file: g for g in new.ggufs}
+    assert by["a.gguf"].mtp is False      # kept, not re-read
+    assert by["b.gguf"].mtp is None       # new file: unknown, not assumed
+
+
+def test_refresh_relabels_across_the_whole_new_set():
+    """Labels come from _distinct_quants over ALL files, so adding a file can
+    legitimately change the label of one that was already there."""
+    from rigma.models import GgufFile, ModelSpec
+    old = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                    full_attn_layers=2, kv_heads=2, head_dim=64,
+                    native_ctx=262144, custom=True,
+                    ggufs=[GgufFile(repo="acme/spicy", file="RVN-Q3_K_M.gguf",
+                                    bytes=100, quant="Q3_K_M")])
+    new = hangar.merge_repo_files(
+        old, _rf([("RVN-Q3_K_M.gguf", 100), ("RVN-Q3_K_M-mtp.gguf", 142)]),
+        on_disk=set())
+    labels = [g.quant for g in new.ggufs]
+    assert len(set(labels)) == 2, f"labels collided: {labels}"
+
+
+def test_refresh_picks_up_an_mmproj_the_repo_gained():
+    from rigma.models import GgufFile, ModelSpec
+    old = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                    full_attn_layers=2, kv_heads=2, head_dim=64,
+                    native_ctx=262144, custom=True, mmproj=None,
+                    ggufs=[GgufFile(repo="acme/spicy", file="a.gguf",
+                                    bytes=100, quant="Q3_K_M")])
+    new = hangar.merge_repo_files(
+        old, _rf([("a.gguf", 100)],
+                 mmproj={"file": "mmproj-F16.gguf", "bytes": 42}),
+        on_disk=set())
+    assert new.mmproj is not None and new.mmproj.file == "mmproj-F16.gguf"
+    assert "vision" in new.capabilities
+
+
+def test_reprobe_refreshes_the_file_list_even_when_geometry_is_current(
+        home, monkeypatch):
+    """The owner's exact case. The geometry was already current, so the old
+    reprobe returned at the freshness check and never looked at the repo —
+    while 76 new ggufs sat there unreachable. Freshness of the GEOMETRY must
+    not gate refreshing the INVENTORY; they are separate questions."""
+    import json
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "RVN-Q3_K_M.gguf")
+    d = home / "custom" / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "hybrid-tune.json").write_text(json.dumps(
+        {"slug": "hybrid-tune", "family": "qwen35", "kind": "dense",
+         "n_layers": 9, "full_attn_layers": 9, "kv_heads": 2, "head_dim": 64,
+         "native_ctx": 262144,
+         "ggufs": [{"repo": "acme/spicy", "file": "RVN-Q3_K_M.gguf",
+                    "bytes": 100, "quant": "Q3_K_M"}],
+         "capabilities": [], "custom": True}), encoding="utf-8")
+
+    def _no_header_reads(*a, **k):
+        raise AssertionError("reprobe re-read headers it did not need")
+    monkeypatch.setattr("rigma.hf_browse.remote_inspect", _no_header_reads)
+    monkeypatch.setattr("rigma.hf_browse.repo_files", lambda repo: _rf(
+        [("RVN-Q3_K_M.gguf", 100), ("RVN-Q3_K_M-mtp.gguf", 142)]))
+    spec = hangar.reprobe("hybrid-tune")
+    assert "RVN-Q3_K_M-mtp.gguf" in {g.file for g in spec.ggufs}
+    saved = json.loads((d / "hybrid-tune.json").read_text())
+    assert len(saved["ggufs"]) == 2, "the refresh was not persisted"
+
+
+def test_reprobe_offline_does_not_touch_the_repo_listing(home, monkeypatch):
+    """--offline means offline: no ranged reads, no listing calls."""
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _hybrid_gguf(home / "models" / "h.gguf")
+    _stale_spec(home, "h.gguf")
+
+    def _boom(*a, **k):
+        raise AssertionError("offline reprobe listed the repo")
+    monkeypatch.setattr("rigma.hf_browse.repo_files", _boom)
+    hangar.reprobe("hybrid-tune", allow_remote=False)
+
+
+# --- variant axes: one row per quant, not one row per file -------------------
+# Live 2026-08-21: 0bserverx/Qwen3.8-27B-Heretic ships 103 ggufs that are really
+# 29 quants x {multilingual} x {mtp} x {vision}. Rendered flat, the card is a
+# 103-row wall. Worse, `extra[:14]` truncated "RVN--MULTILINGUAL" and
+# "RVN--MULTILINGUAL-MTP" to the same 14 characters, and that collision tripped
+# the last-resort branch, whose [-24:] slices the FRONT off every label in the
+# repo: "RVN-IQ3_M-multilingual-mtp" rendered as "N-IQ3_M-MULTILINGUAL-MTP".
+def _ara_names():
+    """The real shape of the owner's repo, without pasting 103 filenames."""
+    quants = ["IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M",
+              "Q2_K_S", "Q2_K", "IQ3_XXS", "IQ3_XS", "Q3_K_S", "IQ3_S",
+              "IQ3_M", "Q3_K_M", "Q3_K_L", "IQ4_XS", "Q4_K_S", "Q4_K_M",
+              "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
+    out = []
+    for q in quants:
+        for ml in ("", "-multilingual"):
+            for mtp in ("", "-mtp"):
+                out.append(f"RVN-{q}{ml}{mtp}.gguf")
+    out.append("Qwen3.8-27B-Heretic-Q4_K_M.gguf")
+    return out
+
+
+def test_labels_never_start_mid_word():
+    """Dropping the uploader's "RVN-" prefix is right; dropping the "RV" off it
+    is not. A label must begin at a token boundary of the filename, so
+    "RVN-IQ3_M-multilingual-mtp" may render as "IQ3_M ..." but never as
+    "N-IQ3_M-MULTILINGUAL-MTP" (which is what shipped)."""
+    import re as _re
+    from rigma.hangar import _distinct_quants
+    names = _ara_names()
+    for name, label in zip(names, _distinct_quants(names)):
+        tokens = {t.upper() for t in name[:-5].split("-") if t}
+        head = _re.split(r"[^A-Za-z0-9_.]+", label)[0].upper()
+        assert head in tokens, (
+            f"{label!r} starts with {head!r}, which is not a whole token of "
+            f"{name!r} — the front was cut off")
+
+
+def test_labels_stay_unique_across_a_103_file_repo():
+    from rigma.hangar import _distinct_quants
+    names = _ara_names()
+    labels = _distinct_quants(names)
+    dupes = {x for x in labels if labels.count(x) > 1}
+    assert not dupes, f"collided: {sorted(dupes)}"
+
+
+def test_variant_axes_collapse_the_repo_to_one_row_per_quant():
+    """The point of the whole exercise: 103 files, 22 base quants."""
+    from rigma.hangar import quant_variants
+    rows = quant_variants(_ara_names())
+    bases = {base for base, _ in rows}
+    assert len(bases) <= 25, f"still {len(bases)} rows: {sorted(bases)}"
+    assert "Q3_K_M" in bases
+
+
+def test_variant_axes_name_the_variants_they_found():
+    from rigma.hangar import quant_variants
+    by = dict(zip(_ara_names(), [v for _, v in quant_variants(_ara_names())]))
+    assert by["RVN-Q3_K_M.gguf"] == []
+    assert by["RVN-Q3_K_M-mtp.gguf"] == ["mtp"]
+    assert by["RVN-Q3_K_M-multilingual.gguf"] == ["multilingual"]
+    assert by["RVN-Q3_K_M-multilingual-mtp.gguf"] == ["multilingual", "mtp"]
+
+
+def test_variant_axes_leave_an_ordinary_repo_alone():
+    """Most repos have no variants at all. They must not grow an axis."""
+    from rigma.hangar import quant_variants
+    rows = quant_variants(["m-Q4_K_M.gguf", "m-Q5_K_M.gguf", "m-Q8_0.gguf"])
+    assert [b for b, _ in rows] == ["Q4_K_M", "Q5_K_M", "Q8_0"]
+    assert all(v == [] for _, v in rows)
+
+
+def test_the_loaded_ring_survives_a_relabel(home):
+    """A quant LABEL is derived from the whole file list, so it changes when
+    the repo publishes siblings. Identity has to be the FILE: matching the
+    running model on its label meant one refresh silently un-marked the model
+    the engine was actually holding (2026-08-21)."""
+    from rigma.models import GgufFile, ModelSpec
+    spec = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=262144, custom=True,
+                     ggufs=[GgufFile(repo="a/b", file="RVN-Q3_K_L.gguf",
+                                     bytes=100, quant="Q3_K_L - mtp")])
+
+    class _Reg:
+        models = {"s": spec}
+    state = {"model": "s", "quant": "Q3_K_L (RVN)",   # the OLD label
+             "gguf": "RVN-Q3_K_L.gguf"}
+    assert hangar._running_files(state, _Reg()) == {"RVN-Q3_K_L.gguf"}
+
+
+def test_the_loaded_ring_still_works_for_state_written_before_the_file_was():
+    """Existing installs have no `gguf` in state.json. They must keep working
+    off the label until the next launch records the file."""
+    from rigma.models import GgufFile, ModelSpec
+    spec = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=262144, custom=True,
+                     ggufs=[GgufFile(repo="a/b", file="RVN-Q3_K_L.gguf",
+                                     bytes=100, quant="Q3_K_L (RVN)")])
+
+    class _Reg:
+        models = {"s": spec}
+    state = {"model": "s", "quant": "Q3_K_L (RVN)"}
+    assert hangar._running_files(state, _Reg()) == {"RVN-Q3_K_L.gguf"}
+
+
+def test_list_models_marks_the_running_row_by_file_not_label(home, monkeypatch):
+    """list_models had its OWN label comparison, separate from _running_files —
+    so fixing one left the amber ring broken anyway. Both must key on the file
+    (2026-08-21)."""
+    from rigma import state as st
+    from rigma.models import GgufFile, ModelSpec
+    spec = ModelSpec(slug="s", family="qwen35", kind="dense", n_layers=8,
+                     full_attn_layers=2, kv_heads=2, head_dim=64,
+                     native_ctx=262144, custom=True,
+                     ggufs=[GgufFile(repo="a/b", file="RVN-Q3_K_L.gguf",
+                                     bytes=100, quant="Q3_K_L"),
+                            GgufFile(repo="a/b", file="RVN-Q3_K_M.gguf",
+                                     bytes=90, quant="Q3_K_M")])
+    hangar._write_spec(spec)
+    monkeypatch.setattr(st, "read_state", lambda: {
+        "model": "s", "quant": "Q3_K_L (RVN)",     # a label that no longer exists
+        "gguf": "RVN-Q3_K_L.gguf"})
+    out = hangar.list_models(Registry.load())
+    cards = out["models"] if isinstance(out, dict) else out
+    rows = next(c for c in cards if c["slug"] == "s")["quants"]
+    assert [r["quant"] for r in rows if r["running"]] == ["Q3_K_L"]

@@ -245,20 +245,25 @@ def test_ctx_endpoint_relaunches_at_requested_size(home, upstream,
     seen = {}
 
     def fake_switch(model, reg=None, prof=None, ctx=None,
-                    force_calibrate=False, kv=None, vision=None):
-        seen.update(model=model, ctx=ctx, kv=kv, vision=vision)
+                    force_calibrate=False, kv=None, vision=None,
+                    quant=None, backend=None):
+        seen.update(model=model, ctx=ctx, kv=kv, vision=vision,
+                    backend=backend)
         return {"model": model, "ctx": ctx, "unloaded": False}
     monkeypatch.setattr(server_ops, "perform_switch", fake_switch)
     client = TestClient(build_app(upstream_port=upstream))
     r = client.post("/api/server/ctx", json={"ctx": 131072})
     assert r.status_code == 200 and r.json()["ctx"] == 131072
     # vision=None means "keep whatever the last launch used"
+    # backend=None means "keep the one it is already running on" — the
+    # selector is opt-in, so a plain ctx change must not restate it
     assert seen == {"model": "m", "ctx": 131072, "kv": None,
-                    "vision": None}
+                    "vision": None, "backend": None}
     assert client.post("/api/server/ctx", json={"ctx": 12}).status_code == 400
     assert client.post("/api/server/ctx", json={}).status_code == 400
     def boom(model, reg=None, prof=None, ctx=None,
-             force_calibrate=False, kv=None, vision=None):
+             force_calibrate=False, kv=None, vision=None,
+             quant=None, backend=None):
         raise RuntimeError("ctx 999,999 doesn't fit — tops out around 262,144")
     monkeypatch.setattr(server_ops, "perform_switch", boom)
     r = client.post("/api/server/ctx", json={"ctx": 999999})

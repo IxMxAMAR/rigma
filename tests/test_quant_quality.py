@@ -407,9 +407,23 @@ def test_when_offloading_is_forced_the_cache_minimises_it():
     # the small window still fits entirely, so it keeps the precise cache
     assert small.cache_type_k == "f16"
     assert _spilled(spec, small) == 0.0
-    # the big one cannot, so it buys layers back with cache precision
-    assert big.cache_type_k == "q8_0"
+    # the big one cannot, so it buys layers back with cache precision.
+    # Asserted as a property rather than a literal: the ladder gained q5_1 and
+    # q4_0 on 2026-08-21 (measured — stopping at q8_0 made a 27B offload nine
+    # layers at 64K while q5_1 fit entirely), so the winner here is now q5_1.
+    # Which exact rung wins is a consequence of the arithmetic; what must hold
+    # is that it is cheaper than f16 and that it minimises the spill.
+    from rigma.resolve import CACHE_BYTES
+    assert CACHE_BYTES[big.cache_type_k] < CACHE_BYTES["f16"]
     assert _spilled(spec, big) < 0.20
+    for rung in ("f16", "q8_0"):
+        alt = fit_gguf(spec.model_copy(update={
+            "cache_type_policy": spec.cache_type_policy.model_copy(
+                update={"k": rung, "v": rung, "pinned": True})}),
+            spec.ggufs[0], prof, 65536, [])
+        if alt is not None:
+            assert _spilled(spec, big) <= _spilled(spec, alt), (
+                f"{big.cache_type_k} spills more than {rung} would")
 
 
 def test_a_fully_resident_fit_still_prefers_the_precise_cache():
