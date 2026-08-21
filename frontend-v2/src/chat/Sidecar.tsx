@@ -181,6 +181,49 @@ measure rather than assume.">
           {busy ? "relaunching…" : "apply — one relaunch"}
         </button>
       )}
+
+      {srv.model && (
+        <button
+          disabled={!!busy}
+          onClick={async () => {
+            const ctx = want.ctx ?? srv.ctx ?? 0;
+            const kv = want.kv ?? srv.kv_cache ?? "";
+            const vision = want.vision ?? !srv.no_vision;
+            if (!window.confirm(
+              `Make this the default for ${srv.model}?
+
+` +
+              `  context  ${Math.round(ctx / 1024)}K
+` +
+              `  kv cache ${kv || "auto"}
+` +
+              `  vision   ${vision ? "on" : "off"}
+
+` +
+              "Loading this model will come up here instead of wherever the " +
+              "resolver puts it. You can still change any of it per-launch.")) {
+              return;
+            }
+            setBusy("saving default");
+            setErr(null);
+            try {
+              await engineApi.setDefaults(srv.model as string,
+                                          { ctx, kv, vision });
+            } catch (e) {
+              setErr((e as Error).message);
+            }
+            setBusy(null);
+            load();
+          }}
+          className="mt-0.5 rounded-md px-2.5 py-1 text-[11.5px] text-muted hover:text-amber text-left disabled:opacity-40"
+          title={"Remember this configuration for this model, so a plain load "
+                 + "lands on it. The resolver's guess is not always the fast "
+                 + "one — on this hardware the gap between configurations of "
+                 + "the same model has measured 4x."}
+        >
+          {busy === "saving default" ? "saving…" : "set as this model's default"}
+        </button>
+      )}
       {srv.has_mmproj && (
         <label className={row} title="The vision projector is loaded with the
 weights and cannot be offloaded, so it costs VRAM for the whole session whether

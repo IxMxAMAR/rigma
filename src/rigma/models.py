@@ -89,6 +89,52 @@ class UseCase(BaseModel):
     description: str = ""
 
 
+class LaunchDefaults(BaseModel):
+    """How this model should be launched when nothing else says otherwise.
+
+    Owner request 2026-08-19: "I have to change context then KV and model
+    reloads 2 times to get me to my idle config." Applying them in one relaunch
+    was fixed then; remembering them was not, so every plain load still landed
+    wherever the resolver put it.
+
+    It matters more than a preference. Measured on this machine 2026-08-21, the
+    same model and quant ran at 9.95 tok/s in one configuration and 38.27 in
+    another; the resolver cannot know which the user wants because the trade
+    (context against speed against draft cache) is a judgement, not arithmetic.
+
+    Unset means NO OPINION, and that is why every field has a falsy sentinel
+    rather than a plausible-looking default: a model that only wants to pin its
+    context must not thereby also pin its cache type.
+    """
+    # which gguf to prefer, by the label the Models page shows
+    quant: str = ""
+    ctx: int = 0
+    kv: str = ""
+    # tri-state: None keeps whatever the last launch used. Distinct from False,
+    # which is an explicit "run this vision model text-only" — conflating them
+    # would silently reload a projector the user turned off to free VRAM.
+    vision: bool | None = None
+    # speculative decoding, e.g. "draft-mtp". Only meaningful on a gguf that
+    # actually carries the draft head; asking for it otherwise resets the
+    # Vulkan driver rather than erroring.
+    spec_type: str = ""
+    spec_n_max: int = 0
+
+    def is_set(self, field: str) -> bool:
+        """Whether this field carries an opinion. `vision` is the odd one: its
+        unset value is None, while everything else uses 0 or ""."""
+        value = getattr(self, field)
+        if field == "vision":
+            return value is not None
+        return bool(value)
+
+    def as_overrides(self) -> dict:
+        """Only the fields that were actually set, for merging over a request."""
+        return {f: getattr(self, f) for f in
+                ("quant", "ctx", "kv", "vision", "spec_type", "spec_n_max")
+                if self.is_set(f)}
+
+
 class ModelSpec(BaseModel):
     slug: str
     family: str
@@ -126,6 +172,9 @@ class ModelSpec(BaseModel):
     # False = the gguf shipped no tokenizer.chat_template, so an empty
     # capability list is missing evidence rather than a finding about the model.
     has_template: bool = True
+    # The configuration this model should come up in. None = no opinion, let
+    # the resolver choose as before.
+    launch: LaunchDefaults | None = None
     # Bumped when the probe learns to read something it used to get wrong;
     # specs below PROBE_VERSION are re-derived on read (hangar.heal_spec).
     probe_version: int = 0

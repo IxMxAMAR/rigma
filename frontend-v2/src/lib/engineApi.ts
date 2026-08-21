@@ -273,6 +273,15 @@ export const engineApi = {
   },
   hfAdd: (repo: string) => j<unknown>("POST", "/api/hf/add", { repo }),
   deleteModel: (slug: string) => j<unknown>("DELETE", `/api/models/${slug}`),
+  /** Pin how a model comes up. Send only the fields you mean to set; null
+   *  clears one. A plain load then lands here instead of on whatever the
+   *  resolver picked — which on this hardware is the difference between
+   *  38 and 53 tok/s, not a matter of taste. */
+  setDefaults: (slug: string, d: {
+    quant?: string | null; ctx?: number | null; kv?: string | null;
+    vision?: boolean | null; spec_type?: string | null;
+    spec_n_max?: number | null;
+  }) => j<unknown>("POST", `/api/models/${slug}/defaults`, d),
 };
 
 export const gb = (n: number) => (n / 2 ** 30).toFixed(1) + " GB";
