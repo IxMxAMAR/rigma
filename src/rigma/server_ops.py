@@ -309,6 +309,21 @@ def perform_switch(model: str, registry=None, profile=None,
     spec_full = reg_full.models.get(model)
     if spec_full is None:
         raise RuntimeError(f"unknown model: {model} — run: rigma update")
+    # The model's own configuration fills in anything the caller did not ask
+    # for. Precedence is explicit request > model default > resolver: a stored
+    # default that could not be overridden would make changing context once
+    # impossible on a model that pins it.
+    launch = getattr(spec_full, "launch", None)
+    if launch is not None:
+        d = launch.as_overrides()
+        if ctx is None and "ctx" in d:
+            ctx = d["ctx"]
+        if kv is None and "kv" in d:
+            kv = d["kv"]
+        if quant is None and "quant" in d:
+            quant = d["quant"]
+        if vision is None and "vision" in d:
+            vision = d["vision"]
     on_disk = [g for g in spec_full.ggufs if _model_on_disk(g)]
     if not on_disk:
         raise RuntimeError(
@@ -357,6 +372,15 @@ def perform_switch(model: str, registry=None, profile=None,
     if kv is not None:
         rp.flags = rp.flags.model_copy(update={"cache_type_k": kv,
                                                "cache_type_v": kv})
+    # Speculation last, and only when the FILE carries the draft head: asking
+    # llama.cpp for draft-mtp against a gguf without the tensors resets the
+    # Vulkan driver rather than erroring (see ComboFlags.spec_type).
+    if launch is not None and launch.is_set("spec_type"):
+        from .hangar import file_has_mtp
+        if launch.spec_type != "draft-mtp" or file_has_mtp(rp.gguf):
+            rp.flags = rp.flags.model_copy(update={
+                "spec_type": launch.spec_type,
+                "spec_n_max": launch.spec_n_max or 1})
     # vision projector: attach it if it's on disk, otherwise run text-only
     # rather than refusing — a vision model still works for text, and the user
     # can download the projector separately to turn vision on

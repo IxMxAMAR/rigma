@@ -841,6 +841,37 @@ def delete_model(slug: str, registry=None) -> None:
     (custom_dir() / f"{slug}.json").unlink(missing_ok=True)
 
 
+def set_launch_defaults(slug: str, registry=None, **fields) -> ModelSpec:
+    """Store how this model should come up. Pass only what you mean to pin.
+
+    Passing None for a field CLEARS it back to "no opinion", which is how the
+    UI removes a default without needing a separate verb.
+    """
+    from .models import LaunchDefaults
+    from .registry import Registry
+    reg = registry if registry is not None else Registry.load()
+    spec = reg.models.get(slug)
+    if spec is None:
+        raise HangarError(f"unknown model: {slug}")
+    if not spec.custom:
+        raise HangarError(f"{slug} is a registry model — its launch settings "
+                          "are hand-authored and are not overwritten here")
+    current = (spec.launch or LaunchDefaults()).model_dump()
+    allowed = set(LaunchDefaults.model_fields)
+    unknown = set(fields) - allowed
+    if unknown:
+        raise HangarError(f"unknown launch setting(s): {', '.join(sorted(unknown))}")
+    for key, value in fields.items():
+        current[key] = value
+    launch = LaunchDefaults(**current)
+    # Everything cleared means no opinion at all; store None rather than an
+    # empty object, so a spec that pins nothing reads as pinning nothing.
+    updated = spec.model_copy(update={
+        "launch": launch if launch.as_overrides() else None})
+    _write_spec(updated)
+    return updated
+
+
 def patch_capabilities(slug: str, caps: list[str]) -> ModelSpec:
     spec = _load_custom(slug)
     if spec is None:

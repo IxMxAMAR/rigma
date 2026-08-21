@@ -2236,6 +2236,32 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": str(e)}, status_code=409)
         return {"ok": True}
 
+    @app.post("/api/models/{slug}/defaults")
+    async def models_set_defaults(slug: str, body: dict):
+        """Pin how this model comes up. Send only the fields you mean to set;
+        send null to clear one."""
+        allowed = {"quant", "ctx", "kv", "vision", "spec_type", "spec_n_max"}
+        fields = {k: v for k, v in (body or {}).items() if k in allowed}
+        if not fields:
+            return JSONResponse(
+                {"error": f"nothing to set — expected any of "
+                          f"{', '.join(sorted(allowed))}"}, status_code=400)
+        if fields.get("kv") and fields["kv"] not in server_ops.KV_CACHE_TYPES:
+            return JSONResponse(
+                {"error": f"kv must be one of "
+                          f"{', '.join(server_ops.KV_CACHE_TYPES)}"},
+                status_code=400)
+        try:
+            spec = await asyncio.to_thread(
+                hangar.set_launch_defaults, slug, registry, **fields)
+        except hangar.HangarError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        # the registry holds specs in memory; reload so the next launch sees it
+        if registry is not None and slug in registry.models:
+            registry.models[slug] = spec
+        return {"slug": slug,
+                "launch": spec.launch.model_dump() if spec.launch else None}
+
     @app.post("/api/models/{slug}/reprobe")
     async def models_reprobe(slug: str):
         """Re-read the gguf and correct the stored geometry/capabilities.
