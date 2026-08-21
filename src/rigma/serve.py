@@ -1131,7 +1131,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "workspace": s.get("workspace") or str(_Path.home()),
                     "has_vision": has_vision,
                     "run_id": run_id, "profile": run_profile,
-                    "method_draft_id": s.get("method_draft_id", "")}
+                    "method_draft_id": s.get("method_draft_id", ""),
+                    # what read_file has already sent this turn, so a model
+                    # that fires two spellings of one filename in parallel is
+                    # not charged twice for the same content (2026-08-21)
+                    "_reads": {}}
             specs = toolkit.tool_specs(
                 allow_code=tctx["allow_code"],
                 has_rag=bool(rag.recorded_sidecar_port()),

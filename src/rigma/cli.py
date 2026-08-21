@@ -825,6 +825,50 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     except ResolveError as e:
         typer.echo(str(e))
         raise typer.Exit(1) from None
+    # The model's stored configuration, under anything asked for on the command
+    # line. `rigma up` resolves directly rather than going through
+    # perform_switch, so without this a pinned default would apply to the UI's
+    # load button and silently not to the CLI.
+    _launch = getattr(reg.models.get(rp.model_slug), "launch", None)
+    if _launch is not None:
+        _d = _launch.as_overrides()
+        _vision = _d.get("vision", True)
+        if "quant" in _d:
+            from .server_ops import _model_on_disk
+            want = _d["quant"].strip().lower()
+            pick = next((g for g in reg.models[rp.model_slug].ggufs
+                         if g.quant.lower() == want), None)
+            if pick is not None and _model_on_disk(pick):
+                rp.gguf = pick
+                rp.origin += "+default-quant"
+        _upd = {}
+        if ctx is None and "ctx" in _d:
+            _upd["ctx"] = _d["ctx"]
+        if "kv" in _d:
+            _upd["cache_type_k"] = _upd["cache_type_v"] = _d["kv"]
+        if spec is None and "spec_type" in _d:
+            # only when THIS file carries the head — see the --spec branch below
+            from .hangar import file_has_mtp
+            if _d["spec_type"] != "draft-mtp" or file_has_mtp(rp.gguf) is True:
+                _upd["spec_type"] = _d["spec_type"]
+                _upd["spec_n_max"] = _d.get("spec_n_max") or 1
+        if _upd:
+            rp.flags = rp.flags.model_copy(update=_upd)
+            rp.origin += "+model-default"
+        # Re-fit against what will ACTUALLY be resident: no projector when
+        # vision is off, plus the draft cache when speculation is on. Without
+        # this the plan reserves 600MB for a projector it will not load and
+        # nothing for a draft cache it will, and lands on a needless offload.
+        from .resolve import fit_gguf as _fit
+        from .resolve import with_launch_overheads as _overheads
+        _spec2 = _overheads(reg.models[rp.model_slug], vision=_vision,
+                            ctx=rp.flags.ctx, kv=rp.flags.cache_type_k,
+                            spec_type=rp.flags.spec_type,
+                            n_max=rp.flags.spec_n_max)
+        _fl = _fit(_spec2, rp.gguf, p, rp.flags.ctx, [])
+        if _fl is not None:
+            rp.flags = rp.flags.model_copy(update={
+                "ngl": _fl.ngl, "n_cpu_moe": _fl.n_cpu_moe})
     if ctx is not None:
         native = reg.models[rp.model_slug].native_ctx
         rp.flags = rp.flags.model_copy(update={"ctx": max(1024, min(ctx, native))})

@@ -205,8 +205,15 @@ def test_a_smaller_cache_is_tried_before_giving_up_context():
     # scenario enough room for f16 to simply fit — a better outcome, but no
     # longer a test of the ladder. Resized to keep exercising it.
     from rigma import resolve
-    spec = _dense(11.5)
-    flags = resolve.fit_gguf(spec, spec.ggufs[0], _box(), 16384, [])
+    box = _box()
+    # Size the model relative to the LIVE budget rather than hardcoding GB.
+    # Pinned sizes had to be re-tuned every time a reserve constant moved
+    # (900 -> 400 -> 150 as they were replaced by measurements), and each
+    # re-tune silently stopped exercising the ladder for a while.
+    usable, _ = resolve._budgets(box)
+    kv_f16 = 16384 * resolve.kv_bytes_per_token(_dense(1.0), "f16", "f16") / 2**30
+    spec = _dense(round(usable / 1024 - kv_f16 + 0.06, 2))   # f16 misses by ~60MB
+    flags = resolve.fit_gguf(spec, spec.ggufs[0], box, 16384, [])
     assert flags is not None, "16k should fit once the cache can be quantised"
     assert flags.cache_type_k != "f16", "gave up context instead of cache bits"
     assert flags.cache_type_k == flags.cache_type_v
@@ -229,8 +236,15 @@ def test_quantised_cache_beats_spilling_weights_to_ram():
     # 11.5GB @16k: f16 needs 14848MB (over the 14284 budget) but q8_0 needs
     # 13408MB, so ONLY the cache choice decides whether weights stay resident.
     from rigma import resolve
-    spec = _dense(11.5)
-    flags = resolve.fit_gguf(spec, spec.ggufs[0], _box(), 16384, [])
+    box = _box()
+    # Size the model relative to the LIVE budget rather than hardcoding GB.
+    # Pinned sizes had to be re-tuned every time a reserve constant moved
+    # (900 -> 400 -> 150 as they were replaced by measurements), and each
+    # re-tune silently stopped exercising the ladder for a while.
+    usable, _ = resolve._budgets(box)
+    kv_f16 = 16384 * resolve.kv_bytes_per_token(_dense(1.0), "f16", "f16") / 2**30
+    spec = _dense(round(usable / 1024 - kv_f16 + 0.06, 2))   # f16 misses by ~60MB
+    flags = resolve.fit_gguf(spec, spec.ggufs[0], box, 16384, [])
     assert flags is not None
     assert flags.ngl == 99, "must not spill layers while q8_0 would fit"
     assert flags.cache_type_k == "q8_0"

@@ -225,7 +225,12 @@ def test_dropping_vision_frees_context():
     """The projector is permanently resident and counted whether or not an image
     is ever sent — 888MB on Qwen3.8-27B, which was 4x the context."""
     from rigma.resolve import quant_verdicts
-    spec, prof = _hybrid_spec(12.5, mmproj_gb=0.87), _prof()
+    # 13.9GB, not 12.5: the compute-buffer reserve fell 900 -> 150 as it was
+    # replaced by measurements (2026-08-21), and at 12.5 both arms simply
+    # reached the context ceiling, so the projector stopped changing the answer
+    # and the test stopped testing anything. Sized so the 891MB projector is
+    # what decides the window.
+    spec, prof = _hybrid_spec(13.9, mmproj_gb=0.87), _prof()
     with_v = quant_verdicts(spec, prof)[0]
     without = quant_verdicts(spec, prof, vision=False)[0]
     assert without["ctx"] > with_v["ctx"]
