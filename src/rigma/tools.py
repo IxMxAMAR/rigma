@@ -1872,6 +1872,34 @@ def _read_file(args, ctx):
     chunk = lines[offset - 1: offset - 1 + limit]
     if not chunk:
         return (f"(no lines at offset {offset}; the file has {len(lines)} lines)")
+    # Already sent this exact content in THIS turn? Say so instead of spending
+    # the window on it twice.
+    #
+    # Live 2026-08-21: a model unsure of a spelling issued two read_file calls
+    # in one turn -- "Chapter_02_Shubashini.txt" and "Chapter_02_Shubhashini.txt".
+    # Only the second exists; _fuzzy_file resolved the first onto it, so the
+    # same 23,068-byte file came back twice: ~5,800 tokens, 18% of a 32K window,
+    # for no new information. The near-miss note could not have helped -- both
+    # calls were emitted before either result returned.
+    #
+    # Keyed on the RESOLVED path plus mtime and size, so a read after a write
+    # returns the new content, and on offset/limit so paging still works.
+    seen = ctx.get("_reads")
+    if seen is not None:
+        try:
+            st = p.stat()
+            key = (str(p.resolve()).lower(), st.st_mtime_ns, st.st_size,
+                   offset, limit)
+        except OSError:
+            key = None
+        if key is not None:
+            if key in seen:
+                return (f"(already read '{p.name}' earlier in this turn — "
+                        f"{st.st_size:,} bytes, unchanged since. Its content is "
+                        "above in this same turn; not sent again so the context "
+                        "window is not spent twice on it. Re-read only after "
+                        "the file changes, or ask for a different offset.)")
+            seen[key] = True
     if args.get("numbered"):
         # opt-in ONLY: numbering the default output would put line numbers
         # into prose the model later re-emits (a bible entry, a chapter).

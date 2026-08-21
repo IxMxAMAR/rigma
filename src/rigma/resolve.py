@@ -8,12 +8,20 @@ from .registry import Registry
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
 RAM_RESERVE_MB = 2048
 # llama.cpp's own scratch allocation, on top of weights and KV. Measured
-# 2026-08-21 on a dense 27B at ubatch 512, across four fully-resident rungs:
-# 43, 44, 55 and 81 MiB. The old 900 was a guess made when the Windows desktop
-# reserve was also a guess, and the two were covering for each other; with the
-# desktop now measured, this can be an estimate of the thing it names. Still
-# ~5x the largest observation, because MoE and larger batches allocate more.
-COMPUTE_BUFFER_MB = 400
+# 2026-08-21 on a dense 27B at ubatch 512, across five fully-resident rungs:
+# 37, 43, 44, 55 and 81 MiB. The original 900 was a guess made when the Windows
+# desktop reserve was also a guess and the two were covering for each other;
+# with the desktop now measured, this can be an estimate of the thing it names.
+#
+# Dropped 400 -> 150 once draft_cache_mb landed: that figure was obtained by
+# DIFFERENCING measured VRAM, so it already contains the draft head's compute
+# buffers, and reserving 400 on top double-counted them. The double-count cost
+# real residency — a 32K MTP plan that measured 14,298 MiB was refused against
+# a budget that had 360 MiB of imaginary scratch in it.
+#
+# Still ~2x the largest observation. MoE and larger batches allocate more, which
+# is what the margin is for.
+COMPUTE_BUFFER_MB = 150
 CACHE_BYTES = {"f16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q4_0": 0.5625}
 CTX_DEFAULT = {"coding": 32768}
 CTX_FLOOR = 8192
@@ -38,6 +46,67 @@ def _apply_calibration(plan: RunPlan) -> RunPlan:
 def kv_bytes_per_token(spec: ModelSpec, k: str, v: str) -> float:
     per_side = spec.full_attn_layers * spec.kv_heads * spec.head_dim
     return per_side * CACHE_BYTES[k] + per_side * CACHE_BYTES[v]
+
+
+# Speculative decoding's draft head needs its own KV cache and compute buffers.
+# MEASURED on an RX 9070 XT, 2026-08-21, five repeats per point, by differencing
+# dedicated VRAM against the same model without the head:
+#
+#     ctx 16K  ->  465 MiB        ctx 32K  ->  565 MiB
+#
+# which is 365 MiB fixed plus 6.25 KiB/token. Derived from geometry it "should"
+# be ~1.1 KiB/token for one draft block; it is not, because the head carries
+# four nextn blocks and its own buffers. The measurement wins.
+#
+# Planning without this term produced configurations that fit on paper and paged
+# in practice: the live server came up at ngl=62 and ran 30.63 tok/s where the
+# identical settings benched at 49.46.
+DRAFT_FIXED_MB = 365.0
+DRAFT_KIB_PER_TOKEN = 6.25
+
+
+def draft_cache_mb(spec: ModelSpec, ctx: int, kv: str,
+                   spec_type: str, n_max: int) -> float:
+    """VRAM the speculative draft head needs on top of weights and KV.
+
+    Zero when speculation is off — the head's WEIGHTS are in the file either
+    way, but its caches are only allocated when it is asked to draft.
+    """
+    if not spec_type or spec_type == "none":
+        return 0.0
+    # Deeper drafts need a slot per drafted token. Measured only at n=1; n=2
+    # more than doubled the total, so scaling by depth is the conservative
+    # reading rather than an established fit.
+    depth = max(1, n_max)
+    return DRAFT_FIXED_MB + DRAFT_KIB_PER_TOKEN * ctx / 1024 * depth
+
+
+def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int, kv: str,
+                          spec_type: str = "", n_max: int = 0) -> ModelSpec:
+    """A copy of `spec` whose mmproj slot holds what will ACTUALLY be resident.
+
+    `fit_gguf` treats mmproj as memory that sits on the GPU and cannot be
+    offloaded. Two other things behave identically and were both getting the
+    wrong treatment:
+
+      * a projector that will NOT be loaded (vision off) was still reserved —
+        600 MiB of a 16GB card, which cost two layers of GPU residency and took
+        a live server from 49.46 tok/s on the bench to 30.63 in practice;
+      * the speculative draft cache was not reserved at all, so plans that fit
+        on paper paged the moment speculation was switched on.
+
+    Folding both into that one slot fixes the arithmetic without threading a new
+    parameter through every fit function.
+    """
+    mm_bytes = spec.mmproj.bytes if (vision and spec.mmproj) else 0
+    draft = draft_cache_mb(spec, ctx, kv, spec_type, n_max)
+    total = mm_bytes + int(draft * 2**20)
+    if total == 0:
+        return spec.model_copy(update={"mmproj": None})
+    slot = (spec.mmproj.model_copy(update={"bytes": total}) if spec.mmproj
+            else GgufFile(repo="local", file="__overhead__", bytes=total,
+                          quant="overhead"))
+    return spec.model_copy(update={"mmproj": slot})
 
 
 def _budgets(profile: HardwareProfile,

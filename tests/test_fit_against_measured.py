@@ -82,3 +82,34 @@ def test_a_config_that_paged_is_not_planned_as_resident(profile, spec):
             spec, flags.cache_type_k, flags.cache_type_v) / MIB
         assert used <= 16304 - 1095, (
             "promised full residency for a config measured paging 566 MiB")
+
+
+def test_a_projector_that_will_not_be_loaded_is_not_reserved(profile, spec):
+    """Measured 2026-08-21: launching with vision off still reserved the
+    600 MiB projector, which pushed the plan to ngl=62 — two layers on the CPU
+    — and the live server then ran at 30.63 tok/s where the same configuration
+    benched at 49.46. Reserving memory for something the launcher is not going
+    to load is pure loss."""
+    from rigma.models import GgufFile
+    with_mm = spec.model_copy(update={
+        "mmproj": GgufFile(repo="a/b", file="mm.gguf", bytes=629_247_008,
+                           quant="mmproj")})
+    without = with_mm.model_copy(update={"mmproj": None})
+    a = fit_gguf(with_mm, with_mm.ggufs[0], profile, 32768, [])
+    b = fit_gguf(without, without.ggufs[0], profile, 32768, [])
+    assert b is not None and b.ngl == 99
+    # the point: dropping the projector must actually buy something
+    assert (a is None) or (b.ngl >= a.ngl)
+
+
+def test_speculation_reserves_its_draft_cache(profile, spec):
+    """draft-mtp allocates a second KV cache for the draft head. Measured on
+    this machine at n=1: ~465 MiB (dedicated went 14,650 -> 15,549 for a file
+    only 434 MiB larger). Planning without it produced a config that fit on
+    paper and paged in practice."""
+    from rigma.resolve import draft_cache_mb
+    # measured: 465 MiB at 16K, 565 MiB at 32K
+    assert 440 <= draft_cache_mb(spec, 16384, "q4_0", "draft-mtp", 1) <= 490
+    assert 540 <= draft_cache_mb(spec, 32768, "q4_0", "draft-mtp", 1) <= 590
+    # no speculation, no reservation
+    assert draft_cache_mb(spec, 32768, "q4_0", "none", 0) == 0
