@@ -234,7 +234,11 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
         title={q.running ? "LOADED — this is the quant the engine is running"
                          : q.on_disk ? "on disk" : "not downloaded"}
       />
-      <span className={`font-mono text-[12.5px] w-24 shrink-0 truncate ${
+      {/* The one cell allowed to give way. Everything else in the row is a
+          fixed column, so without something shrinkable a long quant name plus
+          the "best here" badge pushed the action button clean outside the card
+          (owner, 2026-08-23). A truncated name is the right thing to lose. */}
+      <span className={`font-mono text-[12.5px] w-24 min-w-0 truncate ${
         q.fit?.ok === false ? "text-muted" : ""}`} title={q.file}>
         {q.quant}
       </span>
@@ -247,52 +251,58 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
           {showSpec && <MtpMark q={q} />}
         </>
       )}
-      {!downloading && best === q.quant && (
-        <span className="shrink-0 font-mono text-[10.5px] text-amber bg-amber/10 rounded px-1.5 py-0.5"
-              title="best quality that still runs at GPU speed here">
-          best here
-        </span>
-      )}
-      {!downloading && q.running && (
-        <span className="shrink-0 font-mono text-[10.5px] text-amber bg-amber/15 rounded px-1.5 py-0.5"
-              title="the engine has this exact quant loaded right now">
-          loaded
-        </span>
-      )}
-      {!downloading && <span className="flex-1" />}
-      {q.on_disk && !q.running && !downloading && (
-        <button
-          disabled={busy}
-          onClick={() => void run(() => engineApi.switchTo(card.slug, q.quant))}
-          className="shrink-0 rounded-md bg-moss/15 text-moss px-2.5 py-0.5 text-[12px] font-semibold disabled:opacity-40"
-          title={"Stop the engine and load THIS quant. Two quants on disk had "
-                 + "no way to choose between them."}
-        >
-          load
-        </button>
-      )}
-      {!q.on_disk && q.pullable && !downloading && (
-        <button
-          disabled={busy}
-          onClick={() => void run(() => engineApi.pull(card.slug, q.file))}
-          className="shrink-0 rounded-md bg-amber/15 text-amber px-2.5 py-0.5 text-[12px] font-semibold disabled:opacity-40"
-        >
-          pull
-        </button>
-      )}
-      {q.on_disk && !card.running && (
-        <button
-          disabled={busy}
-          onClick={() => {
-            if (window.confirm(`Delete ${q.file} from disk?`))
-              void run(() => engineApi.deleteFile(card.slug, q.file));
-          }}
-          className="shrink-0 rounded-md px-2 py-0.5 text-[12px] text-muted hover:text-red hover:bg-surface"
-          aria-label={`delete ${q.file}`}
-        >
-          ×
-        </button>
-      )}
+      {/* Badges and buttons travel together, pinned to the right edge. They
+          used to be separate children after a flex-1 spacer, which let a badge
+          displace the button past the edge of the card instead of squeezing
+          the row. `ml-auto` does the pinning; `shrink-0` keeps the button
+          reachable at any width. */}
+      <div className="ml-auto flex shrink-0 items-center gap-2">
+        {!downloading && best === q.quant && (
+          <span className="font-mono text-[10.5px] text-amber bg-amber/10 rounded px-1.5 py-0.5"
+                title="best quality that still runs at GPU speed here">
+            best here
+          </span>
+        )}
+        {!downloading && q.running && (
+          <span className="font-mono text-[10.5px] text-amber bg-amber/15 rounded px-1.5 py-0.5"
+                title="the engine has this exact quant loaded right now">
+            loaded
+          </span>
+        )}
+        {q.on_disk && !q.running && !downloading && (
+          <button
+            disabled={busy}
+            onClick={() => void run(() => engineApi.switchTo(card.slug, q.quant))}
+            className="rounded-md bg-moss/15 text-moss px-2.5 py-0.5 text-[12px] font-semibold disabled:opacity-40"
+            title={"Stop the engine and load THIS quant. Two quants on disk had "
+                   + "no way to choose between them."}
+          >
+            load
+          </button>
+        )}
+        {!q.on_disk && q.pullable && !downloading && (
+          <button
+            disabled={busy}
+            onClick={() => void run(() => engineApi.pull(card.slug, q.file))}
+            className="rounded-md bg-amber/15 text-amber px-2.5 py-0.5 text-[12px] font-semibold disabled:opacity-40"
+          >
+            pull
+          </button>
+        )}
+        {q.on_disk && !card.running && (
+          <button
+            disabled={busy}
+            onClick={() => {
+              if (window.confirm(`Delete ${q.file} from disk?`))
+                void run(() => engineApi.deleteFile(card.slug, q.file));
+            }}
+            className="rounded-md px-2 py-0.5 text-[12px] text-muted hover:text-red hover:bg-surface"
+            aria-label={`delete ${q.file}`}
+          >
+            ×
+          </button>
+        )}
+      </div>
     </li>
   );
 }
