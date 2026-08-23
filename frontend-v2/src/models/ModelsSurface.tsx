@@ -75,12 +75,12 @@ function CtxCell({ fit }: { fit?: QuantRow["fit"] }) {
 /** Where the weights end up. Driven by the resolver's own plan (ngl /
  *  n_cpu_moe), so it cannot claim "gpu" for a quant it decided to offload. */
 function RunsCell({ fit }: { fit?: QuantRow["fit"] }) {
-  if (!fit || fit.speed === undefined) return <span className="w-[74px] shrink-0" />;
+  if (!fit || fit.speed === undefined) return <span className="w-[66px] shrink-0" />;
   const s = SPEED[fit.speed] ?? SPEED.no;
   const off = fit.offload_pct ?? 0;
   return (
     <span
-      className="w-[74px] shrink-0 flex items-center gap-1 font-mono text-[11px] whitespace-nowrap"
+      className="w-[66px] shrink-0 flex items-center gap-1 font-mono text-[11px] whitespace-nowrap"
       title={`${s.hint}${off > 0 && fit.ok ? ` — ${off}% of the weights sit in system RAM` : ""}` +
              (fit.n_cpu_moe ? `; ${fit.n_cpu_moe} layers' experts on CPU` : "")}
     >
@@ -109,7 +109,7 @@ function QualityCell({ q }: { q: QuantRow }) {
     const pct = t.total_pct < 0.1 ? "<0.1" : t.total_pct.toFixed(t.total_pct < 10 ? 1 : 0);
     return (
       <span
-        className="w-[96px] shrink-0 font-mono text-[11px] flex items-center gap-1 whitespace-nowrap"
+        className="w-[78px] shrink-0 font-mono text-[11px] flex items-center gap-1 whitespace-nowrap"
         title={`≈${t.total_pct}% worse than BF16 weights + f16 cache.\n` +
                `  weights (${q.quant}): ≈${t.weights_pct}%\n` +
                `  KV cache: ≈${t.kv_pct}%\n` +
@@ -130,7 +130,7 @@ function QualityCell({ q }: { q: QuantRow }) {
     // quants I-Balanced / I-Quality / I-Compact left nothing to choose between
     // them. bpw is measured, not a quality percentage, and is labelled as such.
     return (
-      <span className="w-[96px] shrink-0 font-mono text-[11px] text-muted/50"
+      <span className="w-[78px] shrink-0 font-mono text-[11px] text-muted/50"
             title={"No published quality figure for this file's naming — it " +
                    "does not use a standard llama.cpp quant name, so any " +
                    "percentage here would be made up.\n\n" +
@@ -147,7 +147,7 @@ function QualityCell({ q }: { q: QuantRow }) {
   const pct = k.ppl_pct < 0.1 ? "<0.1" : k.ppl_pct.toFixed(k.ppl_pct < 10 ? 1 : 0);
   return (
     <span
-      className="w-[96px] shrink-0 font-mono text-[11px] flex items-center gap-1 whitespace-nowrap"
+      className="w-[78px] shrink-0 font-mono text-[11px] flex items-center gap-1 whitespace-nowrap"
       title={`${k.note}. Typical +${k.ppl_pct}% perplexity vs BF16 at ${k.bpw} ` +
              `bits/weight (~${Math.round((k.bpw / 16) * 100)}% of BF16 size).\n\n` +
              "Reference figure for the quant FORMAT, mostly measured on 7B-13B " +
@@ -238,7 +238,7 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
           fixed column, so without something shrinkable a long quant name plus
           the "best here" badge pushed the action button clean outside the card
           (owner, 2026-08-23). A truncated name is the right thing to lose. */}
-      <span className={`font-mono text-[12.5px] w-24 min-w-0 truncate ${
+      <span className={`font-mono text-[12.5px] w-24 shrink-0 truncate ${
         q.fit?.ok === false ? "text-muted" : ""}`} title={q.file}>
         {q.quant}
       </span>
@@ -256,7 +256,8 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
           displace the button past the edge of the card instead of squeezing
           the row. `ml-auto` does the pinning; `shrink-0` keeps the button
           reachable at any width. */}
-      <div className="ml-auto flex shrink-0 items-center gap-2">
+      <div className="ml-auto flex min-w-0 items-center justify-end gap-2
+                      overflow-hidden">
         {!downloading && best === q.quant && (
           <span className="font-mono text-[10.5px] text-amber bg-amber/10 rounded px-1.5 py-0.5"
                 title="best quality that still runs at GPU speed here">
@@ -269,6 +270,8 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
             loaded
           </span>
         )}
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
         {q.on_disk && !q.running && !downloading && (
           <button
             disabled={busy}
@@ -422,6 +425,9 @@ function QuantTable({ card, rows, onAction, best, extra }: {
       {axes.length > 0 && (
         <VariantChips axes={axes} on={on} toggle={toggle} counts={counts} />
       )}
+      {/* These widths are the table. Every one is repeated on the row cells
+          below, so changing one here without the other silently un-aligns the
+          column — the cells are the components CtxCell/RunsCell/QualityCell. */}
       <div className="flex items-center gap-2 px-3 pb-1 font-mono text-[10px]
                       text-muted uppercase tracking-[0.06em]">
         <span className="w-1.5 shrink-0" />
@@ -430,10 +436,10 @@ function QuantTable({ card, rows, onAction, best, extra }: {
         <span className="w-[46px] shrink-0 text-right" title="context window this quant can hold on this machine">
           ctx
         </span>
-        <span className="w-[74px] shrink-0" title="where the weights end up: fully on the GPU, or partly in system RAM">
+        <span className="w-[66px] shrink-0" title="where the weights end up: fully on the GPU, or partly in system RAM">
           runs
         </span>
-        <span className="w-[96px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
+        <span className="w-[78px] shrink-0" title="typical quality given up vs BF16 — reference figure for the format, not measured on this model">
           vs bf16
         </span>
         {anySpec && (
@@ -619,8 +625,8 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
         <span className="w-24 shrink-0">quant</span>
         <span className="w-[52px] shrink-0 text-right">size</span>
         <span className="w-[46px] shrink-0 text-right">ctx</span>
-        <span className="w-[74px] shrink-0">runs</span>
-        <span className="w-[96px] shrink-0">vs bf16</span>
+        <span className="w-[66px] shrink-0">runs</span>
+        <span className="w-[78px] shrink-0">vs bf16</span>
       </div>
       <ul className="flex flex-col">
         {v.shown.map((q) => (
