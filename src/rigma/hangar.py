@@ -18,6 +18,19 @@ from .models import GgufFile, ModelSpec, MoESpec
 from .runtime import rigma_home
 
 VALID_CAPS = ("tools", "vision", "thinking", "mtp")
+
+# How many ggufs a repo may hold before `reprobe` stops asking every file
+# whether it carries the MTP draft head.
+#
+# MTP is a per-FILE fact, and reading one file left every other row as None —
+# which the Models page rendered identically to a verified "no". On a repo whose
+# every quant carries the head (SC117's ...-MTP-APEX-GGUF) that reads as "only
+# this one supports it", and steers the choice for a reason that is not true.
+#
+# The limit exists because a ranged header read escalates to 8, 32 or 64MB and
+# 0bserverx/Qwen3.8-27B-Heretic publishes 103 ggufs. Small repos are worth the
+# handful of requests; that one is not, and its rows stay honestly unknown.
+MTP_PROBE_LIMIT = 8
 # Bump when the probe learns something a stored spec would have got wrong.
 #   1  layer geometry from gguf_meta, capabilities from the chat template
 #   2  hybrid attention read from full_attention_interval (Qwen3.5/3.8)
@@ -432,7 +445,20 @@ def reprobe(slug: str, *, allow_remote: bool = True,
     f = info.spec_fields
     if not f or f.get("n_layers", 0) <= 0 or f.get("kv_heads", 0) <= 0:
         raise HangarError(f"{remote.file} carries no usable model metadata")
-    updated = _with_probe(healed, info, {remote.file: f})
+    fields = {remote.file: f}
+    # Every other file's MTP answer, while we are already talking to the repo.
+    # Only ones we have never read: a second reprobe of the same library costs
+    # nothing. One unreadable file must not cost the answers for the rest.
+    others = [g for g in healed.ggufs
+              if g.file != remote.file and g.mtp is None
+              and g.repo and g.repo != "local"]
+    if others and len(healed.ggufs) <= MTP_PROBE_LIMIT:
+        for g in others:
+            try:
+                fields[g.file] = remote_inspect(g.repo, g.file).spec_fields
+            except (HangarError, OSError, ValueError):
+                continue
+    updated = _with_probe(healed, info, fields)
     _write_spec(updated)
     return updated
 

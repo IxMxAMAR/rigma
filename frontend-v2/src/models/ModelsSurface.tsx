@@ -169,14 +169,33 @@ function QualityCell({ q }: { q: QuantRow }) {
  *  which. Asking llama.cpp for draft-mtp against a file without the tensors
  *  resets the GPU driver, so an optimistic guess here is expensive. */
 function MtpMark({ q }: { q: QuantRow }) {
-  if (q.mtp !== true) return <span className="w-8 shrink-0" />;
+  if (q.mtp === true) {
+    return (
+      <span className="w-8 shrink-0 font-mono text-[10px] text-moss/90"
+            title={"This file carries the MTP tensors (blk.N.nextn.*), read from " +
+                   "its tensor table — so speculative decoding (--spec draft-mtp) " +
+                   "can actually run on it.\n\nVerified in the file, not inferred " +
+                   "from the repo name or the header."}>
+        mtp
+      </span>
+    );
+  }
+  // Read and found to have no draft head. Nothing to say, and an empty cell is
+  // the right amount of nothing.
+  if (q.mtp === false) return <span className="w-8 shrink-0" />;
+  // Never read. This used to render as the same blank cell as a verified "no",
+  // so a repo whose every quant carries the head looked like one where a single
+  // quant did — and MTP is worth roughly a third of your tokens per second, so
+  // it steered the choice (owner, 2026-08-23).
   return (
-    <span className="w-8 shrink-0 font-mono text-[10px] text-moss/90"
-          title={"This file carries the MTP tensors (blk.N.nextn.*), read from " +
-                 "its tensor table — so speculative decoding (--spec draft-mtp) " +
-                 "can actually run on it.\n\nVerified in the file, not inferred " +
-                 "from the repo name or the header."}>
-      mtp
+    <span className="w-8 shrink-0 font-mono text-[10px] text-muted/40"
+          title={"Not read yet — this file's tensor table has not been " +
+                 "checked, so whether it carries the MTP draft head is " +
+                 "unknown. It is NOT a 'no'.\n\nPull the file, or use re-probe " +
+                 "on the card, to get an answer. Rigma will not guess it from " +
+                 "the repo name: asking llama.cpp for draft-mtp against a file " +
+                 "without the tensors resets the GPU driver."}>
+      ·
     </span>
   );
 }
@@ -418,7 +437,13 @@ function QuantTable({ card, rows, onAction, best, extra }: {
 }) {
   const v = useQuantView(rows);
   const { axes, on, toggle, counts, shown } = v;
-  const anySpec = rows.some((q) => q.mtp === true);
+  // Show the column when ANY file is known to carry the head, and also when the
+  // model as a whole advertises mtp — otherwise a repo where nothing has been
+  // read yet hides the column entirely, which is the one case where "unknown"
+  // is worth saying out loud. A model with no mtp capability still gets no
+  // column, so this adds no noise anywhere it does not belong.
+  const anySpec = rows.some((q) => q.mtp === true)
+                  || card.capabilities.includes("mtp");
 
   return (
     <>
