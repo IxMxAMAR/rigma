@@ -153,6 +153,32 @@ def _free_current(profile, state: dict, reg):
     return profile.model_copy(update=update)
 
 
+def _measured_placement(rp, ctx: int) -> dict:
+    """Weight placement that was MEASURED at this context, if there is one.
+
+    `fit_gguf` recomputes ngl / n_cpu_moe from a VRAM model that is deliberately
+    conservative — the right answer for a context nobody has tried, and the
+    wrong one for a context somebody has. Qwen3.8-27B was pinned at ngl 63 after
+    measuring 33.24 t/s there and relaunched at ngl 59, because the calculator
+    disagreed with the machine. The machine wins: a number that came from a
+    stopwatch beats a number that came from arithmetic about the same thing.
+
+    Only on an EXACT context match. Placement measured at 32K says nothing about
+    256K — the KV cache is most of what moved — so a near miss falls back to the
+    calculator rather than guessing.
+    """
+    try:
+        from .bench import load_calibration
+        entry = load_calibration().get(
+            f"{rp.model_slug}:{rp.gguf.quant}:{rp.backend}") or {}
+        if int(entry.get("ctx") or 0) != int(ctx):
+            return {}
+        flags = entry.get("flags") or {}
+        return {k: v for k, v in flags.items() if k in ("ngl", "n_cpu_moe")}
+    except Exception:
+        return {}          # a missing or corrupt calibration is not an error
+
+
 def _resolve_for(slug: str, state: dict, registry, profile,
                  backend: str | None = None):
     from .probe import probe_hardware
@@ -365,10 +391,13 @@ def perform_switch(model: str, registry=None, profile=None,
             raise RuntimeError(
                 f"ctx {want:,} doesn't fit — {model} ({rp.gguf.quant}) tops "
                 f"out around {rp.flags.ctx:,} on this machine")
-        rp.flags = rp.flags.model_copy(update={
+        update = {
             "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe, "ngl": flags.ngl,
             "cache_type_k": flags.cache_type_k,
-            "cache_type_v": flags.cache_type_v})
+            "cache_type_v": flags.cache_type_v}
+        # ...except where the placement was MEASURED at this exact context.
+        update.update(_measured_placement(rp, want))
+        rp.flags = rp.flags.model_copy(update=update)
     if kv is not None:
         rp.flags = rp.flags.model_copy(update={"cache_type_k": kv,
                                                "cache_type_v": kv})
