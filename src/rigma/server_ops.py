@@ -468,12 +468,22 @@ def perform_switch(model: str, registry=None, profile=None,
                        ctx=int(s.get("ctx", 0)), unloaded=True,
                        gguf=s.get("gguf", ""))
         raise
+    # Bring back the prompt cache if one was saved under EXACTLY this
+    # configuration. A 120K window costs about four minutes of prefill to
+    # rebuild and a couple of seconds to read off disk.
+    from . import kvcache
+    kv_fp = kvcache.fingerprint(kvcache.config_of(rp, str(exe)))
+    try:
+        kvcache.restore(int(s["public_port"]) - 1,
+                        runtime.rigma_home() / "sessions", kv_fp)
+    except Exception:
+        pass          # a cache that will not load is a slow start, not a fault
     st.write_state(rp.model_slug, rp.gguf.quant, int(s["public_port"]),
                    engine_pid=sp.proc.pid,
                    ui_pid=int(s.get("ui_pid", os.getpid())),
                    backend=rp.backend, use_case=s.get("use_case", "general"),
                    ctx=rp.flags.ctx, kv_cache=rp.flags.cache_type_k or "",
-                   no_vision=not vision, gguf=rp.gguf.file)
+                   no_vision=not vision, gguf=rp.gguf.file, kv_fp=kv_fp)
     return st.read_state() or {}
 
 
@@ -501,13 +511,26 @@ def perform_unload() -> dict:
         raise RuntimeError("not running")
     if s.get("unloaded"):
         raise RuntimeError("engine is already unloaded")
+    # Write the conversation's KV cache out BEFORE the process dies. Everything
+    # llama-server caches lives in that process; unloading to free the card is
+    # otherwise paid for with a full re-prefill on the way back.
+    if s.get("kv_fp"):
+        from . import kvcache, runtime
+        sessions = runtime.rigma_home() / "sessions"
+        try:
+            kvcache.save(int(s["public_port"]) - 1, sessions, s["kv_fp"],
+                         meta={k: s.get(k) for k in ("model", "quant", "gguf",
+                                                     "backend", "ctx")})
+            kvcache.prune(sessions)
+        except Exception:
+            pass      # never let a cache write block freeing the GPU
     st.kill_pid(int(s.get("engine_pid", -1)))
     st.write_state(s["model"], s["quant"], int(s["public_port"]),
                    engine_pid=-1, ui_pid=int(s.get("ui_pid", os.getpid())),
                    backend=s.get("backend", "unknown"),
                    use_case=s.get("use_case", "general"),
                    ctx=int(s.get("ctx", 0)), unloaded=True,
-                   gguf=s.get("gguf", ""))
+                   gguf=s.get("gguf", ""), kv_fp=s.get("kv_fp", ""))
     return st.read_state()
 
 
