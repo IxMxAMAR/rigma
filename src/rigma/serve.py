@@ -1904,6 +1904,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return Response(server_ops.log_tail(lines), media_type="text/plain",
                         headers=_NO_STORE)
 
+    @app.get("/api/server/findings")
+    async def server_findings():
+        """Decisions the engine announced once at load and never repeated.
+
+        Read from the WHOLE log rather than the tail: these land in the first
+        few hundred lines of a launch and are long gone by the time anyone
+        looks. `cache_reuse is not supported by this context` had appeared
+        fifteen times on this machine without ever being shown to anyone.
+        """
+        from . import engine_log, server_ops
+        try:
+            text = server_ops.log_tail(1000)
+        except Exception:
+            return {"findings": []}
+        return {"findings": engine_log.findings(text)}
+
     @app.get("/api/server/switch-options")
     async def server_switch_options():
         from . import server_ops
