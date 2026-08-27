@@ -76,6 +76,25 @@ def _meta_path(save_dir: Path, fp: str) -> Path:
     return save_dir / f"kv-{fp}.json"
 
 
+def slot_action(port: int, slot: int, action: str, filename: str,
+                timeout: float = 120.0) -> str | None:
+    """One call to llama-server's slot save/restore. Returns None on success.
+
+    Shared with prefixcache so there is a single place that knows the shape of
+    this endpoint — it is enabled by --slot-save-path and takes the filename
+    relative to that directory.
+    """
+    try:
+        r = httpx.post(f"http://127.0.0.1:{port}/slots/{slot}",
+                       params={"action": action},
+                       json={"filename": filename}, timeout=timeout)
+        if r.status_code != 200:
+            return f"engine refused the {action} ({r.status_code})"
+    except Exception as e:
+        return str(e)[:200]
+    return None
+
+
 def config_of(plan, engine: str = "") -> dict:
     """The fingerprint input for a RunPlan. One place, so the launch path and
     the restore path cannot drift into disagreeing about what "the same
@@ -100,14 +119,9 @@ def save(port: int, save_dir: Path, fp: str, *, meta: dict | None = None,
     that produced the running engine is no longer to hand, and re-deriving it
     could silently disagree with what was actually launched — which is exactly
     the mismatch this module exists to prevent."""
-    try:
-        r = httpx.post(f"http://127.0.0.1:{port}/slots/{slot}",
-                       params={"action": "save"},
-                       json={"filename": cache_name(fp)}, timeout=timeout)
-        if r.status_code != 200:
-            return None, f"engine refused the save ({r.status_code})"
-    except Exception as e:
-        return None, str(e)[:200]
+    err = slot_action(port, slot, "save", cache_name(fp), timeout)
+    if err:
+        return None, err
     try:
         _meta_path(save_dir, fp).write_text(
             json.dumps({**{k: (meta or {}).get(k) for k in FINGERPRINT_FIELDS},
@@ -127,15 +141,8 @@ def restore(port: int, save_dir: Path, fp: str, *, slot: int = MAIN_SLOT,
     blob = save_dir / cache_name(fp)
     if not blob.is_file():
         return False, None
-    try:
-        r = httpx.post(f"http://127.0.0.1:{port}/slots/{slot}",
-                       params={"action": "restore"},
-                       json={"filename": cache_name(fp)}, timeout=timeout)
-        if r.status_code != 200:
-            return False, f"engine refused the restore ({r.status_code})"
-    except Exception as e:
-        return False, str(e)[:200]
-    return True, None
+    err = slot_action(port, slot, "restore", cache_name(fp), timeout)
+    return (False, err) if err else (True, None)
 
 
 def prune(save_dir: Path, keep: int = KEEP_CACHES) -> list[str]:

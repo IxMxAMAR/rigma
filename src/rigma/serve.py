@@ -117,6 +117,77 @@ AUTO_COMPACT_KEEP = 16  # one action = TWO messages now (assistant + TOOL
 # right; explicit pinning is deterministic.
 MAIN_SLOT = 0
 AUX_SLOT = 1
+
+# What the main slot is currently warm for, and where its last prefix snapshot
+# was taken. Deliberately in-process: losing it on restart costs one extra
+# restore, and persisting it would be another thing that could disagree with
+# what the engine actually holds.
+_PREFIX_STATE: dict = {"warm_key": "", "last_point": None}
+
+
+def _prefix_ctx():
+    """(engine port, snapshot dir, config fingerprint) or None.
+
+    The fingerprint is the one recorded at launch — the same value the whole-
+    slot cache uses — so a snapshot can never be selected for an engine running
+    a different quant, context or layer split.
+    """
+    from . import state as _st
+    from .runtime import rigma_home
+    s = _st.read_state() or {}
+    fp = s.get("kv_fp") or ""
+    if not fp or s.get("unloaded") or not s.get("public_port"):
+        return None
+    return int(s["public_port"]) - 1, rigma_home() / "sessions", fp
+
+
+def _prefix_warm(msgs: list[dict]) -> None:
+    """Restore the deepest snapshot that this conversation starts with.
+
+    Skipped when the slot is already warm for that exact prefix: the live slot
+    holds at least as much as the snapshot and restoring would be a slower way
+    to arrive at the same place.
+    """
+    try:
+        ctx = _prefix_ctx()
+        if ctx is None:
+            return
+        port, save_dir, fp = ctx
+        from . import prefixcache
+        points = prefixcache.prefix_keys(msgs, fp)
+        hit = prefixcache.best_match(points, prefixcache.available(save_dir))
+        if hit is None or hit.key == _PREFIX_STATE["warm_key"]:
+            return
+        if prefixcache.warm(port, save_dir, hit.key, slot=MAIN_SLOT) is None:
+            _PREFIX_STATE["warm_key"] = hit.key
+            _PREFIX_STATE["last_point"] = hit
+    except Exception:
+        pass          # a cold start is slow, never wrong
+
+
+def _prefix_snapshot(msgs: list[dict]) -> None:
+    """Snapshot the finished turn, if the prefix has grown enough to be worth
+    the gigabytes and the seconds."""
+    try:
+        ctx = _prefix_ctx()
+        if ctx is None:
+            return
+        port, save_dir, fp = ctx
+        from . import prefixcache
+        points = prefixcache.prefix_keys(msgs, fp)
+        if not points:
+            return
+        tip = points[-1]
+        if not prefixcache.should_snapshot(tip, _PREFIX_STATE["last_point"]):
+            return
+        if prefixcache.snapshot(port, save_dir, tip.key, slot=MAIN_SLOT,
+                                meta={"n_messages": tip.n_messages,
+                                      "approx_tokens": tip.approx_tokens}) is None:
+            _PREFIX_STATE["warm_key"] = tip.key
+            _PREFIX_STATE["last_point"] = tip
+            prefixcache.evict(save_dir)
+    except Exception:
+        pass          # never cost the user a turn to save one
 # models whose template/engine rejected tool_choice:"required" (HTTP 400) —
 # forcing is skipped for them from then on and the rescue parser carries
 # the load, exactly as before
@@ -1094,6 +1165,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
         msgs = sessions.build_messages(s, _default_prompt(), preset)
+        # Warm the slot from the deepest snapshot this conversation starts
+        # with. Reopening a long chat, switching between chats and branching
+        # all arrive here with a cold slot that would otherwise re-prefill the
+        # whole history — four minutes at 120K on this machine.
+        _prefix_warm(msgs)
         # nudges are consumed by the turn that just read them: a reminder
         # that re-injects every turn is nagging, not a trigger
         s["pending_nudges"] = []
@@ -1736,6 +1812,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             except Exception:
                 pass          # a trigger must never cost the user their turn
             sessions.save(s)
+            # Rebuilt AFTER the save so it includes the reply that was just
+            # generated — that is what the slot actually holds now.
+            try:
+                _prefix_snapshot(sessions.build_messages(
+                    s, _default_prompt(), preset))
+            except Exception:
+                pass
             _bump_stats(timings)
             # Auto-title once the conversation has a shape (owner request
             # 2026-07-21: the rail was "Sup bro", "Hello", and three identical
