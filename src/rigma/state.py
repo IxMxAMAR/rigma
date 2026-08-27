@@ -17,7 +17,8 @@ def write_state(model_slug: str, quant: str, public_port: int,
                 engine_pid: int, ui_pid: int, backend: str = "unknown",
                 use_case: str = "general", ctx: int = 0,
                 unloaded: bool = False, kv_cache: str = "",
-                no_vision: bool = False, gguf: str = "") -> None:
+                no_vision: bool = False, gguf: str = "",
+                kv_fp: str = "") -> None:
     state_path().parent.mkdir(parents=True, exist_ok=True)
     state_path().write_text(json.dumps({
         "model": model_slug, "quant": quant, "public_port": public_port,
@@ -31,6 +32,11 @@ def write_state(model_slug: str, quant: str, public_port: int,
         # repo gains siblings; the filename does not, so it is what the Models
         # page matches the running row on.
         "gguf": gguf,
+        # names the on-disk KV cache this launch may restore. Recorded at
+        # launch rather than re-derived at unload: by then the plan is gone,
+        # and a re-derivation that disagreed with what actually launched is
+        # precisely the mismatch kvcache exists to prevent.
+        "kv_fp": kv_fp,
     }, indent=2), encoding="utf-8")
 
 
