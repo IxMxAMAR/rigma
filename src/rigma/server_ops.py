@@ -244,11 +244,22 @@ def vram_snapshot(registry=None) -> dict | None:
     from .probe import probe_hardware
     from .registry import Registry
     from .resolve import COMPUTE_BUFFER_MB, VRAM_RESERVE_MB, _budgets
+    from . import state as st
     reg = registry if registry is not None else Registry.load()
     prof = probe_hardware(reg.gpus)
     total = sum(g.vram_mb for g in prof.gpus)
     if not total:
         return None
+    # Credit back the model we are already running. The adapter counter reports
+    # everything held on the card, which INCLUDES our own engine — so with a
+    # 15.7GB model loaded the panel said "other apps hold 15.7 GB of VRAM,
+    # leaving 0.1 GB for the model" and advised closing a browser (owner,
+    # 2026-08-25). The resolver has credited this back since 2026-08-21; this
+    # read never did, so the number the user saw and the number rigma planned
+    # against disagreed. "Other apps" has to mean other apps.
+    s = st.read_state() or {}
+    if s.get("model") and not s.get("unloaded"):
+        prof = _free_current(prof, s, reg)
     usable, _ = _budgets(prof)
     floor = VRAM_RESERVE_MB[prof.os]
     desktop = prof.vram_used_mb
