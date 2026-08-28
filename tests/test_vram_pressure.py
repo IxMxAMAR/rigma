@@ -146,3 +146,76 @@ def test_crediting_falls_back_to_the_largest_when_the_file_is_unknown():
         vram_used_mb=15212)
     out = _free_current(prof, {"model": "m", "quant": "Q3_K_M"}, _Reg())
     assert 2000 < out.vram_used_mb < 3200
+
+
+# --- what the PANEL reports, as opposed to what the resolver plans with ------
+
+def test_a_loaded_model_is_not_reported_as_other_apps(monkeypatch, tmp_path):
+    """The adapter counter includes our own engine.
+
+    Reported by the owner 2026-08-25 with a 15.7GB model loaded: the panel read
+    "other apps hold 15.7 GB of VRAM - leaving 0.1 GB of 15.9 GB for the model"
+    and advised closing a browser. The resolver had credited the running model
+    back since 2026-08-21; this read had not, so the number shown and the
+    number planned against disagreed by the size of the model.
+    """
+    from rigma import server_ops
+    from rigma.models import GgufFile, ModelSpec
+
+    spec = ModelSpec(slug="m", family="qwen35", kind="dense", n_layers=64,
+                     full_attn_layers=16, kv_heads=4, head_dim=256,
+                     native_ctx=262144,
+                     ggufs=[GgufFile(repo="r", file="m.gguf",
+                                     bytes=12 * 2**30, quant="Q4")])
+
+    class _Reg:
+        gpus = []
+        models = {"m": spec}
+
+    prof = _prof(["vulkan"])
+    # 13.2GB held: 12GB of it is the model we are running, 1.2GB is everything
+    # else on the card.
+    prof = prof.model_copy(update={"vram_used_mb": 13_500.0})
+    monkeypatch.setattr(server_ops, "probe_hardware", lambda gpus: prof,
+                        raising=False)
+    monkeypatch.setattr("rigma.probe.probe_hardware", lambda gpus: prof)
+    monkeypatch.setattr("rigma.state.read_state",
+                        lambda: {"model": "m", "gguf": "m.gguf",
+                                 "unloaded": False, "public_port": 11500})
+
+    snap = server_ops.vram_snapshot(_Reg())
+
+    assert snap is not None
+    # ~1.2GB of genuine other-app usage, not 13.5
+    assert snap["desktop_mb"] < 2000, snap
+    # and the model gets a real budget rather than 0.1GB
+    assert snap["usable_mb"] > 10_000, snap
+
+
+def test_an_unloaded_engine_leaves_the_reading_alone(monkeypatch):
+    """Nothing of ours is on the card, so every megabyte really is someone
+    else's and the warning should stand."""
+    from rigma import server_ops
+    from rigma.models import GgufFile, ModelSpec
+
+    spec = ModelSpec(slug="m", family="qwen35", kind="dense", n_layers=64,
+                     full_attn_layers=16, kv_heads=4, head_dim=256,
+                     native_ctx=262144,
+                     ggufs=[GgufFile(repo="r", file="m.gguf",
+                                     bytes=12 * 2**30, quant="Q4")])
+
+    class _Reg:
+        gpus = []
+        models = {"m": spec}
+
+    prof = _prof(["vulkan"]).model_copy(update={"vram_used_mb": 4_000.0})
+    monkeypatch.setattr("rigma.probe.probe_hardware", lambda gpus: prof)
+    monkeypatch.setattr("rigma.state.read_state",
+                        lambda: {"model": "m", "gguf": "m.gguf",
+                                 "unloaded": True, "public_port": 11500})
+
+    snap = server_ops.vram_snapshot(_Reg())
+
+    assert snap is not None
+    assert snap["desktop_mb"] == 4000
+    assert snap["pressured"] is True
