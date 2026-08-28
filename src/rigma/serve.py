@@ -6,6 +6,7 @@ import logging
 import os
 import platform
 import re
+import time
 import subprocess
 import threading
 from contextlib import asynccontextmanager
@@ -1164,12 +1165,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def _llm_turn(s: dict, cont: bool = False):
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
+        # Where a turn's wall clock actually goes. The owner reported ~2 minutes
+        # of "Generating" before the first thinking token, on turns whose
+        # prefill the engine log shows finishing in under 4 seconds — at 32K and
+        # 64K alike, so neither prefill nor context explains it. The gap is
+        # somewhere between here and the first streamed delta. Measure it
+        # instead of reasoning about it (2026-08-28).
+        _turn_t0 = time.perf_counter()
+        _marks: list = []
+
+        def _mark(label: str) -> None:
+            _marks.append((label, time.perf_counter() - _turn_t0))
+
         msgs = sessions.build_messages(s, _default_prompt(), preset)
+        _mark("build_messages")
         # Warm the slot from the deepest snapshot this conversation starts
         # with. Reopening a long chat, switching between chats and branching
         # all arrive here with a cold slot that would otherwise re-prefill the
         # whole history — four minutes at 120K on this machine.
         _prefix_warm(msgs)
+        _mark("prefix_warm")
         # nudges are consumed by the turn that just read them: a reminder
         # that re-injects every turn is nagging, not a trigger
         s["pending_nudges"] = []
@@ -1424,6 +1439,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             rtext, calls, started = "", {}, {}   # started: idx -> (task, cargs)
             finish_reason = None
             try:
+                _mark("request_built")
                 req = client.build_request("POST", "/v1/chat/completions",
                                            json=body)
                 resp = await client.send(req, stream=True)
@@ -1444,10 +1460,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     resp = await client.send(req, stream=True)
                 if resp.status_code != 200:
                     raise RuntimeError(await _upstream_error(resp))
+                _mark("engine_responded")
+                _first_delta = True
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
                     payload = line[6:].strip()
+                    if _first_delta and payload and payload != "[DONE]":
+                        _first_delta = False
+                        _mark("first_token")
+                        _log.info("turn timing: %s", " ".join(
+                            f"{k}={v:.2f}s" for k, v in _marks))
                     if payload == "[DONE]":
                         break
                     try:
