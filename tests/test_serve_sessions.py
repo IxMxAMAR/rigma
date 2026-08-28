@@ -458,10 +458,14 @@ def test_chat_turn_streams_think_events_and_persists_thinking(tmp_path,
         got = c.get(f"/api/sessions/{s['id']}").json()
         last = got["messages"][-1]
         assert last["content"] == "Answer." and last["thinking"] == "hmm ok"
-        # thinking must never reach the model on later turns
+        # Reasoning IS carried back now (owner request 2026-08-28) — but only
+        # as reasoning_content, and nothing else from the stored message may
+        # reach the model.
         from rigma import sessions as sess_mod
         out = sess_mod.build_messages(got)
-        assert all(set(m) == {"role", "content"} for m in out)
+        assert all(set(m) <= {"role", "content", "reasoning_content"}
+                   for m in out)
+        assert any(m.get("reasoning_content") == "hmm ok" for m in out)
     finally:
         srv.shutdown()
 

@@ -259,7 +259,12 @@ def test_server_args_reasoning_budget():
                       gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
                       backend="vulkan", flags=ComboFlags(ctx=8192),
                       origin="test")
-    assert "--reasoning-budget" not in default.server_args("m.gguf", 11500)
+    # The default is a real budget now, not "unlimited". Left unbudgeted this
+    # model has been measured producing 15.7K characters of deliberation and no
+    # answer at all (owner, 2026-08-28).
+    assert default.server_args("m.gguf", 11500)[
+        default.server_args("m.gguf", 11500).index("--reasoning-budget") + 1
+    ] == "16384"
 
 
 # --- reasoning carry-over for autonomous runs ---------------------------------
@@ -286,11 +291,17 @@ def test_reasoning_carry_capped_to_last_four():
     assert with_r[-1]["reasoning_content"] == "thought 6"   # newest kept
 
 
-def test_chat_sessions_never_carry_reasoning():
+def test_ordinary_chats_carry_reasoning_too():
+    """Was scoped to autonomous runs; the owner asked for it in chats.
+
+    Reasoning that is computed, streamed and dropped is paid for once and
+    re-derived every turn — on a long task the model rebuilds its plan from
+    nothing each time. The four-turn cap above is what keeps it affordable.
+    """
     s = _run_session(2)
     s["one_action"] = False
     msgs = sessions.build_messages(s)
-    assert all("reasoning_content" not in m for m in msgs)
+    assert any("reasoning_content" in m for m in msgs)
 
 
 def test_effort_off_never_carries_reasoning():
