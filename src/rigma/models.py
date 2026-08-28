@@ -180,6 +180,17 @@ class ModelSpec(BaseModel):
     probe_version: int = 0
 
 
+# Injected right before the end-of-thinking tag when --reasoning-budget runs
+# out. Written as an instruction the model can act on in a few tokens: state the
+# decision, do not restart the analysis.
+BUDGET_EXHAUSTED = (
+    "You have used your thinking budget. Stop analysing now and write your "
+    "answer. Begin it by stating, briefly, the decisions you reached and the "
+    "single next step you are taking — anything you do not write down here is "
+    "lost to the next turn."
+)
+
+
 class ComboFlags(BaseModel):
     ctx: int
     ngl: int = 99
@@ -188,7 +199,11 @@ class ComboFlags(BaseModel):
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
     reasoning: str = ""   # ""(engine default) | on | off | auto
-    reasoning_budget: int = -1   # max thinking tokens/turn (-1 = unlimited)
+    # Max thinking tokens per turn. -1 (the engine default) lets a model spend
+    # its whole window deliberating: measured on this machine, a nine-rule tool
+    # doctrine produced 15.7K characters of deliberation and NO answer. 16K is
+    # past anything that has ever been useful here and well short of ruinous.
+    reasoning_budget: int = 16384
     spec_type: str = "none"   # none | draft-mtp | ngram-simple | ... (engine list)
     spec_n_max: int = 3
     batch: int = 0        # -b logical batch (0 = engine default 2048)
@@ -279,6 +294,11 @@ class RunPlan(BaseModel):
             args += ["--reasoning", self.flags.reasoning]
         if self.flags.reasoning_budget >= 0:
             args += ["--reasoning-budget", str(self.flags.reasoning_budget)]
+            # What the model reads AS it is cut off. Without it the thinking
+            # block is truncated mid-sentence and whatever it had worked out is
+            # lost; with it, the budget ends in a conclusion instead of a
+            # guillotine.
+            args += ["--reasoning-budget-message", BUDGET_EXHAUSTED]
         if self.flags.spec_type and self.flags.spec_type != "none":
             args += ["--spec-type", self.flags.spec_type,
                      "--spec-draft-n-max", str(self.flags.spec_n_max)]

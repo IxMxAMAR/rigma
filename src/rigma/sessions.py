@@ -278,8 +278,13 @@ def build_messages(session: dict, default_prompt: str = "",
     # Qwen3.6's agent guidance — with preserve_thinking the model stops
     # re-deriving its plan every turn. Only the last few turns' worth, capped,
     # so carried thinking never bloats the window.
-    carry_think = bool(session.get("one_action")) \
-        and session.get("effort", "") != "off"
+    # Carried in ORDINARY chats too, not just autonomous runs. Thinking that is
+    # computed, streamed and then dropped is paid for once and re-derived every
+    # turn — on a long task the model rebuilds its plan from nothing each time.
+    # The cap below is what stops this becoming the context problem it exists to
+    # solve: 4,000 chars each, last 4 assistant turns, so ~5K tokens whatever
+    # the conversation does.
+    carry_think = session.get("effort", "") != "off"
     msgs = []
     for m in session.get("messages", []):
         role = m.get("role", "user")
