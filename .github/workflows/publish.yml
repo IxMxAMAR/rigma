@@ -47,4 +47,9 @@ jobs:
           name: dist
           path: dist/
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        # Pinned to a commit, not a branch. `@release/v1` is a moving ref, and
+        # this is the only job that holds `id-token: write` — whoever controls
+        # that ref could mint a PyPI token for this project by pushing to it.
+        # Bump deliberately: check the action's release notes, then update both
+        # the SHA and the comment.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
