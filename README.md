@@ -16,17 +16,22 @@ shows the arithmetic and sources.
 
 ```powershell
 pip install rigma
-rigma up            # probes your machine, downloads the best model, opens the chat UI
+rigma up                       # opens the chat UI; add a model from the Models page
+rigma up --model <slug>        # probe, resolve, download that model, and serve it
 ```
 
-That's it — a browser tab opens with a chat connected to your tuned local model, and any
-OpenAI-compatible tool can use `http://127.0.0.1:11500/v1`.
+A browser tab opens either way, and any OpenAI-compatible tool can use
+`http://127.0.0.1:11500/v1` once a model is loaded. With no `--model`, `up` starts the UI
+without probing or downloading anything — a fresh install lands on an empty Models page,
+where picking a model runs the same probe-resolve-download path.
 
 Chats persist server-side across restarts — the browser UI lists past sessions in a rail,
-renders markdown (fenced code, copy button), and supports regenerate / edit-last. Each
-session carries its own system prompt (registry ships sensible defaults per use case —
-general, creative, coding — so creative-writing models stay in character from the first
-message) and a per-session "use my documents" RAG toggle with inline citations.
+renders markdown with fenced code, and supports regenerate. Each session carries its own
+system prompt (the registry ships sensible defaults per use case — general, creative,
+coding — so creative-writing models stay in character from the first message) and a
+per-session "use my documents" RAG toggle; retrieved sources appear inside the
+`search_my_documents` step in the transcript. A copy button and edit-last live in the
+legacy UI at `/rizz`.
 
 ## Commands
 
@@ -37,15 +42,16 @@ message) and a per-session "use my documents" RAG toggle with inline citations.
 | `rigma status` | What's running, where |
 | `rigma stop` | Stop the model server and UI |
 | `rigma models` | What fits your machine |
-| `rigma plan --explain` | What `up` would run, with the math |
+| `rigma plan --explain` | What `plan` would choose, and why. When a community combo matches your hardware it reports the match and its source rather than re-deriving the fit; `rigma up --dry-run` is the accurate preview of a launch, since it also applies a model's pinned defaults |
 | `rigma doctor` | What Rigma detects on this machine |
 | `rigma update` | Pull the latest [community combo registry](https://github.com/IxMxAMAR/rigma-registry) |
 | `rigma bench` | Measure real speed; `--evidence FILE` exports registry-format proof |
 | `rigma rag add PATH` | Index a folder into your local knowledge base ([Raggity](https://github.com/IxMxAMAR/raggity) sidecar) |
-| `rigma rag ask "..."` | Answer grounded in your documents, with citations, via your tuned model |
+| `rigma rag ask "..."` | Answer grounded in your documents, naming the sources it used, via your tuned model |
 
-`rigma up` flags: `--use-case coding` · `--model SLUG` · `--port 11500` · `--no-browser` ·
-`--turbo` (fast download, may hog your bandwidth) · `--yes` · `--dry-run`
+`rigma up` flags: `--model SLUG` · `--use-case coding` · `--port 11500` · `--no-browser` ·
+`--ctx N` · `--reasoning on|off|auto` · `--reasoning-budget N` · `--fa on|off|auto` ·
+`--spec none|draft-mtp|…` · `--detach` · `--no-calibrate` · `--yes` · `--dry-run`
 
 ## Status
 
