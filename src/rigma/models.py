@@ -199,11 +199,13 @@ class ComboFlags(BaseModel):
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
     reasoning: str = ""   # ""(engine default) | on | off | auto
-    # Max thinking tokens per turn. -1 (the engine default) lets a model spend
-    # its whole window deliberating: measured on this machine, a nine-rule tool
-    # doctrine produced 15.7K characters of deliberation and NO answer. 16K is
-    # past anything that has ever been useful here and well short of ruinous.
-    reasoning_budget: int = 16384
+    # Max thinking tokens per turn. Back to -1 (engine default, unlimited)
+    # after a 16384 default coincided with decode collapsing from ~26 t/s to
+    # 0.59 t/s on a fresh 4K-context chat (2026-08-28). It was the only launch
+    # flag that changed, so it is the only one that gets reverted until it is
+    # measured on its own. The runaway-deliberation problem it was meant to
+    # solve is real, but it is worth less than 50x the speed.
+    reasoning_budget: int = -1
     spec_type: str = "none"   # none | draft-mtp | ngram-simple | ... (engine list)
     spec_n_max: int = 3
     batch: int = 0        # -b logical batch (0 = engine default 2048)
