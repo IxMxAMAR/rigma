@@ -259,12 +259,9 @@ def test_server_args_reasoning_budget():
                       gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
                       backend="vulkan", flags=ComboFlags(ctx=8192),
                       origin="test")
-    # The default is a real budget now, not "unlimited". Left unbudgeted this
-    # model has been measured producing 15.7K characters of deliberation and no
-    # answer at all (owner, 2026-08-28).
-    assert default.server_args("m.gguf", 11500)[
-        default.server_args("m.gguf", 11500).index("--reasoning-budget") + 1
-    ] == "16384"
+    # Unbudgeted by default again: a 16384 default coincided with decode
+    # collapsing from ~26 t/s to 0.59 t/s (2026-08-28).
+    assert "--reasoning-budget" not in default.server_args("m.gguf", 11500)
 
 
 # --- reasoning carry-over for autonomous runs ---------------------------------
@@ -291,17 +288,18 @@ def test_reasoning_carry_capped_to_last_four():
     assert with_r[-1]["reasoning_content"] == "thought 6"   # newest kept
 
 
-def test_ordinary_chats_carry_reasoning_too():
-    """Was scoped to autonomous runs; the owner asked for it in chats.
+def test_chat_sessions_carry_reasoning_only_when_asked():
+    """Ungated for chats on 2026-08-28 and re-gated the same day.
 
-    Reasoning that is computed, streamed and dropped is paid for once and
-    re-derived every turn — on a long task the model rebuilds its plan from
-    nothing each time. The four-turn cap above is what keeps it affordable.
+    The four-turn window slides, so every turn rewrote the prompt four turns
+    back; this model cannot KV-shift, so every turn reprefilled.
     """
     s = _run_session(2)
     s["one_action"] = False
-    msgs = sessions.build_messages(s)
-    assert any("reasoning_content" in m for m in msgs)
+    assert all("reasoning_content" not in m
+               for m in sessions.build_messages(s))
+    s["carry_reasoning"] = True
+    assert any("reasoning_content" in m for m in sessions.build_messages(s))
 
 
 def test_effort_off_never_carries_reasoning():

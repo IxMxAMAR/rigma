@@ -1,9 +1,16 @@
-"""A thinking budget, and reasoning that survives the turn that produced it.
+"""The thinking budget, and reasoning carried between turns.
 
-Two problems, one cause. Left unbudgeted, this model has been measured
-producing 15.7K characters of deliberation and no answer at all. And reasoning
-was only ever carried forward on autonomous runs, so an ordinary chat computed
-a plan, streamed it, dropped it, and rebuilt it from nothing next turn.
+Both were switched ON as defaults on 2026-08-28 and both were reverted the same
+day, for different reasons. The plumbing is kept and tested because it is
+correct and useful when asked for; only the defaults changed.
+
+  * reasoning_budget defaulted to 16384. Decode collapsed from ~26 t/s to
+    0.59 t/s on a fresh 4K-context chat, and it was the only launch flag that
+    had changed. Back to -1 until it is measured in isolation.
+  * carry_think was ungated for chats. The four-turn window SLIDES, so every
+    turn rewrote the prompt four turns back — and on a DeltaNet hybrid there is
+    no KV shifting to recover from a mid-prompt edit, so every turn reprefilled.
+    Back to runs, plus an explicit `carry_reasoning` opt-in.
 """
 from rigma.models import BUDGET_EXHAUSTED, ComboFlags, GgufFile, RunPlan
 from rigma.sessions import build_messages
@@ -17,30 +24,33 @@ def _args(**over):
     return plan.server_args("m.gguf", 11499)
 
 
-def test_thinking_is_budgeted_by_default():
+def test_thinking_is_unbudgeted_by_default():
+    """A 16384 default coincided with a 50x decode collapse, so it is off.
+
+    Passing no flag leaves the engine on its own default, which is what every
+    benchmark that measured 26-33 t/s on this machine actually ran.
+    """
     args = _args()
 
-    assert "--reasoning-budget" in args
-    assert args[args.index("--reasoning-budget") + 1] == "16384"
+    assert "--reasoning-budget" not in args
+    assert "--reasoning-budget-message" not in args
 
 
-def test_the_budget_ends_in_a_conclusion_not_a_guillotine():
+def test_a_budget_that_is_asked_for_is_passed():
+    args = _args(reasoning_budget=2048)
+
+    assert args[args.index("--reasoning-budget") + 1] == "2048"
+
+
+def test_a_budget_ends_in_a_conclusion_not_a_guillotine():
     # Truncating mid-sentence throws away whatever the model had worked out.
     # The message is what it reads as it is cut off.
-    args = _args()
+    args = _args(reasoning_budget=2048)
 
-    assert "--reasoning-budget-message" in args
     msg = args[args.index("--reasoning-budget-message") + 1]
     assert msg == BUDGET_EXHAUSTED
     assert "decisions you reached" in msg
     assert "next step" in msg
-
-
-def test_an_explicit_unlimited_budget_passes_neither_flag():
-    args = _args(reasoning_budget=-1)
-
-    assert "--reasoning-budget" not in args
-    assert "--reasoning-budget-message" not in args
 
 
 def test_a_zero_budget_is_still_a_budget():
@@ -57,24 +67,41 @@ def _session(msgs, **over):
     return {"messages": msgs, "use_tools": False, **over}
 
 
-def test_an_ordinary_chat_now_carries_its_reasoning():
-    s = _session([
-        {"role": "user", "content": "Plan the app."},
-        {"role": "assistant", "content": "Here is step one.",
-         "thinking": "I will use Kotlin and start with the data layer."},
-    ])
+_CHAT = [
+    {"role": "user", "content": "Plan the app."},
+    {"role": "assistant", "content": "Here is step one.",
+     "thinking": "I will use Kotlin and start with the data layer."},
+]
 
-    out = build_messages(s)
+
+def test_an_ordinary_chat_does_not_carry_reasoning():
+    """Carrying rewrites the prompt four turns back on every turn.
+
+    The window slides, so the edit position moves each turn, and this model
+    cannot KV-shift — the engine disables --cache-reuse outright. Every turn
+    reprefilled, which cost far more than the re-derivation it saved.
+    """
+    assert not any("reasoning_content" in m
+                   for m in build_messages(_session(_CHAT)))
+
+
+def test_a_chat_can_opt_in():
+    out = build_messages(_session(_CHAT, carry_reasoning=True))
 
     assert any(m.get("reasoning_content") == "I will use Kotlin and start "
                "with the data layer." for m in out)
 
 
+def test_runs_still_carry_it():
+    # Qwen3.6's agent guidance asks for this, and a run's trajectory is
+    # append-only in the way that matters.
+    out = build_messages(_session(_CHAT, one_action=True))
+
+    assert any("reasoning_content" in m for m in out)
+
+
 def test_turning_thinking_off_stops_it_being_carried():
-    s = _session([
-        {"role": "user", "content": "Plan the app."},
-        {"role": "assistant", "content": "Step one.", "thinking": "secret"},
-    ], effort="off")
+    s = _session(_CHAT, carry_reasoning=True, effort="off")
 
     assert not any("reasoning_content" in m for m in build_messages(s))
 
@@ -86,28 +113,18 @@ def test_only_the_last_four_assistant_turns_keep_their_reasoning():
         msgs.append({"role": "assistant", "content": f"a{i}",
                      "thinking": f"t{i}"})
 
-    out = build_messages(_session(msgs))
-    carried = [m["reasoning_content"] for m in out
-               if "reasoning_content" in m]
+    out = build_messages(_session(msgs, carry_reasoning=True))
+    carried = [m["reasoning_content"] for m in out if "reasoning_content" in m]
 
     assert carried == ["t4", "t5", "t6", "t7"]
 
 
 def test_a_single_reasoning_block_cannot_flood_the_window():
-    s = _session([
-        {"role": "user", "content": "go"},
-        {"role": "assistant", "content": "done", "thinking": "x" * 50_000},
-    ])
+    s = _session([{"role": "user", "content": "go"},
+                  {"role": "assistant", "content": "done",
+                   "thinking": "x" * 50_000}], carry_reasoning=True)
 
-    out = build_messages(s)
-    carried = next(m["reasoning_content"] for m in out
+    carried = next(m["reasoning_content"] for m in build_messages(s)
                    if "reasoning_content" in m)
 
     assert len(carried) == 4000
-
-
-def test_a_turn_with_no_thinking_carries_nothing():
-    s = _session([{"role": "user", "content": "hi"},
-                  {"role": "assistant", "content": "hello"}])
-
-    assert not any("reasoning_content" in m for m in build_messages(s))

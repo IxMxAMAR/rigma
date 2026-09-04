@@ -12,7 +12,7 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   "preset_id", "params", "notes", "digest", "effort",
                   "authors_note", "authors_note_depth", "prefill",
                   "use_tools", "allow_code", "workspace", "auto_compact",
-                  "max_tool_rounds", "one_action", "method")
+                  "max_tool_rounds", "one_action", "method", "carry_reasoning")
 # "" / off / auto / on are Rigma's own binary thinking switch. The four
 # named levels are Qwen3.8's published reasoning efforts, which its chat
 # template reads from `reasoning_effort` — verified against a live engine
@@ -278,13 +278,22 @@ def build_messages(session: dict, default_prompt: str = "",
     # Qwen3.6's agent guidance — with preserve_thinking the model stops
     # re-deriving its plan every turn. Only the last few turns' worth, capped,
     # so carried thinking never bloats the window.
-    # Carried in ORDINARY chats too, not just autonomous runs. Thinking that is
-    # computed, streamed and then dropped is paid for once and re-derived every
-    # turn — on a long task the model rebuilds its plan from nothing each time.
-    # The cap below is what stops this becoming the context problem it exists to
-    # solve: 4,000 chars each, last 4 assistant turns, so ~5K tokens whatever
-    # the conversation does.
-    carry_think = session.get("effort", "") != "off"
+    # Back to runs only, after shipping it for chats cost the owner most of
+    # their speed (2026-08-28).
+    #
+    # The four-turn window SLIDES. Every turn drops the oldest carried block and
+    # adds a new one, which rewrites the prompt at that position — and on a
+    # DeltaNet hybrid there is no KV shifting to recover from a mid-prompt edit
+    # (the engine disables --cache-reuse outright). So the cache is invalidated
+    # from four turns back on EVERY turn, and the reprefill that follows costs
+    # far more than the re-derivation it was meant to save.
+    #
+    # It stays on for runs because a run's trajectory is append-only in the way
+    # that matters, and Qwen3.6's agent guidance asks for it. `carry_reasoning`
+    # opts a chat in for anyone who wants it with eyes open.
+    carry_think = bool(session.get("one_action")
+                       or session.get("carry_reasoning")) \
+        and session.get("effort", "") != "off"
     msgs = []
     for m in session.get("messages", []):
         role = m.get("role", "user")
