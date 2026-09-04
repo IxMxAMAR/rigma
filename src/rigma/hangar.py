@@ -158,7 +158,6 @@ def _distinct_quants(files: list[str]) -> list[str]:
     labels = [_quant_from_name(f) for f in files]
     if len(set(labels)) == len(labels):
         return labels                       # real quant tags: leave them alone
-    stems = [_P(f).stem for f in files]
     # There IS a tag and two files share it, so something else in the name has
     # to earn its place. quant_variants knows which part: whatever follows the
     # tag. "RVN-Q3_K_M-multilingual-mtp" becomes "Q3_K_M · multilingual+mtp"
