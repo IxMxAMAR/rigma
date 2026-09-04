@@ -5,7 +5,7 @@ the only place that knows how to execute one. Everything the model touches
 (a real chat turn, an aux completion) is INJECTED rather than imported, which
 is what lets the whole interpreter be tested without an engine running.
 
-Spec: docs/superpowers/specs/2026-07-21-custom-methods-design.md
+Spec: the custom-methods design note (local)
 """
 from __future__ import annotations
 
@@ -102,6 +102,16 @@ def asks(steps: list[dict]) -> list[str]:
 
 # --- safety ---------------------------------------------------------------
 
+def _elevates(step: dict) -> bool:
+    """A settings step that switches `allow_code` or `use_tools` ON. bool(),
+    not `is True`, because run_macro stores bool(st[f]) -- the gate has to read
+    the value the same way the interpreter will write it."""
+    st = step.get("set")
+    if not isinstance(st, dict):
+        return False
+    return any(bool(st[f]) for f in ("use_tools", "allow_code") if f in st)
+
+
 def is_effectful(steps: list[dict], *, allow_code: bool = True) -> bool:
     """True if running this unattended could change something the user cares
     about. Conservative by construction: anything not on the read-only
@@ -114,15 +124,30 @@ def is_effectful(steps: list[dict], *, allow_code: bool = True) -> bool:
     exec tool is registered needs="code"; with it off the turn physically
     cannot be offered one. An `aux` prompt is always safe: fresh context, no
     tools, and it never enters the transcript.
+
+    `allow_code` is the value BEFORE the macro runs, and a `settings` step is
+    allowed to change it -- so the walk carries the flag forward rather than
+    judging all five steps against the starting posture. A step that turns
+    code (or tools) on is effectful on its own account: the flag is written to
+    the live session dict, the macro marks the session dirty, and it stays on
+    after the macro ends. Judging the step list against the pre-macro value was
+    how a "will run read-only steps" preview handed the model run_shell.
+    # AUDIT F42: docs/audit-2026-09-04-full.md
     """
+    code = bool(allow_code)
     for step in steps or []:
         kind = step.get("kind")
         if kind == "new_chat":
             return True
         if kind == "tool" and step.get("name") not in ms.SAFE_TOOLS:
             return True
-        if kind == "prompt" and step.get("to", "chat") == "chat" \
-                and allow_code:
+        if kind == "settings":
+            if _elevates(step):
+                return True
+            st = step.get("set")
+            if isinstance(st, dict) and "allow_code" in st:
+                code = bool(st["allow_code"])   # narrowing only, see above
+        if kind == "prompt" and step.get("to", "chat") == "chat" and code:
             return True
     return False
 
@@ -131,6 +156,7 @@ def preview_line(macro: dict, ctx: dict, *, allow_code: bool = True) -> str:
     """The confirm-bar sentence, generated FROM THE STEPS after substitution
     so it names the real files rather than a template."""
     bits: list[str] = []
+    code = bool(allow_code)
     for step in macro.get("steps") or []:
         s = substitute(step, ctx)
         kind = s.get("kind")
@@ -139,7 +165,21 @@ def preview_line(macro: dict, ctx: dict, *, allow_code: bool = True) -> str:
             bits.append(f"{s['name']}" + (f" on {target}" if target else ""))
         elif kind == "new_chat":
             bits.append("open a new chat")
-        elif kind == "prompt" and s.get("to", "chat") == "chat" and allow_code:
+        elif kind == "settings":
+            # the sentence has to name the elevation -- and say that it
+            # outlives the macro -- or the user confirms a preview that never
+            # mentioned the thing being switched on
+            # AUDIT F42: docs/audit-2026-09-04-full.md
+            st = s.get("set") if isinstance(s.get("set"), dict) else {}
+            on = [label for f, label in (("allow_code", "code execution"),
+                                         ("use_tools", "tools"))
+                  if bool(st.get(f))]
+            if on:
+                bits.append(f"with {' and '.join(on)} switched on, and left "
+                            "on for this chat afterwards")
+            if "allow_code" in st:
+                code = bool(st["allow_code"])
+        elif kind == "prompt" and s.get("to", "chat") == "chat" and code:
             bits.append("let the model use its tools")
     what = ", ".join(dict.fromkeys(bits)) or "read-only steps"
     return f"{macro.get('label') or macro.get('id')}: will run {what}"

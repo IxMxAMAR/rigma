@@ -218,6 +218,12 @@ def spec_fields_from_probe(f: dict) -> dict:
             "mtp_layers": int(f.get("mtp_layers", 0) or 0),
             "full_attention_interval":
                 int(f.get("full_attention_interval", 0) or 0),
+            # AUDIT F19: docs/audit-2026-09-04-full.md — without these three the
+            # windowed KV term stays zero for every model that can exist, and the
+            # fit silently overcommits on a Gemma-style import.
+            "swa_layers": int(f.get("swa_layers", 0) or 0),
+            "swa_kv_heads": int(f.get("swa_kv_heads", 0) or 0),
+            "swa_window": int(f.get("swa_window", 0) or 0),
             "has_template": bool(f.get("has_template", True)),
             "probe_version": PROBE_VERSION}
 
@@ -487,7 +493,21 @@ def merge_repo_files(spec: ModelSpec, rf: dict, *,
       can legitimately rename one that was already there.
     """
     if on_disk is None:
-        on_disk = {p.name for p in models_dir().glob("*.gguf")}
+        # AUDIT F28: docs/audit-2026-09-04-full.md
+        # `repo_files` lists the tree recursively because many repos nest
+        # quants in subdirs, so a spec's `file` can be "Q4_K_M/model.gguf".
+        # A name-only glob never matched those, so every nested quant read as
+        # "not downloaded" and the rule above dropped it from the spec.
+        # Both spellings on purpose. The relative path is what a nested spec
+        # entry looks like; the bare name is what a FLAT entry looks like whose
+        # file has since been stored in a subdirectory. Matching only the first
+        # would read that file as absent and the rule above would drop it —
+        # trading the old bug for the exact loss this function exists to
+        # prevent. "On disk is never dropped" wins over precise attribution.
+        mdir = models_dir()
+        found = list(mdir.rglob("*.gguf"))
+        on_disk = ({p.relative_to(mdir).as_posix() for p in found}
+                   | {p.name for p in found})
     repo = next((g.repo for g in spec.ggufs if g.repo and g.repo != "local"), "")
     known = {g.file: g for g in spec.ggufs}
     listed = [g["file"] for g in (rf.get("ggufs") or [])]
@@ -848,6 +868,7 @@ def delete_file(slug: str, file: str, registry=None) -> None:
     if not target.exists():
         raise HangarError(f"{file} is not on disk")
     target.unlink()
+    _discard_partial(target)   # AUDIT F27: docs/audit-2026-09-04-full.md
 
 
 def delete_model(slug: str, registry=None) -> None:
@@ -859,10 +880,18 @@ def delete_model(slug: str, registry=None) -> None:
     state = st.read_state()
     if state and state.get("model") == slug:
         raise HangarError(f"{slug} is running — stop or switch models first")
+    # AUDIT F27: docs/audit-2026-09-04-full.md
+    # The resume files go with the model. Nothing else reaped them, so a
+    # cancelled multi-GB pull outlived the model it belonged to, invisible in
+    # the library because glob("*.gguf") does not match ".part".
     for g in spec.ggufs:
-        (models_dir() / g.file).unlink(missing_ok=True)
+        path = models_dir() / g.file
+        path.unlink(missing_ok=True)
+        _discard_partial(path)
     if spec.mmproj is not None:
-        (models_dir() / spec.mmproj.file).unlink(missing_ok=True)
+        path = models_dir() / spec.mmproj.file
+        path.unlink(missing_ok=True)
+        _discard_partial(path)
     (custom_dir() / f"{slug}.json").unlink(missing_ok=True)
 
 
@@ -941,8 +970,13 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
 
     def _run():
         try:
+            # AUDIT F27: docs/audit-2026-09-04-full.md
+            # What the registry says this file IS. gguf.bytes was in scope all
+            # along and drove nothing but the progress bar; gguf.sha256 was
+            # declared in models.py and read nowhere at all.
             _download_file(repo, file, models_dir() / file,
-                           lambda n: _PULLS[key].update(done=n))
+                           lambda n: _PULLS[key].update(done=n),
+                           expect_bytes=want, sha256=gguf.sha256)
             _PULLS[key]["status"] = "done"
         except Exception as e:   # surfaced via /api/models, not lost in a thread
             _PULLS[key].update(status="error", error=str(e).splitlines()[0])
@@ -951,19 +985,146 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
     return _PULLS[key]
 
 
-def _download_file(repo: str, file: str, dest, report) -> int:
+# AUDIT F27: docs/audit-2026-09-04-full.md
+# A resume file is keyed on the DESTINATION name, which is not an identity.
+# `mmproj-F16.gguf` ships in the registry twice over and quantiser filenames
+# collide routinely, so a cancelled pull of one repo left a .part that the
+# next repo's same-named file resumed onto: the new object's tail appended to
+# the old object's head, landing on EXACTLY the expected byte count. The note
+# beside the .part records which (repo, file) wrote those bytes; a partial
+# that cannot prove what it is gets dropped rather than resumed. Partials
+# written before this existed have no note and are therefore discarded once,
+# which costs one restarted download and no wrong installs.
+_PART_SUFFIX = ".part"
+_PART_NOTE_SUFFIX = ".part.id"
+
+
+def _resume_files(dest) -> tuple[Path, Path]:
+    """The .part beside `dest` and the note saying which file wrote it."""
+    return (dest.with_name(dest.name + _PART_SUFFIX),
+            dest.with_name(dest.name + _PART_NOTE_SUFFIX))
+
+
+def _part_ident(repo: str, file: str) -> str:
+    return f"{repo}\n{file}"
+
+
+def _claim_partial(dest, repo: str, file: str) -> None:
+    """Record which (repo, file) the .part beside `dest` is accumulating."""
+    _resume_files(dest)[1].write_text(_part_ident(repo, file), encoding="utf-8")
+
+
+def _part_owner(dest) -> str:
+    """Who wrote the .part beside `dest`, or "" when it cannot say."""
+    try:
+        return _resume_files(dest)[1].read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _discard_partial(dest) -> None:
+    """Throw away a resume file and its note. Best effort on purpose: a stale
+    partial we cannot remove must not sink the delete that found it."""
+    for p in _resume_files(dest):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _object_size(status: int, headers) -> int:
+    """The WHOLE object's length as the server states it, 0 if it does not.
+
+    On a 206 or 416 that is content-range's total — content-length there
+    describes the slice, not the file — and on a 200 it is content-length."""
+    if status in (206, 416):
+        m = re.search(r"/\s*(\d+)\s*$", headers.get("content-range") or "")
+        return int(m.group(1)) if m else 0
+    try:
+        return int(headers.get("content-length") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sha256_of(path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+class _ShortBody(Exception):
+    """A body that ended cleanly but early — a transport drop by another name.
+    Raised so the retry loop resumes instead of installing a truncated file."""
+
+
+def _install_download(dest, have: int, size: int, sha256: str | None) -> None:
+    """Check a finished .part against what it should be, then move it in.
+
+    Size cannot be the only gate: the splice this guards against lands on the
+    exact expected length. sha256 is the check that proves identity, and it
+    runs at 4.0 GB/s here (SHA-NI), so an 11GB quant verifies in about three
+    seconds against a download measured in minutes — cheap enough to always do
+    when the registry carries a hash. It usually does not, which is why the
+    resume note above has to stand on its own."""
+    part, note = _resume_files(dest)
+    if size and have != size:
+        if have > size:
+            _discard_partial(dest)
+            raise HangarError(
+                f"{dest.name} came back {have:,} bytes where {size:,} were "
+                f"expected — those are not this file's bytes, so they were "
+                f"discarded rather than installed. Re-probe the model to "
+                f"refresh its file list, then press Download again.")
+        raise _ShortBody(f"body ended at {have:,} of {size:,} bytes")
+    if sha256:
+        got = _sha256_of(part)
+        if got.lower() != sha256.lower():
+            _discard_partial(dest)
+            raise HangarError(
+                f"{dest.name} failed its sha256 check (got {got[:12]}, "
+                f"expected {sha256[:12].lower()}) — discarded rather than "
+                f"installed. Press Download again to refetch it.")
+    os.replace(part, dest)
+    note.unlink(missing_ok=True)
+
+
+def _download_file(repo: str, file: str, dest, report, *,
+                   expect_bytes: int = 0, sha256: str | None = None) -> int:
     """Stream a HF file straight to `dest` with resume + live byte reporting.
 
     Direct httpx (not hf_hub_download) on purpose: we get the exact byte count
     for a real progress bar, resume works off a plain `.part` file, and it
-    never touches the xet backend that hangs on this box."""
+    never touches the xet backend that hangs on this box.
+
+    `expect_bytes`/`sha256` are the registry's record of what this file is
+    (GgufFile.bytes and .sha256). They are the fallback: what the server itself
+    declares wins, because a repo that re-uploads a file leaves the registry
+    stale and a stale number must not make a good file undownloadable."""
     import httpx
     if dest.exists():
         report(dest.stat().st_size)
         return dest.stat().st_size
     import time
     tok = os.environ.get("HF_TOKEN", "")
-    part = dest.with_name(dest.name + ".part")
+    part, _note = _resume_files(dest)
+    try:
+        # AUDIT F28: docs/audit-2026-09-04-full.md
+        # `repo_files` lists the tree recursively because many repos nest
+        # quants in subdirs, so `file` can be "Q4_K_M/model.gguf". Without
+        # this the open below raised FileNotFoundError INSIDE the retry loop,
+        # which spent 31 seconds "resuming" and then blamed the connection for
+        # a directory nobody had created. `rigma up` on the same model worked,
+        # because hf_hub_download makes the subdirectory.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # AUDIT F27: bytes that cannot prove they came from this (repo, file)
+        # are not a resume point.
+        if part.exists() and _part_owner(dest) != _part_ident(repo, file):
+            _discard_partial(dest)
+    except OSError as e:
+        raise HangarError(f"cannot write into {dest.parent}: {e}") from e
     url = f"https://huggingface.co/{repo}/resolve/main/{file}"
     # A multi-GB download WILL have the connection dropped ("peer closed
     # connection without sending complete message body"). Resume existed but
@@ -979,10 +1140,19 @@ def _download_file(repo: str, file: str, dest, report) -> int:
             with httpx.stream("GET", url, headers=headers,
                               follow_redirects=True,
                               timeout=httpx.Timeout(60.0, read=120.0)) as r:
-                if r.status_code == 416:   # range past EOF: partial is complete
-                    os.replace(part, dest)
-                    report(dest.stat().st_size)
-                    return dest.stat().st_size
+                size = _object_size(r.status_code, r.headers) or expect_bytes
+                if r.status_code == 416:
+                    # Range past EOF. Renaming the partial in as "complete" is
+                    # right only when it is exactly the object's length, which
+                    # the server states in content-range even on a 416. Any
+                    # other size means the .part outlived some other transfer,
+                    # so drop it and re-issue with no Range header at all.
+                    if size and have == size:
+                        _install_download(dest, have, size, sha256)
+                        report(have)
+                        return have
+                    _discard_partial(dest)
+                    continue
                 if r.status_code in (401, 403):
                     raise HangarError("that repo is gated — accept its license "
                                       "on huggingface.co and set HF_TOKEN")
@@ -992,17 +1162,26 @@ def _download_file(repo: str, file: str, dest, report) -> int:
                         f"Hugging Face returned HTTP {r.status_code}")
                 if not resumed:
                     have = 0               # server ignored Range — start over
+                if not (resumed and have):
+                    _claim_partial(dest, repo, file)     # a fresh .part is ours
                 with open(part, "ab" if resumed and have else "wb") as f:
                     report(have)
                     for chunk in r.iter_bytes(1 << 20):
                         f.write(chunk)
                         have += len(chunk)
                         report(have)
-            os.replace(part, dest)
+            _install_download(dest, have, size, sha256)
             report(have)
             return have
         except HangarError:
-            raise                          # gated/HTTP errors are terminal
+            raise                          # gated/HTTP/identity errors terminal
+        except OSError as e:
+            # AUDIT F28: not a transport drop. httpx wraps network failures in
+            # its own exception tree, so an OSError here came from the local
+            # file — and retrying one six times is what reported "download
+            # kept dropping (0 bytes saved)" for a directory that never
+            # existed, over 31 seconds, forever.
+            raise HangarError(f"could not write {part.name}: {e}") from e
         except Exception as e:             # transport drop: resume and retry
             last = str(e)[:200]
             if attempt == DOWNLOAD_ATTEMPTS - 1:

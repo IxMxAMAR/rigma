@@ -62,6 +62,7 @@
   "temperature": 0.7,
   "top_p": 0.8,
   "top_k": 20,
-  "dry_multiplier": 0.8
+  "dry_multiplier": 0.8,
+  "dry_allowed_length": 16
  }
 }

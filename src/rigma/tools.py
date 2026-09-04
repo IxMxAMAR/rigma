@@ -43,14 +43,24 @@ class Tool:
     handler: Callable[..., str]
     safe: bool = True         # safe -> auto-run; gated -> needs opt-in
     needs: str = ""           # optional capability the session must grant
+    # AUDIT F30: docs/audit-2026-09-04-full.md
+    # What the tool DOES, for profiles that reason about a category rather
+    # than a name. kind="exec" == it spawns a process. The 'confined' profile
+    # used to name run_shell/run_python in two separate tuples, so start_job —
+    # registered later, building the byte-identical PowerShell argv — ran
+    # under the profile whose whole promise is that nothing executes. Marking
+    # the property at the registration means a new execution tool is confined
+    # on the day it is added rather than when someone remembers both tuples.
+    kind: str = ""
 
 
 _REGISTRY: dict[str, Tool] = {}
 
 
-def tool(name, description, parameters, safe=True, needs=""):
+def tool(name, description, parameters, safe=True, needs="", kind=""):
     def wrap(fn):
-        _REGISTRY[name] = Tool(name, description, parameters, fn, safe, needs)
+        _REGISTRY[name] = Tool(name, description, parameters, fn, safe, needs,
+                               kind)
         return fn
     return wrap
 
@@ -131,7 +141,7 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
             continue
         if profile == "no-network" and t.name in _NETWORK_TOOLS:
             continue
-        if profile == "confined" and t.name in ("run_shell", "run_python"):
+        if profile == "confined" and t.kind == "exec":
             continue
         out.append({"type": "function", "function": {
             "name": t.name, "description": t.description,
@@ -542,7 +552,7 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
     prof = ctx.get("profile", "all")
     if prof == "no-network" and name in _NETWORK_TOOLS:
         return "error: network tools are disabled for this run (no-network)"
-    if prof == "confined" and name in ("run_shell", "run_python"):
+    if prof == "confined" and t.kind == "exec":
         return "error: code execution is disabled for this run (confined)"
     if t.needs == "code" and not ctx.get("allow_code"):
         return "error: code execution is not enabled for this chat"
@@ -1329,8 +1339,9 @@ def _grep(args, ctx):
 # is snapshotted so undo_last_change can restore it. The loud REPLACED warning
 # was post-hoc — it fired AFTER the draft was already destroyed (live
 # 2026-07-21: a 15,389-char chapter silently replaced by 8,766 chars, with no
-# recovery path). A safety net must never block the write: all failures here
-# are swallowed.
+# recovery path). A safety net must never block the write, so nothing here
+# raises — but it now REPORTS, because a caller that promises an undo which
+# was never written is worse than one that admits the net had a hole.
 
 def _undo_dir() -> Path:
     from .runtime import rigma_home
@@ -1347,21 +1358,106 @@ def _undo_index(d: Path) -> dict:
         return {}
 
 
-def _snapshot_before_write(p: Path) -> None:
+# AUDIT F9: docs/audit-2026-09-04-full.md
+def _atomic_bytes(target: Path, data: bytes) -> None:
+    """Write `data` into `target` through a temp file and os.replace.
+
+    Both slots here — the snapshot and index.json — are deterministic
+    filenames, so a plain write truncates the ONLY recoverable copy before the
+    new bytes land: a failure mid-write (a different volume, a backup or
+    antivirus handle) leaves a partial file the index still points at, and a
+    torn index.json reads back as {} through _undo_index, losing every
+    recorded change at once. os.replace is atomic on NTFS and POSIX alike, so
+    the slot holds the old content or the new one, never half of either."""
+    # pid AND thread id: undo_last_change writes the swap outside _FILE_LOCK,
+    # so two turns can be in here at once on the same slot
+    tmp = target.with_name(
+        f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _write_undo_index(d: Path, idx: dict) -> None:
+    _atomic_bytes(d / "index.json", json.dumps(idx, indent=1).encode("utf-8"))
+
+
+def _unlong(p: Path) -> Path:
+    r"""Drop the \\?\ prefix _long_path adds, so a containment test
+    compares like with like: \\?\C:\ws\a is not is_relative_to C:\ws."""
+    s = str(p)
+    if s.startswith("\\\\?\\UNC\\"):
+        return Path("\\\\" + s[8:])
+    if s.startswith("\\\\?\\"):
+        return Path(s[4:])
+    return p
+
+
+def _snapshot_before_write(p: Path) -> bool:
+    """Save p's current bytes so undo_last_change can restore them. True only
+    when both the snapshot and its index entry are on disk.
+
+    It used to return None and swallow everything while write_file and two
+    edit_file branches said "call undo_last_change to restore it"
+    unconditionally. A failure isolated to ~/.rigma left the index pointing at
+    an OLDER snapshot, so the undo restored bytes from two edits ago, called
+    it a success, and swapped the version the owner actually wanted into a
+    slot nothing referenced. The caller decides what to promise now."""
     try:
         if not p.is_file():
-            return
+            return False
         import hashlib
         d = _undo_dir()
         h = hashlib.sha1(str(p).encode("utf-8", "replace")).hexdigest()[:12]
         snap = d / f"{h}-{p.name}"
-        snap.write_bytes(p.read_bytes())
+        data = p.read_bytes()
+        _atomic_bytes(snap, data)
         idx = _undo_index(d)
-        idx[str(p)] = {"snap": snap.name, "ts": time.time()}
-        (d / "index.json").write_text(json.dumps(idx, indent=1),
-                                      encoding="utf-8")
+        # the byte length is what lets undo refuse a snapshot that changed
+        # underneath the index rather than write a truncated one over a file
+        # that is currently whole
+        idx[str(p)] = {"snap": snap.name, "ts": time.time(),
+                       "size": len(data)}
+        _write_undo_index(d, idx)
+        return True
     except Exception:
-        pass
+        return False
+
+
+# AUDIT F8: docs/audit-2026-09-04-full.md
+def _newest_undo_key(idx: dict, ctx) -> str | None:
+    """The most recent index entry that lives inside THIS chat's workspace.
+
+    One index at rigma_home()/undo covers every session, workspace and run, so
+    `max(idx, key=ts)` reached across projects: an undo asked for in a coding
+    session reverted whatever was last edited anywhere, a novel chapter
+    included. Containment uses the same is_relative_to test as _ws_path — a
+    string prefix would let /workspace2 match a /workspace root."""
+    ws = str(ctx.get("workspace") or "").strip()
+    if not ws:
+        return None
+    try:
+        root = _unlong(Path(ws).resolve())
+    except OSError:
+        return None
+    best, best_ts = None, None
+    for key, entry in idx.items():
+        try:
+            q = _unlong(Path(key))
+            if q != root and not q.is_relative_to(root):
+                continue
+        except (OSError, ValueError):
+            continue
+        ts = entry.get("ts", 0) if isinstance(entry, dict) else 0
+        if best_ts is None or ts > best_ts:
+            best, best_ts = key, ts
+    return best
 
 
 @tool("undo_last_change",
@@ -1386,7 +1482,17 @@ def _undo_last_change(args, ctx):
             return f"error: no recorded change for {raw}"
         key = str(p)
     else:
-        key = max(idx, key=lambda k: idx[k].get("ts", 0))
+        # AUDIT F8: docs/audit-2026-09-04-full.md
+        if not str(ctx.get("workspace") or "").strip():
+            return ("error: no workspace folder is set for this chat, so "
+                    "there is no way to tell which project the newest change "
+                    "belongs to — pass `path` to name the file to restore")
+        key = _newest_undo_key(idx, ctx)
+        if key is None:
+            return ("error: nothing to undo inside this workspace — every "
+                    "recorded change belongs to another folder (one undo "
+                    "index covers the whole install). Pass `path` if you "
+                    "meant a specific file")
         p = Path(key)
         entry = idx[key]
     snap = d / entry["snap"]
@@ -1395,14 +1501,42 @@ def _undo_last_change(args, ctx):
     try:
         current = p.read_bytes() if p.is_file() else None
         restored = snap.read_bytes()
+        # AUDIT F9: the slot is a deterministic filename in a shared folder,
+        # so a snapshot that no longer weighs what was recorded is a torn or
+        # foreign one. Restoring it would destroy a file that is currently
+        # whole — refuse instead, and leave the swap slot alone.
+        want = entry.get("size")
+        if isinstance(want, int) and len(restored) != want:
+            # Naming the slot matters. The index and the snapshot can disagree
+            # for an innocent reason — the snapshot landed and the index write
+            # that followed did not — and in that case the bytes sitting in the
+            # slot are exactly what the owner wants back. Refusing without
+            # saying where they are turns a recoverable state into one the tool
+            # has made unrecoverable, which is the opposite of this tool's job.
+            return (f"error: the saved version of {_unlong(p)} is "
+                    f"{len(restored)} bytes but {want} were recorded — it "
+                    "changed on disk, so restoring it automatically would risk "
+                    "losing more than it recovers. The saved bytes are intact "
+                    f"at {snap} if you want to inspect or copy them by hand.")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(restored)
         if current is not None:
-            snap.write_bytes(current)          # swap → undo is redoable
-            idx[key]["ts"] = time.time()
-            (d / "index.json").write_text(json.dumps(idx, indent=1),
-                                          encoding="utf-8")
-        return (f"restored {p.name} to the previous version "
+            _atomic_bytes(snap, current)       # swap → undo is redoable
+            # AUDIT F9: re-read the index INSIDE the lock before writing it.
+            # An atomic replace prevents a torn file, not a lost update: an
+            # entry that another turn's write_file recorded between this
+            # function's read at the top and this write would be silently
+            # dropped, and that file would become un-undoable.
+            with _FILE_LOCK:
+                live = _undo_index(d)
+                ent = live.get(key) or dict(entry)
+                ent["ts"] = time.time()
+                ent["size"] = len(current)
+                live[key] = ent
+                _write_undo_index(d, live)
+        # the full path, not p.name: one index spans every project, and a
+        # basename tells the owner nothing about which folder was touched
+        return (f"restored {_unlong(p)} to the previous version "
                 f"({len(restored)} bytes). Call undo_last_change again to "
                 "swap back if this was wrong.")
     except OSError as e:
@@ -1706,11 +1840,15 @@ def _edit_file_locked(args, ctx):
             return (f"error: line range {s}-{e} runs past the end — "
                     f"{args.get('path')} has {count} lines. Call read_file "
                     "with numbered=true to see the real numbers.")
-        _snapshot_before_write(p)
+        # AUDIT F9: only promise the undo the snapshot actually wrote
+        saved = _snapshot_before_write(p)
         lines[s - 1:e] = new.split("\n")
         _put("\n".join(lines))
         return (f"edited {args.get('path')} — replaced lines {s}-{e}. "
-                "undo_last_change reverts it.")
+                + ("undo_last_change reverts it."
+                   if saved else
+                   "WARNING: the previous version could not be saved to "
+                   "the undo folder, so this edit CANNOT be undone."))
 
     # a model that read with numbered=true pastes the numbers back into
     # `old`; strip them rather than failing on a mismatch it cannot see
@@ -1760,13 +1898,17 @@ def _edit_file_locked(args, ctx):
     # decisively similar AND unique — never a guess between candidates.
     span, ratio, region = _fuzzy_region(text, old)
     if span is not None:
-        _snapshot_before_write(p)
+        saved = _snapshot_before_write(p)      # AUDIT F9
         _put(text[:span[0]] + new + text[span[1]:])
         return (f"edited {args.get('path')} (note: your 'old' wording "
                 f"differed slightly from the file — matched the closest "
                 f"region at {int(ratio * 100)}% similarity and replaced the "
-                "FILE's actual text. undo_last_change reverts if this was "
-                "the wrong spot)")
+                "FILE's actual text. "
+                + ("undo_last_change reverts if this was the wrong spot)"
+                   if saved else
+                   "The previous version could not be saved to the undo "
+                   "folder, so this CANNOT be reverted — read the file "
+                   "back and check the spot)"))
     return ("error: the 'old' string wasn't found EXACTLY — check for "
             "mismatched indentation/whitespace or stray markdown backticks."
             + (_region_lines(text, region, ratio) if region else
@@ -2125,18 +2267,25 @@ def _write_file_locked(args, ctx):
             f.write(content)
         return (f"appended {len(content)} chars to {args.get('path')} "
                 f"(file is now {old_len + len(content)} chars)")
+    saved = False
     if existed:
-        _snapshot_before_write(p)      # replaced content is recoverable now
+        saved = _snapshot_before_write(p)   # replaced content recoverable?
     p.write_text(content, encoding="utf-8")
     if existed:
         # Loud on purpose. Live 2026-07-21: the model wrote a 15,389-char
         # chapter, then a second call silently replaced it with 8,766 chars —
         # "wrote 8766 chars" gave it no way to notice it had just destroyed
         # its own draft. The replaced size is the signal.
+        # AUDIT F9: the recovery half of it is only true when the snapshot
+        # landed. Naming undo_last_change after a failed snapshot sends the
+        # model to restore a version from two edits ago and call it a success.
+        recovery = ("If that was a mistake, call undo_last_change to restore "
+                    "it. " if saved else
+                    "The previous version could NOT be saved to the undo "
+                    "folder, so it is GONE — there is nothing to restore. ")
         return (f"wrote {len(content)} chars to {args.get('path')} — REPLACED "
-                f"the previous {old_len}-char version. If that was a mistake, "
-                "call undo_last_change to restore it; if you meant to "
-                "continue the file, use append=true next time.")
+                f"the previous {old_len}-char version. {recovery}If you meant "
+                "to continue the file, use append=true next time.")
     twin = _near_duplicate(p) if not existed else ""
     note = (f" — NOTE: {twin} already exists here and the two names "
             "differ by very little. If you meant that file, use it; "
@@ -2524,7 +2673,7 @@ def heal_python_escapes(code: str) -> tuple[str, int]:
       {"type": "object", "properties": {
           "code": {"type": "string", "description": "the Python source to run"}},
        "required": ["code"]},
-      safe=False, needs="code")
+      safe=False, needs="code", kind="exec")
 def _run_python(args, ctx):
     code = str(args.get("code", ""))
     code, healed = heal_python_escapes(code)
@@ -2561,7 +2710,7 @@ def _run_python(args, ctx):
           "timeout": {"type": "integer", "description":
                       "seconds to wait before killing it (1-300, default 30)"}},
        "required": ["command"]},
-      safe=False, needs="code")
+      safe=False, needs="code", kind="exec")
 def _run_shell(args, ctx):
     cmd = str(args.get("command", ""))
     try:
@@ -2618,7 +2767,7 @@ def _job_pump(job: dict, stream, label: str) -> None:
       "rules as run_shell.",
       {"type": "object", "properties": {
           "command": {"type": "string"}}, "required": ["command"]},
-      safe=False, needs="code")
+      safe=False, needs="code", kind="exec")
 def _start_job(args, ctx):
     cmd = str(args.get("command", ""))
     if not cmd.strip():
@@ -2701,6 +2850,36 @@ def _kill_job(args, ctx):
         return f"job {jid} already exited ({job['proc'].poll()})"
     _kill_tree(job["proc"].pid)
     return f"job {jid} killed"
+
+
+# AUDIT F31: docs/audit-2026-09-04-full.md
+def kill_all_jobs() -> int:
+    """Kill every still-running background job's process tree. Returns how
+    many were killed.
+
+    _launch_killable detaches children on purpose (CREATE_NEW_PROCESS_GROUP /
+    start_new_session) so a timeout can take the whole tree — which also means
+    nothing reaps them when the run that started them ends. _JOBS is a
+    module-level in-process dict, so after a restart the integer ids are gone
+    and kill_job answers "no such job" for every one of them while the orphan
+    still holds the GPU the next run needs. This is the one entry point that
+    walks the dict; stop_run, the run loop's finalize path and the process
+    shutdown hook are its callers.
+
+    Entries are LEFT in place: job_output must still be able to report the
+    exit code of a job that was killed mid-run. Never raises — it runs on
+    shutdown paths where an exception would strand the rest of the teardown."""
+    killed = 0
+    for job in list(_JOBS.values()):
+        try:
+            proc = job.get("proc")
+            if proc is None or proc.poll() is not None:
+                continue
+            _kill_tree(proc.pid)
+            killed += 1
+        except Exception:
+            pass
+    return killed
 
 
 # destructive system commands refused even when code-exec is allowed — these

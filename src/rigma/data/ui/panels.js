@@ -14,7 +14,11 @@ const PARAM_DEFS = [
 const PARAM_DEFS_ADV = [
   ["dry_multiplier", 0, 2, 0.05],
   ["dry_base", 1, 4, 0.05],
-  ["dry_allowed_length", 1, 10, 1],
+  // AUDIT F3: docs/audit-2026-09-04-full.md — a 10 here could not express
+  // the 16 the model cards and hangar ship (a filename is 8-12 tokens and
+  // DRY must not punish re-typing one), so the slider clamped the setting
+  // the server had just widened to accept.
+  ["dry_allowed_length", 1, 64, 1],
   ["xtc_probability", 0, 1, 0.05],
   ["xtc_threshold", 0, 0.5, 0.01],
   ["top_n_sigma", -1, 5, 0.1],

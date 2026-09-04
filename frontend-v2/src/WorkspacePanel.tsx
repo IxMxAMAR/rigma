@@ -3,7 +3,7 @@
 // Refreshes when the chat changes and when a streaming turn finishes (that
 // is when files appear).
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useChat } from "./chat/chatStore";
+import { selectStreaming, useChat } from "./chat/chatStore";
 import { Edit as EditIcon, External, Refresh } from "./Icon";
 import { useApp } from "./store";
 
@@ -20,7 +20,7 @@ const kb = (n: number) =>
 
 export default function WorkspacePanel() {
   const currentId = useChat((s) => s.currentId);
-  const streaming = useChat((s) => s.streaming);
+  const streaming = useChat(selectStreaming);
   const [data, setData] = useState<{ path: string; entries: Entry[];
                                      missing?: boolean } | null>(null);
   const wasStreaming = useRef(false);

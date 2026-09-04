@@ -135,9 +135,12 @@ def test_compaction_keeps_enough_actions():
     assert serve.AUTO_COMPACT_KEEP >= 16
 
 
-def test_archive_is_bounded(home, upstream):
+def test_a_runs_archive_is_bounded(home, upstream):
     # a run compacts often and re-serialises the whole session each save, so an
-    # unbounded archive is real write amplification over a long run
+    # unbounded archive is real write amplification over a long run. The cap is
+    # a RUN concern and now applies only there — a chat's archive is the user's
+    # manuscript (see test_a_chats_archive_is_never_trimmed in
+    # test_audit_serve.py) and what the cap drops is spilled to disk first.
     from rigma import serve as _s
     assert _s.ARCHIVE_MAX <= 1000
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
@@ -145,6 +148,7 @@ def test_archive_is_bounded(home, upstream):
     client = TestClient(build_app(upstream_port=upstream))
     sid = _seed(client, n=24)
     s = sessions.load(sid)
+    s["run_id"] = "run-archive"
     s["archive"] = [{"role": "user", "content": f"old{i}"}
                     for i in range(_s.ARCHIVE_MAX + 50)]
     sessions.save(s)

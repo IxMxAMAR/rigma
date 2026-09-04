@@ -12,7 +12,7 @@ import {
 import { engineApi, type ServerInfo } from "../lib/engineApi";
 import { useApp } from "../store";
 import MethodBuilder from "./MethodBuilder";
-import { useChat } from "./chatStore";
+import { selectAnyStreaming, useChat } from "./chatStore";
 
 const CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 262144];
 const KV_TYPES = ["f16", "q8_0", "q5_1", "q4_0"];
@@ -29,7 +29,9 @@ function EngineCard() {
   const [srv, setSrv] = useState<ServerInfo | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const streaming = useChat((s) => s.streaming);
+  // AUDIT F1: docs/audit-2026-09-04-full.md — one engine serves every chat,
+  // so a relaunch has to wait for ANY reply in flight, not just this pane's.
+  const anyStreaming = useChat(selectAnyStreaming);
   // Staged, not applied. Every control used to relaunch the engine the instant
   // it changed, so reaching a config that differs in context AND cache cost two
   // full reloads of a 13GB model to get to one setup (owner, 2026-08-19). The
@@ -48,7 +50,7 @@ function EngineCard() {
   const apply = async (what: string, o: {
     ctx?: number; kv?: string; vision?: boolean; backend?: string;
   }) => {
-    if (streaming) {
+    if (anyStreaming) {
       setErr("a reply is still generating — stop it first, or wait: "
              + "relaunching now would cut it off mid-sentence.");
       return;
@@ -281,13 +283,28 @@ function GroundingCard() {
       const r = await fetch("/api/rag/status");
       setStatus((await r.json()) as RagStatus);
     } catch {
-      setStatus(null);
+      // AUDIT F48: keep the last known status rather than clearing it. Setting
+      // null makes `status?.indexing` undefined, which tears down the 2 s poll
+      // below — so one dropped fetch during an ingest permanently froze the
+      // card on "indexing…", which is the exact failure the poll was added to
+      // fix. A transient fetch failure is not evidence the ingest ended.
+      setStatus((prev) => prev);
     }
   }, []);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // AUDIT F48: docs/audit-2026-09-04-full.md — the card used to read the
+  // status exactly twice (mount, and after the POST), so an ingest that
+  // finished — or failed — after that left "indexing…" on screen for as long
+  // as the panel stayed open. Same 2 s beat the v1 UI used.
+  useEffect(() => {
+    if (!status?.indexing) return;
+    const t = window.setInterval(() => void refresh(), 2000);
+    return () => window.clearInterval(t);
+  }, [status?.indexing, refresh]);
 
   useEffect(() => {
     if (!currentId) return;

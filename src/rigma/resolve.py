@@ -31,11 +31,69 @@ class ResolveError(RuntimeError):
     pass
 
 
-def _apply_calibration(plan: RunPlan) -> RunPlan:
-    from .bench import load_calibration
+def _engine_now() -> str:
+    """The llama.cpp build this plan will launch on, or "" if unknowable."""
+    try:
+        from .server_ops import engine_version
+        return engine_version()
+    except Exception:
+        return ""
+
+
+def _desktop_vram_mb(profile: HardwareProfile | None) -> float | None:
+    """What everything OTHER than the model we are about to load is holding.
+
+    The profile's reading is preferred over a fresh counter read for two
+    reasons: it is the same number `_budgets` planned against, so the plan and
+    the staleness test describe one machine; and `server_ops._free_current`
+    has already credited the OUTGOING engine back into it, where the raw
+    adapter counter would count our own 12GB model as desktop pressure and
+    call every calibration stale mid-switch.
+    """
+    # AUDIT F17: docs/audit-2026-09-04-full.md — apply the same sanity clamp
+    # `_budgets` uses. A reading at or above the card's own capacity is a broken
+    # counter, not a busy desktop (Windows once reported 359,777MB on a 16GB
+    # card). Unclamped, one bogus read is an enormous apparent drift that
+    # silently retires every calibration on the machine, with the reason buried
+    # in plan.explain. Returning None means "unknown", which skips the check.
+    def _sane(mb: float | None) -> float | None:
+        if mb is None:
+            return None
+        total = sum(g.vram_mb for g in (profile.gpus or [])) if profile else 0
+        return None if total and mb >= total else mb
+
+    if profile is not None and profile.vram_used_mb is not None:
+        return _sane(profile.vram_used_mb)
+    try:
+        from .probe import gpu_used_mb
+        return _sane(gpu_used_mb())
+    except Exception:
+        return None
+
+
+def _apply_calibration(plan: RunPlan,
+                       profile: HardwareProfile | None = None) -> RunPlan:
+    from .bench import calibration_stale, load_calibration
     key = f"{plan.model_slug}:{plan.gguf.quant}:{plan.backend}"
     entry = load_calibration().get(key)
     if entry and entry.get("flags"):
+        # AUDIT F17: docs/audit-2026-09-04-full.md
+        # The key is model:quant:backend and nothing else, so a stored
+        # placement was replayed onto a machine in a different state. The
+        # reachable flags are the ones that decide whether the weights fit at
+        # all — n_cpu_moe, cache_type_k/v (q8_0 crowned over q4_0 nearly
+        # doubles the KV cache) and spec_type (~565MB of draft cache at 32K).
+        # Measured 2026-08-21: 2,828MB of desktop drift took the same combo
+        # from 37.59 to 9.95 tok/s. The entry already records the engine, the
+        # ctx and the VRAM held when it was measured, and calibration_stale
+        # already reads all three — this simply was not asking, while
+        # server_ops._measured_placement gated the very same keys on an exact
+        # ctx match. Two policies for one set of flags; this is the strict one.
+        reason = calibration_stale(entry, _desktop_vram_mb(profile),
+                                   _engine_now(), plan.flags.ctx)
+        if reason:
+            plan.explain.append(f"calibration override skipped: {reason}")
+            return plan
         plan.flags = plan.flags.model_copy(update=entry["flags"])
         plan.origin += "+calibrated"
         plan.explain.append(f"calibration override applied: {entry['flags']} "
@@ -43,9 +101,60 @@ def _apply_calibration(plan: RunPlan) -> RunPlan:
     return plan
 
 
+# AUDIT F21: docs/audit-2026-09-04-full.md
+def _ctx_floor(spec: ModelSpec) -> int:
+    """The smallest context worth trying for THIS model.
+
+    CTX_FLOOR was a global 8192, so a model trained on 4096 (a Llama-2
+    derivative) or 2048 (Phi-2, TinyLlama, or any gguf whose header omits
+    context_length) never entered the fit loop at all: `_calculate` starts at
+    min(CTX_DEFAULT, native_ctx) and the `while ctx >= CTX_FLOOR` body never
+    ran, so fit_gguf was never called and the plan fell through to the absolute
+    floor — CPU, ngl=0 — on a card the model fits in four times over, while
+    quant_verdicts (which probes 8192/4096/2048) told the Models page the same
+    model runs on the GPU. A model cannot be asked for more context than it
+    has, so its own window is the floor.
+    """
+    return min(CTX_FLOOR, spec.native_ctx) if spec.native_ctx > 0 else CTX_FLOOR
+
+
 def kv_bytes_per_token(spec: ModelSpec, k: str, v: str) -> float:
     per_side = spec.full_attn_layers * spec.kv_heads * spec.head_dim
     return per_side * CACHE_BYTES[k] + per_side * CACHE_BYTES[v]
+
+
+# Sliding-window models (Gemma 2/3/4, …) run TWO KV caches: the global layers
+# keep one that grows with ctx, and the windowed layers keep a second one
+# bounded by the window. gguf_meta identifies the windowed layers in order to
+# keep them OUT of the growing cache — correct, and it left their second cache
+# budgeted at exactly zero. For a 27B-class SWA model (52 windowed layers, 16
+# kv heads, 128 wide, 1K window) that is 416 MiB of f16 the planner does not
+# know exists: a fixed term, proportionally worst at small contexts, and the
+# only approximation in this file that errs toward overcommitting the card
+# rather than refusing a plan. It replaced a previous 6x OVERestimate with a
+# zero, so the direction of the error flipped without anyone choosing that.
+def swa_kv_bytes(spec: ModelSpec, k: str, v: str, ctx: int) -> float:
+    """Bytes of the second, window-sized KV cache. Zero unless the spec carries
+    a sliding window.
+
+    Read with getattr because the three fields (`swa_layers`, `swa_kv_heads`,
+    `swa_window`) are what gguf_meta now reports in spec_fields and belong on
+    ModelSpec next to full_attention_interval; a spec without them is charged
+    nothing, which is exactly the behaviour before this term existed. Positive
+    evidence only: a hybrid's SSM or linear-attention layers (Qwen3.5/3.8,
+    DeltaNet) hold a fixed state rather than a windowed cache, and they carry
+    no window size, so they are never charged for one.
+    """
+    n = int(getattr(spec, "swa_layers", 0) or 0)
+    heads = int(getattr(spec, "swa_kv_heads", 0) or 0)
+    window = int(getattr(spec, "swa_window", 0) or 0)
+    if n <= 0 or heads <= 0 or window <= 0 or spec.head_dim <= 0:
+        return 0.0
+    per_side = n * heads * spec.head_dim
+    # llama.cpp sizes this cache by the window, not by ctx; a context shorter
+    # than the window cannot fill it.
+    return min(ctx, window) * (per_side * CACHE_BYTES[k]
+                               + per_side * CACHE_BYTES[v])
 
 
 # Speculative decoding's draft head needs its own KV cache and compute buffers.
@@ -222,8 +331,12 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     # vision projector loads alongside the weights and can't be offloaded;
     # it counts against VRAM but not the MoE expert math below
     mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
-    kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20
+    # AUDIT F19: docs/audit-2026-09-04-full.md — the windowed layers' own cache
+    # is resident too, and until now was budgeted as zero.
+    swa_mb = swa_kv_bytes(spec, k, v, ctx) / 2**20
+    kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20 + swa_mb
     explain.append(f"{gguf.quant}@ctx{ctx} kv={k}: file={file_mb:.0f}MB kv={kv_mb:.0f}MB "
+                   + (f"(incl. {swa_mb:.0f}MB windowed) " if swa_mb else "")
                    + (f"mmproj={mm_mb:.0f}MB " if mm_mb else "")
                    + f"vs vram={usable_vram:.0f}MB ram={usable_ram:.0f}MB")
     if spec.moe is None:
@@ -363,9 +476,16 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
     usable_vram, _ = _budgets(profile)
     mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
     out = []
+    # AUDIT F21: docs/audit-2026-09-04-full.md — the probe ladder is capped by
+    # the model's own window. It used to report a 2048-token model as fitting
+    # "at 8192", a window it was never trained on, while the resolver refused
+    # the same model outright: the two screens disagreed about one model
+    # because only one of them had a floor.
+    ladder = ([c for c in (8192, 4096, 2048) if c <= spec.native_ctx]
+              or [spec.native_ctx or 2048])
     for g in spec.ggufs:
         flags = None
-        for ctx in (8192, 4096, 2048):
+        for ctx in ladder:
             flags = fit_gguf(spec, g, profile, ctx, [])
             if flags:
                 flags = _grow_ctx(spec, g, profile, flags, [],
@@ -374,7 +494,7 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
                 break
         if flags is None:
             out.append({"ok": False, "speed": "no", "offload_pct": 100,
-                        "budget": _budget_rows(spec, g, mm_mb, 8192,
+                        "budget": _budget_rows(spec, g, mm_mb, ladder[0],
                                                usable_vram)})
             continue
         # The spill fraction comes from the PLAN the resolver actually made —
@@ -443,7 +563,8 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
     behind it, so a 46MB near-miss reads as a near-miss."""
     k = k or spec.cache_type_policy.k
     v = v or spec.cache_type_policy.v
-    kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20
+    kv_mb = (ctx * kv_bytes_per_token(spec, k, v)
+             + swa_kv_bytes(spec, k, v, ctx)) / 2**20
     file_mb = gguf.bytes / 2**20
     return {"file_mb": round(file_mb), "mmproj_mb": round(mm_mb),
             "kv_mb": round(kv_mb), "budget_mb": round(usable_vram),
@@ -505,7 +626,8 @@ def _calculate(profile: HardwareProfile, registry: Registry,
                            f"{', '.join(g.quant for g in local)}")
         for gguf in ordered:  # on-disk first, then registry order
             ctx = min(CTX_DEFAULT.get(use_case, 16384), spec.native_ctx)
-            while ctx >= CTX_FLOOR:
+            floor = _ctx_floor(spec)
+            while ctx >= floor:
                 flags = fit_gguf(spec, gguf, profile, ctx, explain)
                 if flags:
                     flags = _grow_ctx(spec, gguf, profile, flags, explain)
@@ -525,16 +647,17 @@ def fallback_plans(plan: RunPlan, registry: Registry,
         smaller = [g for g in spec.ggufs if g.bytes < plan.gguf.bytes]
         for gguf in smaller:  # registry order: largest first
             explain = [f"fallback: {plan.gguf.quant} failed to launch"]
-            ctx = plan.flags.ctx
+            ctx = min(plan.flags.ctx, spec.native_ctx or plan.flags.ctx)
             flags = None
-            while ctx >= CTX_FLOOR and flags is None:
+            floor = _ctx_floor(spec)
+            while ctx >= floor and flags is None:
                 flags = fit_gguf(spec, gguf, profile, ctx, explain)
                 if flags is None:
                     ctx //= 2
             if flags is not None:
                 out.append(_apply_calibration(RunPlan(
                     model_slug=spec.slug, gguf=gguf, backend=plan.backend,
-                    flags=flags, origin="fallback", explain=explain)))
+                    flags=flags, origin="fallback", explain=explain), profile))
     have_ggufs = [m for m in registry.models.values() if m.ggufs]
     if have_ggufs:
         floor_spec = min(have_ggufs, key=lambda m: m.ggufs[-1].bytes)
@@ -542,7 +665,8 @@ def fallback_plans(plan: RunPlan, registry: Registry,
                                                              plan.gguf.quant):
             out.append(RunPlan(
                 model_slug=floor_spec.slug, gguf=floor_spec.ggufs[-1],
-                backend="cpu", flags=ComboFlags(ctx=CTX_FLOOR, ngl=0),
+                backend="cpu",
+                flags=ComboFlags(ctx=_ctx_floor(floor_spec), ngl=0),
                 origin="fallback:floor",
                 explain=["fallback floor: smallest model on CPU"]))
     return out
@@ -568,7 +692,7 @@ def resolve(profile: HardwareProfile, registry: Registry,
             return _apply_calibration(RunPlan(
                 model_slug=combo.model, gguf=gguf, backend=combo.backend,
                 flags=combo.flags, origin=f"{kind}:{rel}",
-                explain=[f"registry match: {rel}"] + combo.sources))
+                explain=[f"registry match: {rel}"] + combo.sources), profile)
     if model_override:
         if model_override not in registry.models:
             raise ResolveError(
@@ -579,7 +703,7 @@ def resolve(profile: HardwareProfile, registry: Registry,
                             registry.combos)
     plan = _calculate(profile, registry, use_case, backend_override)
     if plan:
-        return _apply_calibration(plan)
+        return _apply_calibration(plan, profile)
     # absolute floor: smallest model, smallest quant, CPU
     have_ggufs = [m for m in registry.models.values() if m.ggufs]
     if not have_ggufs:
@@ -587,5 +711,5 @@ def resolve(profile: HardwareProfile, registry: Registry,
     spec = min(have_ggufs, key=lambda m: m.ggufs[-1].bytes)
     return _apply_calibration(RunPlan(
         model_slug=spec.slug, gguf=spec.ggufs[-1], backend="cpu",
-        flags=ComboFlags(ctx=CTX_FLOOR, ngl=0), origin="calculator",
-        explain=["floor: nothing larger fits"]))
+        flags=ComboFlags(ctx=_ctx_floor(spec), ngl=0), origin="calculator",
+        explain=["floor: nothing larger fits"]), profile)

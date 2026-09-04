@@ -6,6 +6,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import time
 import subprocess
 import threading
@@ -31,6 +32,96 @@ _log = logging.getLogger(__name__)
 _FALLBACK_HTML = "<!doctype html><html><body><h1>Rigma</h1></body></html>"
 _HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}
 _NO_STORE = {"Cache-Control": "no-store"}
+
+# --- who is allowed to talk to this server (AUDIT F39) -----------------------
+# docs/audit-2026-09-04-full.md. rigma binds 127.0.0.1 and has no auth — a
+# documented decision, made when the surface was a chat proxy. It is now ~79
+# routes including arbitrary command execution, and the undocumented half was
+# that nothing checked Host or Origin. Two things follow from that:
+#
+#   * Any page the owner visits could drive every POST that takes no request
+#     body — unload, load, recalibrate (a multi-minute GPU sweep), workspace
+#     open (os.startfile), the run pause/stop/restart routes — because a
+#     cross-origin simple POST needs no preflight. It DOES carry an `Origin`
+#     header, which is what the check below uses.
+#   * DNS rebinding (the port is a fixed 11500) turns the whole surface,
+#     GET included, into same-origin traffic from the attacker's page. Only the
+#     Host header distinguishes that from the real UI.
+#
+# The app's own UI is unaffected: a same-origin GET sends no Origin, and a
+# same-origin POST sends one whose authority is exactly the Host it was sent
+# to. Deliberately NOT a token scheme — the goal is to stop a remote page, not
+# to authenticate the single local user.
+
+
+def _split_host(host: str) -> str:
+    """Hostname out of a Host header, lowercased, port and brackets removed."""
+    h = (host or "").strip().lower()
+    if h.startswith("["):                        # [::1]:11500
+        return h[1:].split("]", 1)[0]
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _is_local_host(host: str) -> bool:
+    """Could this Host header have been typed at a browser pointed here?
+
+    Loopback literals and `localhost` are the real UI. A single-label name
+    (`testserver`, a container alias) is allowed because DNS rebinding needs a
+    name the attacker can publish, and a publishable name is dotted; a dotted
+    name or a non-loopback IP is exactly the rebinding case and is refused.
+    """
+    h = _split_host(host)
+    if not h:
+        return False                             # no Host: not a browser
+    if h in ("localhost", "::1", "0:0:0:0:0:0:0:1") or h.endswith(".localhost"):
+        return True
+    if h.startswith("127."):
+        return True
+    return "." not in h and ":" not in h
+
+
+def guard_request(host: str, origin: str) -> str:
+    """Empty when the request may proceed; otherwise why it may not."""
+    if not _is_local_host(host):
+        return ("this server only answers to a loopback address; refusing a "
+                "request addressed to " + (_split_host(host) or "no host"))
+    o = (origin or "").strip()
+    if not o:
+        return ""                                # same-origin GET, or a CLI
+    if "://" not in o:
+        return "refusing a request with an opaque Origin"
+    netloc = o.split("://", 1)[1].split("/", 1)[0].lower()
+    if netloc != (host or "").strip().lower():
+        return (f"refusing a cross-origin request from {o} — this server "
+                "answers only its own page")
+    return ""
+
+
+class LocalOriginGuard:
+    """Pure-ASGI so it cannot interfere with the SSE streams (AUDIT F39)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        head = {k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope.get("headers") or []}
+        why = guard_request(head.get("host", ""), head.get("origin", ""))
+        if why:
+            _log.warning("refused %s %s: %s", scope.get("method"),
+                         scope.get("path"), why)
+            return await JSONResponse({"error": why},
+                                      status_code=403)(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
+# A drag-dropped model is streamed straight to disk, so the only thing that
+# bounds it is what the sender declares. 512 GiB is far above any GGUF that
+# ships today and far below "fill the volume by accident" (AUDIT F39).
+UPLOAD_MAX_BYTES = 512 * 2**30
+UPLOAD_FREE_MARGIN_BYTES = 2 * 2**30
 
 
 def _sse(data: dict, event: str = "") -> bytes:
@@ -90,6 +181,20 @@ _SPILL_EXEMPT = {"read_file"}   # the recovery tool must never spill itself
 RESULT_MAX = 8000       # persisted tool-result cap. In one-action mode this
                         # is the ONLY copy the model sees, so a tight cap
                         # silently turns read_file into 'read the first N bytes'
+# How often a turn in flight writes what it has generated so far into the
+# session as a `partial` message. 20s is a compromise measured against the
+# cost: one save re-serialises the row (~1ms after the F16 digest guard), and
+# a refresh at the worst possible moment costs at most 20s of prose instead of
+# the whole eight-minute reply.
+# AUDIT F7: docs/audit-2026-09-04-full.md
+CHECKPOINT_SECS = 20.0
+
+# SSE events that mean "the engine is about to do a long silent piece of work"
+# — the headless watchdog grants the generous PREFILL budget after one of
+# these instead of the tight inter-token budget.
+# AUDIT F12: docs/audit-2026-09-04-full.md
+PREFILL_EVENTS = (b"event: tool", b"event: housekeeping")
+
 ARCHIVE_MAX = 400       # keep the archive tail bounded; the digest
                         # carries meaning, the archive is convenience
 RUN_CTX_BUDGET = 32768   # autonomous runs keep durable state on DISK, so they
@@ -200,6 +305,7 @@ PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big co
                         # / slow GPU can take minutes. Nothing waits this long unless
                         # the engine is genuinely dead; a normal turn starts instantly
 TICK_SECS = 5.0         # how often a waiting turn reports "still working" to the UI
+KEEPALIVE_POLL_SECS = 30.0   # how often idle auto-unload looks at the clock
 LIVE_MAX = 80           # rolling live-activity entries kept on a run for the UI
 LIVE_TEXT_MAX = 1200    # per streamed-text entry; the tail is kept and marked
 LIVE_RESULT_MAX = 900   # per tool-result entry in the feed (display only)
@@ -445,6 +551,70 @@ def compact_budget(session: dict, engine_ctx: int) -> int:
     return engine_ctx
 
 
+def _spill_archive(sid: str, dropped: list) -> bool:
+    """Append messages about to fall off the archive tail to an append-only
+    jsonl. True when they are safely on disk.
+
+    AUDIT F5: docs/audit-2026-09-04-full.md — the cap used to trim the front of
+    the archive in the same statement that removed those messages from the live
+    list, so a long session's earliest chapters stopped existing anywhere but a
+    few hundred words of model-written summary. The cap itself is a write
+    amplification guard for RUNS (a run compacts every few turns and
+    re-serialises the whole row each time), so runs keep it — but the raw
+    messages go to disk first. Appending is O(1) per message; nothing in the
+    app reads this file back, it exists so nothing is unrecoverable.
+    """
+    if not dropped:
+        return True
+    try:
+        # reuse sessions' own id guard rather than keeping a second copy of it:
+        # a hostile id must not be able to name this file either
+        chats = sessions._path(sid).parent
+        d = chats.parent / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / f"{sid}.jsonl", "a", encoding="utf-8") as f:
+            for m in dropped:
+                f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        _log.exception("archive spill failed for session %s", sid)
+        return False
+
+
+# Fields on a run that belong to whoever is watching it, not to the loop: the
+# steer box, the pause button, and the question ask_user parked there.
+_RUN_EXTERNAL_FIELDS = ("paused", "pending_question")
+
+
+def _save_run_merged(run: dict) -> None:
+    """Save a run, keeping whatever landed on it while the loop was awaiting.
+
+    AUDIT F15: docs/audit-2026-09-04-full.md — the loop loads the run at the
+    top of an iteration, awaits a multi-second engine call, then writes that
+    pre-await dict back wholesale. `inject_run` runs on the same event loop
+    during that await: it loads fresh, appends to `steer_queue`, saves, and
+    tells the user "queued". The loop then overwrote it, so guidance was
+    confirmed and then discarded. Re-read and merge the externally owned
+    fields; the queue merges by keeping what the store has and re-appending
+    only entries this loop added (the loop never removes an entry without
+    saving that removal immediately, so anything of ours the store has not
+    seen is genuinely new).
+    """
+    from . import runs as _runs
+    try:
+        cur = _runs.load(run.get("id", "")) or {}
+    except Exception:
+        cur = {}
+    if cur:
+        stored_q = list(cur.get("steer_queue") or [])
+        mine = list(run.get("steer_queue") or [])
+        run["steer_queue"] = stored_q + [x for x in mine if x not in stored_q]
+        for k in _RUN_EXTERNAL_FIELDS:
+            if k in cur:
+                run[k] = cur[k]
+    _runs.save(run)
+
+
 async def _upstream_error(resp) -> str:
     body = await resp.aread()
     try:
@@ -478,6 +648,12 @@ def _ui_file(name: str) -> str:
 # from a read-only path like a status endpoint.
 def _last_trace(session):
     for m in reversed((session or {}).get("messages", [])):
+        # AUDIT F7: a `partial` is a turn that was cut off, and the run loop
+        # has already taken its own branch for that turn (frozen -> retry). It
+        # must not be read back as the NEXT turn's actions, or a cancelled
+        # turn's tools would be logged and scored twice.
+        if m.get("partial"):
+            continue
         if m.get("role") == "assistant":
             return m.get("tool_trace", []) or []
     return []
@@ -711,10 +887,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 await _stop_run_tasks()
             except Exception:
                 _log.exception("shutdown: run-task teardown failed")
+            # AUDIT F31: the shutdown hooks cancelled run loops and stopped MCP
+            # servers but never touched the children start_job detached, so
+            # every restart could leave one holding the GPU the next run needs.
+            try:
+                from . import tools as _tk
+                _tk.kill_all_jobs()
+            except Exception:
+                _log.exception("shutdown: background-job teardown failed")
             _stop_mcp()
 
     app = FastAPI(title="rigma", docs_url=None, redoc_url=None,
                   lifespan=_lifespan)
+    app.add_middleware(LocalOriginGuard)   # AUDIT F39: see LocalOriginGuard
     base = f"http://127.0.0.1:{upstream_port}"
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
     ingest_state = {"busy": False, "error": ""}
@@ -1024,11 +1209,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         them to `s["archive"]` (never destroyed), save. Returns (session,
         archived_count), or None if there was nothing to compact. Raises on a
         summarizer failure. Shared by the manual endpoint and auto-compact."""
-        msgs = s.get("messages", [])
+        msgs = list(s.get("messages", []))
+        snapshot_n = len(msgs)
         old = msgs[:-keep] if keep else list(msgs)
         recent = msgs[-keep:] if keep else []
         if not old:
             return None
+        activity["last"] = _now()   # AUDIT F14: a fold is the engine working
         def _render(m: dict) -> str:
             content = m.get("content", "")
             if not isinstance(content, str):   # vision parts: keep the text
@@ -1072,14 +1259,43 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # Nothing above touched `s`. A failure part-way through a fold leaves the
         # session exactly as it was — the archive is the user's manuscript and a
         # half-applied compaction is worse than none.
-        s["digest"] = digest
-        # bounded: a run compacts often (small ctx budget) and re-serialises the
-        # whole session on every save, so an unbounded archive is real write
-        # amplification over a 20h run. The digest carries the meaning; the
-        # archive is a convenience tail.
-        s["archive"] = (s.get("archive", []) + old)[-ARCHIVE_MAX:]
-        s["messages"] = recent
-        sessions.save(s)
+        #
+        # AUDIT F4: docs/audit-2026-09-04-full.md — and nothing above may be
+        # written back from the pre-await snapshot either. A fold takes minutes
+        # (one engine call per chunk, each budgeted 120-3600s) and `save` is a
+        # whole-row replace, so a prompt sent and answered while it ran used to
+        # be erased: not in messages, not in archive, not in the digest. Reload
+        # here and keep whatever the session gained.
+        fresh = sessions.load(s["id"])
+        if fresh is None:
+            return None          # deleted while folding: never resurrect it
+        stored = list(fresh.get("messages", []))
+        if len(stored) < snapshot_n:
+            # the stored list no longer contains the prefix we summarised, so
+            # `recent` is not the tail of anything we can reason about — a
+            # second compaction landed. Ours is stale; discard it whole rather
+            # than reshuffle someone else's fold.
+            raise RuntimeError("this session was compacted while the fold was "
+                               "running — nothing was changed, try again")
+        grew = stored[snapshot_n:]
+        archive = list(fresh.get("archive", [])) + old
+        # AUDIT F5: docs/audit-2026-09-04-full.md — the cap now applies to RUNS
+        # only, and spills what it drops first. It exists because a run compacts
+        # often (small ctx budget) and re-serialises the whole session on every
+        # save, which is real write amplification over a 20h run. A chat has no
+        # such cadence, and its archive is the user's manuscript: the docstring
+        # nine lines above says these messages are "never destroyed", and two
+        # design specs say "nothing is destroyed". They now aren't.
+        if fresh.get("run_id") and len(archive) > ARCHIVE_MAX:
+            if _spill_archive(fresh["id"], archive[:-ARCHIVE_MAX]):
+                archive = archive[-ARCHIVE_MAX:]
+            # spill failed -> keep the whole archive. An unbounded row costs
+            # writes; losing the only raw copy costs the work itself.
+        fresh["digest"] = digest
+        fresh["archive"] = archive
+        fresh["messages"] = recent + grew
+        sessions.save(fresh, base_rev=fresh[sessions.REV_KEY])
+        s.update(fresh)          # the caller's snapshot now matches the store
         return s, len(old)
 
     @app.post("/api/sessions/{sid}/compact")
@@ -1087,6 +1303,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
+        # AUDIT F4: docs/audit-2026-09-04-full.md — refuse to fold a chat that
+        # is mid-reply. Both orderings destroyed work: the turn's save landing
+        # last silently reverted a digest that cost minutes to compute, and the
+        # fold landing last erased the reply. The v2 composer's send guard reads
+        # `streaming`, so this is the same rule the client already lives by.
+        if sid in _streaming:
+            return JSONResponse(
+                {"error": "this chat is still generating — compact it once "
+                          "the reply has finished"}, status_code=409)
         try:
             keep = max(0, int((body or {}).get("keep", 6)))
         except (TypeError, ValueError):
@@ -1094,6 +1319,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 status_code=400)
         try:
             result = await _compact(s, keep)
+        except sessions.StaleWriteError:
+            return JSONResponse(
+                {"error": "this chat changed while it was being compacted — "
+                          "nothing was written; try again"}, status_code=409)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)
         if result is None:
@@ -1173,6 +1402,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # instead of reasoning about it (2026-08-28).
         _turn_t0 = time.perf_counter()
         _marks: list = []
+        # AUDIT F14: docs/audit-2026-09-04-full.md — the idle auto-unload clock
+        # was stamped only by the chat route and the /v1 proxy. A run and a
+        # macro reach the engine through _llm_turn on the internal client and
+        # bypassed both, so the keepalive poller saw an idle server and killed
+        # the engine underneath a running job. Stamp where the work is.
+        activity["last"] = _now()
+        # how many messages the store held when this turn took its snapshot;
+        # everything after it is this turn's own (AUDIT F4/F7)
+        _snapshot_n = len(s.get("messages", []))
 
         def _mark(label: str) -> None:
             _marks.append((label, time.perf_counter() - _turn_t0))
@@ -1183,7 +1421,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # with. Reopening a long chat, switching between chats and branching
         # all arrive here with a cold slot that would otherwise re-prefill the
         # whole history — four minutes at 120K on this machine.
-        _prefix_warm(msgs)
+        # AUDIT F13: docs/audit-2026-09-04-full.md — threaded. kvcache.slot_action
+        # uses SYNCHRONOUS httpx with timeout=120, so reading a multi-gigabyte KV
+        # snapshot off disk stopped the single-worker event loop outright: every
+        # other tab's tokens, the status poll and a run's heartbeat all froze for
+        # the duration. The unload path already wraps the same call this way.
+        await asyncio.to_thread(_prefix_warm, msgs)
         _mark("prefix_warm")
         # nudges are consumed by the turn that just read them: a reminder
         # that re-injects every turn is nagging, not a trigger
@@ -1200,6 +1443,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         params = sessions.effective_params(s, preset, _model_defaults())
         effort = s.get("effort", "")
         specs, tctx, trace = None, None, []
+        # what the delegate helper ran inside its firewall (AUDIT F32)
+        delegate_log: list = []
         if use_tools:
             from pathlib import Path as _Path
 
@@ -1251,6 +1496,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     workspace=tctx["workspace"], has_run=False,
                     profile=run_profile)
                     if s["function"]["name"] in _DELEGATE_TOOLS]
+                # AUDIT F32: a narrowed ctx, not the outer session's. No code
+                # execution, and no run_id — the run-scoped tools reach the
+                # live run through it (methods_api.py:135 uses this pattern).
+                _sub_ctx = {**tctx, "allow_code": False, "run_id": "",
+                            "method_draft_id": "", "_reads": {}}
                 q = question + (f"\n(Focus on: {path})" if path else "")
                 msgs = [{"role": "system", "content":
                          "You are a research helper. Use the tools to answer "
@@ -1306,9 +1556,44 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                          "with what you have"})
                             continue
                         seen_calls.add(sig)
+                        # AUDIT F32: docs/audit-2026-09-04-full.md — the
+                        # allowlist is enforced HERE too. It gated what the
+                        # helper is advertised and the rescue-parser path, but
+                        # the normal tool_calls path handed fn["name"] straight
+                        # to cached_run, and run_tool resolves aliases against
+                        # the full registry (bash -> run_shell), so a tool the
+                        # helper was never offered still executed — inside what
+                        # the comment above calls a read-only firewall, with
+                        # tctx carrying run_id, so ask_user (which pauses the
+                        # run) and manage_plan (which rewrites plan steps) were
+                        # reachable from it. Resolve the alias first, then test
+                        # membership.
+                        want = toolkit.resolve_tool_name(
+                            str(fn.get("name", ""))) or fn.get("name", "")
+                        if want not in _DELEGATE_TOOLS:
+                            delegate_log.append({"name": want, "ok": False,
+                                                 "blocked": True,
+                                                 "ts": _now()})
+                            msgs.append({
+                                "role": "tool",
+                                "tool_call_id": tc.get("id", ""),
+                                "content": f"'{want}' is not available to a "
+                                "research helper — you may only use: "
+                                + ", ".join(sorted(_DELEGATE_TOOLS))})
+                            continue
                         result = await asyncio.to_thread(
-                            toolkit.cached_run, fn.get("name", ""),
-                            cargs or {}, tctx)
+                            toolkit.cached_run, want, cargs or {}, _sub_ctx)
+                        # the helper's calls are otherwise absent from the
+                        # transcript, the run log and the post-mortem: only the
+                        # condensed answer comes back. Recorded on the assistant
+                        # message (UI-only — build_messages strips it) rather
+                        # than in `trace`, which feeds context, run scoring and
+                        # the turn signature; the whole point of the firewall is
+                        # that this exploration does NOT re-enter context.
+                        delegate_log.append(
+                            {"name": want, "args": cargs or {},
+                             "ok": not str(result).startswith("error"),
+                             "ts": _now()})
                         msgs.append({"role": "tool",
                                      "tool_call_id": tc.get("id", ""),
                                      "content": _clip(str(result), 4000)})
@@ -1342,6 +1627,102 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 return result, imgs
         text, thinking, failed, resp = "", "", False, None
         usage, timings = {}, {}
+        # AUDIT F7: docs/audit-2026-09-04-full.md — CHECKPOINTING. Nothing
+        # generated during a turn used to be persisted until it completed: the
+        # text, the reasoning and the whole tool trace lived in these locals
+        # until the block far below, which is plain code after the streaming
+        # loop, not a `finally`. Cancelling the SSE generator (a tab refresh, a
+        # sleeping laptop, a server restart) throws CancelledError /
+        # GeneratorExit, neither of which is an Exception subclass, so even the
+        # broad `except` around the stream never saw them — eight minutes and
+        # 3500 words went with the socket. Every CHECKPOINT_SECS the accumulated
+        # work is written into the session as ONE assistant message flagged
+        # `partial`, replaced in place on the next checkpoint and replaced again
+        # by the finished message at the end. `live` is what the USER has seen:
+        # deltas from every round, never reset, so the stored partial matches
+        # the screen.
+        _ckpt = {"id": f"ck{time.time_ns()}", "at": time.monotonic(),
+                 "live": "", "saved": False, "final": False}
+
+        def _partial_message() -> dict:
+            m = {"role": "assistant",
+                 "content": _strip_think(_with_prefill(prefill, _ckpt["live"])),
+                 "partial": True, "ckpt_id": _ckpt["id"],
+                 # UI-only, like every other notice: both transcripts already
+                 # render this field, so a recovered reply says what it is
+                 # without either frontend changing.
+                 "notice": "_(this reply was interrupted — the text above is "
+                           "what had been generated. Say **continue** to "
+                           "resume it.)_"}
+            if thinking:
+                m["thinking"] = thinking
+            if trace:
+                m["tool_trace"] = list(trace)
+            return m
+
+        def _without_checkpoint(msgs: list) -> list:
+            """This turn's partial only — another turn's must survive."""
+            return [m for m in msgs if m.get("ckpt_id") != _ckpt["id"]]
+
+        def _write_checkpoint() -> None:
+            """Replace this turn's partial in the STORE.
+
+            Synchronous on purpose: load and save are one unbroken stretch, so
+            nothing can land between them, and a cancellation in flight cannot
+            interrupt a write that never awaits."""
+            entry = _partial_message()
+            if not (entry["content"].strip() or entry.get("thinking")
+                    or entry.get("tool_trace")):
+                return              # nothing generated yet; don't write a stub
+            fresh = sessions.load(s["id"])
+            if fresh is None:
+                return              # deleted mid-turn: there is nothing to hold
+            kept = _without_checkpoint(list(fresh.get("messages", [])))
+            # The v2 Stop button captures the on-screen partial and PUTs it
+            # back (chatStore.ts alreadySaved); if that write lands first, a
+            # checkpoint on top of it would show the reply twice. Same rule,
+            # same 64-char prefix test, from this side.
+            head = entry["content"].strip()[:64]
+            tail_m = kept[-1] if kept else None
+            if (head and tail_m and tail_m.get("role") == "assistant"
+                    and head in str(tail_m.get("content") or "")):
+                return
+            fresh["messages"] = kept + [entry]
+            try:
+                sessions.save(fresh, base_rev=fresh[sessions.REV_KEY])
+            except sessions.StaleWriteError:
+                return              # someone else wrote; the next tick retries
+            _ckpt["saved"] = True
+
+        def _checkpoint(force: bool = False) -> None:
+            if _ckpt["final"]:
+                return              # the finished message is already stored
+            now = time.monotonic()
+            if not force and now - _ckpt["at"] < CHECKPOINT_SECS:
+                return
+            _ckpt["at"] = now
+            activity["last"] = _now()      # AUDIT F14: this turn is alive
+            try:
+                _write_checkpoint()
+            except Exception:
+                # a checkpoint is insurance, never the turn's problem
+                _log.exception("turn checkpoint failed")
+
+        def _clear_checkpoint() -> None:
+            """Take the partial back out — the turn ended with nothing worth
+            keeping, so an empty bubble would be the only trace of it."""
+            if not _ckpt["saved"]:
+                return
+            try:
+                fresh = sessions.load(s["id"])
+                if fresh is None:
+                    return
+                fresh["messages"] = _without_checkpoint(
+                    list(fresh.get("messages", [])))
+                sessions.save(fresh, base_rev=fresh[sessions.REV_KEY])
+                _ckpt["saved"] = False
+            except Exception:
+                _log.exception("clearing the turn checkpoint failed")
         # agentic loop: stream a round; if the model called tools, run them,
         # feed results back and stream again; otherwise this round is the answer
         # per-turn tool-call ceiling: a safety backstop against runaway loops,
@@ -1357,639 +1738,805 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # "the model chose to stop" — the limit notice used to fire on BOTH,
         # claiming a ceiling after 3 calls of a 1000-round budget (owner
         # report 2026-07-21: 'HUH?')
-        for _round in range(max_rounds):
-            # `last` MUST stay False in one-action mode: tool calls are only
-            # executed when `not last` (see the tool block below), so treating
-            # round 0 as last would DROP the action instead of running it.
-            last = ((_round == max_rounds - 1) and not one_action) or force_last
-            turn_msgs = msgs
-            if use_tools and last:
-                # final round: KEEP tools advertised so a stray tool call is
-                # parsed as a call (and quietly dropped below) instead of
-                # LEAKING as raw "<tool_call>…" text into the chat — then nudge
-                # the model to answer. Withholding tools here was what leaked
-                # the raw call (owner-reported 2026-07-18).
-                # role MUST be user, not system: strict templates (this Qwen3
-                # build, line 84) raise on ANY system message that isn't the
-                # first, and llama-server turns that into HTTP 400 "Unable to
-                # generate parser for this template" — which killed real runs.
-                turn_msgs = msgs + [{"role": "user", "content": (
-                    # force_last means "we just loaded images, take a look" —
-                    # NOT a limit. Telling the model it hit a tool-call limit
-                    # there made it reason about a constraint that isn't real.
-                    "Look at the image(s) above and describe what you actually "
-                    "see. Do not call another tool this turn."
-                    if force_last else
-                    "You have reached the tool-call limit. Do not call any more "
-                    "tools — give your final answer now using what you already "
-                    "gathered.")}]
-            body = {"messages": turn_msgs, "stream": True,
-                    "stream_options": {"include_usage": True},
-                    "id_slot": MAIN_SLOT}
-            body.update(params)
-            if specs:
-                body["tools"] = specs
-            # GRAMMAR-FORCED tool calls on autonomous action turns: llama.cpp
-            # builds a lazy GBNF grammar from the tool schemas, and
-            # tool_choice:"required" makes a syntactically valid call
-            # physically inevitable — deleting the "narrated the call instead
-            # of making it" failure class the loop otherwise fights with
-            # prose nudges and the rescue parser. Never on the final round
-            # (that one wants an answer), and never for models that 400'd on
-            # it (fallback below).
-            engine_model = (st.read_state() or {}).get("model", "")
-            force_call = bool(
-                one_action and specs and not last and not force_last
-                and engine_model not in _TOOL_CHOICE_UNSUPPORTED)
-            if force_call:
-                body["tool_choice"] = "required"
-                if body.get("temperature") == RUN_PARAMS["temperature"]:
-                    # 0.3 existed to keep tool-call SYNTAX stable — grammar
-                    # now guarantees syntax at any temperature, and 0.3 is
-                    # below Qwen's floor for any thinking mode (it starves
-                    # reasoning and CREATES the repetition DRY then fights)
-                    body["temperature"] = 0.6
-            ctk = {}
-            if effort == "off":
-                ctk["enable_thinking"] = False
-            elif effort in sessions.QWEN_EFFORTS:
-                # a named level implies thinking is ON; the template turns the
-                # level into its own steering text, so nothing is injected here
-                ctk["enable_thinking"] = True
-                ctk["reasoning_effort"] = effort
-            elif effort == "on":
-                ctk["enable_thinking"] = True
-            if one_action and effort != "off":
-                # Qwen3.6 agent guidance: keep prior turns' reasoning visible
-                # (reduces re-deriving the plan every turn). Templates that
-                # don't know the kwarg simply ignore it.
-                ctk["preserve_thinking"] = True
-            if ctk:
-                body["chat_template_kwargs"] = ctk
-            _shape_log({
-                "ev": "req", "sid": s["id"], "round": _round,
-                "msgs": [{"r": m_.get("role"),
-                          "n": len(str(m_.get("content") or "")),
-                          **({"calls": len(m_["tool_calls"])}
-                             if m_.get("tool_calls") else {})}
-                         for m_ in turn_msgs],
-                "params": {k: v for k, v in body.items()
-                           if k not in ("messages", "tools")},
-                "n_tools": len(specs or []), "ctk": ctk})
-            rtext, calls, started = "", {}, {}   # started: idx -> (task, cargs)
-            finish_reason = None
-            try:
-                _mark("request_built")
-                req = client.build_request("POST", "/v1/chat/completions",
-                                           json=body)
-                resp = await client.send(req, stream=True)
-                if resp.status_code == 400 and "tool_choice" in body:
-                    # template/engine rejects forced calls — remember, degrade
-                    # to the parse-and-rescue path, and don't try again for
-                    # this model
-                    try:
-                        await resp.aclose()
-                    except Exception:
-                        pass
-                    _TOOL_CHOICE_UNSUPPORTED.add(engine_model)
-                    body.pop("tool_choice", None)
-                    if "temperature" in params:      # undo the grammar-era lift
-                        body["temperature"] = params["temperature"]
-                    req = client.build_request(
-                        "POST", "/v1/chat/completions", json=body)
-                    resp = await client.send(req, stream=True)
-                if resp.status_code != 200:
-                    raise RuntimeError(await _upstream_error(resp))
-                _mark("engine_responded")
-                _first_delta = True
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    payload = line[6:].strip()
-                    if _first_delta and payload and payload != "[DONE]":
-                        _first_delta = False
-                        _mark("first_token")
-                        _log.info("turn timing: %s", " ".join(
-                            f"{k}={v:.2f}s" for k, v in _marks))
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(payload)
-                    except Exception:
-                        continue
-                    if "error" in obj:
-                        err = obj["error"]
-                        raise RuntimeError(
-                            err.get("message", "upstream error")
-                            if isinstance(err, dict) else str(err))
-                    usage = obj.get("usage") or usage
-                    timings = obj.get("timings") or timings
-                    try:
-                        fr = obj["choices"][0].get("finish_reason")
-                        if fr:
-                            finish_reason = fr
-                    except Exception:
-                        pass
-                    try:
-                        d = obj["choices"][0]["delta"]
-                    except Exception:
-                        d = {}
-                    rdelta = d.get("reasoning_content")
-                    if rdelta:
-                        thinking += rdelta
-                        yield _sse({"delta": rdelta}, event="think")
-                    for tc in d.get("tool_calls") or []:   # accumulate by index
-                        idx = tc.get("index", 0)
-                        slot = calls.setdefault(idx,
-                                                {"id": "", "name": "", "args": ""})
-                        if tc.get("id"):
-                            slot["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            slot["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["args"] += fn["arguments"]
-                        # EAGER: the moment a call's args parse as a JSON object,
-                        # start it running so its I/O overlaps the rest of
-                        # generation and any sibling tool calls
-                        # not in one-action mode: we keep only the FIRST call
-                        # there, so eagerly starting siblings would run work we
-                        # are about to drop
-                        if (use_tools and not last and not one_action
-                                and idx not in started
-                                and slot["name"] and slot["args"].strip()):
-                            try:
-                                _ca = json.loads(slot["args"])
-                            except Exception:
-                                _ca = None
-                            if isinstance(_ca, dict):
-                                yield _sse({"id": slot["id"] or f"call-{idx}",
-                                            "name": slot["name"], "args": _ca},
-                                           event="tool")
-                                started[idx] = (asyncio.create_task(
-                                    _run_call(slot["name"], _ca)), _ca)
-                    delta = d.get("content")
-                    if delta:
-                        rtext += delta
-                        yield _sse({"delta": delta})
-            except Exception as e:
-                failed = True
-                msg = str(e) or "model unreachable"
-                if isinstance(e, httpx.ConnectError):
-                    msg = ("the engine is unloaded — load it again from "
-                           "⚙ → Server (or run: rigma load)"
-                           if (st.read_state() or {}).get("unloaded")
-                           else "engine unreachable — check ⚙ → Server → log")
-                yield _sse({"message": msg}, event="error")
-            finally:
-                if resp is not None:
-                    await resp.aclose()
-                    resp = None
-            _shape_log({
-                "ev": "res", "sid": s["id"], "round": _round,
-                "failed": failed, "finish": finish_reason,
-                "prompt_n": timings.get("prompt_n"),
-                "predicted_n": timings.get("predicted_n"),
-                "tps": timings.get("predicted_per_second"),
-                "think_n": len(thinking), "text_n": len(rtext),
-                "calls": [c.get("name") for c in calls.values()]})
-            if failed:
-                for task, _ in started.values():
-                    task.cancel()              # don't leak eager tool tasks
-                break
-            if use_tools and not calls and not last and rtext:
-                # RESCUE: the engine's tool-call parser is nondeterministically
-                # strict — live 2026-07-20, the same request that parsed clean
-                # on replay yielded the whole call as raw text in the run, and
-                # every miss wasted a full turn until the watchdog stalled the
-                # run. If the reply contains an unmistakable call shape, parse
-                # it ourselves rather than treating the turn as prose.
-                r_name, r_args = toolkit.rescue_tool_call(rtext)
-                if r_name and r_name in {s["function"]["name"] for s in specs}:
-                    yield _sse({"note": f"rescued {r_name} from raw text"},
-                               event="think")
-                    calls = {0: {"id": "rescued-0", "name": r_name,
-                                 "args": json.dumps(r_args)}}
-                    rtext = ""          # the text WAS the call; don't keep both
-            if use_tools and calls and not last:   # the model asked for tools
-                if one_action and len(calls) > 1:
-                    # ONE action per turn: a model may emit several parallel
-                    # tool_calls in a single round — keep the first and drop the
-                    # rest, or the loop is unsupervised again at smaller scale
-                    first = sorted(calls)[0]
-                    calls = {first: calls[first]}
-                round_imgs = False
-                msgs.append({"role": "assistant", "content": rtext,
-                             "tool_calls": [
-                                 {"id": c["id"], "type": "function",
-                                  "function": {"name": c["name"],
-                                               "arguments": c["args"]}}
-                                 for c in calls.values()]})
-                # collect results IN ORDER — eager tasks are already running (in
-                # parallel); calls whose args never parsed early run now
-                for idx, c in calls.items():
-                    name = c["name"]
-                    if idx in started:
-                        task, cargs = started[idx]
-                        try:
-                            result, imgs = await task
-                        except Exception as e:
-                            result, imgs = f"error running {name}: {e}", None
-                    else:
-                        bad = None
-                        # A generation cut by the token limit can end MID
-                        # tool-call; the JSON repairer would happily balance
-                        # the braces of half a write_file and execute a partial
-                        # write as if it were the whole thing (silent data
-                        # loss — the model believes it saved everything).
-                        # Strict-parse under finish_reason=length: repaired
-                        # args there mean truncation, and truncated calls are
-                        # never run.
-                        if finish_reason == "length":
-                            try:
-                                json.loads(c["args"])
-                            except Exception:
-                                yield _sse({"id": c["id"], "name": name,
-                                            "args": {}}, event="tool")
-                                result, imgs = (
-                                    "error: this tool call was CUT OFF by the "
-                                    "token limit — its arguments were "
-                                    "incomplete and it was NOT executed. Do "
-                                    "NOT shorten the content. Write the SAME "
-                                    "content in parts: first write_file call "
-                                    "with the first part, then append=true "
-                                    "calls for the rest."), None
-                                _shown = result
-                                yield _sse({"id": c["id"], "name": name,
-                                            "result": _shown},
-                                           event="tool_result")
-                                trace.append({"name": name, "args": {},
-                                              "result": result,
-                                              "ok": not str(result)
-                                              .startswith("error"),
-                                              "ts": _now()})
-                                msgs.append({"role": "tool",
-                                             "tool_call_id": c["id"],
-                                             "content": result})
-                                continue
-                        cargs, note = toolkit.repair_json_args(c["args"])
-                        if cargs is None:
-                            cargs, bad = {}, ("malformed JSON arguments — "
-                                              "auto-repair failed too")
-                        # note: repaired args run normally — the model is told
-                        # about the repair via the result, not punished for it
-                        yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
-                                    "args": cargs}, event="tool")
-                        if bad:                 # don't run — let the model retry
-                            result, imgs = (f"error: {bad} — fix the JSON and "
-                                            "call again"), None
-                        else:
-                            result, imgs = await _run_call(name, cargs)
-                    _shown = str(result)
-                    if len(_shown) > 900:      # display only; the model gets it all
-                        _shown = _shown[:900] + " …(display clipped — the model sees the full text)"
-                    yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
-                                "result": _shown}, event="tool_result")
-                    trace.append({"name": name, "args": cargs, "result": result,
-                                  "ok": not str(result).startswith("error"),
-                                  "ts": _now()})
-                    msgs.append({"role": "tool", "tool_call_id": c["id"],
-                                 "content": result})
-                    if imgs:
-                        content = [{"type": "text",
-                                    "text": "(images loaded — look at them)"}]
-                        for u in imgs:
-                            content.append({"type": "image_url",
-                                            "image_url": {"url": u}})
-                        msgs.append({"role": "user", "content": content})
-                        round_imgs = True
-                if one_action:
-                    if round_imgs:
-                        # the images were appended for the NEXT round's request —
-                        # breaking here would discard them and the model would
-                        # never see a single pixel, only "image loaded" text.
-                        # Take one more round (tools off) so it actually LOOKS.
-                        force_last = True
-                        continue
-                    text = rtext               # keep any narration with the action
-                    break                      # ONE action: end the turn here
-                continue                       # stream the next round
-            text = rtext                       # no tool calls -> this is final
-            break
-        else:
-            hit_ceiling = True                 # every round used, no break
-        # ended mid-task with no final answer? never finish silently — but be
-        # TRUTHFUL about why: running out of rounds and the model going quiet
-        # after its tools are different situations with different fixes.
-        # In one-action mode stopping after a single call is NORMAL, not a
-        # ceiling — the notice would otherwise fire on every single action.
-        # `notice`, NOT `text`: a server-authored notice persisted as the
-        # ASSISTANT'S OWN WORDS poisoned the chat — the model re-read itself
-        # declaring it couldn't continue and answered every later prompt
-        # with instant EOS (live corruption 2026-07-21, one chat bricked).
-        # The notice reaches the USER (stream + UI field) but never the model.
-        notice = ""
-        if (use_tools and not failed and not text.strip() and trace
-                and not one_action):
-            if s.get("run_id"):
-                # in a run there is no user to say "keep going" — the loop
-                # just continues, so tell the model that instead. Runs feed
-                # driving lines, not history notices, so text stays safe here
-                notice = ("_(Reached this turn's tool-call limit. The run "
-                          "continues automatically — resume the SAME step "
-                          "next turn, do not start over.)_" if hit_ceiling
-                          else
-                          "_(You stopped without a reply. Your tool results "
-                          "are above — continue the SAME step next turn.)_")
-            elif hit_ceiling:
-                notice = ("_(Reached this turn's tool-call limit while "
-                          "still working — send **keep going** and I'll "
-                          "continue. You can raise the limit in the chat's "
-                          "settings.)_")
-            else:
-                notice = ("_(The model stopped after its tool calls without "
-                          "a final reply — the results are shown above. Say "
-                          "**continue** if it should keep going.)_")
-            yield _sse({"delta": notice})
-        elif (not failed and not text.strip() and not trace
-                and not one_action):
-            # THINKING-ONLY TURN. The model reasoned and then ended without an
-            # answer and without calling anything. Nothing is persisted (no
-            # text, no trace), so this used to vanish mid-air: the owner saw
-            # "generating" for 8s and then an empty screen, with no record and
-            # no reason (live report 2026-07-21). Silence is the worst possible
-            # reply — say what happened. Stream-only, never persisted: an empty
-            # assistant message is exactly the shape that poisons later turns.
-            notice = ("_(The model spent this turn reasoning and ended without "
-                      "a reply — no tools ran and nothing was saved. Say "
-                      "**continue** to try again"
-                      + (", or set thinking effort lower in this chat's "
-                         "settings if it keeps happening" if thinking else "")
-                      + ".)_")
-            yield _sse({"delta": notice})
-        if not failed:
-            meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}
-            if usage.get("prompt_tokens"):
-                meta["prompt_tokens"] = usage["prompt_tokens"]
-            if timings.get("predicted_per_second"):
-                meta["predicted_per_second"] = timings["predicted_per_second"]
-                telemetry["tg"] = timings["predicted_per_second"]
-            if len(meta) > 1 or meta["ctx"]:
-                yield _sse(meta, event="meta")
-        # persist if we have an answer OR tools already ran — a mid-loop
-        # failure must not erase the record of files written / commands run
-        if (text or trace) and not (cont and failed):
-            # reload before saving: a minutes-long generation must not
-            # clobber title/param/notes edits that landed meanwhile (TOCTOU).
-            # Messages stay OUR snapshot + this turn — the turn owns them.
-            fresh = sessions.load(s["id"])
-            if fresh is None:
-                # the session was deleted mid-generation — discard the turn,
-                # never resurrect the file the user just removed
-                yield b"data: [DONE]\n\n"
-                return
-            for k in ("title", "system_prompt", "params", "notes",
-                      "digest", "preset_id", "effort", "use_rag",
-                      "authors_note", "authors_note_depth", "archive",
-                      "title_source"):
-                s[k] = fresh.get(k, s.get(k))
-            if prefill:
-                s["prefill"] = ""   # consumed once, like a variant
-            last = s["messages"][-1] if s["messages"] else None
-            if cont and last and last.get("role") == "assistant":
-                last["content"] = last.get("content", "") + text
-                if thinking:
-                    last["thinking"] = last.get("thinking", "") + thinking
-            else:
-                body_text = _strip_think(_with_prefill(prefill, text))
-                if not str(body_text).strip() and trace:
-                    # a tool-only action would otherwise persist an EMPTY
-                    # assistant message, which some templates reject outright.
-                    # Record what it actually did — useful history, and valid.
-                    body_text = "→ " + ", ".join(
-                        str(t.get("name", "?")) for t in trace)
-                msg = {"role": "assistant", "content": body_text}
-                if notice:
-                    # UI-only field: build_messages never forwards it, so
-                    # the model can't read its own refusal back as gospel
-                    msg["notice"] = notice
-                if thinking:
-                    msg["thinking"] = thinking
-                if trace:
-                    msg["tool_trace"] = trace
-                # stats attach whenever the engine reported ANYTHING — gating
-                # on timings alone left tool-heavy turns stat-less, and the
-                # UI's context meter walked back to a stale value and froze
-                # (owner report 2026-07-21: "stuck at 8%")
-                if timings.get("predicted_per_second") or usage.get(
-                        "prompt_tokens"):
-                    tps = timings.get("predicted_per_second")
-                    msg["stats"] = {
-                        "tps": round(tps, 1) if tps else None,
-                        "tokens": timings.get("predicted_n"),
-                        "prompt_tokens": usage.get("prompt_tokens"),
-                        "model": (st.read_state() or {}).get("model", "")}
-                s["messages"].append(msg)
-                # CARRY TOOL RESULTS ACROSS TURNS in chat, exactly as runs
-                # do. build_messages sanitises to role/content, so tool_trace
-                # never re-enters context — on the NEXT turn the model could
-                # not see what any tool returned this turn, and it edited
-                # files from MEMORY of a read made two turns ago. Live-proven
-                # 2026-07-21 on the real 35B: 3/3 perfect edits with the file
-                # in context, 0/3 without (one hallucinated edit, two forced
-                # re-reads). Newest results win the budget; the UI renders
-                # these compactly (TOOL RESULT prefix).
-                if trace and not s.get("one_action"):
-                    budget, kept = 24_000, []
-                    for t in reversed(trace):
-                        r = _clip(str(t.get("result", "")), RESULT_MAX)
-                        if kept and budget - len(r) < 0:
-                            break
-                        budget -= len(r)
-                        kept.append((t, r))
-                    kept.reverse()
-                    omitted = len(trace) - len(kept)
-                    body_lines = [f"TOOL RESULT {t.get('name')}: {r}"
-                                  for t, r in kept]
-                    if omitted:
-                        body_lines.append(f"({omitted} earlier tool "
-                                          "result(s) from this turn omitted)")
-                    s["messages"].append({
-                        "role": "user", "kind": "tool_result",
-                        "tools": [{"name": t.get("name"), "ok": call_ok(t)}
-                                  for t, _ in kept],
-                        "content": "\n".join(body_lines)})
-            # TRIGGER RULES. Evaluated after the turn, never during it: a
-            # trigger that fired mid-turn would be reacting to a tool call
-            # the model had not finished reasoning about. Nudges ride on the
-            # session and build_messages injects them as ONE user message
-            # next turn; a mute is a NOTICE, never assistant content.
-            try:
-                trig_notices = _fire_triggers(s, trace, user_spoke=not cont)
-                if trig_notices and s["messages"]:
-                    last_msg = s["messages"][-1]
-                    if last_msg.get("role") == "assistant":
-                        last_msg["notice"] = "\n".join(
-                            filter(None, [last_msg.get("notice"),
-                                          *trig_notices]))
-            except Exception:
-                pass          # a trigger must never cost the user their turn
-            sessions.save(s)
-            # Rebuilt AFTER the save so it includes the reply that was just
-            # generated — that is what the slot actually holds now.
-            try:
-                _prefix_snapshot(sessions.build_messages(
-                    s, _default_prompt(), preset))
-            except Exception:
-                pass
-            _bump_stats(timings)
-            # Auto-title once the conversation has a shape (owner request
-            # 2026-07-21: the rail was "Sup bro", "Hello", and three identical
-            # truncations). One tiny non-streaming call after the 4th message;
-            # a title the USER typed via rename is never overwritten, and
-            # failure changes nothing — the truncation stays.
-            try:
-                if (len(s.get("messages", [])) >= 4
-                        and s.get("title_source") not in ("user", "auto")
-                        and not s.get("run_id")):
-                    convo = []
-                    for m in s["messages"][:6]:
-                        c = m.get("content", "")
-                        if not isinstance(c, str):
-                            c = " ".join(pt.get("text", "") for pt in c
-                                         if isinstance(pt, dict))
-                        convo.append(f"{m.get('role')}: {c[:200]}")
-                    tresp = await client.post(
-                        "/v1/chat/completions",
-                        json={"messages": [{"role": "user", "content":
-                              "Give this conversation a title: 3 to 6 plain "
-                              "words, no quotes, no punctuation at the end. "
-                              "Reply with the title only." + chr(10)
-                              + chr(10).join(convo)}],
-                              "stream": False, "temperature": 0.3,
-                              "max_tokens": 24, "id_slot": AUX_SLOT},
-                        timeout=20.0)
-                    if tresp.status_code == 200:
-                        new_t = (tresp.json()["choices"][0]["message"]
-                                 ["content"] or "").strip().strip('"')
-                        new_t = new_t.splitlines()[0].strip()[:60]
-                        if new_t:
-                            s["title"] = new_t
-                            s["title_source"] = "auto"
-                            sessions.save(s)
-                            yield _sse({"title": new_t}, event="meta")
-            except Exception:
-                pass          # titling is never load-bearing
-            # auto-compact when the window is nearly full, so the NEXT turn
-            # starts small (reactive; uses the engine's real prompt_tokens)
-            ptoks = usage.get("prompt_tokens") or 0
-            wctx = compact_budget(s, (st.read_state() or {}).get("ctx", 0))
-            if (s.get("auto_compact", True) and ptoks and wctx
-                    and ptoks >= AUTO_COMPACT_FRACTION * wctx
-                    and len(s.get("messages", [])) > AUTO_COMPACT_KEEP):
+        # AUDIT F7: docs/audit-2026-09-04-full.md — everything a turn
+        # produces is now reachable on CANCELLATION. CancelledError and
+        # GeneratorExit are BaseException subclasses, so the broad `except`
+        # inside the streaming loop never saw a tab refresh, a sleeping
+        # laptop or a server restart; the persist block below is plain code
+        # after the loop, not a `finally`, so none of it ran either. The last
+        # checkpoint is forced here and the partial stays in the session,
+        # flagged, instead of the reply ceasing to exist.
+        try:
+            for _round in range(max_rounds):
+                # `last` MUST stay False in one-action mode: tool calls are only
+                # executed when `not last` (see the tool block below), so treating
+                # round 0 as last would DROP the action instead of running it.
+                last = ((_round == max_rounds - 1) and not one_action) or force_last
+                turn_msgs = msgs
+                if use_tools and last:
+                    # final round: KEEP tools advertised so a stray tool call is
+                    # parsed as a call (and quietly dropped below) instead of
+                    # LEAKING as raw "<tool_call>…" text into the chat — then nudge
+                    # the model to answer. Withholding tools here was what leaked
+                    # the raw call (owner-reported 2026-07-18).
+                    # role MUST be user, not system: strict templates (this Qwen3
+                    # build, line 84) raise on ANY system message that isn't the
+                    # first, and llama-server turns that into HTTP 400 "Unable to
+                    # generate parser for this template" — which killed real runs.
+                    turn_msgs = msgs + [{"role": "user", "content": (
+                        # force_last means "we just loaded images, take a look" —
+                        # NOT a limit. Telling the model it hit a tool-call limit
+                        # there made it reason about a constraint that isn't real.
+                        "Look at the image(s) above and describe what you actually "
+                        "see. Do not call another tool this turn."
+                        if force_last else
+                        "You have reached the tool-call limit. Do not call any more "
+                        "tools — give your final answer now using what you already "
+                        "gathered.")}]
+                body = {"messages": turn_msgs, "stream": True,
+                        "stream_options": {"include_usage": True},
+                        "id_slot": MAIN_SLOT}
+                body.update(params)
+                if specs:
+                    body["tools"] = specs
+                # GRAMMAR-FORCED tool calls on autonomous action turns: llama.cpp
+                # builds a lazy GBNF grammar from the tool schemas, and
+                # tool_choice:"required" makes a syntactically valid call
+                # physically inevitable — deleting the "narrated the call instead
+                # of making it" failure class the loop otherwise fights with
+                # prose nudges and the rescue parser. Never on the final round
+                # (that one wants an answer), and never for models that 400'd on
+                # it (fallback below).
+                engine_model = (st.read_state() or {}).get("model", "")
+                force_call = bool(
+                    one_action and specs and not last and not force_last
+                    and engine_model not in _TOOL_CHOICE_UNSUPPORTED)
+                if force_call:
+                    body["tool_choice"] = "required"
+                    if body.get("temperature") == RUN_PARAMS["temperature"]:
+                        # 0.3 existed to keep tool-call SYNTAX stable — grammar
+                        # now guarantees syntax at any temperature, and 0.3 is
+                        # below Qwen's floor for any thinking mode (it starves
+                        # reasoning and CREATES the repetition DRY then fights)
+                        body["temperature"] = 0.6
+                ctk = {}
+                if effort == "off":
+                    ctk["enable_thinking"] = False
+                elif effort in sessions.QWEN_EFFORTS:
+                    # a named level implies thinking is ON; the template turns the
+                    # level into its own steering text, so nothing is injected here
+                    ctk["enable_thinking"] = True
+                    ctk["reasoning_effort"] = effort
+                elif effort == "on":
+                    ctk["enable_thinking"] = True
+                if one_action and effort != "off":
+                    # Qwen3.6 agent guidance: keep prior turns' reasoning visible
+                    # (reduces re-deriving the plan every turn). Templates that
+                    # don't know the kwarg simply ignore it.
+                    ctk["preserve_thinking"] = True
+                if ctk:
+                    body["chat_template_kwargs"] = ctk
+                _shape_log({
+                    "ev": "req", "sid": s["id"], "round": _round,
+                    "msgs": [{"r": m_.get("role"),
+                              "n": len(str(m_.get("content") or "")),
+                              **({"calls": len(m_["tool_calls"])}
+                                 if m_.get("tool_calls") else {})}
+                             for m_ in turn_msgs],
+                    "params": {k: v for k, v in body.items()
+                               if k not in ("messages", "tools")},
+                    "n_tools": len(specs or []), "ctk": ctk})
+                rtext, calls, started = "", {}, {}   # started: idx -> (task, cargs)
+                finish_reason = None
                 try:
-                    # Autonomous runs: mask observations FIRST. Summarising is
-                    # lossy in the worst direction for an agent — it keeps the
-                    # gist and drops the exact strings (filenames, error text,
-                    # the argument that worked) it navigates by, which
-                    # measurably lengthens trajectories. Masking shrinks only
-                    # the environment's replies and leaves the model's own
-                    # reasoning byte-identical. Chats keep the digest: there the
-                    # prose IS the content.
-                    still_over = True
-                    if s.get("run_id"):
-                        # chars-per-token measured from THIS session's actual
-                        # content, not guessed: the engine just told us ptoks
-                        # for exactly these messages, so chars/ptoks is ground
-                        # truth for this trajectory's mix of prose and paths.
-                        # The static constant failed in a nasty direction —
-                        # path-heavy sessions tokenise near 1 char/token, so a
-                        # 3× assumption let masking finish "under budget" in
-                        # chars while still over in tokens, skipping the
-                        # summarise fallback and setting up a context overflow
-                        # on the NEXT turn. Clamped: a mid-stream ptoks can be
-                        # partial or zero.
-                        sess_chars = context.session_chars(s["messages"])
-                        cpt = max(1.0, min(6.0, sess_chars / ptoks)) \
-                            if ptoks else CHARS_PER_TOKEN
-                        # ONE target for both the masking and the re-check.
-                        # Masking to `budget` while judging against
-                        # `fraction * budget` makes it stop just above the bar
-                        # and summarise anyway — which silently defeats the
-                        # whole point.
-                        target = AUTO_COMPACT_FRACTION * wctx * cpt
-                        masked, n = context.mask_observations(
-                            s["messages"], keep_recent=AUTO_COMPACT_KEEP,
-                            budget_chars=int(target))
-                        if n:
-                            s["messages"] = masked
-                            sessions.save(s)
-                            yield _sse({"masked": n}, event="masked")
-                            # Re-check on the char estimate ONLY when masking
-                            # actually changed something. The engine's
-                            # prompt_tokens is authoritative but describes the
-                            # turn we already sent, so it cannot see the masking
-                            # we just did. Chats never take this path and keep
-                            # using the real token count.
-                            still_over = (context.session_chars(s["messages"])
-                                          >= target)
-                    if still_over:
-                        r = await _compact(s, AUTO_COMPACT_KEEP)
-                        if r:
-                            yield _sse({"archived": r[1]}, event="compacted")
+                    _mark("request_built")
+                    req = client.build_request("POST", "/v1/chat/completions",
+                                               json=body)
+                    resp = await client.send(req, stream=True)
+                    if resp.status_code == 400 and "tool_choice" in body:
+                        # template/engine rejects forced calls — remember, degrade
+                        # to the parse-and-rescue path, and don't try again for
+                        # this model
+                        try:
+                            await resp.aclose()
+                        except Exception:
+                            pass
+                        _TOOL_CHOICE_UNSUPPORTED.add(engine_model)
+                        body.pop("tool_choice", None)
+                        if "temperature" in params:      # undo the grammar-era lift
+                            body["temperature"] = params["temperature"]
+                        req = client.build_request(
+                            "POST", "/v1/chat/completions", json=body)
+                        resp = await client.send(req, stream=True)
+                    if resp.status_code != 200:
+                        raise RuntimeError(await _upstream_error(resp))
+                    _mark("engine_responded")
+                    _first_delta = True
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        payload = line[6:].strip()
+                        if _first_delta and payload and payload != "[DONE]":
+                            _first_delta = False
+                            _mark("first_token")
+                            _log.info("turn timing: %s", " ".join(
+                                f"{k}={v:.2f}s" for k, v in _marks))
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(payload)
+                        except Exception:
+                            continue
+                        if "error" in obj:
+                            err = obj["error"]
+                            raise RuntimeError(
+                                err.get("message", "upstream error")
+                                if isinstance(err, dict) else str(err))
+                        usage = obj.get("usage") or usage
+                        timings = obj.get("timings") or timings
+                        try:
+                            fr = obj["choices"][0].get("finish_reason")
+                            if fr:
+                                finish_reason = fr
+                        except Exception:
+                            pass
+                        try:
+                            d = obj["choices"][0]["delta"]
+                        except Exception:
+                            d = {}
+                        rdelta = d.get("reasoning_content")
+                        if rdelta:
+                            thinking += rdelta
+                            yield _sse({"delta": rdelta}, event="think")
+                            _checkpoint()          # AUDIT F7
+                        for tc in d.get("tool_calls") or []:   # accumulate by index
+                            idx = tc.get("index", 0)
+                            slot = calls.setdefault(idx,
+                                                    {"id": "", "name": "", "args": ""})
+                            if tc.get("id"):
+                                slot["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                slot["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                slot["args"] += fn["arguments"]
+                            # EAGER: the moment a call's args parse as a JSON object,
+                            # start it running so its I/O overlaps the rest of
+                            # generation and any sibling tool calls
+                            # not in one-action mode: we keep only the FIRST call
+                            # there, so eagerly starting siblings would run work we
+                            # are about to drop
+                            if (use_tools and not last and not one_action
+                                    and idx not in started
+                                    and slot["name"] and slot["args"].strip()):
+                                try:
+                                    _ca = json.loads(slot["args"])
+                                except Exception:
+                                    _ca = None
+                                if isinstance(_ca, dict):
+                                    yield _sse({"id": slot["id"] or f"call-{idx}",
+                                                "name": slot["name"], "args": _ca},
+                                               event="tool")
+                                    started[idx] = (asyncio.create_task(
+                                        _run_call(slot["name"], _ca)), _ca)
+                        delta = d.get("content")
+                        if delta:
+                            rtext += delta
+                            _ckpt["live"] += delta       # AUDIT F7
+                            yield _sse({"delta": delta})
+                            _checkpoint()
+                except Exception as e:
+                    failed = True
+                    msg = str(e) or "model unreachable"
+                    if isinstance(e, httpx.ConnectError):
+                        msg = ("the engine is unloaded — load it again from "
+                               "⚙ → Server (or run: rigma load)"
+                               if (st.read_state() or {}).get("unloaded")
+                               else "engine unreachable — check ⚙ → Server → log")
+                    yield _sse({"message": msg}, event="error")
+                finally:
+                    if resp is not None:
+                        await resp.aclose()
+                        resp = None
+                _shape_log({
+                    "ev": "res", "sid": s["id"], "round": _round,
+                    "failed": failed, "finish": finish_reason,
+                    "prompt_n": timings.get("prompt_n"),
+                    "predicted_n": timings.get("predicted_n"),
+                    "tps": timings.get("predicted_per_second"),
+                    "think_n": len(thinking), "text_n": len(rtext),
+                    "calls": [c.get("name") for c in calls.values()]})
+                if failed:
+                    for task, _ in started.values():
+                        task.cancel()              # don't leak eager tool tasks
+                    break
+                if use_tools and not calls and not last and rtext:
+                    # RESCUE: the engine's tool-call parser is nondeterministically
+                    # strict — live 2026-07-20, the same request that parsed clean
+                    # on replay yielded the whole call as raw text in the run, and
+                    # every miss wasted a full turn until the watchdog stalled the
+                    # run. If the reply contains an unmistakable call shape, parse
+                    # it ourselves rather than treating the turn as prose.
+                    r_name, r_args = toolkit.rescue_tool_call(rtext)
+                    if r_name and r_name in {s["function"]["name"] for s in specs}:
+                        yield _sse({"note": f"rescued {r_name} from raw text"},
+                                   event="think")
+                        calls = {0: {"id": "rescued-0", "name": r_name,
+                                     "args": json.dumps(r_args)}}
+                        rtext = ""          # the text WAS the call; don't keep both
+                if use_tools and calls and not last:   # the model asked for tools
+                    if one_action and len(calls) > 1:
+                        # ONE action per turn: a model may emit several parallel
+                        # tool_calls in a single round — keep the first and drop the
+                        # rest, or the loop is unsupervised again at smaller scale
+                        first = sorted(calls)[0]
+                        calls = {first: calls[first]}
+                    round_imgs = False
+                    msgs.append({"role": "assistant", "content": rtext,
+                                 "tool_calls": [
+                                     {"id": c["id"], "type": "function",
+                                      "function": {"name": c["name"],
+                                                   "arguments": c["args"]}}
+                                     for c in calls.values()]})
+                    # collect results IN ORDER — eager tasks are already running (in
+                    # parallel); calls whose args never parsed early run now
+                    for idx, c in calls.items():
+                        name = c["name"]
+                        if idx in started:
+                            task, cargs = started[idx]
+                            try:
+                                result, imgs = await task
+                            except Exception as e:
+                                result, imgs = f"error running {name}: {e}", None
+                        else:
+                            bad = None
+                            # A generation cut by the token limit can end MID
+                            # tool-call; the JSON repairer would happily balance
+                            # the braces of half a write_file and execute a partial
+                            # write as if it were the whole thing (silent data
+                            # loss — the model believes it saved everything).
+                            # Strict-parse under finish_reason=length: repaired
+                            # args there mean truncation, and truncated calls are
+                            # never run.
+                            if finish_reason == "length":
+                                try:
+                                    json.loads(c["args"])
+                                except Exception:
+                                    yield _sse({"id": c["id"], "name": name,
+                                                "args": {}}, event="tool")
+                                    result, imgs = (
+                                        "error: this tool call was CUT OFF by the "
+                                        "token limit — its arguments were "
+                                        "incomplete and it was NOT executed. Do "
+                                        "NOT shorten the content. Write the SAME "
+                                        "content in parts: first write_file call "
+                                        "with the first part, then append=true "
+                                        "calls for the rest."), None
+                                    _shown = result
+                                    yield _sse({"id": c["id"], "name": name,
+                                                "result": _shown},
+                                               event="tool_result")
+                                    trace.append({"name": name, "args": {},
+                                                  "result": result,
+                                                  "ok": not str(result)
+                                                  .startswith("error"),
+                                                  "ts": _now()})
+                                    msgs.append({"role": "tool",
+                                                 "tool_call_id": c["id"],
+                                                 "content": result})
+                                    continue
+                            cargs, note = toolkit.repair_json_args(c["args"])
+                            if cargs is None:
+                                cargs, bad = {}, ("malformed JSON arguments — "
+                                                  "auto-repair failed too")
+                            # note: repaired args run normally — the model is told
+                            # about the repair via the result, not punished for it
+                            yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
+                                        "args": cargs}, event="tool")
+                            if bad:                 # don't run — let the model retry
+                                result, imgs = (f"error: {bad} — fix the JSON and "
+                                                "call again"), None
+                            else:
+                                result, imgs = await _run_call(name, cargs)
+                        _shown = str(result)
+                        if len(_shown) > 900:      # display only; the model gets it all
+                            _shown = _shown[:900] + " …(display clipped — the model sees the full text)"
+                        yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
+                                    "result": _shown}, event="tool_result")
+                        trace.append({"name": name, "args": cargs, "result": result,
+                                      "ok": not str(result).startswith("error"),
+                                      "ts": _now()})
+                        # AUDIT F7: a completed action is exactly what must not be
+                        # lost to a refresh — the file it wrote is already on disk,
+                        # so a turn that forgets it happened is worse than no turn.
+                        _checkpoint(force=True)
+                        msgs.append({"role": "tool", "tool_call_id": c["id"],
+                                     "content": result})
+                        if imgs:
+                            content = [{"type": "text",
+                                        "text": "(images loaded — look at them)"}]
+                            for u in imgs:
+                                content.append({"type": "image_url",
+                                                "image_url": {"url": u}})
+                            msgs.append({"role": "user", "content": content})
+                            round_imgs = True
+                    if one_action:
+                        if round_imgs:
+                            # the images were appended for the NEXT round's request —
+                            # breaking here would discard them and the model would
+                            # never see a single pixel, only "image loaded" text.
+                            # Take one more round (tools off) so it actually LOOKS.
+                            force_last = True
+                            continue
+                        text = rtext               # keep any narration with the action
+                        break                      # ONE action: end the turn here
+                    continue                       # stream the next round
+                text = rtext                       # no tool calls -> this is final
+                break
+            else:
+                hit_ceiling = True                 # every round used, no break
+            # ended mid-task with no final answer? never finish silently — but be
+            # TRUTHFUL about why: running out of rounds and the model going quiet
+            # after its tools are different situations with different fixes.
+            # In one-action mode stopping after a single call is NORMAL, not a
+            # ceiling — the notice would otherwise fire on every single action.
+            # `notice`, NOT `text`: a server-authored notice persisted as the
+            # ASSISTANT'S OWN WORDS poisoned the chat — the model re-read itself
+            # declaring it couldn't continue and answered every later prompt
+            # with instant EOS (live corruption 2026-07-21, one chat bricked).
+            # The notice reaches the USER (stream + UI field) but never the model.
+            notice = ""
+            if (use_tools and not failed and not text.strip() and trace
+                    and not one_action):
+                if s.get("run_id"):
+                    # in a run there is no user to say "keep going" — the loop
+                    # just continues, so tell the model that instead. Runs feed
+                    # driving lines, not history notices, so text stays safe here
+                    notice = ("_(Reached this turn's tool-call limit. The run "
+                              "continues automatically — resume the SAME step "
+                              "next turn, do not start over.)_" if hit_ceiling
+                              else
+                              "_(You stopped without a reply. Your tool results "
+                              "are above — continue the SAME step next turn.)_")
+                elif hit_ceiling:
+                    notice = ("_(Reached this turn's tool-call limit while "
+                              "still working — send **keep going** and I'll "
+                              "continue. You can raise the limit in the chat's "
+                              "settings.)_")
+                else:
+                    notice = ("_(The model stopped after its tool calls without "
+                              "a final reply — the results are shown above. Say "
+                              "**continue** if it should keep going.)_")
+                yield _sse({"delta": notice})
+            elif (not failed and not text.strip() and not trace
+                    and not one_action):
+                # THINKING-ONLY TURN. The model reasoned and then ended without an
+                # answer and without calling anything. Nothing is persisted (no
+                # text, no trace), so this used to vanish mid-air: the owner saw
+                # "generating" for 8s and then an empty screen, with no record and
+                # no reason (live report 2026-07-21). Silence is the worst possible
+                # reply — say what happened. Stream-only, never persisted: an empty
+                # assistant message is exactly the shape that poisons later turns.
+                notice = ("_(The model spent this turn reasoning and ended without "
+                          "a reply — no tools ran and nothing was saved. Say "
+                          "**continue** to try again"
+                          + (", or set thinking effort lower in this chat's "
+                             "settings if it keeps happening" if thinking else "")
+                          + ".)_")
+                yield _sse({"delta": notice})
+            if not failed:
+                meta = {"ctx": (st.read_state() or {}).get("ctx", 0)}
+                if usage.get("prompt_tokens"):
+                    meta["prompt_tokens"] = usage["prompt_tokens"]
+                if timings.get("predicted_per_second"):
+                    meta["predicted_per_second"] = timings["predicted_per_second"]
+                    telemetry["tg"] = timings["predicted_per_second"]
+                if len(meta) > 1 or meta["ctx"]:
+                    yield _sse(meta, event="meta")
+            # persist if we have an answer OR tools already ran — a mid-loop
+            # failure must not erase the record of files written / commands run
+            if (text or trace) and not (cont and failed):
+                if prefill:
+                    s["prefill"] = ""   # consumed once, like a variant
+                amend_from = None
+                last = s["messages"][-1] if s["messages"] else None
+                if cont and last and last.get("role") == "assistant":
+                    last["content"] = last.get("content", "") + text
+                    if thinking:
+                        last["thinking"] = last.get("thinking", "") + thinking
+                    amend_from = len(s["messages"]) - 1
+                else:
+                    body_text = _strip_think(_with_prefill(prefill, text))
+                    if not str(body_text).strip() and trace:
+                        # a tool-only action would otherwise persist an EMPTY
+                        # assistant message, which some templates reject outright.
+                        # Record what it actually did — useful history, and valid.
+                        body_text = "→ " + ", ".join(
+                            str(t.get("name", "?")) for t in trace)
+                    msg = {"role": "assistant", "content": body_text}
+                    if notice:
+                        # UI-only field: build_messages never forwards it, so
+                        # the model can't read its own refusal back as gospel
+                        msg["notice"] = notice
+                    if thinking:
+                        msg["thinking"] = thinking
+                    if trace:
+                        msg["tool_trace"] = trace
+                    if delegate_log:
+                        # AUDIT F32: what ran behind the context firewall, so
+                        # the transcript and the post-mortem can see it
+                        msg["delegate_trace"] = delegate_log
+                    # stats attach whenever the engine reported ANYTHING — gating
+                    # on timings alone left tool-heavy turns stat-less, and the
+                    # UI's context meter walked back to a stale value and froze
+                    # (owner report 2026-07-21: "stuck at 8%")
+                    if timings.get("predicted_per_second") or usage.get(
+                            "prompt_tokens"):
+                        tps = timings.get("predicted_per_second")
+                        msg["stats"] = {
+                            "tps": round(tps, 1) if tps else None,
+                            "tokens": timings.get("predicted_n"),
+                            "prompt_tokens": usage.get("prompt_tokens"),
+                            "model": (st.read_state() or {}).get("model", "")}
+                    s["messages"].append(msg)
+                    # CARRY TOOL RESULTS ACROSS TURNS in chat, exactly as runs
+                    # do. build_messages sanitises to role/content, so tool_trace
+                    # never re-enters context — on the NEXT turn the model could
+                    # not see what any tool returned this turn, and it edited
+                    # files from MEMORY of a read made two turns ago. Live-proven
+                    # 2026-07-21 on the real 35B: 3/3 perfect edits with the file
+                    # in context, 0/3 without (one hallucinated edit, two forced
+                    # re-reads). Newest results win the budget; the UI renders
+                    # these compactly (TOOL RESULT prefix).
+                    if trace and not s.get("one_action"):
+                        budget, kept = 24_000, []
+                        for t in reversed(trace):
+                            r = _clip(str(t.get("result", "")), RESULT_MAX)
+                            if kept and budget - len(r) < 0:
+                                break
+                            budget -= len(r)
+                            kept.append((t, r))
+                        kept.reverse()
+                        omitted = len(trace) - len(kept)
+                        body_lines = [f"TOOL RESULT {t.get('name')}: {r}"
+                                      for t, r in kept]
+                        if omitted:
+                            body_lines.append(f"({omitted} earlier tool "
+                                              "result(s) from this turn omitted)")
+                        s["messages"].append({
+                            "role": "user", "kind": "tool_result",
+                            "tools": [{"name": t.get("name"), "ok": call_ok(t)}
+                                      for t, _ in kept],
+                            "content": "\n".join(body_lines)})
+                # TRIGGER RULES. Evaluated after the turn, never during it: a
+                # trigger that fired mid-turn would be reacting to a tool call
+                # the model had not finished reasoning about. Nudges ride on the
+                # session and build_messages injects them as ONE user message
+                # next turn; a mute is a NOTICE, never assistant content.
+                try:
+                    trig_notices = _fire_triggers(s, trace, user_spoke=not cont)
+                    if trig_notices and s["messages"]:
+                        last_msg = s["messages"][-1]
+                        if last_msg.get("role") == "assistant":
+                            last_msg["notice"] = "\n".join(
+                                filter(None, [last_msg.get("notice"),
+                                              *trig_notices]))
                 except Exception:
-                    pass   # a summariser hiccup must never break the chat
+                    pass          # a trigger must never cost the user their turn
+                # AUDIT F4/F7: docs/audit-2026-09-04-full.md — merge, never replace.
+                # This save used to write OUR pre-generation snapshot of `messages`
+                # back wholesale, so a compaction that finished while the reply
+                # streamed was silently reverted (its digest cost minutes) and any
+                # message that landed meanwhile disappeared. reload_and_extend
+                # grafts this turn's messages onto whatever is stored NOW; the
+                # checkpoint written during the turn is dropped in the same write,
+                # because the finished message replaces it.
+                my_msgs = list(s["messages"])
+
+                def _merge_and_save() -> bool:
+                    """False only when the session was deleted mid-generation."""
+                    m = sessions.reload_and_extend(
+                        s["id"], my_msgs, since=_snapshot_n,
+                        amend_from=amend_from)
+                    if m is None:
+                        return False
+                    out = dict(s)
+                    # fields the USER can edit while a reply streams stay
+                    # theirs; the rest of the session is this turn's
+                    for k in ("title", "system_prompt", "params", "notes",
+                              "digest", "preset_id", "effort", "use_rag",
+                              "authors_note", "authors_note_depth", "archive",
+                              "title_source"):
+                        out[k] = m.get(k, s.get(k))
+                    out["messages"] = _without_checkpoint(m["messages"])
+                    out[sessions.REV_KEY] = m[sessions.REV_KEY]
+                    sessions.save(out, base_rev=out[sessions.REV_KEY])
+                    s.update(out)
+                    return True
+
+                alive = True
+                for _attempt in range(3):
+                    try:
+                        alive = _merge_and_save()
+                        break
+                    except sessions.StaleWriteError:
+                        # nothing awaits between the merge and the write, so
+                        # this should be unreachable; retrying is still the
+                        # right answer if it ever isn't
+                        _log.warning("session %s moved under the turn write; "
+                                     "merging again", s.get("id"))
+                if not alive:
+                    # the session was deleted mid-generation — discard the turn,
+                    # never resurrect the chat the user just removed
+                    yield b"data: [DONE]\n\n"
+                    return
+                _ckpt["saved"], _ckpt["final"] = False, True
+                # Rebuilt AFTER the save so it includes the reply that was just
+                # generated — that is what the slot actually holds now.
+                try:
+                    # AUDIT F13: threaded — see the warm call at the top of the turn
+                    await asyncio.to_thread(
+                        _prefix_snapshot,
+                        sessions.build_messages(s, _default_prompt(), preset))
+                except Exception:
+                    pass
+                _bump_stats(timings)
+                # Auto-title once the conversation has a shape (owner request
+                # 2026-07-21: the rail was "Sup bro", "Hello", and three identical
+                # truncations). One tiny non-streaming call after the 4th message;
+                # a title the USER typed via rename is never overwritten, and
+                # failure changes nothing — the truncation stays.
+                try:
+                    if (len(s.get("messages", [])) >= 4
+                            and s.get("title_source") not in ("user", "auto")
+                            and not s.get("run_id")):
+                        convo = []
+                        for m in s["messages"][:6]:
+                            c = m.get("content", "")
+                            if not isinstance(c, str):
+                                c = " ".join(pt.get("text", "") for pt in c
+                                             if isinstance(pt, dict))
+                            convo.append(f"{m.get('role')}: {c[:200]}")
+                        tresp = await client.post(
+                            "/v1/chat/completions",
+                            json={"messages": [{"role": "user", "content":
+                                  "Give this conversation a title: 3 to 6 plain "
+                                  "words, no quotes, no punctuation at the end. "
+                                  "Reply with the title only." + chr(10)
+                                  + chr(10).join(convo)}],
+                                  "stream": False, "temperature": 0.3,
+                                  "max_tokens": 24, "id_slot": AUX_SLOT},
+                            timeout=20.0)
+                        if tresp.status_code == 200:
+                            new_t = (tresp.json()["choices"][0]["message"]
+                                     ["content"] or "").strip().strip('"')
+                            new_t = new_t.splitlines()[0].strip()[:60]
+                            if new_t:
+                                # AUDIT F4: reload — the titling call above is an
+                                # await, and writing this snapshot back would undo
+                                # anything that landed during it. Only the two
+                                # title fields belong to this block.
+                                t_fresh = sessions.load(s["id"])
+                                if t_fresh is not None:
+                                    t_fresh["title"] = new_t
+                                    t_fresh["title_source"] = "auto"
+                                    sessions.save(
+                                        t_fresh,
+                                        base_rev=t_fresh[sessions.REV_KEY])
+                                    s["title"], s["title_source"] = new_t, "auto"
+                                    s[sessions.REV_KEY] = t_fresh[sessions.REV_KEY]
+                                    yield _sse({"title": new_t}, event="meta")
+                except Exception:
+                    pass          # titling is never load-bearing
+                # auto-compact when the window is nearly full, so the NEXT turn
+                # starts small (reactive; uses the engine's real prompt_tokens)
+                ptoks = usage.get("prompt_tokens") or 0
+                wctx = compact_budget(s, (st.read_state() or {}).get("ctx", 0))
+                if (s.get("auto_compact", True) and ptoks and wctx
+                        and ptoks >= AUTO_COMPACT_FRACTION * wctx
+                        and len(s.get("messages", [])) > AUTO_COMPACT_KEEP):
+                    try:
+                        # Autonomous runs: mask observations FIRST. Summarising is
+                        # lossy in the worst direction for an agent — it keeps the
+                        # gist and drops the exact strings (filenames, error text,
+                        # the argument that worked) it navigates by, which
+                        # measurably lengthens trajectories. Masking shrinks only
+                        # the environment's replies and leaves the model's own
+                        # reasoning byte-identical. Chats keep the digest: there the
+                        # prose IS the content.
+                        still_over = True
+                        if s.get("run_id"):
+                            # chars-per-token measured from THIS session's actual
+                            # content, not guessed: the engine just told us ptoks
+                            # for exactly these messages, so chars/ptoks is ground
+                            # truth for this trajectory's mix of prose and paths.
+                            # The static constant failed in a nasty direction —
+                            # path-heavy sessions tokenise near 1 char/token, so a
+                            # 3× assumption let masking finish "under budget" in
+                            # chars while still over in tokens, skipping the
+                            # summarise fallback and setting up a context overflow
+                            # on the NEXT turn. Clamped: a mid-stream ptoks can be
+                            # partial or zero.
+                            sess_chars = context.session_chars(s["messages"])
+                            cpt = max(1.0, min(6.0, sess_chars / ptoks)) \
+                                if ptoks else CHARS_PER_TOKEN
+                            # ONE target for both the masking and the re-check.
+                            # Masking to `budget` while judging against
+                            # `fraction * budget` makes it stop just above the bar
+                            # and summarise anyway — which silently defeats the
+                            # whole point.
+                            target = AUTO_COMPACT_FRACTION * wctx * cpt
+                            masked, n = context.mask_observations(
+                                s["messages"], keep_recent=AUTO_COMPACT_KEEP,
+                                budget_chars=int(target))
+                            if n:
+                                s["messages"] = masked
+                                sessions.save(s)
+                                yield _sse({"masked": n}, event="masked")
+                                # Re-check on the char estimate ONLY when masking
+                                # actually changed something. The engine's
+                                # prompt_tokens is authoritative but describes the
+                                # turn we already sent, so it cannot see the masking
+                                # we just did. Chats never take this path and keep
+                                # using the real token count.
+                                still_over = (context.session_chars(s["messages"])
+                                              >= target)
+                        if still_over:
+                            # AUDIT F12: docs/audit-2026-09-04-full.md — HEARTBEAT.
+                            # All end-of-turn housekeeping happens after the last
+                            # meta/masked chunk, so _drain_turn policed this await
+                            # at IDLE_SECS (90s) rather than PREFILL_SECS. _compact
+                            # folds every chunk in one un-yielding await and floors
+                            # each chunk request at COMPACT_MIN_TIMEOUT (120s); at
+                            # the 104 tok/s prefill this module cites for this
+                            # machine a single 24,000-char chunk is 60-77s of
+                            # prefill alone. So a long run reached the point where
+                            # it MUST compact, was cancelled at 90s, compacted
+                            # again next turn, and two freezes later died reported
+                            # as "engine unresponsive" — blaming the engine for a
+                            # watchdog the work could not satisfy. Ticking here
+                            # makes the watchdog measure ENGINE silence again.
+                            _task = asyncio.ensure_future(
+                                _compact(s, AUTO_COMPACT_KEEP))
+                            try:
+                                while True:
+                                    done, _p = await asyncio.wait(
+                                        {_task}, timeout=TICK_SECS)
+                                    if done:
+                                        break
+                                    yield _sse({"note": "compacting the context"},
+                                               event="housekeeping")
+                                r = _task.result()
+                            finally:
+                                _task.cancel()
+                            if r:
+                                yield _sse({"archived": r[1]}, event="compacted")
+                    except Exception:
+                        # AUDIT F47: docs/audit-2026-09-04-full.md — this was a bare
+                        # `except: pass`. Compaction could fail permanently (a
+                        # wedged aux slot, a masking signature change) while every
+                        # turn still ended cleanly, and the first visible symptom
+                        # was llama-server refusing a request for exceeding the
+                        # context — which sent the user to the fit advisor to be
+                        # told their context is too small. Non-fatal by design,
+                        # NEVER invisible (memory.py:446 records the same rule).
+                        _log.exception("auto-compact failed for session %s",
+                                       s.get("id"))
+                        _cfail = ("_(Auto-compaction failed this turn — the "
+                                  "context is not shrinking. If this keeps "
+                                  "happening the chat will hit the engine's "
+                                  "context limit; see ⚙ → Server → log.)_")
+                        yield _sse({"note": _cfail}, event="notice")
+                        try:
+                            # `notice` on the message is the channel both UIs
+                            # already render, and it is never fed back to the
+                            # model. An SSE-only warning would be invisible,
+                            # which is the whole finding.
+                            f2 = sessions.load(s["id"])
+                            lastm = (f2 or {}).get("messages") or []
+                            lastm = lastm[-1] if lastm else None
+                            if lastm and lastm.get("role") == "assistant":
+                                lastm["notice"] = "\n".join(filter(
+                                    None, [lastm.get("notice"), _cfail]))
+                                sessions.save(
+                                    f2, base_rev=f2[sessions.REV_KEY])
+                        except Exception:
+                            _log.exception("could not attach the "
+                                           "auto-compact notice")
+        except BaseException:
+            _checkpoint(force=True)
+            raise
+        if _ckpt["saved"] and not _ckpt["final"]:
+            if _ckpt["live"].strip() or trace:
+                # the turn ended without reaching the persist block — an engine
+                # error mid-reply, or a `continue` that failed — but the words
+                # and the actions are real. Keep them, flagged, rather than
+                # deleting them: deleting them IS the bug.
+                _checkpoint(force=True)
+            else:
+                # a thinking-only turn produced no answer and ran nothing;
+                # an empty bubble would be the only trace of it
+                _clear_checkpoint()
         yield b"data: [DONE]\n\n"
+
+    # AUDIT F10: docs/audit-2026-09-04-full.md — /api/server is the only handler
+    # on a TIMER (5s in v2, 15s in the legacy UI) and it was the only one doing
+    # its probing on the event loop. Because run_ui builds the app with
+    # registry=None, expected_tg / available_backends / vram_snapshot each did a
+    # full uncached Registry.load() and a probe_hardware(), whose PowerShell
+    # adapter query measures 1.449s on this machine — so a streaming reply
+    # stopped dead for a second and a half every fifteen seconds, and so did
+    # every other request. Threaded, and memoized on the same 20s TTL and for
+    # the same reason as _profile_for_fit: none of it can meaningfully change
+    # between two polls. The live fields (RAM, calibration progress) are NOT
+    # cached — the calibration marker is what the first-load UI watches.
+    _engine_cache: dict = {"at": 0.0, "key": None, "data": None}
+
+    def _engine_extras(s: dict) -> dict:
+        key = (s.get("model"), s.get("quant"), s.get("backend"))
+        if (_engine_cache["data"] is not None and _engine_cache["key"] == key
+                and _now() - _engine_cache["at"] < 20):
+            return dict(_engine_cache["data"])
+        out: dict = {}
+        out["expected_tg"] = server_ops.expected_tg(
+            s["model"], s["quant"], s.get("backend", "unknown"))
+        out["engine_version"] = server_ops.engine_version()
+        try:
+            out["native_ctx"] = registry.models[s["model"]].native_ctx \
+                if registry and s.get("model") in registry.models else None
+        except Exception:
+            out["native_ctx"] = None
+        # whether this model HAS a projector at all, so the UI can offer the
+        # toggle only where it means something instead of showing a dead
+        # control on every text model
+        try:
+            out["has_mmproj"] = bool(
+                registry and getattr(registry.models.get(s["model"]),
+                                     "mmproj", None))
+        except Exception:
+            out["has_mmproj"] = False
+        # Which backends this GPU can run, and which engine builds are already
+        # unpacked. Without the second half the UI would offer ROCm with no hint
+        # that choosing it means a ~1.2GB download first.
+        try:
+            out["backends"] = server_ops.available_backends(registry)
+        except Exception:
+            out["backends"] = []
+        # What the DESKTOP is holding. Windows overcommits VRAM rather than
+        # refusing, so this is the difference between a plan that is resident
+        # and one that is silently paged over PCIe — and it is the one number
+        # the user can act on directly, by closing something.
+        try:
+            out["vram"] = server_ops.vram_snapshot(registry)
+        except Exception:
+            out["vram"] = None
+        _engine_cache.update(at=_now(), key=key, data=dict(out))
+        return out
 
     @app.get("/api/server")
     async def server_info():
         from . import server_ops
         s = st.server_running()
         if s is None:
-            calib = server_ops.read_calib_marker()
+            calib = await asyncio.to_thread(server_ops.read_calib_marker)
             if calib:   # mid-switch: old engine dead, tuning the new one
                 return {"calibrating": calib, "unloaded": False}
             return JSONResponse({"error": "not running"}, status_code=404)
-        exp = server_ops.expected_tg(s["model"], s["quant"],
-                                     s.get("backend", "unknown"))
         info = {k: s.get(k) for k in ("model", "quant", "backend", "use_case",
                                       "ctx", "started_at", "public_port",
                                       "unloaded", "kv_cache", "no_vision")}
-        info.update(server_ops.ram_snapshot())
-        info["calibrating"] = server_ops.read_calib_marker()
-        info["engine_version"] = server_ops.engine_version()
-        try:
-            info["native_ctx"] = registry.models[s["model"]].native_ctx                 if registry and s.get("model") in registry.models else None
-        except Exception:
-            info["native_ctx"] = None
+
+        def _probe() -> dict:
+            out = dict(server_ops.ram_snapshot())
+            out["calibrating"] = server_ops.read_calib_marker()
+            out.update(_engine_extras(s))
+            return out
+
+        info.update(await asyncio.to_thread(_probe))
         info["last_tg"] = telemetry["tg"]
-        info["expected_tg"] = exp
-        info["verdict"] = server_ops.verdict(telemetry["tg"], exp)
+        info["verdict"] = server_ops.verdict(telemetry["tg"],
+                                             info.get("expected_tg"))
         info["openai_base"] = f"http://127.0.0.1:{s['public_port']}/v1"
-        # whether this model HAS a projector at all, so the UI can offer the
-        # toggle only where it means something instead of showing a dead
-        # control on every text model
-        try:
-            info["has_mmproj"] = bool(
-                registry and getattr(registry.models.get(s["model"]),
-                                     "mmproj", None))
-        except Exception:
-            info["has_mmproj"] = False
-        # Which backends this GPU can run, and which engine builds are already
-        # unpacked. Without the second half the UI would offer ROCm with no hint
-        # that choosing it means a ~1.2GB download first.
-        try:
-            info["backends"] = server_ops.available_backends(registry)
-        except Exception:
-            info["backends"] = []
-        # What the DESKTOP is holding. Windows overcommits VRAM rather than
-        # refusing, so this is the difference between a plan that is resident
-        # and one that is silently paged over PCIe — and it is the one number
-        # the user can act on directly, by closing something.
-        try:
-            info["vram"] = server_ops.vram_snapshot(registry)
-        except Exception:
-            info["vram"] = None
         return info
 
     @app.get("/api/server/stats")
@@ -2071,21 +2618,31 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = st.read_state()
         if s is None:
             return JSONResponse({"error": "not running"}, status_code=404)
-        if not switch_lock.acquire(blocking=False):
-            return JSONResponse({"error": "a switch is already in progress"},
-                                status_code=409)
+        # AUDIT F11: docs/audit-2026-09-04-full.md — validate BEFORE the lock.
+        # This block does registry loads and a backend probe, both of which
+        # raise on a corrupt gpus.json or model spec, and `backend` used to be
+        # .strip()ed without a str() coercion, so {"backend": 5} raised
+        # AttributeError. Any of those inside the lock leaked it permanently:
+        # every engine control 409s forever after, and _ensure_loaded taxes
+        # every chat turn and every /v1 request 30s polling a lock nobody
+        # holds. The four sibling handlers all acquire immediately before
+        # their try/finally; this one now matches them.
         kv = body.get("kv") or None
         if kv is not None and kv not in server_ops.KV_CACHE_TYPES:
-            switch_lock.release()
             return JSONResponse(
                 {"error": f"kv must be one of "
                           f"{', '.join(server_ops.KV_CACHE_TYPES)}"},
                 status_code=400)
-        backend = (body.get("backend") or "").strip() or None
+        backend = str(body.get("backend") or "").strip() or None
         if backend is not None:
-            avail = {b["name"] for b in server_ops.available_backends(registry)}
+            try:
+                avail = {b["name"]
+                         for b in server_ops.available_backends(registry)}
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"could not read the backend list: {e}"},
+                    status_code=502)
             if backend not in avail:
-                switch_lock.release()
                 return JSONResponse(
                     {"error": f"this GPU cannot run {backend} — it supports "
                               f"{', '.join(sorted(avail)) or 'nothing detected'}"},
@@ -2096,17 +2653,25 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         vision = None if vision is None else bool(vision)
         if vision is False:
             from .registry import Registry
-            reg = registry if registry is not None else Registry.load()
+            try:
+                reg = registry if registry is not None else Registry.load()
+            except Exception as e:
+                return JSONResponse({"error": f"could not read the model "
+                                              f"registry: {e}"},
+                                    status_code=502)
             if getattr(reg.models.get(s["model"]), "mmproj", None) is None:
-                switch_lock.release()
                 return JSONResponse(
                     {"error": f"{s['model']} has no vision projector — there "
                               "is nothing to turn off"}, status_code=400)
+        if not switch_lock.acquire(blocking=False):
+            return JSONResponse({"error": "a switch is already in progress"},
+                                status_code=409)
         try:
             new_state = await asyncio.to_thread(
                 server_ops.perform_switch, s["model"], registry, None, want,
                 False, kv, vision, None, backend)
             telemetry["tg"] = None
+            _engine_cache.update(at=0.0, data=None)   # AUDIT F10
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)
         finally:
@@ -2122,6 +2687,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         try:
             s = await asyncio.to_thread(server_ops.perform_unload)
             telemetry["tg"] = None
+            _engine_cache.update(at=0.0, data=None)   # AUDIT F10
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=409)
         finally:
@@ -2136,6 +2702,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 status_code=409)
         try:
             s = await asyncio.to_thread(server_ops.perform_load, registry)
+            _engine_cache.update(at=0.0, data=None)   # AUDIT F10
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)
         finally:
@@ -2151,6 +2718,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         try:
             s = await asyncio.to_thread(server_ops.perform_recalibrate, registry)
             telemetry["tg"] = None
+            _engine_cache.update(at=0.0, data=None)   # AUDIT F10
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=502)
         finally:
@@ -2321,10 +2889,41 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 status_code=400)
         inbox = hangar.rigma_home() / "custom" / "incoming"
         inbox.mkdir(parents=True, exist_ok=True)
+        # AUDIT F39: docs/audit-2026-09-04-full.md — this reads the raw body via
+        # request.stream(), so FastAPI never checks Content-Type and nothing
+        # bounded the write: an unattended POST could fill the volume the models
+        # and the sessions live on. Declare the size, and stop the moment the
+        # body disagrees with the declaration.
+        declared = request.headers.get("content-length")
+        if declared is None or not declared.strip().isdigit():
+            return JSONResponse(
+                {"error": "a Content-Length is required to upload a model"},
+                status_code=411)
+        size = int(declared)
+        if size <= 0 or size > UPLOAD_MAX_BYTES:
+            return JSONResponse(
+                {"error": f"upload is {size} bytes; the limit is "
+                          f"{UPLOAD_MAX_BYTES} ({UPLOAD_MAX_BYTES // 2**30}GB)"},
+                status_code=413)
+        try:
+            free = shutil.disk_usage(inbox).free
+        except OSError:
+            free = None
+        if free is not None and size + UPLOAD_FREE_MARGIN_BYTES > free:
+            return JSONResponse(
+                {"error": f"not enough free space: {size // 2**20}MB incoming, "
+                          f"{free // 2**20}MB free"}, status_code=507)
         tmp, staged = inbox / (name + ".part"), inbox / name
         try:
+            written = 0
             with open(tmp, "wb") as f:
                 async for chunk in request.stream():
+                    written += len(chunk)
+                    if written > size:
+                        return JSONResponse(
+                            {"error": "the upload sent more than its declared "
+                                      "Content-Length; nothing was installed"},
+                            status_code=413)
                     await asyncio.to_thread(f.write, chunk)   # GBs: don't block
             os.replace(tmp, staged)
             spec = await asyncio.to_thread(hangar.install_model, staged,
@@ -2686,8 +3285,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         except Exception:
                             pass          # telemetry must never kill a turn
                 # a tool event => a tool is running and/or a continuation is about
-                # to prefill; grant the next wait the generous budget
-                expect_prefill = b"event: tool" in chunk
+                # to prefill; grant the next wait the generous budget.
+                # AUDIT F12: docs/audit-2026-09-04-full.md — `housekeeping` is
+                # the same promise made by end-of-turn work (compaction folds a
+                # chunk at a time, each floored at COMPACT_MIN_TIMEOUT=120s).
+                # Policing that at IDLE_SECS killed exactly the runs that had
+                # grown big enough to need it, and reported the engine as
+                # frozen.
+                expect_prefill = any(e in chunk for e in PREFILL_EVENTS)
                 if err is None and b"event: error" in chunk:
                     try:
                         payload = chunk.decode("utf-8", "replace").split(
@@ -2737,7 +3342,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             + ("" if spec.get("compiled") else " (compile failed; using the "
                "request as a single step)"),
             "starting step 1", run.get("workspace", ""))
-        _runs.save(run)
+        _save_run_merged(run)
 
     def _memory_store():
         from . import memory as _mem
@@ -2787,6 +3392,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def _aux_complete(prompt: str, max_tokens: int = 120) -> str:
         """One small fresh-context completion on the aux slot, thinking off.
         Returns "" on any failure — aux calls are never load-bearing."""
+        activity["last"] = _now()   # AUDIT F14: the engine is doing this work
         try:
             resp = await client.post(
                 "/v1/chat/completions",
@@ -2884,7 +3490,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         run["completion_checked"] = True
                         run["force_completion"] = True
                         run["lazy_streak"] = 0
-                        _runs.save(run)
+                        _save_run_merged(run)
                     else:
                         _score_current_step(run, -2)
                         _runs.set_status(run, "stalled", "no progress / idle")
@@ -2914,7 +3520,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             _runs.append_progress(
                                 run_id, "advisor: " + advice[:120],
                                 "apply the advice", run.get("workspace", ""))
-                        _runs.save(run)
+                        _save_run_merged(run)
                 except Exception:
                     _log.exception("reflection failed")
                 session = sessions.load(sid)
@@ -2948,7 +3554,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                     f"for step #{cur_step}",
                                     pend[0].get("text", "")[:60],
                                     run.get("workspace", ""))
-                            _runs.save(run)
+                            _save_run_merged(run)
                 except Exception:
                     _log.exception("memory: per-step recall failed")
                 session["messages"].append({"role": "user", "content": driving})
@@ -3052,7 +3658,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _runs.set_status(run, "frozen", "engine unresponsive")
                         break
                     run["iteration"] = run.get("iteration", 0) + 1
-                    _runs.save(run)
+                    _save_run_merged(run)
                     continue
                 run["frozen_streak"] = 0
                 if turn_err:      # the engine rejected/failed the turn — SURFACE it
@@ -3074,12 +3680,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _runs.set_status(run, "error", "engine could not build a "
                                          "tool-call parser for this template")
                         break
+                    # AUDIT F14: docs/audit-2026-09-04-full.md — a
+                    # connection-shaped error means the engine is GONE (idle
+                    # auto-unload, a crash, a manual unload). Only the frozen
+                    # branch reloaded it, so a run that hit this instead
+                    # retried against a dead port eight times and ended
+                    # "stalled" with no reload ever attempted.
+                    if any(w in low for w in ("unreachable", "unloaded",
+                                              "connect", "refused")):
+                        try:
+                            await _ensure_loaded()
+                        except Exception:
+                            pass
                     run["error_streak"] = run.get("error_streak", 0) + 1
                     _runs.append_progress(run_id, "ENGINE ERROR: " + turn_err,
                                           "retrying", run.get("workspace", ""))
                     run["iteration"] = run.get("iteration", 0) + 1
                     prev_sig = None
-                    _runs.save(run)
+                    _save_run_merged(run)
                     continue
                 trace = _last_trace(sessions.load(sid))
                 for t in trace:
@@ -3154,7 +3772,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _runs.append_progress(
                             run_id, "task_complete refused — deliverables missing",
                             "; ".join(missing[:3]), run.get("workspace", ""))
-                        _runs.save(run)
+                        _save_run_merged(run)
                         prev_sig = None
                         continue
                     if pending and challenges < MAX_COMPLETION_CHALLENGES:
@@ -3167,14 +3785,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             "still pending",
                             f"finish #{pending[0]['id']} {pending[0]['text']}",
                             run.get("workspace", ""))
-                        _runs.save(run)
+                        _save_run_merged(run)
                         prev_sig = None
                         continue
                     if not run.get("verified_once"):
                         run.update(verified_once=True, _verify_pending=True,
                                    error_streak=0, lazy_streak=0)
                         run["iteration"] = run.get("iteration", 0) + 1
-                        _runs.save(run)
+                        _save_run_merged(run)
                         prev_sig = None
                         continue
                     summ = next((t.get("args", {}).get("summary", "")
@@ -3376,7 +3994,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 except Exception:
                     _log.exception("step-budget accounting failed")
                 run["iteration"] = run.get("iteration", 0) + 1
-                _runs.save(run)
+                _save_run_merged(run)
         except asyncio.CancelledError:
             r = _runs.load(run_id)
             if r and r.get("status") == "running":
@@ -3566,6 +4184,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         task = _run_tasks.get(rid)
         if task:
             task.cancel()
+        # AUDIT F31: docs/audit-2026-09-04-full.md — cancelling the asyncio task
+        # does nothing to the children start_job detached. Without this, Stop
+        # left `python train.py` holding VRAM and its port, and after a restart
+        # the in-process id table was gone so kill_job answered "no such job"
+        # for an orphan that was still running.
+        try:
+            from . import tools as _tk
+            killed = _tk.kill_all_jobs()
+            if killed:
+                _log.info("stop_run %s: killed %d background job(s)", rid, killed)
+        except Exception:
+            _log.exception("stop_run: killing background jobs failed")
         if r.get("status") in ("running", "paused"):
             _runs.set_status(r, "stopped", "stopped by user")
         return _runs.load(rid)
@@ -3818,9 +4448,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         async def _loop():
             from . import server_ops
             while True:
-                await asyncio.sleep(30)
+                await asyncio.sleep(KEEPALIVE_POLL_SECS)
                 s = st.read_state()
                 if not s or s.get("unloaded"):
+                    continue
+                # AUDIT F14: docs/audit-2026-09-04-full.md — never unload out
+                # from under work. `activity["last"]` was stamped only at
+                # request arrival by the chat route and the /v1 proxy, so an
+                # autonomous run (which reaches the engine through _llm_turn on
+                # the internal client) looked idle and got its engine killed
+                # mid-flight; the run then retried against a dead port and
+                # ended "stalled". A single chat turn whose prefill outlasts
+                # the window died the same way — PREFILL_SECS allows 420s.
+                if _run_tasks or _streaming:
+                    activity["last"] = _now()
                     continue
                 if activity["last"] and _now() - activity["last"] > mins * 60:
                     if switch_lock.acquire(blocking=False):

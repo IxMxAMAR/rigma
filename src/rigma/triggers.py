@@ -14,7 +14,7 @@ tests/test_triggers.py:
   3. a trigger that fires MUTE_AFTER turns running with no user input is
      muted until the user speaks again -- and the muting is announced
 
-Spec §4.3: docs/superpowers/specs/2026-07-21-custom-methods-design.md
+Spec §4.3: the custom-methods design note (local)
 """
 from __future__ import annotations
 

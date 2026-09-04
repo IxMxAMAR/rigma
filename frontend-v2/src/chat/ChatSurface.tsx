@@ -8,7 +8,7 @@ import ModelPicker from "./ModelPicker";
 import { useApp } from "../store";
 import Sidecar from "./Sidecar";
 import Transcript from "./Transcript";
-import { useChat } from "./chatStore";
+import { selectStreaming, useChat } from "./chatStore";
 
 function SessionRail() {
   const sessions = useChat((s) => s.sessions);
@@ -140,7 +140,7 @@ function ContextMeter() {
 function Composer() {
   const send = useChat((s) => s.send);
   const stop = useChat((s) => s.stop);
-  const streaming = useChat((s) => s.streaming);
+  const streaming = useChat(selectStreaming);
   const images = useChat((s) => s.images);
   const addImage = useChat((s) => s.addImage);
   const removeImage = useChat((s) => s.removeImage);
@@ -161,7 +161,10 @@ function Composer() {
     const text = draft.trim();
     if (!text || streaming) return;
     setDraft("");
-    void send(text);
+    // AUDIT F50: docs/audit-2026-09-04-full.md — the draft was cleared before
+    // send()'s first await. A backend that was restarting took the typed
+    // paragraph with it: no bubble, no error, no spinner, just an empty box.
+    void send(text).then((started) => { if (!started) setDraft(text); });
   };
 
   // autosize: content height up to ~7 lines

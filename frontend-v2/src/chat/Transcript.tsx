@@ -3,7 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../lib/api";
 import Markdown from "./Markdown";
-import { useChat, type Chip, type StreamingTurn } from "./chatStore";
+import {
+  selectStreaming, useChat, type Chip, type StreamingTurn,
+} from "./chatStore";
 
 function ChipRow({ chip }: { chip: Chip }) {
   return (
@@ -242,12 +244,30 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
   );
 }
 
+// AUDIT F49: docs/audit-2026-09-04-full.md — the reason a turn failed used to
+// live on the streaming object, which the end-of-turn reload destroys. On a
+// 3-second engine error the screen was left reading as if the model had simply
+// chosen not to answer. It now outlives the turn and says so here.
+function TurnError({ text, onClose }: { text: string; onClose: () => void }) {
+  return (
+    <div role="alert"
+         className="flex items-start gap-2 rounded-md border border-red/30 bg-red/10 px-3 py-2 text-[12.5px] text-red">
+      <span className="shrink-0" aria-hidden="true">▲</span>
+      <span className="flex-1 min-w-0 whitespace-pre-wrap">{text}</span>
+      <button onClick={onClose} aria-label="dismiss error"
+              className="shrink-0 text-red/70 hover:text-red leading-none">×</button>
+    </div>
+  );
+}
+
 const WINDOW = 150;
 
 export default function Transcript() {
   const messages = useChat((s) => s.messages);
-  const streaming = useChat((s) => s.streaming);
+  const streaming = useChat(selectStreaming);
   const currentId = useChat((s) => s.currentId);
+  const lastError = useChat((s) => s.lastError);
+  const clearError = useChat((s) => s.clearError);
   const [shown, setShown] = useState(WINDOW);
   useEffect(() => setShown(WINDOW), [currentId]);
   const endRef = useRef<HTMLDivElement>(null);
@@ -299,6 +319,7 @@ export default function Transcript() {
           );
         })}
         {streaming && <LiveTurn turn={streaming} />}
+        {lastError && <TurnError text={lastError} onClose={clearError} />}
         <div ref={endRef} />
       </div>
     </div>
