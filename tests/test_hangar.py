@@ -271,6 +271,10 @@ def test_download_file_streams_with_progress_and_resume(home, tmp_path,
     # resume: a .part already has 1MB, server returns 206 with the remaining 2MB
     dest2 = tmp_path / "r.gguf"
     (tmp_path / "r.gguf.part").write_bytes(b"y" * 2**20)
+    # A partial is only a resume point for the (repo, file) that wrote it —
+    # otherwise it is another model's bytes under a shared basename, and gets
+    # discarded instead of appended to (F27, tests/test_audit_hangar.py).
+    H._claim_partial(dest2, "r/x", "r.gguf")
     ranged = {}
     def _stream(method, url, headers=None, **k):
         ranged["range"] = (headers or {}).get("range")

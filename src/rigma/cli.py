@@ -485,6 +485,37 @@ def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> 
     return text
 
 
+def _save_chat_turn(sid: str, turn: list, stored: int, first_line: str,
+                    tries: int = 3):
+    """Graft this turn onto whatever is stored NOW and write it under the guard.
+
+    AUDIT F2: docs/audit-2026-09-04-full.md — `sessions.save` replaces the whole
+    row, so writing back a list this terminal read before the generation started
+    destroys everything that landed during it. `reload_and_extend` re-reads and
+    appends only this turn's own messages; `base_rev` makes a write that lost
+    the race fail loudly instead of winning it.
+
+    Returns the saved session, or None (having said why) when the turn could not
+    be written — the session was deleted, or another writer kept winning.
+    """
+    from . import sessions
+    for _ in range(tries):
+        merged = sessions.reload_and_extend(sid, turn, since=stored)
+        if merged is None:
+            typer.echo(f"session {sid} was deleted elsewhere — ending this chat")
+            return None
+        if merged.get("title") == "New chat":
+            merged["title"] = first_line[:40]
+        try:
+            sessions.save(merged, base_rev=merged[sessions.REV_KEY])
+            return merged
+        except sessions.StaleWriteError:
+            continue      # something landed between the reload and the write
+    typer.echo("could not save this turn — the session is being written from "
+               "somewhere else. Nothing was overwritten; the reply is above.")
+    return None
+
+
 @app.command()
 def chat(session: str = typer.Option(None, "--session",
                                      help="Resume a session by id (ids shown in the UI)")):
@@ -523,7 +554,8 @@ def chat(session: str = typer.Option(None, "--session",
         model_defaults = Registry.load().models[s["model"]].default_params
     except Exception:
         pass
-    typer.echo(f"{s['model']} ({s['quant']}) — session {sess['id']} — "
+    sid = sess["id"]
+    typer.echo(f"{s['model']} ({s['quant']}) — session {sid} — "
                f"exit with 'exit' or Ctrl+C")
     while True:
         try:
@@ -532,24 +564,47 @@ def chat(session: str = typer.Option(None, "--session",
             break
         if q.strip().lower() in ("exit", "quit"):
             break
-        sess["messages"].append({"role": "user", "content": q})
-        if sess.get("title") == "New chat":
-            sess["title"] = q[:40]
-        sessions.save(sess)
+        # AUDIT F2: docs/audit-2026-09-04-full.md — re-read at the top of every
+        # turn. This prompt can sit open for hours while the browser writes into
+        # the same session, and the loaded-once snapshot took title, system
+        # prompt, notes, params, digest and archive down with the messages. The
+        # legacy per-chat JSON files froze at the SQLite migration, so there was
+        # nothing to recover from. serve.py has reloaded before saving since the
+        # same bug cost it minutes; here the window is an evening.
+        fresh = sessions.load(sid)
+        if fresh is None:
+            typer.echo(f"session {sid} was deleted elsewhere — ending this chat")
+            break
+        sess = fresh
+        stored = len(sess["messages"])
+        turn = list(sess["messages"]) + [{"role": "user", "content": q}]
         try:
+            sending = {**sess, "messages": turn}
             reply = _stream_chat(s["public_port"],
-                                 sessions.build_messages(sess, default, preset),
-                                 sessions.effective_params(sess, preset,
+                                 sessions.build_messages(sending, default,
+                                                         preset),
+                                 sessions.effective_params(sending, preset,
                                                            model_defaults))
         except Exception as e:
+            # Nothing has been written yet. The save used to happen BEFORE this
+            # call, so an unreachable engine landed the stale snapshot anyway,
+            # and the handler then popped the user turn and landed it a second
+            # time. A turn that never got an answer is a turn that never was.
             typer.echo(f"\nmodel unreachable: {e} — check `rigma status`")
-            sess["messages"].pop()   # drop the unanswered user turn: a
-            sessions.save(sess)      # dangling user msg breaks strict templates
             continue
-        sess["messages"].append({"role": "assistant", "content": reply})
-        sessions.save(sess)
-    if created and not sess["messages"]:
-        sessions.delete(sess["id"])
+        turn.append({"role": "assistant", "content": reply})
+        saved = _save_chat_turn(sid, turn, stored, q)
+        if saved is None:
+            break
+        sess = saved
+    # AUDIT F2: docs/audit-2026-09-04-full.md — tidying away an unused new chat
+    # has to ask the STORE, not `sess`. On the lost-race break above, `sess` is
+    # the snapshot this loop read before the turn; deleting on it destroys what
+    # the writer that won had just put there — the prose F2 exists to protect.
+    if created:
+        final = sessions.load(sid)
+        if final is not None and not final.get("messages"):
+            sessions.delete(sid)
 
 
 @app.command()
@@ -745,6 +800,16 @@ def stop():
     typer.echo("stopped")
 
 
+def _wants_vision(spec) -> bool:
+    """This model's own opinion about its vision projector.
+
+    True unless the model pinned `vision: false` — LaunchDefaults keeps None
+    (no opinion) distinct from False (deliberately text-only) precisely so a
+    relaunch cannot reload a projector the user turned off.
+    """
+    return getattr(getattr(spec, "launch", None), "vision", None) is not False
+
+
 @app.command()
 def up(use_case: str = typer.Option("general", "--use-case"),
        model: str = typer.Option(None, "--model"),
@@ -830,9 +895,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     # perform_switch, so without this a pinned default would apply to the UI's
     # load button and silently not to the CLI.
     _launch = getattr(reg.models.get(rp.model_slug), "launch", None)
+    _vision = _wants_vision(reg.models.get(rp.model_slug))
     if _launch is not None:
         _d = _launch.as_overrides()
-        _vision = _d.get("vision", True)
         if "quant" in _d:
             from .server_ops import _model_on_disk
             want = _d["quant"].strip().lower()
@@ -855,20 +920,6 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if _upd:
             rp.flags = rp.flags.model_copy(update=_upd)
             rp.origin += "+model-default"
-        # Re-fit against what will ACTUALLY be resident: no projector when
-        # vision is off, plus the draft cache when speculation is on. Without
-        # this the plan reserves 600MB for a projector it will not load and
-        # nothing for a draft cache it will, and lands on a needless offload.
-        from .resolve import fit_gguf as _fit
-        from .resolve import with_launch_overheads as _overheads
-        _spec2 = _overheads(reg.models[rp.model_slug], vision=_vision,
-                            ctx=rp.flags.ctx, kv=rp.flags.cache_type_k,
-                            spec_type=rp.flags.spec_type,
-                            n_max=rp.flags.spec_n_max)
-        _fl = _fit(_spec2, rp.gguf, p, rp.flags.ctx, [])
-        if _fl is not None:
-            rp.flags = rp.flags.model_copy(update={
-                "ngl": _fl.ngl, "n_cpu_moe": _fl.n_cpu_moe})
     if ctx is not None:
         native = reg.models[rp.model_slug].native_ctx
         rp.flags = rp.flags.model_copy(update={"ctx": max(1024, min(ctx, native))})
@@ -914,6 +965,24 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                 raise typer.Exit(2)
         rp.flags = rp.flags.model_copy(update={"spec_type": spec})
         rp.origin += "+spec-override"
+    # Re-fit against what will ACTUALLY be resident: no projector when vision is
+    # off, plus the draft cache when speculation is on. Otherwise the plan
+    # reserves 600MB for a projector it will not load and nothing for a draft
+    # cache it will, and lands on a needless offload.
+    # AUDIT F18: docs/audit-2026-09-04-full.md — this sits BELOW the overrides
+    # now. --ctx and --spec both move the answer, and running it above them
+    # meant `rigma up --spec ...` budgeted a draft cache of the wrong size, or
+    # none at all.
+    _spec_r = reg.models.get(rp.model_slug)
+    if _spec_r is not None:
+        from .server_ops import launch_fit_spec as _fit_spec
+        _spec2, _differs = _fit_spec(_spec_r, rp.flags, vision=_vision)
+        if _launch is not None or _differs:
+            from .resolve import fit_gguf as _fit
+            _fl = _fit(_spec2, rp.gguf, p, rp.flags.ctx, [])
+            if _fl is not None:
+                rp.flags = rp.flags.model_copy(update={
+                    "ngl": _fl.ngl, "n_cpu_moe": _fl.n_cpu_moe})
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
@@ -942,7 +1011,13 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             model_path = runtime.ensure_model(cand.gguf)
             extra = []
             spec_c = reg.models.get(cand.model_slug)
-            if spec_c is not None and spec_c.mmproj is not None:
+            # AUDIT F18: docs/audit-2026-09-04-full.md — the plan frees the
+            # projector's memory and hands it to more GPU layers, so attaching
+            # it here anyway overcommits the card (and `ensure_model` DOWNLOADS
+            # it first). Asked per candidate: a fallback is a different model
+            # with its own opinion.
+            if (spec_c is not None and spec_c.mmproj is not None
+                    and _wants_vision(spec_c)):
                 mm_path = runtime.ensure_model(spec_c.mmproj)
                 extra = ["--mmproj", str(mm_path)]
             # repaired-template override, same rule as server_ops.switch_model.
@@ -980,7 +1055,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     st.write_state(rp.model_slug, rp.gguf.quant, port,
                    engine_pid=sp.proc.pid, ui_pid=os.getpid(),
                    backend=rp.backend, use_case=use_case, ctx=rp.flags.ctx,
-                   gguf=rp.gguf.file)
+                   gguf=rp.gguf.file,
+                   # a projector this launch left off must stay off: perform_switch
+                   # reads no_vision back when the caller has no opinion, and a
+                   # ctx change from the UI would otherwise reload it
+                   no_vision=not _wants_vision(reg.models.get(rp.model_slug)))
     typer.echo(f"chat UI:  http://127.0.0.1:{port}")
     typer.echo(f"OpenAI:   http://127.0.0.1:{port}/v1")
     typer.echo("stop:     Ctrl+C here, or `rigma stop` from any terminal")

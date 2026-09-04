@@ -7,7 +7,7 @@ interpreter possible, and it is why this module has no rigma imports: it is
 pure data rules, so both the save path and the builder tools can lean on it
 without dragging the server in.
 
-Spec: docs/superpowers/specs/2026-07-21-custom-methods-design.md
+Spec: the custom-methods design note (local)
 """
 from __future__ import annotations
 
@@ -173,7 +173,11 @@ def _validate_steps(steps, where: str, var_names: set[str],
             if step.get("op") not in ("append", "replace"):
                 errs.append(f"{at}: note op must be 'append' or 'replace'")
         elif kind == "new_chat":
-            for f in step.get("carry") or []:
+            carry = step.get("carry") or []
+            if not isinstance(carry, (list, tuple)):   # AUDIT F43: "carry": 5
+                errs.append(f"{at}: carry must be a list of field names")
+                carry = []
+            for f in carry:
                 if f not in CARRY_FIELDS:
                     errs.append(f"{at}: cannot carry '{f}' -- carry one of "
                                 f"{', '.join(CARRY_FIELDS)}")
@@ -232,7 +236,17 @@ def validate(doc: dict, tool_names: set[str]) -> list[str]:
             if not str(r.get("text") or "").strip():
                 errs.append(f"rule '{rid}': a standing rule needs text")
             continue
-        on, do = r.get("on") or {}, r.get("do") or {}
+        # AUDIT F43: docs/audit-2026-09-04-full.md — `or {}` rescues null but not
+        # a wrong TYPE: `"on": "boom"` is truthy, so `.get` below raised
+        # AttributeError straight out of validate() and POST /api/methods and
+        # /import answered an unhandled 500 instead of the documented 400 with a
+        # self-correcting errors array. validate() must report bad input, never
+        # raise on it — it is the only thing standing between a hand-edited file
+        # and the endpoint used to repair one.
+        on, do = r.get("on"), r.get("do")
+        if not isinstance(on, dict) or not isinstance(do, dict):
+            errs.append(f"rule '{rid}': 'on' and 'do' must each be an object")
+            continue
         if on.get("event") not in TRIGGER_EVENTS:
             errs.append(f"rule '{rid}': unknown event "
                         f"'{on.get('event')}' -- use one of "
@@ -240,8 +254,13 @@ def validate(doc: dict, tool_names: set[str]) -> list[str]:
         if on.get("event") == "tool_ran" and on.get("tool") \
                 and on["tool"] not in tool_names:
             errs.append(f"rule '{rid}': no such tool '{on['tool']}'")
-        if on.get("event") == "every_n_turns" and int(on.get("n", 0) or 0) < 1:
-            errs.append(f"rule '{rid}': every_n_turns needs n >= 1")
+        if on.get("event") == "every_n_turns":
+            try:                                   # AUDIT F43: "n": "two"
+                n_ok = int(on.get("n", 0) or 0) >= 1
+            except (TypeError, ValueError):
+                n_ok = False
+            if not n_ok:
+                errs.append(f"rule '{rid}': every_n_turns needs n >= 1")
         mode = do.get("mode", "nudge")
         if mode not in TRIGGER_MODES:
             errs.append(f"rule '{rid}': mode must be 'nudge' or 'run'")

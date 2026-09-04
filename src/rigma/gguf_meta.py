@@ -232,15 +232,34 @@ def _inspect(f, fallback: str) -> GgufInfo:
     # makes long contexts read as "won't fit" (live repro 2026-07-18: Gemma4
     # 26B-A4B capped at 8K when it runs at 256K).
     swa = g("attention.sliding_window_pattern")   # True = windowed, False = global
+    # AUDIT F19: docs/audit-2026-09-04-full.md — the windowed layers were
+    # identified only to be EXCLUDED, and the geometry thrown away. llama.cpp
+    # allocates them a second, window-sized KV cache (~400 MiB on a 27B-class
+    # SWA model), which nothing downstream could budget because nothing carried
+    # the numbers. Reported here so the resolver can charge for it; a file with
+    # no window reports zeros and is charged nothing.
+    swa_window = int(g("attention.sliding_window", 0) or 0)
+    swa_layers = swa_kv_heads = 0
     if isinstance(kv, list):
         if isinstance(swa, list) and len(swa) == len(kv):
             gi = [i for i, w in enumerate(swa) if not w]   # global-layer indices
+            wi = [i for i, w in enumerate(swa) if w]       # windowed-layer ones
+            if wi:
+                swa_layers = len(wi)
+                swa_kv_heads = max(int(kv[i]) for i in wi)
             if gi:
                 full_attn = len(gi)
                 kv_heads = max(int(kv[i]) for i in gi)
             else:                                          # all windowed (rare)
                 full_attn = sum(1 for h in kv if int(h) > 0)
                 kv_heads = max((int(h) for h in kv), default=0)
+                # AUDIT F19: with no global layers, `full_attn` above already
+                # charges every layer at the full context. Reporting the same
+                # layers as windowed too would bill them twice. Drop the
+                # windowed term rather than the full one: over-charging is the
+                # safe direction here, and this keeps the rare branch exactly
+                # as it behaved before the windowed term existed.
+                swa_layers = swa_kv_heads = 0
         else:
             # per-layer table without an SWA pattern: zeros are linear-attention
             # (DeltaNet) layers that hold no KV cache
@@ -276,6 +295,13 @@ def _inspect(f, fallback: str) -> GgufInfo:
               # geometry needed to re-derive the above without the file in hand,
               # so a spec written by an older probe can be healed on read
               "full_attention_interval": int(g("full_attention_interval", 0) or 0),
+              # sliding-window geometry: how many layers hold a cache bounded
+              # by the window rather than by ctx, how wide they are, and how
+              # long the window is. All three or nothing — a zero window means
+              # "no evidence of SWA", not "a window of zero".
+              "swa_layers": swa_layers if swa_window else 0,
+              "swa_kv_heads": swa_kv_heads if swa_window else 0,
+              "swa_window": swa_window if swa_layers else 0,
               "mtp_layers": mtp_layers,
               # the file's own inventory, not the header's claims
               "mtp": tx.has_mtp,

@@ -21,6 +21,7 @@ WAL are the boring, correct answer.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -34,10 +35,28 @@ CREATE TABLE IF NOT EXISTS sessions(
   updated_at REAL NOT NULL DEFAULT 0,
   use_rag INTEGER NOT NULL DEFAULT 0,
   message_count INTEGER NOT NULL DEFAULT 0,
-  body TEXT NOT NULL
+  body TEXT NOT NULL,
+  rev INTEGER NOT NULL DEFAULT 0,
+  fts_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_at DESC);
 """
+# AUDIT F1: docs/audit-2026-09-04-full.md
+# Columns added after the table shipped. ALTER TABLE ... ADD COLUMN is the
+# entire migration: SQLite records it in the schema without rewriting the
+# table, existing rows read back with the DEFAULT (rev 0, no index hash), and
+# a database written by any earlier build keeps every row it had.
+_MIGRATIONS = (
+    ("rev", "ALTER TABLE sessions ADD COLUMN rev INTEGER NOT NULL DEFAULT 0"),
+    ("fts_hash",
+     "ALTER TABLE sessions ADD COLUMN fts_hash TEXT NOT NULL DEFAULT ''"),
+)
+
+# The revision a session was loaded at travels on the session dict under this
+# key. Leading underscore, and no member of sessions._SESSION_DEFAULTS, so it
+# cannot collide with a session field; upsert_session strips it, so it never
+# reaches the stored body.
+REV_KEY = "_rev"
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS session_fts
 USING fts5(id UNINDEXED, title, text);
@@ -64,6 +83,10 @@ def connect() -> sqlite3.Connection:
     key = str(p)
     if key not in _initialised:
         c.executescript(_SCHEMA)
+        have = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
+        for col, ddl in _MIGRATIONS:
+            if col not in have:
+                c.execute(ddl)
         try:
             c.executescript(_FTS_SCHEMA)
             _fts_available[key] = True
@@ -82,44 +105,108 @@ def has_fts() -> bool:
 
 def _fts_text(session: dict, cap: int = 1_000_000) -> str:
     """The searchable text of a session: title + message bodies (vision parts
-    contribute their text only)."""
+    contribute their text only).
+
+    AUDIT F16: docs/audit-2026-09-04-full.md — `total` replaces a
+    `sum(len(x) for x in parts)` re-walked once per message. That rescan is
+    O(n^2) in the message count and measured 206 ms on a ~4000-message
+    session, on the same event loop that carries the token stream. The
+    accumulator is the number the sum produced, so the text is unchanged.
+    """
     parts = [str(session.get("title") or "")]
+    total = len(parts[0])
     for m in session.get("messages", []):
         content = m.get("content", "")
         if isinstance(content, list):
             content = " ".join(p.get("text", "") for p in content
                                if isinstance(p, dict))
-        parts.append(str(content or ""))
-        if sum(len(x) for x in parts) > cap:
+        text = str(content or "")
+        parts.append(text)
+        total += len(text)
+        if total > cap:
             break
     return "\n".join(parts)[:cap]
 
 
-def upsert_session(session: dict) -> None:
-    body = json.dumps(session, indent=2)
+def _fts_digest(text: str) -> str:
+    """Fingerprint of the text an FTS row was built from. Hashing 1 MB costs
+    ~1 ms against the ~105 ms the FTS5 rewrite costs, so it is worth paying to
+    answer "did anything searchable actually change?" — a params, notes or
+    preset save touches no indexed byte, and a mid-session message edit still
+    changes the digest and gets reindexed."""
+    return hashlib.blake2b(text.encode("utf-8", "surrogatepass"),
+                           digest_size=16).hexdigest()
+
+
+def upsert_session(session: dict, base_rev: int | None = None) -> int | None:
+    """Write the session; return its new revision, or None if `base_rev` lost.
+
+    AUDIT F1: docs/audit-2026-09-04-full.md — `base_rev` is the lost-update
+    guard. Given one, the row is written ONLY while its stored rev is still
+    exactly that value, and the test lives in the WHERE of the single UPDATE
+    that does the write: a SELECT to check followed by a separate UPDATE is
+    the same race in a smaller window. None (every caller written before the
+    guard existed) keeps the unconditional whole-row upsert this store has
+    always done. A missing row counts as lost as well — the delete is itself
+    a write that moved the session past `base_rev`, and re-inserting would
+    resurrect a chat the user removed.
+    """
+    sid = session["id"]
+    # the revision is bookkeeping ON the row; the stored document stays byte
+    # for byte what it was before the column existed
+    body = json.dumps({k: v for k, v in session.items() if k != REV_KEY},
+                      indent=2)
+    title = str(session.get("title") or "")
+    row = (title, float(session.get("updated_at") or 0),
+           1 if session.get("use_rag") else 0,
+           len(session.get("messages", [])), body)
+    text = _fts_text(session) if has_fts() else ""
+    digest = _fts_digest(text) if has_fts() else ""
     with connect() as c:
-        c.execute(
-            "INSERT INTO sessions(id, title, updated_at, use_rag, "
-            "message_count, body) VALUES(?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET title=excluded.title, "
-            "updated_at=excluded.updated_at, use_rag=excluded.use_rag, "
-            "message_count=excluded.message_count, body=excluded.body",
-            (session["id"], str(session.get("title") or ""),
-             float(session.get("updated_at") or 0),
-             1 if session.get("use_rag") else 0,
-             len(session.get("messages", [])), body))
-        if has_fts():
-            c.execute("DELETE FROM session_fts WHERE id=?", (session["id"],))
+        # IMMEDIATE: the rev test, the row write and the index write are one
+        # write transaction, so nothing can land between them
+        c.execute("BEGIN IMMEDIATE")
+        prev = c.execute("SELECT rev, fts_hash FROM sessions WHERE id=?",
+                         (sid,)).fetchone()
+        if base_rev is None:
+            c.execute(
+                "INSERT INTO sessions(id, title, updated_at, use_rag, "
+                "message_count, body, rev, fts_hash) "
+                "VALUES(?,?,?,?,?,?,0,?) "
+                "ON CONFLICT(id) DO UPDATE SET title=excluded.title, "
+                "updated_at=excluded.updated_at, use_rag=excluded.use_rag, "
+                "message_count=excluded.message_count, body=excluded.body, "
+                "fts_hash=excluded.fts_hash, rev=sessions.rev+1",
+                (sid, *row, digest))
+            new_rev = 0 if prev is None else int(prev[0]) + 1
+        else:
+            cur = c.execute(
+                "UPDATE sessions SET title=?, updated_at=?, use_rag=?, "
+                "message_count=?, body=?, fts_hash=?, rev=rev+1 "
+                "WHERE id=? AND rev=?",
+                (*row, digest, sid, int(base_rev)))
+            if cur.rowcount != 1:
+                c.execute("ROLLBACK")
+                return None
+            new_rev = int(base_rev) + 1
+        if has_fts() and (prev is None or prev[1] != digest):
+            c.execute("DELETE FROM session_fts WHERE id=?", (sid,))
             c.execute("INSERT INTO session_fts(id, title, text) "
-                      "VALUES(?,?,?)",
-                      (session["id"], str(session.get("title") or ""),
-                       _fts_text(session)))
+                      "VALUES(?,?,?)", (sid, title, text))
+    return new_rev
+
+
+def get_session_row(session_id: str) -> tuple[str, int] | None:
+    """(body, rev) for a session, or None. The rev is what a later
+    `upsert_session(..., base_rev=rev)` tests against."""
+    with connect() as c:
+        row = c.execute("SELECT body, rev FROM sessions WHERE id=?",
+                        (session_id,)).fetchone()
+    return (row[0], int(row[1])) if row else None
 
 
 def get_session_body(session_id: str) -> str | None:
-    with connect() as c:
-        row = c.execute("SELECT body FROM sessions WHERE id=?",
-                        (session_id,)).fetchone()
+    row = get_session_row(session_id)
     return row[0] if row else None
 
 

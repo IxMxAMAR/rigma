@@ -179,6 +179,34 @@ def _measured_placement(rp, ctx: int) -> dict:
         return {}          # a missing or corrupt calibration is not an error
 
 
+def launch_fit_spec(spec, flags, *, vision: bool, ctx: int = 0):
+    """The spec to run the fit against, plus whether it differs from `spec`.
+
+    AUDIT F18: docs/audit-2026-09-04-full.md — the plan and the launch have to
+    agree about what sits on the card. `resolve.with_launch_overheads` folds
+    both disagreements into the one mmproj slot `fit_gguf` already treats as
+    non-offloadable memory: the projector comes OUT when vision is off (717-888
+    MiB on the two shipped vision models, enough to cost two layers of GPU
+    residency), and the speculative draft cache goes IN when speculation is on
+    (~565 MiB at 32K, previously budgeted nowhere because spec_type was applied
+    after the fit).
+
+    The second return value says whether that changed the number. It is the
+    guard on the extra fit: when nothing moved, the resolver's own arithmetic
+    already stands and re-running it would only substitute the calculator's
+    answer for a curated combo's.
+    """
+    from .resolve import with_launch_overheads
+    ctx = int(ctx or flags.ctx)
+    fit = with_launch_overheads(spec, vision=vision, ctx=ctx,
+                                kv=flags.cache_type_k,
+                                spec_type=flags.spec_type,
+                                n_max=flags.spec_n_max)
+    was = spec.mmproj.bytes if spec.mmproj else 0
+    now = fit.mmproj.bytes if fit.mmproj else 0
+    return fit, was != now
+
+
 def _resolve_for(slug: str, state: dict, registry, profile,
                  backend: str | None = None):
     from .probe import probe_hardware
@@ -392,12 +420,31 @@ def perform_switch(model: str, registry=None, profile=None,
     rp, _, p = _resolve_for(model, s, trimmed, profile, backend)
     if rp.model_slug != model or not _model_on_disk(rp.gguf):
         raise RuntimeError(f"{model} does not fit this machine right now")
+    # AUDIT F18: docs/audit-2026-09-04-full.md — speculation and vision are
+    # settled BEFORE the fit. Both change what the card will actually hold, and
+    # resolving them 30 lines after the arithmetic is what made this call charge
+    # itself for a projector it then omitted from the command line.
+    # Speculation only when the FILE carries the draft head: asking llama.cpp
+    # for draft-mtp against a gguf without the tensors resets the Vulkan driver
+    # rather than erroring (see ComboFlags.spec_type).
+    if launch is not None and launch.is_set("spec_type"):
+        from .hangar import file_has_mtp
+        if launch.spec_type != "draft-mtp" or file_has_mtp(rp.gguf):
+            rp.flags = rp.flags.model_copy(update={
+                "spec_type": launch.spec_type,
+                "spec_n_max": launch.spec_n_max or 1})
+    # `vision` is remembered across relaunches: a ctx change must not silently
+    # switch vision back on and eat the VRAM the user just freed.
+    if vision is None:
+        vision = not bool((st.read_state() or {}).get("no_vision"))
     if ctx is not None:
         # honest relaunch at a requested context: real fit math, not hope.
         # rp.flags.ctx is the calculator's grow-to-fit maximum for this quant.
         from .resolve import fit_gguf
         want = max(2048, min(int(ctx), spec_full.native_ctx))
-        flags = fit_gguf(spec_full, rp.gguf, p, want, [])
+        fit_spec, _ = launch_fit_spec(spec_full, rp.flags, vision=vision,
+                                      ctx=want)
+        flags = fit_gguf(fit_spec, rp.gguf, p, want, [])
         if flags is None:
             raise RuntimeError(
                 f"ctx {want:,} doesn't fit — {model} ({rp.gguf.quant}) tops "
@@ -409,25 +456,31 @@ def perform_switch(model: str, registry=None, profile=None,
         # ...except where the placement was MEASURED at this exact context.
         update.update(_measured_placement(rp, want))
         rp.flags = rp.flags.model_copy(update=update)
+    else:
+        # No ctx asked for, so the plan is the resolver's — which priced the
+        # full spec. Re-place the weights only when the resident overhead has
+        # actually moved; the freed projector memory is worth GPU layers, and
+        # an unbudgeted draft cache is worth an offload nobody planned.
+        fit_spec, differs = launch_fit_spec(spec_full, rp.flags, vision=vision)
+        if differs:
+            from .resolve import fit_gguf
+            got = fit_gguf(fit_spec, rp.gguf, p, rp.flags.ctx, [])
+            if got is not None:
+                update = {"ngl": got.ngl, "n_cpu_moe": got.n_cpu_moe}
+                # AUDIT F17/F18: docs/audit-2026-09-04-full.md — same rule as the
+                # ctx branch above. `resolve` may already have written a measured
+                # placement into these two keys; the calculator must not overwrite
+                # a stopwatch. Reached on the ordinary path — a text-only vision
+                # model that idle-unloads and reloads comes through here — and
+                # that is the 37.59 -> 9.95 tok/s collapse the audit measured.
+                update.update(_measured_placement(rp, rp.flags.ctx))
+                rp.flags = rp.flags.model_copy(update=update)
     if kv is not None:
         rp.flags = rp.flags.model_copy(update={"cache_type_k": kv,
                                                "cache_type_v": kv})
-    # Speculation last, and only when the FILE carries the draft head: asking
-    # llama.cpp for draft-mtp against a gguf without the tensors resets the
-    # Vulkan driver rather than erroring (see ComboFlags.spec_type).
-    if launch is not None and launch.is_set("spec_type"):
-        from .hangar import file_has_mtp
-        if launch.spec_type != "draft-mtp" or file_has_mtp(rp.gguf):
-            rp.flags = rp.flags.model_copy(update={
-                "spec_type": launch.spec_type,
-                "spec_n_max": launch.spec_n_max or 1})
     # vision projector: attach it if it's on disk, otherwise run text-only
     # rather than refusing — a vision model still works for text, and the user
     # can download the projector separately to turn vision on
-    # `vision` is remembered across relaunches: a ctx change must not silently
-    # switch vision back on and eat the VRAM the user just freed.
-    if vision is None:
-        vision = not bool((st.read_state() or {}).get("no_vision"))
     mm = getattr(reg_full.models.get(model), "mmproj", None)
     extra = (["--mmproj", str(rigma_home() / "models" / mm.file)]
              if vision and mm is not None and _model_on_disk(mm) else None)
@@ -472,12 +525,12 @@ def perform_switch(model: str, registry=None, profile=None,
     except Exception:
         # old engine is gone but the UI is still up — record an unloaded
         # state (not clear) so the UI stays manageable and can retry a load
-        st.write_state(s["model"], s["quant"], int(s["public_port"]),
-                       engine_pid=-1, ui_pid=int(s.get("ui_pid", os.getpid())),
-                       backend=s.get("backend", "unknown"),
-                       use_case=s.get("use_case", "general"),
-                       ctx=int(s.get("ctx", 0)), unloaded=True,
-                       gguf=s.get("gguf", ""))
+        # AUDIT F22: docs/audit-2026-09-04-full.md — merge, never rebuild. The
+        # whole-record form dropped kv_fp here, orphaning a prompt cache that
+        # costs four minutes of prefill to rebuild, plus no_vision and kv_cache.
+        st.update_state(engine_pid=-1,
+                        ui_pid=int(s.get("ui_pid", os.getpid())),
+                        unloaded=True)
         raise
     # Bring back the prompt cache if one was saved under EXACTLY this
     # configuration. A 120K window costs about four minutes of prefill to
@@ -536,13 +589,14 @@ def perform_unload() -> dict:
         except Exception:
             pass      # never let a cache write block freeing the GPU
     st.kill_pid(int(s.get("engine_pid", -1)))
-    st.write_state(s["model"], s["quant"], int(s["public_port"]),
-                   engine_pid=-1, ui_pid=int(s.get("ui_pid", os.getpid())),
-                   backend=s.get("backend", "unknown"),
-                   use_case=s.get("use_case", "general"),
-                   ctx=int(s.get("ctx", 0)), unloaded=True,
-                   gguf=s.get("gguf", ""), kv_fp=s.get("kv_fp", ""))
-    return st.read_state()
+    # AUDIT F22: docs/audit-2026-09-04-full.md — an unload changes exactly two
+    # things: the engine is gone, and the record says so. Everything else is the
+    # configuration the user chose and must survive. Rebuilding the record from
+    # write_state's defaults reverted no_vision to False, so the next load
+    # re-attached the projector and ate the VRAM the unload was for.
+    return st.update_state(engine_pid=-1,
+                           ui_pid=int(s.get("ui_pid", os.getpid())),
+                           unloaded=True)
 
 
 def perform_load(registry=None, profile=None) -> dict:

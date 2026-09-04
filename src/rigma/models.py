@@ -169,6 +169,15 @@ class ModelSpec(BaseModel):
     # Stored so a spec written by an older probe can be re-derived without the
     # multi-GB file being on disk.
     full_attention_interval: int = 0
+    # AUDIT F19: docs/audit-2026-09-04-full.md — a sliding-window model keeps a
+    # SECOND, window-sized KV cache for the layers `full_attn_layers` excludes.
+    # Budgeting those layers as zero is ~400 MiB unaccounted on a 27B-class SWA
+    # model, and it errs toward accepting a plan the card cannot hold — the one
+    # approximation in the fit math that was unsafe in that direction. Defaults
+    # of 0 mean "not a windowed model", which charges nothing.
+    swa_layers: int = 0
+    swa_kv_heads: int = 0
+    swa_window: int = 0
     # False = the gguf shipped no tokenizer.chat_template, so an empty
     # capability list is missing evidence rather than a finding about the model.
     has_template: bool = True

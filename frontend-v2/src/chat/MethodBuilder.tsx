@@ -7,10 +7,10 @@
 // (docs/backlog-post-audit.md). One fewer thing wedged into that loop.
 import { useEffect, useState } from "react";
 import { getDraft, promoteDraft, type Method } from "../lib/methods";
-import { useChat } from "./chatStore";
+import { selectStreaming, useChat } from "./chatStore";
 
 export default function MethodBuilder({ draftId }: { draftId: string }) {
-  const streaming = useChat((s) => s.streaming);
+  const streaming = useChat(selectStreaming);
   const loadSessions = useChat((s) => s.loadSessions);
   const [draft, setDraft] = useState<Method | null>(null);
   const [saved, setSaved] = useState<string>("");

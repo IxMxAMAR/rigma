@@ -17,6 +17,7 @@ template lands only in an empty Notes field.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from . import method_schema as ms
@@ -435,6 +436,70 @@ def methods_dir() -> Path:
     return d
 
 
+class MethodIdError(ValueError):
+    """The requested id can't name a method file."""
+
+
+# CON, PRN, AUX, NUL, COM1-9, LPT1-9 are unopenable as files on Windows
+_WIN_DEVICE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.I)
+
+
+def _method_file(method_id: str) -> Path:
+    """The file for a method id, or raise. The id reaches this line straight
+    from a URL path parameter, and Starlette's {param} converter is [^/]+ --
+    it stops %2f but not %5c, which uvicorn has already decoded by the time
+    routing happens, so on Windows "..%5C..%5Cfoo" was a real traversal out of
+    ~/.rigma. Reject rather than sanitise, the way skills._path_for does: a
+    silently rewritten name unlinks a file nobody asked about. The pattern is
+    ms._ID_RE because that is what the save path already validates against.
+    # AUDIT F40: docs/audit-2026-09-04-full.md
+    """
+    mid = str(method_id or "")
+    if not ms._ID_RE.match(mid) or _WIN_DEVICE.match(mid):
+        raise MethodIdError(
+            "a method id must be 1-40 characters of a-z, 0-9 and underscore")
+    p = (methods_dir() / f"{mid}.json").resolve()
+    if p.parent != methods_dir().resolve():
+        raise MethodIdError("that id would write outside the methods folder")
+    return p
+
+
+# Every key ms.normalize() reaches for with a bare int(), list(), dict() or
+# .items(). Checking them here is what turns a type-confused document into the
+# documented 400 with a self-correcting `errors` array instead of a traceback:
+# validate() is itself unsafe on the same inputs, so ordering alone would not
+# have been enough.  # AUDIT F43: docs/audit-2026-09-04-full.md
+_SHAPES = {"apply": dict, "vars": dict, "guide": list, "rules": list,
+           "macros": list, "workflows": list}
+
+
+def _shape_errors(doc) -> list[str]:
+    """Type problems, phrased like every other validator string so a model can
+    fix them in one turn. Empty list means normalize() will survive `doc`."""
+    if not isinstance(doc, dict):
+        return ["a method must be a JSON object"]
+    errs: list[str] = []
+    for key, want in _SHAPES.items():
+        v = doc.get(key)
+        if v is not None and not isinstance(v, want):
+            errs.append(f"{key} must be "
+                        + ("an object" if want is dict else "a list"))
+    if isinstance(doc.get("vars"), dict):
+        for k, v in doc["vars"].items():
+            if not isinstance(v, dict):
+                errs.append(f"var '{k}': must be an object with a 'kind'")
+    for key in ("rules", "macros", "workflows"):
+        if isinstance(doc.get(key), list):
+            for i, c in enumerate(doc[key]):
+                if not isinstance(c, dict):
+                    errs.append(f"{key}[{i}]: must be an object")
+    try:
+        int(doc.get("version", 1) or 1)      # mirrors normalize() exactly
+    except (TypeError, ValueError):
+        errs.append("version must be a whole number")
+    return errs
+
+
 def builtins() -> list[dict]:
     """Normalized COPIES of the module literals. normalize() never mutates
     its input, so METHODS stays the pristine source and a bad save can't
@@ -447,12 +512,22 @@ def user_methods() -> list[dict]:
     the user should lose one broken method, not the whole Methods panel."""
     out = []
     for f in sorted(methods_dir().glob("*.json")):
+        # ms.normalize() is INSIDE the try, and _shape_errors runs before it.
+        # It used to sit one line below, outside the guard the docstring above
+        # promises: normalize does bare int()/list()/dict()/.items() on
+        # caller-supplied fields, so a file that was valid JSON with one
+        # wrong-typed key ("version": "two") raised straight out of catalog()
+        # and took down GET /api/methods -- including the import endpoint you
+        # would have used to undo it.  # AUDIT F43: docs/audit-2026-09-04-full.md
         try:
             raw = json.loads(f.read_text(encoding="utf-8"))
+            if not (isinstance(raw, dict) and raw.get("id")):
+                continue
+            if _shape_errors(raw):
+                continue      # anything save_user would refuse is not a method
+            out.append(ms.normalize({**raw, "builtin": False}))
         except Exception:
             continue
-        if isinstance(raw, dict) and raw.get("id"):
-            out.append(ms.normalize({**raw, "builtin": False}))
     return out
 
 
@@ -485,17 +560,26 @@ def tool_names() -> set[str]:
 def save_user(doc: dict) -> tuple[dict | None, list[str]]:
     """Validate and persist a user method. Returns (saved, []) or
     (None, errors) -- errors are phrased for a model to self-correct."""
+    errs = _shape_errors(doc)
+    if errs:
+        return None, errs           # before normalize(), which would raise
     full = ms.normalize({**doc, "builtin": False})
     errs = ms.validate(full, tool_names())
     if errs:
         return None, errs
-    (methods_dir() / f"{full['id']}.json").write_text(
-        json.dumps(full, indent=2), encoding="utf-8")
+    try:
+        f = _method_file(full["id"])
+    except MethodIdError as e:
+        return None, [str(e)]       # an id error is a 400, never a traceback
+    f.write_text(json.dumps(full, indent=2), encoding="utf-8")
     return full, []
 
 
 def delete_user(method_id: str) -> bool:
-    f = methods_dir() / f"{method_id}.json"
+    try:
+        f = _method_file(method_id)
+    except MethodIdError:
+        return False                # same answer as "no such user method"
     if not f.is_file():
         return False
     f.unlink()

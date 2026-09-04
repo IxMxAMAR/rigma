@@ -9,6 +9,7 @@ state so it's trivially testable.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from pathlib import Path
@@ -34,9 +35,34 @@ def _runs_dir() -> Path:
     return d
 
 
-def run_dir(run_id: str) -> Path:
-    d = _runs_dir() / run_id
-    d.mkdir(parents=True, exist_ok=True)
+# A run id becomes a DIRECTORY name and arrives from a URL path parameter.
+# Starlette's {param} converter is [^/]+, so it stops %2f but not %5c, and
+# uvicorn decodes before routing -- so GET /api/runs/..%5C..%5Cfoo%5Cbar built
+# arbitrary directory trees, on the READ path, from a CORS-simple request that
+# needed no rebinding. Same guard as skills._path_for.
+# AUDIT F40: docs/audit-2026-09-04-full.md
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# CON, PRN, AUX, NUL, COM1-9, LPT1-9 are unopenable as files on Windows
+_WIN_DEVICE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.I)
+
+
+class RunIdError(ValueError):
+    """The requested id can't name a run directory."""
+
+
+def run_dir(run_id: str, *, create: bool = False) -> Path:
+    """The folder for a run, or raise. `create` is opt-in and belongs to the
+    WRITE sites only: this used to mkdir unconditionally, so every reader --
+    load(), read_plan(), the log endpoint -- conjured a directory for a run
+    that does not exist, and a hostile id conjured it outside ~/.rigma."""
+    rid = str(run_id or "")
+    if not _SAFE_ID.match(rid) or _WIN_DEVICE.match(rid):
+        raise RunIdError(f"'{rid[:40]}' is not a valid run id")
+    d = (_runs_dir() / rid).resolve()
+    if d.parent != _runs_dir().resolve():
+        raise RunIdError("that id would write outside the runs folder")
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -74,7 +100,7 @@ def create(mission: str, session_id: str, workspace: str = "",
         "verified_once": False, "external_calls": 0, "paused": False,
         "steer_queue": [], "summary": "", "halt_reason": "",
     }
-    d = run_dir(rid)
+    d = run_dir(rid, create=True)
     (d / "outputs").mkdir(exist_ok=True)
     write_plan(rid, [])
     _atomic_write(d / "progress.md",
@@ -108,7 +134,7 @@ def save(run: dict, revive: bool = False) -> None:
             # sees the halt on its next check instead of running on stale state
             run["status"] = cur["status"]
             run["halt_reason"] = cur.get("halt_reason", "")
-    _atomic_write(run_dir(run["id"]) / "run.json",
+    _atomic_write(run_dir(run["id"], create=True) / "run.json",
                   json.dumps(run, indent=2))
 
 
@@ -157,7 +183,8 @@ def read_plan(run_id: str) -> list:
 
 
 def write_plan(run_id: str, plan: list) -> None:
-    _atomic_write(run_dir(run_id) / "plan.json", json.dumps(plan, indent=2))
+    _atomic_write(run_dir(run_id, create=True) / "plan.json",
+                  json.dumps(plan, indent=2))
 
 
 def plan_add(run_id: str, text: str) -> int:
@@ -255,7 +282,8 @@ def append_progress(run_id: str, done: str, next_step: str,
                     workspace: str = "") -> None:
     line = (f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] done: "
             f"{str(done)[:600]}  ->  next: {str(next_step)[:600]}\n")
-    with open(run_dir(run_id) / "progress.md", "a", encoding="utf-8") as f:
+    with open(run_dir(run_id, create=True) / "progress.md", "a",
+              encoding="utf-8") as f:
         f.write(line)
     if workspace:
         try:
@@ -304,7 +332,8 @@ def append_action(run_id: str, tool: str, args, ok: bool) -> None:
            "args_sha": hashlib.sha1(full.encode("utf-8", "replace"))
            .hexdigest()[:16],
            "ok": bool(ok)}
-    with open(run_dir(run_id) / "actions.jsonl", "a", encoding="utf-8") as f:
+    with open(run_dir(run_id, create=True) / "actions.jsonl", "a",
+              encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
 
 
@@ -314,7 +343,7 @@ def read_actions(run_id: str) -> list:
     out = []
     try:
         text = (run_dir(run_id) / "actions.jsonl").read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError):
+    except (RunIdError, FileNotFoundError, OSError):
         return out
     for line in text.splitlines():
         line = line.strip()
@@ -364,7 +393,8 @@ def get_last_sample(run_id: str) -> list:
 
 def save_live(run_id: str, live: dict) -> None:
     try:
-        _atomic_write(run_dir(run_id) / "live.json", json.dumps(live))
+        _atomic_write(run_dir(run_id, create=True) / "live.json",
+                      json.dumps(live))
     except Exception:
         pass
 

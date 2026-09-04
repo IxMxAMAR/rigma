@@ -10,11 +10,11 @@ import {
   type MacroDef,
   type MacroPreview,
 } from "../lib/methods";
-import { useChat } from "./chatStore";
+import { selectStreaming, useChat } from "./chatStore";
 
 export default function MacroStrip() {
   const currentId = useChat((s) => s.currentId);
-  const streaming = useChat((s) => s.streaming);
+  const streaming = useChat(selectStreaming);
   const runMacro = useChat((s) => s.runMacro);
   const [macros, setMacros] = useState<MacroDef[]>([]);
   const [pending, setPending] = useState<MacroPreview | null>(null);

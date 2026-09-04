@@ -1,12 +1,62 @@
+"""Chat sessions: the store, the prompt builder and the sampler whitelist.
+
+CONCURRENT WRITES — the API every other module must use
+-------------------------------------------------------
+Every session row carries a monotonic integer revision, bumped by each write.
+
+  * `sessions.REV_KEY` ("_rev") is the key `load()` puts the row's current
+    revision under on the session dict. It is bookkeeping, never part of the
+    document: `save()` strips it before serialising, so it can never reach the
+    stored body.
+  * `sessions.StaleWriteError` is raised by `save()` when the guard loses.
+  * `save(session, *, base_rev=None)` writes unconditionally when `base_rev`
+    is None — exactly what every caller written before the guard does. Given
+    a `base_rev`, it writes ONLY while the stored revision is still exactly
+    that; otherwise it writes nothing and raises. The test and the write are
+    one SQL statement, so nothing can land between them. It returns the new
+    revision and also refreshes `session[REV_KEY]`, so a caller saving several
+    times in one turn can keep passing `session[REV_KEY]` without reloading.
+
+      s = sessions.load(sid)
+      s["messages"].append(...)
+      sessions.save(s, base_rev=s[sessions.REV_KEY])   # may raise
+
+  * `reload_and_extend(sid, messages, since, *, amend_from=None)` is the merge
+    for the reload-then-write pattern: it re-reads the session and grafts this
+    turn's messages (`messages[since:]`) onto whatever is stored NOW, so a
+    rename, a compaction, or another turn that landed during a long generation
+    all survive alongside it. It returns the merged session carrying the
+    CURRENT revision under REV_KEY — ready to hand straight to `save()` as
+    `base_rev` — or None if the session was deleted meanwhile.
+
+Why (audit 2026-09-04, F1/F2/F4/F15): `save()` writes the whole row, so any
+writer holding a snapshot taken before someone else's write silently destroyed
+everything that landed in between.
+"""
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 import time
 from pathlib import Path
 
+from .db import REV_KEY          # re-exported: half the load()/save() contract
 from .runtime import rigma_home
+
+_log = logging.getLogger(__name__)
+
+
+class StaleWriteError(RuntimeError):
+    """The stored session moved past the revision this write was based on (or
+    was deleted). Reload — see reload_and_extend — and write again; never
+    overwrite work this caller has not seen."""
+
+
+class SessionIdError(ValueError):
+    """The requested id can't name a session file."""
+
 
 MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   "preset_id", "params", "notes", "digest", "effort",
@@ -29,7 +79,12 @@ PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
                 "presence_penalty": (-2.0, 2.0),
                 # modern anti-repetition samplers (llama-server per-request)
                 "dry_multiplier": (0.0, 2.0), "dry_base": (1.0, 4.0),
-                "dry_allowed_length": (1, 10),
+                # AUDIT F3: docs/audit-2026-09-04-full.md — the cap was 10,
+                # and hangar._DRY_BASELINE deliberately ships 16 (a filename
+                # is 8-12 tokens and DRY must not punish re-typing one).
+                # _safe_params dropped it key by key, so chat turns ran on
+                # llama.cpp's allowance of 2 — documented above as harmful.
+                "dry_allowed_length": (1, 64),
                 # was MISSING here, so validation silently stripped it and
                 # DRY scanned the whole context — RUN_PARAMS' cap (serve.py)
                 # never reached the engine on chat turns. Found by the
@@ -77,8 +132,30 @@ def chats_dir() -> Path:
     return d
 
 
+# AUDIT F40: docs/audit-2026-09-04-full.md
+# A session id becomes a FILENAME here, and the id arrives over HTTP:
+# Starlette's {param} converter is [^/]+, which blocks %2f but not %5c, and
+# uvicorn percent-decodes before routing — so on Windows a DELETE of
+# "..%5C..%5CDocuments%5Cbudget" reached this function as a traversal and
+# unlinked a file outside ~/.rigma. Same shape as skills._path_for: reject
+# rather than sanitise (quietly rewriting an id writes a file the user can
+# never find again), then assert the resolved parent anyway.
+_SAFE_SID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
 def _path(session_id: str) -> Path:
-    return chats_dir() / f"{session_id}.json"
+    sid = str(session_id or "")
+    if not _SAFE_SID.match(sid):
+        raise SessionIdError(
+            "a session id may only contain letters, numbers, hyphens and "
+            "underscores (max 64)")
+    # CON, PRN, AUX, NUL, COM1-9, LPT1-9 are devices, not files, on Windows
+    if re.match(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", sid, re.I):
+        raise SessionIdError(f"'{sid}' is a reserved Windows device name")
+    p = (chats_dir() / f"{sid}.json").resolve()
+    if p.parent != chats_dir().resolve():
+        raise SessionIdError("that id would resolve outside the chats folder")
+    return p
 
 
 # one-time legacy import, tracked per db path (tests re-home per test)
@@ -122,19 +199,36 @@ def create(title: str = "New chat", system_prompt: str = "") -> dict:
     return session
 
 
-def save(session: dict) -> None:
+def save(session: dict, *, base_rev: int | None = None) -> int:
+    """Persist the session; return the revision it now sits at.
+
+    AUDIT F1: docs/audit-2026-09-04-full.md — pass `base_rev` (from
+    `session[REV_KEY]`, which `load()` set) and the write happens only while
+    the stored row is still at that revision; anything else raises
+    StaleWriteError and writes NOTHING. Omit it and this is the unconditional
+    whole-row write it has always been, unchanged for existing callers.
+    """
     from . import db
     _import_legacy()
     session["updated_at"] = time.time()
-    db.upsert_session(session)
+    rev = db.upsert_session(session, base_rev=base_rev)
+    if rev is None:
+        raise StaleWriteError(
+            f"session {session.get('id', '?')} has moved past revision "
+            f"{base_rev} (or was deleted) — reload before writing")
+    # keep the snapshot's revision honest so a second guarded save in the same
+    # turn can pass session[REV_KEY] again without a reload
+    session[REV_KEY] = rev
+    return rev
 
 
 def load(session_id: str) -> dict | None:
     from . import db
     _import_legacy()
-    body = db.get_session_body(session_id)
-    if body is None:
+    row = db.get_session_row(session_id)
+    if row is None:
         return None
+    body, rev = row
     try:
         raw = json.loads(body)
     except Exception:
@@ -146,7 +240,50 @@ def load(session_id: str) -> dict | None:
     # to the new backstop (a deliberately lowered value survives untouched)
     if raw.get("max_tool_rounds") == 50:
         raw["max_tool_rounds"] = 1000
+    # the revision THIS snapshot was taken at, set last so a body that somehow
+    # carries the key cannot lie about it. Never persisted: save() strips it.
+    raw[REV_KEY] = rev
     return raw
+
+
+def reload_and_extend(sid: str, messages: list, since: int,
+                      *, amend_from: int | None = None) -> dict | None:
+    """Re-read `sid` and graft this turn's messages onto what is stored NOW.
+
+    AUDIT F1: docs/audit-2026-09-04-full.md — the merge half of the
+    reload-then-write pattern. `since` is how many messages the caller's list
+    held when it took its snapshot: everything from that index on is this
+    turn's own work and goes last, after whatever the store has gained
+    meanwhile (another turn's messages, a compaction that moved older ones
+    into `archive`). Fields outside `messages` come from the reloaded session,
+    so a rename or a params edit made during a long generation survives.
+
+    `amend_from` covers the one case that is not an append: a `continue` that
+    extends an assistant message ALREADY stored. Pass the index of the first
+    such message and `messages[amend_from:since]` replaces the stored copies
+    in place, keeping anything stored after them. If a compaction has already
+    moved those messages into `archive` there is nothing left to replace, so
+    they are appended instead — a duplicate in the archive tail is cheap next
+    to losing text the model just generated.
+
+    Returns the merged session — carrying the CURRENT revision under REV_KEY,
+    ready to pass to `save(..., base_rev=...)` — or None if the session was
+    deleted while this turn ran (never resurrect a chat the user removed).
+    """
+    fresh = load(sid)
+    if fresh is None:
+        return None
+    stored = list(fresh.get("messages", []))
+    since = max(0, min(int(since), len(messages)))
+    head, tail_from = stored, since
+    if amend_from is not None and 0 <= amend_from < since:
+        if since <= len(stored):
+            head = (stored[:amend_from] + list(messages[amend_from:since])
+                    + stored[since:])
+        else:
+            tail_from = amend_from      # compacted away: append, never drop
+    fresh["messages"] = head + list(messages[tail_from:])
+    return fresh
 
 
 def delete(session_id: str) -> bool:
@@ -156,7 +293,9 @@ def delete(session_id: str) -> bool:
     # a legacy file left in place would resurrect the chat at next import
     try:
         _path(session_id).unlink(missing_ok=True)
-    except OSError:
+    except (OSError, SessionIdError):
+        # an id that cannot name a file cannot have left one behind either —
+        # the row delete above is parameterised SQL and already ran (F40)
         pass
     return hit
 
@@ -395,20 +534,27 @@ def validate_params(raw: dict) -> dict:
     return out
 
 
-def _safe_params(raw: dict) -> dict:
+def _safe_params(raw: dict, source: str = "") -> dict:
     out = {}
     for key, value in (raw or {}).items():
         try:
             out.update(validate_params({key: value}))
-        except ValueError:
-            continue  # stored junk never blocks a chat turn
+        except ValueError as e:
+            # AUDIT F3: docs/audit-2026-09-04-full.md
+            # Stored junk still never blocks a chat turn — but a model card's
+            # default is deliberately authored, and dropping one in silence is
+            # what hid dry_allowed_length=16 for weeks while DRY ran at the
+            # engine's own harmful allowance of 2.
+            if source:
+                _log.warning("%s: dropping %s=%r (%s)", source, key, value, e)
+            continue
     return out
 
 
 def effective_params(session: dict, preset: dict | None = None,
                      model_defaults: dict | None = None) -> dict:
     """Weakest to strongest: model-card defaults < preset < session."""
-    merged = _safe_params(model_defaults or {})
+    merged = _safe_params(model_defaults or {}, "model_defaults")
     merged.update(_safe_params((preset or {}).get("params", {})))
     merged.update(_safe_params(session.get("params", {})))
     return merged
@@ -451,16 +597,37 @@ def export_markdown(session: dict) -> str:
         lines += ["> " + session["system_prompt"].replace("\n", "\n> "), ""]
     if session.get("notes"):
         lines += ["> Story notes: " + session["notes"].replace("\n", "\n> "), ""]
-    for m in session.get("messages", []):
+
+    def _emit(m: dict) -> None:
         who = "**You:**" if m.get("role") == "user" else "**Model:**"
         content = m.get("content", "")
         if isinstance(content, list):   # vision content-parts
             content = "\n".join(
                 p.get("text", "") if p.get("type") == "text" else "[image]"
                 for p in content if isinstance(p, dict))
-        lines += [who, ""]
+        lines.extend([who, ""])
         if m.get("thinking"):
-            lines += ["<details><summary>thinking</summary>", "",
-                      m["thinking"], "", "</details>", ""]
-        lines += [content, ""]
+            lines.extend(["<details><summary>thinking</summary>", "",
+                          m["thinking"], "", "</details>", ""])
+        lines.extend([content, ""])
+
+    # AUDIT F6: docs/audit-2026-09-04-full.md
+    # After any compaction `messages` holds only the tail, so exporting it
+    # alone handed back the last handful of turns of a 200-turn manuscript
+    # with no marker that the rest ever existed. `archive` is chronological
+    # and precedes `messages`; the digest stands in for whatever the archive's
+    # bounded tail (serve.ARCHIVE_MAX) has already dropped, so it belongs
+    # between them.
+    archive = [m for m in (session.get("archive") or []) if isinstance(m, dict)]
+    for m in archive:
+        _emit(m)
+    digest = str(session.get("digest") or "").strip()
+    if digest:
+        lines += ["---", "",
+                  "> **Compacted summary of the earlier conversation**", ">",
+                  "> " + digest.replace("\n", "\n> "), ""]
+    if archive or digest:
+        lines += ["---", ""]
+    for m in session.get("messages", []):
+        _emit(m)
     return "\n".join(lines)

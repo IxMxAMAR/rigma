@@ -124,6 +124,12 @@ def gpu_used_mb() -> float | None:
 
 _VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1
 
+# VkPhysicalDeviceType. Only CPU (4) was ever filtered; INTEGRATED matters just
+# as much, for the opposite reason — see _plannable_gpus.
+VK_DEVICE_TYPE_INTEGRATED = 1
+VK_DEVICE_TYPE_DISCRETE = 2
+VK_DEVICE_TYPE_CPU = 4
+
 
 class _VkAppInfo(ctypes.Structure):
     _fields_ = [("sType", ctypes.c_int), ("pNext", ctypes.c_void_p),
@@ -193,10 +199,15 @@ def enumerate_vulkan() -> list[dict]:
                                                         ctypes.byref(mem))
                 local = [mem.memoryHeaps[i].size for i in range(mem.memoryHeapCount)
                          if mem.memoryHeaps[i].flags & _VK_MEMORY_HEAP_DEVICE_LOCAL_BIT]
-                if props.deviceType == 4:  # VK_PHYSICAL_DEVICE_TYPE_CPU
+                if props.deviceType == VK_DEVICE_TYPE_CPU:
                     continue
+                # AUDIT F20: docs/audit-2026-09-04-full.md — the type has to
+                # survive enumeration: an integrated device's largest
+                # DEVICE_LOCAL heap IS system RAM, and without knowing which
+                # device that is, _budgets sums it as video RAM.
                 out.append({"vendor_id": props.vendorID,
                             "name": props.deviceName.decode(errors="replace"),
+                            "device_type": int(props.deviceType),
                             "vram_mb": int(max(local, default=0) / (1024 * 1024))})
             return out
         finally:
@@ -223,10 +234,33 @@ def _nvml_gpus() -> list[dict]:
         return []
 
 
+def _plannable_gpus(raw: list[dict]) -> list[dict]:
+    """The devices a plan may spend VRAM on.
+
+    An integrated GPU has no VRAM: on a UMA device the largest DEVICE_LOCAL
+    heap is system RAM, so an iGPU alongside an 8GB card reported ~24GB and
+    `resolve._budgets` summed it into the budget — 24GB that does not exist,
+    driving every quant verdict, ngl and n_cpu_moe on the machine. Worse,
+    `HardwareProfile.primary_gpu` is max-by-vram, so the iGPU also took over
+    backend selection and the registry combo lookup.
+
+    Dropped only when a real card is present. On an iGPU-only laptop it is the
+    machine's only compute device, and dropping it would take the user from
+    slow to nothing. A device that does not declare a type (NVML, and every
+    profile written before the type was recorded) is not integrated: unknown
+    must not blind the planner to a real card.
+    """
+    discrete = [g for g in raw
+                if int(g.get("device_type", VK_DEVICE_TYPE_DISCRETE) or 0)
+                != VK_DEVICE_TYPE_INTEGRATED]
+    return discrete or raw
+
+
 def probe_hardware(gpu_table: list[dict],
                    raw_gpus: list[dict] | None = None) -> HardwareProfile:
     os_name = _os_name()
     raw = raw_gpus if raw_gpus is not None else (enumerate_vulkan() or _nvml_gpus())
+    raw = _plannable_gpus(raw)   # AUDIT F20: docs/audit-2026-09-04-full.md
     vm = psutil.virtual_memory()
     return HardwareProfile(
         gpus=[classify_gpu(r, gpu_table, os_name) for r in raw],
