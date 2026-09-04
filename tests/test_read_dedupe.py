@@ -13,8 +13,6 @@ could not have known.
 Re-reading must still work when it means something: after a write, at a
 different offset, or in a later turn.
 """
-from pathlib import Path
-
 from rigma import tools
 
 

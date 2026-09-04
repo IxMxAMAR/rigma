@@ -2377,6 +2377,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": f"kv must be one of "
                           f"{', '.join(server_ops.KV_CACHE_TYPES)}"},
                 status_code=400)
+        from . import hangar
         try:
             spec = await asyncio.to_thread(
                 hangar.set_launch_defaults, slug, registry, **fields)

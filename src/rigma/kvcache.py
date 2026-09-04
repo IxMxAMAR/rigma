@@ -59,10 +59,15 @@ def fingerprint(cfg: dict) -> str:
     hash — which is the whole safety property, since the hash is what decides
     whether a cache on disk may be restored.
     """
+    # The sentinel is hoisted rather than inlined: a backslash inside an f-string
+    # expression is 3.12-only syntax, and this package supports 3.11. The string
+    # this builds must stay byte-identical — the hash is what decides whether a
+    # cache on disk may be restored, so changing it invalidates every saved cache.
     parts = []
+    nul = "\x00"
     for k in FINGERPRINT_FIELDS:
         v = cfg.get(k)
-        parts.append(f"{k}={'\x00' if v is None else v}")
+        parts.append(f"{k}={nul if v is None else v}")
     blob = "\x1f".join(parts).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]
 
