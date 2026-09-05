@@ -162,6 +162,36 @@ def stop_sidecar() -> bool:
     return True
 
 
+def discover(deep: bool = False, timeout: float = 30.0) -> dict:
+    """Document folders raggity found on this machine, for the Grounding card.
+
+    The card used to offer a bare text box, so adding a folder meant typing an
+    absolute path from memory. raggity does the looking; this only carries the
+    answer across. Never raises: an older raggity has no `discover` command and
+    a missing one is not an error, just an empty list — the text box still works.
+
+    RAGGITY_NONINTERACTIVE is set because this is a subprocess with no terminal:
+    without it a raggity that decided to prompt would hang until the timeout.
+    """
+    cmd = raggity_cmd()
+    if cmd is None:
+        return {"complete": True, "candidates": [], "available": False}
+    env = {**os.environ, "RAGGITY_NONINTERACTIVE": "1"}
+    argv = [*cmd, "discover", "--json"] + (["--deep"] if deep else [])
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=timeout, env=env)
+        if res.returncode != 0:
+            return {"complete": True, "candidates": [], "available": False}
+        out = json.loads(res.stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {"complete": True, "candidates": [], "available": False}
+    out.setdefault("candidates", [])
+    out.setdefault("complete", True)
+    out["available"] = True
+    return out
+
+
 def ingest() -> str:
     cmd = raggity_cmd()
     if cmd is None:

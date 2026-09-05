@@ -3034,6 +3034,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 "sources": rag.load_sources(),
                 "indexing": ingest_state["busy"], "error": ingest_state["error"]}
 
+    @app.get("/api/rag/discover")
+    async def rag_discover(deep: bool = False):
+        """Folders worth indexing, so the Grounding card can offer them.
+
+        Threaded: raggity walks the disk for up to a second and a half, and this
+        server is single-worker — doing that on the event loop would stall every
+        streaming turn, which is the defect F10/F13 were about.
+        """
+        from . import rag
+        return await asyncio.to_thread(rag.discover, deep)
+
     @app.delete("/api/rag/sources")
     async def rag_remove_source(body: dict):
         from . import rag
