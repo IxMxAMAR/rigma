@@ -135,4 +135,16 @@ low-RAM process — ~300 MB) for grounded, cited answers from your own files thr
 local model: `pip install raggity[server]`, then `rigma rag add <folder>` and
 `rigma rag ask "..."`. If raggity isn't on PATH, point `RIGMA_RAGGITY_CMD` at it.
 
+## Working on Rigma
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+One hook, and it matters: `src/rigma/data/ui_v2/` is a **built** artifact that is
+committed, because the wheel ships it and an end user's machine never runs Node. Changing
+`frontend-v2/src/` without `npm run build` therefore releases the old interface — and
+nothing else catches it, since pytest doesn't know the bundle exists and vitest tests the
+source. The hook refuses that commit and tells you what to run.
+
 License: Apache-2.0.

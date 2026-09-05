@@ -1,0 +1,42 @@
+#!/bin/sh
+# Refuse a commit that changes the UI source without rebuilding what ships.
+#
+# src/rigma/data/ui_v2/ is a BUILT artifact that is committed, because the wheel
+# ships it and the user's machine never runs Node (see frontend-v2/vite.config).
+# So editing frontend-v2/src/ and committing without `npm run build` releases the
+# OLD interface — and nothing catches it: pytest does not know the bundle exists,
+# and vitest tests the source, not the build. On 2026-09-05 that came within one
+# command of shipping a release whose headline fix was absent from the actual page.
+#
+# Activate per clone:  git config core.hooksPath .githooks
+# Bypass a genuine exception:  ALLOW_UI_SOURCE_ONLY=1 git commit ...
+
+staged_src=$(git diff --cached --name-only --diff-filter=ACMR | grep -c '^frontend-v2/src/')
+staged_dist=$(git diff --cached --name-only --diff-filter=ACMRD | grep -c '^src/rigma/data/ui_v2/')
+
+if [ "$staged_src" -gt 0 ] && [ "$staged_dist" -eq 0 ]; then
+    if [ -n "$ALLOW_UI_SOURCE_ONLY" ]; then
+        echo "pre-commit: UI source staged without a rebuild - allowed by ALLOW_UI_SOURCE_ONLY."
+        exit 0
+    fi
+    echo
+    echo "  This commit changes frontend-v2/src/ but not src/rigma/data/ui_v2/."
+    echo
+    echo "  data/ui_v2 is the bundle the wheel ships and the browser actually loads."
+    echo "  Committing the source alone means the change does NOT reach users, and"
+    echo "  every test still passes, so nothing else will tell you."
+    echo
+    echo "  Rebuild and stage it:"
+    echo
+    echo "      cd frontend-v2 && npm run build && cd .."
+    echo "      git add src/rigma/data/ui_v2"
+    echo
+    echo "  If this commit genuinely should not ship a rebuild (a comment, a test,"
+    echo "  a file the bundle does not include):"
+    echo
+    echo "      ALLOW_UI_SOURCE_ONLY=1 git commit ..."
+    echo
+    exit 1
+fi
+
+exit 0
