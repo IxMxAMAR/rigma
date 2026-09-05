@@ -248,12 +248,17 @@ def test_tool_calls_run_in_parallel(home, multi_upstream, monkeypatch):
     client = TestClient(build_app(upstream_port=multi_upstream))
     sid = client.post("/api/sessions", json={}).json()["id"]
     client.post(f"/api/sessions/{sid}", json={"use_tools": True})
-    t0 = time.monotonic()
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
-    dt = time.monotonic() - t0
     assert r.status_code == 200
-    assert active["max"] >= 2          # ran concurrently, not one-by-one
-    assert dt < 0.75                   # ~1x (0.3s), not 3x (0.9s)
+    # The overlap counter IS the claim: at some instant more than one tool was
+    # inside `slow` at once, which cannot happen if they ran one at a time. It
+    # holds regardless of how fast or loaded the machine is.
+    #
+    # There was also a `dt < 0.75` wall-clock bound. It asserted the same thing
+    # by proxy and was the one machine-dependent line in the test: a loaded
+    # Windows runner took 1.0s for 0.3s of sleeping and failed a build over
+    # scheduling noise, on three legs that agreed the code was correct.
+    assert active["max"] >= 2
     assert r.text.count("event: tool_result") == 3
 
 
