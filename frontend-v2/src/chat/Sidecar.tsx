@@ -272,11 +272,20 @@ interface RagStatus {
   error: string;
 }
 
+interface RagCandidate {
+  path: string;
+  kind: string;
+  file_count: number;
+  why: string;
+}
+
 function GroundingCard() {
   const currentId = useChat((s) => s.currentId);
   const [status, setStatus] = useState<RagStatus | null>(null);
   const [grounded, setGrounded] = useState(false);
   const [path, setPath] = useState("");
+  const [suggestions, setSuggestions] = useState<RagCandidate[]>([]);
+  const [adding, setAdding] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -292,9 +301,50 @@ function GroundingCard() {
     }
   }, []);
 
+  const loadSuggestions = useCallback(async () => {
+    try {
+      const r = await fetch("/api/rag/discover");
+      const d = (await r.json()) as { candidates?: RagCandidate[] };
+      setSuggestions(d.candidates ?? []);
+    } catch {
+      setSuggestions([]);       // the text box below still works
+    }
+  }, []);
+
+  const addFolder = useCallback(async (folder: string) => {
+    setAdding(folder);
+    try {
+      await fetch("/api/rag/sources", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: folder }),
+      });
+    } catch {
+      /* status line below reports what did and did not land */
+    } finally {
+      setAdding(null);
+    }
+    void refresh();
+    void loadSuggestions();     // drop the one just added from the offers
+  }, [refresh, loadSuggestions]);
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Only look when there is nothing indexed yet — that is the state the
+  // suggestions exist for, and it keeps a disk scan off the panel for anyone
+  // who has already set this up.
+  //
+  // The ref matters: `status` is a fresh object on every poll, and the poll
+  // runs every two seconds while an ingest is going. Depending on `status`
+  // alone would have fired a disk scan on each one.
+  const lookedForFolders = useRef(false);
+  useEffect(() => {
+    if (!status || status.sources.length || lookedForFolders.current) return;
+    lookedForFolders.current = true;
+    void loadSuggestions();
+  }, [status, loadSuggestions]);
 
   // AUDIT F48: docs/audit-2026-09-04-full.md — the card used to read the
   // status exactly twice (mount, and after the POST), so an ingest that
@@ -356,18 +406,42 @@ function GroundingCard() {
           </li>
         ))}
       </ul>
+      {/* Folders raggity found, offered as one click each. The text box below
+          stays: this is a suggestion, not a replacement, and a folder nobody
+          guessed still has to be reachable. Nothing is indexed until clicked. */}
+      {suggestions.length > 0 && (
+        <div className="mt-2">
+          <div className="text-[11px] text-muted mb-1">found on this machine</div>
+          <ul className="flex flex-col gap-1">
+            {suggestions.map((c) => (
+              <li key={c.path}>
+                <button
+                  type="button"
+                  disabled={adding === c.path}
+                  onClick={() => void addFolder(c.path)}
+                  title={c.path}
+                  className="w-full text-left rounded-md bg-surface hover:bg-float
+                             disabled:opacity-50 px-2 py-1"
+                >
+                  <span className="block font-mono text-[12px] truncate">
+                    + {c.path}
+                  </span>
+                  <span className="block text-[11px] text-muted truncate">
+                    {c.why}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <form
         className="mt-2 flex gap-1.5"
         onSubmit={async (e) => {
           e.preventDefault();
           if (!path.trim()) return;
-          await fetch("/api/rag/sources", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ path: path.trim() }),
-          }).catch(() => {});
+          await addFolder(path.trim());
           setPath("");
-          void refresh();
         }}
       >
         <input
