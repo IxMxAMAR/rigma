@@ -285,7 +285,21 @@ def test_a_filesystem_error_is_not_reported_as_a_dropped_connection(
     origin = _Origin(b"I" * 4096)
     monkeypatch.setattr("httpx.stream", origin.stream)
     dest = tmp_path / "model.gguf"
-    (tmp_path / "model.gguf.part").mkdir()       # a directory in the way
+
+    # Fail the write itself, rather than putting a directory in its place. A
+    # directory is not a portable stand-in for "the filesystem said no": its
+    # st_size is 4096 on Linux and 0 on Windows, and `_download_file` reads that
+    # as bytes already fetched. With a 4096-byte body the Linux run therefore
+    # decided the download was ALREADY COMPLETE and never opened anything, so
+    # the test passed on Windows and failed on the runner.
+    real_open = open
+
+    def _refuse_the_part(path, *a, **kw):
+        if str(path).endswith(".part"):
+            raise OSError(28, "No space left on device")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", _refuse_the_part)
     with pytest.raises(HangarError) as ei:
         hangar._download_file("owner/first", "model.gguf", dest,
                               lambda b: None)
