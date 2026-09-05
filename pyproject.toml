@@ -9,6 +9,24 @@ description = "Hardware-aware local LLM deployment: probe, resolve, run."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
+# No `License ::` classifier here on purpose: `license` above is an SPDX
+# expression (PEP 639), and declaring both is an error on current build
+# backends. PyPI reads the license from that field.
+#
+# 3.11 and 3.12 only, because those are the versions CI actually runs. Listing
+# 3.13 would be a claim nothing tests.
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Intended Audience :: Developers",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "pydantic>=2.7",
   "typer>=0.12",
