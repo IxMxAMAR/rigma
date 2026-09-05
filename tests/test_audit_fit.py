@@ -203,7 +203,7 @@ def _reserve_mb(profile) -> float:
 def test_the_windowed_geometry_is_read_off_the_file(tmp_path):
     """gguf_meta already identifies the windowed layers to EXCLUDE them from
     the growing cache; it threw the geometry away instead of reporting it."""
-    from tests.test_gguf_meta import _kv_arr_bool, _kv_arr_u32, _kv_str, _kv_u32, _write
+    from test_gguf_meta import _kv_arr_bool, _kv_arr_u32, _kv_str, _kv_u32, _write
     kvs = [
         _kv_str(b"general.architecture", b"gemma4"),
         _kv_u32(b"gemma4.block_count", 6),
@@ -225,7 +225,7 @@ def test_the_windowed_geometry_is_read_off_the_file(tmp_path):
 
 
 def test_a_file_with_no_sliding_window_reports_none(tmp_path):
-    from tests.test_gguf_meta import DENSE, _write
+    from test_gguf_meta import DENSE, _write
     from rigma.gguf_meta import inspect_gguf
     f = inspect_gguf(_write(tmp_path, DENSE)).spec_fields
     assert f["swa_layers"] == 0 and f["swa_window"] == 0
