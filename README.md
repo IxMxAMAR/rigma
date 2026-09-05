@@ -1,9 +1,15 @@
 # Rigma
 
-Hardware-aware local LLM deployment for consumer machines: `rigma up` probes your GPU/RAM,
-picks the community-verified best model + quant + flag combo for your exact hardware,
-downloads a pinned llama.cpp build and the model, and serves an OpenAI-compatible endpoint —
-no knob-mashing required.
+[![CI](https://github.com/IxMxAMAR/rigma/actions/workflows/ci.yml/badge.svg)](https://github.com/IxMxAMAR/rigma/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/rigma.svg)](https://pypi.org/project/rigma/)
+[![Python](https://img.shields.io/pypi/pyversions/rigma.svg)](https://pypi.org/project/rigma/)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+Local LLM deployment that tunes itself to your machine — a chat UI, an
+OpenAI-compatible endpoint, and an agent that can use tools.
+
+Rigma probes your GPU and RAM, works out the model, quant and flags your hardware can
+actually hold, downloads a pinned llama.cpp build, and serves it.
 
 Unlike generic runners, Rigma applies the tuning that actually matters per machine:
 MoE expert offload (`--n-cpu-moe`) sized to your RAM, architecture-aware KV-cache policies
