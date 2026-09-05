@@ -11,7 +11,11 @@ said yes.
 from rigma.probe import _sum_other_processes
 from rigma.resolve import VRAM_RESERVE_MB, _budgets
 
-from tests.test_backend_choice import _prof
+# Not `from tests.test_backend_choice` — that needs the repo ROOT on sys.path,
+# which `python -m pytest` provides (it prepends the working directory) and the
+# bare `pytest` CI runs does not. pytest puts THIS directory on the path either
+# way, so the flat name is the one that works in both.
+from test_backend_choice import _prof
 
 
 def _s(pairs):
