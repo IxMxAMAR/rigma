@@ -158,6 +158,12 @@ def _run_turn(job: dict) -> int:
                 "type": "done",
                 "text": str(getattr(result, "final_response", "") or ""),
                 "finish_reason": str(getattr(result, "finish_reason", "") or ""),
+                # The handle for THIS conversation, so the next turn resumes it
+                # instead of starting the agent from nothing. Measured: the
+                # RunResult carries it as `session_id`, shaped
+                # `session-<32 hex>`. Without it every turn threw away the
+                # agent's plan, subagents and goals — most of what it is for.
+                "session_id": str(getattr(result, "session_id", "") or ""),
             }
         )
         return 0
