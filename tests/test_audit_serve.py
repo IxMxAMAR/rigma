@@ -782,3 +782,64 @@ def test_auto_compact_failure_is_logged_and_announced(home, engine, caplog):
     last = sessions.load(sid)["messages"][-1]
     assert last["content"] == "ok"                        # the turn is intact
     assert "Auto-compaction failed" in last["notice"]     # and it says so
+
+
+# --------------------------------------------------------------------------
+# F53 — the end-of-turn write put a mid-turn SETTINGS change back
+
+
+def test_every_field_the_patch_endpoint_accepts_survives_a_turn():
+    """The merge list is DERIVED from the PATCH surface, so a field added there
+    cannot be forgotten here.
+
+    It used to be hand-written, and it had drifted: `update_session` accepts
+    every name in `sessions.MUTABLE_FIELDS`, while the merge copied twelve
+    names of its own choosing. The eight it missed were silently reverted at
+    the end of any turn they were changed during — including `allow_code`, a
+    safety control, and `max_tool_rounds`.
+    """
+    covered = set(serve._MERGE_FROM_STORE) | {"messages", "prefill"}
+    missing = set(sessions.MUTABLE_FIELDS) - covered
+    assert not missing, (
+        "these fields can be changed through POST /api/sessions/{sid} but the "
+        "end-of-turn merge does not take them from the stored row, so a "
+        f"mid-turn change to them is reverted: {sorted(missing)}")
+
+
+def test_a_setting_changed_mid_turn_is_not_reverted(home, engine):
+    """A settings change made while a reply is STREAMING is the user's, and the
+    turn's own end-of-turn write must not put it back.
+
+    `allow_code` is the one that matters: a user switching code access OFF
+    mid-reply had it switched back on when the reply finished (audit F53). The
+    write lands in the window between the turn's snapshot and its end-of-turn
+    merge, which is the only window where it can be lost — the titler runs
+    AFTER the merge, so hooking that instead would prove nothing.
+    """
+    import asyncio
+    _running(ctx=131072)
+    Engine.script = [_say("a reply that takes a moment to arrive")]
+    Engine.stream_delay = 0.01
+    c = _client(engine.port)
+    sid = _seed(c, 6)
+    app = build_app(upstream_port=engine.port)
+
+    async def scenario():
+        turn = asyncio.create_task(
+            _stream(app, f"/api/sessions/{sid}/chat", {"message": "go"}))
+        await asyncio.sleep(0.2)              # the reply is streaming now
+        edited = await _request(app, "POST", f"/api/sessions/{sid}",
+                                {"allow_code": False, "max_tool_rounds": 7,
+                                 "workspace": "C:/somewhere"})
+        await turn
+        return edited
+
+    edited = asyncio.run(scenario())
+    assert edited["status"] == 200, edited
+
+    after = sessions.load(sid)
+    assert after["allow_code"] is False, \
+        "a safety setting changed mid-turn was reverted by the turn's own write"
+    assert after["max_tool_rounds"] == 7
+    assert after["workspace"] == "C:/somewhere"
+    assert after["messages"][-1]["role"] == "assistant"   # the turn still landed
