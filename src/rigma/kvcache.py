@@ -115,6 +115,19 @@ def config_of(plan, engine: str = "") -> dict:
     }
 
 
+def launch_fingerprint(rp, exe) -> str:
+    """The fingerprint for a plan that is about to be launched.
+
+    ONE definition on purpose. There are two ways to start an engine — `rigma up`
+    and the UI's switch/reload — and each must record the fingerprint of what it
+    actually launched, because everything downstream trusts the recorded value
+    rather than re-deriving it. Two copies of this expression is exactly how they
+    stop agreeing, and a disagreement here is the silent-corruption case this
+    module exists to prevent.
+    """
+    return fingerprint(config_of(rp, str(exe)))
+
+
 def save(port: int, save_dir: Path, fp: str, *, meta: dict | None = None,
          slot: int = MAIN_SLOT,
          timeout: float = 120.0) -> tuple[str | None, str | None]:

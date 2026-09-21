@@ -538,7 +538,7 @@ def perform_switch(model: str, registry=None, profile=None,
     # configuration. A 120K window costs about four minutes of prefill to
     # rebuild and a couple of seconds to read off disk.
     from . import kvcache
-    kv_fp = kvcache.fingerprint(kvcache.config_of(rp, str(exe)))
+    kv_fp = kvcache.launch_fingerprint(rp, exe)
     try:
         kvcache.restore(int(s["public_port"]) - 1,
                         runtime.rigma_home() / "sessions", kv_fp)
