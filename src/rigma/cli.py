@@ -1098,10 +1098,21 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     if sp is None:
         typer.echo("all fallbacks failed — see logs in ~/.rigma/logs/")
         raise typer.Exit(1)
+    # Both caches are keyed by `kv_fp`, and an EMPTY one disables them silently
+    # rather than loudly: `serve._prefix_ctx` returns None on a falsy fp, so
+    # `_prefix_warm`/`_prefix_snapshot` become no-ops, and `perform_unload` skips
+    # its KV save for the same reason. `rigma up` launches through here, so
+    # omitting this turned off prefix reuse AND restore-on-unload for every
+    # CLI-started run — the whole reason a long conversation re-prefilled from
+    # zero. `write_state` reverts unnamed fields to their defaults by design, so
+    # the launch path has to name it.
+    from . import kvcache as _kvcache
     st.write_state(rp.model_slug, rp.gguf.quant, port,
                    engine_pid=sp.proc.pid, ui_pid=os.getpid(),
                    backend=rp.backend, use_case=use_case, ctx=rp.flags.ctx,
                    gguf=rp.gguf.file,
+                   kv_cache=rp.flags.cache_type_k or "",
+                   kv_fp=_kvcache.launch_fingerprint(rp, exe),
                    # a projector this launch left off must stay off: perform_switch
                    # reads no_vision back when the caller has no opinion, and a
                    # ctx change from the UI would otherwise reload it
