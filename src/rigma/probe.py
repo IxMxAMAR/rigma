@@ -149,12 +149,40 @@ class _VkInstanceCreateInfo(ctypes.Structure):
 
 
 class _VkPhysicalDeviceProperties(ctypes.Structure):
+    # AUDIT F56. `limits` was a `c_uint8 * 504`, which ctypes aligns to 1. That
+    # put it at offset 292 instead of the C ABI's 296 and made the whole struct
+    # 816 bytes instead of 824 — so `vkGetPhysicalDeviceProperties` wrote EIGHT
+    # BYTES PAST THE ALLOCATION on every hardware probe. It never crashed because
+    # on a release allocator those bytes land in malloc's rounding slack; under
+    # PYTHONMALLOC=debug the interpreter aborts with "bad trailing pad byte".
+    #
+    # The fields actually read — vendorID, deviceType, deviceName — all sit below
+    # offset 292, which is why probe RESULTS were always right and only the write
+    # was wrong. That is also why nothing caught it: a read of the wrong bytes
+    # would have shown up as a wrong answer.
+    #
+    # uint64/uint32 arrays reproduce the real alignment instead of faking the
+    # byte count: limits at 296 (504 bytes), sparseProperties at 800 (20 bytes),
+    # and the struct's own 8-byte alignment rounds the total to 824.
     _fields_ = [("apiVersion", ctypes.c_uint32), ("driverVersion", ctypes.c_uint32),
                 ("vendorID", ctypes.c_uint32), ("deviceID", ctypes.c_uint32),
                 ("deviceType", ctypes.c_int), ("deviceName", ctypes.c_char * 256),
                 ("pipelineCacheUUID", ctypes.c_uint8 * 16),
-                ("limits", ctypes.c_uint8 * 504),
-                ("sparseProperties", ctypes.c_uint8 * 20)]
+                ("limits", ctypes.c_uint64 * 63),
+                ("sparseProperties", ctypes.c_uint32 * 5)]
+
+
+# The size IS the contract: the driver writes sizeof(VkPhysicalDeviceProperties)
+# bytes into whatever we hand it, so a struct that is too small is an overrun and
+# one that is too large silently shifts every field after it. Checked at import
+# because this is pure ABI arithmetic — it needs no Vulkan device, and the failure
+# it prevents is invisible on the machines that would otherwise be tested on.
+_VK_PHYSICAL_DEVICE_PROPERTIES_SIZE = 824
+if ctypes.sizeof(_VkPhysicalDeviceProperties) != _VK_PHYSICAL_DEVICE_PROPERTIES_SIZE:
+    raise RuntimeError(
+        "_VkPhysicalDeviceProperties is "
+        f"{ctypes.sizeof(_VkPhysicalDeviceProperties)} bytes, not "
+        f"{_VK_PHYSICAL_DEVICE_PROPERTIES_SIZE}: the driver would write past it")
 
 
 class _VkMemoryHeap(ctypes.Structure):
