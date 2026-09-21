@@ -175,18 +175,14 @@ BACKENDS: dict[str, Harness] = {
         probe=_mcode_available,
         wire="`mcode provider add --base-url <rigma>/v1 --api-format "
              "openai-completions --model <model> --api-key-env <var> "
-             "--context-limit N --output-limit N`, into a Rigma-owned "
+             "--context-limit N --output-limit N --use`, into a Rigma-owned "
              "MINIMAX_DATA_DIR; the turn then runs as "
-             "`--model custom_provider:rigma/<model>`",
-        unsupported=(
-            # FIRST because it is the one that stops the whole thing, and it is
-            # not something Rigma can fix on the owner's behalf.
-            "a MiniMax credential must exist before it will run ANY turn, even "
-            "one served entirely by Rigma's local model: `exec` refuses with "
-            "auth.login_required until `mcode login` (or a saved key) has "
-            "happened once. Measured 2026-09-21 — configuring a custom provider "
-            "does not satisfy it",
-        ) + _LEAVES_BEHIND + (
+             "`--model custom_provider:rigma/<model>`. `--use` is required: it "
+             "selects the provider, and an unselected one leaves mcode "
+             "demanding a MiniMax login for a turn that never leaves this "
+             "machine. It also tests the endpoint first, which costs one "
+             "throwaway call to Rigma's own /v1",
+        unsupported=_LEAVES_BEHIND + (
             "driveable only as a subprocess: it has no library API",
             "its own tool roster: a real turn sent the model 18 tool schemas, "
             "plus whatever MCP adds — Rigma can subtract from that set, never "
