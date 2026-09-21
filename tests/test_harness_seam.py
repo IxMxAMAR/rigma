@@ -171,6 +171,104 @@ def test_the_advertised_endpoint_is_rigmas_not_the_engines(monkeypatch):
     assert "11499" not in body["endpoint"]
 
 
+# --------------------------------------------------------------------------
+# The seam has to be REACHABLE from the product. `harness` was absent from
+# `sessions.MUTABLE_FIELDS`, so `POST /api/sessions/{sid}` could not set it and
+# the only way to point a chat at DSH was to edit its JSON by hand — the whole
+# integration was library-only, and no UI could have fixed that.
+
+
+def _patched_dsh(monkeypatch, present=True):
+    """DSH's availability is a source checkout, so it is monkeypatched rather
+    than installed: these tests are about the SELECTION, not the adapter."""
+    from rigma import harness_dsh
+    monkeypatch.setattr(harness_dsh, "available", lambda: present)
+
+
+def test_a_session_can_be_pointed_at_a_harness_through_the_api(
+        monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    _patched_dsh(monkeypatch)
+    with TestClient(serve.build_app(upstream_port=11500)) as c:
+        sid = c.post("/api/sessions", json={}).json()["id"]
+        r = c.post(f"/api/sessions/{sid}", json={"harness": "dsh"})
+    assert r.status_code == 200, r.text
+    assert r.json()["harness"] == "dsh"
+    assert sessions.load(sid)["harness"] == "dsh"
+
+
+def test_the_stored_harness_name_is_canonical(monkeypatch, tmp_path):
+    """The picker compares its own value against what the server stored, so the
+    stored name has to be the name the menu uses."""
+    from fastapi.testclient import TestClient
+
+    from rigma import serve
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    _patched_dsh(monkeypatch)
+    with TestClient(serve.build_app(upstream_port=11500)) as c:
+        sid = c.post("/api/sessions", json={}).json()["id"]
+        r = c.post(f"/api/sessions/{sid}", json={"harness": " DSH "})
+    assert r.status_code == 200, r.text
+    assert r.json()["harness"] == "dsh"
+
+
+def test_an_unknown_harness_is_refused_at_the_write(monkeypatch, tmp_path):
+    """Refused at the WRITE, not on every turn afterwards.
+
+    A session holding a name that cannot resolve would 400 on every turn, and
+    the user's only clue would be an error on a turn they had no reason to
+    connect to a setting — with nothing in the UI that offers to fix it.
+    """
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    with TestClient(serve.build_app(upstream_port=11500)) as c:
+        sid = c.post("/api/sessions", json={}).json()["id"]
+        r = c.post(f"/api/sessions/{sid}", json={"harness": "not-a-harness"})
+    assert r.status_code == 400
+    assert "unknown harness" in r.json()["error"]
+    assert sessions.load(sid)["harness"] == "native"      # left alone
+
+
+def test_a_listed_but_unwired_harness_cannot_be_selected(monkeypatch, tmp_path):
+    """MiniMax Code is on the menu so its cost is visible; it is not selectable,
+    and the refusal has to say what is missing or it is a dead end."""
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    with TestClient(serve.build_app(upstream_port=11500)) as c:
+        sid = c.post("/api/sessions", json={}).json()["id"]
+        r = c.post(f"/api/sessions/{sid}", json={"harness": "mcode"})
+    assert r.status_code == 400
+    assert "cannot run a turn yet" in r.json()["error"]
+    assert sessions.load(sid)["harness"] == "native"
+
+
+def test_a_harness_that_is_not_on_this_machine_cannot_be_selected(
+        monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    _patched_dsh(monkeypatch, present=False)
+    with TestClient(serve.build_app(upstream_port=11500)) as c:
+        sid = c.post("/api/sessions", json={}).json()["id"]
+        r = c.post(f"/api/sessions/{sid}", json={"harness": "dsh"})
+    assert r.status_code == 400
+    assert "RIGMA_DSH_HOME" in r.json()["error"]
+    assert sessions.load(sid)["harness"] == "native"
+
+
 def test_a_dsh_session_is_driven_by_the_adapter(monkeypatch, tmp_path):
     """The seam hands the turn over for real.
 
@@ -223,6 +321,13 @@ def test_a_dsh_session_is_driven_by_the_adapter(monkeypatch, tmp_path):
     assert '"delta": "all "' in body
     assert "[DONE]" in body
 
+    # and the client is told WHICH backend drove the turn, before the reply:
+    # an external turn can run for a minute before its first token, so a badge
+    # that only appears with the reply is one the reader waits for
+    assert "event: harness" in body
+    assert '"name": "dsh"' in body
+    assert '"label": "DeepSeek Harness"' in body
+
     # RIGMA's endpoint, not the engine's — the whole point of the seam
     assert seen["base_url"] == "http://127.0.0.1:11500/v1"
     assert seen["prompt"] == "do it"
@@ -234,3 +339,7 @@ def test_a_dsh_session_is_driven_by_the_adapter(monkeypatch, tmp_path):
     assert stored["messages"][-1]["role"] == "assistant"
     assert stored["messages"][-1]["content"] == "all done"
     assert stored["messages"][-1]["tool_trace"][0]["name"] == "pwsh"
+    # the badge survives a reload, and only an EXTERNAL reply carries one: a
+    # native message is not stamped "native", or the label would be on the
+    # ordinary case to explain the rare one
+    assert stored["messages"][-1]["harness"] == "dsh"

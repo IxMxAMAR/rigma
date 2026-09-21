@@ -182,13 +182,18 @@ def _turn_prompt(s: dict) -> str:
 
 
 def _save_external_reply(sid: str, text: str, trace: list,
-                         thinking: str = "") -> None:
+                         thinking: str = "", harness: str = "") -> None:
     """Persist what an external backend said into RIGMA's session.
 
     The backend owns its own transcript, so this is not the same record — this
     is the one the rail, the export and the context meter read. Loaded fresh and
     written under a revision guard, so a reply that took minutes cannot land on
     top of a rename or a second turn (the AUDIT F1/F4 shape).
+
+    `harness` is recorded on the message so the badge survives a reload. It is
+    only ever set for an EXTERNAL backend: a native reply needs no marker, and
+    stamping every message with "native" would put a label on the ordinary case
+    to explain the rare one.
     """
     fresh = sessions.load(sid)
     if fresh is None:
@@ -198,6 +203,14 @@ def _save_external_reply(sid: str, text: str, trace: list,
         entry["thinking"] = thinking
     if trace:
         entry["tool_trace"] = trace
+    if harness and harness != _harness.NATIVE:
+        entry["harness"] = harness
+        # The LABEL too, not just the name. The transcript badge is rendered
+        # from a persisted message, and making the UI join a name against
+        # /api/harnesses to find its label would mean a badge that is blank
+        # until a second request lands — or forever, in an exported transcript.
+        _h = _harness.BACKENDS.get(harness)
+        entry["harness_label"] = _h.label if _h else harness
     fresh["messages"] = list(fresh.get("messages", [])) + [entry]
     try:
         sessions.save(fresh, base_rev=fresh[sessions.REV_KEY])
@@ -258,6 +271,16 @@ CHECKPOINT_SECS = 20.0
 # these instead of the tight inter-token budget.
 # AUDIT F12: docs/audit-2026-09-04-full.md
 PREFILL_EVENTS = (b"event: tool", b"event: housekeeping")
+
+# SSE events that are NOT engine output. They say something about the turn
+# rather than about the model, so they are no evidence that the prefill
+# finished — the watchdog must leave its expectation alone when one arrives.
+#
+# This is not hypothetical: `harness` is emitted before the first token, and
+# treating it as a token dropped the very next wait to the tight inter-token
+# budget, freezing exactly the slow-prefill runs PREFILL_SECS exists to protect
+# (caught by tests/test_autonomous_run.py, 2026-09-21).
+CONTROL_EVENTS = (b"event: harness",)
 
 ARCHIVE_MAX = 400       # keep the archive tail bounded; the digest
                         # carries meaning, the archive is convenience
@@ -1282,6 +1305,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": "effort: must be one of "
                  + "/".join(x or "blank" for x in sessions.EFFORT_LEVELS)},
                 status_code=400)
+        if "harness" in body:
+            # Refuse the VALUE, not the turn. The seam's contract is that a
+            # session never silently gets a backend other than the one it asked
+            # for, so a name that cannot run is a bad write here — rather than a
+            # session that 400s on every turn afterwards with no way back that
+            # the UI can offer. `resolve` also canonicalises the name, so "DSH"
+            # is stored as "dsh" and the picker's value always matches.
+            try:
+                body["harness"] = _harness.resolve(
+                    body["harness"], port=upstream_port).name
+            except _harness.HarnessError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
@@ -1544,8 +1579,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             finally:
                 loop.call_soon_threadsafe(q.put_nowait, END)
 
-        yield _sse({"note": f"{backend.label} is driving this turn — it uses "
-                            "its own tools and system prompt, not Rigma's."},
+        # The badge in the transcript names WHICH backend this is; this line
+        # says what that costs, so the two are not the same sentence twice.
+        yield _sse({"note": "An external agent is driving this turn: it uses "
+                            "its own tools and system prompt, so Rigma's "
+                            "tool-call repair does not apply to it."},
                    event="notice")
         task = asyncio.create_task(asyncio.to_thread(_pump))
         said: list = []
@@ -1577,7 +1615,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             await task                          # the pump is done; reap it
         except Exception:
             pass                                # it reports its own failures
-        _save_external_reply(sid, "".join(said), trace, "".join(thought))
+        _save_external_reply(sid, "".join(said), trace, "".join(thought),
+                             backend.name)
         yield b"data: [DONE]\n\n"
 
     async def _llm_turn(s: dict, cont: bool = False):
@@ -1592,6 +1631,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except _harness.HarnessError as e:
             yield _sse({"message": str(e)}, event="error")
             return
+        # Which backend drove this turn, told to the client UP FRONT — an
+        # external turn can take a minute before its first token, and a badge
+        # that only appears with the reply is a badge the reader waits for. It
+        # is sent for every turn, native included: a marker that is only
+        # sometimes present is one the reader has to interpret.
+        #
+        # Its OWN event name, not `meta`. `meta` already means three things
+        # (ctx/timings at the end of a turn, and a new title from the titler),
+        # and it is suppressed on a failed turn precisely because a turn that
+        # produced nothing must not report a context size. Backend identity is
+        # true whether or not the turn succeeded, so it cannot share that name.
+        yield _sse({"name": _backend.name, "label": _backend.label},
+                   event="harness")
         if _backend.name != _harness.NATIVE:
             async for chunk in _external_turn(s, _backend):
                 yield chunk
@@ -3643,7 +3695,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # Policing that at IDLE_SECS killed exactly the runs that had
                 # grown big enough to need it, and reported the engine as
                 # frozen.
-                expect_prefill = any(e in chunk for e in PREFILL_EVENTS)
+                expect_prefill = (
+                    any(e in chunk for e in PREFILL_EVENTS)
+                    or (expect_prefill
+                        and any(e in chunk for e in CONTROL_EVENTS)))
                 if err is None and b"event: error" in chunk:
                     try:
                         payload = chunk.decode("utf-8", "replace").split(
