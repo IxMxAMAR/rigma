@@ -74,6 +74,33 @@ def available() -> bool:
     return sdk_src() is not None and dsh_bin() is not None
 
 
+# Deliberately EMPTY. DSH has never been driven end to end from this machine —
+# the module docstring says so — so there is no build this adapter was measured
+# against, and inventing a number would make `conformance` report agreement with
+# something that was never checked. Empty means "unknown", and `conformance`
+# says unknown rather than implying fine.
+VERIFIED = ""
+
+
+def backend_version() -> str:
+    """The checkout's own identity, or "" when it cannot say.
+
+    `git describe` rather than a `--version`, because DSH arrives as SOURCE: a
+    checkout has no version command, and the tag it was built from is the thing
+    that would move under Rigma. Never raises — this runs from a menu.
+    """
+    root = home()
+    if root is None:
+        return ""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "describe", "--tags", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
 def data_home() -> Path:
     """Where DSH keeps its OWN sessions and profile state.
 

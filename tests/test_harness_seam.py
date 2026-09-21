@@ -4,9 +4,16 @@ These tests pin the two properties that make a seam worth having rather than a
 place to hide a fallback: the default is unchanged, and asking for a backend
 that cannot run a turn says so instead of quietly running the native loop.
 """
+import dataclasses
+
 import pytest
 
-from rigma import harness
+from rigma import harness, harness_mcode
+
+
+def _with_verified(name: str, version: str):
+    """A backend whose declared verified build is a given value."""
+    return dataclasses.replace(harness.BACKENDS[name], verified=version)
 
 
 def test_the_built_in_harness_is_the_default():
@@ -453,6 +460,117 @@ def test_a_permission_mode_the_backend_cannot_take_is_refused_at_the_write():
         assert r.status_code == 400
         assert "full/smart/off" in r.json()["error"]
         assert "permission" not in (sessions.load(s["id"]) or {})
+
+
+def test_every_backend_reports_the_build_it_was_verified_against():
+    """A backend that updates underneath Rigma is the failure this seam is most
+    exposed to, and NOTHING in a turn would say so: an additive event-schema
+    change is absorbed on purpose, and a renamed one degrades quietly — tool
+    calls stop appearing while the reply still arrives. So the menu has to
+    carry the number, or the number exists only in a comment."""
+    for h in harness.list_harnesses():
+        assert "verified" in h, h["name"]
+
+
+def test_the_verified_build_is_a_fact_about_the_code(monkeypatch):
+    """Not a config a user could edit into a lie, and not a value that drifts
+    from the code it describes."""
+    assert harness_mcode.VERIFIED == "0.5.1"
+    assert harness.BACKENDS[harness.MCODE].verified == harness_mcode.VERIFIED
+
+
+def test_a_backend_that_moved_is_reported_as_drifted(monkeypatch):
+    monkeypatch.setattr(harness_mcode, "backend_version", lambda exe=None: "0.6.0")
+    monkeypatch.setitem(harness.BACKENDS, "mcode", _with_verified("mcode", "0.5.1"))
+    row = harness.conformance("mcode")[0]
+    assert row["drift"] is True
+    assert row["verified"] == "0.5.1"
+    assert row["version"] == "0.6.0"
+
+
+def test_the_build_we_verified_against_is_not_reported_as_drifted(monkeypatch):
+    monkeypatch.setattr(harness_mcode, "backend_version", lambda exe=None: "0.5.1")
+    monkeypatch.setitem(harness.BACKENDS, "mcode", _with_verified("mcode", "0.5.1"))
+    assert harness.conformance("mcode")[0]["drift"] is False
+
+
+def test_an_unverified_backend_says_unknown_rather_than_ok(monkeypatch):
+    """DSH has never been driven end to end from here, so its `VERIFIED` is
+    empty. Empty must read as "nobody checked", never as agreement — those are
+    different answers and only one of them is reassuring."""
+    monkeypatch.setattr(harness_mcode, "backend_version",
+                        lambda exe=None: "dsh-v0.1.5-rc.2-1687-gdeadbeef")
+    monkeypatch.setitem(harness.BACKENDS, "mcode", _with_verified("mcode", ""))
+    row = harness.conformance("mcode")[0]
+    assert row["drift"] is None
+    assert row["verified"] == ""
+
+
+def test_a_backend_that_will_not_say_its_version_is_not_agreement(monkeypatch):
+    """A version command that fails is not evidence that nothing changed."""
+    monkeypatch.setattr(harness_mcode, "backend_version", lambda exe=None: "")
+    monkeypatch.setitem(harness.BACKENDS, "mcode", _with_verified("mcode", "0.5.1"))
+    row = harness.conformance("mcode")[0]
+    assert row["version"] == ""
+    assert row["drift"] is None
+
+
+def test_a_version_probe_that_raises_does_not_take_down_the_check(monkeypatch):
+    """This runs from a menu and a health check. A backend that cannot answer is
+    a fact to report, not an exception that kills the reporting."""
+    def _boom(exe=None):
+        raise OSError("no such binary")
+
+    monkeypatch.setattr(harness_mcode, "backend_version", _boom)
+    row = harness.conformance("mcode")[0]
+    assert row["version"] == ""
+    assert row["drift"] is None
+
+
+def test_conformance_covers_every_backend_and_can_be_narrowed():
+    assert {r["name"] for r in harness.conformance()} == set(harness.known())
+    assert [r["name"] for r in harness.conformance("mcode")] == ["mcode"]
+    assert harness.conformance("not-a-backend") == []
+
+
+def test_the_conformance_command_says_drift_out_loud(monkeypatch):
+    """The one-command form. `drift` is a bool|None and a table is what a person
+    actually reads, so the three states have to be three different lines."""
+    from typer.testing import CliRunner
+
+    from rigma.cli import app
+
+    monkeypatch.setattr(harness_mcode, "backend_version", lambda exe=None: "0.6.0")
+    monkeypatch.setitem(harness.BACKENDS, "mcode", dataclasses.replace(
+        harness.BACKENDS["mcode"], verified="0.5.1", probe=lambda: True))
+    r = CliRunner().invoke(app, ["harness", "-b", "mcode"])
+    assert r.exit_code == 0, r.output
+    assert "DRIFTED" in r.output
+    assert "0.5.1" in r.output and "0.6.0" in r.output
+
+
+def test_a_backend_that_is_not_installed_is_not_called_drifted(monkeypatch):
+    """Nothing is installed, so nothing has moved. Reporting drift here would
+    send a reader looking for a version change that did not happen."""
+    from typer.testing import CliRunner
+
+    from rigma.cli import app
+
+    monkeypatch.setitem(harness.BACKENDS, "mcode", dataclasses.replace(
+        harness.BACKENDS["mcode"], verified="0.5.1", probe=lambda: False))
+    r = CliRunner().invoke(app, ["harness", "-b", "mcode"])
+    assert "not installed" in r.output
+    assert "DRIFTED" not in r.output
+
+
+def test_the_conformance_command_refuses_a_name_it_does_not_have():
+    from typer.testing import CliRunner
+
+    from rigma.cli import app
+
+    r = CliRunner().invoke(app, ["harness", "-b", "nope"])
+    assert r.exit_code == 1
+    assert "no such backend" in r.output
 
 
 def _cancels_of(app):

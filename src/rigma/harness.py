@@ -88,11 +88,19 @@ class Harness:
     # or an executable name. A backend can be present as a source checkout (DSH
     # is), which neither `which` nor `find_spec` can see.
     probe: "Callable[[], bool] | None" = None
+    # The build this adapter was measured against, from the adapter module's own
+    # `VERIFIED`. Empty means UNKNOWN — never "fine". A backend that updates
+    # underneath Rigma is the failure this seam is most exposed to, and nothing
+    # in a turn would say so: an additive schema change is absorbed silently and
+    # a RENAMED one degrades quietly, with tool calls simply ceasing to appear
+    # while the reply still arrives. This is the field that makes the drift
+    # sayable.
+    verified: str = ""
 
     def as_dict(self) -> dict:
         return {"name": self.name, "label": self.label, "drives": self.drives,
                 "runnable": self.runnable, "installed": installed(self),
-                "needs": self.needs, "wire": self.wire,
+                "needs": self.needs, "wire": self.wire, "verified": self.verified,
                 "unsupported": list(self.unsupported), "pending": self.pending}
 
 
@@ -133,6 +141,21 @@ def _mcode_available() -> bool:
     return harness_mcode.available()
 
 
+def _verified_of(module: str) -> str:
+    """The build an adapter declares it was measured against, or "".
+
+    Imported DEFENSIVELY for the same reason the probes are: an adapter that
+    cannot be imported must cost one menu entry, not the whole menu. Empty is a
+    real answer — it means nobody has verified that backend — so it is never
+    turned into a default.
+    """
+    try:
+        mod = importlib.import_module(f".{module}", __package__)
+    except Exception:
+        return ""
+    return str(getattr(mod, "VERIFIED", "") or "")
+
+
 BACKENDS: dict[str, Harness] = {
     NATIVE: Harness(
         name=NATIVE,
@@ -149,6 +172,7 @@ BACKENDS: dict[str, Harness] = {
         runnable=True,
         needs="the DeepSeek Harness checkout (set RIGMA_DSH_HOME)",
         probe=_dsh_available,
+        verified=_verified_of("harness_dsh"),
         # The design note had this wrong. `sdk-minimal` already mounts
         # llm-deepseek; what it does NOT do is set `protocol`, which defaults to
         # `messages` (Anthropic) and would POST /v1/messages at an OpenAI
@@ -175,6 +199,7 @@ BACKENDS: dict[str, Harness] = {
         runnable=True,
         needs="mcode",
         probe=_mcode_available,
+        verified=_verified_of("harness_mcode"),
         wire="`mcode provider add --base-url <rigma>/v1 --api-format "
              "openai-completions --model <model> --api-key-env <var> "
              "--context-limit N --output-limit N --use`, into a Rigma-owned "
@@ -226,6 +251,58 @@ def list_harnesses() -> list[dict]:
     For a UI or a CLI: this is the honest menu, not the set of things that work.
     """
     return [BACKENDS[n].as_dict() for n in known()]
+
+
+def conformance(name: str | None = None) -> list[dict]:
+    """Is each backend still the build this adapter was measured against?
+
+    The question a turn cannot answer for itself, and the one this seam is most
+    exposed to. Rigma absorbs an ADDITIVE event-schema change on purpose —
+    `map_event` ignores what it does not know, which is what the upstream docs
+    ask for — so a released backend can change shape while every turn still
+    LOOKS fine. A RENAMED item type degrades further: tool calls stop appearing
+    and the reply still arrives, so the transcript reads as a model that chose
+    not to use tools. Nothing in a turn would say so. This does.
+
+    `drift` is True when the installed build differs from the verified one, and
+    None when either is UNKNOWN — because "I could not tell" and "they agree"
+    are different answers, and only one of them is reassuring.
+    """
+    out: list[dict] = []
+    for key in known():
+        h = BACKENDS[key]
+        mod = _adapter_module(key)
+        probe = getattr(mod, "backend_version", None) if mod else None
+        version = ""
+        if callable(probe):
+            try:
+                version = str(probe() or "")
+            except Exception:
+                version = ""       # a backend that cannot answer is a fact
+        have, want = version.strip(), h.verified.strip()
+        out.append({
+            "name": h.name,
+            "label": h.label,
+            "installed": installed(h),
+            "verified": want,
+            "version": have,
+            "drift": (have != want) if (have and want) else None,
+        })
+    if name is not None:
+        key = str(name).strip().lower()
+        return [r for r in out if r["name"] == key]
+    return out
+
+
+def _adapter_module(name: str):
+    """The adapter module for a backend, or None. Same defensive import."""
+    mod_name = _ADAPTERS.get(str(name or "").strip().lower())
+    if not mod_name:
+        return None
+    try:
+        return importlib.import_module(f".{mod_name}", __package__)
+    except Exception:
+        return None
 
 
 def endpoint_for(port: int) -> str:
