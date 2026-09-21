@@ -18,9 +18,11 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import context
+from . import harness as _harness
 from . import methods_api
 from . import mission as _mission_mod
 from . import presets
+from . import prompt as _prompt
 from . import runtime
 from . import server_ops
 from . import sessions
@@ -333,49 +335,55 @@ class FrozenTurnError(Exception):
 # The run's session runs under THIS system prompt (not the generic chat default)
 # — a weak local model will not start calling tools on its own without being
 # told, plainly and firmly, that it is a tool-using agent.
-AGENT_SYSTEM_PROMPT = (
-    "You are Rigma's AUTONOMOUS AGENT. You pursue one MISSION over many steps, "
-    "entirely on your own, by CALLING TOOLS. Writing prose accomplishes NOTHING "
-    "— only tool calls change anything. There is no human to answer; act.\n\n"
-    "EVERY TURN you MUST call at least one tool. Never reply with only text or "
-    "only thinking. Think briefly, then ACT.\n\n"
-    "Your loop:\n"
-    "1. No plan yet? Call `manage_plan(action=\"add\", task=\"…\")` 3-5 times to "
-    "break the mission into concrete, verifiable steps.\n"
-    "2. Otherwise DO the next pending step with the right tool (read_file, "
-    "write_file, run_shell, run_python, find_files, sample_files, view_images, "
-    "web_search, …).\n"
-    "   • File tools take ABSOLUTE paths (D:\\Art\\pic.png) — you do NOT need "
-    "run_shell to reach a folder outside the workspace.\n"
-    "   • NEVER RETYPE A FILENAME. You will get long names wrong (you cannot "
-    "reliably reproduce ComfyUI_00428_.png). After sample_files, call "
-    "`view_sample()` — it uses the files you were just given, by reference. "
-    "To look at a folder directly use `view_images(folder=..., count=N)`.\n"
-    "   • NEVER dump a big folder. list_directory summarises large folders; use "
-    "`sample_files(path, count)` when you need examples, and `find_files` with a "
-    "glob when you need specific ones. Dumping thousands of filenames wastes "
-    "the context you need for the actual work.\n"
-    "3. After a real step, call `manage_plan(action=\"complete\", id=N)`. Your "
-    "progress log is written for you automatically — never narrate it.\n"
-    "4. Only when the WHOLE mission is genuinely finished, call "
-    "`task_complete(summary=\"…\")` — you will be asked to verify with tools.\n\n"
-    "NEVER SPEND TOOL CALLS FINDING YOUR PLACE. Every turn you are already told "
-    "how many steps are done, your last logged progress, and your ONE next step. "
-    "Do NOT call manage_plan(list), do NOT read progress.md / core_directive.md "
-    "to catch up, and do NOT re-list folders you have already listed. Trust what "
-    "you are given and spend your tool calls on the WORK.\n\n"
-    "NEVER PROMISE AN ACTION INSTEAD OF TAKING IT. If you write \"I will now "
-    "write the file\", \"let me check X\", or \"next I'll generate the "
-    "prompts\", the tool call for it MUST be in that same response. Never end a "
-    "turn on a promise — the promise accomplishes nothing and the next turn "
-    "starts over. Either you called a tool this turn, or the turn was wasted.\n\n"
-    "NEVER INVENT RESULTS. Do not write file contents, directory listings, "
-    "counts or outputs you did not actually get back from a tool. If something "
-    "is blocked, say what blocked you and try another route — reporting a "
-    "blocker honestly is always better than fabricating a result that looks "
-    "plausible.\n\n"
-    "If a tool errors, read it and try a different approach. Keep going until "
-    "task_complete. Do not stop to ask permission — you already have it.")
+#
+# The text now lives in `prompt.py` as named, ordered sections (agent.identity,
+# agent.loop, agent.no_fabrication, …), so each rule is individually testable
+# and a model that cannot use a tool is not told to call it. This name is kept
+# because the value and the call sites are otherwise unchanged, and
+# tests/test_prompt_sections.py asserts the assembled text is byte-for-byte what
+# the old inline literal produced.
+AGENT_SYSTEM_PROMPT = _prompt.agent_prompt()
+
+
+def _tool_surface(run_id: str) -> str:
+    """Which tool surface a session is advertised, for a run or a plain chat.
+
+    One decision with two readers: the round loop, which builds the specs, and
+    the Run's system prompt, which may only name tools those specs advertise.
+    They are assembled in different handlers, so computing the rule twice is how
+    the prompt ends up describing `web_search` to a focused Run that was never
+    offered it — the same disagreement `_engine_has_vision` exists to prevent
+    for vision. RIGMA_TOOL_SURFACE=all reverts a focused Run without a code
+    edit, for an A/B on real hardware."""
+    want = (os.environ.get("RIGMA_TOOL_SURFACE")
+            or ("focused" if run_id else "all")).strip().lower()
+    return want if want in ("all", "focused") else "all"
+
+
+def _prompt_caps(registry=None, *, run_id: str = "run") -> set[str]:
+    """The capabilities the agent prompt may describe: what the model can do,
+    and what its surface actually carries."""
+    caps = {"vision"} if _engine_has_vision(registry) else set()
+    if _tool_surface(run_id) == "all":
+        caps.add("extended")
+    return caps
+
+
+def _engine_has_vision(registry=None) -> bool:
+    """Whether the model that is loaded can see images.
+
+    One reader for one fact. The chat handler gates the vision TOOLS on it
+    (`tools.tool_specs`, needs="vision") and the Run's system prompt gates the
+    vision ADVICE on it; naming `view_images` in a prompt for a model the tool
+    surface withheld it from is two copies of one question disagreeing, which is
+    exactly the failure `prompt.py` was introduced to stop."""
+    try:
+        from .registry import Registry
+        reg = registry if registry is not None else Registry.load()
+        mdl = (st.read_state() or {}).get("model", "")
+        return "vision" in reg.models[mdl].capabilities
+    except Exception:
+        return False
 
 
 def _spill_big_result(name: str, result: str, tctx: dict) -> str:
@@ -1340,6 +1348,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def list_presets():
         return presets.list_presets(registry)
 
+    @app.get("/api/harnesses")
+    async def list_harnesses():
+        """The agent backends, and what choosing one would cost.
+
+        Only the built-in can run a turn today; the external ones are listed
+        with `installed` (is the SDK/CLI present?) kept separate from
+        `runnable` (can a turn be handed to it?), so a probe is never mistaken
+        for a working integration."""
+        from . import harness as _harness
+        return {"built_in": _harness.NATIVE,
+                "endpoint": _harness.endpoint_for(upstream_port),
+                "harnesses": _harness.list_harnesses()}
+
     @app.post("/api/presets")
     async def create_preset(body: dict | None = None):
         body = body or {}
@@ -1443,6 +1464,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         params = sessions.effective_params(s, preset, _model_defaults())
         effort = s.get("effort", "")
         specs, tctx, trace = None, None, []
+        # The tool surface is only chosen inside `if use_tools:` below. These
+        # defaults exist so the round loop's unlock check can be unconditional
+        # — with tools off there is nothing to widen and nothing to refresh.
+        _surface = "all"
+        _advertised: list = []
         # what the delegate helper ran inside its firewall (AUDIT F32)
         delegate_log: list = []
         if use_tools:
@@ -1450,14 +1476,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
             from . import rag
             from . import tools as toolkit
-            has_vision = False
-            try:
-                from .registry import Registry
-                reg2 = registry if registry is not None else Registry.load()
-                mdl = (st.read_state() or {}).get("model", "")
-                has_vision = "vision" in reg2.models[mdl].capabilities
-            except Exception:
-                pass
+            has_vision = _engine_has_vision(registry)
             run_id = s.get("run_id", "")
             run_profile = s.get("run_profile", "all")
             # a method-creation chat is offered the builder tools and NOTHING
@@ -1472,12 +1491,28 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # that fires two spellings of one filename in parallel is
                     # not charged twice for the same content (2026-08-21)
                     "_reads": {}}
-            specs = toolkit.tool_specs(
-                allow_code=tctx["allow_code"],
-                has_rag=bool(rag.recorded_sidecar_port()),
-                workspace=tctx["workspace"], has_vision=has_vision,
-                has_run=bool(run_id), profile=run_profile,
-                builder_only=builder_only)
+            # HOW MUCH of the permitted set goes on the wire.
+            #
+            # A Run advertised all 32 tools = 16,490 chars (~4,100 tok), 14.6%
+            # of a 32K window before the mission or one message of history
+            # (measured 2026-09-20). "focused" advertises the core tier and
+            # offers `use_tools` for the rest, which the session keeps for the
+            # remainder of the run. Plain chat is already lean (9 tools, ~880
+            # tok) and is left on "all" — the waste was only ever the Run.
+            _surface = _tool_surface(run_id)
+            _has_rag = bool(rag.recorded_sidecar_port())
+            tctx["unlocked"] = [str(n) for n in (s.get("unlocked_tools") or [])]
+
+            def _specs_now():
+                return toolkit.tool_specs(
+                    allow_code=tctx["allow_code"], has_rag=_has_rag,
+                    workspace=tctx["workspace"], has_vision=has_vision,
+                    has_run=bool(run_id), profile=run_profile,
+                    builder_only=builder_only, surface=_surface,
+                    unlocked=tctx["unlocked"])
+
+            specs = _specs_now()
+            _advertised = list(tctx["unlocked"])
             _sem = asyncio.Semaphore(8)   # cap concurrent tool subprocesses / IO
 
             # read-only exploration set for the delegate helper. No writes, no
@@ -1599,6 +1634,72 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                      "content": _clip(str(result), 4000)})
                 return "delegate hit its round limit without a final answer"
 
+            def _unlock_tools(cargs) -> str:
+                """`use_tools`: widen THIS session's advertised set.
+
+                The tier table keeps a Run's tool list short; this is the way
+                back to everything it held down. A name is honoured only when
+                permission already allowed it — `lockable_names` is derived
+                from the same filters `tool_specs` uses — so asking for
+                run_shell in a session with no code access is refused, not
+                granted. A tier is not a permission, and neither is this.
+                """
+                allowed = toolkit.lockable_names(
+                    allow_code=tctx["allow_code"], has_rag=_has_rag,
+                    workspace=tctx["workspace"], has_vision=has_vision,
+                    has_run=bool(run_id), profile=run_profile,
+                    builder_only=builder_only)
+                cargs = cargs or {}
+                want = cargs.get("names") or []
+                if isinstance(want, str):
+                    want = [want]
+                want = [str(n).strip() for n in want if str(n).strip()]
+                hidden = allowed - {x["function"]["name"] for x in specs}
+                if not want or str(cargs.get("help", "")).lower() == "list":
+                    if not hidden:
+                        return ("Every tool you can use is already in your "
+                                "list. There is nothing held back.")
+                    rows = []
+                    for n, desc in toolkit.describe_tools(sorted(hidden)):
+                        rows.append("- " + n + ": " + _clip(desc, 100))
+                    return ("Held back (call use_tools(names=[...]) for any of "
+                            "these):\n" + "\n".join(rows))
+                got, refused, already = [], [], []
+                for n in want:
+                    if n not in allowed:
+                        refused.append(n)      # permission, not a tier, says no
+                    elif n in hidden:
+                        got.append(n)          # held back by its tier: unlock it
+                    else:
+                        already.append(n)      # on the wire already
+                for n in got:
+                    if n not in tctx["unlocked"]:
+                        tctx["unlocked"].append(n)
+                out = ""
+                if got:
+                    # Mid-turn, guarded: reload the row so this never writes a
+                    # stale message list over another turn's, then add the one
+                    # field. Same shape the run loop uses for run_profile.
+                    try:
+                        cur = sessions.load(s["id"])
+                        if cur:
+                            cur["unlocked_tools"] = sorted(
+                                set(tctx["unlocked"]))
+                            sessions.save(cur)
+                    except Exception:
+                        pass          # an unlock that failed to persist still
+                                      # works for the rest of THIS turn
+                    out = ("Unlocked for the rest of this session: "
+                           + ", ".join(got) + ". They are in your tool list "
+                           "from your NEXT step — call one then.")
+                if already:
+                    out += ("\nAlready in your tool list: "
+                            + ", ".join(already) + ".")
+                if refused:
+                    out += ("\nNot available in this session (permission): "
+                            + ", ".join(refused) + ".")
+                return out.strip() or "Nothing to unlock."
+
             async def _run_call(name, cargs):
                 """Run one tool (cached, capped) and resolve any image sentinel
                 into base64 vision payloads. Returns (result_text, imgs|None)."""
@@ -1607,6 +1708,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         return await _delegate_call(
                             str((cargs or {}).get("question", "")),
                             str((cargs or {}).get("path", ""))), None
+                if name == "use_tools":
+                    return _unlock_tools(cargs), None
                 async with _sem:
                     result = await asyncio.to_thread(toolkit.cached_run,
                                                      name, cargs, tctx)
@@ -1748,6 +1851,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # flagged, instead of the reply ceasing to exist.
         try:
             for _round in range(max_rounds):
+                if _surface != "all" and tctx["unlocked"] != _advertised:
+                    # A tool unlocked during THIS turn must be advertised from
+                    # the next round on: under tool_choice:"required" the GBNF
+                    # grammar only admits advertised names, so a tool the model
+                    # cannot see is a tool it cannot call. Unlocks are saved on
+                    # the session, so this normally fires once per unlock.
+                    specs = _specs_now()
+                    _advertised = list(tctx["unlocked"])
                 # `last` MUST stay False in one-action mode: tool calls are only
                 # executed when `not last` (see the tool block below), so treating
                 # round 0 as last would DROP the action instead of running it.
@@ -3116,6 +3227,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
+        # Which agent backend runs this turn. Only the built-in can run one
+        # today, and `resolve` REFUSES rather than quietly running the native
+        # loop: a session that asked for another harness and silently got the
+        # built-in would be a lie the user cannot see from the output.
+        try:
+            _harness.resolve(s.get("harness"), port=upstream_port)
+        except _harness.HarnessError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         message = body.get("message")
         if isinstance(message, str):
             message = _apply_skill(message)
@@ -4091,15 +4210,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # after, so it does not churn the cached prompt prefix. A model that
         # begins already knowing "you cannot retype long filenames" is a
         # different model; failing to read them just means it starts naive.
-        agent_prompt = AGENT_SYSTEM_PROMPT
+        #
+        # The prompt is assembled for THIS engine's capabilities: a model with
+        # no vision is not offered the vision tools, so it must not be told to
+        # call them. The memory block is the last section, not a concatenation
+        # glued on at the call site, so its position is a decision.
+        _mem_block = ""
         try:
             if os.environ.get("RIGMA_MEMORY") != "0":
                 from . import memory as _mem
-                block = _mem.render_pitfall_block(_memory_store().all())
-                if block:
-                    agent_prompt = AGENT_SYSTEM_PROMPT + "\n\n" + block
+                _mem_block = _mem.render_pitfall_block(_memory_store().all())
         except Exception:
             pass                   # memory is never load-bearing
+        agent_prompt = _prompt.agent_prompt_with_memory(
+            _mem_block, caps=_prompt_caps(registry))
         sess.update(use_tools=True, allow_code=True, auto_compact=True,
                     workspace=workspace,
                     mission=mission,       # replaced by the compiled spec

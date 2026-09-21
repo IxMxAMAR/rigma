@@ -123,6 +123,10 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # trigger rules: one-line reminders queued for the next
                      # turn, and the loop-guard bookkeeping (see triggers.py)
                      "pending_nudges": [], "trigger_state": {},
+                     # which agent backend runs this session's turns. Only the
+                     # built-in can run one today; `harness.resolve` refuses
+                     # anything else rather than quietly substituting it.
+                     "harness": "native",
                      "messages": []}
 
 
