@@ -96,11 +96,19 @@ class Harness:
     # while the reply still arrives. This is the field that makes the drift
     # sayable.
     verified: str = ""
+    # Rigma's own loop, shipped with Rigma. It has no external build to drift
+    # from and nothing to have been "measured against", so the unverified wording
+    # is not merely unhelpful here — it is wrong, and it made the built-in look
+    # like the riskiest option on the list. Named rather than inferred from
+    # `verified == ""`, because empty means UNKNOWN for every other backend and
+    # conflating the two would hide a real unknown.
+    built_in: bool = False
 
     def as_dict(self) -> dict:
         return {"name": self.name, "label": self.label, "drives": self.drives,
                 "runnable": self.runnable, "installed": installed(self),
                 "needs": self.needs, "wire": self.wire, "verified": self.verified,
+                "built_in": self.built_in,
                 "unsupported": list(self.unsupported), "pending": self.pending}
 
 
@@ -164,6 +172,7 @@ BACKENDS: dict[str, Harness] = {
         runnable=True,
         needs="",
         wire="speaks to llama-server directly",
+        built_in=True,
     ),
     DSH: Harness(
         name=DSH,
@@ -286,6 +295,7 @@ def conformance(name: str | None = None) -> list[dict]:
             "installed": installed(h),
             "verified": want,
             "version": have,
+            "built_in": h.built_in,
             "drift": (have != want) if (have and want) else None,
         })
     if name is not None:
