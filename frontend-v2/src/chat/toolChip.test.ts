@@ -79,3 +79,30 @@ describe("what a chip shows when it is opened", () => {
     expect(formatArgs(undefined)).toBe("");
   });
 });
+
+describe("a subagent call is identified by its agent, not its prose", () => {
+  // Measured off the wire: mcode's `task` requires description, prompt AND
+  // agent_name. Showing the description told the reader what the subagent was
+  // asked to do without telling them WHICH one was asked.
+  const call = {
+    agent_name: "explore",
+    description: "find every place the seam is called",
+    prompt: "long instructions that do not belong on one line",
+    run_in_background: false,
+  };
+
+  it("previews the agent name", () => {
+    expect(previewArgs(call)).toBe("explore");
+  });
+
+  it("keeps the description on the opened chip", () => {
+    const out = formatArgs(call);
+    expect(out.split("\n")[0]).toBe("explore");
+    expect(out).toContain("find every place the seam is called");
+  });
+
+  it("still falls back to description when there is no agent", () => {
+    // A tool with a description and no agent_name must not regress.
+    expect(previewArgs({ description: "do the thing" })).toBe("do the thing");
+  });
+});
