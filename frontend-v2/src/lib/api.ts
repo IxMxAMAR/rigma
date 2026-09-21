@@ -73,6 +73,14 @@ export const api = {
   updateSession: (id: string, patch: Record<string, unknown>) =>
     j<Session>("POST", `/api/sessions/${id}`, patch),
   deleteSession: (id: string) => j<unknown>("DELETE", `/api/sessions/${id}`),
+  /** Stop the turn running in this chat. Distinct from aborting the fetch that
+   *  is reading it: that only drops this browser's end, and the backend keeps
+   *  working — for an external agent, keeps running and keeps spawning
+   *  subagents while the UI says stopped. `stopped` says whether anything was
+   *  actually running, so the UI can be honest about what it did. */
+  stopSession: (id: string) =>
+    j<{ ok: boolean; stopped: boolean }>(
+      "POST", `/api/sessions/${id}/stop`, {}),
   /** The honest menu: every backend, including the ones that cannot run a turn
    *  yet, each with what it would cost. */
   listHarnesses: () => j<HarnessMenu>("GET", "/api/harnesses"),
