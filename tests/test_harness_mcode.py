@@ -519,3 +519,99 @@ def test_continuity_survives_a_real_second_call(fake_cli, monkeypatch):
     execs = [a for a in logged(fake_cli) if a and a[0] == "exec"]
     assert "--session" not in execs[0]
     assert execs[1][execs[1].index("--session") + 1] == "mvs_probe"
+
+
+# --------------------------------------------------------------------------
+# Rigma's one channel into the agent: the agent's OWN instruction file
+
+
+def test_rigmas_note_lands_in_the_agents_own_data_dir(fake_cli, tmp_path):
+    """mcode has no append/override mechanism for its prompt — no flag, no
+    config key, no env var. `<dataDir>/AGENTS.md` is the documented channel, and
+    Rigma owns the data dir, so that is where a note about the agent's world
+    goes. Never into the prompt, and never into the user's project."""
+    list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
+    note = tmp_path / "home" / "mcode" / "AGENTS.md"
+    assert note.exists()
+    text = note.read_text(encoding="utf-8")
+    assert harness_mcode._AGENTS_MARKER in text
+    # the one fact the agent cannot discover for itself
+    assert "not a frontier cloud model" in text
+
+
+def test_the_note_describes_the_world_and_claims_nothing_else(fake_cli,
+                                                              tmp_path):
+    """The agent's instruction set is the thing worth borrowing. A note that
+    told it HOW to work would dilute the benchmark this backend was chosen
+    for."""
+    harness_mcode.ensure_agents_md()
+    text = (tmp_path / "home" / "mcode" / "AGENTS.md").read_text(encoding="utf-8")
+    assert "environment description" in text
+    assert "does not rewrite" in text
+    assert "your tool roster" in text
+
+
+def test_a_users_edit_to_the_note_is_not_fought(fake_cli, tmp_path):
+    """The file sits in a directory Rigma owns, but what it says about the
+    agent's world is worth being able to correct by hand."""
+    note = tmp_path / "home" / "mcode" / "AGENTS.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("# my own note, no marker\n", encoding="utf-8")
+    harness_mcode.ensure_agents_md()
+    assert note.read_text(encoding="utf-8") == "# my own note, no marker\n"
+
+
+def test_the_note_is_refreshed_while_rigma_still_owns_it(fake_cli, tmp_path):
+    note = tmp_path / "home" / "mcode" / "AGENTS.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(harness_mcode._AGENTS_MARKER + "\n<!-- version: 0 -->\n"
+                    "stale\n", encoding="utf-8")
+    harness_mcode.ensure_agents_md()
+    assert "stale" not in note.read_text(encoding="utf-8")
+
+
+def test_a_failure_reports_what_the_exit_code_means(fake_cli, monkeypatch):
+    """The number alone sends a reader to look it up."""
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", "[]")
+    monkeypatch.setenv("FAKE_MCODE_EXIT", "4")
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
+    assert [e.kind for e in got] == ["error"]
+    assert "exited 4" in got[0].text and "the run failed" in got[0].text
+
+
+def test_a_run_that_ends_unsuccessfully_is_not_called_a_success(
+        fake_cli, monkeypatch):
+    """A step limit or a cancellation is reported in the RESULT while the
+    process still exits 0. The documented advice is to check both."""
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps([
+        _ev(1, "exec.started"), _ev(2, "session.started"),
+        _ev(3, "turn.started"),
+        _ev(4, "item.completed", item={"id": "m:message",
+                                       "type": "agent_message",
+                                       "content": "half a job"}),
+        _ev(5, "exec.completed", result={"status": "limit_exceeded"}),
+    ]))
+    monkeypatch.setenv("FAKE_MCODE_EXIT", "0")
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
+    assert [e.text for e in got if e.kind == "text"] == ["half a job"]
+    errs = [e.text for e in got if e.kind == "error"]
+    assert errs and "limit_exceeded" in errs[0]
+
+
+def test_a_turn_that_reported_its_own_failure_is_not_reported_twice(
+        fake_cli, monkeypatch):
+    """`turn.failed` already said what went wrong. A second error line for the
+    same event would read as two failures."""
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps([
+        _ev(1, "turn.failed", status="failed",
+            error={"message": "upstream refused"}),
+        _ev(2, "exec.completed", result={"status": "failed"}),
+    ]))
+    monkeypatch.setenv("FAKE_MCODE_EXIT", "0")
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
+    assert [e.kind for e in got] == ["error"]
+    assert "upstream refused" in got[0].text
