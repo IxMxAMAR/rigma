@@ -28,6 +28,14 @@ export interface StreamingTurn {
   error: string | null;
   /** set while a macro drives this turn, so the UI can say which step */
   macro: { label: string; index: number; total: number } | null;
+  /** Which backend owns this turn, named at its START — an external turn can
+   *  run for a minute before its first token, so the badge must not wait for
+   *  the reply to exist. Empty means the server never said. */
+  harness: string;
+  harnessLabel: string;
+  /** Server-authored status lines for this turn. They used to be dropped here,
+   *  including the one that explains an external backend is driving. */
+  notices: string[];
 }
 
 /** Marks a reply the user cut short, so the transcript never reads as if the
@@ -96,6 +104,9 @@ export const emptyTurn = (): StreamingTurn => ({
   citations: [],
   error: null,
   macro: null,
+  harness: "",
+  harnessLabel: "",
+  notices: [],
 });
 
 /** Pure: fold one SSE event into the streaming turn. Returns a NEW object —
@@ -145,6 +156,20 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
       return { ...turn, citations: (d.citations as unknown[]) ?? [] };
     case "error":
       return { ...turn, error: String(d.message ?? "unknown error") };
+    // Which backend owns this turn, named at its start. Its own event name
+    // rather than `meta`, which already carries ctx/timings and titles.
+    case "harness":
+      return d.name != null
+        ? {
+            ...turn,
+            harness: String(d.name),
+            harnessLabel: String(d.label ?? d.name),
+          }
+        : turn;
+    case "notice": {
+      const note = String(d.note ?? "");
+      return note ? { ...turn, notices: [...turn.notices, note] } : turn;
+    }
     case "message":
     default:
       return d.delta != null
@@ -172,6 +197,10 @@ export interface ChatState {
    *  that produced it is thrown away one round-trip after it appears. */
   lastError: string | null;
   images: string[];               // data URIs staged in the composer
+  /** Which agent backend owns the chat on screen. Held here because both the
+   *  picker and the transcript badge need it, and the store is the only place
+   *  that already knows which chat that is. */
+  harness: string;
 
   loadSessions: () => Promise<void>;
   search: (q: string) => Promise<void>;
@@ -191,6 +220,11 @@ export interface ChatState {
   removeImage: (i: number) => void;
   stop: () => void;
   clearError: () => void;
+  /** Hand the current chat's turns to another backend. Unlike the other
+   *  session patches this one is NOT fire-and-forget: the server refuses a
+   *  backend it cannot run and says why, and that reason is the whole value of
+   *  validating the write. */
+  setHarness: (name: string) => Promise<void>;
 }
 
 /** The live turn for the chat on screen — nothing else may render. */
@@ -221,6 +255,7 @@ export const useChat = create<ChatState>((set, get) => ({
   pendingVariants: {},
   lastError: null,
   images: [],
+  harness: "native",
 
   loadSessions: async () => {
     try {
@@ -268,7 +303,8 @@ export const useChat = create<ChatState>((set, get) => ({
   open: async (id) => {
     try {
       const s = await api.getSession(id);
-      set({ currentId: id, messages: s.messages, lastError: null });
+      set({ currentId: id, messages: s.messages,
+            harness: s.harness ?? "native", lastError: null });
     } catch (e) {
       // AUDIT F50: a session click that failed used to do nothing at all
       set({ lastError: errText(e) });
@@ -278,10 +314,25 @@ export const useChat = create<ChatState>((set, get) => ({
   newChat: async () => {
     try {
       const s = await api.createSession();
-      set({ currentId: s.id, messages: [], lastError: null });
+      set({ currentId: s.id, messages: [], harness: s.harness ?? "native",
+            lastError: null });
       await get().loadSessions();
     } catch (e) {
       set({ lastError: errText(e) });
+    }
+  },
+
+  setHarness: async (name) => {
+    const sid = get().currentId;
+    if (!sid || name === get().harness) return;
+    const prev = get().harness;
+    set({ harness: name, lastError: null });
+    try {
+      await api.updateSession(sid, { harness: name });
+    } catch (e) {
+      // Put the old backend back. Leaving the picker showing one the server
+      // rejected would make the next turn's failure look like a model problem.
+      set({ harness: prev, lastError: errText(e) });
     }
   },
 

@@ -1,7 +1,7 @@
 // Right sidecar for the chat surface: grounding, sampling, system prompt.
 // Collapsible; state persists to the session via the existing PATCH API.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../lib/api";
+import { api, type HarnessInfo } from "../lib/api";
 import {
   createDraft,
   exportUrl,
@@ -469,6 +469,27 @@ interface PresetRow {
   name: string;
 }
 
+/** Why a listed backend cannot be chosen, in the words the SERVER used.
+ *
+ *  The picker is where the choice is made, so the reason has to be readable
+ *  here — the alternative is an option that looks fine, a failed write, and an
+ *  error the user only sees after the fact. */
+function harnessHint(h: HarnessInfo): string {
+  if (!h.runnable) return `${h.label} cannot run a turn yet: ${h.pending}`;
+  if (!h.installed) return `${h.label} needs ${h.needs} on this machine`;
+  return `${h.drives}. It talks to Rigma's own /v1, so the model stays the `
+    + `one tuned for this machine. It leaves behind: `
+    + `${h.unsupported.join("; ")}.`;
+}
+
+/** The short reason shown inside the option itself, for a backend that is on
+ *  the menu but not usable — the menu is honest, not filtered. */
+function harnessShort(h: HarnessInfo): string {
+  if (!h.runnable) return "not wired up yet";
+  if (!h.installed) return "not installed";
+  return "";
+}
+
 function SamplingCard() {
   const currentId = useChat((s) => s.currentId);
   // the cap follows the ENGINE's context — a hardcoded 32768 silently
@@ -484,6 +505,16 @@ function SamplingCard() {
   // enable_thinking, and the UI could not send even that — the field was not
   // rendered anywhere. Applies per chat and needs NO engine restart.
   const [effort, setEffort] = useState("");
+  // Which agent backend owns this chat. The current value lives in the chat
+  // store (it is set when the chat is opened and patched on change); the MENU
+  // is fetched once, because it is static for the life of the server process.
+  const harness = useChat((s) => s.harness);
+  const setHarness = useChat((s) => s.setHarness);
+  const [menu, setMenu] = useState<HarnessInfo[]>([]);
+
+  useEffect(() => {
+    api.listHarnesses().then((d) => setMenu(d.harnesses)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     fetch("/api/presets")
@@ -599,6 +630,38 @@ function SamplingCard() {
           <option value="medium">medium</option>
           <option value="high">high</option>
           <option value="xhigh">xhigh — slowest, most careful</option>
+        </select>
+      </label>
+      <label className="flex items-center gap-2 text-[12.5px]"
+             title={"Which agent runs this chat's turns. Rigma's own loop is "
+                    + "built for a weak local model: it repairs malformed tool "
+                    + "calls, recovers fuzzy filenames, verifies artifacts and "
+                    + "does one action per turn. An external backend brings its "
+                    + "own tools and system prompt and inherits none of that, "
+                    + "but it is a stronger agent. Either way it talks to the "
+                    + "model Rigma tuned for this machine. Applies to THIS chat, "
+                    + "from its next turn."}>
+        <span className="w-24 text-secondary">agent</span>
+        <select
+          value={harness}
+          aria-label="Agent harness"
+          onChange={(e) => void setHarness(e.target.value)}
+          className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"
+        >
+          {/* If the menu has not arrived — or the stored backend is not on it,
+              which is what a moved checkout looks like — show the value we
+              actually have rather than a blank select. */}
+          {harness && !menu.some((h) => h.name === harness) && (
+            <option value={harness}>{harness}</option>
+          )}
+          {menu.map((h) => (
+            <option key={h.name} value={h.name}
+                    disabled={!h.runnable || !h.installed}
+                    title={harnessHint(h)}>
+              {h.label}
+              {harnessShort(h) ? ` — ${harnessShort(h)}` : ""}
+            </option>
+          ))}
         </select>
       </label>
       <label className="flex items-center gap-2 text-[12.5px]">

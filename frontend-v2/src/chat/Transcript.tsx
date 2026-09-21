@@ -154,6 +154,11 @@ function Bubble({ m }: { m: ChatMessage }) {
           </div>
         )}
         {isUser ? text : <Markdown text={text} />}
+        {!isUser && m.harness && m.harness !== "native" && (
+          <div className="pt-1.5">
+            <HarnessBadge name={m.harness} label={m.harness_label} />
+          </div>
+        )}
         {m.notice && (
           <p className="text-[12px] italic text-muted mt-1.5">{m.notice}</p>
         )}
@@ -208,15 +213,49 @@ function Working({ label }: { label: string }) {
   );
 }
 
+/** Which agent backend produced a reply.
+ *
+ *  Absent for a built-in turn, and it renders nothing for one: the badge exists
+ *  to explain the unusual case, and stamping "Rigma (built in)" on every bubble
+ *  would be noise the reader learns to skip — which is exactly what makes a
+ *  real marker easy to miss. The tooltip carries the cost, because "driven by
+ *  DeepSeek Harness" is not self-explanatory: that turn had no tool-call
+ *  repair, no undo and no artifact check behind it. */
+function HarnessBadge({ name, label }: { name: string; label?: string }) {
+  if (!name || name === "native") return null;
+  return (
+    <span
+      className="font-mono text-[10.5px] text-amber bg-amber/15 rounded px-1.5 py-0.5"
+      title={`${label || name} drove this turn with its own tools and system `
+             + "prompt. Rigma's tool-call repair, fuzzy path recovery and "
+             + "artifact verification did not apply to it."}
+    >
+      {label || name}
+    </span>
+  );
+}
+
 function LiveTurn({ turn }: { turn: StreamingTurn }) {
   return (
     <div className="flex flex-col gap-2">
+      {/* Named at the START of the turn, so this is on screen while an external
+          backend is still working — it can run for a minute before its first
+          token. */}
+      {turn.harness && turn.harness !== "native" && (
+        <HarnessBadge name={turn.harness} label={turn.harnessLabel} />
+      )}
       {turn.macro && (
         <p className="font-mono text-[11px] text-muted">
           {turn.macro.label} — step {turn.macro.index + 1} of{" "}
           {turn.macro.total}
         </p>
       )}
+      {/* Server-authored status for this turn. These were being dropped by the
+          store's reducer, which is why the line explaining an external backend
+          never appeared even though the server had always sent it. */}
+      {turn.notices.map((n, i) => (
+        <p key={i} className="text-[12px] italic text-muted">{n}</p>
+      ))}
       <Thinking text={turn.thinking} live={turn.text === ""} />
       {turn.chips.length > 0 && (
         <div className="flex flex-col gap-1">
