@@ -1357,8 +1357,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         `runnable` (can a turn be handed to it?), so a probe is never mistaken
         for a working integration."""
         from . import harness as _harness
+        # RIGMA'S port, not the engine's. `upstream_port` is llama-server, which
+        # this app proxies to; an external harness pointed there would speak to
+        # the engine directly and bypass Rigma altogether — the opposite of what
+        # the seam is for. Same source as `openai_base` below.
+        _s = st.read_state() or {}
+        _public = int(_s.get("public_port") or 0) or upstream_port + 1
         return {"built_in": _harness.NATIVE,
-                "endpoint": _harness.endpoint_for(upstream_port),
+                "endpoint": _harness.endpoint_for(_public),
                 "harnesses": _harness.list_harnesses()}
 
     @app.post("/api/presets")
