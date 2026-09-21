@@ -92,6 +92,11 @@ _API_KEY = "local"
 
 _MARKER = "provider.json"
 _SETUP_TIMEOUT = 120.0
+# (base_url, model, context, output) confirmed against mcode IN THIS PROCESS.
+# The marker file survives a restart and can therefore be wrong about a config
+# that changed underneath it; this cannot, so the ask happens once per process
+# rather than once per turn.
+_VERIFIED: set = set()
 # How long past mcode's own --timeout before Rigma stops waiting for it. mcode
 # bounds the RUN; this bounds the PROCESS, so a wedged child cannot outlive the
 # turn it belongs to.
@@ -217,6 +222,64 @@ def _run(argv: list[str], timeout: float) -> tuple[int, str]:
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+def _run_out(argv: list[str], timeout: float) -> tuple[int, str]:
+    """Run a command whose output is PARSED, not reported: stdout only.
+
+    mcode writes results to stdout and diagnostics to stderr on purpose, so
+    mixing them would put a warning into the middle of the JSON.
+    """
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", env=_env(), timeout=timeout,
+                           stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    return p.returncode, p.stdout or ""
+
+
+def _provider_state(exe: str) -> dict | None:
+    """What mcode ITSELF says about our provider.
+
+    Returns the provider record, `{}` when mcode answered and does not have it,
+    or None when mcode would not answer at all.
+
+    Rigma keeps a marker file so it does not run `provider add` every turn, but
+    a marker is RIGMA'S BELIEF about mcode's config, not mcode's config — and
+    the two drift. A data dir cleared by hand, a port change, or an upstream
+    release that moves where custom providers live all leave Rigma confidently
+    skipping a setup step that is no longer done. Asking mcode is the only way
+    to know, and `provider list --json` is the asking.
+    """
+    code, out = _run_out([exe, "provider", "list", "--json"], _SETUP_TIMEOUT)
+    if code != 0:
+        return None
+    start = out.find("{")
+    if start < 0:
+        return None
+    try:
+        data = json.loads(out[start:])
+    except ValueError:
+        return None
+    for p in data.get("providers") or []:
+        if isinstance(p, dict) and p.get("providerId") == PROVIDER_ID:
+            return p
+    return {}
+
+
+def _provider_is_live(state: dict, base_url: str) -> bool:
+    """Whether `exec` will work with what mcode currently has.
+
+    `active` is the one that matters most: a provider that is present but not
+    SELECTED is exactly the state that makes mcode demand a MiniMax login for a
+    turn that never leaves this machine. `baseUrl` is checked because Rigma's
+    port can move, and a provider pointing at the old one fails in a way that
+    reads like a model problem.
+    """
+    return (bool(state.get("active")) and bool(state.get("enabled"))
+            and str(state.get("baseUrl") or "").rstrip("/")
+            == base_url.rstrip("/"))
+
+
 def _wanted(base_url: str, model: str, context_window: int,
             max_tokens: int) -> dict:
     return {"base_url": base_url, "model": model,
@@ -238,17 +301,36 @@ def ensure_provider(exe: str, base_url: str, model: str, context_window: int,
 
     Cached in a marker file rather than re-run every turn: `provider add` is a
     separate Node process, and re-adding a name mcode already has is an error,
-    not an update. A changed model means the cached provider is stale, so it is
-    removed first — mcode keys a custom provider by name, and the name is ours.
+    not an update. But the marker is only a HINT — once per process, mcode is
+    asked whether the thing it describes is still true, because an upstream
+    release can move where custom providers live and a marker cannot notice.
+    A changed model means the cached provider is stale, so it is removed first —
+    mcode keys a custom provider by name, and the name is ours.
     """
     want = _wanted(base_url, model, context_window, max_tokens)
+    key = (base_url, model, int(context_window), int(max_tokens))
     marker = data_home() / _MARKER
     try:
         have = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         have = None
+
     if have == want:
-        return ""
+        if key in _VERIFIED:
+            return ""
+        state = _provider_state(exe)
+        if state is None:
+            # mcode would not answer. Do NOT re-add on a guess: a transient
+            # failure would become a duplicate provider, and the next turn
+            # would hit the "already exists" error instead.
+            _VERIFIED.add(key)
+            return ""
+        if _provider_is_live(state, base_url):
+            _VERIFIED.add(key)
+            return ""
+        # Rigma believed it was configured and mcode says otherwise. Fall
+        # through and configure it again.
+
     if have is not None:
         _run([exe, "provider", "remove", PROVIDER_ID], _SETUP_TIMEOUT)
     code, out = _run([
@@ -265,6 +347,7 @@ def ensure_provider(exe: str, base_url: str, model: str, context_window: int,
     ], _SETUP_TIMEOUT)
     if code != 0:
         return f"mcode provider add failed ({code}): {out.strip()[:400]}"
+    _VERIFIED.add(key)
     try:
         marker.write_text(json.dumps(want), encoding="utf-8")
     except OSError:

@@ -228,7 +228,23 @@ cmd = argv[0] if argv else ""
 if cmd == "provider":
     action = argv[1] if len(argv) > 1 else ""
     if action == "add":
-        print("Provider added: rigma")
+        print("Provider added and selected: rigma")
+        sys.exit(0)
+    if action == "list":
+        code = int(os.environ.get("FAKE_MCODE_LIST_EXIT", "0"))
+        if code:
+            sys.stderr.write("provider list is unhappy\\n")
+            sys.exit(code)
+        raw = os.environ.get("FAKE_MCODE_PROVIDERS")
+        if raw is None:
+            # the healthy default: present, selected, pointing where Rigma does
+            raw = json.dumps({"providers": [{
+                "providerId": "custom_provider:rigma", "kind": "custom",
+                "active": True, "enabled": True,
+                "baseUrl": os.environ.get(
+                    "FAKE_MCODE_BASEURL", "http://127.0.0.1:11500/v1")}]})
+        sys.stdout.write(raw)
+        sys.exit(0)
     sys.exit(0)
 if cmd == "exec":
     for line in json.loads(os.environ["FAKE_MCODE_EVENTS"]):
@@ -237,6 +253,10 @@ if cmd == "exec":
     sys.exit(int(os.environ.get("FAKE_MCODE_EXIT", "0")))
 sys.exit(2)
 '''
+
+HEALTHY = json.dumps({"providers": [
+    {"providerId": "custom_provider:rigma", "kind": "custom", "active": True,
+     "enabled": True, "baseUrl": "http://127.0.0.1:11500/v1"}]})
 
 
 @pytest.fixture
@@ -258,7 +278,27 @@ def fake_cli(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("FAKE_MCODE_LOG", str(log))
     monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps(TEXT_TURN))
+    # module-level state, so it must not leak between tests
+    monkeypatch.setattr(harness_mcode, "_VERIFIED", set())
     return log
+
+
+def seed_marker(tmp_path, base_url="http://127.0.0.1:11500/v1",
+                model="local-test", ctx=32768, out=4096):
+    """What Rigma leaves behind after a successful setup, on a later process."""
+    d = tmp_path / "home" / "mcode"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "provider.json").write_text(json.dumps(
+        {"base_url": base_url, "model": model, "context_limit": ctx,
+         "output_limit": out}), encoding="utf-8")
+
+
+def provider_calls(log):
+    return [a for a in logged(log) if a[:2] == ["provider", "add"]]
+
+
+def list_calls(log):
+    return [a for a in logged(log) if a[:2] == ["provider", "list"]]
 
 
 def logged(log):
@@ -325,6 +365,93 @@ def test_a_changed_model_replaces_the_cached_provider(fake_cli):
                      ["provider", "add"]]
     adds = [a for a in logged(fake_cli) if a[:2] == ["provider", "add"]]
     assert adds[-1][adds[-1].index("--model") + 1] == "second"
+
+
+# --------------------------------------------------------------------------
+# What happens when mcode updates underneath us
+
+
+def _one_turn(model="local-test", base="http://127.0.0.1:11500/v1"):
+    return list(harness_mcode.drive_turn(base_url=base, model=model,
+                                         prompt="hi"))
+
+
+def test_a_marker_mcode_agrees_with_costs_one_ask_per_process(fake_cli,
+                                                              tmp_path):
+    """The marker saves a Node process per turn, so it must not become a Node
+    process per turn itself."""
+    seed_marker(tmp_path)
+    for _ in range(3):
+        _one_turn()
+    assert provider_calls(fake_cli) == []
+    assert len(list_calls(fake_cli)) == 1
+
+
+def test_an_upstream_that_moves_its_provider_config_is_noticed(fake_cli,
+                                                               tmp_path,
+                                                               monkeypatch):
+    """THE update case, and the reason the marker is only a hint.
+
+    Rigma leaves a marker saying "configured". An mcode release then changes
+    where custom providers live — which this project has already done once, from
+    `~/.minimax-code` to `~/.minimax`. The marker still says configured, so
+    Rigma skips the setup step, and `exec` fails with a model-not-available
+    error that names nothing about the real cause. Asking mcode once per process
+    is what turns that into a silent re-add instead of a mystery.
+    """
+    seed_marker(tmp_path)
+    monkeypatch.setenv("FAKE_MCODE_PROVIDERS", json.dumps({"providers": []}))
+    _one_turn()
+    adds = provider_calls(fake_cli)
+    assert len(adds) == 1, "a provider mcode no longer has must be configured again"
+    assert adds[0][-1] == "--use"
+
+
+def test_a_provider_that_lost_its_selection_is_configured_again(
+        fake_cli, tmp_path, monkeypatch):
+    """Present but not selected is precisely the state that makes mcode demand a
+    MiniMax login for a turn that never leaves this machine."""
+    seed_marker(tmp_path)
+    monkeypatch.setenv("FAKE_MCODE_PROVIDERS", json.dumps({"providers": [
+        {"providerId": "custom_provider:rigma", "active": False,
+         "enabled": True, "baseUrl": "http://127.0.0.1:11500/v1"}]}))
+    _one_turn()
+    assert len(provider_calls(fake_cli)) == 1
+
+
+def test_a_provider_pointing_at_another_port_is_configured_again(
+        fake_cli, tmp_path, monkeypatch):
+    """Rigma's port can move. A provider aimed at the old one fails in a way
+    that reads like a model problem."""
+    seed_marker(tmp_path)
+    monkeypatch.setenv("FAKE_MCODE_PROVIDERS", json.dumps({"providers": [
+        {"providerId": "custom_provider:rigma", "active": True,
+         "enabled": True, "baseUrl": "http://127.0.0.1:9999/v1"}]}))
+    _one_turn()
+    assert len(provider_calls(fake_cli)) == 1
+
+
+def test_a_provider_list_that_fails_is_not_taken_as_absent(
+        fake_cli, tmp_path, monkeypatch):
+    """A transient failure must not be read as "mcode lost the provider" — that
+    would re-add a name mcode already has, which is an error rather than an
+    update, and the next turn would hit it."""
+    seed_marker(tmp_path)
+    monkeypatch.setenv("FAKE_MCODE_LIST_EXIT", "4")
+    _one_turn()
+    assert provider_calls(fake_cli) == []
+
+
+def test_a_fresh_process_re_asks_even_though_the_marker_is_there(fake_cli,
+                                                                 tmp_path):
+    """The marker survives a restart, so it is exactly the thing that can be
+    stale across one."""
+    seed_marker(tmp_path)
+    _one_turn()
+    assert len(list_calls(fake_cli)) == 1
+    # a second turn in the SAME process must not ask again
+    _one_turn()
+    assert len(list_calls(fake_cli)) == 1
 
 
 def test_a_missing_cli_is_reported_and_never_raised(monkeypatch, tmp_path):
