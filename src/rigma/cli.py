@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import platform
 import time
 
@@ -275,6 +276,42 @@ def doctor():
     typer.echo(p.model_dump_json(indent=2))
     typer.echo(f"fingerprint: {p.fingerprint}")
     typer.echo(f"registry: {len(reg.models)} models, {len(reg.combos)} combos")
+
+
+@app.command()
+def harness(backend: str = typer.Option(None, "--backend", "-b",
+                                        help="check only this one"),
+            as_json: bool = typer.Option(False, "--json")):
+    """Check each agent backend against the build Rigma was verified with.
+
+    The failure this exists for: an external agent updates underneath Rigma.
+    Rigma absorbs an ADDITIVE change to its event schema on purpose, so every
+    turn still looks fine — and a RENAMED one degrades quietly, with tool calls
+    simply ceasing to appear while the reply still arrives. Nothing in a turn
+    would say so. This does.
+    """
+    # Imported HERE, not at module level: this function is named `harness`, so a
+    # module-level `from . import harness` would be shadowed by it.
+    from . import harness as seam
+
+    rows = seam.conformance(backend)
+    if not rows:
+        typer.echo(f"no such backend: {backend}")
+        raise typer.Exit(1)
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        if not r["installed"]:
+            state = "not installed"
+        elif r["drift"] is True:
+            state = (f"DRIFTED - verified against {r['verified']}, "
+                     f"found {r['version']}")
+        elif r["drift"] is False:
+            state = f"ok ({r['version']})"
+        else:
+            state = "unverified - no build of this has been checked"
+        typer.echo(f"{r['name']:<8} {state}")
 
 
 @app.command()

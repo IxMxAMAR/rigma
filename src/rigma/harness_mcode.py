@@ -93,6 +93,14 @@ _API_KEY = "local"
 
 _MARKER = "provider.json"
 _SETUP_TIMEOUT = 120.0
+# A version check is a menu line and a health check, not a turn.
+_VERSION_TIMEOUT = 20.0
+# The mcode release this adapter was measured against. Every fact in the module
+# docstring — the provider mechanics, the exit codes, the event vocabulary, the
+# `--permission` mapping — came from running THIS build, so the number is a fact
+# about the CODE and belongs next to it, not in a config a user could edit into
+# a lie. `harness.conformance` compares it with what is installed.
+VERIFIED = "0.5.1"
 # (base_url, model, context, output) -> the provider id confirmed IN THIS
 # PROCESS. The marker file survives a restart and can therefore be wrong about a
 # config that changed underneath it; this cannot, so the ask happens once per
@@ -131,6 +139,26 @@ def bin_path() -> str | None:
 def available() -> bool:
     """Whether a turn can be handed over at all."""
     return bin_path() is not None
+
+
+def backend_version(exe: str | None = None) -> str:
+    """What the installed CLI says it is, or "" when it will not say.
+
+    Never raises. This runs from a menu and from a health check, and a backend
+    that cannot answer its own version is a fact to REPORT — not an exception
+    that would take down the thing doing the reporting.
+    """
+    exe = exe or bin_path()
+    if not exe:
+        return ""
+    try:
+        code, out = _run_out([exe, "--version"], _VERSION_TIMEOUT)
+    except Exception:
+        return ""
+    if code != 0:
+        return ""
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    return lines[0] if lines else ""
 
 
 def data_home() -> Path:

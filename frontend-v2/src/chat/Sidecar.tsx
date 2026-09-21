@@ -476,10 +476,20 @@ interface PresetRow {
  *  error the user only sees after the fact. */
 function harnessHint(h: HarnessInfo): string {
   if (!h.runnable) return `${h.label} cannot run a turn yet: ${h.pending}`;
-  if (!h.installed) return `${h.label} needs ${h.needs} on this machine`;
+  // The version is stated, not checked: comparing it against what is installed
+  // costs a subprocess, and the menu is fetched once for the life of the
+  // server. `rigma harness` is where that comparison lives. Saying which build
+  // was measured is still the honest half — it tells the owner what "it works"
+  // was established against.
+  const measured = h.verified
+    ? ` Measured against ${h.verified}.`
+    : " No build of this has been verified end to end.";
+  if (!h.installed) {
+    return `${h.label} needs ${h.needs} on this machine.${measured}`;
+  }
   return `${h.drives}. It talks to Rigma's own /v1, so the model stays the `
     + `one tuned for this machine. It leaves behind: `
-    + `${h.unsupported.join("; ")}.`;
+    + `${h.unsupported.join("; ")}.${measured}`;
 }
 
 /** The short reason shown inside the option itself, for a backend that is on

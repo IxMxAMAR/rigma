@@ -45,6 +45,10 @@ export interface HarnessInfo {
   installed: boolean;
   needs: string;
   wire: string;
+  /** The build this adapter was MEASURED against. Empty means nobody has
+   *  checked — which is not the same as "it matches". `rigma harness` compares
+   *  it with whatever is installed. */
+  verified: string;
   unsupported: string[];
   pending: string;
 }
