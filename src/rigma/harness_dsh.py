@@ -80,8 +80,7 @@ def available() -> bool:
 # says unknown rather than implying fine.
 VERIFIED = "0.1.6-alpha.2"
 
-# Whether DSH continuity needs anything from Rigma's `state` dict. It does not,
-# and the reason is worth recording because the obvious design is the wrong one.
+# WHY CONTINUITY IS A PROCESS, NOT A SESSION ID — read before changing `_pool`.
 #
 # Measured 2026-09-21 against 0.1.6-alpha.2: `RunResult.session_id` exists, but a
 # session can only be continued by the PROCESS that created it. A second `run()`
@@ -94,11 +93,12 @@ VERIFIED = "0.1.6-alpha.2"
 # layer has a real resume and the CLI exposes it as `--session-id`, but
 # `DeepSeekHarnessConfig` has no field for it.
 #
-# So continuity is a property of the PROCESS, and the fix is a pooled runner that
-# outlives a turn (see `_pool` below) rather than a handle in `state`. Storing the
-# handle instead would guarantee that every turn after the first fails, which is
-# strictly worse than starting fresh: a turn that dies teaches the model nothing.
-CAN_RESUME = False
+# So the handle is NOT passed through `state`: storing one would guarantee that
+# every turn after the first fails, which is strictly worse than starting fresh,
+# because a turn that dies teaches the model nothing. Continuity comes from the
+# pooled runner outliving a turn instead — see `_pool` below, which is where this
+# is actually implemented. Nothing reads this comment; it is here so the next
+# person does not "fix" continuity by putting the id back in `state`.
 
 
 def backend_version() -> str:
