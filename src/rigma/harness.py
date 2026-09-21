@@ -297,7 +297,8 @@ def adapter(name: str):
 
         drive_turn(*, base_url, model, prompt, system_prompt="", session_id="",
                    cwd="", max_tokens=4096, context_window=32768,
-                   timeout=1800.0, cancel=None) -> Iterator[TurnEvent]
+                   timeout=1800.0, cancel=None, permission="full")
+                   -> Iterator[TurnEvent]
 
     It is a BLOCKING generator: the caller owns the thread. That is deliberate
     — a backend is a subprocess doing blocking IO, and the seam's contract is
@@ -321,6 +322,14 @@ def adapter(name: str):
     check against. Stopping is not failing: report it as a notice, and make sure
     whatever the backend needs to resume is still written to `state`, so the
     next turn continues instead of starting over.
+
+    `permission` is how much the backend may do without being asked, as the
+    owner chose it for this chat. It is a HINT the backend translates into its
+    own vocabulary, not a policy Rigma enforces: mcode maps it to
+    `--permission`, and an adapter whose backend has no such notion ignores it.
+    The default is "full" because headless has nobody to ask, so a mode that
+    wants to ask fails the run — a real trade, which is why it is a per-chat
+    choice rather than a constant.
 
     Imported lazily so a broken or absent adapter cannot take down the menu.
     """

@@ -298,6 +298,33 @@ describe("store: choosing an agent backend", () => {
     expect(useChat.getState().harness).toBe("native");
   });
 
+  it("sends the permission mode to the SERVER, not just to this screen", async () => {
+    // It is the agent backend's own setting and it changes what the NEXT turn
+    // may do, so a value that only lived in this tab would be a lie.
+    await useChat.getState().open("A");
+    await useChat.getState().setPermission("smart");
+    expect(h.api.updateSession).toHaveBeenCalledWith("A", { permission: "smart" });
+    expect(useChat.getState().permission).toBe("smart");
+  });
+
+  it("takes the permission mode from the session it opens", async () => {
+    h.api.getSession.mockResolvedValue(
+      { id: "A", title: "a", messages: [], permission: "off" });
+    await useChat.getState().open("A");
+    expect(useChat.getState().permission).toBe("off");
+  });
+
+  it("puts the permission mode back when the server refuses it", async () => {
+    // `ask` is refused by the backend itself, so the server can say no. Leaving
+    // it on screen would make the next turn's failure look like something else.
+    await useChat.getState().open("A");
+    await useChat.getState().setPermission("smart");
+    h.api.updateSession.mockRejectedValueOnce(new Error("permission: no"));
+    await useChat.getState().setPermission("off");
+    expect(useChat.getState().permission).toBe("smart");
+    expect(useChat.getState().lastError).toBeTruthy();
+  });
+
   it("keeps the new backend when the server accepts it", async () => {
     h.api.getSession.mockResolvedValue({ id: "A", title: "a", messages: [] });
     h.api.updateSession.mockResolvedValue({ id: "A" });

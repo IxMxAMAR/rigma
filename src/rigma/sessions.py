@@ -74,7 +74,22 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   # Deriving `_MERGE_FROM_STORE` from this tuple also means a
                   # harness switched mid-turn is not undone by the turn's own
                   # end-of-turn write.
-                  "harness")
+                  "harness",
+                  # How much the agent backend may do without being asked.
+                  # A SESSION field rather than a constant because the honest
+                  # default is a trade, not a fact: headless has nobody to ask,
+                  # so a mode that wants to ask FAILS THE RUN. Rigma therefore
+                  # defaults to `full` (do not ask) and lets the owner choose
+                  # otherwise with the cost stated — rather than hardcoding the
+                  # choice and calling it the only option.
+                  "permission")
+# What each agent backend understands. `smart` classifies and asks when it
+# judges risk high; `full` does not ask; `off` disarms the agent's tools. `ask`
+# is refused headlessly by mcode itself ("requires an interactive host"), so it
+# is not offered. Measured, with the caveat that `full` is NOT "no safety": a
+# hard, workspace-scoped policy bounds recursive writes and deletes under every
+# one of these modes — see docs/mcode-permission-modes.md.
+PERMISSION_MODES = ("full", "smart", "off")
 # "" / off / auto / on are Rigma's own binary thinking switch. The four
 # named levels are Qwen3.8's published reasoning efforts, which its chat
 # template reads from `reasoning_effort` — verified against a live engine

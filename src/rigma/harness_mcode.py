@@ -479,7 +479,7 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
                system_prompt: str = "", session_id: str = "", cwd: str = "",
                max_tokens: int = 4096, context_window: int = 32768,
                timeout: float = 1800.0, state: dict | None = None,
-               cancel: threading.Event | None = None
+               cancel: threading.Event | None = None, permission: str = "full"
                ) -> Iterator[TurnEvent]:
     """Run one mcode turn and yield what happened, in Rigma's vocabulary.
 
@@ -519,10 +519,16 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     ensure_agents_md()
 
     resume = str((state or {}).get("session_id") or "").strip()
+    # Straight through from the chat's own setting. NOT validated against a
+    # list here: the session field is validated at the write, and a second
+    # opinion in the adapter could only disagree with it. An unknown value is
+    # mcode's to refuse, and it does, by name.
+    #
+    # `full` is not "no safety" and must not be described as such — a hard,
+    # workspace-scoped policy bounds recursive writes and deletes under every
+    # mode, measured. See docs/mcode-permission-modes.md.
     argv = [exe, "exec", "--output-format", "stream-json",
-            # headless: `smart` needs a TUI to ask, and `off` would disarm the
-            # agent's tools entirely
-            "--permission", "full",
+            "--permission", str(permission or "full"),
             # the id mcode actually gave us, not the one we asked for
             "--model", f"{pid}/{model}",
             "--timeout", f"{int(timeout)}s"]

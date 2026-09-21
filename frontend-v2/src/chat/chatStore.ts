@@ -201,6 +201,7 @@ export interface ChatState {
    *  picker and the transcript badge need it, and the store is the only place
    *  that already knows which chat that is. */
   harness: string;
+  permission: string;
 
   loadSessions: () => Promise<void>;
   search: (q: string) => Promise<void>;
@@ -225,6 +226,9 @@ export interface ChatState {
    *  backend it cannot run and says why, and that reason is the whole value of
    *  validating the write. */
   setHarness: (name: string) => Promise<void>;
+  /** How much the agent may do without asking. A trade, not a fact: the
+   *  mode that asks fails the run headlessly, so the default is `full`. */
+  setPermission: (mode: string) => Promise<void>;
 }
 
 /** The live turn for the chat on screen — nothing else may render. */
@@ -256,6 +260,7 @@ export const useChat = create<ChatState>((set, get) => ({
   lastError: null,
   images: [],
   harness: "native",
+  permission: "full",
 
   loadSessions: async () => {
     try {
@@ -304,7 +309,8 @@ export const useChat = create<ChatState>((set, get) => ({
     try {
       const s = await api.getSession(id);
       set({ currentId: id, messages: s.messages,
-            harness: s.harness ?? "native", lastError: null });
+            harness: s.harness ?? "native",
+        permission: s.permission ?? "full", lastError: null });
     } catch (e) {
       // AUDIT F50: a session click that failed used to do nothing at all
       set({ lastError: errText(e) });
@@ -315,6 +321,7 @@ export const useChat = create<ChatState>((set, get) => ({
     try {
       const s = await api.createSession();
       set({ currentId: s.id, messages: [], harness: s.harness ?? "native",
+        permission: s.permission ?? "full",
             lastError: null });
       await get().loadSessions();
     } catch (e) {
@@ -333,6 +340,20 @@ export const useChat = create<ChatState>((set, get) => ({
       // Put the old backend back. Leaving the picker showing one the server
       // rejected would make the next turn's failure look like a model problem.
       set({ harness: prev, lastError: errText(e) });
+    }
+  },
+
+  setPermission: async (mode) => {
+    const sid = get().currentId;
+    if (!sid || mode === get().permission) return;
+    const prev = get().permission;
+    set({ permission: mode, lastError: null });
+    try {
+      await api.updateSession(sid, { permission: mode });
+    } catch (e) {
+      // Same reasoning as the backend picker: a rejected value that stays on
+      // screen makes the NEXT turn's failure look like something else.
+      set({ permission: prev, lastError: errText(e) });
     }
   },
 

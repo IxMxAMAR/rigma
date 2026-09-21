@@ -1316,6 +1316,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": "effort: must be one of "
                  + "/".join(x or "blank" for x in sessions.EFFORT_LEVELS)},
                 status_code=400)
+        if "permission" in body and \
+                body["permission"] not in sessions.PERMISSION_MODES:
+            return JSONResponse(
+                {"error": "permission: must be one of "
+                 + "/".join(sessions.PERMISSION_MODES)},
+                status_code=400)
         if "harness" in body:
             # Refuse the VALUE, not the turn. The seam's contract is that a
             # session never silently gets a backend other than the one it asked
@@ -1600,7 +1606,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         session_id=sid, cwd=str(s.get("workspace") or ""),
                         max_tokens=EXTERNAL_MAX_TOKENS,
                         context_window=int(state.get("ctx") or 0) or 32768,
-                        state=hstate, cancel=cancel):
+                        state=hstate, cancel=cancel,
+                        permission=str(s.get("permission") or "full")):
                     loop.call_soon_threadsafe(q.put_nowait, ev)
             except Exception as e:              # pragma: no cover - defensive
                 loop.call_soon_threadsafe(

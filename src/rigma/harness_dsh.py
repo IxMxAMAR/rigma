@@ -318,11 +318,18 @@ def drive_turn(
     timeout: float = 1800.0,
     dsh_home: str | None = None,
     cancel: threading.Event | None = None,
+    permission: str = "full",
 ) -> Iterator[TurnEvent]:
     """Run one turn on DSH and yield what happened.
 
     Never raises: a failure arrives as an `error` event, because the caller is a
     tool and a tool that raises teaches the model nothing it can act on.
+
+    `permission` is ACCEPTED AND IGNORED. DSH's confinement is its own bundle's
+    business — `sdk-minimal` pins the mode — and mapping a Rigma setting onto it
+    would be Rigma choosing the agent's policy, which is the line this seam does
+    not cross. The argument exists so the contract is one shape for every
+    adapter rather than one shape per adapter.
 
     `cancel` kills the child process, which is the same lever the timeout uses.
     The SDK is BATCH — it reports a whole turn rather than streaming it — so
