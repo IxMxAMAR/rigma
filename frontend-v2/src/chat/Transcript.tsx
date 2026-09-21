@@ -6,6 +6,7 @@ import Markdown from "./Markdown";
 import {
   selectStreaming, useChat, type Chip, type StreamingTurn,
 } from "./chatStore";
+import { formatArgs, previewArgs } from "./toolChip";
 
 function ChipRow({ chip }: { chip: Chip }) {
   return (
@@ -26,6 +27,11 @@ function ChipRow({ chip }: { chip: Chip }) {
         <span className="font-semibold text-primary">{chip.name}</span>
         <span className="text-muted truncate">{previewArgs(chip.args)}</span>
       </summary>
+      {formatArgs(chip.args) && (
+        <pre className="px-3 pt-1 text-[12px] font-mono text-muted whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+          {formatArgs(chip.args)}
+        </pre>
+      )}
       {chip.result && (
         <pre className="px-3 pb-2 pt-1 text-[12px] font-mono text-secondary whitespace-pre-wrap break-words max-h-56 overflow-y-auto">
           {chip.result}
@@ -35,19 +41,9 @@ function ChipRow({ chip }: { chip: Chip }) {
   );
 }
 
-// identity, never payload — same rule the legacy chips learned the hard way
-function previewArgs(args: unknown): string {
-  if (!args || typeof args !== "object") return "";
-  const a = args as Record<string, unknown>;
-  for (const k of ["path", "paths", "pattern", "question", "query", "cmd", "task", "action"]) {
-    if (a[k] !== undefined) {
-      const v = Array.isArray(a[k]) ? (a[k] as unknown[]).join(", ") : String(a[k]);
-      const size = typeof a.content === "string" ? ` · ${(a.content as string).length} chars` : "";
-      return v.slice(0, 56) + (v.length > 56 ? "…" : "") + size;
-    }
-  }
-  return Object.keys(a).join(", ").slice(0, 56);
-}
+// identity, never payload — same rule the legacy chips learned the hard way.
+// The rules live in `toolChip.ts` so they can be tested without a renderer.
+
 
 function Thinking({ text, live }: { text: string; live: boolean }) {
   const [open, setOpen] = useState(live);
