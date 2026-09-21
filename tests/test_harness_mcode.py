@@ -17,7 +17,25 @@ import time
 
 import pytest
 
-from rigma import harness, harness_mcode
+from rigma import harness, harness_mcode, rag
+
+
+@pytest.fixture(autouse=True)
+def _a_recorded_sidecar_answers(monkeypatch):
+    """A recorded RAG sidecar counts as LIVE for this file.
+
+    F52 made the record mean "answering" rather than "we once ran Popen", so
+    `seed_docs` writing `sidecar.json` is no longer enough on its own — the port
+    has to answer, and there is no real sidecar in these tests.
+
+    Autouse because `seed_docs` is a plain helper called MID-test, where a
+    fixture argument could not reach it. Harmless for a test that seeds nothing:
+    with no record, the health probe is never consulted. What these tests are
+    about is what gets REGISTERED, not liveness — liveness has its own tests in
+    test_rag.py.
+    """
+    monkeypatch.setattr(rag, "sidecar_health",
+                        lambda port=0, **_k: {"status": "ok", "port": port})
 
 ENVELOPE = {"schemaVersion": 1, "runId": "exec_turn_probe",
             "sessionId": "mvs_probe", "turnId": "turn_probe"}
