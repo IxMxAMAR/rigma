@@ -107,6 +107,52 @@ def sidecar_health(port: int = RAG_PORT) -> dict | None:
         return None
 
 
+def _record_sidecar(pid: int, port: int) -> None:
+    try:
+        (rag_dir() / "sidecar.json").write_text(
+            json.dumps({"pid": pid, "port": port}), encoding="utf-8")
+    except OSError:
+        pass          # a sidecar that is up but unrecorded still answers
+
+
+def _forget_sidecar() -> None:
+    try:
+        (rag_dir() / "sidecar.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# How long to wait for the health endpoint when deciding whether document
+# search may be OFFERED. Localhost: a healthy sidecar answers in about a
+# millisecond and a dead one refuses instantly, so this only ever bites a
+# sidecar that is hung — and for a hung one the answer is no either way.
+OFFER_PROBE_SECS = 0.5
+
+
+def live_sidecar_port(timeout: float = OFFER_PROBE_SECS) -> int | None:
+    """The port of a sidecar that is ACTUALLY ANSWERING, or None.
+
+    A different question to `recorded_sidecar_port`, which reports what was
+    written to disk. F52: `ensure_sidecar` recorded {pid, port} immediately
+    after `Popen` and only then spent up to 90s failing its health check, so the
+    file could name a process that never worked. Everything that decided whether
+    to OFFER document search read that file, so `search_my_documents` was
+    advertised to the model on every turn for a sidecar that had never run —
+    while `/api/rag/status`, which asks the port, correctly reported it down. Two
+    sources of truth disagreeing is what made it hard to notice.
+
+    So this asks the port, and clears a record that turns out to be stale, so the
+    bad file does not outlive the discovery that it is bad.
+    """
+    port = recorded_sidecar_port()
+    if port is None:
+        return None
+    if sidecar_health(port):
+        return port
+    _forget_sidecar()
+    return None
+
+
 def ensure_sidecar(port: int = RAG_PORT, timeout: float = 90.0) -> dict:
     health = sidecar_health(port)
     if health:
@@ -122,17 +168,22 @@ def ensure_sidecar(port: int = RAG_PORT, timeout: float = 90.0) -> dict:
         proc = subprocess.Popen(
             [*cmd, "serve", "--config", str(cfg), "--port", str(port)],
             stdout=log_f, stderr=subprocess.STDOUT)
-    (rag_dir() / "sidecar.json").write_text(
-        json.dumps({"pid": proc.pid, "port": port}), encoding="utf-8")
+    (rag_dir() / "sidecar.json").unlink(missing_ok=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             break
         health = sidecar_health(port)
         if health:
+            # F52: recorded only NOW, once the process has proved it answers.
+            # Writing it straight after Popen made the file a claim about a
+            # process that had not started working, and every reader of that
+            # claim offered document search on the strength of it.
+            _record_sidecar(proc.pid, port)
             return health
         time.sleep(0.5)
     proc.terminate()
+    _forget_sidecar()     # F52: never leave a record of a start that failed
     tail = ""
     try:
         tail = "".join(log_path.read_text(encoding="utf-8",

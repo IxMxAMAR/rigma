@@ -1051,7 +1051,7 @@ def _search_docs(args, ctx):
     q = str(args.get("query", "")).strip()
     if not q:
         return "error: empty query"
-    port = rag.recorded_sidecar_port()
+    port = rag.live_sidecar_port()
     if not port:
         return "no documents are indexed yet."
     a = rag.ask(q, port=port)

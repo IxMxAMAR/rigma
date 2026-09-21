@@ -1805,7 +1805,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # remainder of the run. Plain chat is already lean (9 tools, ~880
             # tok) and is left on "all" — the waste was only ever the Run.
             _surface = _tool_surface(run_id)
-            _has_rag = bool(rag.recorded_sidecar_port())
+            _has_rag = rag.live_sidecar_port() is not None
             tctx["unlocked"] = [str(n) for n in (s.get("unlocked_tools") or [])]
 
             def _specs_now():

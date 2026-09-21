@@ -11,6 +11,7 @@ import json
 import pytest
 
 from rigma import mcp_server
+from rigma import rag
 
 
 def _drive(*messages) -> list[dict]:
@@ -30,11 +31,18 @@ def _req(mid, method, params=None):
 
 @pytest.fixture
 def docs(tmp_path, monkeypatch):
-    """A Rigma home with the RAG sidecar recorded — i.e. documents ARE indexed."""
+    """A Rigma home where the RAG sidecar is recorded AND answering.
+
+    F52: the record alone stopped being proof of availability — the port has to
+    answer. A fixture that only wrote the file would now be describing a STALE
+    record, which is the exact state the fix exists to stop trusting.
+    """
     (tmp_path / "rag").mkdir(parents=True, exist_ok=True)
     (tmp_path / "rag" / "sidecar.json").write_text('{"port": 11699}',
                                                    encoding="utf-8")
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(rag, "sidecar_health",
+                        lambda port=0, **_k: {"status": "ok", "port": port})
     return tmp_path
 
 

@@ -129,7 +129,7 @@ def offered() -> list[dict]:
     from . import tools as toolkit
 
     try:
-        has_rag = bool(rag.recorded_sidecar_port())
+        has_rag = rag.live_sidecar_port() is not None
     except Exception:
         has_rag = False
     try:
