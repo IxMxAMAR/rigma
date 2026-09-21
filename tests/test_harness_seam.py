@@ -367,3 +367,75 @@ def test_a_dsh_session_is_driven_by_the_adapter(monkeypatch, tmp_path):
     # native message is not stamped "native", or the label would be on the
     # ordinary case to explain the rare one
     assert stored["messages"][-1]["harness"] == "dsh"
+
+
+def test_every_adapter_accepts_a_cancel_event():
+    """A stop has to reach the adapter, so `cancel` is part of the contract.
+
+    Checked against the seam's OWN table rather than a list kept here by hand:
+    an adapter added later is covered the moment it is registered, which is the
+    only way a contract stays true instead of becoming a comment.
+    """
+    import inspect
+
+    assert harness._ADAPTERS, "the table is the thing being tested"
+    for name in harness._ADAPTERS:
+        mod = harness.adapter(name)
+        assert mod is not None, name
+        params = inspect.signature(mod.drive_turn).parameters
+        assert "cancel" in params, f"{name} cannot be stopped"
+
+
+def test_stopping_a_chat_that_is_not_running_says_so():
+    """A stop that reports success when nothing was running teaches a UI to
+    lie about what it did."""
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+
+    with TestClient(serve.build_app(upstream_port=59999)) as client:
+        s = sessions.create()
+        r = client.post(f"/api/sessions/{s['id']}/stop")
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "stopped": False}
+
+
+def test_stopping_a_chat_that_IS_running_sets_its_event():
+    """The route's whole job: set the event the turn is already watching. It
+    does not do the stopping itself, because only the backend knows what
+    stopping means there."""
+    import threading
+
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+
+    app = serve.build_app(upstream_port=59999)
+    with TestClient(app) as client:
+        s = sessions.create()
+        ev = threading.Event()
+        _cancels = _cancels_of(app)
+        _cancels[s["id"]] = ev
+        try:
+            r = client.post(f"/api/sessions/{s['id']}/stop")
+            assert r.json() == {"ok": True, "stopped": True}
+            assert ev.is_set()
+        finally:
+            _cancels.pop(s["id"], None)
+
+
+def _cancels_of(app):
+    """The live `_cancels` registry for an app built by `build_app`.
+
+    It is a closure local — deliberately, so two apps cannot share a stop
+    registry — so the only way in is through the route that owns it, and that
+    route is exactly what the test above is exercising. Reaching it any other
+    way would mean the test no longer tested the route.
+    """
+    import inspect
+
+    for route in app.routes:
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is not None and getattr(endpoint, "__name__", "") == "stop_chat":
+            return inspect.getclosurevars(endpoint).nonlocals["_cancels"]
+    raise AssertionError("no stop_chat route on the app")

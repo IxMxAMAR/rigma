@@ -1547,7 +1547,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": "no such skill"}, status_code=404)
         return {"ok": True}
 
-    async def _external_turn(s: dict, backend):
+    async def _external_turn(s: dict, backend, cancel=None):
         """One turn driven by an EXTERNAL agent backend.
 
         Choosing a backend means IT owns the tool surface, the system prompt and
@@ -1600,7 +1600,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         session_id=sid, cwd=str(s.get("workspace") or ""),
                         max_tokens=EXTERNAL_MAX_TOKENS,
                         context_window=int(state.get("ctx") or 0) or 32768,
-                        state=hstate):
+                        state=hstate, cancel=cancel):
                     loop.call_soon_threadsafe(q.put_nowait, ev)
             except Exception as e:              # pragma: no cover - defensive
                 loop.call_soon_threadsafe(
@@ -1619,7 +1619,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         thought: list = []
         trace: list = []
         while True:
-            ev = await q.get()
+            try:
+                ev = await asyncio.wait_for(q.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                # The adapter is what honours `cancel` — killing mcode's child is
+                # the adapter's job. This is the backstop for one that does not:
+                # a stop that leaves the stream open forever is worse than no
+                # stop button, because the reader cannot tell the difference
+                # between "stopping" and "broken". A cancelled `get` loses no
+                # item; the queue wakes the next waiter instead.
+                if cancel is not None and cancel.is_set():
+                    yield _sse({"note": "stopped"}, event="notice")
+                    break
+                continue
             if ev is END:
                 break
             if ev.kind == "text":
@@ -1649,7 +1661,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                              backend_session=str(hstate.get("session_id") or ""))
         yield b"data: [DONE]\n\n"
 
-    async def _llm_turn(s: dict, cont: bool = False):
+    async def _llm_turn(s: dict, cont: bool = False, cancel=None):
         # THE HARNESS SEAM. A session can name an external agent backend; when
         # it does, that backend owns the turn. `resolve` REFUSES rather than
         # falling back, so a session that asked for DSH and quietly got the
@@ -1675,7 +1687,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         yield _sse({"name": _backend.name, "label": _backend.label},
                    event="harness")
         if _backend.name != _harness.NATIVE:
-            async for chunk in _external_turn(s, _backend):
+            async for chunk in _external_turn(s, _backend, cancel):
                 yield chunk
             return
         preset = presets.resolve(s.get("preset_id", ""), registry) \
@@ -2125,6 +2137,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # flagged, instead of the reply ceasing to exist.
         try:
             for _round in range(max_rounds):
+                # WHERE A NATIVE TURN STOPS. An external backend's stop kills its
+                # process and lands immediately; here the only safe boundary is
+                # between rounds, because a request already in flight has
+                # half-written tool-call fragments in it, and abandoning those
+                # mid-parse is how a repair layer invents a call nobody made.
+                # So a native stop lands before the NEXT round, not mid-sentence
+                # — coarser than the arm's, and said out loud rather than
+                # discovered.
+                if cancel is not None and cancel.is_set():
+                    yield _sse({"note": "stopped"}, event="notice")
+                    break
                 if _surface != "all" and tctx["unlocked"] != _advertised:
                     # A tool unlocked during THIS turn must be advertised from
                     # the next round on: under tool_choice:"required" the GBNF
@@ -3497,6 +3520,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # restarted.
     _streaming: set[str] = set()
     _queued: dict[str, list] = {}
+    # session id -> the Event that stops the turn running in it. A THREADING
+    # event, not an asyncio one: the chat route sets it from the event loop and
+    # an external backend's adapter reads it on the worker thread the turn
+    # actually runs on, so the two have to meet on something both can touch.
+    _cancels: dict[str, threading.Event] = {}
 
     def _apply_skill(text: str) -> str:
         """`/name` (or `/skill:name`) pulls a global skill in front of the ask.
@@ -3611,12 +3639,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             stretch of synchronous code: asyncio only switches coroutines at
             an await, so no request can slip in between "queue is empty" and
             "no longer streaming" and have its prompt silently dropped."""
+            cancel = threading.Event()
             _streaming.add(sid)
+            _cancels[sid] = cancel
             try:
                 cur, cont = s, bool(body.get("continue"))
                 while True:
-                    async for chunk in _llm_turn(cur, cont=cont):
+                    async for chunk in _llm_turn(cur, cont=cont, cancel=cancel):
                         yield chunk
+                    # A stop ends the WHOLE drain, not just the turn it landed
+                    # in. Anything typed while that turn ran was queued behind a
+                    # reply the reader then cancelled, and running it now would
+                    # answer a question they had already walked away from.
+                    if cancel.is_set():
+                        break
                     pending = _queued.get(sid)
                     if not pending:
                         break
@@ -3629,12 +3665,31 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                event="info")
             finally:
                 _streaming.discard(sid)
+                _cancels.pop(sid, None)
                 # anything still queued can no longer be delivered: this is
                 # the only generator that would have run it
                 _queued.pop(sid, None)
 
         return StreamingResponse(_drain(), media_type="text/event-stream",
                                  headers=_NO_STORE)
+
+    @app.post("/api/sessions/{sid}/stop")
+    async def stop_chat(sid: str):
+        """Stop the turn running in this chat.
+
+        Only sets an event; the work of stopping belongs to the backend's
+        adapter, because only it knows what stopping MEANS there — for MiniMax
+        Code it is killing a process, which is also what takes its subagents
+        with it, and for the native loop it is declining to start another round.
+
+        `stopped` says whether anything was actually running. A stop that
+        reports success when there was nothing to stop teaches a UI to lie.
+        """
+        ev = _cancels.get(sid)
+        if ev is None:
+            return {"ok": True, "stopped": False}
+        ev.set()
+        return {"ok": True, "stopped": True}
 
     # ================= Autonomous Mode (Runs) =========================
     _run_tasks: dict = {}   # run_id -> asyncio.Task (for cancellation)

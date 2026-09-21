@@ -79,6 +79,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from .harness import TurnEvent
+from . import harness as _harness
 
 # mcode's own id for a provider Rigma adds. The `custom_provider:` prefix is
 # part of the id it prints, and the model reference has to spell it out.
@@ -449,7 +450,8 @@ def _remember(state: dict | None, obj: dict, *, resumed: bool) -> None:
 def drive_turn(*, base_url: str, model: str, prompt: str,
                system_prompt: str = "", session_id: str = "", cwd: str = "",
                max_tokens: int = 4096, context_window: int = 32768,
-               timeout: float = 1800.0, state: dict | None = None
+               timeout: float = 1800.0, state: dict | None = None,
+               cancel: threading.Event | None = None
                ) -> Iterator[TurnEvent]:
     """Run one mcode turn and yield what happened, in Rigma's vocabulary.
 
@@ -465,6 +467,18 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     Quietly pasting Rigma's into the user message would make the transcript
     describe a turn that did not happen, and replacing the agent's instructions
     with Rigma's would throw away the thing worth having.
+
+    `cancel` kills the child. A turn here can run for minutes and spawn
+    subagents of its own, so a stop that only takes effect at the next output
+    line would not be a stop — mcode goes quiet for long stretches while it
+    thinks, and that is the stretch a user wants to interrupt. Killing the
+    process also stops its children, which is the part that matters when the
+    thing being interrupted is a fleet of subagents.
+
+    Stopping is reported as a NOTICE, not an error: nothing failed. The session
+    id was already recorded when the turn started, so the next turn continues
+    this conversation rather than starting it over — an interrupt should cost
+    the turn, not the thread.
     """
     exe = bin_path()
     if exe is None:
@@ -511,17 +525,35 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     drain.start()
 
     killed = threading.Event()
+    stopped = threading.Event()
 
     def _stop() -> None:
         killed.set()
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        # The TREE, not the shim: mcode is started through a `.cmd`, so the pid
+        # Rigma holds is a shell. Killing the shell alone leaves mcode running
+        # with the stdout pipe open, and the read loop below would never end.
+        _harness.kill_tree(proc)
+
+    def _watch_cancel() -> None:
+        """Kill the child the moment the owner asks, not at the next line.
+
+        Waiting on the event rather than checking it inside the read loop is the
+        whole point: mcode says nothing while it is thinking, and a silent turn
+        is exactly the one worth stopping. The poll alongside it is only so this
+        thread ends once the child is gone instead of blocking forever on an
+        event nobody will set.
+        """
+        while not cancel.wait(0.25):
+            if proc.poll() is not None:
+                return
+        stopped.set()
+        _stop()
 
     watchdog = threading.Timer(timeout + _KILL_GRACE, _stop)
     watchdog.daemon = True
     watchdog.start()
+    if cancel is not None:
+        threading.Thread(target=_watch_cancel, daemon=True).start()
 
     seen: dict = {}
     failed = False
@@ -584,6 +616,13 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
         except OSError:
             pass
 
+    # Checked before the timeout branch, because both end in a killed process
+    # and only this one is not a failure. Whatever the agent already said stays
+    # in the transcript: it was said, and hiding it would make the next turn
+    # unintelligible.
+    if stopped.is_set():
+        yield TurnEvent("notice", text="stopped")
+        return
     if killed.is_set():
         yield TurnEvent("error", f"mcode did not finish within "
                                  f"{int(timeout + _KILL_GRACE)}s and was stopped")
