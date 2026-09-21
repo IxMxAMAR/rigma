@@ -1533,9 +1533,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 multi-step exploration and only the condensed answer returns.
                 The single biggest context-engineering win per the research:
                 a 2000-file listing lives and dies inside this helper."""
+                # `surface="all"` is EXPLICIT and load-bearing: the helper's
+                # roster is fixed here, not filtered by the tier table, and
+                # `current_datetime` is a specialist tool a focused surface
+                # holds back. Relying on the default made the roster depend on
+                # a signature change somewhere else — point this at "focused"
+                # and the helper silently loses a tool it is documented to have.
                 sub_specs = [s for s in toolkit.tool_specs(
                     workspace=tctx["workspace"], has_run=False,
-                    profile=run_profile)
+                    profile=run_profile, surface="all")
                     if s["function"]["name"] in _DELEGATE_TOOLS]
                 # AUDIT F32: a narrowed ctx, not the outer session's. No code
                 # execution, and no run_id — the run-scoped tools reach the
@@ -1691,10 +1697,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         if cur:
                             cur["unlocked_tools"] = sorted(
                                 set(tctx["unlocked"]))
-                            sessions.save(cur)
+                            sessions.save(cur,
+                                          base_rev=cur[sessions.REV_KEY])
                     except Exception:
                         pass          # an unlock that failed to persist still
-                                      # works for the rest of THIS turn
+                                      # works for the rest of THIS turn, and the
+                                      # end-of-turn merge unions tctx into the
+                                      # row, so it is never lost either
                     out = ("Unlocked for the rest of this session: "
                            + ", ".join(got) + ". They are in your tool list "
                            "from your NEXT step — call one then.")
@@ -2366,6 +2375,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                               "title_source"):
                         out[k] = m.get(k, s.get(k))
                     out["messages"] = _without_checkpoint(m["messages"])
+                    # `unlocked_tools` is written DURING the turn, by
+                    # `use_tools` (see `_unlock_tools`), through its own guarded
+                    # load/save. `out` is built from the PRE-turn snapshot, so
+                    # leaving this field to come from there reverts every unlock
+                    # the turn just made — measured on hardware 2026-09-21: the
+                    # model called `use_tools` five times, was told ok=True five
+                    # times, never got the tool and routed around it. Unlocks
+                    # only ever accumulate, so the union of what the store holds
+                    # and what this turn holds live can lose neither.
+                    out["unlocked_tools"] = sorted(
+                        set(m.get("unlocked_tools") or ())
+                        | set((tctx or {}).get("unlocked") or ()))
                     out[sessions.REV_KEY] = m[sessions.REV_KEY]
                     sessions.save(out, base_rev=out[sessions.REV_KEY])
                     s.update(out)
@@ -2488,7 +2509,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 budget_chars=int(target))
                             if n:
                                 s["messages"] = masked
-                                sessions.save(s)
+                                # Reload and write ONLY `messages`. The titling
+                                # call above is an await, so a whole-row write of
+                                # this turn's snapshot reverts a rename or a
+                                # params edit made meanwhile — AUDIT F4's shape,
+                                # on the masking path. Writing the one field this
+                                # block owns is what makes that impossible.
+                                _mfresh = sessions.load(s["id"])
+                                if _mfresh is not None:
+                                    _mfresh["messages"] = masked
+                                    try:
+                                        sessions.save(
+                                            _mfresh,
+                                            base_rev=_mfresh[sessions.REV_KEY])
+                                    except sessions.StaleWriteError:
+                                        pass     # the next turn re-masks
                                 yield _sse({"masked": n}, event="masked")
                                 # Re-check on the char estimate ONLY when masking
                                 # actually changed something. The engine's
