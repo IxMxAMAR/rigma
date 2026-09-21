@@ -30,12 +30,19 @@ def test_an_unknown_harness_is_refused_by_name():
         harness.resolve("not-a-harness")
 
 
-def test_a_known_but_unwired_harness_refuses_rather_than_falling_back():
+def test_a_wired_harness_that_is_absent_refuses_rather_than_falling_back(
+        monkeypatch):
     """The property this module exists for. A session that asked for MiniMax
-    Code and silently got the native loop would be a lie the user cannot see."""
+    Code and silently got the native loop would be a lie the user cannot see.
+
+    Both external backends are WIRED now; neither is present on a machine that
+    has not got it. `runnable` is a promise about the code, `installed` is a
+    fact about this machine, and the refusal is what keeps the two apart."""
+    from rigma import harness_mcode
+    monkeypatch.setattr(harness_mcode, "available", lambda: False)
     with pytest.raises(harness.HarnessError) as e:
         harness.resolve(harness.MCODE)
-    assert "cannot run a turn yet" in str(e.value)
+    assert "not installed" in str(e.value)
     assert harness.BACKENDS[harness.MCODE].label in str(e.value)
 
 
@@ -56,41 +63,55 @@ def test_a_wired_harness_still_refuses_when_it_is_not_on_this_machine(
 def test_every_backend_is_listed_with_its_honest_cost():
     rows = {r["name"]: r for r in harness.list_harnesses()}
     assert set(rows) == {harness.NATIVE, harness.DSH, harness.MCODE}
-    # the built-in is the default; DSH is wired up; MiniMax Code is not
-    assert rows[harness.NATIVE]["runnable"] is True
-    assert rows[harness.DSH]["runnable"] is True
-    assert rows[harness.MCODE]["runnable"] is False
+    # all three can run a turn now — `runnable` is about the code, not about
+    # this machine (see the installed/runnable test below)
+    assert all(r["runnable"] for r in rows.values())
     # an external harness must declare what it does NOT inherit, or a user
     # chooses it expecting Rigma's tools and undo
     for name in (harness.DSH, harness.MCODE):
         assert rows[name]["unsupported"], name
         assert rows[name]["wire"], name
-    # only a backend that CANNOT run has to explain why not
-    assert rows[harness.MCODE]["pending"]
-    assert not rows[harness.DSH]["pending"]
+    # `pending` is for a backend that cannot run a turn at all, and none is
+    assert not any(r["pending"] for r in rows.values())
+    # mcode's real cost is not Rigma's to fix, so it has to be said out loud
+    assert any("MiniMax credential" in u
+               for u in rows[harness.MCODE]["unsupported"])
 
 
-def test_installed_is_separate_from_runnable():
-    """A probe must not be mistaken for a working integration: MiniMax Code is
-    listed and probeable and still cannot run a turn."""
+def test_installed_is_separate_from_runnable(monkeypatch):
+    """A probe must not be mistaken for a working integration, and wiring a
+    backend up must not be mistaken for it being present."""
+    from rigma import harness_dsh, harness_mcode
+    monkeypatch.setattr(harness_dsh, "available", lambda: False)
+    monkeypatch.setattr(harness_mcode, "available", lambda: False)
     rows = {r["name"]: r for r in harness.list_harnesses()}
     assert rows[harness.NATIVE]["installed"] is True
-    assert rows[harness.MCODE]["runnable"] is False     # regardless of installed
+    assert rows[harness.NATIVE]["runnable"] is True
+    for name in (harness.DSH, harness.MCODE):
+        assert rows[name]["runnable"] is True, name
+        assert rows[name]["installed"] is False, name
+        with pytest.raises(harness.HarnessError, match="not installed"):
+            harness.resolve(name)
     # and no probe may raise, on any machine
     for name in harness.known():
         assert isinstance(harness.installed(harness.BACKENDS[name]), bool)
 
 
-def test_a_session_asking_for_an_unwired_harness_is_refused(monkeypatch,
-                                                            tmp_path):
+def test_a_session_asking_for_an_absent_harness_is_refused(monkeypatch,
+                                                           tmp_path):
     """The seam is load-bearing, not decorative: a session that names another
-    harness gets a refusal, never a silent turn on the built-in loop."""
+    harness gets a refusal, never a silent turn on the built-in loop.
+
+    `available` is pinned false so the test says the same thing on a machine
+    that happens to have mcode installed.
+    """
     from fastapi.testclient import TestClient
 
-    from rigma import serve, sessions
+    from rigma import harness_mcode, serve, sessions
     from rigma import state as st
 
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(harness_mcode, "available", lambda: False)
     st.write_state("m", "Q4", 11500, engine_pid=1, ui_pid=1)
     s = sessions.create(title="t")
     s["harness"] = "mcode"
@@ -98,7 +119,7 @@ def test_a_session_asking_for_an_unwired_harness_is_refused(monkeypatch,
     with TestClient(serve.build_app(upstream_port=11500)) as c:
         r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "hi"})
     assert r.status_code == 400
-    assert "cannot run a turn yet" in r.json()["error"]
+    assert "not installed" in r.json()["error"]
     assert "MiniMax Code" in r.json()["error"]
 
 
@@ -144,9 +165,9 @@ def test_the_api_lists_the_harnesses(monkeypatch, tmp_path):
     assert body["endpoint"] == "http://127.0.0.1:11500/v1"
     names = {h["name"] for h in body["harnesses"]}
     assert {"native", "dsh", "mcode"} <= names
-    # the built-in and DSH can be selected; MiniMax Code is listed but not wired
+    # all three can be selected, on a machine that has them
     assert [h["name"] for h in body["harnesses"] if h["runnable"]] == \
-        ["dsh", "native"]
+        ["dsh", "mcode", "native"]
 
 
 def test_the_advertised_endpoint_is_rigmas_not_the_engines(monkeypatch):
@@ -237,19 +258,21 @@ def test_an_unknown_harness_is_refused_at_the_write(monkeypatch, tmp_path):
     assert sessions.load(sid)["harness"] == "native"      # left alone
 
 
-def test_a_listed_but_unwired_harness_cannot_be_selected(monkeypatch, tmp_path):
-    """MiniMax Code is on the menu so its cost is visible; it is not selectable,
-    and the refusal has to say what is missing or it is a dead end."""
+def test_a_listed_but_absent_harness_cannot_be_selected(monkeypatch, tmp_path):
+    """MiniMax Code is on the menu so its cost is visible; on a machine without
+    it, it is not selectable — and the refusal has to say what is missing or it
+    is a dead end."""
     from fastapi.testclient import TestClient
 
-    from rigma import serve, sessions
+    from rigma import harness_mcode, serve, sessions
 
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(harness_mcode, "available", lambda: False)
     with TestClient(serve.build_app(upstream_port=11500)) as c:
         sid = c.post("/api/sessions", json={}).json()["id"]
         r = c.post(f"/api/sessions/{sid}", json={"harness": "mcode"})
     assert r.status_code == 400
-    assert "cannot run a turn yet" in r.json()["error"]
+    assert "not installed" in r.json()["error"]
     assert sessions.load(sid)["harness"] == "native"
 
 

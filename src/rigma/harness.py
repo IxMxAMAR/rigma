@@ -42,6 +42,23 @@ class HarnessError(ValueError):
     """A harness cannot be used: unknown, not installed, or not implemented."""
 
 
+@dataclass
+class TurnEvent:
+    """One thing that happened during a turn, in RIGMA's vocabulary.
+
+    The seam's shared language. A driver translates its backend's wire format
+    into these and the turn loop renders them, so neither side has to know the
+    other's protocol — which is what lets a second backend be added without
+    touching the loop that streams a chat.
+    """
+
+    kind: str  # "text" | "thinking" | "tool" | "tool_result" | "notice" | "error"
+    text: str = ""
+    name: str = ""
+    args: dict | None = None
+    ok: bool = True
+
+
 @dataclass(frozen=True)
 class Harness:
     """One agent backend.
@@ -101,6 +118,19 @@ def _dsh_available() -> bool:
     return harness_dsh.available()
 
 
+def _mcode_available() -> bool:
+    """MiniMax Code is a CLI on PATH, or wherever `RIGMA_MCODE_BIN` points.
+
+    A probe rather than `needs="mcode"` so the menu and the adapter agree: the
+    adapter honours the env override, and `shutil.which` alone would call a
+    backend missing that the adapter can in fact run."""
+    try:
+        from . import harness_mcode
+    except Exception:
+        return False
+    return harness_mcode.available()
+
+
 BACKENDS: dict[str, Harness] = {
     NATIVE: Harness(
         name=NATIVE,
@@ -140,19 +170,31 @@ BACKENDS: dict[str, Harness] = {
         # exec's versioned NDJSON stream, and treat ACP as a later upgrade —
         # ACP would additionally mean implementing the ACP *client* side.
         drives="a subprocess turn: `mcode exec --output-format stream-json`",
-        runnable=False,
+        runnable=True,
         needs="mcode",
+        probe=_mcode_available,
         wire="`mcode provider add --base-url <rigma>/v1 --api-format "
-             "openai-completions --context-limit N --output-limit N`",
-        unsupported=_LEAVES_BEHIND + (
+             "openai-completions --model <model> --api-key-env <var> "
+             "--context-limit N --output-limit N`, into a Rigma-owned "
+             "MINIMAX_DATA_DIR; the turn then runs as "
+             "`--model custom_provider:rigma/<model>`",
+        unsupported=(
+            # FIRST because it is the one that stops the whole thing, and it is
+            # not something Rigma can fix on the owner's behalf.
+            "a MiniMax credential must exist before it will run ANY turn, even "
+            "one served entirely by Rigma's local model: `exec` refuses with "
+            "auth.login_required until `mcode login` (or a saved key) has "
+            "happened once. Measured 2026-09-21 — configuring a custom provider "
+            "does not satisfy it",
+        ) + _LEAVES_BEHIND + (
             "driveable only as a subprocess: it has no library API",
-            "its own tool roster: 12 built-in ids plus MCP, which Rigma can "
-            "subtract from but never replace",
+            "its own tool roster: a real turn sent the model 18 tool schemas, "
+            "plus whatever MCP adds — Rigma can subtract from that set, never "
+            "replace it",
+            "its own system prompt: Rigma's is not passed through",
+            "the sandbox: a headless turn needs `--permission full`, so a "
+            "confined profile does not survive the seam",
         ),
-        pending="the adapter is not written yet — install it with `npm install "
-                "-g @minimax-ai/code` (Node 22.19+ or 24+), then select it; its "
-                "stream-json schema is versioned, so the adapter is written "
-                "against a stable contract",
     ),
 }
 
@@ -217,3 +259,30 @@ def resolve(name: str | None, *, port: int | None = None) -> Harness:
             f"{h.label} needs {h.needs!r} on this machine and it is not "
             f"installed")
     return h
+
+
+# Which module drives which backend. A backend with an adapter and no entry
+# here would be `runnable` on the menu and refuse at the first turn, so this
+# table is the other half of that promise.
+_ADAPTERS = {DSH: "harness_dsh", MCODE: "harness_mcode"}
+
+
+def adapter(name: str):
+    """The module that drives `name`, or None for the native loop.
+
+    Every adapter exposes the same one call:
+
+        drive_turn(*, base_url, model, prompt, system_prompt="", session_id="",
+                   cwd="", max_tokens=4096, context_window=32768,
+                   timeout=1800.0) -> Iterator[TurnEvent]
+
+    It is a BLOCKING generator: the caller owns the thread. That is deliberate
+    — a backend is a subprocess doing blocking IO, and the seam's contract is
+    that a stalled backend stalls a worker, never the event loop.
+
+    Imported lazily so a broken or absent adapter cannot take down the menu.
+    """
+    mod = _ADAPTERS.get(str(name or "").strip().lower())
+    if mod is None:
+        return None
+    return importlib.import_module(f".{mod}", __package__)

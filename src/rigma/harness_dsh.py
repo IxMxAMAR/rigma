@@ -34,27 +34,17 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# The seam's event vocabulary, shared with every other adapter. Re-exported
+# rather than redefined so a driver and the turn loop cannot drift apart — and
+# so `harness_dsh.TurnEvent` keeps naming the same type.
+from .harness import TurnEvent
+
 # The checkout this machine actually has. The env override exists because a
 # checkout is a user's directory, not a fact about Rigma.
 _DEFAULT_HOME = r"C:\AI\deepseek-harness"
 _PATCH_NAME = "rigma-dsh-patch.yaml"
 _SDK_REL = ("python", "sdk", "src")
 _CLI_REL = ("python", "sdk-runtime", "node_modules", ".bin", "dsh.CMD")
-
-
-@dataclass
-class TurnEvent:
-    """One thing that happened during a turn, in Rigma's vocabulary.
-
-    Neutral on purpose: the parent renders these, and the runner's wire format
-    is not the parent's problem.
-    """
-
-    kind: str  # "text" | "thinking" | "tool" | "tool_result" | "notice" | "error"
-    text: str = ""
-    name: str = ""
-    args: dict | None = None
-    ok: bool = True
 
 
 def home() -> Path | None:

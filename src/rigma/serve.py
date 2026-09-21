@@ -1550,8 +1550,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         The backend is a SUBPROCESS doing blocking IO, so it runs in a worker
         thread and hands events over a queue. A harness that stalls must not
         stall Rigma's event loop — the AUDIT F16/F36 family.
+
+        Which adapter drives it comes from the seam's own table, so this loop
+        names no backend: adding one is a new module and a table entry, and this
+        function does not change.
         """
-        from . import harness_dsh
+        adapter = _harness.adapter(backend.name)
+        if adapter is None:
+            # Unreachable while `runnable` and the table agree, and reported
+            # rather than silently running the native loop if they ever don't.
+            yield _sse({"message": f"no adapter drives {backend.label}"},
+                       event="error")
+            return
         sid = s["id"]
         state = st.read_state() or {}
         prompt = _turn_prompt(s) or "Continue where you left off."
@@ -1564,7 +1574,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             """Drain the adapter on a worker thread. It never raises: a driver
             failure comes back as an error event, so the turn still ends."""
             try:
-                for ev in harness_dsh.drive_turn(
+                for ev in adapter.drive_turn(
                         base_url=_harness.endpoint_for(
                             _public_port(upstream_port)),
                         model=str(state.get("model") or ""),
@@ -1575,7 +1585,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     loop.call_soon_threadsafe(q.put_nowait, ev)
             except Exception as e:              # pragma: no cover - defensive
                 loop.call_soon_threadsafe(
-                    q.put_nowait, harness_dsh.TurnEvent("error", str(e)))
+                    q.put_nowait, _harness.TurnEvent("error", str(e)))
             finally:
                 loop.call_soon_threadsafe(q.put_nowait, END)
 
