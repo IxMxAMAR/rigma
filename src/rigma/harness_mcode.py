@@ -93,11 +93,11 @@ _API_KEY = "local"
 
 _MARKER = "provider.json"
 _SETUP_TIMEOUT = 120.0
-# (base_url, model, context, output) confirmed against mcode IN THIS PROCESS.
-# The marker file survives a restart and can therefore be wrong about a config
-# that changed underneath it; this cannot, so the ask happens once per process
-# rather than once per turn.
-_VERIFIED: set = set()
+# (base_url, model, context, output) -> the provider id confirmed IN THIS
+# PROCESS. The marker file survives a restart and can therefore be wrong about a
+# config that changed underneath it; this cannot, so the ask happens once per
+# process rather than once per turn.
+_VERIFIED: dict = {}
 # How long past mcode's own --timeout before Rigma stops waiting for it. mcode
 # bounds the RUN; this bounds the PROCESS, so a wedged child cannot outlive the
 # turn it belongs to.
@@ -238,11 +238,8 @@ def _run_out(argv: list[str], timeout: float) -> tuple[int, str]:
     return p.returncode, p.stdout or ""
 
 
-def _provider_state(exe: str) -> dict | None:
-    """What mcode ITSELF says about our provider.
-
-    Returns the provider record, `{}` when mcode answered and does not have it,
-    or None when mcode would not answer at all.
+def _providers(exe: str) -> list[dict] | None:
+    """mcode's own provider list, or None when mcode would not answer.
 
     Rigma keeps a marker file so it does not run `provider add` every turn, but
     a marker is RIGMA'S BELIEF about mcode's config, not mcode's config — and
@@ -261,24 +258,32 @@ def _provider_state(exe: str) -> dict | None:
         data = json.loads(out[start:])
     except ValueError:
         return None
-    for p in data.get("providers") or []:
-        if isinstance(p, dict) and p.get("providerId") == PROVIDER_ID:
-            return p
-    return {}
+    return [p for p in (data.get("providers") or []) if isinstance(p, dict)]
 
 
-def _provider_is_live(state: dict, base_url: str) -> bool:
-    """Whether `exec` will work with what mcode currently has.
+def _ours(provs: list[dict]) -> list[dict]:
+    """The providers RIGMA created, by the namespace it asks for."""
+    return [p for p in provs
+            if str(p.get("providerId") or "") == PROVIDER_ID
+            or str(p.get("providerId") or "").startswith(PROVIDER_ID + "-")]
 
-    `active` is the one that matters most: a provider that is present but not
-    SELECTED is exactly the state that makes mcode demand a MiniMax login for a
-    turn that never leaves this machine. `baseUrl` is checked because Rigma's
-    port can move, and a provider pointing at the old one fails in a way that
-    reads like a model problem.
+
+def _active_at(provs: list[dict], base_url: str) -> str:
+    """The provider id mcode has ACTIVE at this URL — what `exec --model` must
+    name.
+
+    Read back rather than assumed, because `provider add` DEDUPES a name it
+    already holds: a second `--name rigma` becomes `rigma-2`. `--use` then
+    activates the NEW one while `--model custom_provider:rigma/<model>` keeps
+    resolving to the OLD one — a provider Rigma believes it configured and a
+    turn that fails against a dead port. Measured 2026-09-21.
     """
-    return (bool(state.get("active")) and bool(state.get("enabled"))
-            and str(state.get("baseUrl") or "").rstrip("/")
-            == base_url.rstrip("/"))
+    for p in provs:
+        if (p.get("active") and p.get("enabled")
+                and str(p.get("baseUrl") or "").rstrip("/")
+                == base_url.rstrip("/")):
+            return str(p.get("providerId") or "")
+    return ""
 
 
 def _wanted(base_url: str, model: str, context_window: int,
@@ -301,12 +306,17 @@ def ensure_provider(exe: str, base_url: str, model: str, context_window: int,
     an account error.
 
     Cached in a marker file rather than re-run every turn: `provider add` is a
-    separate Node process, and re-adding a name mcode already has is an error,
-    not an update. But the marker is only a HINT — once per process, mcode is
-    asked whether the thing it describes is still true, because an upstream
-    release can move where custom providers live and a marker cannot notice.
-    A changed model means the cached provider is stale, so it is removed first —
-    mcode keys a custom provider by name, and the name is ours.
+    separate Node process. But the marker is only a HINT — once per process,
+    mcode is asked whether the thing it describes is still true, because an
+    upstream release can move where custom providers live and a marker cannot
+    notice.
+
+    Returns the provider ID to name in `--model`, READ BACK from mcode rather
+    than assumed. That is not belt-and-braces: `provider add` dedupes a name it
+    already holds, so a second `--name rigma` becomes `rigma-2`, `--use`
+    activates `rigma-2`, and a `--model custom_provider:rigma/…` — the id Rigma
+    used to hardcode — resolves to the FIRST one and fails against whatever port
+    that was. Reading the active id back makes the name mcode chose irrelevant.
     """
     want = _wanted(base_url, model, context_window, max_tokens)
     key = (base_url, model, int(context_window), int(max_tokens))
@@ -316,24 +326,34 @@ def ensure_provider(exe: str, base_url: str, model: str, context_window: int,
     except (OSError, ValueError):
         have = None
 
-    if have == want:
-        if key in _VERIFIED:
-            return ""
-        state = _provider_state(exe)
-        if state is None:
-            # mcode would not answer. Do NOT re-add on a guess: a transient
-            # failure would become a duplicate provider, and the next turn
-            # would hit the "already exists" error instead.
-            _VERIFIED.add(key)
-            return ""
-        if _provider_is_live(state, base_url):
-            _VERIFIED.add(key)
-            return ""
-        # Rigma believed it was configured and mcode says otherwise. Fall
-        # through and configure it again.
+    if have == want and key in _VERIFIED:
+        return _VERIFIED[key], ""
 
-    if have is not None:
-        _run([exe, "provider", "remove", PROVIDER_ID], _SETUP_TIMEOUT)
+    provs = _providers(exe)
+    if provs is None:
+        # mcode would not answer. Do NOT re-add on a guess: a transient failure
+        # would become a duplicate provider, and the dedupe would then point
+        # `--use` at a provider that `--model` does not name.
+        if have == want:
+            _VERIFIED[key] = PROVIDER_ID
+            return PROVIDER_ID, ""
+        return "", "mcode would not list its providers"
+
+    live = _active_at(provs, base_url)
+    if have == want and live:
+        _VERIFIED[key] = live
+        return live, ""
+
+    # Clear Rigma's own leftovers before adding. `provider add` DEDUPES a name
+    # it already has, and `provider remove` REFUSES without `--yes` — which is
+    # how the leftovers accumulated in the first place, since an earlier version
+    # of this called remove without it and the removal silently did nothing.
+    # Left alone, each change leaks a provider and points `--use` one step
+    # further from the id `--model` names.
+    for p in _ours(provs):
+        _run([exe, "provider", "remove", str(p.get("providerId") or ""),
+              "--yes"], _SETUP_TIMEOUT)
+
     code, out = _run([
         exe, "provider", "add",
         "--name", PROVIDER,
@@ -347,13 +367,21 @@ def ensure_provider(exe: str, base_url: str, model: str, context_window: int,
         "--use",
     ], _SETUP_TIMEOUT)
     if code != 0:
-        return f"mcode provider add failed ({code}): {out.strip()[:400]}"
-    _VERIFIED.add(key)
+        return "", f"mcode provider add failed ({code}): {out.strip()[:400]}"
+
+    live = _active_at(_providers(exe) or [], base_url)
+    if not live:
+        # Saved but not active, or active somewhere else. Either way a turn
+        # would run against a provider Rigma did not configure, so say so here
+        # rather than letting it surface as a model-not-available error.
+        return "", (f"mcode saved a provider but reports nothing active at "
+                    f"{base_url}")
+    _VERIFIED[key] = live
     try:
         marker.write_text(json.dumps(want), encoding="utf-8")
     except OSError:
         pass                        # a cache that cannot be written is not fatal
-    return ""
+    return live, ""
 
 
 def _flatten(out) -> str:
@@ -484,7 +512,7 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     if exe is None:
         yield TurnEvent("error", "mcode is not on PATH")
         return
-    why = ensure_provider(exe, base_url, model, context_window, max_tokens)
+    pid, why = ensure_provider(exe, base_url, model, context_window, max_tokens)
     if why:
         yield TurnEvent("error", why)
         return
@@ -495,7 +523,8 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
             # headless: `smart` needs a TUI to ask, and `off` would disarm the
             # agent's tools entirely
             "--permission", "full",
-            "--model", f"{PROVIDER_ID}/{model}",
+            # the id mcode actually gave us, not the one we asked for
+            "--model", f"{pid}/{model}",
             "--timeout", f"{int(timeout)}s"]
     if resume:
         argv += ["--session", resume]

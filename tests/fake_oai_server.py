@@ -21,6 +21,28 @@ logpath = sys.argv[sys.argv.index("--log") + 1] if "--log" in sys.argv else ""
 # machine. One shot, not every request — otherwise the backend calls the tool,
 # is told it failed, and calls it again until it hits its step limit.
 toolname = sys.argv[sys.argv.index("--tool") + 1] if "--tool" in sys.argv else ""
+# `--tool-args JSON` is what that call carries. The default is deliberately
+# nonsense: a tool call that FAILS VALIDATION never reaches the layer under
+# test, so a probe of permissions or of presentation has to send arguments the
+# tool actually accepts. Measuring `--permission smart` with `{"probe": 1}` and
+# concluding "no permission prompt appears" would have been measuring the schema
+# validator (2026-09-21).
+toolargs = (sys.argv[sys.argv.index("--tool-args") + 1]
+            if "--tool-args" in sys.argv else '{"probe": 1}')
+# `--tool-args-file PATH` is the same thing without the shell in the way.
+# `Start-Process -ArgumentList` joins its array with spaces and quotes nothing,
+# so a JSON argument containing a space arrives as three arguments and the
+# server starts happily with a broken tool call — which then looks like a
+# backend that cannot reach its provider (measured 2026-09-21).
+if "--tool-args-file" in sys.argv:
+    with open(sys.argv[sys.argv.index("--tool-args-file") + 1],
+              encoding="utf-8") as _f:
+        toolargs = _f.read().strip()
+# `--tool-always` asks for the tool on EVERY request rather than only the first.
+# Comparing two runs needs it: the one-shot version gives the tool call to
+# whichever run happens to be first and plain text to all the others, so the
+# comparison silently measures nothing.
+toolalways = "--tool-always" in sys.argv
 # `--no-count` answers 404 to the token-counting route. MiniMax Code asks
 # `/v1/responses/input_tokens` before every turn, which llama-server does not
 # serve — so whether an agent backend survives that 404 decides whether Rigma's
@@ -70,12 +92,12 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             first = _requests["n"] == 0
             _requests["n"] += 1
-            if toolname and first:
+            if toolname and (first or toolalways):
                 self.wfile.write(b"data: " + json.dumps(
                     {"choices": [{"delta": {"tool_calls": [
                         {"index": 0, "id": "call_probe_1", "type": "function",
                          "function": {"name": toolname,
-                                      "arguments": "{\"probe\": 1}"}}]}}]}
+                                      "arguments": toolargs}}]}}]}
                 ).encode() + b"\n\n")
                 self.wfile.write(b"data: " + json.dumps(
                     {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
