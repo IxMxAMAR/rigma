@@ -62,7 +62,19 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   "preset_id", "params", "notes", "digest", "effort",
                   "authors_note", "authors_note_depth", "prefill",
                   "use_tools", "allow_code", "workspace", "auto_compact",
-                  "max_tool_rounds", "one_action", "method", "carry_reasoning")
+                  "max_tool_rounds", "one_action", "method", "carry_reasoning",
+                  # which agent backend owns this session's turns. It belongs
+                  # here because `update_session` offers exactly this tuple —
+                  # and without it the harness seam was UNREACHABLE from the
+                  # product: a session could only be pointed at DSH by editing
+                  # its JSON by hand, so the whole integration was library-only.
+                  # `serve.update_session` validates the name through
+                  # `harness.resolve`, so an unknown or unusable backend is
+                  # refused at the write instead of 400-ing every turn after it.
+                  # Deriving `_MERGE_FROM_STORE` from this tuple also means a
+                  # harness switched mid-turn is not undone by the turn's own
+                  # end-of-turn write.
+                  "harness")
 # "" / off / auto / on are Rigma's own binary thinking switch. The four
 # named levels are Qwen3.8's published reasoning efforts, which its chat
 # template reads from `reasoning_effort` — verified against a live engine
@@ -123,9 +135,10 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # trigger rules: one-line reminders queued for the next
                      # turn, and the loop-guard bookkeeping (see triggers.py)
                      "pending_nudges": [], "trigger_state": {},
-                     # which agent backend runs this session's turns. Only the
-                     # built-in can run one today; `harness.resolve` refuses
-                     # anything else rather than quietly substituting it.
+                     # which agent backend runs this session's turns: the
+                     # built-in loop, or an external one wired behind the seam.
+                     # `harness.resolve` refuses an unknown or unusable backend
+                     # rather than quietly substituting the built-in.
                      "harness": "native",
                      "messages": []}
 

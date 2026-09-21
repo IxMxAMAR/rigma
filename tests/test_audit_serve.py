@@ -806,7 +806,7 @@ def test_every_field_the_patch_endpoint_accepts_survives_a_turn():
         f"mid-turn change to them is reverted: {sorted(missing)}")
 
 
-def test_a_setting_changed_mid_turn_is_not_reverted(home, engine):
+def test_a_setting_changed_mid_turn_is_not_reverted(home, engine, monkeypatch):
     """A settings change made while a reply is STREAMING is the user's, and the
     turn's own end-of-turn write must not put it back.
 
@@ -815,8 +815,16 @@ def test_a_setting_changed_mid_turn_is_not_reverted(home, engine):
     write lands in the window between the turn's snapshot and its end-of-turn
     merge, which is the only window where it can be lost — the titler runs
     AFTER the merge, so hooking that instead would prove nothing.
+
+    `harness` is in the same body because it joined the PATCH surface after
+    this test was written: switching the backend mid-reply and having the turn
+    hand it back would be the same bug, on the field that decides which agent
+    owns the next turn.
     """
     import asyncio
+
+    from rigma import harness_dsh
+    monkeypatch.setattr(harness_dsh, "available", lambda: True)
     _running(ctx=131072)
     Engine.script = [_say("a reply that takes a moment to arrive")]
     Engine.stream_delay = 0.01
@@ -830,7 +838,8 @@ def test_a_setting_changed_mid_turn_is_not_reverted(home, engine):
         await asyncio.sleep(0.2)              # the reply is streaming now
         edited = await _request(app, "POST", f"/api/sessions/{sid}",
                                 {"allow_code": False, "max_tool_rounds": 7,
-                                 "workspace": "C:/somewhere"})
+                                 "workspace": "C:/somewhere",
+                                 "harness": "dsh"})
         await turn
         return edited
 
@@ -842,4 +851,36 @@ def test_a_setting_changed_mid_turn_is_not_reverted(home, engine):
         "a safety setting changed mid-turn was reverted by the turn's own write"
     assert after["max_tool_rounds"] == 7
     assert after["workspace"] == "C:/somewhere"
+    assert after["harness"] == "dsh", \
+        "the backend chosen mid-turn was handed back by the turn's own write"
     assert after["messages"][-1]["role"] == "assistant"   # the turn still landed
+
+
+# --------------------------------------------------------------------------
+# the client is told which backend drove a turn
+
+
+def test_a_turn_says_which_backend_drove_it(home, engine):
+    """The UI badges a reply with the backend that produced it.
+
+    Sent on EVERY turn, the built-in included: a marker that is only sometimes
+    present is one the reader has to interpret, and "no badge" would otherwise
+    be ambiguous between the built-in and an older server.
+
+    Its own event name, NOT `meta`: `meta` is suppressed on a failed turn
+    (a turn that produced nothing must not report a context size), while which
+    backend ran is true whether or not it succeeded.
+    """
+    import asyncio
+    _running()
+    Engine.script = [_say("hi")]
+    c = _client(engine.port)
+    sid = _seed(c, 1)
+    app = build_app(upstream_port=engine.port)
+
+    got = asyncio.run(
+        _stream(app, f"/api/sessions/{sid}/chat", {"message": "go"}))
+    assert got["status"] == 200
+    assert "event: harness" in got["text"]
+    assert '"name": "native"' in got["text"]
+    assert '"label": "Rigma (built in)"' in got["text"]
