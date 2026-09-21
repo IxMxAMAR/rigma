@@ -27,6 +27,16 @@ question that decides whether an in-process server can serve it at all:
 
   search_my_documents   rag_dir()/sidecar.json + the sidecar's HTTP port. A file
                         and a port. No session, no Rigma process. Eligible.
+  remember, recall      rigma_home()/model_memory.json. A file, read and written
+                        whole. No session, no Rigma process. Eligible — and worth
+                        the two small schemas, because this is the one kind of
+                        memory the arm does NOT have: its own session remembers
+                        the conversation, but not the durable facts about the
+                        user, and sharing this file means a fact learned in an
+                        arm chat is there for the native loop and the other way
+                        round. That sharing is the point, not a side effect. The
+                        arm has exactly the power the native model already has
+                        here — same file, same trust, no new surface.
 
 NOT offered, and why — these are not oversights:
 
@@ -63,7 +73,7 @@ SERVER_NAME = "rigma"
 # The curated roster. Adding a name here is a deliberate act, and
 # `test_the_roster_is_exactly_what_was_justified` fails until it is justified in
 # this file's docstring as well.
-_ROSTER = ("search_my_documents",)
+_ROSTER = ("search_my_documents", "remember", "recall")
 
 # Tools whose result is not a failure even though it begins with "error". Empty
 # today; it exists so the `isError` heuristic below is not the only word on it.

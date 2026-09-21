@@ -63,7 +63,9 @@ def test_the_handshake_answers_what_the_client_sends(nodocs):
     assert init["protocolVersion"] == mcp_server.PROTOCOL_VERSION
     assert init["serverInfo"]["name"] == "rigma"
     assert "tools" in init["capabilities"]
-    assert got[1]["result"]["tools"] == []
+    # the memory tools need only a file, so they are here even with nothing
+    # indexed; the documents tool is not
+    assert "search_my_documents" not in [t["name"] for t in got[1]["result"]["tools"]]
 
 
 def test_a_notification_is_never_answered(nodocs):
@@ -122,24 +124,44 @@ def test_the_roster_is_exactly_what_was_justified():
     """Every offered tool is a schema on EVERY request, forever, and mcode
     already sends 18. So the roster is the tools the arm CANNOT do — and adding
     one is a deliberate act that has to be argued for in the module docstring,
-    not a line somebody appended."""
-    assert mcp_server._ROSTER == ("search_my_documents",)
+    not a line somebody appended.
+
+    `remember`/`recall` earn their two small schemas because they are the one
+    kind of memory the arm does not have: its session remembers the
+    conversation, but not the durable facts about the user.
+    """
+    assert mcp_server._ROSTER == ("search_my_documents", "remember", "recall")
+
+
+def test_the_memory_tools_are_offered_without_any_documents(docs):
+    """They are a plain file, so they do not depend on the RAG sidecar — and
+    they must not disappear just because nothing is indexed."""
+    names = [t["name"] for t in mcp_server.offered()]
+    assert names == ["search_my_documents", "remember", "recall"]
+
+    (docs / "rag" / "sidecar.json").unlink()
+    assert [t["name"] for t in mcp_server.offered()] == ["remember", "recall"]
 
 
 def test_the_documents_tool_is_offered_only_when_documents_exist(docs):
     """Offered-and-empty costs tokens on every turn to say "nothing is indexed".
     Absent says the same thing for free."""
     tools = _drive(_req(1, "tools/list"))[0]["result"]["tools"]
-    assert [t["name"] for t in tools] == ["search_my_documents"]
-    t = tools[0]
+    assert "search_my_documents" in [t["name"] for t in tools]
+    t = next(t for t in tools if t["name"] == "search_my_documents")
     # the schema the arm is shown comes from RIGMA's registry, so a tool whose
     # arguments change cannot drift from it
     assert t["inputSchema"]["required"] == ["query"]
     assert "indexed documents" in t["description"]
 
 
-def test_no_documents_means_no_tools_rather_than_a_broken_server(nodocs):
-    assert mcp_server.offered() == []
+def test_no_documents_means_no_documents_tool_rather_than_a_broken_server(nodocs):
+    """Not an empty roster — the memory tools need nothing but a file, so they
+    stay. The rule is that a tool which would answer "nothing here" is not
+    offered, not that a missing sidecar empties the server."""
+    names = [t["name"] for t in mcp_server.offered()]
+    assert "search_my_documents" not in names
+    assert names == ["remember", "recall"]
 
 
 # -- calling ------------------------------------------------------------------
