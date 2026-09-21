@@ -37,15 +37,20 @@ question that decides whether an in-process server can serve it at all:
                         round. That sharing is the point, not a side effect. The
                         arm has exactly the power the native model already has
                         here — same file, same trust, no new surface.
+  undo_last_change      rigma_home()/undo — the same slot-and-index store the
+                        native loop uses. No session, no Rigma process. Eligible
+                        now that `watch.py` records the ARM's own edits: the
+                        journal alone only ever held RIGMA's write_file /
+                        edit_file, so this tool used to answer "nothing to undo"
+                        every single time. It is the one entry here that adds a
+                        CAPABILITY rather than a duplicate: the arm has no undo
+                        of its own, and a tool that restores what an agent just
+                        broke earns its schema on every turn. Offered only when a
+                        workspace is set, because without one there is nothing to
+                        restore and it would be a schema that only ever refuses.
 
 NOT offered, and why — these are not oversights:
 
-  undo_last_change      Its journal only records RIGMA's own write_file /
-                        edit_file. The arm edits with its own tools, which Rigma
-                        never sees, so it would answer "nothing to undo" every
-                        single time — a tool that looks like it works and finds
-                        nothing. Making it work needs a filesystem watcher,
-                        which is a different feature.
   view_image            Returns Rigma's IMAGE_SENTINEL for RIGMA'S OWN LOOP to
                         read and inject as vision. An external agent's loop has
                         never heard of it, and injecting it into the arm's
@@ -73,7 +78,7 @@ SERVER_NAME = "rigma"
 # The curated roster. Adding a name here is a deliberate act, and
 # `test_the_roster_is_exactly_what_was_justified` fails until it is justified in
 # this file's docstring as well.
-_ROSTER = ("search_my_documents", "remember", "recall")
+_ROSTER = ("search_my_documents", "remember", "recall", "undo_last_change")
 
 # Tools whose result is not a failure even though it begins with "error". Empty
 # today; it exists so the `isError` heuristic below is not the only word on it.
@@ -100,6 +105,17 @@ def profile() -> str:
     return str(os.environ.get("RIGMA_MCP_PROFILE") or "all").strip() or "all"
 
 
+def allow_code() -> bool:
+    """Whether Rigma's code-capability tools may be offered to the arm.
+
+    Read from the environment for the same reason the workspace is: the registrar
+    decides it, the server obeys it. `_ROSTER` is still the real gate — this only
+    decides whether a tool that NEEDS the capability can appear at all, and the
+    only roster entry that needs it is `undo_last_change`.
+    """
+    return os.environ.get("RIGMA_MCP_ALLOW_CODE") == "1"
+
+
 def ctx() -> dict:
     """The context dict `run_tool` expects.
 
@@ -110,12 +126,13 @@ def ctx() -> dict:
     return {
         "workspace": workspace(),
         "profile": profile(),
-        "allow_code": os.environ.get("RIGMA_MCP_ALLOW_CODE") == "1",
+        "allow_code": allow_code(),
         "run_id": "",
     }
 
 
-def offered() -> list[dict]:
+def offered(*, ws: str | None = None, prof: str | None = None,
+            code: bool | None = None) -> list[dict]:
     """The roster as MCP tool definitions.
 
     Built from Rigma's OWN registry rather than hand-written, so a tool whose
@@ -124,17 +141,28 @@ def offered() -> list[dict]:
     `search_my_documents` disappears entirely when no documents are indexed,
     instead of being offered and answering "nothing is indexed yet" on every
     turn.
+
+    The arguments exist so the REGISTRAR can ask what WOULD be offered for a
+    workspace, without starting a server or mutating its own environment. That
+    matters because the decision to register was being made from a different fact
+    (`is a RAG sidecar live`) than the one that decides the roster, and the two
+    had drifted: with nothing indexed the arm also lost `remember` and `recall`,
+    which never needed documents at all.
     """
     from . import rag
     from . import tools as toolkit
+
+    ws = workspace() if ws is None else str(ws or "").strip()
+    prof = profile() if prof is None else (str(prof or "").strip() or "all")
+    code = allow_code() if code is None else bool(code)
 
     try:
         has_rag = rag.live_sidecar_port() is not None
     except Exception:
         has_rag = False
     try:
-        specs = toolkit.tool_specs(has_rag=has_rag, workspace=workspace(),
-                                   profile=profile())
+        specs = toolkit.tool_specs(has_rag=has_rag, workspace=ws or None,
+                                   profile=prof, allow_code=code)
     except Exception:
         return []
 
@@ -142,6 +170,10 @@ def offered() -> list[dict]:
     for s in specs:
         fn = s.get("function") if isinstance(s, dict) else None
         if not isinstance(fn, dict) or fn.get("name") not in _ROSTER:
+            continue
+        if fn["name"] == "undo_last_change" and not ws:
+            # No workspace means nothing to restore, so it would be a schema
+            # that only ever answers "no workspace folder is set".
             continue
         out.append({
             "name": fn["name"],
@@ -247,10 +279,27 @@ def serve(stdin=None, stdout=None) -> None:
 
 
 def main() -> int:
+    # Start watching the workspace BEFORE the loop, because the arm may edit a
+    # file on its very first tool call and then ask to undo it. A watcher that
+    # started lazily — on the first `undo_last_change` — would have read the file
+    # only after the change, so the first undo of every session would find
+    # nothing. Nothing is recorded until a file actually changes; this only
+    # remembers what things looked like.
+    try:
+        from . import watch
+        watch.watch(workspace())
+    except Exception:
+        pass            # an undo net that cannot start must not break the server
     try:
         serve()
     except (BrokenPipeError, KeyboardInterrupt):
         pass            # the client went away; that is a normal way to end
+    finally:
+        try:
+            from . import watch
+            watch.stop_all()
+        except Exception:
+            pass
     return 0
 
 

@@ -249,7 +249,16 @@ def _mcp_spec(cwd: str) -> dict:
     """
     from .runtime import rigma_home
 
-    env = {"RIGMA_HOME": str(rigma_home())}
+    env = {"RIGMA_HOME": str(rigma_home()),
+           # Granted HERE, deliberately and visibly. The server is pessimistic by
+           # default — `allow_code` is off unless the environment turns it on — so
+           # a capability nobody granted is refused rather than assumed. The only
+           # roster entry that needs it is `undo_last_change`.
+           #
+           # This widens which of RIGMA's tools may APPEAR; it does not widen what
+           # the arm can do. The arm already writes files with its own tools under
+           # its own permission model, and `_ROSTER` is still the real gate.
+           "RIGMA_MCP_ALLOW_CODE": "1"}
     if cwd:
         # Passed, not guessed. A tool that silently operated on the wrong
         # directory would be worse than one that refused.
@@ -291,8 +300,13 @@ def ensure_mcp(cwd: str = "") -> None:
         servers = {}
 
     try:
-        from . import rag
-        wanted = rag.live_sidecar_port() is not None
+        # Ask what would ACTUALLY be offered, rather than inferring it from one
+        # dependency. The gate used to be `is a RAG sidecar live`, which is only
+        # one of four roster entries: with nothing indexed the arm also lost
+        # `remember` and `recall`, and now `undo_last_change` — none of which need
+        # documents. Two facts that must agree should be one fact.
+        from . import mcp_server
+        wanted = bool(mcp_server.offered(ws=cwd, code=True))
     except Exception:
         wanted = False
 
