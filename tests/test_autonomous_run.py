@@ -721,3 +721,56 @@ def test_sample_files_hint_is_not_callable_looking_text(tmp_path):
                       {"run_id": r["id"], "workspace": str(tmp_path)})
     assert "view_sample" in out                 # still points at the right tool
     assert "view_sample()" not in out           # but not as copyable syntax
+
+
+def _run_turn_tools(c, monkeypatch, surface=None):
+    """The `tools` array a Run actually put on the wire. Filters to the
+    streaming turn requests — the mission compiler is a non-streaming call and
+    carries no tools."""
+    if surface is None:
+        monkeypatch.delenv("RIGMA_TOOL_SURFACE", raising=False)
+    else:
+        monkeypatch.setenv("RIGMA_TOOL_SURFACE", surface)
+    _Engine.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
+    _Engine.bodies = []
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    _wait(c, rid)
+    carrying = [b for b in _Engine.bodies if b.get("tools")]
+    assert carrying, "the run made no turn request carrying tools"
+    return carrying
+
+
+def test_a_run_advertises_the_focused_tool_surface(engine, monkeypatch):
+    """A Run used to put all 32 permitted tools on the wire: 16,490 chars of
+    schema, ~4,100 tok, 14.6% of a 32K window spent before the mission, the
+    run-state block, or one message of history (measured 2026-09-20). It now
+    advertises the core tier and holds the tail back, with `use_tools` as the
+    way to get it — so a Run pays ~3,200 tok instead of ~4,800."""
+    c = _client(engine)
+    bodies = _run_turn_tools(c, monkeypatch)
+    names = {t["function"]["name"] for t in bodies[0]["tools"]}
+
+    # the workhorse set is untouched
+    for must in ("read_file", "write_file", "list_directory", "manage_plan",
+                 "task_complete", "run_shell"):
+        assert must in names, must
+    # and the way back to everything else is on the wire
+    assert "use_tools" in names
+    # the tail is held back
+    for held in ("calculator", "move_files", "kill_job", "view_image"):
+        assert held not in names, held
+    # every round of the run, not just the first
+    for b in bodies:
+        assert len(b["tools"]) < 32
+
+
+def test_the_tool_surface_env_var_reverts_to_all(engine, monkeypatch):
+    """The A/B switch: RIGMA_TOOL_SURFACE=all restores the old surface with no
+    code edit, so a tier table can be measured against it on real hardware."""
+    c = _client(engine)
+    bodies = _run_turn_tools(c, monkeypatch, surface="all")
+    names = {t["function"]["name"] for t in bodies[0]["tools"]}
+    assert "calculator" in names and "move_files" in names
+    # `use_tools` exists only to widen a focused surface; on a full one it would
+    # be a tool whose whole job is already done
+    assert "use_tools" not in names

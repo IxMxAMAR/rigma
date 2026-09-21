@@ -259,6 +259,98 @@ def test_fuzzy_filename_recovery(tmp_path):
     assert _fuzzy_file(tmp_path / "totally_other_thing.png")[0] is None
 
 
+def test_repair_never_crosses_to_a_different_number(tmp_path):
+    """Found by replaying recorded runs on 2026-09-20.
+
+    The similarity fallback matched `ComfyUI_00010_.png` to
+    `ComfyUI_00501_.webp` inside a real 6,000-file folder: same prefix, same
+    extension family, different picture. For an image that is worse than an
+    error — the model is handed the wrong picture and describes it
+    confidently. Punctuation, spacing and zero padding may differ; numbers may
+    not."""
+    from rigma.tools import _fuzzy_file
+    (tmp_path / "ComfyUI_00501_.webp").write_text("x", encoding="utf-8")
+    (tmp_path / "ComfyUI_00888_.png").write_text("x", encoding="utf-8")
+    assert _fuzzy_file(tmp_path / "ComfyUI_00010_.png")[0] is None
+
+
+def test_repair_still_crosses_a_format_difference(tmp_path):
+    """The same number in another container is the same picture, and ComfyUI
+    folders routinely hold both — so this must keep working."""
+    from rigma.tools import _fuzzy_file
+    real = tmp_path / "ComfyUI_00001_.webp"
+    real.write_text("x", encoding="utf-8")
+    got, note = _fuzzy_file(tmp_path / "ComfyUI_00001_.png")
+    assert got == real and "used" in note
+
+
+def test_absolute_paths_get_the_same_fuzzy_repair_as_relative_ones(tmp_path):
+    """The repair used to be unreachable for ABSOLUTE paths.
+
+    `_resolve_image` returned "no such file" the moment an absolute path did
+    not exist, so `_fuzzy_file` — which resolves exactly this class of mistake —
+    never ran where missions actually live: a run told to "go through
+    D:\\Good Stuff" names every file absolutely. Live 2026-07-19, 6 of 18
+    view_images calls failed this way, on names the repair resolves in one step.
+    """
+    from PIL import Image
+    real = tmp_path / "ComfyUI_00428_.png"
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(real)
+
+    got, err = tools._resolve_image(str(tmp_path / "Comfy_UI_428.png"), {})
+    assert err == "" and got == real.resolve()
+
+    # and a relative path still resolves through the workspace, unchanged
+    got_rel, err_rel = tools._resolve_image(
+        "Comfy_UI_428.png", {"workspace": str(tmp_path)})
+    assert err_rel == "" and got_rel == real.resolve()
+
+
+def test_unresolvable_path_hands_back_a_real_spelling(tmp_path):
+    """A bare "no such file" is what makes the model guess a third time.
+
+    The live run emitted three consecutive variations of one filename
+    (`Comfy *(173).png`, `Comfy_UI_428.png`, `ComfyUI__20_.png`) because every
+    miss taught it nothing. A miss must name what is actually in the folder.
+    """
+    from PIL import Image
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(tmp_path / "ComfyUI_00428_.png")
+
+    got, err = tools._resolve_image(str(tmp_path / "Comfy *(173).png"), {})
+    assert got is None
+    assert "no such file" in err
+    assert "ComfyUI_00428_.png" in err
+
+
+def test_view_images_recovers_a_batch_of_mangled_absolute_names(tmp_path):
+    """This batch used to lose every image and report "no valid images".
+
+    `Comfy_UI_428.png` is a mangling of `ComfyUI_00428_.png` — same number — and
+    is now recovered. `ComfyUI__20_.png` is NOT recovered, and that is the
+    correct outcome rather than a shortfall: "20" and "201" are different
+    numbers, so `ComfyUI_00201_.png` is a different picture and substituting it
+    would hand the model an image it never asked for. It gets a teaching error
+    naming the real files instead.
+    """
+    from PIL import Image
+    for n in ("ComfyUI_00428_.png", "ComfyUI_00201_.png"):
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(tmp_path / n)
+
+    out = tools.run_tool(
+        "view_images",
+        {"paths": [str(tmp_path / "Comfy_UI_428.png"),
+                   str(tmp_path / "ComfyUI__20_.png")]},
+        {"workspace": str(tmp_path), "has_vision": True})
+    assert out.startswith(tools.IMAGE_SENTINEL)
+    body = out[len(tools.IMAGE_SENTINEL):].split("\x00")[0]
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    assert len(lines) == 1, body
+    assert lines[0].endswith("ComfyUI_00428_.png")
+    # the wrong-number guess is skipped, taught, not silently satisfied
+    assert "ComfyUI_00201_.png" not in body
+    assert "ComfyUI_00201_.png" in out
+
+
 def test_view_images_can_sample_a_folder_without_paths(tmp_path):
     # the model itself worked out it cannot copy 20 exact filenames across
     # turns; `folder` lets it skip the copying entirely

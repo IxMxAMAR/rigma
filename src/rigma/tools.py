@@ -77,6 +77,62 @@ _LIST_MAX = 200          # above this, summarise a folder instead of dumping nam
 _FUZZY_NOTES: list = []  # filename corrections made during the current call
 
 
+# --- tool tiers --------------------------------------------------------------
+#
+# An autonomous Run used to advertise every permitted tool: 32 schemas, 16,490
+# chars (~4,100 tok) — 14.6% of a 32K window before the mission, the run-state
+# block, or one message of history (measured 2026-09-20 on the reference
+# machine, `rigma.plan`-independent: json.dumps(tool_specs(...))).
+#
+# The bytes are spread thin rather than concentrated — the largest single tool
+# is 794 chars and 20 of the 32 are under 450 — so the saving comes from
+# dropping the tail, not from shrinking any one schema.
+#
+#   core        the loop cannot do work without it
+#   extended    earns its place on a task that is not most tasks
+#   specialist  one narrow job, or a near-duplicate of a broader tool
+#
+# A tier decides ONLY what is advertised. It is never a permission: `use_tools`
+# pulls any permitted tool back on request, and the run loop keeps the unlock
+# for the rest of the run (see serve.py), so a wrong guess costs one step.
+TIERS = ("core", "extended", "specialist")
+_TIER: dict[str, str] = {
+    # near-duplicates of a broader tool: view_images already takes a list of one
+    "view_image": "specialist",
+    # one narrow job each
+    "calculator": "specialist",
+    "current_datetime": "specialist",
+    "system_info": "specialist",
+    "start_job": "specialist",
+    "job_output": "specialist",
+    "kill_job": "specialist",
+    "remember": "specialist",
+    "recall": "specialist",
+    "ask_gemini": "specialist",
+    "http_request": "specialist",
+    # real work, but only for that kind of mission
+    "web_search": "extended",
+    "fetch_url": "extended",
+    "move_files": "extended",
+    "copy_files": "extended",
+    "search_my_documents": "extended",
+}
+
+
+def tier_of(name: str) -> str:
+    """The tier a tool is advertised under. Unknown names are core, so a tool
+    added without a tier lands in the always-on set rather than silently
+    vanishing from every focused surface."""
+    return _TIER.get(name, "core")
+
+
+# `use_tools` is advertised ONLY on a focused surface, where it is the way back
+# to everything the tier table held back. Execution needs the live run (it
+# persists the unlock), so it routes to serve.py on this sentinel — the same
+# shape DELEGATE_SENTINEL uses.
+USE_TOOLS_SENTINEL = "\x00__RIGMA_USE_TOOLS__\x00"
+
+
 def sanitize_schema(schema: dict) -> dict:
     """Normalise a tool's JSON Schema into shapes llama.cpp's GBNF converter
     accepts. Cloud APIs silently tolerate these; llama.cpp can reject the whole
@@ -116,7 +172,8 @@ def sanitize_schema(schema: dict) -> dict:
 def tool_specs(allow_code: bool = False, has_rag: bool = False,
                workspace: str | None = None, has_vision: bool = False,
                has_run: bool = False, profile: str = "all",
-               builder_only: bool = False) -> list[dict]:
+               builder_only: bool = False, surface: str = "all",
+               unlocked: list | None = None) -> list[dict]:
     """OpenAI-format tool definitions to hand the model, filtered to what this
     session/run actually permits.
 
@@ -124,10 +181,26 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
     tools and NOTHING else. Withholding the rest is the safety property --
     the model there cannot wander into write_file because write_file is not
     on the wire, not because a prompt asked it not to.
+
+    `surface` decides how much of the PERMITTED set is advertised:
+
+      "all"      every permitted tool (the historical behaviour, and still the
+                 default everywhere so nothing changes until it is asked for)
+      "focused"  core tier only, plus `use_tools` to pull the rest back
+
+    `unlocked` names tools a focused surface must advertise anyway — the
+    session's accumulated `use_tools` requests. It can only ADD to the
+    permitted set, never past it: a name that permission already filtered out
+    stays out, because a tier table is not a permission and neither is this.
     """
+    unlocked_set = set(unlocked or ())
     out = []
     for t in _REGISTRY.values():
         if builder_only != (t.needs == "method_builder"):
+            continue
+        # `use_tools` exists only to widen a focused surface; on a full one it
+        # would be a tool whose whole job is already done.
+        if t.name == "use_tools" and surface != "focused":
             continue
         if t.needs == "code" and not allow_code:
             continue
@@ -142,6 +215,9 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
         if profile == "no-network" and t.name in _NETWORK_TOOLS:
             continue
         if profile == "confined" and t.kind == "exec":
+            continue
+        if (surface == "focused" and tier_of(t.name) != "core"
+                and t.name not in unlocked_set):
             continue
         out.append({"type": "function", "function": {
             "name": t.name, "description": t.description,
@@ -162,6 +238,37 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
         except Exception:
             pass          # MCP is never load-bearing for the built-ins
     return out
+
+
+def lockable_names(allow_code: bool = False, has_rag: bool = False,
+                   workspace: str | None = None, has_vision: bool = False,
+                   has_run: bool = False, profile: str = "all",
+                   builder_only: bool = False) -> set[str]:
+    """Every name a focused surface is allowed to unlock.
+
+    Derived from the SAME permission filters as `tool_specs(surface="all")` and
+    not from the tier table, so `use_tools` can never reach a tool this session
+    was not going to get anyway. One source of truth for the permission rules.
+    """
+    return {s["function"]["name"] for s in tool_specs(
+        allow_code=allow_code, has_rag=has_rag, workspace=workspace,
+        has_vision=has_vision, has_run=has_run, profile=profile,
+        builder_only=builder_only)} - {"use_tools"}
+
+
+def describe_tools(names) -> list[tuple[str, str]]:
+    """(name, one-line description) for the named tools, in the order asked.
+
+    Used by `use_tools` to say what is held back without dumping a full schema
+    — a weak model told about six tools briefly chooses better than one handed
+    six more JSON objects.
+    """
+    rows = []
+    for n in names:
+        t = _REGISTRY.get(str(n))
+        if t is not None:
+            rows.append((t.name, " ".join(t.description.split())))
+    return rows
 
 
 _XML_CALL = re.compile(r"<function=([\w.-]+)>(.*?)(?:</function>|$)", re.S)
@@ -876,6 +983,29 @@ def _ask_gemini(args, ctx):
 DELEGATE_SENTINEL = "\x00__RIGMA_DELEGATE__\x00"
 
 
+@tool("use_tools",
+      "Get MORE tools for this session, by name. A few tools are held back to "
+      "keep this list short — ask for what you need and they are available "
+      "from your NEXT step. Call it when the tool you want is not in your "
+      "list. Pass help='list' to see every tool you are allowed to unlock.",
+      {"type": "object", "properties": {
+          "names": {"type": "array", "items": {"type": "string"},
+                    "description": "tool names to unlock, e.g. ['view_image']"},
+          "help": {"type": "string",
+                   "description": "pass 'list' to list what is unlockable"}},
+       "required": []})
+def _use_tools(args, ctx):
+    # Execution needs the live session (it persists the unlock beyond this
+    # turn), so serve.py intercepts on the sentinel. Returning the payload from
+    # the handler keeps every non-serve caller -- tests, cached_run -- safe.
+    names = args.get("names") or []
+    if isinstance(names, str):
+        names = [names]
+    return USE_TOOLS_SENTINEL + json.dumps(
+        {"names": [str(n) for n in names],
+         "help": str(args.get("help", "") or "")})
+
+
 @tool("delegate",
       "Hand a research question to a helper agent with a FRESH context. The "
       "helper explores files/folders itself and returns one short answer, so "
@@ -1045,11 +1175,27 @@ def _ask_user(args, ctx):
 
 # ---- gated tools (filesystem + code) ----------------------------------------
 
+def _numbers_in(name: str) -> list[str]:
+    """The digit runs in a filename, with zero padding removed.
+
+    `ComfyUI_00428_.png` and `Comfy_UI_428.png` both give ["428"], which is what
+    makes them the same file to a human and to `norm` below."""
+    return [d.lstrip("0") or "0" for d in re.findall(r"\d+", name)]
+
+
 def _fuzzy_file(p: Path):
     """Recover a near-miss filename. Weak models retype paths from memory and
     mangle them — dropping zero padding is the classic one, because digit runs
     tokenize awkwardly (ComfyUI_00428_.png -> Comfy_UI_428.png). The file it
-    meant is unambiguous, so use it and say what we did. Returns (path, note)."""
+    meant is unambiguous, so use it and say what we did. Returns (path, note).
+
+    A candidate with DIFFERENT NUMBERS is never substituted. "Close enough" by
+    string similarity is how `ComfyUI_00010_.png` resolved to
+    `ComfyUI_00501_.webp` on a real 6,000-file folder (measured 2026-09-20 by
+    replaying recorded runs) — and for an image, silently handing back the wrong
+    picture is worse than an error, because the model then describes it
+    confidently. Punctuation, spacing and zero padding may differ; the numbers
+    may not."""
     if p.exists():
         return p, ""
     parent = p.parent
@@ -1061,15 +1207,55 @@ def _fuzzy_file(p: Path):
         return re.sub(r"(?<![0-9])0+(?=[0-9])", "", s)   # 00428 -> 428
 
     want = norm(p.name)
+    want_nums = _numbers_in(p.name)
     names = [x.name for x in parent.iterdir() if x.is_file()]
     for n in names:                       # exact match ignoring case/pad/punct
         if norm(n) == want:
             return parent / n, f" (you asked for '{p.name}' — used '{n}')"
     import difflib
-    close = difflib.get_close_matches(p.name, names, n=1, cutoff=0.8)
+    # Only names that agree on every number. Without this the similarity
+    # fallback happily crosses between different images in a numbered series.
+    same_num = [n for n in names if _numbers_in(n) == want_nums]
+    close = difflib.get_close_matches(p.name, same_num, n=1, cutoff=0.8)
     if close:
         return parent / close[0], f" (you asked for '{p.name}' — used '{close[0]}')"
     return None, ""
+
+
+def _candidates(p: Path, n: int = 5) -> str:
+    """The closest real names in p's parent, for an error that TEACHES instead
+    of repeating 'no such file'.
+
+    A bare "no such file" is what makes a weak model guess again: it has no way
+    to recover the exact spelling it just got wrong, so it emits a second
+    near-miss and burns another turn. Naming what is actually there ends the
+    loop in one step. Live evidence, 2026-07-19 run: `Comfy *(173).png`,
+    `Comfy_UI_428.png` and `ComfyUI__20_.png` in consecutive turns, each one a
+    fresh guess at a file that was sitting in the folder the whole time.
+
+    Read-only and bounded: it lists names of FILES in a directory that must
+    already exist, and never resolves or opens anything."""
+    import difflib
+    parent = p.parent
+    try:
+        if not parent.is_dir():
+            return ""
+        names = sorted(x.name for x in parent.iterdir() if x.is_file())
+    except OSError:
+        return ""
+    if not names:
+        return ""
+    close = difflib.get_close_matches(p.name, names, n=n, cutoff=0.4)
+    if close:
+        return (" Closest names actually in that folder: "
+                + ", ".join(f"'{c}'" for c in close) + ".")
+    # Nothing is close enough to be "the one it meant" — but showing a few real
+    # names still ends the guessing loop, because the model can copy a spelling
+    # instead of inventing a fourth variation of it.
+    shown = names[:n]
+    tail = "" if len(names) <= n else f" (+{len(names) - n} more)"
+    return (" No close match; files in that folder start: "
+            + ", ".join(f"'{c}'" for c in shown) + tail + ".")
 
 
 # characters that are illegal in a Windows filename and are never what a model
@@ -2454,19 +2640,29 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
     ps = str(ps).strip().strip('"').strip("'")
     if not ps:
         return None, "empty path"
-    if _is_abs_anyos(ps) and not Path(ps).exists():
-        return None, f"no such file: {ps}"
     p = Path(ps)
     if not p.is_absolute():
+        if _is_abs_anyos(ps):
+            # A Windows-style absolute path on a host that cannot open it
+            # (CI on POSIX). There is no such directory here to repair against.
+            return None, f"no such file: {ps}"
         try:
             p = _ws_path(ctx, ps)
         except ValueError as e:
             return None, str(e)
     if not p.is_file():
-        # a mangled filename is the model's memory failing, not a missing file
-        p, note = _fuzzy_file(p)
-        if p is None:
-            return None, f"no such file: {ps}"
+        # A mangled filename is the model's memory failing, not a missing file
+        # — and this repair has to run for ABSOLUTE paths too. The early return
+        # that used to sit above skipped it for every absolute path, which is
+        # exactly where missions live ("go through D:\Good Stuff"): the
+        # 2026-07-19 run failed 6 of its 18 view_images calls on mangled D:\...
+        # names that _fuzzy_file resolves in one step. _fuzzy_file only ever
+        # returns a file inside p.parent, so an absolute path stays in its own
+        # directory and no confinement is lost.
+        found, note = _fuzzy_file(p)
+        if found is None:
+            return None, f"no such file: {ps}" + _candidates(p)
+        p = found
         _FUZZY_NOTES.append(note)
     if p.suffix.lower() not in _IMAGE_EXTS:
         return None, f"{p.name} is not an image"
