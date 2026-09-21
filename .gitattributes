@@ -1,0 +1,23 @@
+# Byte-exact fixtures.
+#
+# `tests/test_prompt_sections.py` compares `tests/golden/agent_system_prompt.txt`
+# against the assembled system prompt BYTE for byte — that is the whole point of
+# the file, which exists to prove the section split was a refactor and not a
+# rewrite. It reads with `newline=""` specifically so no platform's line-ending
+# opinion can reach the comparison.
+#
+# That was not enough. With `core.autocrlf=true` (the Git for Windows default,
+# and what the Windows CI runner checks out with) the LF blob is written to the
+# working copy as CRLF, the golden read then ends every line with `\r`, and the
+# comparison fails — on Windows only, and only from a fresh checkout. It passed
+# on the development machine by accident, because the working copy there happened
+# to hold LF from a tool that wrote it rather than from git.
+#
+# So the checkout is pinned instead of the reader. `eol=lf` makes the working
+# copy LF on every platform, which is what the prompt actually contains.
+#
+# `-text` would be stronger still (no conversion at all), but it also tells git
+# the file is binary, which costs readable diffs on a file whose diffs are the
+# interesting part — this is a prompt, and a change to it is a model-behaviour
+# change someone will want to review.
+tests/golden/** text eol=lf
