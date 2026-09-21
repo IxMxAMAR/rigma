@@ -73,6 +73,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from collections import deque
 from collections.abc import Iterator
@@ -238,6 +239,89 @@ def ensure_agents_md() -> None:
         path.write_text(_AGENTS_MD, encoding="utf-8")
     except OSError:
         pass            # a note that cannot be written is not a failed turn
+
+
+def _mcp_spec(cwd: str) -> dict:
+    """How mcode should launch Rigma's MCP server.
+
+    `sys.executable`, never a bare `python`: the server imports Rigma, and the
+    interpreter that has Rigma installed is the one already running this.
+    """
+    from .runtime import rigma_home
+
+    env = {"RIGMA_HOME": str(rigma_home())}
+    if cwd:
+        # Passed, not guessed. A tool that silently operated on the wrong
+        # directory would be worse than one that refused.
+        env["RIGMA_MCP_WORKSPACE"] = str(cwd)
+    return {"command": sys.executable,
+            "args": ["-m", "rigma.mcp_server"],
+            "env": env}
+
+
+def ensure_mcp(cwd: str = "") -> None:
+    """Point the arm at Rigma's MCP server — or take the pointer away.
+
+    This is how Rigma's own tools reach an external agent without touching a
+    single message the agent sends to its model: MCP makes Rigma a tool
+    PROVIDER, and the arm decides whether to load it and whether to call what it
+    offers. Every other route to the same end — normalising roles, prepending a
+    prompt, editing the roster, re-running repair on the arm's calls — means
+    Rigma editing the arm's conversation.
+
+    Registered ONLY when there is something to offer. An MCP server with an
+    empty roster still costs a process launch on every turn, and paying that for
+    nothing is worse than the tool appearing a turn later than it could. The
+    check runs per turn and is one small file read.
+
+    Written into the data dir Rigma already owns. NOT passed as `--config`,
+    which REPLACES mcode's config and would drop the provider settings that make
+    the turn work at all. Other servers in the file are preserved — the file is
+    Rigma's to manage, not Rigma's to own exclusively.
+    """
+    path = data_home() / "mcp.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raw = {}
+    except (OSError, ValueError):
+        raw = {}
+    servers = raw.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+
+    try:
+        from . import rag
+        wanted = bool(rag.recorded_sidecar_port())
+    except Exception:
+        wanted = False
+
+    if wanted:
+        servers["rigma"] = _mcp_spec(cwd)
+    else:
+        servers.pop("rigma", None)
+
+    if servers:
+        raw["mcpServers"] = servers
+    else:
+        raw.pop("mcpServers", None)
+
+    if not raw and not path.exists():
+        # Nothing to say and nowhere to say it. Creating an empty file here
+        # would be a side effect with no purpose — and this runs every turn.
+        return
+
+    body = json.dumps(raw, indent=2)
+    try:
+        if path.read_text(encoding="utf-8") == body:
+            return              # already exactly right; do not touch the mtime
+    except OSError:
+        pass
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    except OSError:
+        pass            # a registration that cannot be written is not a failed turn
 
 
 def _run(argv: list[str], timeout: float) -> tuple[int, str]:
@@ -545,6 +629,7 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
         yield TurnEvent("error", why)
         return
     ensure_agents_md()
+    ensure_mcp(cwd)
 
     resume = str((state or {}).get("session_id") or "").strip()
     # Straight through from the chat's own setting. NOT validated against a

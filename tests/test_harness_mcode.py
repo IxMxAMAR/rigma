@@ -864,6 +864,109 @@ def test_continuity_survives_a_real_second_call(fake_cli, monkeypatch):
 # Rigma's one channel into the agent: the agent's OWN instruction file
 
 
+# --------------------------------------------------------------------------
+# Handing Rigma's own tools to the arm (MCP)
+
+
+def seed_docs(tmp_path):
+    """Documents are indexed — the sidecar has recorded its port."""
+    d = tmp_path / "home" / "rag"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "sidecar.json").write_text('{"port": 11699}', encoding="utf-8")
+
+
+def mcp_file(tmp_path):
+    return tmp_path / "home" / "mcode" / "mcp.json"
+
+
+def test_the_documents_tool_is_offered_only_when_there_are_documents(fake_cli,
+                                                                    tmp_path):
+    """This is the whole point of item 5: Rigma's own tool reaching an external
+    agent WITHOUT Rigma touching a message the agent sends to its model. MCP
+    makes Rigma a tool PROVIDER; the arm decides whether to call it."""
+    harness_mcode.ensure_mcp(str(tmp_path))
+    assert not mcp_file(tmp_path).exists(), "nothing to offer, nothing to register"
+
+    seed_docs(tmp_path)
+    harness_mcode.ensure_mcp(str(tmp_path))
+    entry = json.loads(mcp_file(tmp_path).read_text(encoding="utf-8"))
+    assert "rigma" in entry["mcpServers"]
+
+
+def test_the_registration_points_at_rigmas_own_interpreter(fake_cli, tmp_path):
+    """A bare `python` would be whatever the arm's PATH resolves to. The server
+    imports Rigma, and the interpreter that has Rigma installed is the one
+    already running this."""
+    seed_docs(tmp_path)
+    harness_mcode.ensure_mcp(r"C:\work")
+    spec = json.loads(mcp_file(tmp_path).read_text(encoding="utf-8"))["mcpServers"]["rigma"]
+    assert spec["command"] == sys.executable
+    assert spec["args"] == ["-m", "rigma.mcp_server"]
+    # passed, not guessed: a tool on the wrong directory is worse than a refusal
+    assert spec["env"]["RIGMA_MCP_WORKSPACE"] == r"C:\work"
+    assert spec["env"]["RIGMA_HOME"] == str(tmp_path / "home")
+
+
+def test_the_registration_is_taken_away_when_there_is_nothing_to_offer(
+        fake_cli, tmp_path):
+    """An MCP server with an empty roster still costs a process launch on every
+    turn. Leaving the pointer behind would pay that for nothing."""
+    seed_docs(tmp_path)
+    harness_mcode.ensure_mcp(str(tmp_path))
+    (tmp_path / "home" / "rag" / "sidecar.json").unlink()
+    harness_mcode.ensure_mcp(str(tmp_path))
+    left = json.loads(mcp_file(tmp_path).read_text(encoding="utf-8"))
+    assert "rigma" not in (left.get("mcpServers") or {})
+
+
+def test_another_mcp_server_in_the_file_is_left_alone(fake_cli, tmp_path):
+    """The file is Rigma's to MANAGE, not Rigma's to own exclusively — it is the
+    same `mcpServers` notation the client side reads, so a user may well have put
+    their own server there."""
+    mcp_file(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    mcp_file(tmp_path).write_text(json.dumps({"mcpServers": {
+        "theirs": {"command": "npx", "args": ["-y", "something"]}}}),
+        encoding="utf-8")
+    seed_docs(tmp_path)
+    harness_mcode.ensure_mcp(str(tmp_path))
+    entry = json.loads(mcp_file(tmp_path).read_text(encoding="utf-8"))
+    assert entry["mcpServers"]["theirs"]["command"] == "npx"
+    assert "rigma" in entry["mcpServers"]
+
+
+def test_the_registration_is_not_rewritten_when_it_is_already_right(fake_cli,
+                                                                    tmp_path):
+    """This runs on EVERY turn, so it must not churn the file's mtime each time
+    — and it must not fight a file that is already correct."""
+    seed_docs(tmp_path)
+    harness_mcode.ensure_mcp(str(tmp_path))
+    before = mcp_file(tmp_path).stat().st_mtime_ns
+    for _ in range(3):
+        harness_mcode.ensure_mcp(str(tmp_path))
+    assert mcp_file(tmp_path).stat().st_mtime_ns == before
+
+
+def test_a_file_that_is_not_json_is_replaced_rather_than_crashing(fake_cli,
+                                                                  tmp_path):
+    """A half-written file from a killed process must cost the registration, not
+    the turn."""
+    mcp_file(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    mcp_file(tmp_path).write_text("{not json", encoding="utf-8")
+    seed_docs(tmp_path)
+    harness_mcode.ensure_mcp(str(tmp_path))
+    assert "rigma" in json.loads(
+        mcp_file(tmp_path).read_text(encoding="utf-8"))["mcpServers"]
+
+
+def test_a_turn_registers_the_server(fake_cli, tmp_path):
+    """The hook is `drive_turn`, so the registration cannot be something a
+    caller has to remember."""
+    seed_docs(tmp_path)
+    _one_turn()
+    assert "rigma" in json.loads(
+        mcp_file(tmp_path).read_text(encoding="utf-8"))["mcpServers"]
+
+
 def test_rigmas_note_lands_in_the_agents_own_data_dir(fake_cli, tmp_path):
     """mcode has no append/override mechanism for its prompt — no flag, no
     config key, no env var. `<dataDir>/AGENTS.md` is the documented channel, and
