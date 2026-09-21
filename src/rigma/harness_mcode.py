@@ -37,6 +37,22 @@ contract read out of it is a guess until a real turn agrees:
     before saving, and "a failed connection test saves nothing" — so the
     failure mode is a provider that is not configured, which is a far clearer
     thing to report than an account error.
+  * A SESSION SURVIVES THE PROCESS. Every event carries a `sessionId`, and
+    passing it back as `--session <id>` makes the next run continue that
+    conversation: verified 2026-09-21 across three separate processes, the
+    second and third reported `session.resumed` with the same id, and the model
+    was replayed 3, then 5, then 7 messages. This is the difference between an
+    agent and a stateless prompt — mcode's plan, its subagents and its goals all
+    live in the session, so a fresh session per turn throws away most of what it
+    is good at. Rigma stores the id per backend and hands it back, which is why
+    `drive_turn` takes a `state` dict.
+  * What mcode sends is a `developer`-role message of ~10.5k characters (its own
+    system prompt, headed `# Harness`, `# Core Judgment`, `# Communication &
+    Delivery`, `# Environment`), 18 tool schemas, and `max_completion_tokens` /
+    `reasoning_effort` rather than `max_tokens` / `temperature`. Rigma's /v1 is
+    a byte passthrough, so none of that is rewritten on the way to the engine —
+    which is the point. Anything that normalised roles here would silently
+    delete the agent's entire instruction set.
 
 THE EVENT STREAM. Each line is `{schemaVersion, sequence, timestampMs, runId,
 sessionId, turnId, type, ...}`. The types are `exec.started`,
@@ -259,18 +275,41 @@ def map_event(obj: dict, seen: dict) -> list[TurnEvent]:
     return []
 
 
+def _remember(state: dict | None, obj: dict, *, resumed: bool) -> None:
+    """Keep the backend's own handle on this conversation where Rigma can find
+    it.
+
+    Written on EVERY session event rather than only the first: a resumed run
+    reports the id it was given, and recording it again is how a backend that
+    renumbers a session still leaves the right one behind.
+    """
+    if state is None:
+        return
+    sid = str(obj.get("sessionId") or "")
+    if sid:
+        state["session_id"] = sid
+    state["resumed"] = resumed
+
+
 def drive_turn(*, base_url: str, model: str, prompt: str,
                system_prompt: str = "", session_id: str = "", cwd: str = "",
                max_tokens: int = 4096, context_window: int = 32768,
-               timeout: float = 1800.0) -> Iterator[TurnEvent]:
+               timeout: float = 1800.0, state: dict | None = None
+               ) -> Iterator[TurnEvent]:
     """Run one mcode turn and yield what happened, in Rigma's vocabulary.
 
     BLOCKING, and the caller owns the thread — the seam's contract, so a stalled
     mcode stalls a worker rather than the event loop that is streaming a chat.
 
-    `system_prompt` is accepted and IGNORED. mcode owns its own system prompt;
-    that is the trade the menu states, and quietly pasting Rigma's into the user
-    message would make the transcript describe a turn that did not happen.
+    `state`, when given, is read for the mcode session to CONTINUE and written
+    with the session this turn ran in. See the module docstring: continuity is
+    the whole reason to hand a turn to an agent rather than a prompt.
+
+    `system_prompt` is accepted and IGNORED. mcode owns its own system prompt —
+    10.5k characters of it, measured — and that is the trade the menu states.
+    Quietly pasting Rigma's into the user message would make the transcript
+    describe a turn that did not happen, and replacing the agent's instructions
+    with Rigma's would throw away the thing worth having.
     """
     exe = bin_path()
     if exe is None:
@@ -281,12 +320,15 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
         yield TurnEvent("error", why)
         return
 
+    resume = str((state or {}).get("session_id") or "").strip()
     argv = [exe, "exec", "--output-format", "stream-json",
             # headless: `smart` needs a TUI to ask, and `off` would disarm the
             # agent's tools entirely
             "--permission", "full",
             "--model", f"{PROVIDER_ID}/{model}",
             "--timeout", f"{int(timeout)}s"]
+    if resume:
+        argv += ["--session", resume]
     if cwd and Path(cwd).is_dir():
         argv += ["--cwd", cwd]
     argv.append(prompt)
@@ -327,6 +369,7 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
 
     seen: dict = {}
     failed = False
+    said = False
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -338,9 +381,37 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
                 continue            # a partial or non-JSON line is a skipped line
             if not isinstance(obj, dict):
                 continue
+            kind = obj.get("type")
+            if kind in ("session.started", "session.resumed"):
+                resumed = kind == "session.resumed"
+                _remember(state, obj, resumed=resumed)
+                if resumed:
+                    # Say it out loud. Continuity the reader cannot see is
+                    # indistinguishable from a backend that forgot everything.
+                    yield TurnEvent(
+                        "notice",
+                        text="continuing this chat's MiniMax Code session")
+                continue
+            if kind == "turn.completed" and state is not None:
+                state["usage"] = obj.get("usage") or {}
+                continue
+            if kind == "exec.completed":
+                result = obj.get("result") or {}
+                if state is not None:
+                    state["status"] = str(result.get("status") or "")
+                # The final answer, for a model that never streamed one. mcode
+                # reports it either way, and a turn that produced a reply must
+                # not come back with an empty transcript.
+                out = result.get("output")
+                if out and not said:
+                    said = True
+                    yield TurnEvent("text", str(out))
+                continue
             for ev in map_event(obj, seen):
                 if ev.kind == "error":
                     failed = True
+                elif ev.kind == "text":
+                    said = True
                 yield ev
         proc.wait(timeout=10)
     except Exception as e:          # pragma: no cover - defensive
