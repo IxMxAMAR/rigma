@@ -1,7 +1,8 @@
 // Engine room: what's loaded, how it's doing, and the levers.
 // Telemetry is mono + instant (CONSTITUTION §6: never animate data values).
 import { useCallback, useEffect, useState } from "react";
-import { engineApi, type ServerInfo, type SwitchOption } from "../lib/engineApi";
+import { engineApi, type EngineFinding, type ServerInfo,
+         type SwitchOption } from "../lib/engineApi";
 
 function uptime(startedAt: number): string {
   const s = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
@@ -34,6 +35,7 @@ export default function EngineSurface() {
   const [info, setInfo] = useState<ServerInfo | null>(null);
   const [options, setOptions] = useState<SwitchOption[]>([]);
   const [log, setLog] = useState("");
+  const [findings, setFindings] = useState<EngineFinding[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -56,6 +58,10 @@ export default function EngineSurface() {
   useEffect(() => {
     engineApi.switchOptions().then(setOptions).catch(() => setOptions([]));
     engineApi.log().then(setLog).catch(() => {});
+    // Re-read per model, because these are facts about the engine that is
+    // RUNNING: a different model is a different set of decisions.
+    engineApi.findings().then((d) => setFindings(d.findings))
+      .catch(() => setFindings([]));
   }, [info?.model]);
 
   const act = async (name: string, fn: () => Promise<unknown>) => {
@@ -100,6 +106,44 @@ export default function EngineSurface() {
       <div className="max-w-[1200px] mx-auto flex flex-col gap-5">
         {err && (
           <div className="rounded-md bg-red/10 text-red px-3 py-2 text-[13px]">{err}</div>
+        )}
+
+        {/* What the engine decided at load and never said again. These are the
+            facts where the flag being SET and the flag being IN EFFECT differ —
+            `--cache-reuse 256` is passed on every launch and refused on a hybrid
+            model, so the setting looks right and does nothing. Nothing else in
+            the app can see this: it is one WARN line in a log nobody opens. */}
+        {findings.length > 0 && (
+          <section className="rounded-lg bg-panel p-5">
+            <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-3">
+              engine decisions
+            </h3>
+            <div className="flex flex-col gap-3">
+              {findings.map((f) => (
+                <div key={f.id}
+                     className={`rounded-md px-3 py-2 ${
+                       f.severity === "warn"
+                         ? "bg-amber/10 border border-amber/30"
+                         : "bg-surface"}`}>
+                  <div className="flex items-baseline gap-2">
+                    <span className={`font-mono text-[11px] uppercase tracking-[0.08em] ${
+                      f.severity === "warn" ? "text-amber" : "text-muted"}`}>
+                      {f.severity}
+                    </span>
+                    {f.confirmed_here && (
+                      <span className="font-mono text-[10.5px] text-muted">
+                        seen on this machine
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[12.5px] mt-1">{f.message}</div>
+                  <div className="font-mono text-[11px] text-muted mt-1.5 break-all">
+                    {f.example}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
         )}
 
         <section className="rounded-lg bg-panel p-5">
