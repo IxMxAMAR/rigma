@@ -309,6 +309,11 @@ def harness(backend: str = typer.Option(None, "--backend", "-b",
                      f"found {r['version']}")
         elif r["drift"] is False:
             state = f"ok ({r['version']})"
+        elif r.get("built_in"):
+            # Rigma's own loop: shipped with Rigma, so there is no separate build
+            # it could have drifted from. "unverified" here made the built-in read
+            # as the least trustworthy option on the list, which is backwards.
+            state = "built in - this build, nothing to drift from"
         else:
             state = "unverified - no build of this has been checked"
         typer.echo(f"{r['name']:<8} {state}")

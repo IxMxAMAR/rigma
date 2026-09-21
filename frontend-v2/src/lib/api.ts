@@ -49,6 +49,10 @@ export interface HarnessInfo {
    *  checked — which is not the same as "it matches". `rigma harness` compares
    *  it with whatever is installed. */
   verified: string;
+  /** Rigma's own loop. It ships with Rigma, so it has no separate build to
+   *  drift from and the "nothing has been verified" wording would be wrong —
+   *  it made the built-in read as the least trustworthy option. */
+  built_in?: boolean;
   /** What the backend ACTUALLY is, when the caller asked for a check. Empty
    *  when nobody asked. */
   version?: string;
