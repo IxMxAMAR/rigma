@@ -594,6 +594,27 @@ def _spill_archive(sid: str, dropped: list) -> bool:
 _RUN_EXTERNAL_FIELDS = ("paused", "pending_question")
 
 
+# Fields the end-of-turn session merge takes from the FRESHLY-STORED row rather
+# than from this turn's snapshot — the session-side twin of the constant above.
+#
+# `update_session` (the PATCH endpoint) accepts every name in
+# `sessions.MUTABLE_FIELDS`, so DERIVING this from that tuple is the point. The
+# hand-written list it replaced had drifted from it and omitted use_tools,
+# allow_code, workspace, auto_compact, max_tool_rounds, one_action, method and
+# carry_reasoning — so turning code access OFF while a reply streamed was
+# silently undone by the end-of-turn write (audit F53). Deriving it means the
+# next field added to the PATCH surface is covered by construction.
+#
+# `messages` and `prefill` are excluded because the TURN owns them: messages is
+# grafted by `reload_and_extend`, and a prefill is consumed exactly once, so a
+# turn that used one must clear it even if the user set another meanwhile.
+# `archive` and `title_source` are not offered by the PATCH body but both move
+# during a turn (compaction, auto-titling), so the stored value wins for them.
+_MERGE_FROM_STORE = tuple(
+    k for k in sessions.MUTABLE_FIELDS if k not in ("messages", "prefill")
+) + ("archive", "title_source")
+
+
 def _save_run_merged(run: dict) -> None:
     """Save a run, keeping whatever landed on it while the loop was awaiting.
 
@@ -2369,11 +2390,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     out = dict(s)
                     # fields the USER can edit while a reply streams stay
                     # theirs; the rest of the session is this turn's
-                    for k in ("title", "system_prompt", "params", "notes",
-                              "digest", "preset_id", "effort", "use_rag",
-                              "authors_note", "authors_note_depth", "archive",
-                              "title_source"):
+                    for k in _MERGE_FROM_STORE:
                         out[k] = m.get(k, s.get(k))
+                    # `prefill` is the one field the turn itself owns: it is
+                    # consumed exactly once (see the persist block above), so a
+                    # turn that used one clears it even if the user set a new
+                    # one while the reply streamed.
+                    out["prefill"] = "" if prefill else m.get(
+                        "prefill", s.get("prefill"))
                     out["messages"] = _without_checkpoint(m["messages"])
                     # `unlocked_tools` is written DURING the turn, by
                     # `use_tools` (see `_unlock_tools`), through its own guarded
