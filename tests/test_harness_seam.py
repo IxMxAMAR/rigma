@@ -178,6 +178,83 @@ def test_the_api_lists_the_harnesses(monkeypatch, tmp_path):
         ["dsh", "mcode", "native"]
 
 
+def test_the_menu_does_not_pay_for_a_version_probe_it_did_not_ask_for(monkeypatch,
+                                                                     tmp_path):
+    """The plain list must stay cheap. Asking every backend what version it is
+    starts a process per backend, and the menu is wanted immediately — so drift
+    is absent unless the caller asked, and the UI asks separately."""
+    from fastapi.testclient import TestClient
+
+    from rigma import harness as seam
+    from rigma import serve
+    from rigma import state as st
+
+    called = []
+
+    def _never():
+        called.append(1)
+        raise AssertionError("conformance must not run for the plain list")
+
+    monkeypatch.setattr(seam, "conformance", _never)
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    st.write_state("m", "Q4", 11500, engine_pid=1, ui_pid=1)
+    with TestClient(serve.build_app(upstream_port=11500)) as c:
+        body = c.get("/api/harnesses").json()
+
+    assert called == []
+    assert all("drift" not in h for h in body["harnesses"])
+
+
+def test_asking_for_a_check_reports_drift_per_backend(monkeypatch, tmp_path):
+    """`check=1` is what the UI fetches second, so the owner can be told their
+    backend moved under them. `null` must survive as `null`: "I could not tell"
+    is not "it agrees", and the UI is written to treat them differently."""
+    from fastapi.testclient import TestClient
+
+    from rigma import harness as seam
+    from rigma import serve
+    from rigma import state as st
+
+    monkeypatch.setattr(seam, "conformance", lambda name=None: [
+        {"name": "mcode", "label": "MiniMax Code", "installed": True,
+         "verified": "0.5.1", "version": "0.9.9", "drift": True},
+        {"name": "dsh", "label": "DeepSeek Harness", "installed": True,
+         "verified": "0.1.6-alpha.2", "version": "", "drift": None},
+    ])
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    st.write_state("m", "Q4", 11500, engine_pid=1, ui_pid=1)
+    with TestClient(serve.build_app(upstream_port=11500)) as c:
+        body = c.get("/api/harnesses?check=1").json()
+
+    by = {h["name"]: h for h in body["harnesses"]}
+    assert by["mcode"]["drift"] is True
+    assert by["mcode"]["version"] == "0.9.9"
+    assert by["dsh"]["drift"] is None, "unknown must not collapse into 'fine'"
+    assert by["native"]["drift"] is None
+
+
+def test_a_broken_check_does_not_take_the_menu_down(monkeypatch, tmp_path):
+    """The version probe runs other people's binaries. If it explodes, the owner
+    still needs to choose a backend."""
+    from fastapi.testclient import TestClient
+
+    from rigma import harness as seam
+    from rigma import serve
+    from rigma import state as st
+
+    def _boom(name=None):
+        raise RuntimeError("probe blew up")
+
+    monkeypatch.setattr(seam, "conformance", _boom)
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    st.write_state("m", "Q4", 11500, engine_pid=1, ui_pid=1)
+    with TestClient(serve.build_app(upstream_port=11500)) as c:
+        r = c.get("/api/harnesses?check=1")
+
+    assert r.status_code == 200
+    assert {h["name"] for h in r.json()["harnesses"]} >= {"dsh", "mcode"}
+
+
 def test_the_advertised_endpoint_is_rigmas_not_the_engines(monkeypatch):
     """Every backend is pointed at RIGMA's /v1, never at llama-server's.
 

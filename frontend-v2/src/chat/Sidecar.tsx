@@ -523,9 +523,17 @@ function SamplingCard() {
   const permission = useChat((s) => s.permission);
   const setPermission = useChat((s) => s.setPermission);
   const [menu, setMenu] = useState<HarnessInfo[]>([]);
+  // The one backend that moved, if any. Only INSTALLED ones count: a backend
+  // that is not here cannot have drifted, and reporting it would be noise.
+  const drifted = menu.find((h) => h.installed && h.drift === true);
 
   useEffect(() => {
     api.listHarnesses().then((d) => setMenu(d.harnesses)).catch(() => {});
+    // Then the expensive half, in the background: which build each backend
+    // ACTUALLY is. Deliberately a second request, so a subprocess per backend
+    // delays the warning rather than the menu. A failure is silent — a check
+    // that could not run must not look like a backend that is wrong.
+    api.listHarnesses(true).then((d) => setMenu(d.harnesses)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -676,6 +684,19 @@ function SamplingCard() {
           ))}
         </select>
       </label>
+      {/* Said out loud, and only when it is TRUE. A backend that moved under us
+          is the one thing about this seam the owner cannot see any other way:
+          the turn keeps working right up until it quietly does not, and the
+          adapter was measured against a build that is no longer the one
+          installed. `null` says nothing — "I could not tell" is not "it
+          agrees", and it is not a warning either. */}
+      {drifted && (
+        <div className="rounded-md bg-amber/10 px-2 py-1 text-[11.5px] text-amber">
+          {drifted.label} is {drifted.version || "a different build"} — its
+          adapter was measured against {drifted.verified || "nothing"}. Turns
+          may still work; if one misbehaves, that is the first thing to check.
+        </div>
+      )}
       {/* Only for a chat an external agent drives: the setting is that agent's
           vocabulary, and showing it on Rigma's own loop would offer a knob that
           does nothing. Shown rather than hidden because the trade is real —
