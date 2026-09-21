@@ -87,11 +87,23 @@ class H(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             return
-        data = json.dumps({"choices": [{"message": {"content": "ok"}}],
-                           "usage": {"prompt_tokens": 2048,
-                                     "completion_tokens": 128},
-                           "timings": {"prompt_per_second": 650.0,
-                                       "predicted_per_second": 55.5}}).encode()
+        # A COMPLETE OpenAI chat completion, not the two fields a reader needs.
+        # An agent backend's `provider add --use` runs this through a strict
+        # schema before it will save and select the provider, and a thin body is
+        # rejected as "Invalid response from model provider" — which then looks
+        # like the provider being unusable rather than the fixture being short.
+        data = json.dumps({
+            "id": "chatcmpl-probe",
+            "object": "chat.completion",
+            "created": 1789990501,
+            "model": body.get("model") or "local-test",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 2048, "completion_tokens": 128,
+                      "total_tokens": 2176},
+            "timings": {"prompt_per_second": 650.0,
+                        "predicted_per_second": 55.5},
+        }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))

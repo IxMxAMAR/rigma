@@ -73,9 +73,10 @@ def test_every_backend_is_listed_with_its_honest_cost():
         assert rows[name]["wire"], name
     # `pending` is for a backend that cannot run a turn at all, and none is
     assert not any(r["pending"] for r in rows.values())
-    # mcode's real cost is not Rigma's to fix, so it has to be said out loud
-    assert any("MiniMax credential" in u
-               for u in rows[harness.MCODE]["unsupported"])
+    # mcode only stays account-free if its provider is SELECTED, and that is
+    # the one step an integrator can silently skip — so it is on the menu
+    assert "--use" in rows[harness.MCODE]["wire"]
+    assert "MiniMax login" in rows[harness.MCODE]["wire"]
 
 
 def test_installed_is_separate_from_runnable(monkeypatch):

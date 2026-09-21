@@ -21,13 +21,22 @@ contract read out of it is a guess until a real turn agrees:
   * mcode also probes `/v1/responses/input_tokens` before each turn. llama-server
     does not serve it, and a 404 is TOLERATED: verified, the turn completed with
     only the chat-completions request logged. Rigma's proxy needs no new route.
-  * THE PREREQUISITE THAT IS NOT RIGMA'S TO GIVE. `exec` refuses with
-    `auth.login_required` until SOME MiniMax credential exists — "Sign in to
-    MiniMax to use Agent features". A custom provider does NOT satisfy it. With
-    any key saved once (`mcode provider set-minimax-key`), the identical command
-    runs the turn against the LOCAL model and never contacts MiniMax. Rigma does
-    not fake that credential: it belongs to the owner's account, and a turn that
-    cannot run must say so rather than appear to work.
+  * A CUSTOM PROVIDER HAS TO BE **SELECTED**, NOT JUST ADDED — and once it is,
+    no MiniMax account is involved at all. This was got wrong first, so it is
+    written down carefully. Adding a provider without `--use` saves it and
+    leaves NO provider active; `exec` then dies with `auth.login_required`,
+    "Sign in to MiniMax to use Agent features". That message is about the
+    account status of the ACTIVE provider, not about the model — it fires even
+    when `--model` names the custom provider explicitly, which is what made it
+    look like a hard prerequisite. With `--use` (which tests the endpoint, then
+    saves AND selects) the same command runs the turn against the LOCAL model
+    with no MiniMax credential anywhere on the machine. Verified 2026-09-21
+    both ways, and the upstream README documents this: "BYOK does not require a
+    MiniMax login."
+  * The cost of that is one throwaway model call: `--use` tests the first model
+    before saving, and "a failed connection test saves nothing" — so the
+    failure mode is a provider that is not configured, which is a far clearer
+    thing to report than an account error.
 
 THE EVENT STREAM. Each line is `{schemaVersion, sequence, timestampMs, runId,
 sessionId, turnId, type, ...}`. The types are `exec.started`,
@@ -130,6 +139,15 @@ def ensure_provider(exe: str, base_url: str, model: str, context_window: int,
                     max_tokens: int) -> str:
     """Point mcode at Rigma's /v1, once. Returns "" or why it could not.
 
+    `--use` is load-bearing, not a convenience. It is what makes the custom
+    provider the ACTIVE one, and mcode's account gate reads the active
+    provider's status: a provider that is merely added leaves `exec` refusing
+    every turn with "Sign in to MiniMax", even though the model is Rigma's and
+    no MiniMax service is involved. `--use` also tests the endpoint first and
+    saves NOTHING if that test fails, so a failure here is reported as what it
+    is — the provider could not be configured — instead of surfacing later as
+    an account error.
+
     Cached in a marker file rather than re-run every turn: `provider add` is a
     separate Node process, and re-adding a name mcode already has is an error,
     not an update. A changed model means the cached provider is stale, so it is
@@ -154,6 +172,8 @@ def ensure_provider(exe: str, base_url: str, model: str, context_window: int,
         "--api-key-env", API_KEY_ENV,
         "--context-limit", str(int(context_window)),
         "--output-limit", str(int(max_tokens)),
+        # see the docstring: this is what clears mcode's account gate
+        "--use",
     ], _SETUP_TIMEOUT)
     if code != 0:
         return f"mcode provider add failed ({code}): {out.strip()[:400]}"

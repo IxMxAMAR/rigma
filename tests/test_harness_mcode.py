@@ -341,20 +341,37 @@ def test_a_missing_cli_is_reported_and_never_raised(monkeypatch, tmp_path):
 def test_a_failed_turn_surfaces_the_reason(fake_cli, monkeypatch):
     monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps(
         [_ev(1, "turn.failed", status="failed",
-             error={"category": "config",
-                    "message": "Sign in to MiniMax to use Agent features."})]))
+             error={"category": "runtime",
+                    "message": "upstream error: connection refused"})]))
     got = list(harness_mcode.drive_turn(
         base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
     assert [e.kind for e in got] == ["error"]
-    assert "Sign in to MiniMax" in got[0].text
+    assert "connection refused" in got[0].text
 
 
-def test_the_prerequisite_is_on_the_menu_not_discovered_at_the_first_turn():
-    """The MiniMax credential is the one cost Rigma cannot remove, so it is
-    stated where the choice is made."""
-    cost = " ".join(harness.BACKENDS[harness.MCODE].unsupported)
-    assert "MiniMax credential" in cost
-    assert "auth.login_required" in cost
+def test_the_provider_is_selected_not_merely_added(fake_cli):
+    """THE bug this adapter was written wrong once already.
+
+    Adding a provider without `--use` saves it and leaves NO provider active,
+    and mcode then refuses every turn with "Sign in to MiniMax to use Agent
+    features" — about the ACTIVE provider's account, even when `--model` names
+    the custom provider explicitly. That reads exactly like a hard account
+    prerequisite for a turn that never leaves this machine. `--use` selects it
+    and the gate is gone."""
+    list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="local-test", prompt="hi"))
+    add = [a for a in logged(fake_cli) if a[:2] == ["provider", "add"]][0]
+    assert "--use" in add
+    # and it is the LAST thing on the command, where `provider add` expects it
+    assert add[-1] == "--use"
+
+
+def test_the_menu_says_why_the_provider_must_be_selected():
+    """The one step an integrator can silently skip, stated where the backend
+    is chosen rather than discovered as an account error at the first turn."""
+    wire = harness.BACKENDS[harness.MCODE].wire
+    assert "--use" in wire
+    assert "MiniMax login" in wire
 
 
 def test_mcode_is_selectable_and_driven_by_its_adapter(monkeypatch, tmp_path):
