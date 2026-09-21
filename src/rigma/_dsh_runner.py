@@ -69,10 +69,42 @@ def _cli_for(home: str) -> Path | None:
     return path if path is not None and path.is_file() else None
 
 
-def _run_turn(job: dict) -> int:
-    """Import the SDK, run the turn, emit the outcome. Never raises."""
-    harness = None
-    scratch = ""
+class _Live:
+    """One SDK runtime, kept alive so the NEXT turn can continue its session.
+
+    Continuity is a property of the PROCESS, not of the session id. Measured
+    2026-09-21 against 0.1.6-alpha.2: a second `run()` on the same
+    `DeepSeekHarness` continues the session correctly — the follow-up request
+    carried the first turn's history — while a second PROCESS handed the same id
+    dies with `JsonRpcError: session "..." already exists`. So a runner that is
+    spawned per turn can never resume, and this one is not.
+    """
+
+    def __init__(self) -> None:
+        self.harness = None
+        self.key: tuple | None = None
+        self.session_id = ""
+        self.scratch = ""
+
+    def close(self) -> None:
+        if self.harness is not None:
+            try:
+                self.harness.close()
+            except Exception:
+                pass
+            self.harness = None
+        if self.scratch:
+            shutil.rmtree(self.scratch, ignore_errors=True)
+            self.scratch = ""
+
+
+def _run_turn(job: dict, live: _Live) -> int:
+    """Run one turn on the live runtime and emit the outcome. Never raises.
+
+    Returns 0 when a `done` was emitted. Anything else means this runtime is not
+    trustworthy for a second turn, and `main` exits so the parent spawns a fresh
+    one rather than writing into a broken session.
+    """
     try:
         from deepseek_harness import DeepSeekHarness, DeepSeekHarnessConfig
     except Exception as exc:
@@ -106,38 +138,49 @@ def _run_turn(job: dict) -> int:
         data_home = str(job.get("data_home") or "") or home
 
         max_tokens = int(job.get("max_tokens") or 4096)
+        context_window = int(job.get("context_window") or 32768)
         cwd = str(job.get("cwd") or "")
         if not cwd.strip() or not Path(cwd).is_dir():
-            scratch = tempfile.mkdtemp(prefix="rigma-dsh-cwd-")
-            cwd = scratch
+            # Stable for the LIFE of this runtime, not per turn: DSH keys its
+            # session directories off the cwd, so a cwd that moved between turns
+            # would put the session somewhere the next turn cannot find.
+            if not live.scratch:
+                live.scratch = tempfile.mkdtemp(prefix="rigma-dsh-cwd-")
+            cwd = live.scratch
 
-        patch = str(job.get("patch_path") or "")
-        if not patch or not Path(patch).is_file():
-            # The parent normally writes it; regenerate rather than run with the
-            # stock Anthropic protocol, which an OpenAI server cannot answer.
-            from rigma.harness_dsh import patch_file
+        # Everything that would make the running runtime WRONG for this job. The
+        # patch path is deliberately NOT part of it: it is per-turn by nature,
+        # and the patch below is regenerated here instead, once per runtime.
+        key = (home, data_home, str(job.get("base_url") or ""),
+               str(job.get("model") or ""), cwd, context_window, max_tokens)
+        if live.harness is not None and live.key != key:
+            live.close()            # a different endpoint or model: rebuild
 
-            scratch = scratch or tempfile.mkdtemp(prefix="rigma-dsh-cwd-")
-            patch = str(
-                patch_file(
-                    int(job.get("context_window") or 32768), max_tokens, scratch
-                )
+        if live.harness is None:
+            if not live.scratch:
+                live.scratch = tempfile.mkdtemp(prefix="rigma-dsh-cwd-")
+            # The parent's patch may already be gone, or may belong to a turn
+            # that is over; this runtime generates the one it will keep using.
+            patch = str(job.get("patch_path") or "")
+            if not patch or not Path(patch).is_file():
+                from rigma.harness_dsh import patch_file
+
+                patch = str(patch_file(context_window, max_tokens, live.scratch))
+            config = DeepSeekHarnessConfig(
+                profile="sdk-minimal",
+                dsh_bin=str(cli),
+                dsh_home=data_home,
+                base_url=str(job.get("base_url") or ""),
+                api_key="local",
+                model=str(job.get("model") or ""),
+                max_tokens=max_tokens,
+                cwd=cwd,
+                runtime_cwd=cwd,
+                patches=(patch,),
             )
-
-        config = DeepSeekHarnessConfig(
-            profile="sdk-minimal",
-            dsh_bin=str(cli),
-            dsh_home=data_home,
-            base_url=str(job.get("base_url") or ""),
-            api_key="local",
-            model=str(job.get("model") or ""),
-            max_tokens=max_tokens,
-            cwd=cwd,
-            runtime_cwd=cwd,
-            patches=(patch,),
-        )
-        harness = DeepSeekHarness(config)
-        harness.start()
+            live.harness = DeepSeekHarness(config)
+            live.harness.start()
+            live.key = key
 
         def on_notification(notification) -> None:
             try:
@@ -147,52 +190,58 @@ def _run_turn(job: dict) -> int:
             except Exception:
                 pass  # a progress line must never break the turn
 
-        session_id = str(job.get("session_id") or "")
-        result = harness.run(
+        # The session this runtime already owns, which is what makes the second
+        # and later turns continue instead of starting the agent from nothing.
+        result = live.harness.run(
             prompt,
-            session_id=session_id or None,
+            session_id=live.session_id or None,
             on_notification=on_notification,
         )
+        live.session_id = str(getattr(result, "session_id", "") or "") or live.session_id
         _emit(
             {
                 "type": "done",
                 "text": str(getattr(result, "final_response", "") or ""),
                 "finish_reason": str(getattr(result, "finish_reason", "") or ""),
-                # The handle for THIS conversation, so the next turn resumes it
-                # instead of starting the agent from nothing. Measured: the
-                # RunResult carries it as `session_id`, shaped
-                # `session-<32 hex>`. Without it every turn threw away the
-                # agent's plan, subagents and goals — most of what it is for.
-                "session_id": str(getattr(result, "session_id", "") or ""),
+                # Reported for the record and for the cross-process case, where
+                # it is what the NEXT process would need if the SDK ever learns
+                # to open a session it did not create.
+                "session_id": live.session_id,
             }
         )
         return 0
     except Exception as exc:
         _emit({"type": "error", "text": f"{type(exc).__name__}: {exc}"[:2000]})
         return 1
-    finally:
-        if harness is not None:
-            try:
-                harness.close()
-            except Exception:
-                pass
-        if scratch:
-            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def main() -> int:
-    raw = sys.stdin.read()
     # From here on, anything the SDK prints lands on stderr: stdout carries
     # events, and a stray print would be an unparseable line to the parent.
     sys.stdout = sys.stderr
+    live = _Live()
+    code = 0
     try:
-        job = json.loads(raw or "{}")
-        if not isinstance(job, dict):
-            raise ValueError("job must be a JSON object")
-    except Exception as exc:
-        _emit({"type": "error", "text": f"bad job on stdin: {exc}"})
-        return 1
-    return _run_turn(job)
+        for raw in sys.stdin:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                job = json.loads(line)
+                if not isinstance(job, dict):
+                    raise ValueError("job must be a JSON object")
+            except Exception as exc:
+                _emit({"type": "error", "text": f"bad job on stdin: {exc}"})
+                return 1
+            code = _run_turn(job, live)
+            if code != 0:
+                # This runtime cannot be trusted for another turn. Exit, so the
+                # parent spawns a fresh one instead of writing into a session
+                # that just failed.
+                return code
+    finally:
+        live.close()
+    return code
 
 
 if __name__ == "__main__":

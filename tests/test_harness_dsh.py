@@ -170,26 +170,33 @@ def test_a_hung_turn_times_out_and_is_killed(monkeypatch, tmp_path):
 
 def test_an_empty_done_is_never_silence(monkeypatch, tmp_path):
     """A failed model call arrives as `done` with no text. Passing that through
-    as silence would make a dead endpoint look like a turn with nothing to say."""
+    as silence would make a dead endpoint look like a turn with nothing to say.
+
+    Two turns rather than two `done` rows in one: one job is one turn now, so a
+    second `done` on the same stream belongs to the NEXT turn, not this one.
+    """
     home = _fake_home(tmp_path)
     argv = _fake_runner(
         tmp_path,
         """
         import json, sys
-        rows = [
-            {"type": "done", "text": "", "finish_reason": "error"},
-            {"type": "done", "text": "", "finish_reason": "stop"},
-        ]
-        for row in rows:
-            sys.stdout.write(json.dumps(row) + "\\n")
-        sys.stdout.flush()
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            job = json.loads(line)
+            reason = "error" if "fail" in str(job.get("prompt")) else "stop"
+            sys.stdout.write(json.dumps(
+                {"type": "done", "text": "", "finish_reason": reason}) + "\\n")
+            sys.stdout.flush()
         """,
     )
-    events = _drive(monkeypatch, argv, home)
+    failed = _drive(monkeypatch, argv, home, prompt="fail please")
+    stopped = _drive(monkeypatch, argv, home, prompt="all good")
 
-    assert [e.kind for e in events] == ["error", "notice"]
-    assert "model call failed" in events[0].text
-    assert "stop" in events[1].text
+    assert [e.kind for e in failed] == ["error"]
+    assert "model call failed" in failed[0].text
+    assert [e.kind for e in stopped] == ["notice"]
+    assert "stop" in stopped[0].text
 
 
 def test_a_runner_that_cannot_start_is_an_error_event_not_a_raise(
@@ -256,51 +263,106 @@ def test_every_adapter_takes_the_arguments_the_server_actually_passes():
     assert checked == 2
 
 
-def test_a_turn_does_not_hand_back_a_session_it_cannot_resume(monkeypatch, tmp_path):
-    """Storing a handle the next turn cannot use turns turn 2 into a hard
-    failure — measured, `JsonRpcError: session "..." already exists`. A fresh
-    turn that answers beats a resuming turn that dies."""
+@pytest.fixture(autouse=True)
+def _clean_pool():
+    """The runner pool is module-level and deliberately long-lived, so no test
+    may inherit one. Every entry is a live Node child."""
+    harness_dsh._reap_all()
+    yield
+    harness_dsh._reap_all()
+
+
+_ECHO_PID = """
+    import json, os, sys
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        sys.stdout.write(json.dumps(
+            {"type": "done", "text": str(os.getpid()),
+             "finish_reason": "completed"}) + "\\n")
+        sys.stdout.flush()
+    """
+
+
+def test_the_runner_outlives_a_turn_so_a_session_can_be_continued(
+        monkeypatch, tmp_path):
+    """Continuity is a property of the PROCESS, not of a session id.
+
+    Measured: a second `run()` on one harness continues the session and carries
+    the history, while a second PROCESS handed the same id dies with
+    `JsonRpcError: session "..." already exists`. So the same chat MUST get the
+    same runner — this is the whole mechanism, and the pid is the proof.
+    """
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(tmp_path, _ECHO_PID)
+
+    first = _drive(monkeypatch, argv, home, session_id="chat-1")
+    second = _drive(monkeypatch, argv, home, session_id="chat-1")
+
+    assert first[0].text == second[0].text, "same chat must reuse the same runner"
+
+
+def test_a_different_chat_gets_its_own_runner(monkeypatch, tmp_path):
+    """Two conversations must not share one agent — that would put one chat's
+    history in front of the other's model."""
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(tmp_path, _ECHO_PID)
+
+    one = _drive(monkeypatch, argv, home, session_id="chat-1")
+    two = _drive(monkeypatch, argv, home, session_id="chat-2")
+
+    assert one[0].text != two[0].text
+
+
+def test_a_changed_model_does_not_reuse_the_runner(monkeypatch, tmp_path):
+    """A runner is built for one endpoint and model. Reusing it after either
+    changed would quietly answer from the wrong one."""
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(tmp_path, _ECHO_PID)
+
+    one = _drive(monkeypatch, argv, home, session_id="chat-1", model="a")
+    two = _drive(monkeypatch, argv, home, session_id="chat-1", model="b")
+
+    assert one[0].text != two[0].text
+
+
+def test_a_turn_that_does_not_finish_is_dropped_from_the_pool(monkeypatch, tmp_path):
+    """A killed child or a session mid-prompt is not a runtime to write into
+    again. Dropping it means the next turn starts clean instead of inheriting
+    the wreckage."""
     home = _fake_home(tmp_path)
     argv = _fake_runner(
         tmp_path,
         """
-        import json, sys
-        sys.stdout.write(json.dumps(
-            {"type": "done", "text": "hi", "finish_reason": "completed",
-             "session_id": "session-abc123"}) + "\\n")
+        import sys
+        sys.stdout.write('{"type": "notice", "text": "working"}\\n')
         sys.stdout.flush()
+        sys.exit(3)
         """,
     )
-    hstate = {"session_id": ""}
-    events = _drive(monkeypatch, argv, home, state=hstate)
+    events = _drive(monkeypatch, argv, home, session_id="chat-x", timeout=10)
 
-    assert [e.kind for e in events] == ["text"]
-    assert hstate["session_id"] == "", "no resume, so no handle to store"
+    assert events[-1].kind == "error"
+    assert "chat-x" not in harness_dsh._pool
 
 
-def test_a_handle_is_used_and_stored_once_the_sdk_can_resume(monkeypatch, tmp_path):
-    """The other half: with CAN_RESUME on, the handle round-trips. This is the
-    one-line flip the constant exists for, so it is pinned rather than assumed."""
+def test_a_finished_turn_stays_in_the_pool(monkeypatch, tmp_path):
+    """The other half of the same rule, so the drop above is not just 'always
+    drop' — which would pass its test and break continuity entirely."""
     home = _fake_home(tmp_path)
-    argv = _fake_runner(
-        tmp_path,
-        """
-        import json, sys
-        job = json.loads(sys.stdin.readline())
-        sys.stdout.write(json.dumps(
-            {"type": "done", "text": job.get("session_id") or "none",
-             "finish_reason": "completed", "session_id": "session-abc123"}) + "\\n")
-        sys.stdout.flush()
-        """,
-    )
-    monkeypatch.setattr(harness_dsh, "CAN_RESUME", True)
-    hstate = {"session_id": "session-previous"}
-    events = _drive(monkeypatch, argv, home, state=hstate)
+    argv = _fake_runner(tmp_path, _ECHO_PID)
+    _drive(monkeypatch, argv, home, session_id="chat-y")
+    assert "chat-y" in harness_dsh._pool
 
-    # the id was READ from state and passed to the runner...
-    assert events[0].text == "session-previous"
-    # ...and the new one was written back
-    assert hstate["session_id"] == "session-abc123"
+
+def test_the_pool_is_bounded(monkeypatch, tmp_path):
+    """It is a long-lived server process, so an unbounded pool is an unbounded
+    number of Node children."""
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(tmp_path, _ECHO_PID)
+    for i in range(harness_dsh._POOL_MAX + 2):
+        _drive(monkeypatch, argv, home, session_id=f"chat-{i}")
+    assert len(harness_dsh._pool) <= harness_dsh._POOL_MAX
 
 
 def test_a_stop_is_a_notice_not_a_failure(monkeypatch, tmp_path):

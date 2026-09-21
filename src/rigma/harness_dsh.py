@@ -20,13 +20,12 @@ on the child's stdout, so a malformed line is a skipped line and never a crash.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import queue
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
@@ -81,30 +80,24 @@ def available() -> bool:
 # says unknown rather than implying fine.
 VERIFIED = "0.1.6-alpha.2"
 
-# Whether a DSH session can be CONTINUED across Rigma's turns. Measured
-# 2026-09-21 against 0.1.6-alpha.2, and the answer is no — not through the Python
-# SDK, which is the only thing this adapter has:
+# Whether DSH continuity needs anything from Rigma's `state` dict. It does not,
+# and the reason is worth recording because the obvious design is the wrong one.
 #
-#   * `RunResult.session_id` DOES exist (`session-<32 hex>`), and a SECOND
-#     `run()` on the SAME `DeepSeekHarness` instance resumes correctly — the
-#     follow-up request carried the first turn's history, verified from the wire.
-#   * A second PROCESS given that id dies with
-#     `JsonRpcError: session "..." already exists`.
+# Measured 2026-09-21 against 0.1.6-alpha.2: `RunResult.session_id` exists, but a
+# session can only be continued by the PROCESS that created it. A second `run()`
+# on one harness resumes correctly — the follow-up request carried the first
+# turn's history, verified from the wire — while a second PROCESS handed that id
+# dies with `JsonRpcError: session "..." already exists`. The cause is upstream:
+# the SDK's server resolves a session from an IN-MEMORY map and only on a miss
+# calls `agents.create`, which refuses an id already on disk
+# (`packages/sdk/server/src/server.ts`, `getOrCreateSession`). The TypeScript
+# layer has a real resume and the CLI exposes it as `--session-id`, but
+# `DeepSeekHarnessConfig` has no field for it.
 #
-# The cause is upstream and precise: the SDK's server resolves a session from an
-# IN-MEMORY map and only on a miss calls `agents.create`, which refuses an id
-# already on disk (`packages/sdk/server/src/server.ts`, `getOrCreateSession`).
-# The TypeScript layer HAS a real resume (`agents.resume` with `resumeSessionId`,
-# `packages/core/agent-loop/src/index.ts`) and the CLI exposes it as
-# `--session-id` (`packages/bundle/headless/src/index.ts`) — but
-# `DeepSeekHarnessConfig` has no field for it, so nothing here can reach it.
-#
-# So the handle is deliberately NOT handed back. Storing one would guarantee that
-# every turn after the first fails, which is strictly worse than starting fresh:
-# a turn that dies teaches the model nothing, while a fresh turn still answers.
-# Flip this to True — the two call sites below are the whole change — once the
-# SDK can resume, or once the runner outlives a turn instead of being spawned
-# per turn. Continuity is the one arm capability DSH does not yet have.
+# So continuity is a property of the PROCESS, and the fix is a pooled runner that
+# outlives a turn (see `_pool` below) rather than a handle in `state`. Storing the
+# handle instead would guarantee that every turn after the first fails, which is
+# strictly worse than starting fresh: a turn that dies teaches the model nothing.
 CAN_RESUME = False
 
 
@@ -310,15 +303,6 @@ def _read_events(state: _Run, timeout: float) -> Iterator[TurnEvent]:
             continue
         if str(payload.get("type") or "").strip().lower() == "done":
             state.done = True
-            # Hand the conversation handle back to the caller — but ONLY when
-            # the next turn could actually use it. See CAN_RESUME: storing one
-            # that cannot be resumed makes the next turn die with `already
-            # exists`, so not storing it is the difference between a turn that
-            # starts fresh and a turn that fails.
-            if state.hstate is not None and CAN_RESUME:
-                sid = str(payload.get("session_id") or "").strip()
-                if sid:
-                    state.hstate["session_id"] = sid
             text = str(payload.get("text") or "")
             reason = str(payload.get("finish_reason") or "")
             if text:
@@ -337,13 +321,15 @@ def _read_events(state: _Run, timeout: float) -> Iterator[TurnEvent]:
                     kind="notice",
                     text=f"DSH finished with reason {reason or 'unknown'} and no reply text",
                 )
-            continue
+            # The turn is OVER. Return rather than continue: the runtime stays up
+            # for the next turn, so waiting for more lines here would spin until
+            # the deadline and report a timeout on a turn that had already
+            # answered — which is exactly what a pooled runner did before this.
+            return
         event = _event_for(payload)
         if event is not None:
             yield event
 
-    if state.done:
-        return
     if state.cancel is not None and state.cancel.is_set():
         # A stop is a NOTICE, not a failure. The person who pressed stop does not
         # need to be told their own action failed, and reporting it as an error
@@ -394,6 +380,101 @@ def _stop(state: _Run) -> None:
                 pass
 
 
+# -- keeping a runtime alive between turns ------------------------------------
+#
+# A DSH session can only be continued by the PROCESS that created it. Measured
+# 2026-09-21 against 0.1.6-alpha.2: a second `run()` on one harness resumes and
+# the follow-up request carries the first turn's history, while a second PROCESS
+# handed the same id dies with `JsonRpcError: session "..." already exists`.
+# So the runner is NOT spawned per turn — it is pooled per Rigma chat session and
+# fed one job per turn, which is what makes continuity exist at all.
+#
+# Bounded, and every entry is killed at interpreter exit: a leaked entry is a
+# leaked Node child, and this is a long-lived server process.
+
+_POOL_MAX = 4
+_pool: dict[str, "_Live"] = {}
+_pool_lock = threading.Lock()
+
+
+class _Live:
+    """A runner process, its reader threads, and the config it was built for."""
+
+    def __init__(self, proc: subprocess.Popen, run: "_Run", key: tuple) -> None:
+        self.proc = proc
+        self.run = run
+        self.key = key
+        # One runtime speaks one NDJSON stream. Two turns writing into it at once
+        # would interleave jobs and replies into a stream neither could parse, so
+        # the second waits. Rigma turns a session one at a time, so this should
+        # never contend — it is here because the failure it prevents is a
+        # corrupted stream, which is close to undiagnosable from the outside.
+        self.turn_lock = threading.Lock()
+
+
+def _kill(live: "_Live") -> None:
+    live.run.hard = True      # kill the tree; do not wait for a graceful exit
+    _stop(live.run)
+
+
+def _reap_all() -> None:
+    with _pool_lock:
+        lives = list(_pool.values())
+        _pool.clear()
+    for live in lives:
+        _kill(live)
+
+
+atexit.register(_reap_all)
+
+
+def _drop(pkey: str) -> None:
+    with _pool_lock:
+        live = _pool.pop(pkey, None)
+    if live is not None:
+        _kill(live)
+
+
+def _take(pkey: str, key: tuple) -> "_Live | None":
+    """The pooled runner for this chat, if it is alive AND still right for us."""
+    with _pool_lock:
+        live = _pool.get(pkey)
+    if live is None:
+        return None
+    if live.key != key or live.proc.poll() is not None:
+        _drop(pkey)          # wrong endpoint, or dead: not reusable
+        return None
+    return live
+
+
+def _spawn(pkey: str, key: tuple, env: dict) -> "_Live":
+    run = _Run()
+    run.proc = subprocess.Popen(
+        _runner_argv(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+    )
+    _start_readers(run)
+    live = _Live(run.proc, run, key)
+    evicted: list[_Live] = []
+    with _pool_lock:
+        while len(_pool) >= _POOL_MAX:
+            victim = next(iter(_pool), None)   # oldest first
+            if victim is None:
+                break
+            evicted.append(_pool.pop(victim))
+        _pool[pkey] = live
+    for old in evicted:
+        _kill(old)                 # killed outside the lock, never held across it
+    return live
+
+
 def drive_turn(
     *,
     base_url: str,
@@ -435,9 +516,6 @@ def drive_turn(
     killing the process is the only stop that arrives promptly. Verified against
     the real CLI 0.1.6-alpha.2: a cancel at 0.25s returned at 0.35s.
     """
-    hstate = state          # the caller's dict; `state` below is this run
-    state = _Run(hstate=hstate, cancel=cancel)
-    tmpdir = ""
     try:
         root = Path(dsh_home) if dsh_home else home()
         src = root.joinpath(*_SDK_REL) if root else None
@@ -449,69 +527,75 @@ def drive_turn(
             yield TurnEvent(kind="error", text=f"DSH CLI not found under {root}")
             return
 
-        tmpdir = tempfile.mkdtemp(prefix="rigma-dsh-")
-        # Rigma's `session_id` argument is RIGMA's chat id and means nothing to
-        # DSH, whose own handles are `session-<hex>`. The backend's handle would
-        # travel in `state` — but only when it can be used, or handing it back
-        # would turn every turn after the first into a failure. See CAN_RESUME.
-        resume = ""
-        if CAN_RESUME:
-            resume = str((hstate or {}).get("session_id") or "").strip()
+        # Everything that would make a pooled runtime WRONG for this turn. The
+        # patch is deliberately absent: it is per-runtime now, not per-turn, and
+        # the runner generates and keeps its own.
+        key = (str(root), str(data_home()), str(base_url), str(model),
+               str(cwd), int(context_window), int(max_tokens))
+        # Keyed by RIGMA's chat session, because that is the conversation and the
+        # only name stable across turns. The DSH handle is not known until the
+        # first turn answers, and it is the RUNTIME that owns it, not this side —
+        # so continuity comes from reusing the process, not from passing an id.
+        pkey = str(session_id or "").strip() or f"cwd:{cwd}"
         job = {
             "base_url": base_url,
             "model": model,
             "prompt": prompt,
             "system_prompt": system_prompt,
-            "session_id": resume,
             "cwd": cwd,
             "max_tokens": int(max_tokens),
             "context_window": int(context_window),
             "dsh_home": str(root),
             "data_home": str(data_home()),
-            "patch_path": str(patch_file(context_window, max_tokens, tmpdir)),
+            "patch_path": "",       # the runner owns the patch for its lifetime
         }
         env = os.environ.copy()
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(src) + (os.pathsep + existing if existing else "")
 
-        state.proc = subprocess.Popen(
-            _runner_argv(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=env,
-        )
-        _start_readers(state)
+        live = _take(pkey, key) or _spawn(pkey, key, env)
+        run = live.run
+        run.done = False            # per-turn: the reader stops at this turn's
+        run.hard = False            # `done`, not at the runtime's first one
+        run.cancel = cancel         # so a stop is reported as a stop
+
+        # A watcher PER TURN, and it must end with the turn. The runtime is
+        # shared, so a watcher that outlived its turn would leave a thread per
+        # turn waiting on an event that will never fire again.
+        stop_watch = threading.Event()
         if cancel is not None:
             def _watch_cancel() -> None:
-                """Same shape as mcode's: wait on the event, poll only to end.
-
-                The TREE, not the runner: the SDK drives a Node child, and
-                killing the Python runner alone would leave that child running
-                with the pipes open — the read loop would never see EOF, which
-                turns a stop into a hang.
-                """
+                """The TREE, not the runner: the SDK drives a Node child, and
+                killing the Python runner alone leaves that child holding the
+                pipes open — the read loop would never see EOF, which turns a
+                stop into a hang."""
                 while not cancel.wait(0.25):
-                    if state.proc is None or state.proc.poll() is not None:
+                    if stop_watch.is_set() or live.proc.poll() is not None:
                         return
-                _harness.kill_tree(state.proc)
+                if not stop_watch.is_set():
+                    _harness.kill_tree(live.proc)
             threading.Thread(target=_watch_cancel, daemon=True).start()
+
+        live.turn_lock.acquire()
         try:
-            assert state.proc.stdin is not None
-            state.proc.stdin.write(json.dumps(job) + "\n")
-            state.proc.stdin.close()
+            assert live.proc.stdin is not None
+            live.proc.stdin.write(json.dumps(job) + "\n")
+            live.proc.stdin.flush()     # one job per LINE; the runtime stays up
         except (BrokenPipeError, OSError):
             pass  # the child died on startup; the exit path below reports why
-        yield from _read_events(state, timeout)
+        try:
+            yield from _read_events(run, timeout)
+        finally:
+            stop_watch.set()
+            # A turn that did not finish leaves the runtime in a state we cannot
+            # vouch for — a killed child, or a session mid-prompt. Drop it, so
+            # the next turn starts clean instead of writing into the wreckage.
+            # `hard` catches the timeout, which sets it before yielding its error
+            # and would otherwise leave a live child with no turn to serve.
+            if not run.done or run.hard:
+                _drop(pkey)
+            live.turn_lock.release()
     except Exception as exc:
         yield TurnEvent(
             kind="error", text=f"DSH turn could not start: {type(exc).__name__}: {exc}"
         )
-    finally:
-        _stop(state)
-        if tmpdir:
-            shutil.rmtree(tmpdir, ignore_errors=True)
