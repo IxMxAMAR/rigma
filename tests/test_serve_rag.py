@@ -53,7 +53,7 @@ def test_grounded_chat_streams_from_the_engine(client, oai_upstream,
                               default_prompt=""))
     s = c2.post("/api/sessions", json={}).json()
     c2.post(f"/api/sessions/{s['id']}", json={"use_rag": True})
-    with patch("rigma.rag.ensure_sidecar", return_value={}) as ens,          patch("rigma.rag.recorded_sidecar_port", return_value=8899):
+    with patch("rigma.rag.ensure_sidecar", return_value={}) as ens,          patch("rigma.rag.live_sidecar_port", return_value=8899):
         r = c2.post(f"/api/sessions/{s['id']}/chat", json={"message": "q"})
     assert "Hel" in r.text and "[DONE]" in r.text      # engine streamed it
     assert ens.called, "grounding must bring the sidecar up"
@@ -68,7 +68,7 @@ def test_grounded_nudge_is_in_the_system_prompt(client, oai_upstream):
                               default_prompt="be helpful"))
     s = c2.post("/api/sessions", json={}).json()
     c2.post(f"/api/sessions/{s['id']}", json={"use_rag": True})
-    with patch("rigma.rag.ensure_sidecar", return_value={}),          patch("rigma.rag.recorded_sidecar_port", return_value=8899):
+    with patch("rigma.rag.ensure_sidecar", return_value={}),          patch("rigma.rag.live_sidecar_port", return_value=8899):
         c2.post(f"/api/sessions/{s['id']}/chat", json={"message": "q"})
     body = oai_upstream.last()
     sys_msg = body["messages"][0]

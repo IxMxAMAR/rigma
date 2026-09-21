@@ -292,7 +292,7 @@ def ensure_mcp(cwd: str = "") -> None:
 
     try:
         from . import rag
-        wanted = bool(rag.recorded_sidecar_port())
+        wanted = rag.live_sidecar_port() is not None
     except Exception:
         wanted = False
 
