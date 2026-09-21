@@ -143,6 +143,68 @@ def _with_prefill(prefill: str, text: str) -> str:
     return prefill + text
 
 
+# How much room an EXTERNAL harness may take for one reply. The DSH SDK's own
+# default is 256,000 tokens, which a 32K local server rejects outright, so the
+# adapter always passes an explicit value and this is it.
+EXTERNAL_MAX_TOKENS = 4096
+
+
+def _public_port(upstream_port: int) -> int:
+    """Rigma's OWN port — the one serving the UI and the /v1 passthrough.
+
+    NOT `upstream_port`, which is llama-server. A backend pointed there talks to
+    the engine directly and bypasses Rigma: the session, the weak-model repair
+    layer and the idle-unload bookkeeping all go with it. That is the silent
+    bypass the seam exists to prevent, and it is why this exists as one function
+    instead of the same expression in two handlers.
+    """
+    return int((st.read_state() or {}).get("public_port") or 0) \
+        or upstream_port + 1
+
+
+def _turn_prompt(s: dict) -> str:
+    """The text an external backend is asked to act on: the last user message.
+
+    A content-parts message (vision) is reduced to its text parts. An external
+    backend has its own image handling or none at all, and handing it a parts
+    list it never asked for is how a turn dies on a schema error."""
+    msgs = s.get("messages") or []
+    last = msgs[-1] if msgs else None
+    if not isinstance(last, dict) or last.get("role") != "user":
+        return ""
+    content = last.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(p.get("text", "")) for p in content
+                         if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
+def _save_external_reply(sid: str, text: str, trace: list,
+                         thinking: str = "") -> None:
+    """Persist what an external backend said into RIGMA's session.
+
+    The backend owns its own transcript, so this is not the same record — this
+    is the one the rail, the export and the context meter read. Loaded fresh and
+    written under a revision guard, so a reply that took minutes cannot land on
+    top of a rename or a second turn (the AUDIT F1/F4 shape).
+    """
+    fresh = sessions.load(sid)
+    if fresh is None:
+        return                      # deleted mid-turn: never resurrect it
+    entry: dict = {"role": "assistant", "content": text}
+    if thinking:
+        entry["thinking"] = thinking
+    if trace:
+        entry["tool_trace"] = trace
+    fresh["messages"] = list(fresh.get("messages", [])) + [entry]
+    try:
+        sessions.save(fresh, base_rev=fresh[sessions.REV_KEY])
+    except sessions.StaleWriteError:
+        _log.warning("session %s moved under an external turn's write", sid)
+
+
 _COMPACT_PROMPT = (
     "Summarize this conversation transcript into a dense digest for the model "
     "to continue from. Preserve: named characters/entities and their traits, "
@@ -1439,7 +1501,101 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": "no such skill"}, status_code=404)
         return {"ok": True}
 
+    async def _external_turn(s: dict, backend):
+        """One turn driven by an EXTERNAL agent backend.
+
+        Choosing a backend means IT owns the tool surface, the system prompt and
+        its own transcript — that is the trade, and the backend's `unsupported`
+        list says so on the menu rather than after the fact. Rigma keeps the
+        MODEL: the backend is pointed at Rigma's own /v1, so the combo, the KV
+        policy and the context size that fits this machine are unchanged. And
+        Rigma keeps the rendering, so the reply lands in the same rail and the
+        same transcript as a native turn.
+
+        The backend is a SUBPROCESS doing blocking IO, so it runs in a worker
+        thread and hands events over a queue. A harness that stalls must not
+        stall Rigma's event loop — the AUDIT F16/F36 family.
+        """
+        from . import harness_dsh
+        sid = s["id"]
+        state = st.read_state() or {}
+        prompt = _turn_prompt(s) or "Continue where you left off."
+        sys_prompt = str(s.get("system_prompt") or "") or _default_prompt()
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        END = object()
+
+        def _pump() -> None:
+            """Drain the adapter on a worker thread. It never raises: a driver
+            failure comes back as an error event, so the turn still ends."""
+            try:
+                for ev in harness_dsh.drive_turn(
+                        base_url=_harness.endpoint_for(
+                            _public_port(upstream_port)),
+                        model=str(state.get("model") or ""),
+                        prompt=prompt, system_prompt=sys_prompt,
+                        session_id=sid, cwd=str(s.get("workspace") or ""),
+                        max_tokens=EXTERNAL_MAX_TOKENS,
+                        context_window=int(state.get("ctx") or 0) or 32768):
+                    loop.call_soon_threadsafe(q.put_nowait, ev)
+            except Exception as e:              # pragma: no cover - defensive
+                loop.call_soon_threadsafe(
+                    q.put_nowait, harness_dsh.TurnEvent("error", str(e)))
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, END)
+
+        yield _sse({"note": f"{backend.label} is driving this turn — it uses "
+                            "its own tools and system prompt, not Rigma's."},
+                   event="notice")
+        task = asyncio.create_task(asyncio.to_thread(_pump))
+        said: list = []
+        thought: list = []
+        trace: list = []
+        while True:
+            ev = await q.get()
+            if ev is END:
+                break
+            if ev.kind == "text":
+                said.append(ev.text)
+                yield _sse({"delta": ev.text})
+            elif ev.kind == "thinking":
+                thought.append(ev.text)
+                yield _sse({"delta": ev.text}, event="think")
+            elif ev.kind == "tool":
+                yield _sse({"id": ev.name, "name": ev.name,
+                            "args": ev.args or {}}, event="tool")
+            elif ev.kind == "tool_result":
+                yield _sse({"id": ev.name, "name": ev.name,
+                            "result": ev.text}, event="tool_result")
+                trace.append({"name": ev.name, "result": ev.text, "ok": ev.ok,
+                              "ts": _now()})
+            elif ev.kind == "notice":
+                yield _sse({"note": ev.text}, event="notice")
+            elif ev.kind == "error":
+                yield _sse({"message": ev.text}, event="error")
+        try:
+            await task                          # the pump is done; reap it
+        except Exception:
+            pass                                # it reports its own failures
+        _save_external_reply(sid, "".join(said), trace, "".join(thought))
+        yield b"data: [DONE]\n\n"
+
     async def _llm_turn(s: dict, cont: bool = False):
+        # THE HARNESS SEAM. A session can name an external agent backend; when
+        # it does, that backend owns the turn. `resolve` REFUSES rather than
+        # falling back, so a session that asked for DSH and quietly got the
+        # native loop cannot happen — the chat route already turned a refusal
+        # into a 400 before reaching here. This second call covers the paths
+        # that reach the loop WITHOUT that route: a run and a macro.
+        try:
+            _backend = _harness.resolve(s.get("harness"), port=upstream_port)
+        except _harness.HarnessError as e:
+            yield _sse({"message": str(e)}, event="error")
+            return
+        if _backend.name != _harness.NATIVE:
+            async for chunk in _external_turn(s, _backend):
+                yield chunk
+            return
         preset = presets.resolve(s.get("preset_id", ""), registry) \
             if s.get("preset_id") else None
         # Where a turn's wall clock actually goes. The owner reported ~2 minutes

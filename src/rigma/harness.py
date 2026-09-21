@@ -31,6 +31,7 @@ from __future__ import annotations
 import importlib.util
 import shutil
 from dataclasses import dataclass
+from typing import Callable
 
 NATIVE = "native"
 DSH = "dsh"
@@ -64,6 +65,10 @@ class Harness:
     unsupported: tuple[str, ...] = ()
     # why it is not runnable yet, when it is not
     pending: str = ""
+    # how to tell whether it is on this machine, when `needs` is not a module
+    # or an executable name. A backend can be present as a source checkout (DSH
+    # is), which neither `which` nor `find_spec` can see.
+    probe: "Callable[[], bool] | None" = None
 
     def as_dict(self) -> dict:
         return {"name": self.name, "label": self.label, "drives": self.drives,
@@ -80,6 +85,22 @@ _LEAVES_BEHIND = (
     "the run progress log, artifact verification and one-action-per-turn guard",
 )
 
+
+def _dsh_available() -> bool:
+    """DSH arrives as a source checkout, not as a module or a binary name.
+
+    `RIGMA_DSH_HOME` names it; the adapter also accepts the checkout this
+    project was developed against. Imported lazily so this module stays free of
+    the adapter's own imports — and DEFENSIVELY, because a probe that raises
+    would take down the whole harness menu rather than report one backend
+    missing."""
+    try:
+        from . import harness_dsh
+    except Exception:
+        return False
+    return harness_dsh.available()
+
+
 BACKENDS: dict[str, Harness] = {
     NATIVE: Harness(
         name=NATIVE,
@@ -92,29 +113,46 @@ BACKENDS: dict[str, Harness] = {
     DSH: Harness(
         name=DSH,
         label="DeepSeek Harness",
-        drives="subprocess over stdio JSON-RPC (deepseek-harness-sdk)",
-        runnable=False,
-        needs="deepseek_harness",
-        wire="a custom composition mounting @deepseek-ai/dsh-llm-pi-ai with "
-             "api: openai-completions and baseURL: <rigma>/v1",
-        unsupported=_LEAVES_BEHIND,
-        pending="the runtime backend is not implemented yet — the SDK is "
-                "pip-installable and needs no system Node, and the adapter "
-                "route is documented, but no code here drives it",
+        drives="a subprocess turn: the SDK drives the dsh CLI over stdio JSON-RPC",
+        runnable=True,
+        needs="the DeepSeek Harness checkout (set RIGMA_DSH_HOME)",
+        probe=_dsh_available,
+        # The design note had this wrong. `sdk-minimal` already mounts
+        # llm-deepseek; what it does NOT do is set `protocol`, which defaults to
+        # `messages` (Anthropic) and would POST /v1/messages at an OpenAI
+        # server. So the wire is a one-file patch, not a custom composition.
+        wire="sdk-minimal, patched to protocol: chat-completions and to a "
+             "context window that fits this machine, pointed at <rigma>/v1",
+        unsupported=_LEAVES_BEHIND + (
+            "streaming: the SDK reports a turn's text when it ENDS, so the "
+            "reply lands in one piece instead of token by token",
+            "cancel: there is no wire-level cancel, so Stop ends the "
+            "subprocess and the turn with it",
+            "the sandbox: sdk-minimal pins danger-full-access with its "
+            "workspace at the process cwd, so a confined profile does not "
+            "survive the seam",
+        ),
     ),
     MCODE: Harness(
         name=MCODE,
         label="MiniMax Code",
-        drives="subprocess over stdio (`mcode acp`), or `mcode exec` headless",
+        # The design note said "acp for streaming, exec for batch". Stale: use
+        # exec's versioned NDJSON stream, and treat ACP as a later upgrade —
+        # ACP would additionally mean implementing the ACP *client* side.
+        drives="a subprocess turn: `mcode exec --output-format stream-json`",
         runnable=False,
         needs="mcode",
         wire="`mcode provider add --base-url <rigma>/v1 --api-format "
-             "openai-completions --context-limit N`",
+             "openai-completions --context-limit N --output-limit N`",
         unsupported=_LEAVES_BEHIND + (
             "driveable only as a subprocess: it has no library API",
+            "its own tool roster: 12 built-in ids plus MCP, which Rigma can "
+            "subtract from but never replace",
         ),
-        pending="the runtime backend is not implemented yet — it is a Node "
-                "CLI, so it needs its runtime present on the user's machine",
+        pending="the adapter is not written yet — install it with `npm install "
+                "-g @minimax-ai/code` (Node 22.19+ or 24+), then select it; its "
+                "stream-json schema is versioned, so the adapter is written "
+                "against a stable contract",
     ),
 }
 
@@ -122,9 +160,12 @@ BACKENDS: dict[str, Harness] = {
 def installed(h: Harness) -> bool:
     """Whether the thing this backend needs is actually on this machine.
 
-    An executable on PATH, or an importable module — the two ways a backend
-    can arrive. `find_spec` raises rather than returning None for a malformed
-    name, so a bad `needs` reads as "not installed" and not as a crash."""
+    An executable on PATH, an importable module, or a source checkout — the
+    three ways a backend can arrive. `find_spec` raises rather than returning
+    None for a malformed name, so a bad `needs` reads as "not installed" and
+    not as a crash."""
+    if h.probe is not None:
+        return h.probe()                # a checkout, not a module or a binary
     if not h.needs:
         return True                     # native needs nothing
     if shutil.which(h.needs):
