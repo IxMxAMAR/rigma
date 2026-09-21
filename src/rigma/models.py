@@ -82,6 +82,54 @@ class GgufFile(BaseModel):
     # Vulkan driver rather than erroring. None = not probed yet.
     mtp: bool | None = None
 
+    # AUDIT F57: docs/audit-2026-09-04-full.md
+    #
+    # `file` is joined onto `models_dir()` at every sink that WRITES or UNLINKS a
+    # model file — `hangar.delete_file`, `delete_model`, `_download_file`,
+    # `start_pull` — and nothing on that path checked where the join landed. A
+    # registry entry carrying `..` would therefore write or delete outside the
+    # models directory. The registry arrives over the network, so its contents are
+    # not a constant of this program.
+    #
+    # `delete_file` does check the name belongs to the model, which is why this has
+    # not been exploitable: the guard is only ever as good as the data it checks.
+    #
+    # Validated HERE, where every gguf name is parsed, so all four sinks are
+    # covered by construction. A containment check at each sink would have to be
+    # repeated and could be forgotten at the fifth; this cannot.
+    #
+    # A SUBDIRECTORY IS LEGITIMATE, and the obvious fix is wrong because of it.
+    # `Q4_K_M/model.gguf` is a real quant in a real repo, stored under
+    # `models_dir()/Q4_K_M/` — flattening to `Path(v).name` would silently
+    # collide two quants of the same model into one file, and
+    # `test_refresh_keeps_a_quant_that_lives_in_a_repo_subdirectory` is what
+    # caught that. So this permits nesting and rejects only what can ESCAPE:
+    #
+    #   * an absolute path (leading separator, or the UNC form `//host/share`)
+    #   * any `..` component, which is the actual escape
+    #   * a colon, for the Windows drive-relative `D:x.gguf` — no separator, so it
+    #     looks relative, but it resolves against another drive's directory
+    #   * NUL, which truncates the name at the syscall boundary
+    #
+    # Both separators are split on. On POSIX a backslash is an ordinary filename
+    # character, so a POSIX-only check would pass `..\..\x` and let it escape on
+    # Windows — and CI runs Linux.
+    @field_validator("file")
+    @classmethod
+    def _a_model_file_cannot_escape_the_models_directory(cls, v: str) -> str:
+        if not v or "\x00" in v:
+            raise ValueError(f"model file must be a non-empty name, got {v!r}")
+        if ":" in v:
+            raise ValueError(
+                f"model file may not contain a drive or colon, got {v!r}: it is "
+                "joined onto the models directory to be downloaded and deleted")
+        parts = v.replace("\\", "/").split("/")
+        if parts[0] == "" or ".." in parts:
+            raise ValueError(
+                f"model file must stay inside the models directory, got {v!r}: "
+                "it is joined onto that directory to be downloaded and deleted")
+        return v
+
 
 class UseCase(BaseModel):
     name: str
