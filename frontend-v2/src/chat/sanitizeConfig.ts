@@ -6,19 +6,35 @@ import type { Config } from "dompurify";
  *  `Markdown.tsx` pulls in highlight.js stylesheets and touches `document`, and
  *  neither belongs in a security-boundary test.
  *
- *  DOMPurify's stock allowlist is generous, and marked passes raw HTML through
- *  from wherever the text came from — a RAG-indexed document, an MCP result, a
- *  file the model read. It includes `style`, `form`, `input`, `button` and the
- *  `style`/`action` attributes. A `<style>` element is document-GLOBAL, so one
- *  arriving in model output restyles the whole app, and `background:
- *  url(https://…)` fires an outbound request the moment it renders. No script
- *  runs and the origin holds no secret, so the realistic damage is defacement
- *  plus a render beacon — but "model output is untrusted HTML by definition"
- *  (see the header of Markdown.tsx) means the allowlist should be the small
- *  thing, not the generous one.
+ *  DOMPurify's stock config already strips the things people expect it to —
+ *  `<script>`, event handlers, `javascript:` URLs — and, MEASURED rather than
+ *  assumed, the `<style>`, `<iframe>`, `<object>` and `<embed>` ELEMENTS too. The
+ *  audit that prompted this file said the stock allowlist "includes `style`"; it
+ *  does not, and neither does it include the other three. That part of the finding
+ *  was wrong, and it was the part the finding led with. Running the real sanitiser
+ *  under jsdom is what showed it (dompurify 3.4.12).
+ *
+ *  What stock really does allow, same measurement:
+ *
+ *    `style` attribute + `background:url(…)`   KEPT — outbound request on render
+ *    `style` attribute + `position:fixed`      KEPT — full-viewport overlay
+ *    `-moz-binding:url(…)`                     KEPT — outbound (Firefox-only, and
+ *                                                     Firefox has since removed it)
+ *    `srcset` attribute                        KEPT — a second image URL
+ *    `<form action=…>` and `<input>`           KEPT — the phishing shape
+ *    `<button>`, `<textarea>`, `<select>`      KEPT — the elements, not just text
+ *
+ *  So the real reach is per-ELEMENT, not document-global: an inline `style` cannot
+ *  restyle the app the way a `<style>` element would have, and it cannot run
+ *  script. The damage it does allow is a render beacon, a defacement overlay and a
+ *  credential-shaped form — not code execution, and nothing leaves the origin that
+ *  was not already going to be requested. Still worth closing, because model
+ *  output is untrusted HTML by definition (see the header of `Markdown.tsx`): it
+ *  arrives from RAG-indexed documents, MCP results, and files the model read.
  *
  *  A boundary a later edit can quietly widen is not a boundary, so the lists are
- *  named here and pinned by a test.
+ *  named here and pinned by a test — and that test RUNS the real sanitiser, so a
+ *  config DOMPurify ignored could no longer pass it.
  */
 export const SANITIZE_CONFIG: Config = {
   FORBID_TAGS: ["style", "form", "input", "button", "textarea", "select",
@@ -32,11 +48,10 @@ type Sanitizer = (html: string, cfg?: Config) => string;
  *
  *  The config is applied HERE rather than left to each call site, for two
  *  reasons. A second renderer cannot forget it, because there is no second place
- *  to pass it. And the boundary becomes testable by handing in a spy instead of
- *  the real sanitiser — which matters, because this project's test environment
- *  has no DOM and `DOMPurify.sanitize` cannot be executed in it. Pinning that the
- *  config is DEFINED is not the same as pinning that it is USED, and the original
- *  bug was precisely a sanitiser called with no config at all.
+ *  to pass it. And the boundary stays testable by handing in a spy instead of the
+ *  real sanitiser — which was the only option when this project's test environment
+ *  had no DOM. It has jsdom now, so the same seam carries both a spy that pins the
+ *  config is PASSED and real DOMPurify that proves it WORKS.
  */
 export function sanitizeHtml(raw: string, sanitize: Sanitizer): string {
   return sanitize(raw, SANITIZE_CONFIG);
