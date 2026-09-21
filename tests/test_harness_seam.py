@@ -424,6 +424,37 @@ def test_stopping_a_chat_that_IS_running_sets_its_event():
             _cancels.pop(s["id"], None)
 
 
+def test_the_permission_mode_is_a_session_choice():
+    """How much the agent may do unasked is a trade, not a fact: headless has
+    nobody to ask, so the mode that asks FAILS THE RUN. A hardcoded choice
+    hides that; a per-chat one states it."""
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+
+    with TestClient(serve.build_app(upstream_port=59999)) as client:
+        s = sessions.create()
+        r = client.post(f"/api/sessions/{s['id']}", json={"permission": "smart"})
+        assert r.status_code == 200, r.text
+        assert sessions.load(s["id"])["permission"] == "smart"
+
+
+def test_a_permission_mode_the_backend_cannot_take_is_refused_at_the_write():
+    """`ask` is refused by mcode ITSELF headlessly — "requires an interactive
+    host" — so offering it would be a setting that breaks the turn it is set
+    on. Refused here, where the reason can be read."""
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+
+    with TestClient(serve.build_app(upstream_port=59999)) as client:
+        s = sessions.create()
+        r = client.post(f"/api/sessions/{s['id']}", json={"permission": "ask"})
+        assert r.status_code == 400
+        assert "full/smart/off" in r.json()["error"]
+        assert "permission" not in (sessions.load(s["id"]) or {})
+
+
 def _cancels_of(app):
     """The live `_cancels` registry for an app built by `build_app`.
 

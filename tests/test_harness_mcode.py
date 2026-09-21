@@ -490,6 +490,26 @@ def test_leftovers_are_cleared_before_adding(fake_cli, tmp_path):
     assert gone == ["custom_provider:rigma", "custom_provider:rigma-2"], gone
 
 
+def test_the_permission_mode_comes_from_the_chat(fake_cli):
+    """How much the agent may do unasked is the OWNER's call, so the value has
+    to reach the CLI instead of being decided here."""
+    for mode in ("full", "smart", "off"):
+        list(harness_mcode.drive_turn(
+            base_url=BASE, model="local-test", prompt="hi", permission=mode))
+    execs = [a for a in logged(fake_cli) if a and a[0] == "exec"]
+    assert [a[a.index("--permission") + 1] for a in execs] == \
+        ["full", "smart", "off"]
+
+
+def test_the_default_is_the_mode_that_does_not_ask(fake_cli):
+    """Headless has nobody to ask, so a mode that wants to ask FAILS the run.
+    The default has to be the one that works; the trade belongs in the UI, not
+    in a turn that dies."""
+    _one_turn()
+    exe = [a for a in logged(fake_cli) if a and a[0] == "exec"][0]
+    assert exe[exe.index("--permission") + 1] == "full"
+
+
 # --------------------------------------------------------------------------
 # What happens when mcode updates underneath us
 

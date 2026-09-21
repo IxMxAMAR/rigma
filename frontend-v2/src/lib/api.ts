@@ -18,6 +18,7 @@ export interface ChatMessage {
    *  are absent on a reply the built-in loop wrote: the badge explains the
    *  unusual case, so the ordinary one carries no marker. */
   harness?: string;
+  permission?: string;
   harness_label?: string;
 }
 
@@ -28,6 +29,7 @@ export interface Session {
   use_rag?: boolean;
   use_tools?: boolean;
   harness?: string;
+  permission?: string;
 }
 
 /** One agent backend, and what choosing it would cost.

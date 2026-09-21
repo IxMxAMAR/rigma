@@ -510,6 +510,8 @@ function SamplingCard() {
   // is fetched once, because it is static for the life of the server process.
   const harness = useChat((s) => s.harness);
   const setHarness = useChat((s) => s.setHarness);
+  const permission = useChat((s) => s.permission);
+  const setPermission = useChat((s) => s.setPermission);
   const [menu, setMenu] = useState<HarnessInfo[]>([]);
 
   useEffect(() => {
@@ -664,6 +666,34 @@ function SamplingCard() {
           ))}
         </select>
       </label>
+      {/* Only for a chat an external agent drives: the setting is that agent's
+          vocabulary, and showing it on Rigma's own loop would offer a knob that
+          does nothing. Shown rather than hidden because the trade is real —
+          headless has nobody to ask, so the mode that asks FAILS THE RUN, which
+          is exactly the kind of thing an owner should be told once. */}
+      {harness !== "native" && (
+        <label className="flex items-center gap-2 text-[12.5px]"
+               title={"How much the agent may do without asking. full: it does "
+                      + "not ask. smart: it classifies each action and asks when "
+                      + "it judges the risk high — but headless has nobody to "
+                      + "ask, so the RUN FAILS instead of auto-approving. off: "
+                      + "the agent loses its tools entirely. None of these is "
+                      + "\"no safety\": a hard, workspace-scoped policy still "
+                      + "blocks recursive writes and deletes outside the "
+                      + "workspace. Applies to THIS chat, from its next turn."}>
+          <span className="w-24 text-secondary">permission</span>
+          <select
+            value={permission}
+            aria-label="Agent permission mode"
+            onChange={(e) => void setPermission(e.target.value)}
+            className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"
+          >
+            <option value="full">full — never asks</option>
+            <option value="smart">smart — asks, so a turn can fail</option>
+            <option value="off">off — no tools at all</option>
+          </select>
+        </label>
+      )}
       <label className="flex items-center gap-2 text-[12.5px]">
         <span className="w-24 text-secondary">preset</span>
         <select
