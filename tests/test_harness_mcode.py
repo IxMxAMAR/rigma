@@ -229,23 +229,64 @@ if log:
 cmd = argv[0] if argv else ""
 if cmd == "provider":
     action = argv[1] if len(argv) > 1 else ""
-    if action == "add":
-        print("Provider added and selected: rigma")
-        sys.exit(0)
+    store = os.environ.get("FAKE_MCODE_PROVIDERS_FILE") or ""
+
+    def load():
+        try:
+            with open(store, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def save(provs):
+        with open(store, "w", encoding="utf-8") as f:
+            json.dump(provs, f)
+
     if action == "list":
         code = int(os.environ.get("FAKE_MCODE_LIST_EXIT", "0"))
         if code:
             sys.stderr.write("provider list is unhappy\\n")
             sys.exit(code)
-        raw = os.environ.get("FAKE_MCODE_PROVIDERS")
-        if raw is None:
-            # the healthy default: present, selected, pointing where Rigma does
-            raw = json.dumps({"providers": [{
+        if store:
+            provs = load()
+        else:
+            raw = os.environ.get("FAKE_MCODE_PROVIDERS")
+            provs = (json.loads(raw).get("providers") if raw else [{
                 "providerId": "custom_provider:rigma", "kind": "custom",
                 "active": True, "enabled": True,
                 "baseUrl": os.environ.get(
-                    "FAKE_MCODE_BASEURL", "http://127.0.0.1:11500/v1")}]})
-        sys.stdout.write(raw)
+                    "FAKE_MCODE_BASEURL", "http://127.0.0.1:11500/v1")}])
+        sys.stdout.write(json.dumps({"providers": provs}))
+        sys.exit(0)
+    if action == "remove":
+        pid = argv[2] if len(argv) > 2 else ""
+        # THE REAL BEHAVIOUR, and the bug this fake exists to catch: a remove
+        # without --yes does nothing and says so on stderr. Rigma called it that
+        # way, the removal silently failed, and the leftover made the next add
+        # dedupe to rigma-2 while --model kept naming rigma.
+        if "--yes" not in argv:
+            sys.stderr.write("Refusing to remove a provider without --yes.\\n")
+            sys.exit(2)
+        if store:
+            save([p for p in load() if p.get("providerId") != pid])
+        print("Provider removed: " + pid)
+        sys.exit(0)
+    if action == "add":
+        name = argv[argv.index("--name") + 1]
+        url = argv[argv.index("--base-url") + 1]
+        if store:
+            provs = load()
+            taken = {p.get("providerId") for p in provs}
+            pid, n = "custom_provider:" + name, 2
+            while pid in taken:          # mcode dedupes; it does not update
+                pid = "custom_provider:%s-%d" % (name, n)
+                n += 1
+            for p in provs:
+                p["active"] = False
+            provs.append({"providerId": pid, "kind": "custom", "active": True,
+                          "enabled": True, "baseUrl": url})
+            save(provs)
+        print("Provider added and selected: " + name)
         sys.exit(0)
     sys.exit(0)
 if cmd == "exec":
@@ -259,14 +300,24 @@ if cmd == "exec":
 sys.exit(2)
 '''
 
-HEALTHY = json.dumps({"providers": [
-    {"providerId": "custom_provider:rigma", "kind": "custom", "active": True,
-     "enabled": True, "baseUrl": "http://127.0.0.1:11500/v1"}]})
+BASE = "http://127.0.0.1:11500/v1"
+
+
+def _prov(pid="custom_provider:rigma", *, active=True, enabled=True, url=BASE):
+    return {"providerId": pid, "kind": "custom", "active": active,
+            "enabled": enabled, "baseUrl": url}
 
 
 @pytest.fixture
 def fake_cli(tmp_path, monkeypatch):
-    """A `mcode` on PATH that answers the two commands the adapter runs."""
+    """A `mcode` on PATH that answers the commands the adapter runs.
+
+    Its provider store is a FILE, and `add` dedupes names and `remove` refuses
+    without `--yes` exactly as the real CLI does. A stateless fake would let the
+    dedupe bug back in: the whole failure was that `add` created `rigma-2` while
+    `--model` still named `rigma`, and a fake that always answers "rigma" cannot
+    tell those apart.
+    """
     script = tmp_path / "fake_mcode.py"
     script.write_text(FAKE_SRC, encoding="utf-8")
     if os.name == "nt":
@@ -279,16 +330,24 @@ def fake_cli(tmp_path, monkeypatch):
                        encoding="utf-8")
         exe.chmod(0o755)
     log = tmp_path / "argv.jsonl"
+    store = tmp_path / "providers.json"
+    store.write_text("[]", encoding="utf-8")
     monkeypatch.setenv("RIGMA_MCODE_BIN", str(exe))
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("FAKE_MCODE_LOG", str(log))
+    monkeypatch.setenv("FAKE_MCODE_PROVIDERS_FILE", str(store))
     monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps(TEXT_TURN))
     # module-level state, so it must not leak between tests
-    monkeypatch.setattr(harness_mcode, "_VERIFIED", set())
+    monkeypatch.setattr(harness_mcode, "_VERIFIED", {})
     return log
 
 
-def seed_marker(tmp_path, base_url="http://127.0.0.1:11500/v1",
+def seed_providers(tmp_path, provs):
+    (tmp_path / "providers.json").write_text(json.dumps(provs),
+                                             encoding="utf-8")
+
+
+def seed_marker(tmp_path, base_url=BASE,
                 model="local-test", ctx=32768, out=4096):
     """What Rigma leaves behind after a successful setup, on a later process."""
     d = tmp_path / "home" / "mcode"
@@ -302,8 +361,16 @@ def provider_calls(log):
     return [a for a in logged(log) if a[:2] == ["provider", "add"]]
 
 
+def remove_calls(log):
+    return [a for a in logged(log) if a[:2] == ["provider", "remove"]]
+
+
 def list_calls(log):
     return [a for a in logged(log) if a[:2] == ["provider", "list"]]
+
+
+def model_arg(call):
+    return call[call.index("--model") + 1]
 
 
 def logged(log):
@@ -349,34 +416,85 @@ def test_the_provider_is_pointed_at_rigmas_own_endpoint(fake_cli):
 
 
 def test_the_provider_is_configured_once_not_every_turn(fake_cli):
-    """`provider add` is a second Node process, and re-adding a name mcode
-    already has is an error rather than an update."""
+    """`provider add` is a second Node process, so it must not run per turn."""
     for _ in range(3):
-        list(harness_mcode.drive_turn(
-            base_url="http://127.0.0.1:11500/v1", model="local-test",
-            prompt="hi"))
-    adds = [a for a in logged(fake_cli) if a[:2] == ["provider", "add"]]
-    assert len(adds) == 1, adds
+        _one_turn()
+    assert len(provider_calls(fake_cli)) == 1
+
+
+def test_the_remove_says_yes_or_it_does_nothing(fake_cli, tmp_path):
+    """THE BUG THIS FAKE EXISTS TO CATCH.
+
+    `provider remove` refuses without `--yes` — "Refusing to remove a provider
+    without --yes" — and exits 2. Rigma called it without, so the removal
+    silently did nothing, the old provider stayed, the next `add` deduped to
+    `rigma-2`, and `--use` activated `rigma-2` while `--model
+    custom_provider:rigma/…` kept resolving to the stale one. Every change
+    leaked a provider and pointed the turn one step further from the id it
+    named.
+    """
+    seed_providers(tmp_path, [_prov(active=False, url="http://127.0.0.1:9999/v1")])
+    _one_turn()
+    removes = remove_calls(fake_cli)
+    assert removes, "a provider at the wrong URL has to be replaced"
+    assert all("--yes" in a for a in removes), removes
+    # and the proof it WORKED: with the old entry gone the name is free again,
+    # so the turn names `rigma` and not `rigma-2`
+    exe = [a for a in logged(fake_cli) if a and a[0] == "exec"][0]
+    assert model_arg(exe) == "custom_provider:rigma/local-test"
+
+
+def test_the_provider_id_is_read_back_rather_than_assumed(fake_cli, tmp_path):
+    """What mcode CALLED the provider is what `--model` has to name.
+
+    This is the post-dedupe state: `rigma` exists but is inactive and points
+    somewhere else, and the live one is `rigma-2`. Naming `custom_provider:rigma`
+    because that is the name Rigma asked for sends the turn to a dead port.
+    """
+    seed_providers(tmp_path, [
+        _prov(active=False, url="http://127.0.0.1:9999/v1"),
+        _prov("custom_provider:rigma-2", active=True, url=BASE),
+    ])
+    seed_marker(tmp_path)
+    _one_turn()
+    assert provider_calls(fake_cli) == []      # nothing to configure
+    assert remove_calls(fake_cli) == []        # and nothing to clean up
+    exe = [a for a in logged(fake_cli) if a and a[0] == "exec"][0]
+    assert model_arg(exe) == "custom_provider:rigma-2/local-test"
 
 
 def test_a_changed_model_replaces_the_cached_provider(fake_cli):
-    """mcode keys a custom provider by NAME, and the name is Rigma's, so a new
-    model has to remove the old entry or the add is refused."""
+    """A new model has to clear the old entry, or the add dedupes and the turn
+    keeps naming the provider that holds the OLD model."""
     for model in ("first", "second"):
-        list(harness_mcode.drive_turn(
-            base_url="http://127.0.0.1:11500/v1", model=model, prompt="hi"))
-    calls = [a[:2] for a in logged(fake_cli) if a and a[0] == "provider"]
-    assert calls == [["provider", "add"], ["provider", "remove"],
-                     ["provider", "add"]]
-    adds = [a for a in logged(fake_cli) if a[:2] == ["provider", "add"]]
-    assert adds[-1][adds[-1].index("--model") + 1] == "second"
+        _one_turn(model=model)
+    verbs = [a[:2] for a in logged(fake_cli) if a and a[0] == "provider"]
+    assert verbs.count(["provider", "add"]) == 2, verbs
+    assert ["provider", "remove"] in verbs, verbs
+    # the turn must name the provider that actually HOLDS the new model, and
+    # the replace has to happen between the two turns rather than after both
+    execs = [a for a in logged(fake_cli) if a and a[0] == "exec"]
+    assert model_arg(execs[0]) == "custom_provider:rigma/first"
+    assert model_arg(execs[-1]) == "custom_provider:rigma/second"
+
+
+def test_leftovers_are_cleared_before_adding(fake_cli, tmp_path):
+    """Every entry Rigma created is Rigma's to remove — otherwise they pile up
+    one per change and each `--use` moves further from the id `--model` names."""
+    seed_providers(tmp_path, [
+        _prov(active=False, url="http://127.0.0.1:9998/v1"),
+        _prov("custom_provider:rigma-2", active=False, url="http://127.0.0.1:9999/v1"),
+    ])
+    _one_turn()
+    gone = [a[2] for a in remove_calls(fake_cli)]
+    assert gone == ["custom_provider:rigma", "custom_provider:rigma-2"], gone
 
 
 # --------------------------------------------------------------------------
 # What happens when mcode updates underneath us
 
 
-def _one_turn(model="local-test", base="http://127.0.0.1:11500/v1"):
+def _one_turn(model="local-test", base=BASE):
     return list(harness_mcode.drive_turn(base_url=base, model=model,
                                          prompt="hi"))
 
@@ -386,6 +504,7 @@ def test_a_marker_mcode_agrees_with_costs_one_ask_per_process(fake_cli,
     """The marker saves a Node process per turn, so it must not become a Node
     process per turn itself."""
     seed_marker(tmp_path)
+    seed_providers(tmp_path, [_prov()])
     for _ in range(3):
         _one_turn()
     assert provider_calls(fake_cli) == []
@@ -393,8 +512,7 @@ def test_a_marker_mcode_agrees_with_costs_one_ask_per_process(fake_cli,
 
 
 def test_an_upstream_that_moves_its_provider_config_is_noticed(fake_cli,
-                                                               tmp_path,
-                                                               monkeypatch):
+                                                               tmp_path):
     """THE update case, and the reason the marker is only a hint.
 
     Rigma leaves a marker saying "configured". An mcode release then changes
@@ -402,49 +520,46 @@ def test_an_upstream_that_moves_its_provider_config_is_noticed(fake_cli,
     `~/.minimax-code` to `~/.minimax`. The marker still says configured, so
     Rigma skips the setup step, and `exec` fails with a model-not-available
     error that names nothing about the real cause. Asking mcode once per process
-    is what turns that into a silent re-add instead of a mystery.
+    is what turns that into a re-add instead of a mystery.
     """
     seed_marker(tmp_path)
-    monkeypatch.setenv("FAKE_MCODE_PROVIDERS", json.dumps({"providers": []}))
+    seed_providers(tmp_path, [])
     _one_turn()
     adds = provider_calls(fake_cli)
     assert len(adds) == 1, "a provider mcode no longer has must be configured again"
     assert adds[0][-1] == "--use"
 
 
-def test_a_provider_that_lost_its_selection_is_configured_again(
-        fake_cli, tmp_path, monkeypatch):
+def test_a_provider_that_lost_its_selection_is_configured_again(fake_cli,
+                                                                tmp_path):
     """Present but not selected is precisely the state that makes mcode demand a
     MiniMax login for a turn that never leaves this machine."""
     seed_marker(tmp_path)
-    monkeypatch.setenv("FAKE_MCODE_PROVIDERS", json.dumps({"providers": [
-        {"providerId": "custom_provider:rigma", "active": False,
-         "enabled": True, "baseUrl": "http://127.0.0.1:11500/v1"}]}))
+    seed_providers(tmp_path, [_prov(active=False)])
     _one_turn()
     assert len(provider_calls(fake_cli)) == 1
 
 
-def test_a_provider_pointing_at_another_port_is_configured_again(
-        fake_cli, tmp_path, monkeypatch):
+def test_a_provider_pointing_at_another_port_is_configured_again(fake_cli,
+                                                                 tmp_path):
     """Rigma's port can move. A provider aimed at the old one fails in a way
     that reads like a model problem."""
     seed_marker(tmp_path)
-    monkeypatch.setenv("FAKE_MCODE_PROVIDERS", json.dumps({"providers": [
-        {"providerId": "custom_provider:rigma", "active": True,
-         "enabled": True, "baseUrl": "http://127.0.0.1:9999/v1"}]}))
+    seed_providers(tmp_path, [_prov(url="http://127.0.0.1:9999/v1")])
     _one_turn()
     assert len(provider_calls(fake_cli)) == 1
 
 
-def test_a_provider_list_that_fails_is_not_taken_as_absent(
-        fake_cli, tmp_path, monkeypatch):
-    """A transient failure must not be read as "mcode lost the provider" — that
-    would re-add a name mcode already has, which is an error rather than an
-    update, and the next turn would hit it."""
+def test_a_provider_list_that_fails_is_not_taken_as_absent(fake_cli, tmp_path,
+                                                           monkeypatch):
+    """A transient failure must not be read as "mcode lost the provider" — the
+    re-add would dedupe, and `--use` would then activate a provider that
+    `--model` does not name."""
     seed_marker(tmp_path)
     monkeypatch.setenv("FAKE_MCODE_LIST_EXIT", "4")
     _one_turn()
     assert provider_calls(fake_cli) == []
+    assert remove_calls(fake_cli) == []
 
 
 def test_a_fresh_process_re_asks_even_though_the_marker_is_there(fake_cli,
@@ -452,6 +567,7 @@ def test_a_fresh_process_re_asks_even_though_the_marker_is_there(fake_cli,
     """The marker survives a restart, so it is exactly the thing that can be
     stale across one."""
     seed_marker(tmp_path)
+    seed_providers(tmp_path, [_prov()])
     _one_turn()
     assert len(list_calls(fake_cli)) == 1
     # a second turn in the SAME process must not ask again
