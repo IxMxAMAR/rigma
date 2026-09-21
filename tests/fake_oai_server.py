@@ -14,6 +14,19 @@ import sys
 
 port = int(sys.argv[sys.argv.index("--port") + 1])
 logpath = sys.argv[sys.argv.index("--log") + 1] if "--log" in sys.argv else ""
+# `--tool NAME` makes the fake model ask for a tool on its FIRST request and
+# answer in words on the next one, so a test can see how an agent backend
+# projects a tool call AND its result. The name is deliberately one no backend
+# has: the call is reported either way, and an unknown tool cannot touch this
+# machine. One shot, not every request — otherwise the backend calls the tool,
+# is told it failed, and calls it again until it hits its step limit.
+toolname = sys.argv[sys.argv.index("--tool") + 1] if "--tool" in sys.argv else ""
+# `--no-count` answers 404 to the token-counting route. MiniMax Code asks
+# `/v1/responses/input_tokens` before every turn, which llama-server does not
+# serve — so whether an agent backend survives that 404 decides whether Rigma's
+# proxy has to learn the route or not.
+count404 = "--no-count" in sys.argv
+_requests = {"n": 0}
 CHUNKS = ("hello ", "from ", "dsh")
 
 
@@ -23,6 +36,11 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if count404 and "input_tokens" in self.path:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         n = int(self.headers.get("content-length", 0))
         try:
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -43,6 +61,21 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
+            first = _requests["n"] == 0
+            _requests["n"] += 1
+            if toolname and first:
+                self.wfile.write(b"data: " + json.dumps(
+                    {"choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "id": "call_probe_1", "type": "function",
+                         "function": {"name": toolname,
+                                      "arguments": "{\"probe\": 1}"}}]}}]}
+                ).encode() + b"\n\n")
+                self.wfile.write(b"data: " + json.dumps(
+                    {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
+                ).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             for tok in CHUNKS:
                 self.wfile.write(b"data: " + json.dumps(
                     {"choices": [{"delta": {"content": tok}}]}).encode() + b"\n\n")
