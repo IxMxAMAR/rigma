@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import textwrap
+import threading
 import time
 
 import pytest
@@ -218,3 +219,130 @@ def test_the_real_checkout_resolves_to_the_sdk_source_and_cli():
     assert harness_dsh.sdk_src().is_dir()
     assert harness_dsh.dsh_bin().is_file()
     assert harness_dsh.available() is True
+
+
+# -- the seam's contract, and what driving the real CLI found ------------------
+
+
+def test_every_adapter_takes_the_arguments_the_server_actually_passes():
+    """The contract, checked against the ONE caller that matters.
+
+    `serve.py` calls every adapter with the same keyword set. An adapter that
+    cannot accept one of them raises TypeError — and the caller CATCHES it and
+    reports a failed turn, so the arm looks broken rather than mismatched. That
+    is precisely how the DSH adapter shipped unable to run a single turn through
+    the product: it had no `state` parameter, worked when driven directly, and
+    every unit test called it directly.
+    """
+    import inspect
+
+    from rigma import harness as seam
+
+    passed = {
+        "base_url": "http://127.0.0.1:1/v1", "model": "m", "prompt": "p",
+        "system_prompt": "s", "session_id": "sid", "cwd": ".",
+        "max_tokens": 1, "context_window": 2, "state": {}, "cancel": None,
+        "permission": "full",
+    }
+    checked = 0
+    for name in ("dsh", "mcode"):
+        mod = seam.adapter(name)
+        assert mod is not None, f"{name} should have an adapter"
+        # `adapter()` returns the MODULE; the server calls `adapter.drive_turn`.
+        params = inspect.signature(mod.drive_turn).parameters
+        missing = sorted(k for k in passed if k not in params)
+        assert not missing, f"{name}.drive_turn cannot accept {missing} from serve.py"
+        checked += 1
+    assert checked == 2
+
+
+def test_a_turn_does_not_hand_back_a_session_it_cannot_resume(monkeypatch, tmp_path):
+    """Storing a handle the next turn cannot use turns turn 2 into a hard
+    failure — measured, `JsonRpcError: session "..." already exists`. A fresh
+    turn that answers beats a resuming turn that dies."""
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(
+        tmp_path,
+        """
+        import json, sys
+        sys.stdout.write(json.dumps(
+            {"type": "done", "text": "hi", "finish_reason": "completed",
+             "session_id": "session-abc123"}) + "\\n")
+        sys.stdout.flush()
+        """,
+    )
+    hstate = {"session_id": ""}
+    events = _drive(monkeypatch, argv, home, state=hstate)
+
+    assert [e.kind for e in events] == ["text"]
+    assert hstate["session_id"] == "", "no resume, so no handle to store"
+
+
+def test_a_handle_is_used_and_stored_once_the_sdk_can_resume(monkeypatch, tmp_path):
+    """The other half: with CAN_RESUME on, the handle round-trips. This is the
+    one-line flip the constant exists for, so it is pinned rather than assumed."""
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(
+        tmp_path,
+        """
+        import json, sys
+        job = json.loads(sys.stdin.readline())
+        sys.stdout.write(json.dumps(
+            {"type": "done", "text": job.get("session_id") or "none",
+             "finish_reason": "completed", "session_id": "session-abc123"}) + "\\n")
+        sys.stdout.flush()
+        """,
+    )
+    monkeypatch.setattr(harness_dsh, "CAN_RESUME", True)
+    hstate = {"session_id": "session-previous"}
+    events = _drive(monkeypatch, argv, home, state=hstate)
+
+    # the id was READ from state and passed to the runner...
+    assert events[0].text == "session-previous"
+    # ...and the new one was written back
+    assert hstate["session_id"] == "session-abc123"
+
+
+def test_a_stop_is_a_notice_not_a_failure(monkeypatch, tmp_path):
+    """The person who pressed stop does not need to be told their own action
+    failed. Reporting it as an error puts a red failure in the transcript for
+    the one outcome they chose — measured against the real CLI: a cancel at
+    0.25s returned at 0.34s, and said `error` before this was fixed."""
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(
+        tmp_path,
+        """
+        import sys, time
+        sys.stdout.write('{"type": "notice", "text": "working"}\\n')
+        sys.stdout.flush()
+        time.sleep(120)
+        """,
+    )
+    cancel = threading.Event()
+    threading.Timer(0.4, cancel.set).start()
+    events = _drive(monkeypatch, argv, home, timeout=60, cancel=cancel)
+
+    assert [e.kind for e in events] == ["notice", "notice"]
+    assert events[-1].text == "stopped"
+    assert not any(e.kind == "error" for e in events)
+
+
+def test_a_timeout_is_still_an_error_not_a_stop(monkeypatch, tmp_path):
+    """The two must not be confused: a cancel is the user's choice, a timeout is
+    a fault. If a timeout were reported as a stop, a hung turn would look like a
+    turn the user ended."""
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(
+        tmp_path,
+        """
+        import sys, time
+        sys.stdout.write('{"type": "notice", "text": "working"}\\n')
+        sys.stdout.flush()
+        time.sleep(120)
+        """,
+    )
+    events = _drive(monkeypatch, argv, home, timeout=1.5, cancel=threading.Event())
+
+    assert events[-1].kind == "error"
+    assert "timed out" in events[-1].text
+

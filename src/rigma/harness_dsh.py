@@ -79,19 +79,63 @@ def available() -> bool:
 # against, and inventing a number would make `conformance` report agreement with
 # something that was never checked. Empty means "unknown", and `conformance`
 # says unknown rather than implying fine.
-VERIFIED = ""
+VERIFIED = "0.1.6-alpha.2"
+
+# Whether a DSH session can be CONTINUED across Rigma's turns. Measured
+# 2026-09-21 against 0.1.6-alpha.2, and the answer is no — not through the Python
+# SDK, which is the only thing this adapter has:
+#
+#   * `RunResult.session_id` DOES exist (`session-<32 hex>`), and a SECOND
+#     `run()` on the SAME `DeepSeekHarness` instance resumes correctly — the
+#     follow-up request carried the first turn's history, verified from the wire.
+#   * A second PROCESS given that id dies with
+#     `JsonRpcError: session "..." already exists`.
+#
+# The cause is upstream and precise: the SDK's server resolves a session from an
+# IN-MEMORY map and only on a miss calls `agents.create`, which refuses an id
+# already on disk (`packages/sdk/server/src/server.ts`, `getOrCreateSession`).
+# The TypeScript layer HAS a real resume (`agents.resume` with `resumeSessionId`,
+# `packages/core/agent-loop/src/index.ts`) and the CLI exposes it as
+# `--session-id` (`packages/bundle/headless/src/index.ts`) — but
+# `DeepSeekHarnessConfig` has no field for it, so nothing here can reach it.
+#
+# So the handle is deliberately NOT handed back. Storing one would guarantee that
+# every turn after the first fails, which is strictly worse than starting fresh:
+# a turn that dies teaches the model nothing, while a fresh turn still answers.
+# Flip this to True — the two call sites below are the whole change — once the
+# SDK can resume, or once the runner outlives a turn instead of being spawned
+# per turn. Continuity is the one arm capability DSH does not yet have.
+CAN_RESUME = False
 
 
 def backend_version() -> str:
-    """The checkout's own identity, or "" when it cannot say.
+    """The version that would MOVE under Rigma, or "" when it cannot say.
 
-    `git describe` rather than a `--version`, because DSH arrives as SOURCE: a
-    checkout has no version command, and the tag it was built from is the thing
-    that would move under Rigma. Never raises — this runs from a menu.
+    The CLI's own `--version` first: measured 2026-09-21 against 0.1.6-alpha.2, it
+    prints a stable semver that only changes on a release, which is exactly what
+    drift detection needs. (The earlier claim that a checkout has no version
+    command was wrong — `dsh.CMD --version` answers.)
+
+    `git describe` only as a fallback, because it is the wrong SHAPE for this:
+    measured, it returns `dsh-v0.1.5-rc.2-1687-gddefc45fbc-dirty` — the commit
+    count moves on every commit and `-dirty` is permanent on a working checkout,
+    so a pinned value could never match it and every turn would report drift.
+    Useful when there is no CLI to ask, which is the only reason it is still here.
+
+    Never raises — this runs from a menu.
     """
     root = home()
     if root is None:
         return ""
+    cli = root.joinpath(*_CLI_REL)
+    if cli.is_file():
+        try:
+            out = subprocess.run([str(cli), "--version"], capture_output=True,
+                                 text=True, timeout=20)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip().splitlines()[0].strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
     try:
         out = subprocess.run(
             ["git", "-C", str(root), "describe", "--tags", "--always", "--dirty"],
@@ -160,6 +204,8 @@ class _Run:
     done: bool = False
     stderr: deque = field(default_factory=lambda: deque(maxlen=400))
     lines: queue.Queue = field(default_factory=queue.Queue)
+    hstate: dict | None = None          # the backend-owned handle, in and out
+    cancel: threading.Event | None = None
 
 
 def _tail(state: _Run) -> str:
@@ -264,6 +310,15 @@ def _read_events(state: _Run, timeout: float) -> Iterator[TurnEvent]:
             continue
         if str(payload.get("type") or "").strip().lower() == "done":
             state.done = True
+            # Hand the conversation handle back to the caller — but ONLY when
+            # the next turn could actually use it. See CAN_RESUME: storing one
+            # that cannot be resumed makes the next turn die with `already
+            # exists`, so not storing it is the difference between a turn that
+            # starts fresh and a turn that fails.
+            if state.hstate is not None and CAN_RESUME:
+                sid = str(payload.get("session_id") or "").strip()
+                if sid:
+                    state.hstate["session_id"] = sid
             text = str(payload.get("text") or "")
             reason = str(payload.get("finish_reason") or "")
             if text:
@@ -288,6 +343,13 @@ def _read_events(state: _Run, timeout: float) -> Iterator[TurnEvent]:
             yield event
 
     if state.done:
+        return
+    if state.cancel is not None and state.cancel.is_set():
+        # A stop is a NOTICE, not a failure. The person who pressed stop does not
+        # need to be told their own action failed, and reporting it as an error
+        # would put a red failure in the transcript for the one outcome they
+        # chose. Same shape as mcode's, for the same reason.
+        yield TurnEvent(kind="notice", text="stopped")
         return
     code = _exit_code(state)
     yield TurnEvent(
@@ -344,6 +406,7 @@ def drive_turn(
     context_window: int = 32768,
     timeout: float = 1800.0,
     dsh_home: str | None = None,
+    state: dict | None = None,
     cancel: threading.Event | None = None,
     permission: str = "full",
 ) -> Iterator[TurnEvent]:
@@ -351,6 +414,14 @@ def drive_turn(
 
     Never raises: a failure arrives as an `error` event, because the caller is a
     tool and a tool that raises teaches the model nothing it can act on.
+
+    `state`, when given, is read for the DSH session to CONTINUE and written back
+    with the one this turn produced. It is the BACKEND's handle and not Rigma's:
+    DSH's own ids look like `session-<32 hex>`, so Rigma's chat id means nothing
+    to it. This parameter was MISSING until 2026-09-21, which made every turn
+    through the web seam raise `TypeError: unexpected keyword argument 'state'`
+    and come back as a failed turn — the adapter worked when driven directly and
+    was broken in the product, which is the gap that driving it end to end found.
 
     `permission` is ACCEPTED AND IGNORED. DSH's confinement is its own bundle's
     business — `sdk-minimal` pins the mode — and mapping a Rigma setting onto it
@@ -361,12 +432,11 @@ def drive_turn(
     `cancel` kills the child process, which is the same lever the timeout uses.
     The SDK is BATCH — it reports a whole turn rather than streaming it — so
     there is no per-event boundary at which a cancel could be noticed, and
-    killing the process is the only stop that arrives promptly. NOT VERIFIED
-    END TO END: DSH is not installed on the machine this was written on, so the
-    path is written to the same shape as the mcode one and exercised only by
-    unit tests with a stand-in child.
+    killing the process is the only stop that arrives promptly. Verified against
+    the real CLI 0.1.6-alpha.2: a cancel at 0.25s returned at 0.35s.
     """
-    state = _Run()
+    hstate = state          # the caller's dict; `state` below is this run
+    state = _Run(hstate=hstate, cancel=cancel)
     tmpdir = ""
     try:
         root = Path(dsh_home) if dsh_home else home()
@@ -380,12 +450,19 @@ def drive_turn(
             return
 
         tmpdir = tempfile.mkdtemp(prefix="rigma-dsh-")
+        # Rigma's `session_id` argument is RIGMA's chat id and means nothing to
+        # DSH, whose own handles are `session-<hex>`. The backend's handle would
+        # travel in `state` — but only when it can be used, or handing it back
+        # would turn every turn after the first into a failure. See CAN_RESUME.
+        resume = ""
+        if CAN_RESUME:
+            resume = str((hstate or {}).get("session_id") or "").strip()
         job = {
             "base_url": base_url,
             "model": model,
             "prompt": prompt,
             "system_prompt": system_prompt,
-            "session_id": session_id,
+            "session_id": resume,
             "cwd": cwd,
             "max_tokens": int(max_tokens),
             "context_window": int(context_window),
