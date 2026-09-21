@@ -332,3 +332,70 @@ def test_refresh_still_forgets_a_flat_quant_that_was_never_downloaded(home):
         old, {"ggufs": [{"file": "kept.gguf", "bytes": 100}],
               "mmproj": None, "split_skipped": 0})
     assert [g.file for g in new.ggufs] == ["kept.gguf"]
+
+
+# ---- F57: a registry file name cannot escape the models directory -----------
+#
+# `GgufFile.file` is joined onto `models_dir()` at every sink that writes or
+# unlinks a model file, and the registry arrives over the network. `delete_file`
+# already refused a name that does not belong to the model, which is why this was
+# never exploitable — but that guard is only as good as the data it checks, and
+# the writes have no equivalent.
+
+def _rejects(name):
+    with pytest.raises(Exception) as ei:
+        GgufFile(repo="acme/spicy", file=name, bytes=16, quant="Q4_K_M")
+    return str(ei.value)
+
+
+def test_a_nested_quant_is_still_allowed():
+    """The reason the obvious fix is wrong. `Q4_K_M/model.gguf` is a real quant
+    in a real repo and is stored under `models_dir()/Q4_K_M/`; flattening to
+    `Path(name).name` would silently collide two quants into one file."""
+    g = GgufFile(repo="acme/spicy", file="Q4_K_M/model.gguf", bytes=16,
+                 quant="Q4_K_M")
+    assert g.file == "Q4_K_M/model.gguf"
+    # and a plain flat name, the common case
+    assert GgufFile(repo="a/b", file="model.gguf", bytes=1,
+                    quant="Q4_K_M").file == "model.gguf"
+
+
+@pytest.mark.parametrize("name", [
+    "../../../etc/passwd",
+    "..\\..\\..\\Windows\\System32\\evil.gguf",
+    "Q4_K_M/../../evil.gguf",
+    "/etc/passwd",
+    "\\\\host\\share\\evil.gguf",       # UNC
+    "//host/share/evil.gguf",
+    "D:evil.gguf",                      # drive-relative: no separator, still escapes
+    "",
+    "model\x00.gguf",
+])
+def test_a_file_name_that_can_escape_is_rejected(name):
+    msg = _rejects(name)
+    assert "models directory" in msg or "non-empty" in msg or "colon" in msg
+
+
+def test_the_backslash_form_is_rejected_on_every_platform():
+    """On POSIX a backslash is an ordinary filename character, so a check written
+    against `os.sep` alone would pass `..\\..\\evil.gguf` on Linux and let it
+    escape on Windows. CI runs Linux and the owner runs Windows, so the rule has
+    to be the same on both."""
+    _rejects("..\\..\\evil.gguf")
+    # and the split is on both separators, so a mixed form is caught too
+    _rejects("a/../../evil.gguf")
+    _rejects("..\\a/../evil.gguf")
+
+
+def test_a_registry_name_cannot_reach_outside_the_models_directory(home):
+    """The property, not the mechanism: whatever a registry entry says, the path
+    a sink builds from it stays under `models_dir()`."""
+    from pathlib import Path
+
+    mdir = hangar.models_dir()
+    for name in ("model.gguf", "Q4_K_M/model.gguf", "a/b/c.gguf"):
+        g = GgufFile(repo="acme/spicy", file=name, bytes=16, quant="Q4_K_M")
+        target = (mdir / g.file).resolve()
+        assert target.is_relative_to(Path(mdir).resolve()), (
+            f"{name!r} resolved to {target}, outside {mdir}")
+
