@@ -387,7 +387,12 @@ def test_mcode_is_selectable_and_driven_by_its_adapter(monkeypatch, tmp_path):
     seen: dict = {}
 
     def _fake_drive(**kw):
+        # snapshot what the adapter was HANDED, before writing back to it
         seen.update(kw)
+        seen.setdefault("handed", []).append(dict(kw["state"]))
+        # the backend's own handle on the conversation, reported the way a real
+        # one reports it: mid-stream, out of band from the text
+        kw["state"]["session_id"] = "mvs_fake_session"
         yield harness.TurnEvent("notice", text="working")
         yield harness.TurnEvent("text", text="from ")
         yield harness.TurnEvent("text", text="mcode")
@@ -405,13 +410,112 @@ def test_mcode_is_selectable_and_driven_by_its_adapter(monkeypatch, tmp_path):
 
     with TestClient(serve.build_app(upstream_port=11499)) as c:
         r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "go"})
-    assert r.status_code == 200, r.text
-    assert '"delta": "from "' in r.text
-    assert '"name": "mcode"' in r.text          # the harness event, up front
+        assert r.status_code == 200, r.text
+        assert '"delta": "from "' in r.text
+        assert '"name": "mcode"' in r.text      # the harness event, up front
+        # a SECOND turn, to prove Rigma remembers what the backend told it
+        r2 = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "again"})
+        assert r2.status_code == 200, r2.text
+
     assert seen["base_url"] == "http://127.0.0.1:11500/v1"
     assert seen["context_window"] == 32768
+    assert seen["handed"][0] == {"session_id": ""}
+    assert seen["handed"][1] == {"session_id": "mvs_fake_session"}
 
     stored = sessions.load(s["id"])
     assert stored["messages"][-1]["content"] == "from mcode"
     assert stored["messages"][-1]["harness"] == "mcode"
     assert stored["messages"][-1]["harness_label"] == "MiniMax Code"
+    # and what the backend told us about itself is Rigma's to keep
+    assert stored["harness_sessions"] == {"mcode": "mvs_fake_session"}
+
+
+# --------------------------------------------------------------------------
+# continuity: the difference between an agent and a stateless prompt
+
+
+def test_a_fresh_chat_passes_no_session(fake_cli):
+    list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
+    argv = [a for a in logged(fake_cli) if a and a[0] == "exec"][0]
+    assert "--session" not in argv
+
+
+def test_a_remembered_session_is_handed_back_to_continue(fake_cli):
+    """mcode keeps the plan, the subagents and the goals in the session, so a
+    fresh session per turn throws away most of what the agent is for."""
+    state = {"session_id": "mvs_2f1e8eb0d851476cb2f9aef5eba79de5"}
+    list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi",
+        state=state))
+    argv = [a for a in logged(fake_cli) if a and a[0] == "exec"][0]
+    assert argv[argv.index("--session") + 1] == \
+        "mvs_2f1e8eb0d851476cb2f9aef5eba79de5"
+
+
+def test_the_session_id_is_read_back_out_of_the_stream(fake_cli, monkeypatch):
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps(TEXT_TURN))
+    state: dict = {}
+    list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi",
+        state=state))
+    assert state["session_id"] == "mvs_probe"
+    assert state["resumed"] is False
+    assert state["status"] == "succeeded"
+    assert state["usage"]["totalTokens"] == 11
+
+
+def test_a_resumed_session_says_so(fake_cli, monkeypatch):
+    """Continuity the reader cannot see is indistinguishable from a backend
+    that forgot everything."""
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps(
+        [_ev(1, "exec.started"), _ev(2, "session.resumed"),
+         _ev(3, "turn.started")]))
+    state: dict = {}
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi",
+        state=state))
+    assert state["resumed"] is True
+    notes = [e.text for e in got if e.kind == "notice"]
+    assert notes and "continuing" in notes[0]
+
+
+def test_the_final_answer_is_used_when_nothing_streamed(fake_cli, monkeypatch):
+    """mcode reports the answer on `exec.completed` whether or not it streamed.
+    A turn that produced a reply must not come back with an empty transcript."""
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps([
+        _ev(1, "exec.started"), _ev(2, "session.started"),
+        _ev(3, "turn.started"),
+        _ev(4, "turn.completed", usage={"totalTokens": 4}),
+        _ev(5, "exec.completed", result={"status": "succeeded",
+                                         "output": "a whole answer"}),
+    ]))
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
+    assert [e.text for e in got if e.kind == "text"] == ["a whole answer"]
+
+
+def test_a_streamed_answer_is_not_repeated_from_the_result(fake_cli,
+                                                           monkeypatch):
+    """The other half of the same rule — the fallback must not double a reply
+    that already arrived as deltas."""
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps(TEXT_TURN))
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
+    assert "".join(e.text for e in got if e.kind == "text") == "hello from dsh"
+
+
+def test_continuity_survives_a_real_second_call(fake_cli, monkeypatch):
+    """End to end through the driver: turn one learns the id, turn two hands it
+    back — which is the whole mechanism, with no state passed by the caller."""
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps(TEXT_TURN))
+    state: dict = {}
+    list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="one",
+        state=state))
+    list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="two",
+        state=state))
+    execs = [a for a in logged(fake_cli) if a and a[0] == "exec"]
+    assert "--session" not in execs[0]
+    assert execs[1][execs[1].index("--session") + 1] == "mvs_probe"

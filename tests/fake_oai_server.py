@@ -26,6 +26,10 @@ toolname = sys.argv[sys.argv.index("--tool") + 1] if "--tool" in sys.argv else "
 # serve — so whether an agent backend survives that 404 decides whether Rigma's
 # proxy has to learn the route or not.
 count404 = "--no-count" in sys.argv
+# `--dump PATH` writes each request body whole. The `--log` line is a summary
+# for asserting on; this is for finding out what a client actually SENDS —
+# which tool schemas, which system prompt, how much history it replays.
+dumppath = sys.argv[sys.argv.index("--dump") + 1] if "--dump" in sys.argv else ""
 _requests = {"n": 0}
 CHUNKS = ("hello ", "from ", "dsh")
 
@@ -57,6 +61,9 @@ class H(http.server.BaseHTTPRequestHandler):
                     "tools": len(body.get("tools") or []),
                     "messages": len(body.get("messages") or []),
                 }) + "\n")
+        if dumppath:
+            with open(dumppath, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"path": self.path, "body": body}) + "\n")
         if body.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

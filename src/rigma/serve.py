@@ -182,7 +182,8 @@ def _turn_prompt(s: dict) -> str:
 
 
 def _save_external_reply(sid: str, text: str, trace: list,
-                         thinking: str = "", harness: str = "") -> None:
+                         thinking: str = "", harness: str = "",
+                         backend_session: str = "") -> None:
     """Persist what an external backend said into RIGMA's session.
 
     The backend owns its own transcript, so this is not the same record — this
@@ -194,6 +195,12 @@ def _save_external_reply(sid: str, text: str, trace: list,
     only ever set for an EXTERNAL backend: a native reply needs no marker, and
     stamping every message with "native" would put a label on the ordinary case
     to explain the rare one.
+
+    `backend_session` is the BACKEND's own handle on this conversation — MiniMax
+    Code calls it a session id, and it is what lets the next turn continue
+    instead of starting over. It is stored per backend under `harness_sessions`
+    because it belongs to the chat, not to one reply, and because switching
+    backends and back must not hand one backend's id to another.
     """
     fresh = sessions.load(sid)
     if fresh is None:
@@ -211,6 +218,10 @@ def _save_external_reply(sid: str, text: str, trace: list,
         # until a second request lands — or forever, in an exported transcript.
         _h = _harness.BACKENDS.get(harness)
         entry["harness_label"] = _h.label if _h else harness
+        if backend_session:
+            fresh["harness_sessions"] = {
+                **(fresh.get("harness_sessions") or {}),
+                harness: backend_session}
     fresh["messages"] = list(fresh.get("messages", [])) + [entry]
     try:
         sessions.save(fresh, base_rev=fresh[sessions.REV_KEY])
@@ -1566,6 +1577,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         state = st.read_state() or {}
         prompt = _turn_prompt(s) or "Continue where you left off."
         sys_prompt = str(s.get("system_prompt") or "") or _default_prompt()
+        # The backend's OWN handle on this conversation, handed in and read back
+        # out. Without it every turn starts the agent from nothing and its
+        # session — its plan, its subagents, its goals — is thrown away each
+        # time, which is most of what makes it worth having. Keyed by backend so
+        # a switch away and back resumes the right one.
+        hstate: dict = {"session_id": str(
+            (s.get("harness_sessions") or {}).get(backend.name) or "")}
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
         END = object()
@@ -1581,7 +1599,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         prompt=prompt, system_prompt=sys_prompt,
                         session_id=sid, cwd=str(s.get("workspace") or ""),
                         max_tokens=EXTERNAL_MAX_TOKENS,
-                        context_window=int(state.get("ctx") or 0) or 32768):
+                        context_window=int(state.get("ctx") or 0) or 32768,
+                        state=hstate):
                     loop.call_soon_threadsafe(q.put_nowait, ev)
             except Exception as e:              # pragma: no cover - defensive
                 loop.call_soon_threadsafe(
@@ -1626,7 +1645,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception:
             pass                                # it reports its own failures
         _save_external_reply(sid, "".join(said), trace, "".join(thought),
-                             backend.name)
+                             backend.name,
+                             backend_session=str(hstate.get("session_id") or ""))
         yield b"data: [DONE]\n\n"
 
     async def _llm_turn(s: dict, cont: bool = False):

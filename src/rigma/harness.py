@@ -276,6 +276,14 @@ def adapter(name: str):
     — a backend is a subprocess doing blocking IO, and the seam's contract is
     that a stalled backend stalls a worker, never the event loop.
 
+    `session_id` is the CALLER's session id, for a backend that wants to key its
+    own logs on it. `state` is the other direction and belongs to the BACKEND: a
+    mutable dict the adapter reads to resume and writes to be remembered. MiniMax
+    Code puts its own session id there, which is what lets the next turn
+    continue the conversation instead of starting it over — and that continuity
+    is most of what makes an external agent worth handing a turn to. Rigma
+    persists it per backend, so switching away and back resumes the right one.
+
     Imported lazily so a broken or absent adapter cannot take down the menu.
     """
     mod = _ADAPTERS.get(str(name or "").strip().lower())
