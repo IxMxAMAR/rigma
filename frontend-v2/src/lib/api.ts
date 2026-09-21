@@ -49,6 +49,13 @@ export interface HarnessInfo {
    *  checked — which is not the same as "it matches". `rigma harness` compares
    *  it with whatever is installed. */
   verified: string;
+  /** What the backend ACTUALLY is, when the caller asked for a check. Empty
+   *  when nobody asked. */
+  version?: string;
+  /** `true` it moved, `false` it still matches, `null` one side could not say.
+   *  `null` is not `false` — "I could not tell" is a different sentence to the
+   *  owner than "it agrees". Absent when no check was run. */
+  drift?: boolean | null;
   unsupported: string[];
   pending: string;
 }
@@ -88,6 +95,12 @@ export const api = {
     j<{ ok: boolean; stopped: boolean }>(
       "POST", `/api/sessions/${id}/stop`, {}),
   /** The honest menu: every backend, including the ones that cannot run a turn
-   *  yet, each with what it would cost. */
-  listHarnesses: () => j<HarnessMenu>("GET", "/api/harnesses"),
+   *  yet, each with what it would cost.
+   *
+   *  `check` additionally asks each backend what version it actually is, which
+   *  costs a subprocess per backend — so the caller asks for the plain list
+   *  first and this one after, and the warning arrives late rather than the
+   *  menu. */
+  listHarnesses: (check = false) =>
+    j<HarnessMenu>("GET", `/api/harnesses${check ? "?check=1" : ""}`),
 };

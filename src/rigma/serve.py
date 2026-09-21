@@ -1484,13 +1484,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return presets.list_presets(registry)
 
     @app.get("/api/harnesses")
-    async def list_harnesses():
+    async def list_harnesses(check: int = 0):
         """The agent backends, and what choosing one would cost.
 
         Only the built-in can run a turn today; the external ones are listed
         with `installed` (is the SDK/CLI present?) kept separate from
         `runnable` (can a turn be handed to it?), so a probe is never mistaken
-        for a working integration."""
+        for a working integration.
+
+        `check=1` also asks each backend what version it actually is and reports
+        whether it still matches the build its adapter was measured against.
+        OFF by default because it starts a process per backend, and the menu is
+        wanted immediately: the caller fetches the plain list first and this one
+        after, so the warning arrives a moment late instead of the menu arriving
+        a moment late.
+        """
         from . import harness as _harness
         # RIGMA'S port, not the engine's. `upstream_port` is llama-server, which
         # this app proxies to; an external harness pointed there would speak to
@@ -1498,9 +1506,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # the seam is for. Same source as `openai_base` below.
         _s = st.read_state() or {}
         _public = int(_s.get("public_port") or 0) or upstream_port + 1
+        harnesses = _harness.list_harnesses()
+        if check:
+            # A version probe per backend, so only for a caller who asked.
+            try:
+                known = {c.get("name"): c for c in _harness.conformance()}
+            except Exception:
+                known = {}
+            for h in harnesses:
+                c = known.get(h.get("name")) or {}
+                h["version"] = str(c.get("version") or "")
+                # True / False / None, and None is NOT False: it means one side
+                # could not say, which is a different sentence to the owner.
+                h["drift"] = c.get("drift")
         return {"built_in": _harness.NATIVE,
                 "endpoint": _harness.endpoint_for(_public),
-                "harnesses": _harness.list_harnesses()}
+                "harnesses": harnesses}
 
     @app.post("/api/presets")
     async def create_preset(body: dict | None = None):
