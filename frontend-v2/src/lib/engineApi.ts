@@ -230,6 +230,23 @@ export interface HfRepoDetail extends ProbedFacts {
   recommended?: string | null;
 }
 
+/** A decision the engine announced once at load and never mentioned again.
+ *
+ *  The point of these is that the flag being SET and the flag being IN EFFECT
+ *  are different facts: `--cache-reuse 256` is passed on every launch and the
+ *  engine refuses it on a hybrid model, silently, forever. Nothing else in the
+ *  app can see that. */
+export interface EngineFinding {
+  id: string;
+  severity: "info" | "warn";
+  message: string;
+  count: number;
+  /** Observed in this machine's own logs, as opposed to matched best-effort
+   *  from upstream reports. */
+  confirmed_here: boolean;
+  example: string;
+}
+
 export const engineApi = {
   server: () => j<ServerInfo>("GET", "/api/server"),
   switchOptions: () => j<SwitchOption[]>("GET", "/api/server/switch-options"),
@@ -250,6 +267,9 @@ export const engineApi = {
   load: () => j<unknown>("POST", "/api/server/load", {}),
   unload: () => j<unknown>("POST", "/api/server/unload", {}),
   recalibrate: () => j<unknown>("POST", "/api/server/recalibrate", {}),
+  /** Read from the WHOLE log, not the tail: these land in the first few hundred
+   *  lines of a launch and are long gone by the time anyone looks. */
+  findings: () => j<{ findings: EngineFinding[] }>("GET", "/api/server/findings"),
   log: async (lines = 120): Promise<string> => {
     const r = await fetch(`/api/server/log?lines=${lines}`);
     return r.ok ? r.text() : "";
