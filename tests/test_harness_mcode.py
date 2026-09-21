@@ -12,6 +12,8 @@ Nothing here needs mcode installed, a MiniMax account, or a GPU.
 import json
 import os
 import sys
+import threading
+import time
 
 import pytest
 
@@ -250,6 +252,9 @@ if cmd == "exec":
     for line in json.loads(os.environ["FAKE_MCODE_EVENTS"]):
         sys.stdout.write(json.dumps(line) + "\\n")
     sys.stdout.flush()
+    if os.environ.get("FAKE_MCODE_HANG"):
+        import time
+        time.sleep(600)
     sys.exit(int(os.environ.get("FAKE_MCODE_EXIT", "0")))
 sys.exit(2)
 '''
@@ -452,6 +457,77 @@ def test_a_fresh_process_re_asks_even_though_the_marker_is_there(fake_cli,
     # a second turn in the SAME process must not ask again
     _one_turn()
     assert len(list_calls(fake_cli)) == 1
+
+
+# --------------------------------------------------------------------------
+# Stopping a turn
+
+
+def test_a_cancel_stops_a_silent_turn_without_losing_the_session(fake_cli,
+                                                                 monkeypatch):
+    """An interrupt must cost the TURN, not the thread.
+
+    The child says one thing and then goes quiet — which is what mcode does
+    while it thinks, and therefore the state a stop has to work in. A stop that
+    only takes effect at the next output line would not be a stop at all.
+
+    The session id is recorded before the silence, so the next turn continues
+    this conversation instead of starting the agent over. Losing it would make
+    "stop" mean "forget everything", which is the opposite of what it is for.
+    """
+    monkeypatch.setenv("FAKE_MCODE_HANG", "1")
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps([
+        {"type": "session.started", "sessionId": "mvs_interrupted"}]))
+    cancel = threading.Event()
+    state: dict = {}
+    got: list = []
+
+    def _run():
+        got.extend(harness_mcode.drive_turn(
+            base_url="http://127.0.0.1:11500/v1", model="local-test",
+            prompt="hi", state=state, cancel=cancel))
+
+    t = threading.Thread(target=_run)
+    t.start()
+    time.sleep(1.5)
+    cancel.set()
+    t.join(timeout=25)
+
+    assert not t.is_alive(), "a cancel must land without the child speaking"
+    assert state.get("session_id") == "mvs_interrupted"
+    assert [e.text for e in got if e.kind == "notice"] == ["stopped"]
+    assert [e.text for e in got if e.kind == "error"] == []
+
+
+def test_stopping_is_not_reported_as_a_failure(fake_cli, monkeypatch):
+    """Nothing failed, so nothing may be reported as an error — a red line in
+    the transcript would make a deliberate stop look like a broken backend."""
+    monkeypatch.setenv("FAKE_MCODE_HANG", "1")
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps([]))
+    cancel = threading.Event()
+    got: list = []
+
+    def _run():
+        got.extend(harness_mcode.drive_turn(
+            base_url="http://127.0.0.1:11500/v1", model="local-test",
+            prompt="hi", cancel=cancel))
+
+    t = threading.Thread(target=_run)
+    t.start()
+    time.sleep(1.0)
+    cancel.set()
+    t.join(timeout=25)
+    assert not t.is_alive()
+    assert [e.kind for e in got] == ["notice"], got
+
+
+def test_no_cancel_means_the_turn_runs_to_the_end(fake_cli):
+    """The event is opt-in: a caller that does not pass one must see the turn
+    finish normally, not be cut short by a stray default."""
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="local-test", prompt="hi"))
+    assert {e.kind for e in got} == {"text"}, got
+    assert "".join(e.text for e in got) == "hello from dsh"
 
 
 def test_a_missing_cli_is_reported_and_never_raised(monkeypatch, tmp_path):

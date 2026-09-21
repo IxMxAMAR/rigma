@@ -38,6 +38,7 @@ from pathlib import Path
 # rather than redefined so a driver and the turn loop cannot drift apart — and
 # so `harness_dsh.TurnEvent` keeps naming the same type.
 from .harness import TurnEvent
+from . import harness as _harness
 
 # The checkout this machine actually has. The env override exists because a
 # checkout is a user's directory, not a fact about Rigma.
@@ -316,11 +317,20 @@ def drive_turn(
     context_window: int = 32768,
     timeout: float = 1800.0,
     dsh_home: str | None = None,
+    cancel: threading.Event | None = None,
 ) -> Iterator[TurnEvent]:
     """Run one turn on DSH and yield what happened.
 
     Never raises: a failure arrives as an `error` event, because the caller is a
     tool and a tool that raises teaches the model nothing it can act on.
+
+    `cancel` kills the child process, which is the same lever the timeout uses.
+    The SDK is BATCH — it reports a whole turn rather than streaming it — so
+    there is no per-event boundary at which a cancel could be noticed, and
+    killing the process is the only stop that arrives promptly. NOT VERIFIED
+    END TO END: DSH is not installed on the machine this was written on, so the
+    path is written to the same shape as the mcode one and exercised only by
+    unit tests with a stand-in child.
     """
     state = _Run()
     tmpdir = ""
@@ -365,6 +375,20 @@ def drive_turn(
             env=env,
         )
         _start_readers(state)
+        if cancel is not None:
+            def _watch_cancel() -> None:
+                """Same shape as mcode's: wait on the event, poll only to end.
+
+                The TREE, not the runner: the SDK drives a Node child, and
+                killing the Python runner alone would leave that child running
+                with the pipes open — the read loop would never see EOF, which
+                turns a stop into a hang.
+                """
+                while not cancel.wait(0.25):
+                    if state.proc is None or state.proc.poll() is not None:
+                        return
+                _harness.kill_tree(state.proc)
+            threading.Thread(target=_watch_cancel, daemon=True).start()
         try:
             assert state.proc.stdin is not None
             state.proc.stdin.write(json.dumps(job) + "\n")

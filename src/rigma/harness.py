@@ -29,7 +29,9 @@ the native loop would be a lie the user cannot see from the output.
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 from typing import Callable
 
@@ -263,6 +265,31 @@ def resolve(name: str | None, *, port: int | None = None) -> Harness:
 _ADAPTERS = {DSH: "harness_dsh", MCODE: "harness_mcode"}
 
 
+def kill_tree(proc) -> None:
+    """Kill a backend process AND everything it started.
+
+    An adapter is handed a `.cmd` shim on Windows, so the process Rigma holds is
+    a SHELL whose real work is a grandchild. Killing only the shell leaves the
+    agent running and — the part that actually bites — leaves the pipe to stdout
+    OPEN, so the read loop never sees EOF and the turn never ends. That is the
+    difference between a stop button and a hang, and it was found by a test that
+    hung rather than by reading the code.
+
+    Killing the tree is also what stops an agent's SUBAGENTS. The arm spawns
+    child agents of its own, and a stop that leaves them running is not a stop.
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            pass                    # fall through: proc.kill still gets the shell
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def adapter(name: str):
     """The module that drives `name`, or None for the native loop.
 
@@ -270,7 +297,7 @@ def adapter(name: str):
 
         drive_turn(*, base_url, model, prompt, system_prompt="", session_id="",
                    cwd="", max_tokens=4096, context_window=32768,
-                   timeout=1800.0) -> Iterator[TurnEvent]
+                   timeout=1800.0, cancel=None) -> Iterator[TurnEvent]
 
     It is a BLOCKING generator: the caller owns the thread. That is deliberate
     — a backend is a subprocess doing blocking IO, and the seam's contract is
@@ -283,6 +310,17 @@ def adapter(name: str):
     continue the conversation instead of starting it over — and that continuity
     is most of what makes an external agent worth handing a turn to. Rigma
     persists it per backend, so switching away and back resumes the right one.
+
+    `cancel` is a `threading.Event` the OWNER sets to stop the turn, and an
+    adapter that ignores it is not finished. A THREADING event and not an
+    asyncio one, because the adapter runs on a worker thread: the chat route
+    sets it from the event loop and the adapter reads it where the work is. An
+    adapter should WAIT on it rather than poll between output lines — a backend
+    that has gone quiet, waiting on a model or on a subagent it spawned, is
+    exactly the one worth stopping, and it is the one that emits nothing to
+    check against. Stopping is not failing: report it as a notice, and make sure
+    whatever the backend needs to resume is still written to `state`, so the
+    next turn continues instead of starting over.
 
     Imported lazily so a broken or absent adapter cannot take down the menu.
     """
