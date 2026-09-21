@@ -14,6 +14,11 @@ export interface ChatMessage {
   variants?: unknown[];
   kind?: string;          // "tool_result" = model-context carrier, not UI
   notice?: string;        // server-authored status line — shown, never fed
+  /** Which EXTERNAL agent backend wrote this reply, and what to call it. Both
+   *  are absent on a reply the built-in loop wrote: the badge explains the
+   *  unusual case, so the ordinary one carries no marker. */
+  harness?: string;
+  harness_label?: string;
 }
 
 export interface Session {
@@ -22,6 +27,30 @@ export interface Session {
   messages: ChatMessage[];
   use_rag?: boolean;
   use_tools?: boolean;
+  harness?: string;
+}
+
+/** One agent backend, and what choosing it would cost.
+ *
+ *  `runnable` (can a turn be handed to it?) is deliberately separate from
+ *  `installed` (is it on this machine?): a backend can be present and still not
+ *  wired up, and collapsing the two is how a probe becomes a silent fallback. */
+export interface HarnessInfo {
+  name: string;
+  label: string;
+  drives: string;
+  runnable: boolean;
+  installed: boolean;
+  needs: string;
+  wire: string;
+  unsupported: string[];
+  pending: string;
+}
+
+export interface HarnessMenu {
+  built_in: string;
+  endpoint: string;
+  harnesses: HarnessInfo[];
 }
 
 async function j<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -44,4 +73,7 @@ export const api = {
   updateSession: (id: string, patch: Record<string, unknown>) =>
     j<Session>("POST", `/api/sessions/${id}`, patch),
   deleteSession: (id: string) => j<unknown>("DELETE", `/api/sessions/${id}`),
+  /** The honest menu: every backend, including the ones that cannot run a turn
+   *  yet, each with what it would cost. */
+  listHarnesses: () => j<HarnessMenu>("GET", "/api/harnesses"),
 };

@@ -150,6 +150,55 @@ describe("macro turns", () => {
 // Stop used to throw the partial reply away: the turn never reaches the
 // server's persist step, so what was on screen was the only copy. send() now
 // appends it — exactly once, which is what alreadySaved() decides.
+describe("which backend drove a turn", () => {
+  it("names the backend from the harness event sent at the START of the turn", () => {
+    // An external turn can run for a minute before its first token, so the
+    // server names the backend up front rather than with the reply.
+    const t = applyEvent(emptyTurn(), {
+      event: "harness",
+      data: { name: "dsh", label: "DeepSeek Harness" },
+    });
+    expect(t.harness).toBe("dsh");
+    expect(t.harnessLabel).toBe("DeepSeek Harness");
+  });
+
+  it("is not set by the meta payloads, which mean other things", () => {
+    // `meta` carries ctx and timings at the end of a turn and a new title from
+    // the auto-titler. Backend identity is its own event so that a context
+    // update can never set the badge — and so that a failed turn, which
+    // suppresses meta, still says which backend ran.
+    const t = feed(emptyTurn(), [
+      ["harness", { name: "dsh", label: "DeepSeek Harness" }],
+      ["meta", { ctx: 32768, prompt_tokens: 900, predicted_per_second: 41 }],
+      ["meta", { title: "A new title" }],
+    ]);
+    expect(t.harness).toBe("dsh");
+    expect(t.harnessLabel).toBe("DeepSeek Harness");
+  });
+
+  it("leaves the backend unnamed when the event carries nothing", () => {
+    const t = applyEvent(emptyTurn(), { event: "harness", data: {} });
+    expect(t.harness).toBe("");
+    expect(t.harnessLabel).toBe("");
+  });
+
+  it("keeps a server notice on the turn instead of dropping it", () => {
+    // The reducer had no `notice` case, so every status line the server sent —
+    // including the one explaining that an external backend is driving, with
+    // none of Rigma's tool-call repair behind it — fell through the default.
+    const t = applyEvent(emptyTurn(), {
+      event: "notice",
+      data: { note: "an external agent is driving this turn" },
+    });
+    expect(t.notices).toEqual(["an external agent is driving this turn"]);
+  });
+
+  it("ignores an empty notice rather than rendering a blank line", () => {
+    const t = applyEvent(emptyTurn(), { event: "notice", data: {} });
+    expect(t.notices).toEqual([]);
+  });
+});
+
 describe("stopped-turn persistence", () => {
   const asst = (content: string): ChatMessage =>
     ({ role: "assistant", content }) as ChatMessage;
@@ -207,6 +256,7 @@ const h = vi.hoisted(() => ({
     createSession: vi.fn(),
     updateSession: vi.fn(),
     deleteSession: vi.fn(),
+    listHarnesses: vi.fn(),
   },
 }));
 
@@ -227,6 +277,49 @@ const PRISTINE = useChat.getState();
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 const asUser = (t: string) => ({ role: "user", content: t }) as ChatMessage;
 const asAsst = (t: string) => ({ role: "assistant", content: t }) as ChatMessage;
+
+describe("store: choosing an agent backend", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useChat.setState(PRISTINE, true);
+  });
+
+  it("takes the current backend from the session it opens", async () => {
+    h.api.getSession.mockResolvedValue(
+      { id: "A", title: "a", messages: [], harness: "dsh" });
+    await useChat.getState().open("A");
+    expect(useChat.getState().harness).toBe("dsh");
+  });
+
+  it("defaults to the built-in when the session does not say", async () => {
+    h.api.getSession.mockResolvedValue({ id: "A", title: "a", messages: [] });
+    await useChat.getState().open("A");
+    expect(useChat.getState().harness).toBe("native");
+  });
+
+  it("keeps the new backend when the server accepts it", async () => {
+    h.api.getSession.mockResolvedValue({ id: "A", title: "a", messages: [] });
+    h.api.updateSession.mockResolvedValue({ id: "A" });
+    await useChat.getState().open("A");
+    await useChat.getState().setHarness("dsh");
+    expect(useChat.getState().harness).toBe("dsh");
+    expect(h.api.updateSession).toHaveBeenCalledWith("A", { harness: "dsh" });
+  });
+
+  it("puts the old backend back when the server refuses the new one", async () => {
+    // The server validates this write and refuses a backend it cannot run, so
+    // unlike every other session patch this one must not swallow the failure:
+    // the picker would show a backend the next turn will not actually use.
+    h.api.getSession.mockResolvedValue({ id: "A", title: "a", messages: [] });
+    h.api.updateSession.mockRejectedValue(
+      new Error("MiniMax Code cannot run a turn yet: the adapter is not "
+                + "written yet"));
+    await useChat.getState().open("A");
+    await useChat.getState().setHarness("mcode");
+    expect(useChat.getState().harness).toBe("native");
+    expect(useChat.getState().lastError).toMatch(/cannot run a turn yet/);
+  });
+});
 
 describe("store: one chat's turn never lands in another chat", () => {
   let server: Record<string, FakeSession>;
