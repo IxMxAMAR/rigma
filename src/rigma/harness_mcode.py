@@ -96,6 +96,17 @@ _SETUP_TIMEOUT = 120.0
 # bounds the RUN; this bounds the PROCESS, so a wedged child cannot outlive the
 # turn it belongs to.
 _KILL_GRACE = 30.0
+# mcode's documented exit codes. The number alone sends a reader to look it up;
+# the number AND the meaning makes a transcript self-explaining.
+_EXIT_MEANING = {
+    2: "the command was malformed",
+    3: "mcode could not use its configuration",
+    4: "the run failed",
+    6: "the run timed out",
+    7: "the run hit a runtime limit",
+    70: "mcode hit an internal error",
+    130: "the run was cancelled",
+}
 # Tool-call item status codes seen: 4 on first sight, then 5, then 1 while the
 # arguments stream in, then 3 with the result. The numbers are not documented
 # and the ORDER was not stable enough to key on, so `output` — which only ever
@@ -132,6 +143,67 @@ def data_home() -> Path:
 def _env() -> dict:
     return {**os.environ, "MINIMAX_DATA_DIR": str(data_home()),
             API_KEY_ENV: _API_KEY}
+
+
+# Rigma's one channel into the agent, and it is the agent's OWN documented one:
+# `<dataDir>/AGENTS.md` is the global instruction file, and Rigma owns the data
+# dir. This is how an arm can be told about the world it is running in without
+# anyone touching its prompt — mcode has NO append/override mechanism for that
+# (no flag, no config key, no env var), so a wrapper that wants to contribute
+# context has exactly two options: this file, or the user's own project.
+#
+# WHAT IT MAY SAY. Environment facts the agent cannot discover — above all that
+# the model behind its provider is a local one tuned for this machine, not a
+# frontier model. What it may NOT do is tell the agent how to work: mcode's
+# instruction set is the thing worth borrowing, and adding opinions to it
+# dilutes the very benchmark this backend was chosen for.
+_AGENTS_MARKER = "<!-- rigma-owned: environment description -->"
+_AGENTS_VERSION = 1
+_AGENTS_MD = f"""\
+{_AGENTS_MARKER}
+<!-- version: {_AGENTS_VERSION} — Rigma rewrites this file only while this
+     marker is present. Delete the marker, or the file, and Rigma leaves it
+     alone from then on. -->
+
+# The environment you are running in
+
+Your provider `{PROVIDER}` is served by Rigma, which runs on the user's own
+machine. The model behind it is a local LLM chosen and tuned for that machine's
+hardware — not a frontier cloud model. Rigma owns the endpoint, the context
+window and the KV policy; you own your tools, your plan and your session.
+
+Two consequences worth having in mind:
+
+- The model is smaller than the ones you may be calibrated for. Small,
+  verifiable steps land better than long plans, and re-reading a file is
+  cheaper than being wrong about what it says.
+- Your workspace is the folder the user opened for this chat. Rigma renders
+  your replies and your tool calls into the chat transcript as they happen, so
+  the user is watching the work rather than reading a summary of it at the end.
+
+Nothing else here is Rigma's. Your system prompt, your tool roster, your
+session and your permission decisions are yours, and Rigma does not rewrite
+them. This file is environment description and nothing more.
+"""
+
+
+def ensure_agents_md() -> None:
+    """Install Rigma's environment note into the agent's own data dir.
+
+    Written once. Rigma rewrites it only while its marker is still in the file,
+    so a user who edits or deletes it is not fought — the file lives in a
+    directory Rigma owns, but what it says about the agent's world is worth
+    being able to correct by hand.
+    """
+    path = data_home() / "AGENTS.md"
+    try:
+        if path.exists():
+            head = path.read_text(encoding="utf-8", errors="replace")[:200]
+            if _AGENTS_MARKER not in head or f"version: {_AGENTS_VERSION}" in head:
+                return
+        path.write_text(_AGENTS_MD, encoding="utf-8")
+    except OSError:
+        pass            # a note that cannot be written is not a failed turn
 
 
 def _run(argv: list[str], timeout: float) -> tuple[int, str]:
@@ -319,6 +391,7 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     if why:
         yield TurnEvent("error", why)
         return
+    ensure_agents_md()
 
     resume = str((state or {}).get("session_id") or "").strip()
     argv = [exe, "exec", "--output-format", "stream-json",
@@ -370,6 +443,7 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     seen: dict = {}
     failed = False
     said = False
+    final_status = ""
     try:
         for line in proc.stdout:
             line = line.strip()
@@ -397,8 +471,9 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
                 continue
             if kind == "exec.completed":
                 result = obj.get("result") or {}
+                final_status = str(result.get("status") or "")
                 if state is not None:
-                    state["status"] = str(result.get("status") or "")
+                    state["status"] = final_status
                 # The final answer, for a model that never streamed one. mcode
                 # reports it either way, and a turn that produced a reply must
                 # not come back with an empty transcript.
@@ -432,4 +507,14 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
         return
     if proc.returncode not in (0, None) and not failed:
         tail = " / ".join(list(err_lines)[-4:])[:400]
-        yield TurnEvent("error", f"mcode exited {proc.returncode}: {tail}")
+        why = _EXIT_MEANING.get(proc.returncode, "")
+        yield TurnEvent("error",
+                        f"mcode exited {proc.returncode}"
+                        + (f" ({why})" if why else "")
+                        + (f": {tail}" if tail else ""))
+        return
+    # A run can end unsuccessfully while the process still exits 0: a step
+    # limit or a cancellation is reported in the RESULT, not in the code. The
+    # documented advice is to check both, so both are checked.
+    if final_status and final_status != "succeeded" and not failed:
+        yield TurnEvent("error", f"the run ended as {final_status}")
