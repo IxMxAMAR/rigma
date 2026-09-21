@@ -551,9 +551,21 @@ export const useChat = create<ChatState>((set, get) => ({
   // where the transcript reload already lives — two writers racing over the
   // same message list is how a stopped reply ends up duplicated or lost.
   // It cancels the chat ON SCREEN: the button lives in that chat's composer.
+  //
+  // But aborting the fetch only drops THIS BROWSER'S END of the stream. The
+  // server's turn keeps running: for the native loop the engine generates on,
+  // and for an external agent the process — and any subagents it spawned —
+  // keeps going while the transcript says "stopped". So the server is told
+  // first, and the local abort follows once that request has settled. Order
+  // matters: a disconnect processed before the stop would tear down the
+  // registry entry the stop route reads, and the stop would silently do
+  // nothing.
   stop: () => {
     const { currentId } = get();
-    if (currentId) get().aborts[currentId]?.abort();
+    if (!currentId) return;
+    void api.stopSession(currentId)
+      .catch(() => {})
+      .then(() => get().aborts[currentId]?.abort());
   },
 
   clearError: () => set({ lastError: null }),

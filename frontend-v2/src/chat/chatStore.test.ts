@@ -256,6 +256,7 @@ const h = vi.hoisted(() => ({
     createSession: vi.fn(),
     updateSession: vi.fn(),
     deleteSession: vi.fn(),
+    stopSession: vi.fn(async () => ({ ok: true, stopped: true })),
     listHarnesses: vi.fn(),
   },
 }));
@@ -400,11 +401,40 @@ describe("store: one chat's turn never lands in another chat", () => {
     await tick();
     await useChat.getState().open("A");
     useChat.getState().stop();
+    // the server is told first; the local stream drops once that has settled
+    await tick();
     expect(signals.A.aborted).toBe(true);
     expect(signals.B.aborted).toBe(false);
     await useChat.getState().open("B");
     useChat.getState().stop();
+    await tick();
     await Promise.all([a, b]);
+  });
+
+  it("asks the SERVER to stop, not just this browser's stream", async () => {
+    // Aborting the fetch only ends this browser's end of it. The server's turn
+    // runs on — and for an external agent, so does its process and every
+    // subagent it spawned — while the transcript says "stopped". The order is
+    // the point: a disconnect processed before the stop would tear down the
+    // registry entry the stop route reads, and the stop would do nothing.
+    const signals: Record<string, AbortSignal> = {};
+    h.streamChat.mockImplementation(
+      async (sid: string, _body: unknown, _on: unknown, signal: AbortSignal) => {
+        signals[sid] = signal;
+        await new Promise<void>((_res, rej) => {
+          signal.addEventListener("abort", () =>
+            rej(Object.assign(new Error("aborted"), { name: "AbortError" })));
+        });
+      });
+    await useChat.getState().open("A");
+    const a = useChat.getState().send("write");
+    await tick();
+    useChat.getState().stop();
+    expect(h.api.stopSession).toHaveBeenCalledWith("A");
+    expect(signals.A.aborted).toBe(false);   // asked for before letting go
+    await tick();
+    expect(signals.A.aborted).toBe(true);
+    await a;
   });
 
   it("re-opening a chat mid-reply does not let a second turn start in it",
