@@ -11,6 +11,12 @@
 // reading "bash" and nothing else was the one call a reader most needs to see.
 export const IDENTITY_KEYS = [
   "command", "cmd", "path", "paths", "pattern", "url", "query", "question",
+  // `agent_name` BEFORE `description`, and it is the whole reason it is here.
+  // mcode's `task` takes description, prompt and agent_name (all required,
+  // measured off the wire), and "spawn a subagent to do X" is identified by
+  // WHICH subagent — worker, explore, verifier — not by its prose. The
+  // description still appears, on the opened chip's JSON line.
+  "agent_name",
   "description", "objective", "name", "todos", "task", "task_id", "id",
   "action",
 ];
