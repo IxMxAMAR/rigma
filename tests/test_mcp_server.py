@@ -137,8 +137,36 @@ def test_the_roster_is_exactly_what_was_justified():
     `remember`/`recall` earn their two small schemas because they are the one
     kind of memory the arm does not have: its session remembers the
     conversation, but not the durable facts about the user.
+
+    `undo_last_change` earns its schema because the arm has no undo of its own.
+    It could not be offered before: the journal only held RIGMA's own
+    write_file/edit_file, so it answered "nothing to undo" every time — a tool
+    that looks like it works and finds nothing. `watch.py` is what changed that.
     """
-    assert mcp_server._ROSTER == ("search_my_documents", "remember", "recall")
+    assert mcp_server._ROSTER == ("search_my_documents", "remember", "recall",
+                                  "undo_last_change")
+
+
+def test_undo_is_offered_only_when_there_is_a_workspace_to_restore(
+        docs, monkeypatch):
+    """Without a workspace the tool has nothing to restore and no way to tell
+    which project a change belongs to, so it would be a schema on every request
+    that only ever answers "no workspace folder is set"."""
+    monkeypatch.setenv("RIGMA_MCP_ALLOW_CODE", "1")
+    monkeypatch.setenv("RIGMA_MCP_WORKSPACE", "C:/work")
+    assert "undo_last_change" in [t["name"] for t in mcp_server.offered()]
+
+    monkeypatch.delenv("RIGMA_MCP_WORKSPACE", raising=False)
+    assert "undo_last_change" not in [t["name"] for t in mcp_server.offered()]
+
+
+def test_undo_needs_the_capability_granted_not_assumed(docs, monkeypatch):
+    """The server is pessimistic: `needs="code"` tools are refused unless the
+    environment turns the capability on. The registrar is what grants it, so a
+    server nobody configured cannot hand out a file-restoring tool."""
+    monkeypatch.setenv("RIGMA_MCP_WORKSPACE", "C:/work")
+    monkeypatch.delenv("RIGMA_MCP_ALLOW_CODE", raising=False)
+    assert "undo_last_change" not in [t["name"] for t in mcp_server.offered()]
 
 
 def test_the_memory_tools_are_offered_without_any_documents(docs):

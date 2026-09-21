@@ -897,15 +897,20 @@ def mcp_file(tmp_path):
     return tmp_path / "home" / "mcode" / "mcp.json"
 
 
-def test_the_documents_tool_is_offered_only_when_there_are_documents(fake_cli,
-                                                                    tmp_path):
+def test_the_server_is_registered_even_with_no_documents(fake_cli, tmp_path):
     """This is the whole point of item 5: Rigma's own tool reaching an external
     agent WITHOUT Rigma touching a message the agent sends to its model. MCP
-    makes Rigma a tool PROVIDER; the arm decides whether to call it."""
-    harness_mcode.ensure_mcp(str(tmp_path))
-    assert not mcp_file(tmp_path).exists(), "nothing to offer, nothing to register"
+    makes Rigma a tool PROVIDER; the arm decides whether to call it.
 
-    seed_docs(tmp_path)
+    The gate used to be `is a RAG sidecar live`, which is only one of four roster
+    entries — so with nothing indexed the arm also lost `remember`, `recall` and
+    `undo_last_change`, none of which need documents. Registration now asks what
+    would actually be offered.
+
+    That does change the cost: the server is spawned on every turn rather than
+    only when documents exist. It is worth it — memory and undo are the two
+    things the arm has no equivalent of — but it is a real trade, not a free one.
+    """
     harness_mcode.ensure_mcp(str(tmp_path))
     entry = json.loads(mcp_file(tmp_path).read_text(encoding="utf-8"))
     assert "rigma" in entry["mcpServers"]
@@ -923,15 +928,29 @@ def test_the_registration_points_at_rigmas_own_interpreter(fake_cli, tmp_path):
     # passed, not guessed: a tool on the wrong directory is worse than a refusal
     assert spec["env"]["RIGMA_MCP_WORKSPACE"] == r"C:\work"
     assert spec["env"]["RIGMA_HOME"] == str(tmp_path / "home")
+    # granted at the registration site rather than assumed by the server, which
+    # is pessimistic by default. Only `undo_last_change` needs it.
+    assert spec["env"]["RIGMA_MCP_ALLOW_CODE"] == "1"
 
 
 def test_the_registration_is_taken_away_when_there_is_nothing_to_offer(
-        fake_cli, tmp_path):
+        fake_cli, tmp_path, monkeypatch):
     """An MCP server with an empty roster still costs a process launch on every
-    turn. Leaving the pointer behind would pay that for nothing."""
+    turn. Leaving the pointer behind would pay that for nothing.
+
+    Tested by emptying the roster rather than by removing the documents, because
+    the roster no longer depends on documents: `remember` and `recall` are always
+    offerable, so no on-disk state makes it empty. The mechanism still has to
+    work, which is what this pins.
+    """
+    from rigma import mcp_server
+
     seed_docs(tmp_path)
     harness_mcode.ensure_mcp(str(tmp_path))
-    (tmp_path / "home" / "rag" / "sidecar.json").unlink()
+    assert "rigma" in json.loads(
+        mcp_file(tmp_path).read_text(encoding="utf-8"))["mcpServers"]
+
+    monkeypatch.setattr(mcp_server, "offered", lambda **kw: [])
     harness_mcode.ensure_mcp(str(tmp_path))
     left = json.loads(mcp_file(tmp_path).read_text(encoding="utf-8"))
     assert "rigma" not in (left.get("mcpServers") or {})
