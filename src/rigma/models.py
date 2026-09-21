@@ -119,6 +119,11 @@ class LaunchDefaults(BaseModel):
     # Vulkan driver rather than erroring.
     spec_type: str = ""
     spec_n_max: int = 0
+    # which compute backend to launch on, for a model that only runs on one.
+    # Ternary-Bonsai-2's PQ2_0 weights need the prism fork's ROCm kernels; the
+    # Vulkan backend loads them without complaint and then falls back to CPU
+    # for every ternary tensor, which reads as a hang rather than an error.
+    backend: str = ""
 
     def is_set(self, field: str) -> bool:
         """Whether this field carries an opinion. `vision` is the odd one: its
@@ -131,7 +136,8 @@ class LaunchDefaults(BaseModel):
     def as_overrides(self) -> dict:
         """Only the fields that were actually set, for merging over a request."""
         return {f: getattr(self, f) for f in
-                ("quant", "ctx", "kv", "vision", "spec_type", "spec_n_max")
+                ("quant", "ctx", "kv", "vision", "spec_type", "spec_n_max",
+                 "backend")
                 if self.is_set(f)}
 
 
