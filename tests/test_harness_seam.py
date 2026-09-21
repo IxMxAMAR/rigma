@@ -110,3 +110,25 @@ def test_the_api_lists_the_harnesses(monkeypatch, tmp_path):
     assert {"native", "dsh", "mcode"} <= names
     # the built-in is the only one a session may select today
     assert [h["name"] for h in body["harnesses"] if h["runnable"]] == ["native"]
+
+
+def test_the_advertised_endpoint_is_rigmas_not_the_engines(monkeypatch):
+    """Every backend is pointed at RIGMA's /v1, never at llama-server's.
+
+    `build_app(upstream_port)` proxies to the engine, so handing that port to
+    `endpoint_for` aimed every external harness straight at llama-server —
+    bypassing the session, the repair layer and the idle-unload bookkeeping,
+    which is exactly the silent bypass the seam exists to prevent. The public
+    port is read from the same state the OpenAI base is built from.
+    """
+    from fastapi.testclient import TestClient
+
+    from rigma import serve
+    from rigma import state as st
+
+    monkeypatch.setattr(st, "read_state",
+                        lambda: {"public_port": 11500, "model": "m"})
+    with TestClient(serve.build_app(11499)) as c:
+        body = c.get("/api/harnesses").json()
+    assert body["endpoint"] == "http://127.0.0.1:11500/v1"
+    assert "11499" not in body["endpoint"]
