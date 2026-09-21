@@ -389,6 +389,8 @@ def perform_switch(model: str, registry=None, profile=None,
             quant = d["quant"]
         if vision is None and "vision" in d:
             vision = d["vision"]
+        if backend is None and "backend" in d:
+            backend = d["backend"]
     on_disk = [g for g in spec_full.ggufs if _model_on_disk(g)]
     if not on_disk:
         raise RuntimeError(

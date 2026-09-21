@@ -906,6 +906,15 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             if pick is not None and _model_on_disk(pick):
                 rp.gguf = pick
                 rp.origin += "+default-quant"
+        if "backend" in _d and _d["backend"] != rp.backend:
+            _avail = p.primary_gpu.backends if p.primary_gpu else []
+            if _d["backend"] not in _avail:
+                typer.echo(f"{rp.model_slug} pins the {_d['backend']} backend, "
+                           f"which this GPU does not offer "
+                           f"({', '.join(_avail) or 'none'})")
+                raise typer.Exit(1)
+            rp.backend = _d["backend"]
+            rp.origin += "+default-backend"
         _upd = {}
         if ctx is None and "ctx" in _d:
             _upd["ctx"] = _d["ctx"]
