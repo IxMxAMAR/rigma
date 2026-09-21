@@ -774,3 +774,44 @@ def test_the_tool_surface_env_var_reverts_to_all(engine, monkeypatch):
     # `use_tools` exists only to widen a focused surface; on a full one it would
     # be a tool whose whole job is already done
     assert "use_tools" not in names
+
+
+def test_an_unlock_survives_the_turn_that_made_it(engine):
+    """`use_tools` is the focused surface's way back, and it only works if the
+    unlock OUTLIVES the turn that asked for it.
+
+    `_unlock_tools` persists it mid-turn through a guarded load/save. The
+    end-of-turn write then rebuilds the row from the PRE-turn snapshot and
+    takes only a whitelist of fields from the fresh store — so a field the turn
+    itself wrote has to be on that list, or it is silently reverted.
+
+    Measured on real hardware 2026-09-21 (Bonsai-2-27B, reasoning on): the
+    model called `use_tools(names=["current_datetime"])` five times, was told
+    `ok=True` five times, never got the tool, and routed around it with
+    `run_shell`. Design decision: a tier mistake costs one step, not the run.
+    """
+    from rigma import sessions
+    _Engine.script = [
+        ("use_tools", {"names": ["current_datetime"]}),
+        ("manage_plan", {"action": "add", "task": "step one"}),
+        ("task_complete", {"summary": "done"}),
+        ("task_complete", {"summary": "done"}),
+    ]
+    _Engine.bodies = []
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x",
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid)
+
+    stored = sessions.load(r["session_id"])
+    assert "current_datetime" in (stored.get("unlocked_tools") or []), \
+        "the end-of-turn write reverted the unlock this turn made"
+
+    # the property the model actually needs: a LATER turn advertises it. Under
+    # tool_choice:"required" the grammar only admits advertised names, so an
+    # unadvertised tool is one the model cannot call no matter how often it asks.
+    carrying = [b for b in _Engine.bodies if b.get("tools")]
+    advertised = [{t["function"]["name"] for t in b["tools"]}
+                  for b in carrying]
+    assert any("current_datetime" in n for n in advertised), \
+        "the unlocked tool was never advertised on a later turn"
