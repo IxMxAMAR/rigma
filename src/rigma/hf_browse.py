@@ -16,7 +16,7 @@ import httpx
 
 from .gguf_meta import GgufParseError, inspect_gguf
 from .hangar import (HangarError, _distinct_quants, _quant_from_name,
-                     _write_spec, model_slug)
+                     _reject_case_twins, _write_spec, model_slug)
 from .models import GgufFile, ModelSpec
 
 HF = "https://huggingface.co"
@@ -203,6 +203,12 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
                  "split files aren't supported yet)"
                  if rf["split_skipped"] else "")
         raise HangarError(f"no single-file gguf in that repo{extra}")
+    # AUDIT 07-3: two names differing only in case are one file on Windows.
+    # Refuse the repo rather than build a spec whose rows share a file.
+    names = [g["file"] for g in rf["ggufs"]]
+    if rf.get("mmproj"):
+        names.append(rf["mmproj"]["file"])
+    _reject_case_twins(names)
     # probe cheapest header first; skip odd non-model ggufs (live find
     # 2026-07-17: bartowski repos ship imatrix data as .gguf) and fall
     # forward to the next smallest before giving up
