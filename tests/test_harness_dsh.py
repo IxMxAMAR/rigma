@@ -13,6 +13,7 @@ import sys
 import textwrap
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -275,17 +276,33 @@ def test_every_adapter_takes_the_arguments_the_server_actually_passes():
     is precisely how the DSH adapter shipped unable to run a single turn through
     the product: it had no `state` parameter, worked when driven directly, and
     every unit test called it directly.
+
+    The keyword set is READ OUT OF serve.py, not retyped here. A hand-written
+    copy is the same class of bug one level up: it only ever covers the names
+    somebody remembered to write down, so a NEW keyword added to the call site
+    is invisible to the guard that exists to notice exactly that. Parsed with
+    `ast` because the call is multi-line and keyword-only.
     """
+    import ast
     import inspect
+    from pathlib import Path
 
     from rigma import harness as seam
 
-    passed = {
-        "base_url": "http://127.0.0.1:1/v1", "model": "m", "prompt": "p",
-        "system_prompt": "s", "session_id": "sid", "cwd": ".",
-        "max_tokens": 1, "context_window": 2, "state": {}, "cancel": None,
-        "permission": "full",
-    }
+    serve_py = (Path(__file__).resolve().parents[1] / "src" / "rigma"
+                / "serve.py")
+    tree = ast.parse(serve_py.read_text(encoding="utf-8"), filename=str(serve_py))
+    passed: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else ""
+        if name == "drive_turn":
+            passed |= {k.arg for k in node.keywords if k.arg}
+    # if the call site ever stops naming these, this guard has lost its subject
+    assert {"state", "cancel", "permission"} <= passed, sorted(passed)
+
     checked = 0
     for name in ("dsh", "mcode"):
         mod = seam.adapter(name)
@@ -477,4 +494,73 @@ def test_a_timeout_is_still_an_error_not_a_stop(monkeypatch, tmp_path):
 
     assert events[-1].kind == "error"
     assert "timed out" in events[-1].text
+
+
+def test_a_failed_tree_kill_is_reported_not_assumed(monkeypatch):
+    """`kill_tree` swallows its own failure, so "was killed" could be a claim
+    about something that did not happen.
+
+    `taskkill /T` is the only thing that reaches the Node grandchild — and it is
+    the one call this environment refuses outright. When it fails, `proc.kill()`
+    still takes the Python runner, so the turn ends and the message used to say
+    the agent was killed while the agent is in fact still running against the
+    model server, holding VRAM. The user's only signal is that message.
+    """
+    class FakeProc:
+        pid = 4242
+        stdin = stdout = stderr = None
+
+        def kill(self):
+            pass
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return None         # still running, so the tree kill is attempted
+
+    monkeypatch.setattr(harness_dsh._harness.os, "name", "nt")
+    monkeypatch.setattr(harness_dsh._harness.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
+    assert harness_dsh._harness.kill_tree(FakeProc()) is False
+
+    # and the turn that timed out says so, rather than claiming a kill
+    run = harness_dsh._Run(proc=FakeProc(), hard=True)
+    events = list(harness_dsh._read_events(run, 0.0))
+    assert events[-1].kind == "error"
+    assert "STILL BE RUNNING" in events[-1].text, events[-1].text
+    assert "and was killed" not in events[-1].text
+
+
+def test_a_tree_kill_that_worked_says_nothing_extra(monkeypatch):
+    """The warning must not become noise on the path that works."""
+    class FakeProc:
+        pid = 4242
+        stdin = stdout = stderr = None
+
+        def kill(self):
+            pass
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return None         # still running: the kill path is what is under test
+
+    monkeypatch.setattr(harness_dsh._harness.os, "name", "nt")
+    monkeypatch.setattr(harness_dsh._harness.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0))
+    assert harness_dsh._harness.kill_tree(FakeProc()) is True
+
+    run = harness_dsh._Run(proc=FakeProc(), hard=True)
+    events = list(harness_dsh._read_events(run, 0.0))
+    assert events[-1].kind == "error"
+    assert "and was killed" in events[-1].text
+    assert "STILL BE RUNNING" not in events[-1].text
 
