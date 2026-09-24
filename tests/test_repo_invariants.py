@@ -6,6 +6,8 @@ undetected the whole time, passing locally and failing on every push.
 """
 from pathlib import Path
 
+import pytest
+
 TESTS = Path(__file__).parent
 ROOT = TESTS.parent
 
@@ -44,3 +46,26 @@ def test_the_shipped_ui_bundle_is_present():
     assert (bundle / "index.html").is_file(), f"{bundle} has no index.html"
     assets = list((bundle / "assets").glob("*.js"))
     assert assets, f"{bundle / 'assets'} contains no javascript bundle"
+
+
+def test_the_bundle_guard_hook_is_tracked_executable():
+    """Git ignores a non-executable hook on POSIX, so `core.hooksPath .githooks`
+    alone does not arm it. The mode must live in the index (100755)."""
+    import subprocess
+    out = subprocess.run(["git", "ls-files", "-s", ".githooks/pre-commit"],
+                         cwd=ROOT, capture_output=True, text=True)
+    if out.returncode != 0 or not out.stdout.strip():
+        pytest.skip("not a git checkout")
+    mode = out.stdout.split()[0]
+    assert mode == "100755", (
+        f".githooks/pre-commit is tracked {mode}; on POSIX git refuses to run "
+        "it, so the bundle guard is silent. Fix: "
+        "git update-index --chmod=+x .githooks/pre-commit")
+
+
+def test_ci_bundle_staleness_check_counts_untracked_output():
+    """`git diff` compares tracked files only, so a build that emits a new
+    untracked asset looks clean. `git status --porcelain` includes `??`."""
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "git status --porcelain" in ci
+    assert "git diff --quiet -- src/rigma/data/ui_v2" not in ci
