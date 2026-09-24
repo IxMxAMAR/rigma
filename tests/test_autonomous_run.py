@@ -411,8 +411,11 @@ def test_one_action_lets_the_model_see_loaded_images(engine, tmp_path):
     png = tmp_path / "x.png"
     Image.new("RGB", (8, 8), (200, 30, 30)).save(png)
 
+    # sentinel=True: a handler whose result IS a loop sentinel declares it at
+    # registration, so run_tool passes it around the control-byte guard by
+    # property rather than by sniffing the text (AUDIT 04-7).
     @toolkit.tool("fake_view", "test-only image loader",
-                  {"type": "object", "properties": {}})
+                  {"type": "object", "properties": {}}, sentinel=True)
     def _fake(args, ctx):
         return toolkit.IMAGE_SENTINEL + str(png)
 
