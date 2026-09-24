@@ -225,7 +225,7 @@ def test_tool_results_defuse_control_byte_runs(tmp_path, monkeypatch):
     """read_file on a crash-corrupted file (NUL flood mid-text) must hand the
     model a readable marker, not the raw bytes — a NUL run reads to a language
     model as end-of-document and produced instant-EOS turns (2026-07-21)."""
-    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path / "rigma-home"))
     from rigma import tools
     f = tmp_path / "bible.md"
     f.write_bytes(b"CAST: Corwin\n" + b"\x00" * 207 + b"STORY SO FAR: ch1-7\n")

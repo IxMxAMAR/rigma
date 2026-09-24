@@ -132,6 +132,10 @@ def ctx() -> dict:
         # so the two move together here rather than defaulting to the library
         # fallback.
         "confirm_exec": allow_code(),
+        # AUDIT 13-2: absolute reads are a capability, so this second entry
+        # point does not inherit them; a caller who needs them says so.
+        "allow_absolute_reads":
+            os.environ.get("RIGMA_MCP_ALLOW_ABSOLUTE_READS") == "1",
         "run_id": "",
     }
 

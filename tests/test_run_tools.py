@@ -6,7 +6,11 @@ from rigma import runs, tools
 
 @pytest.fixture(autouse=True)
 def home(tmp_path, monkeypatch):
-    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    # AUDIT 13-2: RIGMA_HOME is Rigma's own state dir and reads of it are
+    # denied, so it must not be the same directory a test uses as a workspace.
+    d = tmp_path / "rigma-home"
+    d.mkdir()
+    monkeypatch.setenv("RIGMA_HOME", str(d))
     return tmp_path
 
 
@@ -106,18 +110,36 @@ def test_task_complete_acknowledges():
 def test_read_only_tools_accept_absolute_paths(tmp_path):
     # refusing absolute paths didn't make anything safer (run_shell reaches the
     # whole disk anyway) — it pushed the model into `run_shell dir`, which
-    # dumped thousands of filenames into context and blew the run up
+    # dumped thousands of filenames into context and blew the run up.
+    # AUDIT 13-2: that capability is now an explicit grant, not the default, so
+    # a prompt-injected page cannot aim a read at a credential file.
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "a.txt").write_text("hello there", encoding="utf-8")
     ws = tmp_path / "ws"
     ws.mkdir()
-    ctx = {"workspace": str(ws)}
+    ctx = {"workspace": str(ws), "allow_absolute_reads": True}
     listing = tools.run_tool("list_directory", {"path": str(outside)}, ctx)
     assert not listing.startswith("error"), listing
     assert "a.txt" in listing
     body = tools.run_tool("read_file", {"path": str(outside / "a.txt")}, ctx)
     assert body.strip() == "hello there"
+
+
+def test_absolute_reads_outside_the_workspace_are_refused_by_default(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.txt").write_text("hello there", encoding="utf-8")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    out = tools.run_tool("read_file", {"path": str(outside / "a.txt")},
+                         {"workspace": str(ws)})
+    assert out.startswith("error") and "absolute path" in out
+    # ...but an absolute path INSIDE the workspace is not an escape
+    inside = ws / "b.txt"
+    inside.write_text("here", encoding="utf-8")
+    assert tools.run_tool("read_file", {"path": str(inside)},
+                          {"workspace": str(ws)}).strip() == "here"
 
 
 def test_confined_profile_still_refuses_absolute_paths(tmp_path):

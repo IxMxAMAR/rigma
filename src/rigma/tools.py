@@ -13,6 +13,7 @@ the result back. Tools are tiered by risk:
 from __future__ import annotations
 
 import ast
+import fnmatch
 import html
 import json
 import operator
@@ -1332,18 +1333,133 @@ def _nearest_hint(root: Path, rel: str) -> str:
 
 
 def _read_path(ctx, raw: str) -> Path:
-    """Resolve a path for READ-ONLY tools, allowing ABSOLUTE paths.
+    """Resolve a path for READ-ONLY tools.
 
-    Missions routinely name folders outside the workspace ("go through
-    D:\\Good Stuff"). Refusing those didn't make anything safer — run_shell can
-    already reach the whole filesystem — it just pushed the model into
-    `run_shell dir`, which dumped thousands of filenames into context and blew
-    the run up. Writes still go through _ws_path; the 'confined' profile keeps
-    everything workspace-relative."""
+    AUDIT 13-2: an absolute read is a capability a prompt-injected page can aim
+    at a credential file, and the result is exfiltrable through the network
+    tools running in the same session. Reads therefore default to the
+    workspace; the pre-13-2 behaviour is one explicit session grant away
+    (`allow_absolute_reads`), so a mission that legitimately works outside its
+    workspace opts in instead of defaulting in. Writes still go through
+    _ws_path.
+
+    The credential-path denylist applies on BOTH branches and cannot be
+    overridden by the grant — the model has no legitimate reason to put a key
+    into the conversation."""
+    raw = str(raw or "").strip()
+    if Path(raw).is_absolute():
+        if ctx.get("profile") == "confined":
+            raise ValueError(
+                f"'{raw}' is an absolute path — the confined profile keeps "
+                "reads RELATIVE to the workspace")
+        p = Path(raw).resolve()
+        # an absolute path that is INSIDE the workspace is not an escape, so it
+        # needs no grant; only one that leaves the workspace does
+        if not _inside_workspace(ctx, p) and not _absolute_reads_allowed(ctx):
+            raise ValueError(
+                "reading an absolute path outside the workspace is disabled "
+                "for this chat — pass a path RELATIVE to the workspace, or "
+                "enable 'allow absolute reads' on the session to restore it")
+        p = _long_path(p)
+    else:
+        p = _ws_path(ctx, raw or ".")
+    denied = _credential_path_reason(p, ctx)
+    if denied:
+        raise ValueError(f"refusing to read {p} — {denied}")
+    return p
+
+
+def _inside_workspace(ctx: dict, p: Path) -> bool:
+    """Is the (already resolved, un-prefixed) path inside the session workspace?"""
+    ws = (ctx.get("workspace") or "").strip()
+    if not ws:
+        return False
+    try:
+        root = Path(ws).resolve()
+        return p == root or p.is_relative_to(root)
+    except (OSError, ValueError):
+        return False
+
+
+# AUDIT 13-2: paths whose contents are credentials or the owner's private
+# state. A read of any of these is refused EVEN when absolute reads are
+# granted. Matched case-insensitively against the resolved path.
+_CREDENTIAL_FILES = (
+    ".env", ".env.*", "*.env",
+    "id_rsa", "id_rsa.*", "id_dsa", "id_dsa.*", "id_ecdsa", "id_ecdsa.*",
+    "id_ed25519", "id_ed25519.*",
+    "*.pem", "*.key", "*.pfx", "*.p12", "*.jks", "*.keystore",
+    ".netrc", ".npmrc", ".pypirc", ".htpasswd", ".git-credentials",
+    "credentials", "credentials.*", "*.credentials",
+    ".gemini_api_key", ".openai_api_key", "*.api_key", "*_api_key",
+)
+_CREDENTIAL_DIRS = frozenset((
+    ".ssh", ".aws", ".azure", ".gcloud", ".kube", ".docker", ".gnupg",
+))
+# A browser profile holds saved logins and cookies. Matched as a path SHAPE,
+# because the profile directory is nested under the vendor's name.
+_BROWSER_PROFILE_RE = re.compile(
+    r"(?i)(google[\\/]chrome|microsoft[\\/]edge|brave-browser|brave[\\/]user"
+    r" data|chromium|mozilla[\\/]firefox[\\/]profiles|opera software"
+    r"|vivaldi|librewolf)[\\/]")
+
+
+def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
+    """Why `p` may not be read, or "" when it may.
+
+    The one exemption is a run's progress log, which the run loop hands the
+    model by name and which lives under Rigma's state dir; refusing it would
+    break the run for no security gain (it is model-written). A workspace that
+    IS (or lives inside) the state dir is also an explicit choice — the default
+    workspace is the home dir, which CONTAINS the state dir, so that case must
+    stay denied."""
+    name = p.name.lower()
+    if name in ("progress.md", "progress.txt"):
+        return ""
+    for pat in _CREDENTIAL_FILES:
+        if fnmatch.fnmatch(name, pat):
+            return "that looks like a credential file"
+    parts = [part.lower() for part in p.parts]
+    if any(part in _CREDENTIAL_DIRS for part in parts):
+        return "that is a credential directory"
+    if _BROWSER_PROFILE_RE.search(str(p)):
+        return "that is a browser profile (saved logins and cookies)"
+    try:
+        from .runtime import rigma_home
+        home = rigma_home().resolve()
+        if p == home or p.is_relative_to(home):
+            ws = str((ctx or {}).get("workspace") or "").strip()
+            if ws and Path(ws).resolve().is_relative_to(home):
+                return ""
+            return "that is Rigma's own state directory"
+    except Exception:
+        pass
+    return ""
+
+
+def _write_path(ctx, raw: str) -> Path:
+    """Resolve a WRITE target (a move/copy destination).
+
+    AUDIT 13-2 confines READS, but a destination was never a read: the pre-fix
+    behaviour (an absolute destination allowed outside the `confined` profile)
+    is preserved, with the credential denylist still applied so a move cannot
+    plant a file in `.ssh`."""
     raw = str(raw or "").strip()
     if Path(raw).is_absolute() and ctx.get("profile") != "confined":
-        return _long_path(Path(raw).resolve())
-    return _ws_path(ctx, raw or ".")
+        p = _long_path(Path(raw).resolve())
+    else:
+        p = _ws_path(ctx, raw or ".")
+    denied = _credential_path_reason(p, ctx)
+    if denied:
+        raise ValueError(f"refusing to write {p} — {denied}")
+    return p
+
+
+def _absolute_reads_allowed(ctx: dict) -> bool:
+    """The explicit grant that restores the pre-13-2 absolute-read behaviour."""
+    if ctx.get("profile") == "confined":
+        return False
+    return bool(ctx.get("allow_absolute_reads"))
 
 
 def _ws_path(ctx, rel: str) -> Path:
@@ -1391,6 +1507,15 @@ def _http_request(args, ctx):
     if method not in ("GET", "POST"):
         return (f"error: method {method} is not allowed — this tool only "
                 "does GET and POST")
+    # AUDIT 13-2: a POST that carries data is the exfiltration half of the
+    # finding. It needs its own explicit grant, so a session that can read a
+    # file cannot also post it out unattended.
+    if method == "POST" and (args.get("json") or args.get("headers")):
+        if not ctx.get("allow_outbound_post"):
+            return ("error: outbound POST with a body is disabled for this "
+                    "chat — a body is how a file read in this session would "
+                    "leave the machine. Enable 'allow outbound POST' on the "
+                    "session to restore it")
     try:
         status, body = _bounded_get(
             url, method=method, headers=args.get("headers") or None,
@@ -2124,10 +2249,12 @@ def _edit_file_locked(args, ctx):
 
 
 @tool("read_file",
-      "Read a text file. Accepts an ABSOLUTE path or one relative to the "
-      "workspace. Use `offset` (1-indexed line) and `limit` to PAGE THROUGH a "
-      "big file instead of pulling it all in at once — the reply tells you the "
-      "exact offset to pass next.",
+      "Read a text file. Takes a path relative to the workspace, or an "
+      "absolute path inside it. An absolute path OUTSIDE the workspace needs "
+      "the session's 'allow absolute reads' grant, and credential files are "
+      "always refused. Use `offset` (1-indexed line) and `limit` to PAGE "
+      "THROUGH a big file instead of pulling it all in at once — the reply "
+      "tells you the exact offset to pass next.",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "absolute path, or one "
                    "relative to the workspace"},
@@ -2303,8 +2430,10 @@ def _folder_listing(p: Path) -> str:
 
 
 @tool("list_directory",
-      "List files and folders. Accepts an ABSOLUTE path (e.g. D:/Art) or one "
-      "relative to the workspace. Large folders are SUMMARISED (counts by type "
+      "List files and folders. Takes a path relative to the workspace, or an "
+      "absolute path inside it (an absolute path OUTSIDE the workspace needs "
+      "the session's 'allow absolute reads' grant). Large folders are "
+      "SUMMARISED (counts by type "
       "+ examples) — use sample_files or find_files to work with them.",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "folder path relative to "
@@ -2575,7 +2704,7 @@ def _do_transfer(args, ctx, move: bool):
     if not dest_raw:
         return "error: `dest` folder is required"
     try:
-        dest = _read_path(ctx, dest_raw)
+        dest = _write_path(ctx, dest_raw)
     except ValueError as e:
         return f"error: {e}"
     srcs, errs, notes = _transfer_sources(args, ctx)
