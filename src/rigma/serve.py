@@ -1374,7 +1374,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     @app.get("/api/sessions")
     async def list_sessions():
         # file scans block the loop with many/large chats — thread them
-        return await asyncio.to_thread(sessions.list_sessions)
+        rows = await asyncio.to_thread(sessions.list_sessions)
+        # AUDIT 03-5: the run's "🤖 …" chat is not a chat the owner can type
+        # into while the run drives it, so it must not appear as an ordinary
+        # writable row in the rail. Only the ACTIVE run is hidden: once a run
+        # ends its session is history and belongs back in the list.
+        try:
+            from . import runs as _runs
+            a = await asyncio.to_thread(_runs.active)
+            if a and a.get("session_id"):
+                rows = [r for r in rows if r.get("id") != a["session_id"]]
+        except Exception:
+            pass          # the rail must never fail on a run-store hiccup
+        return rows
 
     @app.post("/api/sessions")
     async def create_session(body: dict | None = None):
@@ -1926,7 +1938,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         await asyncio.to_thread(_prefix_warm, msgs)
         _mark("prefix_warm")
         # nudges are consumed by the turn that just read them: a reminder
-        # that re-injects every turn is nagging, not a trigger
+        # that re-injects every turn is nagging, not a trigger. Whether this
+        # turn WAS started by a queued nudge is carried to _fire_triggers
+        # (AUDIT 03-1): guard #1 — a trigger never fires on its own action —
+        # reads that fact, and with the flag hardcoded False it was dead code.
+        s["_turn_was_triggered"] = bool(s.get("pending_nudges"))
         s["pending_nudges"] = []
         # steer the reply's opening: llama-server continues from a trailing
         # assistant message AND echoes that prefix back in its output, so we
@@ -3821,6 +3837,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = await asyncio.to_thread(sessions.load, sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
+        # AUDIT 03-5: a session an ACTIVE run is driving is not a normal chat.
+        # A run reaches _llm_turn through _drain_turn directly, so it never
+        # joins `_streaming`; without this guard the owner could type into the
+        # run's chat and two agent loops would share one transcript — the
+        # chat's model fed the run's driving lines, the run's action audit
+        # crediting the chat's tool calls, and the run's unguarded save able to
+        # drop the chat's message.
+        if s.get("run_id"):
+            from . import runs as _runs
+            _r = await asyncio.to_thread(_runs.load, str(s["run_id"]))
+            if _r is not None and _r.get("status") in ("running", "paused"):
+                return JSONResponse(
+                    {"error": "this chat is being driven by an autonomous run "
+                              "— stop the run first"}, status_code=409)
         # Which agent backend runs this turn. Only the built-in can run one
         # today, and `resolve` REFUSES rather than quietly running the native
         # loop: a session that asked for another harness and silently got the
@@ -4004,7 +4034,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception:
             return event, None
 
-    async def _drain_turn(session, on_wait=None, on_event=None):
+    async def _drain_turn(session, on_wait=None, on_event=None, agen=None):
         """Drain one agentic turn headless with an idle-watchdog: a turn is only
         frozen if it emits nothing for its whole budget (tolerates slow-but-working
         generation). Returns the engine error message if the turn errored (the
@@ -4012,9 +4042,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         progress'); else None. aclose swallows BaseException so its cleanup can't
         clobber the outcome; the call site converts a leaked CancelledError ->
         frozen. `on_wait(waited, kind)` fires every TICK_SECS while waiting so the
-        UI can show the run is alive instead of a blank screen."""
-        agen = _llm_turn(session)
+        UI can show the run is alive instead of a blank screen.
+
+        `agen` overrides the SSE stream — tests drive the cancellation contract
+        with a scripted generator instead of a real engine (AUDIT 03-4)."""
+        if agen is None:
+            agen = _llm_turn(session)
         err = None
+        # The inner __anext__ task currently in flight. Held so an EXTERNAL
+        # cancellation can cancel it too (AUDIT 03-4): cancelling only this
+        # coroutine orphaned the generator, which kept reading the engine and
+        # wrote a partial message after the run was already "stopped".
+        task = None
         # The generous PREFILL budget covers the slow gaps: the first token of a
         # turn, a tool that takes a while to run, and the continuation request
         # that prefills a big context after a tool. A normal token->token gap
@@ -4083,6 +4122,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     except Exception:
                         err = "engine error"
         finally:
+            # AUDIT 03-4: an external cancellation (stop_run cancelling the
+            # driver task) only cancels THIS coroutine at the `asyncio.wait`
+            # above; the inner `agen.__anext__()` task was orphaned, so the
+            # generator stayed alive, kept reading the engine's SSE response and
+            # persisted a partial message after the run said "stopped". Cancel
+            # it and let it unwind BEFORE aclose — aclose on a still-running
+            # generator raises RuntimeError, which the bare except swallowed, so
+            # the response was never closed. Mirrors the watchdog path, which
+            # already cancels the task before raising FrozenTurnError.
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
             try:
                 await agen.aclose()
             except BaseException:
@@ -4368,8 +4422,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             _save_run_merged(run)
                 except Exception:
                     _log.exception("memory: per-step recall failed")
-                session["messages"].append({"role": "user", "content": driving})
-                await asyncio.to_thread(sessions.save, session)
+                # AUDIT 03-5: save with base_rev. This whole-row write used to
+                # be unconditional, so a message that landed in the session
+                # while the driving line was being built (a rename, another
+                # writer) was silently dropped by it. On a stale write, reload
+                # and re-append: the driving line is the run's own turn input.
+                for _try in range(3):
+                    session["messages"].append({"role": "user",
+                                                "content": driving})
+                    try:
+                        await asyncio.to_thread(
+                            sessions.save, session,
+                            base_rev=session[sessions.REV_KEY])
+                        break
+                    except sessions.StaleWriteError:
+                        fresh = await asyncio.to_thread(sessions.load, sid)
+                        if fresh is None:
+                            break
+                        session = fresh
                 frozen = False
                 turn_err = None
 
@@ -4434,6 +4504,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     if kind in ("tool", "result") or _time.time() - live["last"] > 1.5:
                         _flush_live()
 
+                # AUDIT 03-2: how many messages the session held before this
+                # turn, so the turn's engine usage can be charged exactly once.
+                _msg_n = len(session.get("messages") or [])
                 try:
                     turn_err = await _drain_turn(session, on_wait=_tick,
                                                  on_event=_activity)
@@ -4454,6 +4527,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if live["items"]:
                     _flush_live()                # persist the tail of this turn
                 run = _runs.load(run_id) or run
+                # AUDIT 03-2: charge this turn's engine usage to the run, or
+                # `token_cap`/`tokens_used` are dead fields and the token
+                # clause of budget_exceeded can never bind. The engine's
+                # usage/timings are recorded on the assistant message's
+                # `stats` (prompt_tokens + tokens); sum only the messages THIS
+                # turn added, so a turn that persisted nothing is not charged
+                # again for the previous turn's message.
+                try:
+                    _added = 0
+                    for _m in (session.get("messages") or [])[_msg_n:]:
+                        if _m.get("role") != "assistant":
+                            continue
+                        _stt = _m.get("stats") or {}
+                        _added += int(_stt.get("prompt_tokens") or 0)
+                        _added += int(_stt.get("tokens") or 0)
+                    if _added:
+                        run["tokens_used"] = (int(run.get("tokens_used", 0))
+                                              + _added)
+                except Exception:
+                    pass          # accounting must never kill a run
                 _lv = _runs.load_live(run_id)
                 _lv["waiting_secs"] = 0          # turn is over; clear the notice
                 _runs.save_live(run_id, _lv)
@@ -4931,8 +5024,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     effort=effort, one_action=True,
                     params={**RUN_PARAMS, **(sess.get("params") or {})},
                     run_profile=profile if profile in _runs.PROFILES else "all")
+        # AUDIT 03-2: the token budget was dead — `token_cap` could not be set
+        # through the API and `tokens_used` was never written, so
+        # budget_exceeded's token clause could never bind. Parse the cap here
+        # (0/absent = uncapped, as documented) and charge usage per turn in
+        # _run_loop.
+        try:
+            _token_cap = int(float((body or {}).get("token_cap") or 0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "token_cap must be a number"},
+                                status_code=400)
         run = _runs.create(mission, sess["id"], workspace=workspace,
-                           profile=profile,
+                           profile=profile, token_cap=max(0, _token_cap),
                            budget_hours=budget_hours)
         run["spec"] = None          # compiled by the run loop, see _compile_spec
         _runs.save(run)
@@ -5024,9 +5127,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # left `python train.py` holding VRAM and its port, and after a restart
         # the in-process id table was gone so kill_job answered "no such job"
         # for an orphan that was still running.
+        #
+        # AUDIT 03-3: scope it to THIS run's jobs. kill_all_jobs killed every
+        # background job in the process — including a download the owner had
+        # started in an unrelated chat, which then reported a nonzero exit with
+        # nothing saying who killed it. The process shutdown hook still calls
+        # kill_all_jobs, where there is no other owner left to protect.
         try:
             from . import tools as _tk
-            killed = _tk.kill_all_jobs()
+            killed = _tk.kill_jobs_for_run(rid)
             if killed:
                 _log.info("stop_run %s: killed %d background job(s)", rid, killed)
         except Exception:
@@ -5045,6 +5154,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # method whose rules were just removed) must not leave the stamp behind
         # for a LATER method's rules to fire on (AUDIT F46).
         applied = str(session.pop("_method_applied", "") or "")
+        # Consumed unconditionally for the same reason (AUDIT 03-1): the stamp
+        # belongs to the turn that just ended. _llm_turn set it before it
+        # consumed pending_nudges, and by the time this hook runs the nudges
+        # are gone — this is the only evidence that the turn was triggered.
+        triggered = bool(session.pop("_turn_was_triggered", False))
         m = _methods.get(str(session.get("method") or ""))
         if not m or not any(r.get("kind") == "trigger"
                             for r in m.get("rules") or []):
@@ -5056,13 +5170,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if applied:
             events.append({"kind": "method_applied", "method": applied,
                            "tool": "", "path": "", "turn": turn,
-                           "by_trigger": False, "user_spoke": user_spoke})
+                           "by_trigger": triggered, "user_spoke": user_spoke})
         events += [{"kind": "tool_ran", "tool": t.get("name"),
                     "path": str((t.get("args") or {}).get("path") or ""),
-                    "turn": turn, "by_trigger": False, "user_spoke": user_spoke}
+                    "turn": turn, "by_trigger": triggered,
+                    "user_spoke": user_spoke}
                    for t in trace or []]
         events.append({"kind": "turn_ended", "tool": "", "path": "",
-                       "turn": turn, "by_trigger": False,
+                       "turn": turn, "by_trigger": triggered,
                        "user_spoke": user_spoke})
         notices, nudges = [], list(session.get("pending_nudges") or [])
         for ev in events:
@@ -5116,6 +5231,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # drive the REAL wiring instead of trusting it matches triggers.py's
     # unit tests
     app.state.fire_triggers = _fire_triggers
+    # same reason: the turn drain's cancellation contract is a closure, so a
+    # test drives the REAL one with a scripted engine generator (AUDIT 03-4)
+    app.state.drain_turn = _drain_turn
 
     @app.get("/api/mcp")
     async def mcp_status():
@@ -5131,12 +5249,31 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    def _run_control_refusal(rid: str, r: dict) -> str:
+        """Why a pause/resume/inject must be refused, or "" if it is honest.
+
+        AUDIT 03-6: all three used to write the field and return the run
+        without consulting the status or `_run_tasks`, so resume on a `done`
+        run answered 200, inject answered {"queued": true} for guidance nothing
+        would ever consume, and pause left `paused: true` on a terminal run.
+        A control request is only honest when a driver will service it."""
+        status = r.get("status")
+        if status not in ("running", "paused"):
+            return f"run is {status} — restart it first"
+        t = _run_tasks.get(rid)
+        if t is None or t.done():
+            return "run has no driver — restart it first"
+        return ""
+
     @app.post("/api/runs/{rid}/pause")
     async def pause_run(rid: str):
         from . import runs as _runs
         r = _runs.load(rid)
         if r is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
+        refusal = _run_control_refusal(rid, r)
+        if refusal:
+            return JSONResponse({"error": refusal}, status_code=409)
         r["paused"] = True
         _runs.save(r)
         return r
@@ -5147,6 +5284,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r = _runs.load(rid)
         if r is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
+        refusal = _run_control_refusal(rid, r)
+        if refusal:
+            return JSONResponse({"error": refusal}, status_code=409)
         r["paused"] = False
         _runs.save(r)
         return r
@@ -5195,11 +5335,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _runs.plan_complete(rid, t["id"])
                         recovered.append(t["id"])
         # rehydrate volatile loop state
+        #
+        # AUDIT 03-7: the per-ATTEMPT counters matter as much as the streaks.
+        # A run restarted while `frozen` re-froze after one freeze instead of
+        # two (frozen_streak survived); a run that had spent both completion
+        # challenges kept `verified_once=True`, so its first task_complete was
+        # accepted and it was written `done` with steps still pending and no
+        # deliverable checked — the exact "declares victory with work
+        # outstanding" failure the challenge gate exists to stop.
         r.update(status="running", paused=False, error_streak=0,
                  lazy_streak=0, completion_checked=False,
                  force_completion=False, _verify_pending=False,
                  _challenge_pending=False, _step_turns=0, _cur_step_id=None,
                  _reflected_err=False, _reflected_lazy=False,
+                 frozen_streak=0, verified_once=False,
+                 completion_challenges=0, _echo_streak=0,
                  _paused_at=0,
                  halt_reason="")
         # a used-up or nearly-used-up clock gets a grace hour — a restart
@@ -5241,6 +5391,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r = _runs.load(rid)
         if r is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
+        # AUDIT 03-6: guidance queued onto a run no driver will service is
+        # silently discarded, but the caller is told {"queued": true}.
+        refusal = _run_control_refusal(rid, r)
+        if refusal:
+            return JSONResponse({"error": refusal}, status_code=409)
         note = str((body or {}).get("message", "")).strip()
         if not note:
             return JSONResponse({"error": "message required"}, status_code=400)

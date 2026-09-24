@@ -28,6 +28,8 @@ class _Engine(BaseHTTPRequestHandler):
     gate = None          # threading.Event: hold the turn OPEN after the 1st chunk
     bodies = []          # every request body the engine received
     compile_reply = "not a spec"   # mission compiler falls back by default
+    usage = None         # AUDIT 03-2: engine usage to report on each turn
+    timings = None       # ...and its timings (predicted_n feeds tokens_used)
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
@@ -80,6 +82,9 @@ class _Engine(BaseHTTPRequestHandler):
                 {"index": j, "id": f"c{i}_{j}", "type": "function",
                  "function": {"name": nm, "arguments": json.dumps(ar)}}
                 for j, (nm, ar) in enumerate(steps)]}}]})
+        if _Engine.usage:                 # AUDIT 03-2: report usage/timings
+            sse({"choices": [{"delta": {}}], "usage": _Engine.usage,
+                 "timings": _Engine.timings or {}})
         if _Engine.gate is not None:      # hold the turn open, deterministically
             _Engine.gate.wait(timeout=10)
         self.wfile.write(b"data: [DONE]\n\n")
@@ -108,6 +113,8 @@ def home(tmp_path, monkeypatch):
     _Engine.gate = None
     _Engine.bodies = []
     _Engine.compile_reply = "not a spec"
+    _Engine.usage = None
+    _Engine.timings = None
     yield tmp_path
     # Stop this test's run so its background loop exits. Nothing cancels those
     # tasks on teardown, so without this every finished test leaves a loop
@@ -487,23 +494,74 @@ def test_start_requires_a_model(engine, tmp_path, monkeypatch):
 def test_run_control_endpoints(engine):
     from rigma import sessions
     c = _client(engine)
+    # AUDIT 03-6: a run with NO driver must refuse. The old code wrote the
+    # field and answered 200, so resume on a terminal run claimed an effect
+    # nothing would service and inject queued guidance nothing would consume.
     sess = sessions.create()
-    rid = runs.create("m", sess["id"])["id"]        # active run, no live loop
-    assert c.post(f"/api/runs/{rid}/inject",
-                  json={"message": "use bs4"}).json()["queued"] is True
-    assert runs.load(rid)["steer_queue"] == ["use bs4"]
-    c.post(f"/api/runs/{rid}/pause")
-    assert runs.load(rid)["paused"] is True
-    c.post(f"/api/runs/{rid}/resume")
-    assert runs.load(rid)["paused"] is False
-    runs.append_progress(rid, "did x", "do y")
-    runs.plan_add(rid, "step one")
-    g = c.get(f"/api/runs/{rid}").json()
-    assert g["plan"][0]["text"] == "step one" and "did x" in g["log_tail"]
-    assert "did x" in c.get(f"/api/runs/{rid}/log").json()["log"]
+    dead = runs.create("m", sess["id"])["id"]        # active run, no live loop
+    assert c.post(f"/api/runs/{dead}/inject",
+                  json={"message": "use bs4"}).status_code == 409
+    assert c.post(f"/api/runs/{dead}/pause").status_code == 409
+    assert c.post(f"/api/runs/{dead}/resume").status_code == 409
+    assert runs.load(dead)["paused"] is False        # nothing was written
+    runs.set_status(runs.load(dead), "stopped", "test teardown")
+
+    # A LIVE run accepts the same three, and the writes land.
+    hold = threading.Event()
+    _Engine.gate = hold                 # keep the driver alive, mid-turn
+    _Engine.script = [None]
+    rid = c.post("/api/runs", json={"mission": "control",
+                                    "budget_hours": 1}).json()["id"]
+    try:
+        assert c.post(f"/api/runs/{rid}/inject",
+                      json={"message": "use bs4"}).json()["queued"] is True
+        assert runs.load(rid)["steer_queue"] == ["use bs4"]
+        c.post(f"/api/runs/{rid}/pause")
+        assert runs.load(rid)["paused"] is True
+        c.post(f"/api/runs/{rid}/resume")
+        assert runs.load(rid)["paused"] is False
+        runs.append_progress(rid, "did x", "do y")
+        runs.plan_add(rid, "step one")
+        g = c.get(f"/api/runs/{rid}").json()
+        assert g["plan"][0]["text"] == "step one" and "did x" in g["log_tail"]
+        assert "did x" in c.get(f"/api/runs/{rid}/log").json()["log"]
+    finally:
+        hold.set()
     c.post(f"/api/runs/{rid}/stop")
     assert runs.load(rid)["status"] == "stopped"
     assert c.get("/api/runs/active").json() == {}    # active released
+
+
+def test_restart_resets_every_per_attempt_counter(engine):
+    """AUDIT 03-7: restart rehydrated the streaks and step fields but left
+    `frozen_streak`, `verified_once`, `completion_challenges` and `_echo_streak`
+    spent, so a restarted `frozen` run re-froze after one freeze instead of two
+    and a run that had spent both completion challenges had its first
+    task_complete accepted with plan steps still pending."""
+    from rigma import sessions
+    hold = threading.Event()
+    _Engine.gate = hold                  # hold the restarted loop mid-turn
+    _Engine.script = [None]
+    c = _client(engine)
+    sess = sessions.create("restart chat")
+    rid = runs.create("m", sess["id"])["id"]
+    r = runs.load(rid)
+    r.update(frozen_streak=2, verified_once=True, completion_challenges=2,
+             _echo_streak=3, error_streak=4, lazy_streak=5)
+    runs.set_status(r, "frozen", "engine unresponsive")   # clears active.json
+    try:
+        out = c.post(f"/api/runs/{rid}/restart")
+        assert out.status_code == 200, out.text
+        assert out.json().get("restarted") is True
+        r = runs.load(rid)
+        assert r["status"] == "running"
+        assert r["frozen_streak"] == 0
+        assert r["verified_once"] is False
+        assert r["completion_challenges"] == 0
+        assert r.get("_echo_streak", 0) == 0
+        assert r["error_streak"] == 0 and r["lazy_streak"] == 0
+    finally:
+        hold.set()
 
 
 def test_run_fails_fast_on_template_parser_error(engine):
@@ -591,6 +649,44 @@ def test_run_gets_anti_repetition_samplers_and_a_token_cap(engine):
     # generous: it must fit a real batch of work (25 detailed prompts +
     # a thinking block). 8192 truncated legitimate output mid-sentence.
     assert 16384 <= p["max_tokens"] <= 32768
+
+
+def test_a_run_halts_when_its_token_cap_is_spent(engine):
+    """AUDIT 03-2: `token_cap` could not be set through POST /api/runs and
+    `tokens_used` was never written, so budget_exceeded's token clause was
+    unreachable. Each turn's engine usage is now charged to the run."""
+    _Engine.script = [None]
+    _Engine.usage = {"prompt_tokens": 40, "completion_tokens": 20}
+    _Engine.timings = {"predicted_n": 60, "predicted_per_second": 5.0}
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "spend tokens",
+                                    "budget_hours": 1,
+                                    "token_cap": 100}).json()["id"]
+    r = _wait(c, rid)
+    assert r["status"] == "budget_exhausted", r.get("halt_reason")
+    assert "token budget" in r["halt_reason"]
+    assert runs.load(rid)["tokens_used"] >= 100
+
+
+def test_usage_is_recorded_even_without_a_token_cap(engine):
+    """The counter is honest accounting, not only a halt trigger."""
+    _Engine.script = [None]
+    _Engine.usage = {"prompt_tokens": 10}
+    _Engine.timings = {"predicted_n": 5}
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    _wait(c, rid)
+    r = runs.load(rid)
+    assert r["token_cap"] == 0
+    assert r["tokens_used"] > 0
+    assert r["status"] != "budget_exhausted", r.get("halt_reason")
+
+
+def test_a_non_numeric_token_cap_is_a_400(engine):
+    c = _client(engine)
+    r = c.post("/api/runs", json={"mission": "x", "budget_hours": 1,
+                                  "token_cap": "lots"})
+    assert r.status_code == 400, r.text
 
 
 def test_driving_line_states_the_work_not_the_protocol(engine):
