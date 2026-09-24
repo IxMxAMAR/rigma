@@ -8,6 +8,7 @@ import InlineError from "../InlineError";
 import LoadError from "../LoadError";
 import { readList, responseError } from "../lib/listFetch";
 import { budget, remainingTime, stopSentence } from "./budget";
+import { DEFAULT_PROFILE, PROFILES, profileSentence } from "./profiles";
 
 interface PlanStep {
   id: number;
@@ -48,6 +49,10 @@ function Launcher({ onLaunched, missionRef }: {
 }) {
   const [mission, setMission] = useState("");
   const [workspace, setWorkspace] = useState("");
+  // IMP-4: the run's safety profile. POST /api/runs has always accepted it and
+  // the v2 launcher never sent one, so every run silently got "all" and the
+  // main safety control was unreachable from this UI.
+  const [profile, setProfile] = useState(DEFAULT_PROFILE);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   return (
@@ -71,6 +76,22 @@ function Launcher({ onLaunched, missionRef }: {
         aria-label="Mission"
         className="w-full rounded-md bg-surface px-3 py-2 text-[13.5px] outline-none resize-y placeholder:text-muted max-h-[420px] overflow-y-auto"
       />
+      <label className="flex items-center gap-2 mt-2 text-[12.5px]">
+        <span className="w-24 shrink-0 text-secondary">safety profile</span>
+        <select
+          value={profile}
+          onChange={(e) => setProfile(e.target.value)}
+          aria-label="Run safety profile"
+          className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"
+        >
+          {PROFILES.map((p) => (
+            <option key={p.value} value={p.value}>{p.label}</option>
+          ))}
+        </select>
+      </label>
+      <p className="text-[11px] text-muted leading-snug pl-24 pr-1">
+        {profileSentence(profile)}
+      </p>
       <div className="flex gap-2 mt-2">
         <input
           value={workspace}
@@ -92,6 +113,7 @@ function Launcher({ onLaunched, missionRef }: {
                   mission: mission.trim(),
                   workspace: workspace.trim(),
                   budget_hours: 8,
+                  profile,
                 }),
               });
               const d = (await r.json()) as { id?: string; error?: string };
