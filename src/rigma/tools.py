@@ -2810,9 +2810,21 @@ def _sample_files(args, ctx):
     # Deliberately NOT written as `view_sample()`: a weak model copies
     # callable-looking text out of tool output and emits it as prose instead of
     # making the call (owner watched exactly that). Describe, don't demonstrate.
-    tail = ("\nThese paths are already recorded. Do not retype them — you will "
-            "get them wrong. Use the view_sample tool, with no arguments, to "
-            "look at this sample." if rid else "")
+    #
+    # AUDIT 05-3: view_sample is gated needs="vision", so a text-only model
+    # cannot call it — naming it in this result is the prompt/tool-surface
+    # disagreement prompt.py exists to stop. Give that model the same remedy
+    # `prompt._REMEDY_TEXT_ONLY` gives instead.
+    if rid and ctx.get("has_vision"):
+        tail = ("\nThese paths are already recorded. Do not retype them — you "
+                "will get them wrong. Use the view_sample tool, with no "
+                "arguments, to look at this sample.")
+    elif rid:
+        tail = ("\nThese paths are already recorded. Do not retype them — you "
+                "will get them wrong. Copy the names EXACTLY as written, or "
+                "call read_file with the path above.")
+    else:
+        tail = ""
     found = f"{len(hits)}" if not truncated else f"{len(hits)}+"
     return (f"{found} files match '{pat}' in {p}; random sample of "
             f"{len(picked)}:\n{body}{tail}")
