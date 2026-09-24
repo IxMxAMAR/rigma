@@ -425,14 +425,217 @@ def update():
         typer.echo(f"engine pin: {old_v} (no newer pin published)")
 
 
-@app.command()
-def doctor():
-    """Print detected hardware and registry status."""
+def _port_status(port: int) -> str:
+    """Who is LISTENing on `port`, or "" — READ-ONLY.
+
+    Deliberately not `_port_holder`: that one binds the port to probe it, and
+    `rigma doctor` must not touch a running server's port at all. This only
+    asks the OS who is already there.
+    """
+    pid = _listening_pid(port)
+    if pid is None:
+        return ""
+    try:
+        import psutil
+        return f"pid {pid}: {psutil.Process(pid).name()}"
+    except Exception:
+        return f"pid {pid}"
+
+
+def _engine_row(backend: str, os_name: str) -> dict:
+    """Is the pinned engine for this backend on disk? Never downloads."""
+    from . import runtime
+    try:
+        man = runtime._engines_manifest()
+    except Exception as e:
+        return {"id": "engine", "state": "warn",
+                "detail": f"cannot read the engine pin: {e}",
+                "remedy": "run `rigma update` to fetch a fresh pin"}
+    key = f"{os_name}/{backend}"
+    if key not in (man.get("assets") or {}):
+        return {"id": "engine", "state": "warn",
+                "detail": f"no pinned engine build for {key}",
+                "remedy": "run `rigma plan --explain` and pick a supported "
+                          "backend, then `rigma update`"}
+    root = runtime.rigma_home() / "engines" / man["version"] / backend
+    exe = root / ("llama-server.exe" if os_name == "windows"
+                  else "llama-server")
+    if exe.exists():
+        return {"id": "engine", "state": "ok",
+                "detail": f"{backend} engine {man['version']} present",
+                "remedy": ""}
+    return {"id": "engine", "state": "warn",
+            "detail": f"{backend} engine {man['version']} is not downloaded",
+            "remedy": "run `rigma up` — it downloads and verifies the engine "
+                      "on first run (`rigma up --dry-run` previews it)"}
+
+
+def _model_present(gguf) -> bool:
+    """Is this gguf on disk, in either the managed or the custom models dir?"""
+    from . import hangar, runtime
+    if (runtime.rigma_home() / "models" / gguf.file).exists():
+        return True
+    try:
+        return (hangar.custom_dir() / gguf.file).exists()
+    except Exception:
+        return False
+
+
+def _doctor_rows() -> list[dict]:
+    """Every cheap pre-flight check, as {id, state, detail, remedy} rows.
+
+    Never downloads, never binds a port, never starts or stops anything: a
+    doctor with side effects is worse than none. `state` is ok / warn / fail,
+    and only `fail` is fatal — a missing download is a warn, because `rigma up`
+    fetches it.
+    """
+    from . import state as st
+    rows: list[dict] = []
     reg = Registry.load()
-    p = _profile(reg)
-    typer.echo(p.model_dump_json(indent=2))
-    typer.echo(f"fingerprint: {p.fingerprint}")
-    typer.echo(f"registry: {len(reg.models)} models, {len(reg.combos)} combos")
+    try:
+        p = _profile(reg)
+    except Exception as e:
+        return [{"id": "hardware", "state": "fail",
+                 "detail": f"the hardware probe failed: {e}",
+                 "remedy": "repair the GPU driver, then run `rigma reprobe`"}]
+
+    # --- GPU backend ---
+    if not p.gpus:
+        rows.append({"id": "gpu", "state": "fail",
+                     "detail": "no GPU detected",
+                     "remedy": "install or repair the GPU driver; Rigma needs "
+                               "a Vulkan, ROCm or CUDA device"})
+        backend = "vulkan"
+    else:
+        g = p.gpus[0]
+        backs = ", ".join(g.backends or []) or "no compute backend"
+        rows.append({"id": "gpu",
+                     "state": "ok" if g.backends else "fail",
+                     "detail": f"{g.name} ({g.slug}) — {backs}",
+                     "remedy": "" if g.backends
+                     else "update the GPU driver so a Vulkan/ROCm/CUDA "
+                          "backend is exposed"})
+        backend = (g.backends or ["vulkan"])[0]
+
+    # --- engine binary ---
+    rows.append(_engine_row(backend, getattr(p, "os", "windows")))
+
+    # --- model on disk ---
+    gguf = None
+    size_gb = 0.0
+    try:
+        rp = resolve(p, reg, use_case="general")
+    except ResolveError as e:
+        rows.append({"id": "model", "state": "fail",
+                     "detail": f"no model fits this machine: {e}",
+                     "remedy": "run `rigma plan --explain`; free VRAM/RAM or "
+                               "install a smaller model from the Models page"})
+    except Exception as e:
+        rows.append({"id": "model", "state": "warn",
+                     "detail": f"could not resolve a model: {e}",
+                     "remedy": "run `rigma plan --explain` for the reason"})
+    else:
+        gguf, size_gb = rp.gguf, rp.gguf.bytes / 2**30
+        if _model_present(rp.gguf):
+            rows.append({"id": "model", "state": "ok",
+                         "detail": f"{rp.model_slug} ({rp.gguf.quant}, "
+                                   f"{size_gb:.1f} GB) is on disk",
+                         "remedy": ""})
+        else:
+            rows.append({"id": "model", "state": "warn",
+                         "detail": f"{rp.model_slug} ({size_gb:.1f} GB) is "
+                                   "not downloaded yet",
+                         "remedy": "run `rigma up` — it downloads and verifies "
+                                   "the model on first run"})
+
+    # --- ports (read-only: doctor must not disturb a running server) ---
+    port = 11500
+    holder = _port_status(port)
+    s = st.read_state()
+    if holder and s and int(s.get("public_port", 0) or 0) == port:
+        rows.append({"id": "port", "state": "ok",
+                     "detail": f"Rigma is already running on :{port}",
+                     "remedy": ""})
+    elif holder:
+        rows.append({"id": "port", "state": "warn",
+                     "detail": f"port {port} is in use ({holder})",
+                     "remedy": f"stop that process, or run `rigma up --port "
+                               f"{port + 1}`"})
+    else:
+        rows.append({"id": "port", "state": "ok",
+                     "detail": f"port {port} is free", "remedy": ""})
+
+    # --- disk space ---
+    free = float(getattr(p, "disk_free_gb", 0) or 0)
+    need = 10.0 + (0.0 if gguf is None or _model_present(gguf) else size_gb)
+    if free < 5:
+        rows.append({"id": "disk", "state": "fail",
+                     "detail": f"only {free:.1f} GB free",
+                     "remedy": "free at least 5 GB; the engine plus a model "
+                               "will not fit otherwise"})
+    elif free < need:
+        rows.append({"id": "disk", "state": "warn",
+                     "detail": f"{free:.1f} GB free, about {need:.0f} GB "
+                               "wanted for the first download",
+                     "remedy": "free some space, or install a smaller model "
+                               "from the Models page"})
+    else:
+        rows.append({"id": "disk", "state": "ok",
+                     "detail": f"{free:.1f} GB free", "remedy": ""})
+
+    # --- mcp.json parse ---
+    from . import mcp_client
+    mp = mcp_client.config_path()
+    if not mp.exists():
+        rows.append({"id": "mcp", "state": "ok",
+                     "detail": "no mcp.json (no MCP servers configured)",
+                     "remedy": ""})
+    else:
+        try:
+            raw = json.loads(mp.read_text(encoding="utf-8"))
+        except ValueError as e:
+            rows.append({"id": "mcp", "state": "warn",
+                         "detail": f"mcp.json does not parse: {e}",
+                         "remedy": f"fix the JSON at {mp} — Rigma ignores a "
+                                   "bad file, so every MCP tool silently "
+                                   "disappears"})
+        except OSError as e:
+            rows.append({"id": "mcp", "state": "warn",
+                         "detail": f"cannot read mcp.json: {e}",
+                         "remedy": f"check permissions on {mp}"})
+        else:
+            if not isinstance(raw, dict):
+                rows.append({"id": "mcp", "state": "warn",
+                             "detail": "mcp.json is not a JSON object",
+                             "remedy": f"make {mp} an object with an "
+                                       "`mcpServers` key"})
+            else:
+                servers = raw.get("mcpServers") or {}
+                rows.append({"id": "mcp", "state": "ok",
+                             "detail": f"{len(servers)} MCP server(s) "
+                                       "configured",
+                             "remedy": ""})
+    return rows
+
+
+@app.command()
+def doctor(as_json: bool = typer.Option(False, "--json",
+                                        help="machine-readable rows")):
+    """Run every cheap pre-flight check, with the exact remedy for each.
+
+    One line per check. Exits non-zero only on a hard failure: a missing
+    download is a warning, not a failure, because `rigma up` fetches it.
+    """
+    rows = _doctor_rows()
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2))
+    else:
+        for r in rows:
+            typer.echo(f"{r['state']:<4} {r['id']:<7} {r['detail']}")
+            if r.get("remedy"):
+                typer.echo(f"     fix: {r['remedy']}")
+    if any(r["state"] == "fail" for r in rows):
+        raise typer.Exit(1)
 
 
 @app.command()
