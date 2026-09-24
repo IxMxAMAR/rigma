@@ -3268,7 +3268,41 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # drifted from the validator that actually rejects the write. One
         # definition, sessions.PARAM_RANGES, is the one the 400 names.
         info["param_ranges"] = {k: list(v) for k, v in sessions.PARAM_RANGES.items()}
+        # IMP-5: the idle auto-unload timeout is a setting, so the surface can
+        # SHOW it (and say "reloading the model" after a break) instead of a
+        # slow first token looking like a bug.
+        from . import app_settings
+        idle = app_settings.idle_unload_minutes()
+        info["idle_unload_minutes"] = idle
+        info["idle_unload"] = idle > 0
         return info
+
+    @app.get("/api/settings")
+    async def get_settings():
+        """Server-level settings — today, the idle auto-unload timeout.
+
+        `idle_unload_minutes` is the EFFECTIVE value (0 = never unload), which
+        may come from RIGMA_KEEP_ALIVE_MIN; `env_override` says so, because a
+        setting the UI changes that has no effect would look broken.
+        """
+        from . import app_settings
+        return {"settings": app_settings.load(),
+                "idle_unload_minutes": app_settings.idle_unload_minutes(),
+                "env_override": os.environ.get("RIGMA_KEEP_ALIVE_MIN")
+                not in (None, "")}
+
+    @app.post("/api/settings")
+    async def post_settings(body: dict | None = None):
+        """Change one server setting. Validated before anything is written."""
+        from . import app_settings
+        try:
+            saved = await asyncio.to_thread(app_settings.save, body or {})
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return {"settings": saved,
+                "idle_unload_minutes": app_settings.idle_unload_minutes(),
+                "env_override": os.environ.get("RIGMA_KEEP_ALIVE_MIN")
+                not in (None, "")}
 
     @app.get("/api/server/stats")
     async def server_stats():
@@ -5559,18 +5593,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             _log.exception("startup: run reconciliation failed")
 
     def _start_keepalive():
-        """The idle auto-unload poller, or None when it's switched off.
+        """The idle auto-unload poller.
 
-        Returns the task so lifespan can cancel it: an un-cancelled loop keeps
-        polling (and can unload an engine) while the app is shutting down."""
-        mins = float(os.environ.get("RIGMA_KEEP_ALIVE_MIN", "0") or 0)
-        if mins <= 0:
-            return None   # opt-in: 0 disables idle auto-unload
-
+        IMP-5: always running, and it re-reads the setting every poll, so the
+        Settings switch takes effect without a restart. When the timeout is 0
+        (the default) the loop does nothing but sleep. Returns the task so
+        lifespan can cancel it: an un-cancelled loop keeps polling while the
+        app is shutting down."""
         async def _loop():
+            from . import app_settings
             from . import server_ops
             while True:
                 await asyncio.sleep(KEEPALIVE_POLL_SECS)
+                mins = app_settings.idle_unload_minutes()
+                if mins <= 0:
+                    continue          # switched off: never unload
                 s = st.read_state()
                 if not s or s.get("unloaded"):
                     continue
