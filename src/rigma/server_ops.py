@@ -532,7 +532,7 @@ def perform_switch(model: str, registry=None, profile=None,
     exe = runtime.ensure_engine(rp.backend, os_name)
     model_path = rigma_home() / "models" / rp.gguf.file
     port = int(s["public_port"]) - 1
-    st.kill_pid(int(s.get("engine_pid", -1)))
+    st.kill_recorded(s, "engine_pid")   # AUDIT F08-1: identity-checked
     _await_port_free(port)   # Windows TIME_WAIT grace
     # First load of a never-seen model+quant: with the old engine already dead,
     # VRAM is free — auto-tune the hardware-specific toggles ONCE, then launch
@@ -623,7 +623,7 @@ def perform_unload() -> dict:
             kvcache.prune(sessions)
         except Exception:
             pass      # never let a cache write block freeing the GPU
-    st.kill_pid(int(s.get("engine_pid", -1)))
+    st.kill_recorded(s, "engine_pid")   # AUDIT F08-1: identity-checked
     # AUDIT F22: docs/audit-2026-09-04-full.md — an unload changes exactly two
     # things: the engine is gone, and the record says so. Everything else is the
     # configuration the user chose and must survive. Rebuilding the record from

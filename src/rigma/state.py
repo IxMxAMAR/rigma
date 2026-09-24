@@ -20,7 +20,50 @@ _FIELD_DEFAULTS = {
     "model": "", "quant": "", "public_port": 0, "engine_pid": -1, "ui_pid": -1,
     "backend": "unknown", "use_case": "general", "ctx": 0, "unloaded": False,
     "kv_cache": "", "no_vision": False, "gguf": "", "kv_fp": "",
+    # AUDIT F08-1: a PID alone does not identify a process. Windows reallocates
+    # numbers, and state.json outlives the processes it names, so a stale record
+    # can point at anything. These are the create times of engine_pid/ui_pid as
+    # recorded at launch, and they are what makes "this is still our process"
+    # checkable. 0.0 means "unknown" (a record written before this field existed,
+    # or a pid that had already exited) and is treated as no evidence, not as a
+    # mismatch — an old state.json keeps behaving exactly as it used to.
+    "engine_started_at": 0.0, "ui_started_at": 0.0,
 }
+
+_PID_STAMP = {"engine_pid": "engine_started_at", "ui_pid": "ui_started_at"}
+
+
+def _create_time(pid: int) -> float:
+    """When this process started, or 0.0 if that cannot be established."""
+    try:
+        if pid <= 0:
+            return 0.0
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return 0.0
+
+
+def _is_recorded_process(pid: int, started_at) -> bool:
+    """Is `pid` still the process the record was written about?
+
+    True when the record carries no identity to check (started_at 0.0), so a
+    pre-upgrade state.json is never made unkillable. Otherwise the create time
+    must match: a recycled pid belongs to some other process and must be left
+    alone. Unreadable identity counts as "not ours" — the safe direction, since
+    the only action gated on this is terminating a process.
+    """
+    if pid <= 0:
+        return False
+    try:
+        want = float(started_at)
+    except (TypeError, ValueError):
+        return False
+    if want <= 0.0:
+        return True
+    try:
+        return abs(psutil.Process(pid).create_time() - want) < 1.0
+    except Exception:
+        return False
 
 
 def _write_record(rec: dict) -> dict:
@@ -33,6 +76,11 @@ def _write_record(rec: dict) -> dict:
         "use_case": rec["use_case"], "ctx": rec["ctx"],
         "started_at": rec["started_at"], "unloaded": rec["unloaded"],
         "kv_cache": rec["kv_cache"],
+        # AUDIT F08-1: the identity of the two pids above, so a later
+        # `rigma stop` can tell "our engine" from "whatever now owns that
+        # number". See _is_recorded_process.
+        "engine_started_at": rec["engine_started_at"],
+        "ui_started_at": rec["ui_started_at"],
         # the vision projector was deliberately left off this launch; sticky,
         # so a later ctx change doesn't silently reload it and eat the VRAM
         "no_vision": rec["no_vision"],
@@ -65,7 +113,9 @@ def write_state(model_slug: str, quant: str, public_port: int,
                    "ui_pid": ui_pid, "backend": backend, "use_case": use_case,
                    "ctx": ctx, "started_at": time.time(), "unloaded": unloaded,
                    "kv_cache": kv_cache, "no_vision": no_vision, "gguf": gguf,
-                   "kv_fp": kv_fp})
+                   "kv_fp": kv_fp,
+                   "engine_started_at": _create_time(engine_pid),
+                   "ui_started_at": _create_time(ui_pid)})
 
 
 def update_state(**changed) -> dict:
@@ -94,6 +144,13 @@ def update_state(**changed) -> dict:
         return {}
     rec = {**_FIELD_DEFAULTS, **cur, **changed}
     rec["started_at"] = changed.get("started_at", time.time())
+    # AUDIT F08-1: a record that changes hands (a new engine pid after a model
+    # switch, or -1 after an unload) must not carry the previous process's
+    # identity forward: a stale stamp would make the NEW pid look like a
+    # mismatch and so unkillable.
+    for pid_key, stamp_key in _PID_STAMP.items():
+        if pid_key in changed and stamp_key not in changed:
+            rec[stamp_key] = _create_time(int(rec.get(pid_key) or -1))
     return _write_record(rec)
 
 
@@ -119,7 +176,8 @@ def server_running() -> dict | None:
     s = read_state()
     if s is None:
         return None
-    ui_alive = pid_alive(int(s.get("ui_pid", -1)))
+    ui_pid = int(s.get("ui_pid", -1))
+    ui_alive = pid_alive(ui_pid) and _is_recorded_process(ui_pid, s.get("ui_started_at"))
     if s.get("unloaded"):
         # engine deliberately stopped to free VRAM/RAM; the UI process is
         # the thing that must still be alive
@@ -127,17 +185,38 @@ def server_running() -> dict | None:
             clear_state()
             return None
         return s
-    engine_alive = pid_alive(int(s.get("engine_pid", -1)))
+    engine_pid = int(s.get("engine_pid", -1))
+    engine_alive = (pid_alive(engine_pid)
+                    and _is_recorded_process(engine_pid, s.get("engine_started_at")))
     if not ui_alive and engine_alive:
         # terminal closed → UI died but llama-server lingers. Left alone this
         # locks the user out ("already running" with a dead UI). Reap it.
-        kill_pid(int(s["engine_pid"]))
+        kill_recorded(s, "engine_pid")
         clear_state()
         return None
     if not engine_alive:
         clear_state()
         return None
     return s
+
+
+def kill_recorded(s: dict, pid_key: str) -> bool:
+    """Terminate the process a state record names — but only if it is still
+    that process. Returns True when a process was actually signalled.
+
+    AUDIT F08-1: the old call sites asked only `pid_alive(pid)` and then killed
+    whatever owned the number. state.json survives the processes it names (it is
+    cleared only by `rigma stop`, `server_running()` or `up`'s finally block),
+    and Windows reallocates pids, so a record left behind by a crash could name
+    the owner's editor, browser or build. `_is_recorded_process` requires the
+    create time recorded at launch to still match; on a mismatch nothing is
+    killed and the caller clears the record.
+    """
+    pid = int(s.get(pid_key, -1) or -1)
+    if not _is_recorded_process(pid, s.get(_PID_STAMP[pid_key])):
+        return False
+    kill_pid(pid)
+    return True
 
 
 def kill_pid(pid: int) -> None:
