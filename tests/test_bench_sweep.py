@@ -45,6 +45,30 @@ def test_run_sweep_picks_best_and_saves(monkeypatch, tmp_path):
     assert cal["flags"]["flash_attn"] == "off"
 
 
+def test_a_config_with_no_usable_measurement_is_a_loss(monkeypatch, tmp_path):
+    """AUDIT F08-7: `run_bench` now raises when the engine reports no timings.
+    The sweep must record that as a failed row — never crown it, never write it
+    to calibration."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    monkeypatch.setattr(bench, "run_bench",
+                        lambda port, **k: (_ for _ in ()).throw(
+                            RuntimeError("engine returned no timings")))
+    monkeypatch.setattr(bench, "sweep_configs", lambda base, moe, caps=(): [
+        ("baseline", {}), ("fa-off", {"flash_attn": "off"})])
+
+    rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601)
+    assert all(r["ok"] is False for r in rows)
+    assert bench.crowned_row(rows) is None
+    assert "m:Q4:vulkan" not in bench.load_calibration()
+
+
 def test_quick_configs_is_short_and_baseline_first():
     q = bench.quick_configs(ComboFlags(ctx=8192, n_cpu_moe=4), moe=True)
     assert q[0] == ("baseline", {})
