@@ -74,7 +74,6 @@ IMAGE_SENTINEL = "\x00__RIGMA_IMAGE__\x00"
 _NETWORK_TOOLS = {"web_search", "fetch_url", "http_request", "ask_gemini"}
 
 _LIST_MAX = 200          # above this, summarise a folder instead of dumping names
-_FUZZY_NOTES: list = []  # filename corrections made during the current call
 
 
 # --- tool tiers --------------------------------------------------------------
@@ -530,9 +529,14 @@ def _defuse_control_bytes(text: str) -> str:
     corrupt instead of silently poisoning the conversation. \\t \\n \\r stay."""
     if not text or not _CTRL_RUN.search(text):
         return text
-    if IMAGE_SENTINEL in text:
-        # the ONE legitimate control-byte use: view_image's unfakeable marker,
-        # consumed by the agent loop — never fed to the model as text
+    if (IMAGE_SENTINEL in text or DELEGATE_SENTINEL in text
+            or USE_TOOLS_SENTINEL in text):
+        # the legitimate control-byte uses: unfakeable markers consumed by the
+        # agent loop (image injection, delegate routing, tool unlock) and never
+        # fed to the model as text. Only a caller that hosts the loop can
+        # produce them — run_tool refuses `_LOOP_ONLY_TOOLS` otherwise — so
+        # defusing them here would break the contract for its only real user
+        # (AUDIT F37).
         return text
     return _CTRL_RUN.sub(
         lambda m: f"[{len(m.group())} unreadable control byte(s) — "
@@ -667,6 +671,11 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
         return "error: this model can't see images"
     if t.needs == "run" and not ctx.get("run_id"):
         return "error: this tool is only available inside an autonomous run"
+    if name in _LOOP_ONLY_TOOLS and not ctx.get("can_host_loop_tools"):
+        # Not a permission refusal — a structural one. The handler cannot do
+        # this; only serve.py's loop can, and it says so by setting the flag.
+        return (f"error: '{name}' is only available in a chat turn — it needs "
+                "the chat loop to host it")
     try:
         # defuse at the ONE choke point every tool result passes through, so
         # read_file, grep, run_shell, carriers and persistence all inherit it
@@ -981,6 +990,15 @@ def _ask_gemini(args, ctx):
 # Execution lives in serve.py (it needs the engine); this sentinel tells the
 # agentic loop to route the call there instead of running a local handler.
 DELEGATE_SENTINEL = "\x00__RIGMA_DELEGATE__\x00"
+
+# Tools whose real implementation is in serve.py's agentic loop, not in the
+# handler: the handler only returns a sentinel that the LOOP understands. Every
+# other caller — a method macro, cached_run, the MCP server — would receive the
+# raw control bytes, which then get defused into
+# "[1 unreadable control byte(s) — file corruption?]…" and substituted into a
+# note or a written file. run_tool refuses them unless the caller declares it
+# hosts the loop (AUDIT F37).
+_LOOP_ONLY_TOOLS = frozenset({"delegate", "use_tools"})
 
 
 @tool("use_tools",
@@ -2486,7 +2504,10 @@ def _write_file_locked(args, ctx):
 # sample by reference; every name gets fuzzy recovery; nothing is ever
 # overwritten (collision-safe renaming).
 
-def _transfer_sources(args, ctx) -> tuple[list, list]:
+def _transfer_sources(args, ctx) -> tuple[list, list, list]:
+    """(found, errors, notes). The notes are the "asked X / used Y" corrections
+    `_fuzzy_file` made — they used to be computed and then dropped on the floor
+    here, so a misfiled chapter arrived with no explanation (AUDIT F34)."""
     paths = args.get("paths") or []
     if isinstance(paths, str):
         paths = [paths]
@@ -2504,7 +2525,7 @@ def _transfer_sources(args, ctx) -> tuple[list, list]:
             except (TypeError, ValueError):
                 n = len(sample)
             paths = sample[first - 1: first - 1 + n]
-    found, errs = [], []
+    found, errs, notes = [], [], []
     for raw in list(paths)[:50]:
         try:
             p = _read_path(ctx, str(raw))
@@ -2515,11 +2536,13 @@ def _transfer_sources(args, ctx) -> tuple[list, list]:
             fixed, note = _fuzzy_file(p)
             if fixed is not None:
                 p = fixed
+                if note:
+                    notes.append(note)
         if p.is_file():
             found.append(p)
         else:
             errs.append(f"no such file: {raw}")
-    return found, errs
+    return found, errs, notes
 
 
 def _free_name(dest_dir: Path, name: str) -> Path:
@@ -2548,7 +2571,7 @@ def _do_transfer(args, ctx, move: bool):
         dest = _read_path(ctx, dest_raw)
     except ValueError as e:
         return f"error: {e}"
-    srcs, errs = _transfer_sources(args, ctx)
+    srcs, errs, notes = _transfer_sources(args, ctx)
     if not srcs:
         return ("error: no source files — pass `paths`, or call sample_files "
                 "first and reference the sample"
@@ -2573,6 +2596,7 @@ def _do_transfer(args, ctx, move: bool):
     note = ""
     if renamed:
         note += f" ({renamed} renamed to avoid overwriting existing files)"
+    note += "".join(notes)     # name the file actually used, not the one asked for
     if errs:
         note += " — errors: " + "; ".join(errs[:6])
     shown = ", ".join(done[:10]) + ("…" if len(done) > 10 else "")
@@ -2634,22 +2658,27 @@ def _is_abs_anyos(ps: str) -> bool:
 
 
 def _resolve_image(ps: str, ctx: dict) -> tuple:
-    """(resolved_path, error). Validates it exists, is an image, and is ≤20MB.
-    Absolute paths are allowed (images live outside the workspace); relative
-    paths are confined to the workspace."""
+    """(resolved_path, error, note). Validates it exists, is an image, and is
+    ≤20MB. Absolute paths are allowed (images live outside the workspace);
+    relative paths are confined to the workspace.
+
+    The correction note is RETURNED, not appended to a module-level list: two
+    concurrent image calls run as separate tasks under serve.py's semaphore and
+    used to clear and drain each other's notes (AUDIT F38)."""
     ps = str(ps).strip().strip('"').strip("'")
     if not ps:
-        return None, "empty path"
+        return None, "empty path", ""
     p = Path(ps)
     if not p.is_absolute():
         if _is_abs_anyos(ps):
             # A Windows-style absolute path on a host that cannot open it
             # (CI on POSIX). There is no such directory here to repair against.
-            return None, f"no such file: {ps}"
+            return None, f"no such file: {ps}", ""
         try:
             p = _ws_path(ctx, ps)
         except ValueError as e:
-            return None, str(e)
+            return None, str(e), ""
+    note = ""
     if not p.is_file():
         # A mangled filename is the model's memory failing, not a missing file
         # — and this repair has to run for ABSOLUTE paths too. The early return
@@ -2661,14 +2690,13 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
         # directory and no confinement is lost.
         found, note = _fuzzy_file(p)
         if found is None:
-            return None, f"no such file: {ps}" + _candidates(p)
+            return None, f"no such file: {ps}" + _candidates(p), ""
         p = found
-        _FUZZY_NOTES.append(note)
     if p.suffix.lower() not in _IMAGE_EXTS:
-        return None, f"{p.name} is not an image"
+        return None, f"{p.name} is not an image", ""
     if p.stat().st_size > 20_000_000:
-        return None, f"{p.name} is too large (max 20MB)"
-    return p.resolve(), ""
+        return None, f"{p.name} is too large (max 20MB)", ""
+    return p.resolve(), "", note
 
 
 def encode_image_data_uri(path: str, max_px: int = 1024) -> str:
@@ -2704,10 +2732,13 @@ def encode_image_data_uri(path: str, max_px: int = 1024) -> str:
        "required": ["path"]},
       needs="vision")
 def _view_image(args, ctx):
-    p, err = _resolve_image(args.get("path", ""), ctx)
+    p, err, note = _resolve_image(args.get("path", ""), ctx)
     if err:
         return f"error: {err}"
-    return IMAGE_SENTINEL + str(p)     # the loop reads + injects it as vision
+    # the sentinel already carries an optional note after a NUL (serve.py splits
+    # on it) — so a corrected filename reaches the model here too, not only in
+    # the batch tool (AUDIT F38).
+    return IMAGE_SENTINEL + str(p) + ("\x00" + note if note else "")
 
 
 @tool("view_images",
@@ -2756,17 +2787,19 @@ def _view_images(args, ctx):
         paths = [str(x) for x in random.sample(pool, min(n, len(pool)))]
     if not paths:
         return "error: no paths given"
-    _FUZZY_NOTES.clear()
-    ok, errs = [], []
+    ok, errs, notes = [], [], []
     for ps in list(paths)[:8]:
-        p, err = _resolve_image(ps, ctx)
-        (ok.append(str(p)) if p else errs.append(err))
+        p, err, note = _resolve_image(ps, ctx)
+        if p:
+            ok.append(str(p))
+        else:
+            errs.append(err)
+        if note:
+            notes.append(note)
     if not ok:
         return "error: no valid images — " + "; ".join(errs)
     note = f" (skipped: {'; '.join(errs)})" if errs else ""
-    if _FUZZY_NOTES:      # tell the model the real filenames it got
-        note += "".join(_FUZZY_NOTES)
-        _FUZZY_NOTES.clear()
+    note += "".join(notes)      # tell the model the real filenames it got
     if len(paths) > 8:
         note += f" (only the first 8 of {len(paths)} — call again for the rest)"
     return IMAGE_SENTINEL + "\n".join(ok) + ("\x00" + note if note else "")
@@ -3044,8 +3077,12 @@ def _kill_job(args, ctx):
         return f"error: no such job: {args.get('id')}"
     if job["proc"].poll() is not None:
         return f"job {jid} already exited ({job['proc'].poll()})"
-    _kill_tree(job["proc"].pid)
-    return f"job {jid} killed"
+    if _kill_tree(job["proc"].pid, job["proc"]):
+        return f"job {jid} killed"
+    # Say so rather than claim a kill nobody confirmed: the model, told the
+    # tree died, rebinds the same port and gets "address in use" (AUDIT F35).
+    return (f"error: could not confirm job {jid} (pid {job['proc'].pid}) "
+            "stopped — it may still be running; check with job_output")
 
 
 # AUDIT F31: docs/audit-2026-09-04-full.md
@@ -3071,7 +3108,7 @@ def kill_all_jobs() -> int:
             proc = job.get("proc")
             if proc is None or proc.poll() is not None:
                 continue
-            _kill_tree(proc.pid)
+            _kill_tree(proc.pid, proc)
             killed += 1
         except Exception:
             pass
@@ -3115,7 +3152,17 @@ def _launch_killable(cmd, shell, cwd):
                             stdin=subprocess.DEVNULL, text=True, **kw)
 
 
-def _kill_tree(pid: int) -> None:
+def _kill_tree(pid: int, proc=None, *, timeout: float = 3.0) -> bool:
+    """Kill the whole process tree and report whether it actually died.
+
+    `taskkill /F /T` exits 0 even when its tree walk misses a re-parented
+    grandchild, so the exit code is not a signal — poll the process instead.
+    Returns True only when the process is confirmed gone (AUDIT F35).
+
+    `proc`, when the caller still holds it, is the reliable poll: it costs
+    nothing extra, where re-asking Windows by pid means another process spawn."""
+    if pid <= 0:
+        return True
     try:
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
@@ -3126,6 +3173,63 @@ def _kill_tree(pid: int) -> None:
             os.killpg(os.getpgid(pid), signal.SIGKILL)
     except Exception:
         pass
+    if proc is not None:
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except Exception:
+            return False
+    return not _pid_alive(pid)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort: is this pid still a live process? Used only when the caller
+    has dropped the Popen, so it is worth a subprocess on Windows."""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return str(pid) in (out.stdout or "")
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+# How much of ONE stream a tool subprocess may produce before it is stopped.
+# _run_subprocess pipes stdout/stderr and used to call communicate(), which
+# holds the ENTIRE output in memory and only truncates afterwards — so
+# run_python(code="while True: print('x'*4096)") accumulated gigabytes inside
+# the server, on a box whose RAM is committed to the model (AUDIT F33). 256KB
+# is 32x the 8000 chars ever shown, so no legitimate call can reach it.
+_SHELL_OUT_CAP = 256_000
+
+
+def _read_capped(stream, sink: list, cap: int, overflow: list) -> None:
+    """Drain `stream` into `sink`, stopping at `cap` characters and flagging it.
+    Runs on its own thread so the parent can wait on the PROCESS, not the
+    pipe — which is what makes the cap enforceable while the child is alive."""
+    total = 0
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                break
+            if total < cap:
+                sink.append(chunk[:cap - total])
+            total += len(chunk)
+            if total >= cap:
+                overflow.append(True)
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
 
 
 def _run_subprocess(cmd, ctx, shell=False, python_src=None, timeout=30):
@@ -3148,18 +3252,46 @@ def _run_subprocess(cmd, ctx, shell=False, python_src=None, timeout=30):
         p = _launch_killable(cmd, shell, cwd)
     except Exception as e:
         return f"error: could not start process: {e}"
+    out_parts: list = []
+    err_parts: list = []
+    overflow: list = []
+    readers = [
+        threading.Thread(target=_read_capped,
+                         args=(p.stdout, out_parts, _SHELL_OUT_CAP, overflow),
+                         daemon=True),
+        threading.Thread(target=_read_capped,
+                         args=(p.stderr, err_parts, _SHELL_OUT_CAP, overflow),
+                         daemon=True)]
+    for t in readers:
+        t.start()
+    timed_out = False
     try:
         # stdin=DEVNULL (in _launch_killable) so input()/bare `cat` can't hang
-        stdout, stderr = p.communicate(timeout=timeout)
+        p.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_tree(p.pid)                       # kill the WHOLE tree, not just p
-        try:
-            stdout, stderr = p.communicate(timeout=5)
-        except Exception:
-            stdout, stderr = "", ""
-        return (f"error: timed out after {timeout}s (process tree killed) — "
-                "for long-running work use start_job instead")
-    out = (stdout or "") + (("\n[stderr]\n" + stderr) if stderr else "")
+        timed_out = True
+    # A runaway printer is stopped the moment it crosses the cap, rather than
+    # after it has filled RAM: waiting for `timeout` (up to 300s) is exactly
+    # how the old version accumulated gigabytes.
+    capped = bool(overflow)
+    confirmed = True
+    if timed_out or capped:
+        confirmed = _kill_tree(p.pid, p)
+    for t in readers:
+        t.join(timeout=5)
+    stdout = "".join(out_parts)
+    stderr = "".join(err_parts)
+    if timed_out:
+        if confirmed:
+            return (f"error: timed out after {timeout}s (process tree killed) — "
+                    "for long-running work use start_job instead")
+        return (f"error: timed out after {timeout}s and could NOT confirm the "
+                f"process (pid {p.pid}) stopped — it may still be running")
+    if capped:
+        return (f"error: output exceeded {_SHELL_OUT_CAP // 1000}KB on one "
+                f"stream and the process (pid {p.pid}) was stopped — print less, "
+                "or write the result to a file and read it back")
+    out = stdout + (("\n[stderr]\n" + stderr) if stderr else "")
     out = out.strip()
     # ALWAYS lead with the exit code. It used to appear only when output was
     # empty — so a failing script that printed anything looked identical to
@@ -3215,7 +3347,7 @@ def _check_component(draft, key, component):
     trial = _ms.normalize(trial)
     cid = trial[key][-1]["id"]
     kind = key[:-1]
-    errs = [e for e in _ms.validate(trial, set(_REGISTRY))
+    errs = [e for e in _ms.validate(trial, set(_REGISTRY) - _LOOP_ONLY_TOOLS)
             if f"'{cid}'" in e or e.startswith(f"{kind} '{cid}'")]
     return trial, cid, errs
 

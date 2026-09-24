@@ -59,7 +59,7 @@ def resolved(mod, paths):
     n = 0
     for ps in paths:
         try:
-            p, _ = mod._resolve_image(ps, CTX)
+            p, _, _ = mod._resolve_image(ps, CTX)
         except Exception:
             p = None
         if p:

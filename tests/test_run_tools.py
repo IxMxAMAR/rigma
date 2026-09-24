@@ -297,11 +297,11 @@ def test_absolute_paths_get_the_same_fuzzy_repair_as_relative_ones(tmp_path):
     real = tmp_path / "ComfyUI_00428_.png"
     Image.new("RGB", (4, 4), (1, 2, 3)).save(real)
 
-    got, err = tools._resolve_image(str(tmp_path / "Comfy_UI_428.png"), {})
+    got, err, _ = tools._resolve_image(str(tmp_path / "Comfy_UI_428.png"), {})
     assert err == "" and got == real.resolve()
 
     # and a relative path still resolves through the workspace, unchanged
-    got_rel, err_rel = tools._resolve_image(
+    got_rel, err_rel, _ = tools._resolve_image(
         "Comfy_UI_428.png", {"workspace": str(tmp_path)})
     assert err_rel == "" and got_rel == real.resolve()
 
@@ -316,7 +316,7 @@ def test_unresolvable_path_hands_back_a_real_spelling(tmp_path):
     from PIL import Image
     Image.new("RGB", (4, 4), (1, 2, 3)).save(tmp_path / "ComfyUI_00428_.png")
 
-    got, err = tools._resolve_image(str(tmp_path / "Comfy *(173).png"), {})
+    got, err, _ = tools._resolve_image(str(tmp_path / "Comfy *(173).png"), {})
     assert got is None
     assert "no such file" in err
     assert "ComfyUI_00428_.png" in err
