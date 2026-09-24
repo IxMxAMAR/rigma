@@ -721,3 +721,46 @@ describe("errText", () => {
     expect(errText("network down")).toBe("network down");
   });
 });
+
+// AUDIT F11-1: the composer draft was component state, so it outlived the chat
+// it was typed in — a paragraph written in "chapter one" and Entered after
+// switching to "chapter two" was sent, and persisted, in the wrong chapter.
+// The draft now lives in the store, keyed by session.
+describe("drafts are keyed to the chat they were typed in", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useChat.setState(PRISTINE, true);
+  });
+
+  it("writes the draft under the chat on screen", () => {
+    useChat.setState({ currentId: "A" });
+    useChat.getState().setDraft("half a paragraph");
+    expect(useChat.getState().drafts).toEqual({ A: "half a paragraph" });
+  });
+
+  it("does not leak one chat's draft into another", () => {
+    useChat.setState({ currentId: "A" });
+    useChat.getState().setDraft("for A");
+    useChat.setState({ currentId: "B" });
+    expect(useChat.getState().drafts.B).toBeUndefined();
+    expect(useChat.getState().drafts.A).toBe("for A");
+  });
+
+  it("puts a failed send back where it came from, not where you are now", () => {
+    useChat.setState({ currentId: "A" });
+    // the composer captures the session when the send starts, then the user
+    // switches to B while it is in flight
+    useChat.getState().setDraft("", "A");
+    useChat.setState({ currentId: "B" });
+    useChat.getState().setDraft("restore me", "A");
+    expect(useChat.getState().drafts.A).toBe("restore me");
+    expect(useChat.getState().drafts.B).toBeUndefined();
+  });
+
+  it("leaves no key behind for an emptied draft", () => {
+    useChat.setState({ currentId: "A" });
+    useChat.getState().setDraft("gone in a moment");
+    useChat.getState().setDraft("");
+    expect(useChat.getState().drafts).toEqual({});
+  });
+});

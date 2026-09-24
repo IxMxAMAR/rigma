@@ -197,6 +197,11 @@ export interface ChatState {
    *  that produced it is thrown away one round-trip after it appears. */
   lastError: string | null;
   images: string[];               // data URIs staged in the composer
+  /** Unsent composer text, keyed by the chat it was typed in. The draft is the
+   *  one piece of user input that must NOT outlive its chat: a paragraph typed
+   *  in "chapter one" and Entered after switching to "chapter two" used to be
+   *  sent — and persisted — in the wrong chapter with no warning. */
+  drafts: Record<string, string>;
   /** Which agent backend owns the chat on screen. Held here because both the
    *  picker and the transcript badge need it, and the store is the only place
    *  that already knows which chat that is. */
@@ -219,6 +224,10 @@ export interface ChatState {
   flipVariant: (dir: 1 | -1) => Promise<void>;
   addImage: (dataUri: string) => void;
   removeImage: (i: number) => void;
+  /** Write the composer draft under the chat it belongs to. `sid` is the
+   *  session captured when a send STARTED, so a failed send can put the text
+   *  back where it came from even if the user has switched chats since. */
+  setDraft: (text: string, sid?: string) => void;
   stop: () => void;
   clearError: () => void;
   /** Hand the current chat's turns to another backend. Unlike the other
@@ -259,6 +268,7 @@ export const useChat = create<ChatState>((set, get) => ({
   pendingVariants: {},
   lastError: null,
   images: [],
+  drafts: {},
   harness: "native",
   permission: "full",
 
@@ -288,6 +298,8 @@ export const useChat = create<ChatState>((set, get) => ({
       streams: without(st.streams, id),
       aborts: without(st.aborts, id),
       pendingVariants: without(st.pendingVariants, id),
+      // the draft was typed for a chat that is about to stop existing
+      drafts: without(st.drafts, id),
       ...(st.currentId === id ? { currentId: null, messages: [] } : {}),
     }));
     await get().loadSessions();
@@ -567,6 +579,17 @@ export const useChat = create<ChatState>((set, get) => ({
   addImage: (dataUri) => set((st) => ({ images: [...st.images, dataUri] })),
   removeImage: (i) =>
     set((st) => ({ images: st.images.filter((_, j) => j !== i) })),
+
+  setDraft: (text, sid) => set((st) => {
+    const key = sid ?? st.currentId ?? "";
+    if ((st.drafts[key] ?? "") === text) return {};
+    const drafts = { ...st.drafts };
+    // An empty draft leaves no entry behind, so the rail's unsent marker and
+    // the map itself cannot accumulate a key per chat the user ever typed in.
+    if (text) drafts[key] = text;
+    else delete drafts[key];
+    return { drafts };
+  }),
 
   // Stop ABORTS, and only aborts. Persisting the partial is send()'s job,
   // where the transcript reload already lives — two writers racing over the
