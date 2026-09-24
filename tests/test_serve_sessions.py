@@ -605,6 +605,20 @@ def test_workspace_listing(tmp_path, monkeypatch):
     assert d["entries"][1]["size"] == 5
 
 
+def test_workspace_listing_is_bounded_before_the_sort(tmp_path, monkeypatch):
+    """14-1: a huge workspace folder must not be stat-ed and sorted in full to
+    show 200 names — the scan itself is capped."""
+    import rigma.serve as srv
+    monkeypatch.setattr(srv, "_WORKSPACE_SCAN_MAX", 50)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for i in range(200):
+        (ws / f"f{i:03d}.txt").write_text("x", encoding="utf-8")
+    entries = srv._workspace_entries(ws)
+    assert len(entries) == 50
+    assert all(e["dir"] is False for e in entries)
+
+
 def test_workspace_open_is_scoped_to_the_session(tmp_path, monkeypatch):
     # opens ONLY the session's recorded workspace — no path from the request
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))

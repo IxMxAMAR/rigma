@@ -824,6 +824,39 @@ def _last_trace(session):
             return m.get("tool_trace", []) or []
     return []
 
+
+# The workspace panel shows at most 200 entries. Scanning at most this many
+# means a 100k-file folder costs ~2000 cached stats instead of a full listing
+# plus an O(n log n) sort before the loop could break at 200 (14-1: 324 ms at
+# 10 000 entries, on the event loop).
+_WORKSPACE_SCAN_MAX = 2000
+
+
+def _workspace_entries(root, cap: int = 200) -> list[dict]:
+    """First `cap` non-dot entries of `root`, folders first, as plain dicts.
+
+    Bounded BEFORE the sort — see `_WORKSPACE_SCAN_MAX`. Module scope so the
+    bound is testable without driving the route.
+    """
+    found: list[dict] = []
+    try:
+        with os.scandir(root) as it:
+            for e in it:
+                if len(found) >= _WORKSPACE_SCAN_MAX:
+                    break
+                if e.name.startswith("."):
+                    continue
+                try:
+                    is_dir = e.is_dir()
+                    size = 0 if is_dir else e.stat().st_size
+                except OSError:
+                    continue
+                found.append({"name": e.name, "dir": is_dir, "size": size})
+    except OSError:
+        return []
+    found.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    return found[:cap]
+
 def _round_cap(session: dict) -> int:
     """Per-turn tool-round budget. The session default became 1000 (a
     runaway backstop, not a leash) but the old inline clamp still cut it to
@@ -1261,7 +1294,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def session_workspace(sid: str):
         """The chat's workspace folder, listed — so the user can SEE what the
         model's file tools can touch. Names and sizes only, never contents."""
-        s = sessions.load(sid)
+        s = await asyncio.to_thread(sessions.load, sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
         ws = str(s.get("workspace") or "").strip()
@@ -1271,23 +1304,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         root = _pl.Path(ws)
         if not root.is_dir():
             return {"path": ws, "entries": [], "missing": True}
-        entries = []
-        try:
-            for e in sorted(root.iterdir(),
-                            key=lambda x: (not x.is_dir(), x.name.lower())):
-                if e.name.startswith("."):
-                    continue
-                try:
-                    entries.append({"name": e.name, "dir": e.is_dir(),
-                                    "size": 0 if e.is_dir()
-                                    else e.stat().st_size})
-                except OSError:
-                    continue
-                if len(entries) >= 200:
-                    break
-        except OSError:
-            pass
-        return {"path": ws, "entries": entries}
+        # 14-1: the listing is bounded before it sorts, and the whole scan runs
+        # off the loop — it used to stat every entry and sort them all on the
+        # event loop before it could break at 200.
+        return {"path": ws,
+                "entries": await asyncio.to_thread(_workspace_entries, root)}
 
     @app.post("/api/sessions/{sid}/workspace/open")
     async def session_workspace_open(sid: str):

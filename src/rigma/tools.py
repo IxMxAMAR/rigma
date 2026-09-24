@@ -13,6 +13,7 @@ the result back. Tools are tiered by risk:
 from __future__ import annotations
 
 import ast
+import fnmatch
 import html
 import json
 import operator
@@ -74,6 +75,11 @@ IMAGE_SENTINEL = "\x00__RIGMA_IMAGE__\x00"
 _NETWORK_TOOLS = {"web_search", "fetch_url", "http_request", "ask_gemini"}
 
 _LIST_MAX = 200          # above this, summarise a folder instead of dumping names
+
+# Entries examined per directory listing before the cap applies. A listing only
+# ever shows `_LIST_MAX` names, so reading (and stat-ing, and sorting) a 100k
+# entry folder to produce 200 of them was pure waste on the caller's thread.
+_SCAN_MAX = 2000
 
 
 # --- tool tiers --------------------------------------------------------------
@@ -2273,30 +2279,59 @@ def _read_file(args, ctx):
             + ("\n…(" + "; ".join(notes) + ")" if notes else ""))
 
 
+def _scan_entries(p: Path, limit: int | None = None):
+    """`(entries, truncated)` for at most `limit` entries of `p`.
+
+    Each entry is `(name, is_dir, size)`. `os.scandir` caches the stat from the
+    directory read, so this pays no extra syscall per entry — and it stops
+    reading at `limit` instead of materialising a 100k-entry listing to show 200
+    of them, which is what the old `sorted(p.iterdir(), key=...)` did.
+    """
+    limit = _SCAN_MAX if limit is None else limit
+    out: list[tuple[str, bool, int]] = []
+    truncated = False
+    try:
+        with os.scandir(p) as it:
+            for e in it:
+                if len(out) >= limit:
+                    truncated = True
+                    break
+                try:
+                    is_dir = e.is_dir()
+                    size = 0 if is_dir else e.stat().st_size
+                except OSError:
+                    continue
+                out.append((e.name, is_dir, size))
+    except OSError:
+        return [], False
+    return out, truncated
+
+
 def _folder_listing(p: Path) -> str:
     """Shared by list_directory and read_file's directory-redirect: a compact
     listing that summarises big folders instead of dumping every name."""
-    items = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-    if not items:
+    entries, truncated = _scan_entries(p)
+    if not entries:
         return "(this is a folder, and it is empty)"
+    items = sorted(entries, key=lambda x: (not x[1], x[0].lower()))
     lead = "(that is a folder — its contents:)\n"
-    if len(items) <= _LIST_MAX:
-        body = "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
-                         for x in items)
+    if not truncated and len(items) <= _LIST_MAX:
+        body = "\n".join(("📁 " if d else "📄 ") + n for n, d, _ in items)
         return lead + body + f"\n({len(items)} entries)"
     from collections import Counter
-    files = [x for x in items if x.is_file()]
-    dirs = [x for x in items if x.is_dir()]
+    files = [(n, s) for n, d, s in items if not d]
+    dirs = [n for n, d, _ in items if d]
     kinds = ", ".join(f"{n}× {e}" for e, n in
-                      Counter((x.suffix.lower() or "(no ext)")
-                              for x in files).most_common(8))
+                      Counter((Path(n).suffix.lower() or "(no ext)")
+                              for n, _ in files).most_common(8))
+    count = f"{len(items)}" if not truncated else f"{len(items)}+"
     out = [lead.rstrip(),
-           f"{len(items)} entries in {p} — too many to list in full.",
+           f"{count} entries in {p} — too many to list in full.",
            f"{len(files)} files ({kinds}); {len(dirs)} folders."]
     if dirs:
-        out.append("folders: " + ", ".join(d.name for d in dirs[:10]))
+        out.append("folders: " + ", ".join(dirs[:10]))
     out.append("example files:\n"
-               + "\n".join("📄 " + x.name for x in files[:15]))
+               + "\n".join("📄 " + n for n, _ in files[:15]))
     out.append("To work with this folder use sample_files (random sample) or "
                "find_files (glob). Do NOT dump the whole listing.")
     return "\n".join(out)
@@ -2314,28 +2349,29 @@ def _list_dir(args, ctx):
     p = _read_path(ctx, str(args.get("path", "") or "."))
     if not p.is_dir():
         return f"error: not a folder: {args.get('path')}"
-    items = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-    if not items:
+    entries, truncated = _scan_entries(p)
+    if not entries:
         return "(empty)"
-    if len(items) <= _LIST_MAX:
-        body = "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
-                         for x in items)
+    items = sorted(entries, key=lambda x: (not x[1], x[0].lower()))
+    if not truncated and len(items) <= _LIST_MAX:
+        body = "\n".join(("📁 " if d else "📄 ") + n for n, d, _ in items)
         return body + f"\n({len(items)} entries)"
     # BIG folder: a summary beats 200 raw filenames — it's a fraction of the
     # tokens and actually tells the model what's in there. Dumping names is
     # what ballooned context and stalled runs.
     from collections import Counter
-    files = [x for x in items if x.is_file()]
-    dirs = [x for x in items if x.is_dir()]
+    files = [(n, s) for n, d, s in items if not d]
+    dirs = [n for n, d, _ in items if d]
     kinds = ", ".join(f"{n}× {e}" for e, n in
-                      Counter((x.suffix.lower() or "(no ext)")
-                              for x in files).most_common(8))
-    out = [f"{len(items)} entries in {p} — too many to list in full.",
+                      Counter((Path(n).suffix.lower() or "(no ext)")
+                              for n, _ in files).most_common(8))
+    count = f"{len(items)}" if not truncated else f"{len(items)}+"
+    out = [f"{count} entries in {p} — too many to list in full.",
            f"{len(files)} files ({kinds}); {len(dirs)} folders."]
     if dirs:
-        out.append("folders: " + ", ".join(d.name for d in dirs[:10]))
+        out.append("folders: " + ", ".join(dirs[:10]))
     out.append("example files:\n"
-               + "\n".join("📄 " + x.name for x in files[:15]))
+               + "\n".join("📄 " + n for n, _ in files[:15]))
     out.append("To work with this folder use sample_files (random sample) or "
                "find_files (glob). Do NOT dump the whole listing.")
     return "\n".join(out)
@@ -2363,17 +2399,25 @@ def _sample_files(args, ctx):
         n = max(1, min(int(args.get("count", 20) or 20), 50))
     except (TypeError, ValueError):
         n = 20
-    try:
-        # AUDIT F04-5: mirror _find_files. Filtering on is_file() alone let a
-        # `..` glob hand back files outside the workspace — including under the
-        # confined profile, whose whole promise is that nothing leaves it — and
-        # the hits were then remembered with runs.set_last_sample, so a later
-        # move_files/copy_files with no paths acted on outside files.
-        root = p.resolve()
-        hits = [x for x in p.glob(pat)
-                if x.is_file() and x.resolve().is_relative_to(root)]
-    except Exception as e:
-        return f"error: bad pattern '{pat}': {e}"
+    # AUDIT F04-5 + 14-1: containment is tested on (directory, name) — the
+    # directory is already known to be inside the root and a scandir name can
+    # never contain a separator, so only a symlink entry can point out, and only
+    # symlinks pay the resolve(). The old per-file x.resolve() ran for every
+    # candidate before the sample was taken (1.5 s on a 10 000-file folder).
+    root = p.resolve()
+    entries, truncated = _scan_entries(p)
+    hits = []
+    for name, is_dir, _size in entries:
+        if is_dir or not fnmatch.fnmatch(name, pat):
+            continue
+        f = p / name
+        if f.is_symlink():
+            try:
+                if not f.resolve().is_relative_to(root):
+                    continue
+            except OSError:
+                continue
+        hits.append(f)
     if not hits:
         return f"no files match '{pat}' in {p}"
     picked = sorted(random.sample(hits, min(n, len(hits))), key=lambda x: x.name)
@@ -2390,7 +2434,8 @@ def _sample_files(args, ctx):
     tail = ("\nThese paths are already recorded. Do not retype them — you will "
             "get them wrong. Use the view_sample tool, with no arguments, to "
             "look at this sample." if rid else "")
-    return (f"{len(hits)} files match '{pat}' in {p}; random sample of "
+    found = f"{len(hits)}" if not truncated else f"{len(hits)}+"
+    return (f"{found} files match '{pat}' in {p}; random sample of "
             f"{len(picked)}:\n{body}{tail}")
 
 
