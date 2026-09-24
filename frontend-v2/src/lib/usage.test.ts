@@ -68,11 +68,14 @@ describe("usage rows across both server shapes", () => {
   });
 
   it("labels a last-used stamp, or says nothing", () => {
-    expect(sinceLabel(null, 1000)).toBe("");
-    expect(sinceLabel(0, 1000)).toBe("");
-    expect(sinceLabel(970, 1000)).toBe("just now");
-    expect(sinceLabel(1000 - 120, 1000)).toBe("2m ago");
-    expect(sinceLabel(1000 - 7200, 1000)).toBe("2h ago");
-    expect(sinceLabel(1000 - 3 * 86400, 1000)).toBe("3d ago");
+    // stamps are epoch seconds; a tiny `now` would push "2h ago" below zero,
+    // which sinceLabel rightly reads as "never stamped"
+    const now = 1_790_000_000;
+    expect(sinceLabel(null, now)).toBe("");
+    expect(sinceLabel(0, now)).toBe("");
+    expect(sinceLabel(now - 30, now)).toBe("just now");
+    expect(sinceLabel(now - 120, now)).toBe("2m ago");
+    expect(sinceLabel(now - 7200, now)).toBe("2h ago");
+    expect(sinceLabel(now - 3 * 86400, now)).toBe("3d ago");
   });
 });
