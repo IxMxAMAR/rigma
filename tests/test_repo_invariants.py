@@ -92,3 +92,16 @@ def test_publish_is_gated_on_tests_and_a_matching_tag():
         frontier.extend([needs] if isinstance(needs, str) else needs)
     assert runs_pytest, "publish does not depend on any job that runs pytest"
     assert "github.event.release.tag_name" in text
+
+
+def test_the_browser_smokes_target_the_right_ui():
+    """`/` is the v2 React shell; the legacy DOM the old smoke drives moved to
+    /rizz at the cutover, so a root-relative BASE tested the wrong page."""
+    import re
+    ui = ROOT / "tools" / "ui-smoke"
+    legacy = (ui / "smoke_browser.py").read_text(encoding="utf-8")
+    assert re.search(r'BASE\s*=\s*"http://127\.0\.0\.1:18500/rizz"', legacy)
+    v2_path = ui / "smoke_browser_v2.py"
+    assert v2_path.is_file(), "no browser smoke for the v2 shell at /"
+    assert re.search(r'BASE\s*=\s*"http://127\.0\.0\.1:18500"',
+                     v2_path.read_text(encoding="utf-8"))
