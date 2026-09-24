@@ -27,7 +27,12 @@ _RANGE_STEPS_MB = (8, 32, 64)   # escalate when a huge vocab pads the header
 # quant list they show up as tiny phantom "models" and, being the smallest
 # file, get picked as the header-probe source — mislabelling the real model
 # (live repro 2026-07-18: a 240MB mtp-*.gguf made a 26B MoE read as "dense").
-_AUX_MARKERS = ("imatrix", "-draft", "eagle", "medusa")
+_AUX_MARKERS = ("imatrix", "eagle", "medusa")
+# Matched as whole tokens, never as substrings: "eagle" is inside ordinary
+# words ("Beagle") and directory names, so `m in n` hid any quant whose path
+# merely contained it. `-draft` keeps its substring form — the leading hyphen
+# is already a token boundary — and the MTP test below anchors the same way.
+_AUX_TOKEN_SPLIT = re.compile(r"[-_./]+")
 # "mtp" as a bare substring was wrong: MTP-PRESERVED models carry it in their
 # name ("...-Native-MTP-Preserved-APEX-I-Compact.gguf", unsloth's
 # "...-A3B-MTP-UD-Q4_K_XL.gguf") and are exactly what the user wants. Only a
@@ -53,9 +58,14 @@ _AUX_MTP_MAX_SHARE = 0.10
 
 
 def _is_aux_gguf(name: str) -> bool:
-    """Name-only markers: importance-matrix data and non-MTP draft heads."""
+    """Name-only markers: importance-matrix data and non-MTP draft heads.
+
+    Whole tokens, not substrings (07-7): `eagle` inside `Beagle-9B-Q4_K_M.gguf`
+    used to read as an EAGLE draft head and drop a real quant from the list."""
     n = name.lower()
-    return any(m in n for m in _AUX_MARKERS)
+    if "-draft" in n:
+        return True
+    return any(t in _AUX_MARKERS for t in _AUX_TOKEN_SPLIT.split(n))
 
 
 def _is_aux_mtp(name: str, size: int, biggest: int) -> bool:
