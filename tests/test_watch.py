@@ -10,6 +10,10 @@ test here is deterministic: no sleeps, no polling intervals, no timing.
 
 Covers the open item in docs/HANDOFF-harness-rework.md.
 """
+import os
+import time
+from pathlib import Path
+
 import pytest
 
 from rigma import tools, watch
@@ -120,6 +124,58 @@ def test_a_recorded_change_that_fails_to_store_is_not_reported(ws):
     w.poll_once()
     f.write_bytes(b"v2")
     assert w.poll_once() == []
+
+
+def test_a_failed_store_is_retried_and_the_baseline_is_kept(ws):
+    """AUDIT F08-6: advancing the baseline after a FAILED snapshot makes the
+    change permanently un-undoable — the next pass would see the new bytes as
+    the known version and never try again."""
+    f = ws / "a.txt"
+    f.write_bytes(b"v1")
+    ok = {"value": False}
+    calls = []
+
+    def record(p, data):
+        calls.append((str(p), data))
+        return ok["value"]
+
+    w = watch.Watcher(ws, record=record)
+    w.poll_once()
+    f.write_bytes(b"v2")
+    assert w.poll_once() == []               # store failed: nothing reported
+    assert w.poll_once() == []               # still failing, still not reported
+    ok["value"] = True
+    assert w.poll_once() == [str(f)]         # the retry finally lands
+    assert calls[-1][1] == b"v1", "must still record the PRE-change bytes"
+
+
+def test_an_unchanged_poll_does_not_re_read_file_bytes(ws, monkeypatch):
+    """14-2: change detection is metadata-first. The old watcher re-read every
+    file's bytes every 1.5 s (measured 19.7 GB/h on a 2000-file tree); a
+    steady-state poll on an unchanged tree must read nothing."""
+    files = []
+    for i in range(5):
+        f = ws / f"f{i}.txt"
+        f.write_bytes(b"x" * 100)
+        files.append(f)
+    # age them past the timestamp-granularity window: a file written in the
+    # last tick is deliberately re-read, because two writes inside one
+    # filesystem clock tick share an mtime
+    old = time.time() - 10
+    for f in files:
+        os.utime(f, (old, old))
+
+    reads = []
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes",
+                        lambda self: (reads.append(str(self)), real(self))[1])
+
+    w = watch.Watcher(ws, record=lambda p, d: True)
+    w.poll_once()
+    assert len(reads) == len(files), "the baseline pass reads each file once"
+    reads.clear()
+    w.poll_once()
+    assert reads == [], "an unchanged poll must not re-read any file bytes"
 
 
 # -- what it refuses to walk --------------------------------------------------
