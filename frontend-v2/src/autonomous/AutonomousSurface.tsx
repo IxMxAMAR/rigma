@@ -7,6 +7,8 @@ import EmptyState from "../EmptyState";
 import InlineError from "../InlineError";
 import LoadError from "../LoadError";
 import { readList, responseError } from "../lib/listFetch";
+import { budget, remainingTime, stopSentence } from "./budget";
+import { DEFAULT_PROFILE, PROFILES, profileSentence } from "./profiles";
 
 interface PlanStep {
   id: number;
@@ -28,6 +30,10 @@ interface Run extends RunSummary {
   activity?: { kind: string; text: string }[];
   log_tail?: string;
   pending_question?: { q: string } | null;
+  /** IMP-8: the budget the run is judged against. `iter_ceiling` is present
+   *  only on a restarted run; `deadline` is an absolute epoch (runs.create). */
+  iter_ceiling?: number;
+  deadline?: number;
 }
 
 const ACTIVE = new Set(["running", "paused"]);
@@ -43,6 +49,10 @@ function Launcher({ onLaunched, missionRef }: {
 }) {
   const [mission, setMission] = useState("");
   const [workspace, setWorkspace] = useState("");
+  // IMP-4: the run's safety profile. POST /api/runs has always accepted it and
+  // the v2 launcher never sent one, so every run silently got "all" and the
+  // main safety control was unreachable from this UI.
+  const [profile, setProfile] = useState(DEFAULT_PROFILE);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   return (
@@ -66,6 +76,22 @@ function Launcher({ onLaunched, missionRef }: {
         aria-label="Mission"
         className="w-full rounded-md bg-surface px-3 py-2 text-[13.5px] outline-none resize-y placeholder:text-muted max-h-[420px] overflow-y-auto"
       />
+      <label className="flex items-center gap-2 mt-2 text-[12.5px]">
+        <span className="w-24 shrink-0 text-secondary">safety profile</span>
+        <select
+          value={profile}
+          onChange={(e) => setProfile(e.target.value)}
+          aria-label="Run safety profile"
+          className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"
+        >
+          {PROFILES.map((p) => (
+            <option key={p.value} value={p.value}>{p.label}</option>
+          ))}
+        </select>
+      </label>
+      <p className="text-[11px] text-muted leading-snug pl-24 pr-1">
+        {profileSentence(profile)}
+      </p>
       <div className="flex gap-2 mt-2">
         <input
           value={workspace}
@@ -87,6 +113,7 @@ function Launcher({ onLaunched, missionRef }: {
                   mission: mission.trim(),
                   workspace: workspace.trim(),
                   budget_hours: 8,
+                  profile,
                 }),
               });
               const d = (await r.json()) as { id?: string; error?: string };
@@ -143,6 +170,7 @@ function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
   };
   const plan = run.plan ?? [];
   const done = plan.filter((s) => s.status === "done").length;
+  const b = budget(run, Date.now() / 1000);
   return (
     <section className="rounded-lg bg-panel p-4">
       <div className="flex items-center gap-3 mb-1">
@@ -170,6 +198,15 @@ function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
             stop
           </button>
         </div>
+      </div>
+      {/* IMP-8: the step and time budget the run is judged against — both are
+          already in the record. The token axis is deliberately absent: the
+          server never writes `tokens_used` (finding 03-2), so a token number
+          here would be a fiction. */}
+      <div className="font-mono text-[11px] text-muted mb-2">
+        budget · {b.remainingSteps.toLocaleString()} of{" "}
+        {b.ceiling.toLocaleString()} steps left ·{" "}
+        {remainingTime(b.remainingSeconds)} of run time left
       </div>
       {err && (
         <div role="alert"
@@ -331,8 +368,17 @@ export default function AutonomousSurface() {
             <div className={`font-mono text-[11.5px] font-semibold uppercase mb-1 ${statusTone(active.status)}`}>
               {active.status}
             </div>
+            {/* IMP-8: WHY it stopped, not only that it did — "finished" and
+                "gave up" used to be the same screen. The server's own
+                halt_reason wins when it wrote one. */}
             <p className="text-[13px] text-secondary">
-              {active.summary || active.halt_reason || active.mission}
+              {stopSentence(active.status, active.halt_reason)}
+            </p>
+            {active.summary && (
+              <p className="text-[12.5px] text-muted mt-1.5">{active.summary}</p>
+            )}
+            <p className="font-mono text-[11px] text-muted mt-2">
+              {active.mission}
             </p>
           </section>
         )}
@@ -355,7 +401,8 @@ export default function AutonomousSurface() {
           <ul className="flex flex-col gap-1">
               {history.map((h) => (
                 <li key={h.id} className="flex items-center gap-3 text-[12.5px] rounded-md hover:bg-surface px-2 py-1">
-                  <span className={`font-mono text-[11px] w-16 shrink-0 ${statusTone(h.status)}`}>
+                  <span className={`font-mono text-[11px] w-16 shrink-0 ${statusTone(h.status)}`}
+                        title={stopSentence(h.status)}>
                     {h.status}
                   </span>
                   <span className="flex-1 truncate text-secondary">{h.mission}</span>

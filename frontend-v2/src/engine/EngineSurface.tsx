@@ -2,7 +2,9 @@
 // Telemetry is mono + instant (CONSTITUTION §6: never animate data values).
 import { useCallback, useEffect, useState } from "react";
 import { engineApi, type EngineFinding, type ServerInfo,
-         type SwitchOption } from "../lib/engineApi";
+         type SwitchOption, type UsageStats } from "../lib/engineApi";
+import { filterLines } from "../lib/logTail";
+import { tokens, usageRows, sinceLabel } from "../lib/usage";
 
 function uptime(startedAt: number): string {
   const s = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
@@ -36,6 +38,12 @@ export default function EngineSurface() {
   const [options, setOptions] = useState<SwitchOption[]>([]);
   const [log, setLog] = useState("");
   const [findings, setFindings] = useState<EngineFinding[]>([]);
+  const [stats, setStats] = useState<UsageStats | null>(null);
+  // IMP-11: the log tail is bounded server-side; these are the client-side
+  // filter and the copy affordance the viewer was missing.
+  const [logLines, setLogLines] = useState(200);
+  const [logFilter, setLogFilter] = useState("");
+  const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -47,6 +55,9 @@ export default function EngineSurface() {
       setInfo(null);
       setErr((e as Error).message);
     }
+    // IMP-7: the odometer is a local file read, so it rides the same 4s poll
+    // and a reply that finishes while this page is open moves the number.
+    engineApi.stats().then(setStats).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -57,7 +68,6 @@ export default function EngineSurface() {
 
   useEffect(() => {
     engineApi.switchOptions().then(setOptions).catch(() => setOptions([]));
-    engineApi.log().then(setLog).catch(() => {});
     // Re-read per model, because these are facts about the engine that is
     // RUNNING: a different model is a different set of decisions.
     engineApi.findings().then((d) => setFindings(d.findings))
@@ -71,6 +81,22 @@ export default function EngineSurface() {
         example: "",
       }]));
   }, [info?.model]);
+
+  // IMP-11: the log tail, re-read when the model changes (a different model is
+  // a different log) or when the user asks for more lines. A read failure
+  // leaves the previous text rather than blanking the panel.
+  useEffect(() => {
+    engineApi.log(logLines).then(setLog).catch(() => {});
+  }, [info?.model, logLines]);
+
+  const shown = filterLines(log, logFilter);
+  const copyLog = async () => {
+    try {
+      await navigator.clipboard.writeText(shown.join("\n"));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard refused — the text is still selectable */ }
+  };
 
   const act = async (name: string, fn: () => Promise<unknown>) => {
     setBusy(name);
@@ -106,6 +132,8 @@ export default function EngineSurface() {
     );
 
   const tg = info.last_tg ?? null;
+  const usage = usageRows(stats);
+  const now = Date.now() / 1000;
   const verdictTone =
     info.verdict === "healthy" ? "moss" : info.verdict ? "red" : undefined;
 
@@ -245,6 +273,57 @@ export default function EngineSurface() {
           </div>
         </section>
 
+        {/* IMP-7: the lifetime odometer stats.json has always kept and no v2
+            screen read. Read-only, no new endpoint. `by_model` counts tokens
+            GENERATED per model; the file has no last-used stamp, so none is
+            shown rather than guessed. */}
+        {stats && (
+          <section className="rounded-lg bg-panel p-5">
+            <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-3">
+              usage
+            </h3>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <Stat label="tokens generated" value={tokens(stats.total_tokens)} />
+              <Stat label="replies" value={stats.total_turns.toLocaleString()} />
+              <Stat label="models used"
+                    value={String(Object.keys(stats.by_model).length)} />
+            </div>
+            {usage.length > 0 && (
+              <ul className="mt-4 flex flex-col gap-1.5">
+                {usage.map((u) => {
+                  const seen = sinceLabel(u.last_used, now);
+                  return (
+                    <li key={u.model} className="flex items-center gap-3 text-[12.5px]">
+                      <span className="flex-1 min-w-0">
+                        <span className="block truncate font-mono text-secondary"
+                              title={u.model || "unknown model"}>
+                          {u.model || "(unknown model)"}
+                        </span>
+                        {(u.turns > 0 || seen) && (
+                          <span className="block font-mono text-[10.5px] text-muted">
+                            {u.turns > 0
+                              ? `${u.turns} turn${u.turns === 1 ? "" : "s"}`
+                              : ""}
+                            {u.turns > 0 && seen ? " · " : ""}
+                            {seen ? `last used ${seen}` : ""}
+                          </span>
+                        )}
+                      </span>
+                      <span className="font-mono text-[12px] text-muted shrink-0">
+                        {tokens(u.tokens)}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            <p className="text-[11px] text-muted mt-3 leading-snug">
+              Lifetime totals from this machine's stats.json. Tokens are what
+              the model generated, not what it read.
+            </p>
+          </section>
+        )}
+
         {options.length > 0 && (
           <section className="rounded-lg bg-panel p-5">
             <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-3">
@@ -269,14 +348,50 @@ export default function EngineSurface() {
           </section>
         )}
 
-        <section className="rounded-lg bg-panel p-5">
-          <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-3">
-            engine log
-          </h3>
+        {/* IMP-11: the reason a model failed to load is in this log, and
+            finding it used to mean opening a terminal and knowing where
+            ~/.rigma/logs is (finding 15-7). Collapsible, filterable and
+            copyable; the tail bound is the server's own (`?lines=`). */}
+        <details open className="rounded-lg bg-panel p-5">
+          <summary className="cursor-pointer list-none">
+            <span className="font-mono text-[11px] text-muted uppercase tracking-[0.08em]">
+              engine log
+            </span>
+          </summary>
+          <div className="flex items-center gap-2 mt-3 mb-2">
+            <input
+              value={logFilter}
+              onChange={(e) => setLogFilter(e.target.value)}
+              placeholder="filter lines…"
+              aria-label="Filter engine log"
+              className="flex-1 min-w-0 rounded-md bg-surface px-2.5 py-1 font-mono text-[12px] outline-none placeholder:text-muted"
+            />
+            <span className="font-mono text-[11px] text-muted shrink-0">
+              {shown.length} line{shown.length === 1 ? "" : "s"}
+            </span>
+            <select
+              value={logLines}
+              onChange={(e) => setLogLines(Number(e.target.value))}
+              aria-label="Engine log tail size"
+              className="shrink-0 rounded-md bg-surface px-2 py-1 font-mono text-[11.5px] outline-none"
+            >
+              {[200, 500, 2000].map((n) => (
+                <option key={n} value={n}>last {n}</option>
+              ))}
+            </select>
+            <button
+              onClick={() => void copyLog()}
+              className="shrink-0 rounded-md bg-surface hover:bg-float px-2.5 py-1 text-[12px]"
+            >
+              {copied ? "copied" : "copy"}
+            </button>
+          </div>
           <pre className="font-mono text-[11.5px] text-secondary whitespace-pre-wrap max-h-64 overflow-y-auto">
-            {log || "(empty)"}
+            {shown.length > 0
+              ? shown.join("\n")
+              : log ? "(no line matches the filter)" : "(empty)"}
           </pre>
-        </section>
+        </details>
       </div>
     </main>
   );

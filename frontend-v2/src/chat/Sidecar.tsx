@@ -1,6 +1,7 @@
 // Right sidecar for the chat surface: grounding, sampling, system prompt.
 // Collapsible; state persists to the session via the existing PATCH API.
 import { useCallback, useEffect, useRef, useState } from "react";
+import InlineError from "../InlineError";
 import { api, type HarnessInfo } from "../lib/api";
 import {
   createDraft,
@@ -15,6 +16,8 @@ import { clampParam, rangeFor } from "../lib/paramLimits";
 import { useApp } from "../store";
 import MethodBuilder from "./MethodBuilder";
 import { selectAnyStreaming, useChat } from "./chatStore";
+import { GRANTS, NO_GRANTS, readGrants,
+         type GrantKey, type Grants } from "./grants";
 
 const CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 262144];
 const KV_TYPES = ["f16", "q8_0", "q5_1", "q4_0"];
@@ -551,6 +554,11 @@ function SamplingCard() {
   const setHarness = useChat((s) => s.setHarness);
   const permission = useChat((s) => s.permission);
   const setPermission = useChat((s) => s.setPermission);
+  // IMP-4 / AUDIT 13-3: the per-chat tool grants. Held LOCALLY rather than in
+  // the chat store because only this card renders them, and the session body
+  // is already fetched below for the sampling fields.
+  const [grants, setGrants] = useState<Grants>(NO_GRANTS);
+  const [grantErr, setGrantErr] = useState<string | null>(null);
   const [menu, setMenu] = useState<HarnessInfo[]>([]);
   // The one backend that moved, if any. Only INSTALLED ones count: a backend
   // that is not here cannot have drifted, and reporting it would be noise.
@@ -591,9 +599,26 @@ function SamplingCard() {
       setPrompt(raw.system_prompt ?? "");
       setPresetId(raw.preset_id ?? "");
       setEffort(String((s as unknown as { effort?: string }).effort ?? ""));
+      setGrants(readGrants(s));
       setDirty(false);
     }).catch(() => {});
   }, [currentId]);
+
+  // A grant is a real write, so it is NOT fire-and-forget: the server refuses
+  // a bad value and the checkbox must not keep showing a permission the chat
+  // does not have. Optimistic, then rolled back with the server's sentence.
+  const setGrant = async (key: GrantKey, on: boolean) => {
+    if (!currentId) return;
+    const prev = grants;
+    setGrants((g) => ({ ...g, [key]: on }));
+    setGrantErr(null);
+    try {
+      await api.updateSession(currentId, { [key]: on });
+    } catch (e) {
+      setGrants(prev);
+      setGrantErr((e as Error).message || "could not save");
+    }
+  };
 
   const save = async () => {
     if (!currentId) return;
@@ -786,6 +811,43 @@ function SamplingCard() {
           </select>
         </label>
       )}
+      {/* IMP-4 / AUDIT 13-3: the server gates run_shell / start_job /
+          run_python behind the session field `confirm_exec`, and 13-2 gates
+          absolute reads and outbound POSTs behind two more. NO session
+          defaults any of them and NO surface wrote them, so code execution
+          was silently OFF for every chat — the owner's own tools were
+          unreachable with nothing on screen to say why. Rendered for EVERY
+          harness, not just an external agent: these gate Rigma's own loop
+          too. Off is the honest starting point; turning one on is a real
+          grant, so each sentence says exactly what it permits. */}
+      <fieldset className="mt-1 rounded-md bg-surface px-2.5 py-2 flex flex-col gap-1.5">
+        <legend className="px-1 font-mono text-[10.5px] text-muted uppercase tracking-[0.08em]">
+          this chat may
+        </legend>
+        {GRANTS.map((g) => (
+          <label key={g.key}
+                 className="flex items-start gap-2 text-[12.5px] cursor-pointer">
+            <input
+              type="checkbox"
+              checked={grants[g.key]}
+              onChange={(e) => void setGrant(g.key, e.target.checked)}
+              aria-label={g.label}
+              className="mt-0.5 shrink-0 accent-amber"
+            />
+            <span className="min-w-0">
+              <span className="text-primary">{g.label}</span>
+              <span className="block text-[11px] text-muted leading-snug">
+                {g.consequence}
+              </span>
+            </span>
+          </label>
+        ))}
+        <p className="text-[10.5px] text-muted leading-snug">
+          All three start off. A normal chat needs none of them; they only
+          widen what the model may do on this PC.
+        </p>
+        {grantErr && <InlineError message={grantErr} />}
+      </fieldset>
       <label className="flex items-center gap-2 text-[12.5px]">
         <span className="w-24 text-secondary">preset</span>
         <select
