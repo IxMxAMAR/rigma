@@ -3413,6 +3413,28 @@ def _run_shell(args, ctx):
 _JOBS: dict[int, dict] = {}
 _JOB_MAX_BUF = 64_000        # chars of rolling output kept per job
 _JOB_LIMIT = 8               # concurrent jobs — a runaway-spawn backstop
+# AUDIT 05-4: `_JOBS` is never popped, so every finished Popen plus its output
+# window was retained for the server's uptime and `job_output` with no id
+# returned one line per retained job. Keep the most recent few finished records
+# (so a just-finished job's exit code is still reachable) and evict the rest.
+_JOB_KEEP_FINISHED = 32
+
+
+def _prune_jobs(keep_finished: int | None = None) -> int:
+    """Evict the OLDEST finished job records, keeping the newest `keep_finished`.
+
+    Live jobs are never evicted — only records whose process has exited. Returns
+    how many were dropped. `job_output`/`kill_job` already answer "no such job"
+    for an evicted id, and ids increase monotonically, so "oldest" is the
+    smallest id."""
+    keep = _JOB_KEEP_FINISHED if keep_finished is None else keep_finished
+    finished = sorted(jid for jid, j in _JOBS.items()
+                      if j["proc"].poll() is not None)
+    dropped = 0
+    for jid in finished[:max(0, len(finished) - keep)]:
+        _JOBS.pop(jid, None)
+        dropped += 1
+    return dropped
 
 
 def _job_pump(job: dict, stream, label: str) -> None:
@@ -3483,6 +3505,7 @@ def _start_job(args, ctx):
     job = {"proc": proc, "chunks": deque(), "buflen": 0,
            "lock": threading.Lock(), "cmd": cmd[:500], "started": time.time()}
     _JOBS[jid] = job
+    _prune_jobs()          # AUDIT 05-4: bound the table, never the live jobs
     for stream, label in ((proc.stdout, "out"), (proc.stderr, "err")):
         threading.Thread(target=_job_pump, args=(job, stream, label),
                          daemon=True).start()
@@ -3560,7 +3583,9 @@ def kill_all_jobs() -> int:
     shutdown hook are its callers.
 
     Entries are LEFT in place: job_output must still be able to report the
-    exit code of a job that was killed mid-run. Never raises — it runs on
+    exit code of a job that was killed mid-run. The table is bounded by
+    `_prune_jobs` at the next `start_job`, which keeps the newest few finished
+    records and drops older ones (AUDIT 05-4). Never raises — it runs on
     shutdown paths where an exception would strand the rest of the teardown."""
     killed = 0
     for job in list(_JOBS.values()):

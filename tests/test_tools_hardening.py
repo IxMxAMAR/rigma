@@ -295,3 +295,63 @@ def test_the_write_path_guard_still_rejects_globs_and_allows_real_names():
     assert tools._bad_write_char("aux_data.txt") is None
     assert tools._bad_write_char("com10.gguf") is None
     assert tools._reserved_device_name("Q4_K_M/nul.gguf") == "nul.gguf"
+
+
+# --- AUDIT 05-4: the background-job table is bounded --------------------------
+# Fakes only: a test that spawns and kills a real child hangs in this sandbox
+# (taskkill is denied), and the defect is pure bookkeeping anyway.
+class _FakeProc:
+    pid = 4242
+
+    def __init__(self, rc=0):
+        import io
+        self.stdout = io.StringIO("")
+        self.stderr = io.StringIO("")
+        self.rc = rc
+
+    def poll(self):
+        return self.rc
+
+
+def _fake_job(rc=0):
+    import collections
+    import threading
+    return {"proc": _FakeProc(rc), "chunks": collections.deque(),
+            "buflen": 0, "lock": threading.Lock(), "cmd": "echo hi",
+            "started": 0.0}
+
+
+def _with_saved_jobs(fn):
+    saved = dict(tools._JOBS)
+    try:
+        tools._JOBS.clear()
+        return fn()
+    finally:
+        tools._JOBS.clear()
+        tools._JOBS.update(saved)
+
+
+def test_prune_jobs_keeps_live_jobs_and_the_newest_finished():
+    def run():
+        for jid in range(1, 11):
+            tools._JOBS[jid] = _fake_job(rc=0)      # finished
+        tools._JOBS[11] = _fake_job(rc=None)        # live
+        assert tools._prune_jobs(keep_finished=3) == 7
+        assert sorted(tools._JOBS) == [8, 9, 10, 11]
+    _with_saved_jobs(run)
+
+
+def test_start_job_evicts_old_finished_records(monkeypatch, tmp_path):
+    """`_JOBS[jid] = job` was the only writer and nothing ever popped, so every
+    finished Popen and its output window lived for the server's uptime."""
+    def run():
+        monkeypatch.setattr(tools, "_launch_killable",
+                            lambda *a, **k: _FakeProc(0))
+        monkeypatch.setattr(tools, "_JOB_KEEP_FINISHED", 4)
+        ctx = {"allow_code": True, "confirm_exec": True, "profile": "all",
+               "workspace": str(tmp_path)}
+        for _ in range(25):
+            out = tools.run_tool("start_job", {"command": "echo hi"}, ctx)
+            assert out.startswith("started job"), out
+        assert len(tools._JOBS) <= 4
+    _with_saved_jobs(run)
