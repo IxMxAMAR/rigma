@@ -63,6 +63,22 @@ def _read_value(f, t: int, keep: bool, depth: int = 0):
     return (bool(v) if t == 7 else v) if keep else None
 
 
+def _as_int(value, key: str) -> int:
+    """A header integer, or a GgufParseError naming the key it came from.
+
+    AUDIT F06-6: every other malformed-header path in this module raises
+    GgufParseError and callers catch that type, but the numeric conversions used
+    a raw int()/max() — so a header whose `attention.head_count` was an empty
+    array, or whose `block_count` was declared as a string, crashed with a bare
+    ValueError ("max() iterable argument is empty", "invalid literal for int()")
+    that names neither the file nor the key and escapes every caller's except.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise GgufParseError(f"{key} is not a number: {value!r}") from exc
+
+
 def read_metadata(src) -> dict:
     """Header KVs, skipping bulky tokenizer arrays (vocab, merges, scores).
 
@@ -217,14 +233,20 @@ def _inspect(f, fallback: str) -> GgufInfo:
     # reported 64. Same weights, same geometry, two different specs — and every
     # per-layer figure derived from them (KV per token, dense offload, the MoE
     # expert share) silently disagreed by one layer's worth.
-    blocks = int(g("block_count", 0))
-    mtp_layers = int(g("nextn_predict_layers", 0) or 0)
+    blocks = _as_int(g("block_count", 0), f"{arch}.block_count")
+    mtp_layers = _as_int(g("nextn_predict_layers", 0) or 0,
+                         f"{arch}.nextn_predict_layers")
     if not mtp_layers and tx.mtp_blocks:
         # tensors carry MTP the header forgot to declare: trust the file
         mtp_layers = 1
     n_layers = max(1, blocks - mtp_layers) if blocks else 0
     heads = g("attention.head_count", 0)
-    heads = max(int(h) for h in heads) if isinstance(heads, list) else int(heads)
+    if isinstance(heads, list):
+        # default=0: an empty array is corrupt, not a reason to crash unnamed
+        heads = max((_as_int(h, f"{arch}.attention.head_count") for h in heads),
+                    default=0)
+    else:
+        heads = _as_int(heads, f"{arch}.attention.head_count")
     kv = g("attention.head_count_kv", 0)
     # sliding-window attention (Gemma 2/3/4, …): only the GLOBAL layers keep a
     # KV cache that grows with context; the windowed layers are bounded by the
@@ -238,7 +260,8 @@ def _inspect(f, fallback: str) -> GgufInfo:
     # SWA model), which nothing downstream could budget because nothing carried
     # the numbers. Reported here so the resolver can charge for it; a file with
     # no window reports zeros and is charged nothing.
-    swa_window = int(g("attention.sliding_window", 0) or 0)
+    swa_window = _as_int(g("attention.sliding_window", 0) or 0,
+                         f"{arch}.attention.sliding_window")
     swa_layers = swa_kv_heads = 0
     if isinstance(kv, list):
         if isinstance(swa, list) and len(swa) == len(kv):
@@ -246,13 +269,17 @@ def _inspect(f, fallback: str) -> GgufInfo:
             wi = [i for i, w in enumerate(swa) if w]       # windowed-layer ones
             if wi:
                 swa_layers = len(wi)
-                swa_kv_heads = max(int(kv[i]) for i in wi)
+                swa_kv_heads = max(_as_int(kv[i], f"{arch}.attention.head_count_kv")
+                                   for i in wi)
             if gi:
                 full_attn = len(gi)
-                kv_heads = max(int(kv[i]) for i in gi)
+                kv_heads = max(_as_int(kv[i], f"{arch}.attention.head_count_kv")
+                               for i in gi)
             else:                                          # all windowed (rare)
-                full_attn = sum(1 for h in kv if int(h) > 0)
-                kv_heads = max((int(h) for h in kv), default=0)
+                full_attn = sum(1 for h in kv
+                                if _as_int(h, f"{arch}.attention.head_count_kv") > 0)
+                kv_heads = max((_as_int(h, f"{arch}.attention.head_count_kv")
+                                for h in kv), default=0)
                 # AUDIT F19: with no global layers, `full_attn` above already
                 # charges every layer at the full context. Reporting the same
                 # layers as windowed too would bill them twice. Drop the
@@ -263,8 +290,10 @@ def _inspect(f, fallback: str) -> GgufInfo:
         else:
             # per-layer table without an SWA pattern: zeros are linear-attention
             # (DeltaNet) layers that hold no KV cache
-            full_attn = sum(1 for h in kv if int(h) > 0)
-            kv_heads = max((int(h) for h in kv), default=0)
+            full_attn = sum(1 for h in kv
+                            if _as_int(h, f"{arch}.attention.head_count_kv") > 0)
+            kv_heads = max((_as_int(h, f"{arch}.attention.head_count_kv")
+                            for h in kv), default=0)
     else:
         # A SCALAR kv head count does not mean every layer is full attention.
         # Qwen3.5/3.8 interleave SSM (linear-attention) layers and declare the
@@ -278,23 +307,29 @@ def _inspect(f, fallback: str) -> GgufInfo:
         # 8K on a 16GB card when its real appetite allows far more (owner
         # report 2026-07-30 — the same failure Gemma's sliding-window pattern
         # got fixed for above, arriving in a different shape).
-        interval = int(g("full_attention_interval", 0) or 0)
+        interval = _as_int(g("full_attention_interval", 0) or 0,
+                           f"{arch}.full_attention_interval")
         if interval > 1 and n_layers > 0:
             full_attn = max(1, n_layers // interval)
         else:
             full_attn = n_layers
-        kv_heads = int(kv)
-    head_dim = int(g("attention.key_length", 0)) or (
-        int(g("embedding_length", 0)) // heads if heads else 0)
+        kv_heads = _as_int(kv, f"{arch}.attention.head_count_kv")
+    head_dim = _as_int(g("attention.key_length", 0),
+                       f"{arch}.attention.key_length") or (
+        _as_int(g("embedding_length", 0), f"{arch}.embedding_length") // heads
+        if heads else 0)
     caps, has_template = _capabilities(meta, tx)
-    experts = int(g("expert_count", 0) or 0)
+    experts = _as_int(g("expert_count", 0) or 0, f"{arch}.expert_count")
     fields = {"n_layers": n_layers, "full_attn_layers": full_attn,
               "kv_heads": kv_heads, "head_dim": head_dim,
-              "native_ctx": int(g("context_length", 0)),
+              "native_ctx": _as_int(g("context_length", 0),
+                                    f"{arch}.context_length"),
               "kind": "moe" if experts else "dense",
               # geometry needed to re-derive the above without the file in hand,
               # so a spec written by an older probe can be healed on read
-              "full_attention_interval": int(g("full_attention_interval", 0) or 0),
+              "full_attention_interval": _as_int(
+                  g("full_attention_interval", 0) or 0,
+                  f"{arch}.full_attention_interval"),
               # sliding-window geometry: how many layers hold a cache bounded
               # by the window rather than by ctx, how wide they are, and how
               # long the window is. All three or nothing — a zero window means
@@ -307,7 +342,8 @@ def _inspect(f, fallback: str) -> GgufInfo:
               "mtp": tx.has_mtp,
               "params": tx.params,
               "expert_params": tx.expert_params,
-              "expert_used": int(g("expert_used_count", 0) or 0),
+              "expert_used": _as_int(g("expert_used_count", 0) or 0,
+                                     f"{arch}.expert_used_count"),
               "experts": experts,
               "has_template": has_template,
               # the model's OWN recommended sampling, which it ships and Rigma
