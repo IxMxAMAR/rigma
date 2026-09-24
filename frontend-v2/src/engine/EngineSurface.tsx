@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { engineApi, type EngineFinding, type ServerInfo,
          type SwitchOption, type UsageStats } from "../lib/engineApi";
 import { filterLines } from "../lib/logTail";
-import { tokens, topModels } from "../lib/usage";
+import { tokens, usageRows, sinceLabel } from "../lib/usage";
 
 function uptime(startedAt: number): string {
   const s = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
@@ -132,7 +132,8 @@ export default function EngineSurface() {
     );
 
   const tg = info.last_tg ?? null;
-  const usage = topModels(stats?.by_model);
+  const usage = usageRows(stats);
+  const now = Date.now() / 1000;
   const verdictTone =
     info.verdict === "healthy" ? "moss" : info.verdict ? "red" : undefined;
 
@@ -288,18 +289,32 @@ export default function EngineSurface() {
                     value={String(Object.keys(stats.by_model).length)} />
             </div>
             {usage.length > 0 && (
-              <ul className="mt-4 flex flex-col gap-1">
-                {usage.map((u) => (
-                  <li key={u.model} className="flex items-center gap-3 text-[12.5px]">
-                    <span className="flex-1 min-w-0 truncate font-mono text-secondary"
-                          title={u.model || "unknown model"}>
-                      {u.model || "(unknown model)"}
-                    </span>
-                    <span className="font-mono text-[12px] text-muted shrink-0">
-                      {tokens(u.tokens)}
-                    </span>
-                  </li>
-                ))}
+              <ul className="mt-4 flex flex-col gap-1.5">
+                {usage.map((u) => {
+                  const seen = sinceLabel(u.last_used, now);
+                  return (
+                    <li key={u.model} className="flex items-center gap-3 text-[12.5px]">
+                      <span className="flex-1 min-w-0">
+                        <span className="block truncate font-mono text-secondary"
+                              title={u.model || "unknown model"}>
+                          {u.model || "(unknown model)"}
+                        </span>
+                        {(u.turns > 0 || seen) && (
+                          <span className="block font-mono text-[10.5px] text-muted">
+                            {u.turns > 0
+                              ? `${u.turns} turn${u.turns === 1 ? "" : "s"}`
+                              : ""}
+                            {u.turns > 0 && seen ? " · " : ""}
+                            {seen ? `last used ${seen}` : ""}
+                          </span>
+                        )}
+                      </span>
+                      <span className="font-mono text-[12px] text-muted shrink-0">
+                        {tokens(u.tokens)}
+                      </span>
+                    </li>
+                  );
+                })}
               </ul>
             )}
             <p className="text-[11px] text-muted mt-3 leading-snug">

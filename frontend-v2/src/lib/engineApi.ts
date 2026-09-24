@@ -248,13 +248,17 @@ export interface EngineFinding {
 }
 
 /** The lifetime odometer, read from ~/.rigma/stats.json by serve.server_stats.
- *  `by_model` maps a model id to the tokens IT generated. The file does not
- *  record when a model was last used, so the UI shows no date — inventing one
- *  would be worse than omitting it (IMP-7). */
+ *  `by_model` maps a model id to the tokens IT generated. The IMP-7 enrichment
+ *  adds a pre-sorted `models[]` with a per-model turn count and a last-used
+ *  stamp; all three are optional because an older server does not send them. */
 export interface UsageStats {
   total_tokens: number;
   total_turns: number;
   by_model: Record<string, number>;
+  by_model_turns?: Record<string, number>;
+  last_used?: Record<string, number>;
+  models?: { model?: string; tokens?: number; turns?: number;
+             last_used?: number | null }[];
 }
 
 export const engineApi = {
