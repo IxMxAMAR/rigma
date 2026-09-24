@@ -1119,7 +1119,18 @@ def status():
         typer.echo("stop with: rigma stop")
         raise typer.Exit(0)
     up_min = (time.time() - s["started_at"]) / 60
-    typer.echo(f"running: {s['model']} ({s['quant']})  up {up_min:.0f} min")
+    # R3-VLLM-4: a vLLM launch has NO quant — it serves HF safetensors, not a
+    # quantised GGUF — so the old line printed `running: Qwen/Qwen3-8B ()  up 3
+    # min`, an empty pair of brackets where the one fact that explains why they
+    # are empty belongs. Name the engine instead.
+    _eng = str(s.get("engine") or "")
+    if _eng == "vllm":
+        typer.echo(f"running: {s['model']} (vLLM)  up {up_min:.0f} min")
+    elif s.get("quant"):
+        typer.echo(f"running: {s['model']} ({s['quant']})  up {up_min:.0f} min")
+    else:
+        # no engine recorded and no quant: do not assert an engine nobody wrote
+        typer.echo(f"running: {s['model']}  up {up_min:.0f} min")
     typer.echo(f"chat UI:  http://127.0.0.1:{s['public_port']}")
     typer.echo(f"OpenAI:   http://127.0.0.1:{s['public_port']}/v1")
     typer.echo("stop with: rigma stop")

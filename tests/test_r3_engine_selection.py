@@ -225,3 +225,35 @@ def test_engine_runtimes_json_is_machine_readable(home):
     assert isinstance(rows, list) and rows
     for r in rows:
         assert {"engine", "available", "reason"} <= set(r), r
+
+
+# --- `rigma status` names the engine ----------------------------------------
+
+def test_status_names_vllm_instead_of_printing_empty_brackets(home):
+    """A vLLM launch has no quant, so the old line read `running: Qwen/Qwen3-8B ()
+    up 3 min` — empty brackets where the explaining fact belongs."""
+    import os
+    st.write_state("Qwen/Qwen3-8B", "", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="vllm", engine="vllm")
+    res = runner.invoke(cli.app, ["status"])
+    assert res.exit_code == 0, res.output
+    assert "vLLM" in res.output
+    assert "()" not in res.output, res.output
+
+
+def test_status_is_unchanged_for_a_llamacpp_launch(home):
+    import os
+    st.write_state("m", "Q4_K_M", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="vulkan", engine="llamacpp")
+    res = runner.invoke(cli.app, ["status"])
+    assert "m (Q4_K_M)" in res.output, res.output
+
+
+def test_status_does_not_invent_an_engine(home):
+    """A record with no engine and no quant must not claim either."""
+    import os
+    st.write_state("m", "", 11500, engine_pid=os.getpid(), ui_pid=os.getpid(),
+                   backend="vulkan")
+    res = runner.invoke(cli.app, ["status"])
+    assert "()" not in res.output, res.output
+    assert "vLLM" not in res.output, res.output
