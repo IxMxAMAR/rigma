@@ -2918,6 +2918,10 @@ def _run_python(args, ctx):
                 "string like 'a\\nb', write the backslash TWICE in the JSON "
                 "argument ('a\\\\nb') — a single backslash becomes a real "
                 "newline and splits the literal.")
+    # AUDIT 13-3: same gate as the shell tools (confirmation + profile).
+    allowed, why = exec_decision(code, ctx, python_src=code)
+    if not allowed:
+        return f"error: {why}"
     out = _run_subprocess(["python", "-I", "-c", code], ctx, python_src=code)
     if healed:
         out = (f"(note: {healed} string literal(s) in your code had been "
@@ -2946,19 +2950,16 @@ def _run_shell(args, ctx):
         tmo = max(1, min(int(args.get("timeout", 30) or 30), 300))
     except (TypeError, ValueError):
         tmo = 30
+    # AUDIT 13-3: the gate (confirmation + profile) is the enforcement; the
+    # regex inside exec_decision is only an advisory refusal of the literal form.
+    allowed, why = exec_decision(cmd, ctx)
+    if not allowed:
+        return f"error: {why}"
     # Windows: run through PowerShell, not cmd.exe. Every local model is
     # Unix-trained and reaches for ls/pwd/cat/mv/cp - which are all native
     # PowerShell aliases, but unknown words to cmd (live 2026-07-21: the
-    # model ran `ls`, cmd said "not recognized", turn wasted). The
-    # destructive-command blocklist runs on the TEXT first either way.
+    # model ran `ls`, cmd said "not recognized", turn wasted).
     if sys.platform == "win32":
-        text = cmd
-        if _BLOCKED_CMD.search(text):
-            return ("error: blocked — that looks like a destructive system "
-                    "command; refusing to run it")
-        if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(text):
-            return ("error: blocked — deletion is disabled for this run "
-                    "(no-delete)")
         return _run_subprocess(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
             ctx, shell=False, timeout=tmo)
@@ -3001,11 +3002,10 @@ def _start_job(args, ctx):
     cmd = str(args.get("command", ""))
     if not cmd.strip():
         return "error: `command` is required"
-    if _BLOCKED_CMD.search(cmd):
-        return ("error: blocked — that looks like a destructive system "
-                "command; refusing to run it")
-    if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(cmd):
-        return "error: blocked — deletion is disabled for this run (no-delete)"
+    # AUDIT 13-3: same gate as run_shell (confirmation + profile).
+    allowed, why = exec_decision(cmd, ctx)
+    if not allowed:
+        return f"error: {why}"
     live = [j for j in _JOBS.values() if j["proc"].poll() is None]
     if len(live) >= _JOB_LIMIT:
         return (f"error: {_JOB_LIMIT} jobs already running — kill_job one "
@@ -3169,6 +3169,61 @@ _BLOCKED_PY = re.compile(
     r"clear-disk|initialize-disk)\b)")
 _DELETE_PY = re.compile(
     r"(?i)(os\.(remove|unlink|rmdir)|shutil\.rmtree|\.unlink\s*\(|send2trash)")
+
+
+# AUDIT 13-3: the regexes above are ADVISORY, not the boundary. They match
+# literal text, and the text handed to PowerShell is only the outer wrapper —
+# base64, `-EncodedCommand`, a nested interpreter or string concatenation all
+# decode to a destructive payload the regex never sees. So the enforcement is a
+# separate, explicit per-session confirmation, and the regexes stay as a fast
+# refusal of the obvious literal form (and as a message that says what they
+# are). Tests call `exec_decision` on the TEXT; nothing here executes.
+def _exec_confirmed(ctx: dict) -> bool:
+    """Whether this session has explicitly confirmed it may spawn processes.
+
+    A caller that does not set `confirm_exec` keeps the pre-13-3 behaviour
+    (`allow_code` is the grant) so embedders of the library do not silently
+    lose execution. Every ctx the PRODUCT builds — serve.py, mcp_server, the
+    macro context — sets the field explicitly, so the product default is the
+    safe one.
+    """
+    v = ctx.get("confirm_exec")
+    if v is None:
+        return bool(ctx.get("allow_code"))
+    return bool(v)
+
+
+def exec_decision(cmd: str, ctx: dict, *, python_src: str | None = None
+                  ) -> tuple[bool, str]:
+    """May this execution tool run `cmd`? Returns (allowed, refusal).
+
+    The single decision point for run_shell / start_job / run_python. It only
+    reads TEXT — it never runs anything, which is what lets the tests exercise
+    it with destructive strings (safety rule 7).
+    """
+    prof = ctx.get("profile", "all")
+    if prof == "confined":
+        return False, "code execution is disabled for this run (confined)"
+    if python_src is not None:
+        if _BLOCKED_PY.search(python_src):
+            return False, ("blocked — that code destroys a drive or shells out "
+                           "to a destructive command; refusing to run it")
+    elif _BLOCKED_CMD.search(cmd):
+        return False, ("blocked — that looks like a destructive system "
+                       "command; refusing to run it")
+    if prof == "no-delete":
+        hit = (_DELETE_PY.search(python_src) if python_src is not None
+               else _DELETE_CMD.search(cmd))
+        if hit:
+            return False, ("blocked — deletion is disabled for this run "
+                           "(no-delete)")
+    if not _exec_confirmed(ctx):
+        return False, ("running shell commands or code needs explicit "
+                       "confirmation for this chat — the destructive-command "
+                       "list is only an advisory text check, so it cannot gate "
+                       "what a wrapper decodes. Enable 'confirm execution' on "
+                       "the session to allow it")
+    return True, ""
 
 
 def _launch_killable(cmd, shell, cwd):

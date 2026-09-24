@@ -1831,6 +1831,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # else, so the model there cannot wander into the real toolset
             builder_only = bool(s.get("method_draft_id"))
             tctx = {"allow_code": bool(s.get("allow_code")),
+                    # AUDIT 13-3: execution needs its own explicit confirmation;
+                    # the destructive-command regex is only an advisory. The
+                    # session setting is the way back to the old behaviour.
+                    "confirm_exec": bool(s.get("confirm_exec")),
                     "workspace": s.get("workspace") or str(_Path.home()),
                     "has_vision": has_vision,
                     "run_id": run_id, "profile": run_profile,
@@ -1894,6 +1898,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # execution, and no run_id — the run-scoped tools reach the
                 # live run through it (methods_api.py:135 uses this pattern).
                 _sub_ctx = {**tctx, "allow_code": False, "run_id": "",
+                            "confirm_exec": False,
                             "method_draft_id": "", "_reads": {}}
                 q = question + (f"\n(Focus on: {path})" if path else "")
                 msgs = [{"role": "system", "content":
@@ -4888,6 +4893,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     def _macro_tool_ctx(session) -> dict:
         return {"allow_code": bool(session.get("allow_code")),
+                "confirm_exec": bool(session.get("confirm_exec")),
                 "workspace": session.get("workspace") or "",
                 "session_id": session.get("id", "")}
 

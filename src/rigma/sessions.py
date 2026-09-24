@@ -82,7 +82,12 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   # defaults to `full` (do not ask) and lets the owner choose
                   # otherwise with the cost stated — rather than hardcoding the
                   # choice and calling it the only option.
-                  "permission")
+                  "permission",
+                  # AUDIT 13-3: spawning a process is its own grant. The
+                  # destructive-command regex is a literal-text advisory and
+                  # cannot be the boundary, so run_shell/start_job/run_python
+                  # need this explicit confirmation as well as allow_code.
+                  "confirm_exec")
 # What each agent backend understands. `smart` classifies and asks when it
 # judges risk high; `full` does not ask; `off` disarms the agent's tools. `ask`
 # is refused headlessly by mcode itself ("requires an interactive host"), so it
