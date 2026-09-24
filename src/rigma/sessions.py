@@ -87,7 +87,11 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   # destructive-command regex is a literal-text advisory and
                   # cannot be the boundary, so run_shell/start_job/run_python
                   # need this explicit confirmation as well as allow_code.
-                  "confirm_exec")
+                  "confirm_exec",
+                  # AUDIT 13-2: reads default to the workspace and outbound
+                  # POSTs carrying a body are refused. These two grants restore
+                  # the pre-fix behaviour explicitly rather than by default.
+                  "allow_absolute_reads", "allow_outbound_post")
 # What each agent backend understands. `smart` classifies and asks when it
 # judges risk high; `full` does not ask; `off` disarms the agent's tools. `ask`
 # is refused headlessly by mcode itself ("requires an interactive host"), so it

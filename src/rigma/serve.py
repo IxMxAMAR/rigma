@@ -1835,6 +1835,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # the destructive-command regex is only an advisory. The
                     # session setting is the way back to the old behaviour.
                     "confirm_exec": bool(s.get("confirm_exec")),
+                    # AUDIT 13-2: reads are workspace-confined and outbound
+                    # POSTs carrying a body are refused unless the session
+                    # grants them; both are explicit opt-ins.
+                    "allow_absolute_reads": bool(s.get("allow_absolute_reads")),
+                    "allow_outbound_post": bool(s.get("allow_outbound_post")),
                     "workspace": s.get("workspace") or str(_Path.home()),
                     "has_vision": has_vision,
                     "run_id": run_id, "profile": run_profile,
@@ -1899,6 +1904,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # live run through it (methods_api.py:135 uses this pattern).
                 _sub_ctx = {**tctx, "allow_code": False, "run_id": "",
                             "confirm_exec": False,
+                            "allow_absolute_reads": False,
+                            "allow_outbound_post": False,
                             "method_draft_id": "", "_reads": {}}
                 q = question + (f"\n(Focus on: {path})" if path else "")
                 msgs = [{"role": "system", "content":
@@ -4894,6 +4901,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     def _macro_tool_ctx(session) -> dict:
         return {"allow_code": bool(session.get("allow_code")),
                 "confirm_exec": bool(session.get("confirm_exec")),
+                "allow_absolute_reads": bool(
+                    session.get("allow_absolute_reads")),
+                "allow_outbound_post": bool(
+                    session.get("allow_outbound_post")),
                 "workspace": session.get("workspace") or "",
                 "session_id": session.get("id", "")}
 
