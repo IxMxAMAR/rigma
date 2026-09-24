@@ -3196,6 +3196,14 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
         if found is None:
             return None, f"no such file: {ps}" + _candidates(p), ""
         p = found
+    # AUDIT R3-7: this branch never consulted the credential denylist, so an
+    # image inside `.ssh`, a browser profile or Rigma's own state dir was the
+    # one read the 13-2 fix did not cover — the grant is irrelevant to it, and
+    # the two image modes disagreed with `view_images(folder=…)`, which goes
+    # through `_read_path` and refuses.
+    denied = _credential_path_reason(p, ctx)
+    if denied:
+        return None, f"refusing to read {p} — {denied}", ""
     if p.suffix.lower() not in _IMAGE_EXTS:
         return None, f"{p.name} is not an image", ""
     if p.stat().st_size > 20_000_000:
