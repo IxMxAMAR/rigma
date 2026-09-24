@@ -106,6 +106,15 @@ def register(app, *, sse, drive_turn, aux_complete, tool_ctx_for) -> None:
         document that travelled here from somewhere else."""
         doc = dict(body or {})
         doc.pop("always_allow", None)
+        # AUDIT 10-2: run the shape guard BEFORE the strip below. `dict(c)` on a
+        # wrong-typed component list ("macros": "boom") raised TypeError/
+        # ValueError straight out of this comprehension, so the one endpoint
+        # you use to REPAIR a broken method file answered a 500 instead of the
+        # documented 400 with a self-correcting errors array. save_user would
+        # have caught it, but it only runs after this line.
+        errs = _methods._shape_errors(doc)
+        if errs:
+            return JSONResponse({"errors": errs}, status_code=400)
         for key in ("macros", "workflows", "rules"):
             doc[key] = [{k: v for k, v in dict(c).items()
                          if k != "always_allow"}
