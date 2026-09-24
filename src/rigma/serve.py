@@ -4895,9 +4895,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # left `python train.py` holding VRAM and its port, and after a restart
         # the in-process id table was gone so kill_job answered "no such job"
         # for an orphan that was still running.
+        #
+        # AUDIT 03-3: scope it to THIS run's jobs. kill_all_jobs killed every
+        # background job in the process — including a download the owner had
+        # started in an unrelated chat, which then reported a nonzero exit with
+        # nothing saying who killed it. The process shutdown hook still calls
+        # kill_all_jobs, where there is no other owner left to protect.
         try:
             from . import tools as _tk
-            killed = _tk.kill_all_jobs()
+            killed = _tk.kill_jobs_for_run(rid)
             if killed:
                 _log.info("stop_run %s: killed %d background job(s)", rid, killed)
         except Exception:
