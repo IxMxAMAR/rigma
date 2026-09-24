@@ -1333,7 +1333,7 @@ def _numbers_in(name: str) -> list[str]:
     return [d.lstrip("0") or "0" for d in re.findall(r"\d+", name)]
 
 
-def _fuzzy_file(p: Path):
+def _fuzzy_file(p: Path, ctx: dict | None = None):
     """Recover a near-miss filename. Weak models retype paths from memory and
     mangle them — dropping zero padding is the classic one, because digit runs
     tokenize awkwardly (ComfyUI_00428_.png -> Comfy_UI_428.png). The file it
@@ -1345,7 +1345,13 @@ def _fuzzy_file(p: Path):
     replaying recorded runs) — and for an image, silently handing back the wrong
     picture is worse than an error, because the model then describes it
     confidently. Punctuation, spacing and zero padding may differ; the numbers
-    may not."""
+    may not.
+
+    AUDIT R3-2: a candidate the credential denylist refuses is not a candidate.
+    The check in `_read_path`/`_write_path` runs on the name the MODEL gave, and
+    the recovery then substituted the real sibling underneath it — so
+    `read_file('.en')` handed back `.env` (and the note named it). `ctx` is
+    optional so a caller with no context keeps the old behaviour."""
     if p.exists():
         return p, ""
     parent = p.parent
@@ -1359,6 +1365,9 @@ def _fuzzy_file(p: Path):
     want = norm(p.name)
     want_nums = _numbers_in(p.name)
     names = [x.name for x in parent.iterdir() if x.is_file()]
+    if ctx is not None:
+        names = [n for n in names
+                 if not _credential_path_reason(parent / n, ctx)]
     for n in names:                       # exact match ignoring case/pad/punct
         if norm(n) == want:
             return parent / n, f" (you asked for '{p.name}' — used '{n}')"
@@ -2547,7 +2556,7 @@ def _read_file(args, ctx):
     p = _read_path(ctx, raw)
     _read_note = ""
     if not p.is_file():
-        fixed, _read_note = _fuzzy_file(p)
+        fixed, _read_note = _fuzzy_file(p, ctx)
         if fixed is not None:
             p = fixed
     if not p.is_file():
@@ -2999,7 +3008,7 @@ def _transfer_sources(args, ctx) -> tuple[list, list, list]:
             errs.append(str(e))
             continue
         if not p.is_file():
-            fixed, note = _fuzzy_file(p)
+            fixed, note = _fuzzy_file(p, ctx)
             if fixed is not None:
                 p = fixed
                 if note:
@@ -3147,7 +3156,7 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
         # names that _fuzzy_file resolves in one step. _fuzzy_file only ever
         # returns a file inside p.parent, so an absolute path stays in its own
         # directory and no confinement is lost.
-        found, note = _fuzzy_file(p)
+        found, note = _fuzzy_file(p, ctx)
         if found is None:
             return None, f"no such file: {ps}" + _candidates(p), ""
         p = found
