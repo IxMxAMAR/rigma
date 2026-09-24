@@ -205,18 +205,57 @@ def test_repaired_chat_template_is_passed_to_the_engine(tmp_path, monkeypatch):
     minja evaluates as unbounded recursion — the process dies with
     STATUS_STACK_BUFFER_OVERRUN (0xC0000409) before allocating any context, so
     it looks like a VRAM problem and isn't. Dropping a repaired template at
-    ~/.rigma/templates/<slug>.jinja must override the embedded one."""
+    ~/.rigma/templates/<slug>.jinja must override the embedded one.
+
+    AUDIT F60: the body used to check the file existed and then do the lookup
+    itself, so it never proved the flag reached the command line.
+    """
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
-    from rigma.runtime import rigma_home
-    d = rigma_home() / "templates"
+    reg, profile = _dual_quant_world(tmp_path)
+    d = tmp_path / "templates"
     d.mkdir(parents=True, exist_ok=True)
-    t = d / "my-model.jinja"
+    t = d / "dual.jinja"
     t.write_text("{{ 'hi' }}", encoding="utf-8")
-    assert t.is_file()
-    # the lookup server_ops performs, isolated
-    found = (rigma_home() / "templates" / "my-model.jinja")
-    assert found.is_file()
-    assert not (rigma_home() / "templates" / "other-model.jinja").is_file()
+    state.write_state("other", "Q0", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    monkeypatch.setattr("rigma.state.kill_pid", lambda pid: None)
+    monkeypatch.setattr("rigma.runtime.ensure_engine",
+                        lambda backend, os_name: tmp_path / "llama-server.exe")
+    seen = {}
+
+    def _launch(exe, plan, mp, port=0, timeout=300.0, extra_args=None):
+        seen["extra"] = list(extra_args or [])
+        return SimpleNamespace(proc=SimpleNamespace(pid=4242))
+
+    monkeypatch.setattr("rigma.runtime.launch_server", _launch)
+    server_ops.perform_switch("dual", registry=reg, profile=profile)
+    assert "--chat-template-file" in seen["extra"], seen["extra"]
+    i = seen["extra"].index("--chat-template-file")
+    assert seen["extra"][i + 1] == str(t), seen["extra"]
+
+
+def test_a_model_with_no_repaired_template_gets_no_flag(tmp_path, monkeypatch):
+    """The negative half: the flag is not sent for every model, only for one
+    that actually has a template dropped next to it (AUDIT F60)."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    reg, profile = _dual_quant_world(tmp_path)
+    (tmp_path / "templates").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "templates" / "someone-else.jinja").write_text("x",
+                                                              encoding="utf-8")
+    state.write_state("other", "Q0", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    monkeypatch.setattr("rigma.state.kill_pid", lambda pid: None)
+    monkeypatch.setattr("rigma.runtime.ensure_engine",
+                        lambda backend, os_name: tmp_path / "llama-server.exe")
+    seen = {}
+
+    def _launch(exe, plan, mp, port=0, timeout=300.0, extra_args=None):
+        seen["extra"] = list(extra_args or [])
+        return SimpleNamespace(proc=SimpleNamespace(pid=4242))
+
+    monkeypatch.setattr("rigma.runtime.launch_server", _launch)
+    server_ops.perform_switch("dual", registry=reg, profile=profile)
+    assert "--chat-template-file" not in seen["extra"], seen["extra"]
 
 
 # --- choosing WHICH downloaded quant to run ----------------------------------

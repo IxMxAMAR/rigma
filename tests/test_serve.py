@@ -40,9 +40,16 @@ def test_proxy_get_and_streaming_post(upstream):
     client = TestClient(build_app(upstream_port=upstream))
     r = client.get("/v1/models")
     assert r.status_code == 200 and r.json()["object"] == "list"
-    r = client.post("/v1/chat/completions", json={"x": 1})
+    # A RAW body, deliberately: the passthrough guarantee is BYTE-for-byte, and
+    # `json={"x": 1}` only proved what the TEST CLIENT's serializer emits. That
+    # changed between starlette/httpx versions (compact vs `{"x": 1}`) and broke
+    # this test with the proxy itself untouched — found by the CI `floors` job
+    # (AUDIT F61). Spaces and all, the engine must see exactly these bytes.
+    raw = b'{"x":1, "pad" : "  keep   the   spacing  "}'
+    r = client.post("/v1/chat/completions", content=raw,
+                    headers={"content-type": "application/json"})
     assert r.status_code == 200
-    assert 'data: {"x":1}' in r.text and "[DONE]" in r.text
+    assert raw.decode() in r.text and "[DONE]" in r.text, r.text
 
 
 def test_root_serves_html(upstream):
