@@ -596,6 +596,29 @@ def _defuse_control_bytes(text: str) -> str:
                   "file corruption?]", text)
 
 
+# The sentinels a `sentinel=True` tool's result may legitimately START with.
+# Resolved lazily inside the function: DELEGATE_SENTINEL is defined further
+# down the module.
+_SENTINEL_MARKS = (IMAGE_SENTINEL, USE_TOOLS_SENTINEL)
+
+
+def _defuse_sentinel_result(result: str) -> str:
+    """Defuse a sentinel tool's result without corrupting the sentinel itself.
+
+    AUDIT R3-3. The payload after a sentinel is a resolved path list or a
+    json-encoded dict (which escapes control bytes), so it is safe to pass
+    through; everything a handler derived from the model's own input is not.
+    serve.py splits the image payload on the first NUL, so the separator is
+    preserved and only the trailing note is defused.
+    """
+    marks = _SENTINEL_MARKS + (DELEGATE_SENTINEL,)
+    for mark in marks:
+        if result.startswith(mark):
+            payload, sep, tail = result[len(mark):].partition("\x00")
+            return mark + payload + sep + _defuse_control_bytes(tail)
+    return _defuse_control_bytes(result)
+
+
 # Names other harnesses (and models trained on them) use for the SAME argument.
 # Applied per-tool against the tool's own schema, so `content` can mean the new
 # text for edit_file without also being aliased onto a tool that has its own
@@ -738,9 +761,16 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
         # (image injection, delegate routing, tool unlock) that serve.py's loop
         # consumes — never model-facing text. The property is declared at
         # registration, not sniffed from the result: file content can forge a
-        # sentinel and switch a text guard off (AUDIT 04-7). Every other
-        # result, read_file and grep included, is defused unconditionally.
-        return result
+        # sentinel and switch a text guard off (AUDIT 04-7).
+        #
+        # AUDIT R3-3: the property exempted the tool's ORDINARY results too, and
+        # a sentinel tool's error path embeds the model's own argument
+        # (`view_image(path="…\u0000\u0000…")` answers "no such file: …"), so it
+        # became the one way to deliver a raw NUL run — the instant-EOS poison
+        # this function exists to stop. Only a result that really IS a sentinel
+        # is passed around the guard, and even then the human-readable tail
+        # (after the NUL separator serve.py splits on) is defused.
+        return _defuse_sentinel_result(result)
     # defuse at the ONE choke point every tool result passes through, so
     # read_file, grep, run_shell, carriers and persistence all inherit it
     return _defuse_control_bytes(result)
