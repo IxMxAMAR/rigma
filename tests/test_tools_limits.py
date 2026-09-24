@@ -1,5 +1,8 @@
 """Tools must SIGNAL truncation so the model never mistakes a partial view for
 the whole thing (regression: a 2330-file folder showed only 200 silently)."""
+import os
+from contextlib import contextmanager
+
 from rigma import tools
 
 
@@ -30,6 +33,45 @@ def test_find_files_reports_truncation(tmp_path):
         (tmp_path / f"f{i:03}.py").write_text("x")
     out = tools.run_tool("find_files", {"pattern": "*.py"}, _ws(tmp_path))
     assert "250" in out and "200 of 250" in out
+
+
+def test_list_directory_bounds_the_scan_not_just_the_output(tmp_path,
+                                                            monkeypatch):
+    """14-1: the 200-name cap must not force a stat-per-entry sort of the whole
+    directory. With the scan cap at 50 and 200 files on disk, only ~50 entries
+    may be examined."""
+    monkeypatch.setattr(tools, "_SCAN_MAX", 50)
+    for i in range(200):
+        (tmp_path / f"f{i:03d}.txt").write_text("x")
+
+    seen = {"n": 0}
+    real = os.scandir
+
+    @contextmanager
+    def counting(path):
+        with real(path) as it:
+            def gen():
+                for e in it:
+                    seen["n"] += 1
+                    yield e
+            yield gen()
+
+    monkeypatch.setattr(tools.os, "scandir", counting)
+    out = tools.run_tool("list_directory", {}, _ws(tmp_path))
+    assert seen["n"] <= 51, f"examined {seen['n']} entries for a 200-file folder"
+    assert "50+ entries" in out, out
+
+
+def test_sample_files_bounds_the_scan(tmp_path, monkeypatch):
+    """14-1: sample_files used to resolve() every candidate before sampling 20."""
+    monkeypatch.setattr(tools, "_SCAN_MAX", 40)
+    for i in range(200):
+        (tmp_path / f"img_{i:03d}.png").write_text("x")
+    out = tools.run_tool("sample_files", {"path": ".", "pattern": "*.png",
+                                          "count": 5}, _ws(tmp_path))
+    assert "40+ files match" in out, out
+    picked = [ln for ln in out.splitlines() if ln.endswith(".png")]
+    assert len(picked) == 5
 
 
 def test_read_file_marks_truncation(tmp_path):
