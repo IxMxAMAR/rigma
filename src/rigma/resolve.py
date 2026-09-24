@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 
-from .models import ComboFlags, GgufFile, HardwareProfile, ModelSpec, RunPlan
+from .models import (CACHE_BYTES, ComboFlags, GgufFile, HardwareProfile,
+                     ModelSpec, RunPlan)
 from .registry import Registry
 
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
@@ -22,7 +23,10 @@ RAM_RESERVE_MB = 2048
 # Still ~2x the largest observation. MoE and larger batches allocate more, which
 # is what the margin is for.
 COMPUTE_BUFFER_MB = 150
-CACHE_BYTES = {"f16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q4_0": 0.5625}
+# CACHE_BYTES lives in models.py: the fit math here and ComboFlags' K/V
+# normalisation must read ONE table, and the validators that reject an unknown
+# cache type live next to it. Re-exported here because this module is where the
+# cache arithmetic lives and callers import it from `rigma.resolve`.
 CTX_DEFAULT = {"coding": 32768}
 CTX_FLOOR = 8192
 
