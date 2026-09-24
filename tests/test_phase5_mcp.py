@@ -209,6 +209,107 @@ def test_a_non_object_mcp_json_reads_as_empty(tmp_path):
     assert mcp_client.load_config() == {}
 
 
+# --- 09-5: a server that accepts but never answers must be marked dead --------
+
+class _FakeStdin:
+    def write(self, s):
+        pass
+
+    def flush(self):
+        pass
+
+
+class _MuteProc:
+    """A live child whose stdin swallows requests and whose stdout never
+    answers. No process is started."""
+    pid = 4242
+    stdin = _FakeStdin()
+    stdout = None
+
+    def poll(self):
+        return None
+
+
+def _wedge(srv):
+    for _ in range(mcp_client._WEDGE_AFTER):
+        with pytest.raises(mcp_client.McpError):
+            srv._send("tools/call", {"name": "t"}, timeout=0.01)
+
+
+def test_a_server_that_accepts_but_never_answers_is_marked_wedged():
+    """A timeout changed no state, so `reader_error` stayed empty and `_ensure`
+    kept the mute process in `_servers` forever (09-5)."""
+    srv = mcp_client.McpServer("mute", {"command": "x"})
+    srv.proc = _MuteProc()
+    _wedge(srv)
+    assert srv.wedged is True
+    assert srv.timeouts == mcp_client._WEDGE_AFTER
+    assert "timed out" in srv.reader_error
+
+
+def test_one_real_reply_clears_the_consecutive_timeout_count():
+    """One slow call is not a dead server: the count has to be CONSECUTIVE."""
+    import threading
+    import time
+    srv = mcp_client.McpServer("mute", {"command": "x"})
+    srv.proc = _MuteProc()
+    with pytest.raises(mcp_client.McpError):
+        srv._send("m", {}, timeout=0.01)
+    assert srv.timeouts == 1
+    out = {}
+
+    def call():
+        out["r"] = srv._send("m", {}, timeout=5)
+
+    t = threading.Thread(target=call)
+    t.start()
+    deadline = time.monotonic() + 5
+    while not srv._replies and time.monotonic() < deadline:
+        time.sleep(0.01)
+    mid = next(iter(srv._replies))
+    srv._replies[mid].put({"jsonrpc": "2.0", "id": mid, "result": "ok"})
+    t.join(timeout=5)
+
+    assert out.get("r") == "ok"
+    assert srv.timeouts == 0 and srv.wedged is False
+
+
+def test_a_wedged_server_is_rebuilt_on_the_next_ensure(monkeypatch):
+    mgr = mcp_client.McpManager()
+    srv = mcp_client.McpServer("mute", {"command": "x"})
+    srv.proc = _MuteProc()
+    _wedge(srv)
+    mgr._servers = {"mute": srv}
+    mgr._started = True
+    mgr._cfg_key = json.dumps({"mute": {"command": "x"}}, sort_keys=True)
+    monkeypatch.setattr(mcp_client, "load_config",
+                        lambda: {"mute": {"command": "x"}})
+    stopped = []
+    monkeypatch.setattr(srv, "stop", lambda: stopped.append("old"))
+    monkeypatch.setattr(
+        mcp_client.McpServer, "start",
+        lambda self: (_ for _ in ()).throw(mcp_client.McpError("down")))
+    mgr._ensure()
+    assert stopped == ["old"], "the wedged server must be stopped and rebuilt"
+    assert "mute" in mgr._failed
+
+
+def test_status_reports_the_wedged_server_and_its_count(monkeypatch):
+    mgr = mcp_client.McpManager()
+    srv = mcp_client.McpServer("mute", {"command": "x"})
+    srv.proc = _MuteProc()
+    _wedge(srv)
+    mgr._servers = {"mute": srv}
+    mgr._started = True
+    mgr._cfg_key = json.dumps({"mute": {"command": "x"}}, sort_keys=True)
+    monkeypatch.setattr(mcp_client, "load_config",
+                        lambda: {"mute": {"command": "x"}})
+    monkeypatch.setattr(mgr, "_ensure", lambda: None)
+    st = mgr.status()
+    assert st["wedged"] == {"mute": mcp_client._WEDGE_AFTER}
+    assert "mute" in st["dead"]
+
+
 # --- F54: shutdown must actually end the server -------------------------------
 def test_stop_kills_the_server_and_releases_its_pipes(tmp_path):
     """`stop()` called terminate() and dropped the reference: no wait, no kill

@@ -36,6 +36,11 @@ from .runtime import rigma_home
 PROTOCOL_VERSION = "2025-06-18"
 _START_TIMEOUT = 20.0     # server boot + initialize handshake
 _CALL_TIMEOUT = 60.0
+# A server that accepts a request and never answers is DEAD for our purposes,
+# but a timeout changed no state — so `reader_error` stayed empty and `_ensure`
+# kept the mute process in `_servers` forever, costing a worker thread per call
+# (09-5). Consecutive timeouts past this mark it wedged and restart it.
+_WEDGE_AFTER = 2
 _RESULT_MAX = 8000        # same cap philosophy as built-in tools
 # One JSON-RPC frame is one line, and a legitimate "read this big file" call can
 # be huge — but it must not be held in memory whole, twice, before the 8000-char
@@ -82,6 +87,11 @@ class McpServer:
         # full timeout with no explanation (AUDIT F55).
         self.reader_error: str = ""
         self.oversize_frames = 0
+        # Consecutive call timeouts, and the flag they set. A live-but-mute
+        # server is the same worker-thread tax as a dead reader, so it has to
+        # become visible to `_ensure` the same way (09-5).
+        self.timeouts = 0
+        self.wedged = False
 
     # -- plumbing --------------------------------------------------------------
     def _handle_line(self, line: str) -> None:
@@ -199,7 +209,15 @@ class McpServer:
         try:
             reply = self._replies[mid].get(timeout=timeout)
         except queue.Empty:
+            self.timeouts += 1
+            if self.timeouts >= _WEDGE_AFTER:
+                self.wedged = True
+                if not self.reader_error:
+                    self.reader_error = (f"'{self.name}' timed out "
+                                         f"{self.timeouts} times in a row")
             raise McpError(f"'{self.name}' timed out on {method}") from None
+        else:
+            self.timeouts = 0
         finally:
             self._replies.pop(mid, None)
         if "error" in reply:
@@ -392,6 +410,8 @@ class McpManager:
                 "failed": dict(self._failed),
                 "dead": {n: s.reader_error for n, s in self._servers.items()
                          if s.reader_error},
+                "wedged": {n: s.timeouts for n, s in self._servers.items()
+                           if s.wedged},
                 "oversize_frames": {n: s.oversize_frames
                                     for n, s in self._servers.items()
                                     if s.oversize_frames},
