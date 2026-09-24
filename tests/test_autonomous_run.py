@@ -183,6 +183,33 @@ def test_run_stalls_on_pure_narration(engine):
     assert "progress" in r["halt_reason"] or "idle" in r["halt_reason"]
 
 
+def test_a_run_iteration_re_loads_the_session_a_bounded_number_of_times(
+        engine, monkeypatch):
+    """14-5: the post-turn section used to hit sqlite five times with the SAME
+    session (trace read, tool-result append, no-network flip, two prose probes).
+    It now loads once; the loop's own start-of-iteration load stays."""
+    from rigma import sessions
+    _Engine.script = [("manage_plan", {"action": "add", "task": "one thing"}),
+                      None]
+    loads = []
+    real = sessions.load
+
+    def counting(sid):
+        loads.append(sid)
+        return real(sid)
+
+    monkeypatch.setattr(sessions, "load", counting)
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid)
+    sid = r.get("session_id") or runs.load(rid).get("session_id")
+    n_iter = int(r.get("iteration", 0)) + 1
+    mine = loads.count(sid)
+    # two per iteration (start + post-turn) plus the turn's own merge load;
+    # the old code added four more per iteration on top of this
+    assert mine <= 4 * n_iter, f"{mine} session loads over {n_iter} iterations"
+
+
 def test_run_freezes_when_engine_hangs(engine, monkeypatch):
     monkeypatch.setattr(serve, "IDLE_SECS", 0.2)
     monkeypatch.setattr(serve, "PREFILL_SECS", 0.2)   # first-token budget too

@@ -309,13 +309,41 @@ def log_tool_action(run_id: str, name: str, args, result: str,
     append_progress(run_id, f"{name}({shown})", res or "(no output)", workspace)
 
 
+# The active-run poll reads progress.md every 2 s. Reading and splitting the
+# WHOLE file to produce 40 lines made total work O(n^2) over a run; only the
+# tail can hold the last 40 lines, so read that.
+_LOG_TAIL_BYTES = 64 * 1024
+
+
 def get_log_tail(run_id: str, n: int = 5) -> str:
+    p = run_dir(run_id) / "progress.md"
     try:
-        lines = (run_dir(run_id) / "progress.md").read_text(
-            encoding="utf-8").splitlines()
+        size = p.stat().st_size
+    except OSError:
+        return ""
+    try:
+        with open(p, "rb") as f:
+            if size > _LOG_TAIL_BYTES:
+                f.seek(size - _LOG_TAIL_BYTES)
+                data = f.read()
+                nl = data.find(b"\n")       # the first line may be cut in half
+                if nl >= 0:
+                    data = data[nl + 1:]
+            else:
+                data = f.read()
     except Exception:
         return ""
+    lines = data.decode("utf-8", "replace").splitlines()
     prog = [ln for ln in lines if "->  next:" in ln]
+    if not prog and size > _LOG_TAIL_BYTES:
+        # the last 64 KB held no progress lines (a huge tool dump, say) —
+        # fall back to the whole file rather than report nothing
+        try:
+            lines = p.read_text(encoding="utf-8",
+                                errors="replace").splitlines()
+        except Exception:
+            return ""
+        prog = [ln for ln in lines if "->  next:" in ln]
     return "\n".join(prog[-n:])
 
 
