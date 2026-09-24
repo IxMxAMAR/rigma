@@ -1,4 +1,5 @@
 """Autonomous-run store — pure state, no engine."""
+import builtins
 import json
 
 import pytest
@@ -130,3 +131,55 @@ def test_log_tool_action_writes_a_server_authored_line():
     assert "write_file" in tail and "out.txt" in tail
     assert "wrote 999 bytes" in tail
     assert len(tail) < 800, "log line must stay compact"
+
+
+def test_get_log_tail_reads_only_the_tail(tmp_path, monkeypatch):
+    """14-5/14-6: /api/runs/active reads the tail every 2 s. Reading and
+    splitting the whole progress log made total work O(n^2) over a run."""
+    r = runs.create("m", "s")
+    p = runs.run_dir(r["id"]) / "progress.md"
+    lines = [f"step {i} ->  next: do thing {i}\n" for i in range(20000)]
+    p.write_text("".join(lines), encoding="utf-8")
+    assert p.stat().st_size > runs._LOG_TAIL_BYTES
+
+    read = {"n": 0}
+    real_open = builtins.open
+
+    class _Counted:
+        def __init__(self, f):
+            self._f = f
+
+        def read(self, *a):
+            data = self._f.read(*a)
+            read["n"] += len(data)
+            return data
+
+        def __getattr__(self, k):
+            return getattr(self._f, k)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return self._f.__exit__(*a)
+
+    def counting_open(file, *a, **k):
+        f = real_open(file, *a, **k)
+        return _Counted(f) if str(file).endswith("progress.md") else f
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    tail = runs.get_log_tail(r["id"], 5)
+    assert tail.splitlines() == [ln.strip() for ln in lines[-5:]]
+    assert read["n"] <= runs._LOG_TAIL_BYTES + 1, \
+        f"read {read['n']} bytes of a {p.stat().st_size}-byte log"
+
+
+def test_get_log_tail_falls_back_when_the_tail_has_no_progress_lines(
+        tmp_path, monkeypatch):
+    """The last 64 KB can be one huge tool dump; the progress lines before it
+    must still be found rather than reported as an empty tail."""
+    r = runs.create("m", "s")
+    p = runs.run_dir(r["id"]) / "progress.md"
+    p.write_text("old ->  next: the only step\n" + "x" * (128 * 1024),
+                 encoding="utf-8")
+    assert "the only step" in runs.get_log_tail(r["id"], 5)
