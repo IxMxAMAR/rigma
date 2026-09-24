@@ -172,6 +172,28 @@ class _UndeclaredLength:
         return _Resp(200, b"TRUNCATED", {})
 
 
+def test_a_negative_content_length_is_read_as_undeclared(tmp_path, monkeypatch):
+    """AUDIT 06R3-4. `int(headers.get("content-length") or 0)` accepted any
+    integer, so a lying `Content-Length: -5` became a real size of -5. It is
+    truthy, so the size gate fired on EVERY attempt, `have > size` took the
+    "these are not this file's bytes" branch, and each retry discarded the
+    accumulated multi-GB .part — a download that can never converge, reported
+    as "download kept dropping"."""
+    assert hangar._object_size(200, {"content-length": "-5"}) == 0
+    assert hangar._object_size(200, {"content-length": "100"}) == 100
+    assert hangar._object_size(200, {"content-length": "junk"}) == 0
+
+    # and a 100-byte partial against such an origin installs instead of being
+    # thrown away
+    dest = tmp_path / "model.gguf"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(b"A" * 100)
+    hangar._claim_partial(dest, "owner/first", "model.gguf")
+    size = hangar._object_size(200, {"content-length": "-5"}) or 100
+    hangar._install_download(dest, 100, size, None)
+    assert dest.read_bytes() == b"A" * 100
+
+
 def test_a_body_with_no_declared_length_is_not_installed_unverified(
         tmp_path, monkeypatch):
     """AUDIT 06R3-2. `_install_download`'s size gate is `if size and ...`, so
