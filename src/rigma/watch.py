@@ -193,6 +193,10 @@ class Watcher:
                     continue
                 # The change has already happened and `old` is the version to go
                 # back to — which only exists because the previous pass read it.
+                # AUDIT F08-6: `_remember` used to run even when `_record` failed,
+                # so the old bytes were dropped and the retry that would have
+                # recorded them could never happen — the edit became permanently
+                # un-undoable, the exact failure this module exists to prevent.
                 if self._record(p, old):
                     changed.append(key)
                     self._remember(key, data)

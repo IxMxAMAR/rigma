@@ -39,6 +39,18 @@ def test_chat_unknown_session_exits(tmp_path, monkeypatch):
     assert r.exit_code == 1 and "no such session" in r.output
 
 
+def test_chat_ui_only_refuses_and_says_pick_a_model(tmp_path, monkeypatch):
+    """AUDIT F15-2: `rigma up` with no model writes model="" and unloaded=True.
+    Treating that as "a model is loaded" opened a session whose first send died
+    with `model unreachable`."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    state.write_state("", "", 11500, engine_pid=-1, ui_pid=os.getpid(),
+                      backend="", use_case="general", ctx=0, unloaded=True)
+    r = runner.invoke(app, ["chat"])
+    assert r.exit_code == 1 and "no model loaded" in r.output
+    assert sessions.list_sessions() == []      # no empty session was created
+
+
 def test_chat_exiting_immediately_leaves_no_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     state.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())

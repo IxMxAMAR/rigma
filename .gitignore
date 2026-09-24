@@ -10,5 +10,10 @@ dist/
 tools/ui-smoke/pwenv/
 frontend-v2/node_modules/
 
-# internal working notes — never published
-docs/
+# internal working notes — never published. `docs/*` rather than `docs/` so the
+# one shipped guide can be re-included below: a file inside an excluded
+# DIRECTORY cannot be re-included, no matter what the negation says.
+docs/*
+# the agent-integration guide is user-facing documentation, not a working note —
+# it is shipped in the wheel/repo and pointed at from the legacy UI.
+!docs/AGENTS.md

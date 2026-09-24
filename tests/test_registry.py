@@ -19,6 +19,20 @@ def test_find_combo_exact_then_class():
     assert r.find_combo("amd", "nope", 999, 999, "general") is None
 
 
+def test_find_combo_falls_back_to_the_nearest_lower_ram_tier():
+    """AUDIT F15-4: the reference box measures 31.4 GB (tier 32) but the verified
+    9070 XT combo is filed at ram-16, so an exact-tier-only lookup missed on the
+    very machine it was measured on."""
+    r = Registry.load()
+    hit = r.find_combo("amd", "amd-radeon-rx-9070-xt-16g", 16, 32, "coding")
+    assert hit is not None
+    assert hit[1] == "amd/amd-radeon-rx-9070-xt-16g/ram-16/coding.json"
+    assert hit[0].flags.n_cpu_moe == 10
+    # never falls UP: a machine with less RAM must not get a higher-tier combo
+    assert r.find_combo("amd", "amd-radeon-rx-9070-xt-16g", 16, 12,
+                        "coding") is None
+
+
 def test_bundled_use_case_prompts_load():
     r = Registry.load()
     assert {"general", "creative", "coding"} <= set(r.use_cases)

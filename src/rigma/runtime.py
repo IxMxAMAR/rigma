@@ -196,7 +196,18 @@ def ensure_engine(backend: str, os_name: str) -> Path:
             "packaging fault, not something on your machine — please report it.")
     root.mkdir(parents=True, exist_ok=True)
     lock_path = rigma_home() / "engines" / "lock.json"
-    lock = json.loads(lock_path.read_text()) if lock_path.exists() else {}
+    # AUDIT F08-4: the lock is read on every engine bootstrap and was written
+    # non-atomically, so a crash/power loss/full disk between open and close left
+    # a torn file that made `rigma up` and `rigma sweep` die with a raw
+    # JSONDecodeError before they could do anything — the only cure was finding
+    # and deleting lock.json by hand. A corrupt lock is rebuilt on the next
+    # download, so tolerate it rather than fail.
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        lock = {}
+    if not isinstance(lock, dict):
+        lock = {}
     # AUDIT F25: docs/audit-2026-09-04-full.md — carry the pre-fix entries over
     # instead of orphaning them. They are keyed on the bare os/backend but each
     # one already records the `asset` and `version` the new key is built from,
@@ -235,7 +246,11 @@ def ensure_engine(backend: str, os_name: str) -> Path:
                           "version": man["version"]}
         _extract(archive, root)
         archive.unlink()
-    lock_path.write_text(json.dumps(lock, indent=2))
+    # AUDIT F08-4: temp-file + replace, like update_engines_manifest — a plain
+    # write_text leaves a torn lock.json behind if the process dies mid-write.
+    lock_tmp = lock_path.with_suffix(".tmp")
+    lock_tmp.write_text(json.dumps(lock, indent=2), encoding="utf-8")
+    lock_tmp.replace(lock_path)
     result = exe if exe.exists() else next(root.rglob(exe.name), None)
     if not result:   # some archives nest under build/bin/
         raise RuntimeError(f"{exe.name} not found in downloaded engine assets")
@@ -287,6 +302,20 @@ class ServerProcess:
             self.proc.kill()
 
 
+def server_argv(exe, plan: RunPlan, model_path, port: int,
+                extra_args: list[str] | None = None) -> list[str]:
+    """The exact llama-server command line a launch runs.
+
+    AUDIT F15-3: `rigma up --dry-run` printed only `plan.server_args(...)`, so
+    it omitted every flag the real launch adds — `--mmproj`,
+    `--chat-template-file` and the always-present `--slot-save-path`. One
+    helper means the preview cannot drift from what actually launches.
+    """
+    return [str(exe), *(extra_args or []),
+            *plan.server_args(str(model_path), port),
+            "--slot-save-path", str(rigma_home() / "sessions")]
+
+
 def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
                   timeout: float = 300.0,
                   extra_args: list[str] | None = None) -> ServerProcess:
@@ -295,9 +324,7 @@ def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
     logs.mkdir(parents=True, exist_ok=True)
     sessions.mkdir(parents=True, exist_ok=True)
     log_path = logs / f"server-{port}.log"
-    argv = [str(exe), *(extra_args or []),
-            *plan.server_args(str(model_path), port),
-            "--slot-save-path", str(sessions)]
+    argv = server_argv(exe, plan, model_path, port, extra_args)
     # on Windows, suppress the jarring console window llama-server would pop
     popen_kw = {}
     if platform.system() == "Windows":

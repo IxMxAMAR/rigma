@@ -28,6 +28,23 @@ def test_exact_combo_wins():
     assert plan.gguf.quant == "UD-Q3_K_XL" and plan.backend == "vulkan"
 
 
+def test_a_lower_ram_tier_combo_is_used_and_named(tmp_path, monkeypatch):
+    """AUDIT F15-4: the reference box measures 31.4 GB (tier 32) and the verified
+    9070 XT combo is filed at ram-16. find_combo must fall back to it — and say
+    in `explain` which tier it came from."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    gpu = GpuInfo(vendor="amd", name="AMD Radeon RX 9070 XT", vram_mb=16368,
+                  arch="rdna4", slug="amd-radeon-rx-9070-xt-16g",
+                  backends=["vulkan", "rocm"])
+    p = HardwareProfile(gpus=[gpu], ram_mb=32143, ram_free_mb=20000,
+                        cpu=CpuInfo(cores=16), os="windows", disk_free_gb=400.0)
+    plan = resolve(p, Registry.load(), use_case="coding")
+    assert plan.origin == \
+        "combo:amd/amd-radeon-rx-9070-xt-16g/ram-16/coding.json"
+    assert plan.flags.n_cpu_moe == 10
+    assert any("ram-16 tier" in e for e in plan.explain)
+
+
 def test_calculator_kicks_in_for_unknown_gpu(tmp_path, monkeypatch):
     # RIGMA_HOME isolated: the resolver now prefers ON-DISK quants, so with
     # the real home this test would see the owner's models and pick a
