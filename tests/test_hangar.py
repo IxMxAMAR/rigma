@@ -293,13 +293,19 @@ def test_download_file_streams_with_progress_and_resume(home, tmp_path,
         def iter_bytes(self, n):
             yield from self._chunks
 
-    # fresh download: 200 with 3 x 1MB chunks
+    # fresh download: 200 with 3 x 1MB chunks. The origin declares its length,
+    # as a real one does — without it the transfer is unverifiable and
+    # _install_download refuses it (AUDIT 06R3-2).
     seen = []
+    total = 3 * 2**20
     monkeypatch.setattr(hangar.httpx if hasattr(hangar, "httpx") else httpx,
-                        "stream", lambda *a, **k: _Resp(200, [b"x" * 2**20] * 3))
+                        "stream",
+                        lambda *a, **k: _Resp(200, [b"x" * 2**20] * 3,
+                                              {"content-length": str(total)}))
     import rigma.hangar as H
     monkeypatch.setattr("httpx.stream",
-                        lambda *a, **k: _Resp(200, [b"x" * 2**20] * 3))
+                        lambda *a, **k: _Resp(200, [b"x" * 2**20] * 3,
+                                              {"content-length": str(total)}))
     dest = tmp_path / "m.gguf"
     n = H._download_file("r/x", "m.gguf", dest, lambda b: seen.append(b))
     assert n == 3 * 2**20 and dest.exists() and dest.stat().st_size == n
@@ -316,7 +322,11 @@ def test_download_file_streams_with_progress_and_resume(home, tmp_path,
     ranged = {}
     def _stream(method, url, headers=None, **k):
         ranged["range"] = (headers or {}).get("range")
-        return _Resp(206, [b"z" * 2**20] * 2)
+        # on a 206 content-length is the SLICE and only content-range carries
+        # the whole object — which is what the final size check compares to.
+        return _Resp(206, [b"z" * 2**20] * 2,
+                     {"content-length": str(2 * 2**20),
+                      "content-range": f"bytes {2**20}-{total - 1}/{total}"})
     monkeypatch.setattr("httpx.stream", _stream)
     n2 = H._download_file("r/x", "r.gguf", dest2, lambda b: None)
     assert ranged["range"] == "bytes=1048576-"        # asked to resume
