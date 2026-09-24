@@ -35,7 +35,13 @@ def test_unloaded_survives_dead_engine_if_ui_alive(home):
 
 def test_await_port_free_returns_when_free(home):
     from rigma.server_ops import _await_port_free
-    _await_port_free(0, tries=1)   # port 0 is always bindable
+    import time as _t
+    t0 = _t.monotonic()
+    _await_port_free(0, tries=1, delay=5.0)   # port 0 is always bindable
+    # it must return on the FIRST try, not sleep through its retries: the
+    # assertion is the elapsed time, since the function returns None either
+    # way and a silent 5s stall per launch is exactly the bug (AUDIT F60)
+    assert _t.monotonic() - t0 < 1.0
 
 
 def _tiny_gguf(path):

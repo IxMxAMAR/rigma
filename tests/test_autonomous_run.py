@@ -586,10 +586,30 @@ def test_prose_turn_is_saved_not_discarded(engine, tmp_path):
     assert "saved" not in log or not (tmp_path / "rigma-drafts").exists()
 
 
-def test_long_prose_is_written_to_a_draft_file(tmp_path, monkeypatch):
-    from rigma import serve as _s
-    assert _s.DRAFT_MIN_CHARS >= 200
-    assert _s.RUN_PARAMS["max_tokens"] >= 16384, "must fit a real batch of work"
+def test_long_prose_is_written_to_a_draft_file(engine, tmp_path):
+    """Prose in a run may BE the work. The test above covers the SHORT reply
+    (which must not be saved); this is the case the name promises and which
+    nothing exercised — the body used to assert two module constants instead
+    (AUDIT F60)."""
+    prose = "a cinematic prompt of a small airport at dawn. " * 12
+    assert len(prose) >= serve.DRAFT_MIN_CHARS
+    _Engine.script = [("__text__", prose), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1,
+                                    "workspace": str(tmp_path)}).json()["id"]
+    r = _wait(c, rid, timeout=40)
+    assert r.get("drafts"), c.get(f"/api/runs/{rid}/log").json()["log"][-8:]
+    p = pathlib.Path(r["drafts"][0])
+    assert p.is_file() and p.parent.name == "rigma-drafts", r["drafts"]
+    assert p.read_text(encoding="utf-8").strip() == prose.strip()
+    assert p.parent.parent == tmp_path, p
+
+
+def test_long_prose_bounds_are_sane():
+    """The two constants the old body checked are still worth pinning, but as
+    their own test rather than as a stand-in for the behaviour above."""
+    assert serve.DRAFT_MIN_CHARS >= 200
+    assert serve.RUN_PARAMS["max_tokens"] >= 16384, "must fit a real batch of work"
 
 
 def test_start_run_responds_immediately(engine, monkeypatch):

@@ -81,22 +81,45 @@ def test_vision_off_is_an_opinion_but_unset_is_not():
 
 def test_perform_switch_applies_the_stored_defaults(home, monkeypatch):
     """A plain load — no ctx, no kv, no quant — must land on the model's own
-    configuration rather than the resolver's guess."""
-    from rigma import server_ops
+    configuration rather than the resolver's guess.
+
+    AUDIT F60: the body used to build a LaunchDefaults, assert on a local dict
+    it had just written itself, and never call perform_switch at all — so the
+    one thing the test is named for was the one thing it did not check.
+    """
+    import os
+    from types import SimpleNamespace
+
+    from rigma import server_ops, state
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    from rigma.registry import Registry
+
+    spec = _spec(launch=LaunchDefaults(ctx=8192, kv="q5_1", quant="Q3_K_M",
+                                       vision=False))
+    reg = Registry([], {"m": spec}, {})
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=24576, backends=["vulkan"])
+    profile = HardwareProfile(gpus=[gpu], ram_mb=32768, ram_free_mb=24000,
+                              cpu=CpuInfo(cores=16), os="windows",
+                              disk_free_gb=200.0)
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    (home / "models" / "q.gguf").write_text("x", encoding="utf-8")
+    state.write_state("other", "Q0", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan", ctx=4096)
+    monkeypatch.setattr("rigma.state.kill_pid", lambda pid: None)
+    monkeypatch.setattr("rigma.runtime.ensure_engine",
+                        lambda backend, os_name: home / "llama-server.exe")
     seen = {}
 
-    def _capture(model, s, trimmed, profile, backend=None):
-        raise AssertionError("should not reach the resolver in this test")
+    def _launch(exe, plan, mp, port=0, timeout=300.0, extra_args=None):
+        seen["plan"] = plan
+        return SimpleNamespace(proc=SimpleNamespace(pid=4242))
 
-    # Record what perform_switch resolved the request to, without launching.
-    monkeypatch.setattr(server_ops, "_resolve_for", _capture)
-    from rigma.models import LaunchDefaults
-    d = LaunchDefaults(ctx=65536, kv="q5_1", quant="Q3_K_M", vision=False)
-    over = d.as_overrides()
-    assert over == {"quant": "Q3_K_M", "ctx": 65536, "kv": "q5_1",
-                    "vision": False}
-    seen.update(over)
-    assert seen["ctx"] == 65536
+    monkeypatch.setattr("rigma.runtime.launch_server", _launch)
+    new = server_ops.perform_switch("m", registry=reg, profile=profile)
+    assert seen["plan"].flags.ctx == 8192, seen["plan"].flags
+    assert seen["plan"].flags.cache_type_k == "q5_1", seen["plan"].flags
+    assert seen["plan"].gguf.quant == "Q3_K_M", seen["plan"].gguf
+    assert new["ctx"] == 8192 and new["quant"] == "Q3_K_M", new
 
 
 def test_an_explicit_request_beats_the_stored_default():

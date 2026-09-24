@@ -20,12 +20,20 @@ from rigma.bench import (
 def oai_server():
     fake = Path(__file__).parent / "fake_oai_server.py"
     proc = subprocess.Popen([sys.executable, str(fake), "--port", "11598"])
+    ready = False
     for _ in range(50):
         try:
             if httpx.get("http://127.0.0.1:11598/health", timeout=1).status_code == 200:
+                ready = True
                 break
         except Exception:
             time.sleep(0.1)
+    if not ready:
+        # the loop used to fall through silently, so a server that never came
+        # up surfaced as a confusing connection error inside whichever test
+        # happened to run first (AUDIT F60)
+        proc.terminate()
+        pytest.fail("fake engine on port 11598 never answered /health")
     yield 11598
     proc.terminate()
 
