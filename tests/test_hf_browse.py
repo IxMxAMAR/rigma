@@ -446,3 +446,27 @@ def test_imatrix_and_other_aux_files_are_unaffected(monkeypatch):
     ])
     names = [g["file"] for g in hf_browse.repo_files("r")["ggufs"]]
     assert names == ["model-Q4_K_M.gguf"]
+
+
+def test_eagle_is_a_token_not_a_substring(monkeypatch):
+    """"eagle" as a bare substring hid every quant whose path merely contained
+    it. A model actually named Beagle lost its files from the list — and if it
+    was the only gguf the user got the misleading "no single-file gguf in that
+    repo". The marker is now matched as a whole token, like the MTP filter."""
+    from rigma import hf_browse
+    _tree(monkeypatch, [
+        ("Beagle-9B-Q4_K_M.gguf", 6_000_000_000),
+        ("Model-Q4_K_M.gguf", 6_000_000_000),
+    ])
+    names = [g["file"] for g in hf_browse.repo_files("r")["ggufs"]]
+    assert "Beagle-9B-Q4_K_M.gguf" in names
+    # a genuine EAGLE head is still skipped, whatever the separators
+    assert hf_browse._is_aux_gguf("eagle-draft-head.gguf")
+    assert hf_browse._is_aux_gguf("model_eagle.gguf")
+    assert hf_browse._is_aux_gguf("eagle.gguf")
+    assert not hf_browse._is_aux_gguf("Beagle-9B-Q4_K_M.gguf")
+    assert not hf_browse._is_aux_gguf("Rocinante-X-12B-v1b-Q6_K.gguf")
+    # imatrix/medusa keep working as whole tokens
+    assert hf_browse._is_aux_gguf("model-imatrix.gguf")
+    assert hf_browse._is_aux_gguf("model-medusa.gguf")
+    assert not hf_browse._is_aux_gguf("Model-Q4_K_M.gguf")
