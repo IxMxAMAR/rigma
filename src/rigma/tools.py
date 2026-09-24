@@ -869,16 +869,33 @@ def _safe_eval(node):
     raise ValueError("unsupported expression")
 
 
-def _is_public_host(host: str) -> bool:
-    """True only if `host` resolves entirely to public addresses — blocks the
-    model (possibly prompt-injected by a fetched page) from reaching localhost,
-    cloud metadata (169.254.169.254), or the LAN."""
-    import ipaddress
+def _resolve_addresses(host: str):
+    """The resolver, behind one indirection so a test can stub it.
+
+    AUDIT 13-1: the whole point of the fix is that the answer THIS function
+    gives is the address that gets dialed, so the seam has to be callable."""
     import socket
+    return socket.getaddrinfo(host, None)
+
+
+def _vetted_ip(host: str) -> str | None:
+    """Resolve `host` ONCE, validate EVERY address, and return the single IP to
+    dial. None when the name does not resolve or ANY answer is private/loopback/
+    link-local/reserved/multicast/unspecified.
+
+    Returning the address (rather than a bool) is the fix for 13-1: the guard
+    used to decide on a `getaddrinfo` answer that the transport then threw away
+    and re-resolved, so a 0-TTL name could answer a public IP to the check and
+    127.0.0.1 to the connect. Every address is validated, and the returned one
+    is the one `_pinned_transport` dials."""
+    import ipaddress
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = _resolve_addresses(host)
     except OSError:
-        return False
+        return None
+    if not infos:
+        return None
+    ips: list[str] = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         # ::ffff:127.0.0.1 reports itself as global — unwrap the mapped v4 so a
@@ -887,22 +904,75 @@ def _is_public_host(host: str) -> bool:
             ip = ip.ipv4_mapped
         if (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return False
-    return bool(infos)
+            return None
+        ips.append(str(ip))
+    return ips[0] if ips else None
+
+
+def _is_public_host(host: str) -> bool:
+    """True only if `host` resolves entirely to public addresses — blocks the
+    model (possibly prompt-injected by a fetched page) from reaching localhost,
+    cloud metadata (169.254.169.254), or the LAN."""
+    return _vetted_ip(host) is not None
+
+
+def _pin_request(request) -> str:
+    """Vet `request`'s host and record the address to dial on the request.
+
+    The request hook calls this on EVERY hop (httpx re-runs request hooks after
+    a redirect), so a public URL that redirects to an internal one is refused at
+    the hop that would reach it. Raises ValueError when the host is not public.
+    """
+    host = request.url.host or ""
+    ip = _vetted_ip(host)
+    if ip is None:
+        raise ValueError("refusing to reach a private/loopback address")
+    request.extensions = {**request.extensions,
+                          "rigma_pin_ip": ip, "sni_hostname": host}
+    return ip
+
+
+def _pinned_transport():
+    """An httpx transport that dials the vetted IP instead of re-resolving.
+
+    httpx/httpcore resolve the hostname again at connect time (httpcore 1.0.9
+    `_backends/anyio.py` `connect_tcp(remote_host=host, ...)`), so the guard's
+    verdict never reached the socket. Here the host is swapped for the address
+    the hook vetted, while the `Host` header and the TLS `sni_hostname` keep the
+    real name — so virtual hosting and certificate checks still work.
+    """
+    import httpx
+
+    class _PinnedTransport(httpx.HTTPTransport):
+        def handle_request(self, request):
+            host = request.url.host or ""
+            ip = request.extensions.get("rigma_pin_ip") or _vetted_ip(host)
+            if ip is None:
+                raise ValueError("refusing to reach a private/loopback address")
+            if ip == host:
+                return super().handle_request(request)
+            headers = request.headers.copy()
+            headers["Host"] = request.url.netloc.decode("ascii")
+            pinned = httpx.Request(
+                method=request.method,
+                url=request.url.copy_with(host=ip),
+                headers=headers,
+                stream=request.stream,
+                extensions={**request.extensions, "sni_hostname": host})
+            return super().handle_request(pinned)
+
+    return _PinnedTransport()
 
 
 def _public_client():
     """httpx client that refuses private/loopback targets on EVERY hop (the
     request hook fires again on each redirect, so a public URL can't bounce
-    the fetch to an internal address)."""
+    the fetch to an internal address) AND connects to the address it vetted
+    (AUDIT 13-1: no check-then-connect TOCTOU)."""
     import httpx
-    from urllib.parse import urlparse
-
-    def guard(request):
-        if not _is_public_host(urlparse(str(request.url)).hostname or ""):
-            raise ValueError("refusing to reach a private/loopback address")
     return httpx.Client(follow_redirects=True, timeout=25,
-                        event_hooks={"request": [guard]})
+                        transport=_pinned_transport(),
+                        event_hooks={"request": [_pin_request]})
 
 
 _MAX_FETCH_BYTES = 3_000_000   # cap so a 10GB URL / infinite stream can't OOM
