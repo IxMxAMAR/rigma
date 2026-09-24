@@ -97,6 +97,30 @@ def test_tools_on_by_default(home):
     assert sessions.create()["use_tools"] is True
 
 
+def test_confirm_exec_reaches_the_tool_ctx(home, upstream, monkeypatch):
+    """AUDIT 13-3 regression, second half: a granted chat must actually carry
+    `confirm_exec` into the ctx the tool loop builds (serve.py's tctx), or the
+    grant is decorative and every run_shell still refuses."""
+    seen: dict = {}
+    monkeypatch.setattr(tools, "cached_run",
+                        lambda name, args, ctx: (seen.update(ctx), "42")[1])
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    # the safe default is visible on the record, not merely absent
+    assert client.get(f"/api/sessions/{sid}").json()["confirm_exec"] is False
+
+    client.post(f"/api/sessions/{sid}/chat", json={"message": "6*7?"})
+    assert seen.get("confirm_exec") is False
+
+    # the same PATCH the UI toggle will send
+    r = client.post(f"/api/sessions/{sid}", json={"confirm_exec": True})
+    assert r.status_code == 200 and r.json()["confirm_exec"] is True
+    seen.clear()
+    client.post(f"/api/sessions/{sid}/chat", json={"message": "6*7?"})
+    assert seen.get("confirm_exec") is True
+
+
 class _BadArgsUpstream(BaseHTTPRequestHandler):
     """Round 1: stream a tool_call with BROKEN JSON args. Round 2 (after the
     error is fed back as a tool message): answer."""

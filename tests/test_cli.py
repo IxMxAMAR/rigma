@@ -25,6 +25,52 @@ def test_doctor(monkeypatch):
     assert res.exit_code == 0 and "rx-9070-xt" in res.output.lower()
 
 
+def test_session_exec_grants_and_revokes(tmp_path, monkeypatch):
+    """AUDIT 13-3 regression: execution needs an explicit per-session grant,
+    and there was no way to give one. `rigma session exec` is that way."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import sessions
+    sid = sessions.create()["id"]
+    # the safe direction: a fresh chat is NOT granted
+    assert sessions.load(sid)["confirm_exec"] is False
+
+    res = runner.invoke(cli.app, ["session", "exec", sid, "--on"])
+    assert res.exit_code == 0 and "granted" in res.output
+    assert sessions.load(sid)["confirm_exec"] is True
+
+    res = runner.invoke(cli.app, ["session", "exec", sid, "--off"])
+    assert res.exit_code == 0 and "revoked" in res.output
+    assert sessions.load(sid)["confirm_exec"] is False
+
+
+def test_session_exec_without_a_flag_only_reports(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import sessions
+    sid = sessions.create()["id"]
+    res = runner.invoke(cli.app, ["session", "exec", sid])
+    assert res.exit_code == 0 and "off" in res.output
+    assert sessions.load(sid)["confirm_exec"] is False
+
+
+def test_session_exec_refuses_an_unknown_chat(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    res = runner.invoke(cli.app, ["session", "exec", "nope", "--on"])
+    assert res.exit_code == 1 and "no such session" in res.output
+
+
+def test_session_exec_rejects_a_non_boolean_grant(tmp_path, monkeypatch):
+    """`bool("false")` is True: a stringly-typed grant must be refused, not
+    read as a yes."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import sessions
+    sessions.create()
+    try:
+        sessions.validate_field_types({"confirm_exec": "false"})
+        raise AssertionError("a string grant was accepted")
+    except ValueError as e:
+        assert "confirm_exec" in str(e)
+
+
 def test_plan_explain(monkeypatch):
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
     res = runner.invoke(cli.app, ["plan", "--use-case", "coding", "--explain"])

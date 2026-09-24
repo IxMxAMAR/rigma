@@ -122,6 +122,11 @@ _FIELD_TYPES: dict[str, type] = {
     "workspace": str, "method": str, "harness": str, "permission": str,
     "messages": list, "archive": list, "pending_nudges": list,
     "params": dict, "trigger_state": dict,
+    # AUDIT 13-3 regression: this is a GRANT, so it is type-checked where the
+    # other booleans are not. `bool("false")` is True, and a client that sent
+    # the string form of "no" would otherwise have been read as "yes" — the one
+    # mistake here that hands a chat process spawning.
+    "confirm_exec": bool,
 }
 
 
@@ -204,6 +209,12 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # `harness.resolve` refuses an unknown or unusable backend
                      # rather than quietly substituting the built-in.
                      "harness": "native",
+                     # AUDIT 13-3 regression: execution is its own grant and
+                     # defaults OFF. Naming it here (rather than leaving it
+                     # absent) is what lets a reader — the UI toggle, the CLI,
+                     # an API client — SEE the current value and offer to
+                     # change it. `serve.py` and `mcp_server.py` read it.
+                     "confirm_exec": False,
                      # AUDIT 10-9: the schema version this document was written
                      # at. Stamped by save(); a body that predates the key is
                      # what the max_tool_rounds migration below keys on.
