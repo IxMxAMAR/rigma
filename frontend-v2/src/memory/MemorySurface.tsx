@@ -3,6 +3,8 @@
 // nightmare" (agent-memory spec). Every learned rule, its evidence, delete.
 import { useCallback, useEffect, useState } from "react";
 
+import { responseError } from "../lib/listFetch";
+
 interface MemoryRow {
   id: string;
   kind: string;
@@ -88,10 +90,20 @@ export default function MemorySurface() {
                   </div>
                 </div>
                 <button
-                  className="opacity-0 group-hover:opacity-100 shrink-0 rounded-md px-2 py-1 text-[13px] text-muted hover:text-red hover:bg-surface"
+                  className="shrink-0 rounded-md px-2 py-1 text-[13px] text-muted hover:text-red hover:bg-surface"
                   aria-label={`forget: ${m.text}`}
                   onClick={async () => {
-                    await fetch(`/api/memory/${m.id}`, { method: "DELETE" });
+                    setErr(null);
+                    // AUDIT F11-4: this ignored r.ok and refreshed, so a refused
+                    // forget looked exactly like one that worked — the rule just
+                    // stayed put with no reason.
+                    const r = await fetch(
+                      `/api/memory/${encodeURIComponent(m.id)}`,
+                      { method: "DELETE" });
+                    if (!r.ok) {
+                      setErr(await responseError(r));
+                      return;
+                    }
                     void refresh();
                   }}
                 >
