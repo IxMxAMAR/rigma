@@ -15,11 +15,17 @@ runner = CliRunner()
 
 
 def _free_port():
-    probe = socket.socket()
-    probe.bind(("127.0.0.1", 0))
-    port = probe.getsockname()[1]
-    probe.close()
-    return port
+    """A port whose predecessor is free too: `up` pre-checks port-1 for the
+    engine, and an ephemeral port's predecessor may be occupied."""
+    for _ in range(50):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        if port > 1024 and cli._port_holder(port) == "" and \
+                cli._port_holder(port - 1) == "":
+            return port
+    raise AssertionError("no free port pair found")
 
 
 def test_open_when_listening_opens_once_the_port_accepts(monkeypatch):
