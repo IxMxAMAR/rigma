@@ -106,27 +106,43 @@ _LOOP_HEAD_A = (
     "Your loop:\n"
     "1. No plan yet? Call `manage_plan(action=\"add\", task=\"…\")` 3-5 times to "
     "break the mission into concrete, verifiable steps.\n"
-    "2. Otherwise DO the next pending step with the right tool (read_file, "
-    "write_file, run_shell, run_python, find_files, sample_files, ")
-_LOOP_HEAD_B = (
-    ").\n"
-    "   • File tools take ABSOLUTE paths (D:\\Art\\pic.png) — you do NOT need "
-    "run_shell to reach a folder outside the workspace.\n"
-    "   • NEVER RETYPE A FILENAME. You will get long names wrong (you cannot "
-    "reliably reproduce ComfyUI_00428_.png).")
-# Even this example list is capability-gated: it is the model's menu, so it may
-# only name tools the surface actually advertises. Two things withhold one:
-# `view_images` is not offered to a model with no vision, and `web_search` is
-# extended-tier, which a focused Run holds back (tools._TIER). Naming either at
-# a session that cannot call it is the prompt/tool-surface disagreement this
-# module exists to stop.
+    "2. Otherwise DO the next pending step with the right tool (")
+
+
+def _loop_head_b(caps: frozenset) -> str:
+    # The "you do NOT need run_shell" aside names an exec tool, so a confined
+    # run must not get it (AUDIT 05-1): its surface dropped run_shell entirely.
+    no_shell = (" — you do NOT need run_shell to reach a folder outside the "
+                "workspace" if "exec" in caps else "")
+    # AUDIT 05-6: "File tools take ABSOLUTE paths" was true for the read tools
+    # and false for write_file/edit_file, which resolve through `_ws_path` and
+    # REFUSE an absolute path. A run whose mission is "tidy up D:\Art" read and
+    # sampled files there, then passed the absolute path it had just been handed
+    # to edit_file and was refused — one wasted turn per file. The rule is
+    # scoped to the tools it is true for.
+    return (").\n"
+            "   • READ tools take ABSOLUTE paths (D:\\Art\\pic.png); write_file "
+            "and edit_file take paths RELATIVE to the workspace"
+            + no_shell + ".\n"
+            "   • NEVER RETYPE A FILENAME. You will get long names wrong (you "
+            "cannot reliably reproduce ComfyUI_00428_.png).")
+# The menu is built from `caps`, because it IS the model's menu: every tool it
+# names has to be on the wire for that session. Three things withhold one:
+# `view_images` is not offered to a model with no vision, `web_search` is
+# extended-tier, and — AUDIT 05-1 — `run_shell`/`run_python` are withheld by a
+# `confined` run (`tools.tool_specs`, kind="exec") and `web_search`/network
+# tools by a `no-network` run. Naming any of them at a session that cannot call
+# it is the prompt/tool-surface disagreement this module exists to stop.
 def _tool_menu(caps: frozenset) -> str:
-    names = []
+    names = ["read_file", "write_file"]
+    if "exec" in caps:
+        names += ["run_shell", "run_python"]
+    names += ["find_files", "sample_files"]
     if "vision" in caps:
         names.append("view_images")
-    if "extended" in caps:
+    if "extended" in caps and "network" in caps:
         names.append("web_search")
-    return "".join(n + ", " for n in names) + "…"
+    return ", ".join(names) + ", …"
 _LOOP_TAIL = (
     "\n"
     "   • NEVER dump a big folder. list_directory summarises large folders; use "
@@ -155,7 +171,7 @@ _REMEDY_TEXT_ONLY = (
 
 def _loop_text(caps: frozenset) -> str:
     remedy = _REMEDY_VISION if "vision" in caps else _REMEDY_TEXT_ONLY
-    return (_LOOP_HEAD_A + _tool_menu(caps) + _LOOP_HEAD_B
+    return (_LOOP_HEAD_A + _tool_menu(caps) + _loop_head_b(caps)
             + remedy + _LOOP_TAIL)
 
 
@@ -214,20 +230,25 @@ def _registry(caps: Iterable[str]) -> Prompt:
 MEMORY_ORDER = 90
 
 
-def agent_prompt(caps: Iterable[str] = ("vision", "extended")) -> str:
+def agent_prompt(caps: Iterable[str] = ("vision", "extended", "exec",
+                                        "network")) -> str:
     """The autonomous agent's system prompt.
 
-    `caps=("vision", "extended")` reproduces exactly what shipped before this
-    module existed — that is a vision model on the full tool surface, which is
-    what every run got then. Drop "vision" and the model is not told to call
-    tools it cannot see; drop "extended" and it is not told about the
-    extended-tier tools a focused Run holds back.
+    The default caps are a full-capability session — vision, the extended tier,
+    execution and network — which reproduces exactly what shipped before this
+    module existed. Drop "vision" and the model is not told to call tools it
+    cannot see; drop "extended" and it is not told about the extended-tier tools
+    a focused Run holds back; drop "exec" and it is not told about
+    `run_shell`/`run_python`, which a `confined` run withholds; drop "network"
+    and it is not told about `web_search`, which a `no-network` run withholds
+    (AUDIT 05-1).
     """
     return _registry(caps).render()
 
 
 def agent_prompt_with_memory(memory_block: str = "",
-                             caps: Iterable[str] = ("vision", "extended")) -> str:
+                             caps: Iterable[str] = ("vision", "extended",
+                                                    "exec", "network")) -> str:
     """The agent prompt plus what earlier runs learned, as one more section.
 
     This used to be `AGENT_SYSTEM_PROMPT + "\\n\\n" + block` at the call site,

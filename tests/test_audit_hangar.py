@@ -377,6 +377,15 @@ def test_a_file_name_that_can_escape_is_rejected(name):
     assert "models directory" in msg or "non-empty" in msg or "colon" in msg
 
 
+@pytest.mark.parametrize("name", ["nul", "NUL.gguf", "con", "aux", "prn",
+                                  "com1", "LPT9.gguf", "Q4_K_M/nul"])
+def test_a_windows_reserved_device_name_is_rejected(name):
+    """AUDIT 04-10: `NUL.gguf` is the NUL device, not a file — the download and
+    delete sinks would 'succeed' against the device and the model would never
+    exist."""
+    assert "reserved device name" in _rejects(name)
+
+
 def test_the_backslash_form_is_rejected_on_every_platform():
     """On POSIX a backslash is an ordinary filename character, so a check written
     against `os.sep` alone would pass `..\\..\\evil.gguf` on Linux and let it

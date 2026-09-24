@@ -147,6 +147,27 @@ def test_no_delete_profile_knows_the_powershell_alias():
     assert tools._DELETE_CMD.search("tar -xzf ri.tar") is None
 
 
+# --- AUDIT F04-9: no-delete must know the rest of the removal family ----------
+# TEXT-ONLY check of the guard regex (safety rule 7) — nothing here is run.
+def test_no_delete_profile_covers_the_removal_family():
+    for code in (
+            "from pathlib import Path; Path('old_dir').rmdir()",
+            "import os; os.replace('a','b')",
+            "import os; os.truncate('a', 0)",
+            "import shutil; shutil.move('a','b')",
+            "import pathlib; pathlib.Path('x').unlink()",
+            "import shutil; shutil.rmtree('build')",
+            "import os; os.remove('a')"):
+        assert tools._DELETE_PY.search(code), code
+
+
+def test_no_delete_profile_does_not_match_benign_python():
+    for code in ("import shutil; shutil.copy('a','b')",
+                 "import os; os.path.join('a', 'b')",
+                 "import pathlib; p = pathlib.Path('x').resolve()"):
+        assert tools._DELETE_PY.search(code) is None, code
+
+
 # --- view_images: the two modes no longer fight the schema --------------------
 def test_view_images_requires_nothing():
     spec = next(t for t in tools.tool_specs(has_vision=True)

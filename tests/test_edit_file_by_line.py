@@ -45,6 +45,22 @@ def test_numbering_respects_offset(ws):
     assert "3|charlie" in flat and "1|alpha" not in flat
 
 
+def test_a_numbered_read_is_not_refused_as_already_read(ws):
+    """AUDIT 05-5: the per-turn dedupe key omitted `numbered`, so the numbered
+    call collided with the plain one and was answered "already read" — leaving
+    the model without the line numbers `edit_file(start_line=…)` requires."""
+    ctx = dict(ws, _reads={})
+    plain = tools.run_tool("read_file", {"path": "a.txt"}, ctx)
+    assert plain.startswith("alpha")               # unnumbered, as asked
+    numbered = tools.run_tool(
+        "read_file", {"path": "a.txt", "numbered": True}, ctx)
+    assert not numbered.startswith("(already read"), numbered
+    assert "1|alpha" in numbered.replace(" ", "")
+    # ...while the identical plain repeat is still deduped
+    assert tools.run_tool(
+        "read_file", {"path": "a.txt"}, ctx).startswith("(already read")
+
+
 def test_edit_by_line_range_replaces_exactly_those_lines(ws, tmp_path):
     out = tools.run_tool("edit_file", {
         "path": "a.txt", "start_line": 2, "end_line": 3,

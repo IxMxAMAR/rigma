@@ -418,8 +418,11 @@ def test_one_action_lets_the_model_see_loaded_images(engine, tmp_path):
     png = tmp_path / "x.png"
     Image.new("RGB", (8, 8), (200, 30, 30)).save(png)
 
+    # sentinel=True: a handler whose result IS a loop sentinel declares it at
+    # registration, so run_tool passes it around the control-byte guard by
+    # property rather than by sniffing the text (AUDIT 04-7).
     @toolkit.tool("fake_view", "test-only image loader",
-                  {"type": "object", "properties": {}})
+                  {"type": "object", "properties": {}}, sentinel=True)
     def _fake(args, ctx):
         return toolkit.IMAGE_SENTINEL + str(png)
 
@@ -874,9 +877,27 @@ def test_sample_files_hint_is_not_callable_looking_text(tmp_path):
     r = _r.create("m", "s")
     (tmp_path / "a.png").write_text("x", encoding="utf-8")
     out = _t.run_tool("sample_files", {"path": str(tmp_path)},
-                      {"run_id": r["id"], "workspace": str(tmp_path)})
+                      {"run_id": r["id"], "workspace": str(tmp_path),
+                       "has_vision": True})
     assert "view_sample" in out                 # still points at the right tool
     assert "view_sample()" not in out           # but not as copyable syntax
+
+
+def test_sample_files_never_names_view_sample_to_a_text_only_model(tmp_path):
+    """AUDIT 05-3: view_sample is gated needs="vision", so a model without
+    vision cannot call it. The result used to name it anyway, leaving the model
+    with no usable next step from the sample it was told not to retype."""
+    from rigma import runs as _r, tools as _t
+    r = _r.create("m", "s")
+    (tmp_path / "a.png").write_text("x", encoding="utf-8")
+    out = _t.run_tool("sample_files", {"path": str(tmp_path)},
+                      {"run_id": r["id"], "workspace": str(tmp_path),
+                       "has_vision": False})
+    assert "view_sample" not in out
+    # ...and it gives the remedy the sightless model can actually use
+    assert "Do not retype" in out and "read_file" in out
+    # the sample is still recorded, so move/copy by reference stays possible
+    assert len(_r.get_last_sample(r["id"])) == 1
 
 
 def _run_turn_tools(c, monkeypatch, surface=None):
