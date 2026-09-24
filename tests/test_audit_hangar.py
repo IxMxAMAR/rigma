@@ -298,6 +298,29 @@ def test_deleting_a_file_takes_its_resume_file_with_it(home, monkeypatch):
     assert not part.exists()
 
 
+def test_deleting_a_model_takes_its_template_and_calibration_rows(home):
+    """A slug is not just a label: the repaired template lives at
+    templates/<slug>.jinja and calibration rows are keyed
+    "<slug>:<quant>:<backend>". rename_model already carries both, but delete
+    left them behind, so a later model that slugified to the same name came
+    back wearing the dead model's template and its stale benchmark rows."""
+    import json
+    spec = _spec(GgufFile(repo="owner/first", file="a.gguf", bytes=16,
+                          quant="Q4_K_M"))
+    hangar._write_spec(spec)
+    (home / "templates").mkdir(parents=True, exist_ok=True)
+    (home / "templates" / "s.jinja").write_text("TEMPLATE", encoding="utf-8")
+    (home / "calibration.json").write_text(json.dumps({
+        "s:Q4_K_M:vulkan": {"flags": {}},
+        "other:Q4_K_M:vulkan": {"flags": {}},
+    }), encoding="utf-8")
+    hangar.delete_model("s")
+    assert not (home / "templates" / "s.jinja").exists()
+    rows = json.loads((home / "calibration.json").read_text(encoding="utf-8"))
+    assert "s:Q4_K_M:vulkan" not in rows
+    assert "other:Q4_K_M:vulkan" in rows      # untouched
+
+
 def test_deleting_a_model_takes_its_resume_files_with_it(home):
     spec = _spec(GgufFile(repo="owner/first", file="a.gguf", bytes=16,
                           quant="Q4_K_M"))

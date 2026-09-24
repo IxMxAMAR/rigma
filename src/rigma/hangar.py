@@ -992,6 +992,29 @@ def delete_model(slug: str, registry=None) -> None:
         path.unlink(missing_ok=True)
         _discard_partial(path)
     custom_spec_path(slug).unlink(missing_ok=True)   # AUDIT F07-1: confined
+    # AUDIT 07-6: a slug keys more than the spec. A repaired chat template
+    # lives at templates/<slug>.jinja and calibration rows are keyed
+    # "<slug>:<quant>:<backend>"; rename_model already carries both, so a
+    # delete that left them orphaned handed a LATER model that slugified to the
+    # same name the dead model's template and its stale benchmark rows. A
+    # template the registry itself ships for the slug is not ours to remove.
+    from .registry import Registry
+    shipped = Registry.load().models.get(slug)
+    if shipped is None or shipped.custom:
+        (rigma_home() / "templates" / f"{slug}.jinja").unlink(missing_ok=True)
+    calib = rigma_home() / "calibration.json"
+    if calib.is_file():
+        try:
+            import json
+            rows = json.loads(calib.read_text(encoding="utf-8"))
+            kept = {k: v for k, v in rows.items()
+                    if not k.startswith(f"{slug}:")}
+            if kept != rows:
+                tmp = calib.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(kept, indent=1), encoding="utf-8")
+                os.replace(tmp, calib)
+        except (OSError, ValueError):
+            pass          # a lost calibration row costs one re-tune, not data
 
 
 def set_launch_defaults(slug: str, registry=None, **fields) -> ModelSpec:
