@@ -275,3 +275,69 @@ def test_the_method_applied_stamp_never_survives_a_ruleless_turn(
     methods.apply_to_session(s, "coding")          # no trigger rules
     assert fire(s, [], user_spoke=True) == []
     assert "_method_applied" not in s, s.get("_method_applied")
+
+
+# --- loop guard 1 through the real wiring (AUDIT 03-1) ----------------------
+
+def _self_loop_fire(tmp_path, monkeypatch):
+    from rigma import methods, sessions
+    fire = _fire_app(tmp_path, monkeypatch)
+    base = methods.get("book")
+    saved, errs = methods.save_user({
+        **base, "id": "selfloop", "label": "Self loop",
+        "rules": [{"kind": "trigger", "id": "r1",
+                   "on": {"event": "tool_ran", "tool": "write_file"},
+                   "do": {"mode": "nudge", "text": "do it again"}}]})
+    assert saved is not None, errs
+    s = sessions.create("t")
+    methods.apply_to_session(s, "selfloop")
+    return fire, s
+
+
+def test_a_triggered_turn_does_not_fire_its_own_trigger(
+        tmp_path, monkeypatch):
+    """Guard #1: a rule must not fire on the action its own nudge caused.
+
+    `_fire_triggers` hardcoded `by_trigger: False` on every event and
+    `_llm_turn` consumed `pending_nudges` before the loop, so the flag that
+    says "this turn was started by a nudge" never reached triggers.evaluate
+    and the guard was unreachable in production (AUDIT 03-1)."""
+    fire, s = _self_loop_fire(tmp_path, monkeypatch)
+    trace = [{"name": "write_file", "args": {"path": "a.md"}, "result": "ok"}]
+
+    # an ordinary, user-driven turn runs write_file -> the nudge is queued
+    assert fire(s, trace, user_spoke=True) == []
+    assert s["pending_nudges"] == ["do it again"], s["pending_nudges"]
+
+    # the NEXT turn is the one that nudge started: _llm_turn consumes the
+    # nudge and records that this turn was triggered. Its own write_file must
+    # NOT queue the same nudge again.
+    s["pending_nudges"] = []
+    s["_turn_was_triggered"] = True
+    fire(s, trace, user_spoke=False)
+    assert s["pending_nudges"] == [], (
+        "the trigger re-fired on the turn its own nudge started")
+    assert "_turn_was_triggered" not in s, "the stamp outlived its turn"
+
+
+def test_an_ordinary_turn_still_fires_the_trigger(tmp_path, monkeypatch):
+    """The control for the test above: without the stamp the rule fires, so
+    the guard is not simply disabling triggers altogether."""
+    fire, s = _self_loop_fire(tmp_path, monkeypatch)
+    s["pending_nudges"] = []
+    fire(s, [{"name": "write_file", "args": {"path": "a.md"}, "result": "ok"}],
+         user_spoke=True)
+    assert s["pending_nudges"] == ["do it again"], s["pending_nudges"]
+
+
+def test_the_triggered_stamp_never_survives_a_ruleless_turn(
+        tmp_path, monkeypatch):
+    """Same unconditional consumption as `_method_applied`: a later method's
+    rules must not see a stamp left by an earlier, ruleless turn."""
+    from rigma import methods, sessions
+    fire = _fire_app(tmp_path, monkeypatch)
+    s = sessions.create("t")
+    methods.apply_to_session(s, "coding")          # no trigger rules
+    s["_turn_was_triggered"] = True
+    assert fire(s, [], user_spoke=False) == []
+    assert "_turn_was_triggered" not in s

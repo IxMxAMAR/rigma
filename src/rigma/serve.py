@@ -1862,7 +1862,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         await asyncio.to_thread(_prefix_warm, msgs)
         _mark("prefix_warm")
         # nudges are consumed by the turn that just read them: a reminder
-        # that re-injects every turn is nagging, not a trigger
+        # that re-injects every turn is nagging, not a trigger. Whether this
+        # turn WAS started by a queued nudge is carried to _fire_triggers
+        # (AUDIT 03-1): guard #1 — a trigger never fires on its own action —
+        # reads that fact, and with the flag hardcoded False it was dead code.
+        s["_turn_was_triggered"] = bool(s.get("pending_nudges"))
         s["pending_nudges"] = []
         # steer the reply's opening: llama-server continues from a trailing
         # assistant message AND echoes that prefix back in its output, so we
@@ -4988,6 +4992,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # method whose rules were just removed) must not leave the stamp behind
         # for a LATER method's rules to fire on (AUDIT F46).
         applied = str(session.pop("_method_applied", "") or "")
+        # Consumed unconditionally for the same reason (AUDIT 03-1): the stamp
+        # belongs to the turn that just ended. _llm_turn set it before it
+        # consumed pending_nudges, and by the time this hook runs the nudges
+        # are gone — this is the only evidence that the turn was triggered.
+        triggered = bool(session.pop("_turn_was_triggered", False))
         m = _methods.get(str(session.get("method") or ""))
         if not m or not any(r.get("kind") == "trigger"
                             for r in m.get("rules") or []):
@@ -4999,13 +5008,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if applied:
             events.append({"kind": "method_applied", "method": applied,
                            "tool": "", "path": "", "turn": turn,
-                           "by_trigger": False, "user_spoke": user_spoke})
+                           "by_trigger": triggered, "user_spoke": user_spoke})
         events += [{"kind": "tool_ran", "tool": t.get("name"),
                     "path": str((t.get("args") or {}).get("path") or ""),
-                    "turn": turn, "by_trigger": False, "user_spoke": user_spoke}
+                    "turn": turn, "by_trigger": triggered,
+                    "user_spoke": user_spoke}
                    for t in trace or []]
         events.append({"kind": "turn_ended", "tool": "", "path": "",
-                       "turn": turn, "by_trigger": False,
+                       "turn": turn, "by_trigger": triggered,
                        "user_spoke": user_spoke})
         notices, nudges = [], list(session.get("pending_nudges") or [])
         for ev in events:
