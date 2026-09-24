@@ -747,6 +747,8 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     import json as _json
     from pathlib import Path
 
+    import httpx
+
     from . import state as st
     from .bench import run_bench, save_calibration, verdict
 
@@ -755,7 +757,16 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
         typer.echo("not running — start with: rigma up")
         raise typer.Exit(1)
     typer.echo(f"benchmarking {s['model']} ({s['quant']}) ...")
-    r = run_bench(s["public_port"], prompt_tokens, gen_tokens)
+    # AUDIT F08-8: run_bench raises HTTPStatusError/ConnectError, and
+    # server_running() returns the UI-only record (unloaded=True) for a Rigma
+    # with no engine at all — so this reached the user as a multi-frame httpx
+    # traceback instead of "the engine is not answering". RuntimeError covers
+    # the no-timings case 08-7 raises.
+    try:
+        r = run_bench(s["public_port"], prompt_tokens, gen_tokens)
+    except (httpx.HTTPError, RuntimeError) as e:
+        typer.echo(f"benchmark failed: {e}")
+        raise typer.Exit(1) from e
     typer.echo(f"prefill: {r.pp_tps:.0f} t/s   gen: {r.tg_tps:.1f} t/s "
                f"({r.prompt_tokens}-token prompt)")
     reg = Registry.load()
