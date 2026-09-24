@@ -1314,7 +1314,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.post("/api/sessions")
     async def create_session(body: dict | None = None):
-        body = body or {}
+        body = dict(body or {})
+        try:
+            sessions.validate_field_types(body)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         return sessions.create(title=body.get("title", "New chat"),
                                system_prompt=body.get("system_prompt", ""))
 
@@ -1379,7 +1383,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
         from urllib.parse import quote
-        raw = s.get("title") or "chat"
+        raw = str(s.get("title") or "chat")
         stem = "".join(ch for ch in raw if ch.isascii()
                        and (ch.isalnum() or ch in " -_")).strip() or "chat"
         ext = ".md" if fmt == "md" else ".json"
@@ -1401,7 +1405,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.post("/api/sessions/{sid}")
     async def update_session(sid: str, body: dict | None = None):
-        body = body or {}
+        body = dict(body or {})
+        # AUDIT 01-3: type-check BEFORE validate_params, which calls `.items()`
+        # on `params` and 500s on a list. `validate_field_types` also coerces
+        # null to the field's empty value.
+        try:
+            sessions.validate_field_types(body)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         if "params" in body:
             try:
                 body["params"] = sessions.validate_params(body["params"])

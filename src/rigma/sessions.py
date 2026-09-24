@@ -98,6 +98,41 @@ PERMISSION_MODES = ("full", "smart", "off")
 QWEN_EFFORTS = ("low", "medium", "high", "xhigh")
 EFFORT_LEVELS = ("", "off", "auto", "on") + QWEN_EFFORTS
 
+# AUDIT 01-3: the PATCH body is JSON of any shape and `update_session` copied
+# every MUTABLE_FIELD straight through. A wrong type did not fail the write —
+# it failed LATER, in a reader: `export_markdown` joins message content into a
+# str-only list, `build_messages` joins system_prompt into the system block,
+# and `validate_params` calls `.items()` on `params`. Refusing at the write is
+# the only place the client can still be told which field is wrong. Fields the
+# PATCH body does not offer today (`archive`, `pending_nudges`,
+# `trigger_state`) are listed too, so adding one to MUTABLE_FIELDS cannot
+# inherit the hole.
+_FIELD_TYPES: dict[str, type] = {
+    "title": str, "system_prompt": str, "preset_id": str, "notes": str,
+    "digest": str, "effort": str, "authors_note": str, "prefill": str,
+    "workspace": str, "method": str, "harness": str, "permission": str,
+    "messages": list, "archive": list, "pending_nudges": list,
+    "params": dict, "trigger_state": dict,
+}
+
+
+def validate_field_types(body: dict) -> None:
+    """Raise ValueError('<field>: must be a <type>') for a mistyped write.
+
+    `null` is COERCED to the field's empty value rather than refused: every
+    reader already treats a missing value as empty, so a client that sends
+    null for an unset box gets the same result as omitting the key. Any other
+    value of the wrong type is refused by name.
+    """
+    for key, want in _FIELD_TYPES.items():
+        if key not in body:
+            continue
+        value = body[key]
+        if value is None:
+            body[key] = want()      # str() / list() / dict() = the empty value
+        elif not isinstance(value, want):
+            raise ValueError(f"{key}: must be a {want.__name__}")
+
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
                 "min_p": (0.0, 1.0), "repeat_penalty": (0.5, 2.0),
                 "max_tokens": (1, 262144), "top_k": (0, 200),
@@ -640,24 +675,44 @@ def duplicate(session_id: str) -> dict | None:
     return dup
 
 
+def _as_text(value) -> str:
+    """The str `export_markdown`'s join needs, whatever the stored JSON holds.
+
+    AUDIT 01-3: a session written before the write guard can hold a null, a
+    dict or an int where the schema says string — the export used to raise
+    `TypeError` on exactly that, so a chat became permanently unexportable.
+    Coerce instead of raising; the guard stops new ones at the write.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return str(value)
+
+
 def export_markdown(session: dict) -> str:
-    lines = ["# " + (session.get("title") or "chat"), ""]
+    lines = ["# " + _as_text(session.get("title") or "chat"), ""]
     if session.get("system_prompt"):
-        lines += ["> " + session["system_prompt"].replace("\n", "\n> "), ""]
+        lines += ["> " + _as_text(session["system_prompt"]).replace("\n", "\n> "),
+                  ""]
     if session.get("notes"):
-        lines += ["> Story notes: " + session["notes"].replace("\n", "\n> "), ""]
+        lines += ["> Story notes: "
+                  + _as_text(session["notes"]).replace("\n", "\n> "), ""]
 
     def _emit(m: dict) -> None:
         who = "**You:**" if m.get("role") == "user" else "**Model:**"
         content = m.get("content", "")
         if isinstance(content, list):   # vision content-parts
             content = "\n".join(
-                p.get("text", "") if p.get("type") == "text" else "[image]"
+                _as_text(p.get("text", "")) if p.get("type") == "text"
+                else "[image]"
                 for p in content if isinstance(p, dict))
+        else:
+            content = _as_text(content)
         lines.extend([who, ""])
         if m.get("thinking"):
             lines.extend(["<details><summary>thinking</summary>", "",
-                          m["thinking"], "", "</details>", ""])
+                          _as_text(m["thinking"]), "", "</details>", ""])
         lines.extend([content, ""])
 
     # AUDIT F6: docs/audit-2026-09-04-full.md
