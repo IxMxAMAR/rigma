@@ -65,7 +65,14 @@ function SessionRail() {
                     title="unsent draft"
                     className="shrink-0 pr-1 text-amber">•</span>
             ) : null}
-            <span className="hidden group-hover:flex items-center gap-0.5 pr-1.5 shrink-0">
+            {/* Always rendered, not `hidden group-hover:flex`: a display:none
+                control is outside the tab order, so export/duplicate/delete
+                could not be reached by keyboard at all, and a touch device has
+                no hover state so they did not exist there either (AUDIT F11-8).
+                Muted at rest; full contrast on row hover or when one of them
+                takes focus. */}
+            <span className="flex items-center gap-0.5 pr-1.5 shrink-0 opacity-60
+                             group-hover:opacity-100 focus-within:opacity-100">
               <a href={`/api/sessions/${s.id}/export?fmt=md`} download
                  title="export as markdown" aria-label={`export ${s.title}`}
                  className="p-0.5 text-muted hover:text-amber"><Download /></a>
