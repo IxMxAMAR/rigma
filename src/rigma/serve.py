@@ -5201,11 +5201,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _runs.plan_complete(rid, t["id"])
                         recovered.append(t["id"])
         # rehydrate volatile loop state
+        #
+        # AUDIT 03-7: the per-ATTEMPT counters matter as much as the streaks.
+        # A run restarted while `frozen` re-froze after one freeze instead of
+        # two (frozen_streak survived); a run that had spent both completion
+        # challenges kept `verified_once=True`, so its first task_complete was
+        # accepted and it was written `done` with steps still pending and no
+        # deliverable checked — the exact "declares victory with work
+        # outstanding" failure the challenge gate exists to stop.
         r.update(status="running", paused=False, error_streak=0,
                  lazy_streak=0, completion_checked=False,
                  force_completion=False, _verify_pending=False,
                  _challenge_pending=False, _step_turns=0, _cur_step_id=None,
                  _reflected_err=False, _reflected_lazy=False,
+                 frozen_streak=0, verified_once=False,
+                 completion_challenges=0, _echo_streak=0,
                  _paused_at=0,
                  halt_reason="")
         # a used-up or nearly-used-up clock gets a grace hour — a restart
