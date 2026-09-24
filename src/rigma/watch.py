@@ -75,6 +75,30 @@ POLL_SECS = 1.5
 STAT_SETTLE_NS = 2_000_000_000
 
 
+def is_reparse_dir(p) -> bool:
+    """True for a directory that is a link of ANY kind — symlink OR junction.
+
+    AUDIT R3-1: `os.walk(followlinks=False)` and `Path.is_symlink()` only
+    recognise a NAME-SURROGATE reparse point (a real symlink). A Windows
+    JUNCTION is a MOUNT-POINT reparse point, so `is_symlink()` is False for it
+    and `os.walk` descends into it — which is how `find_files`, `grep` and this
+    watcher read files outside the workspace through one. Junctions need no
+    privilege (`mklink /J`), unlike symlinks, so this is the reachable form.
+    Files are deliberately NOT covered: a non-symlink reparse-point FILE is a
+    cloud placeholder (OneDrive), which is ordinary user content, not a link.
+    """
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    return bool(getattr(st, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
 def _iter_files(root: Path):
     """`(path, stat)` for candidate files under `root`, pruned and capped.
 
@@ -86,7 +110,9 @@ def _iter_files(root: Path):
     """
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        dirnames[:] = [d for d in dirnames
+                       if d not in IGNORE_DIRS
+                       and not is_reparse_dir(Path(dirpath) / d)]
         for name in filenames:
             p = Path(dirpath) / name
             try:

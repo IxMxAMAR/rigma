@@ -36,10 +36,16 @@ def pack_folder(folder: str, max_total: int = _MAX_TOTAL) -> dict:
     if not root.is_dir():
         raise WorkspaceError(f"not a folder: {folder}")
     files, tree, total, truncated = [], [], 0, False
+    # AUDIT R3-1: a JUNCTION reads as an ordinary directory to `os.walk`
+    # (`followlinks=False` only prunes name-surrogate reparse points), so a
+    # link inside the folder used to pack files from outside it into the prompt.
+    from .watch import is_reparse_dir
     # top-down walk with in-place pruning: never enumerate skipped subtrees
     # (a monorepo/drive-root shouldn't be fully materialized before the cap)
     for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in _SKIP_DIRS
+                             and not is_reparse_dir(Path(dirpath) / d))
         for fn in sorted(filenames):
             if _skip_name(fn):
                 continue
