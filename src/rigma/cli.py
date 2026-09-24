@@ -977,6 +977,36 @@ def stop():
     typer.echo("stopped" if killed else "stale state — nothing was killed")
 
 
+def _open_when_listening(port: int, url: str, timeout: float = 15.0):
+    """Open `url` in a browser once 127.0.0.1:port accepts a connection.
+
+    AUDIT F16-2: `webbrowser.open` ran BEFORE `serve.run_ui`, so on a cold start
+    (uvicorn imports FastAPI, builds the app and binds after the browser already
+    had the URL) the first navigation could race the bind and show "can't reach
+    this site" — on the very first impression. The wait runs in a daemon thread
+    so the caller can start the server immediately; `--no-browser` still skips
+    this entirely.
+    """
+    import threading
+
+    def _wait() -> None:
+        import socket
+        import time
+        import webbrowser
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    webbrowser.open(url)
+                    return
+            except OSError:
+                time.sleep(0.1)
+
+    t = threading.Thread(target=_wait, name="rigma-open-browser", daemon=True)
+    t.start()
+    return t
+
+
 def _wants_vision(spec) -> bool:
     """This model's own opinion about its vision projector.
 
@@ -1050,7 +1080,6 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
-    import webbrowser
 
     from . import runtime, serve
     from . import state as st
@@ -1087,7 +1116,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                    "tunes, and loads on demand")
         typer.echo("stop:   Ctrl+C here, or `rigma stop` from any terminal")
         if not no_browser:
-            webbrowser.open(f"http://127.0.0.1:{port}")
+            _open_when_listening(port, f"http://127.0.0.1:{port}")
         try:
             serve.run_ui(port, port - 1)
         finally:
@@ -1304,7 +1333,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     typer.echo(f"OpenAI:   http://127.0.0.1:{port}/v1")
     typer.echo("stop:     Ctrl+C here, or `rigma stop` from any terminal")
     if not no_browser:
-        webbrowser.open(f"http://127.0.0.1:{port}")
+        _open_when_listening(port, f"http://127.0.0.1:{port}")
     try:
         serve.run_ui(port, port - 1)
     finally:
