@@ -30,6 +30,12 @@ export interface Session {
   use_tools?: boolean;
   harness?: string;
   permission?: string;
+  /** AUDIT 13-2/13-3 per-chat tool grants. None has a server default, so a
+   *  chat that has never been toggled reports all three absent — which the UI
+   *  must read as OFF, never as granted (see chat/grants.ts). */
+  confirm_exec?: boolean;
+  allow_absolute_reads?: boolean;
+  allow_outbound_post?: boolean;
 }
 
 /** One agent backend, and what choosing it would cost.
