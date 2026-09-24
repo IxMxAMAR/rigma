@@ -977,7 +977,6 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         raise typer.Exit(1)
 
     reg = Registry.load()
-    p = _profile(reg)
 
     # UI-only: `rigma up` with no --model just starts Rigma. You pick a model
     # later in the UI (Models tab / Bazaar), which downloads, tunes, and loads
@@ -1015,6 +1014,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             st.clear_state()
         return
 
+    # AUDIT F15-1: the hardware probe used to run ABOVE the UI-only branch and
+    # be discarded, so the README's "no probing" first command spent up to 20s
+    # in a PowerShell GPU query (probe.py) before the UI appeared. It is only
+    # needed for the resolve path below.
+    p = _profile(reg)
     try:
         rp = resolve(p, reg, use_case=use_case, model_override=model)
     except ResolveError as e:
