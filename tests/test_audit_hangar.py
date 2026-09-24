@@ -216,7 +216,8 @@ def test_a_pull_tells_the_downloader_what_the_registry_says_the_file_is(
 
     seen = {}
 
-    def _fake(repo, file, dest, report, *, expect_bytes=0, sha256=None):
+    def _fake(repo, file, dest, report, *, expect_bytes=0, sha256=None,
+              cancelled=None):
         seen.update(repo=repo, file=file, expect_bytes=expect_bytes,
                     sha256=sha256)
         return 0
@@ -319,6 +320,97 @@ def test_deleting_a_model_takes_its_template_and_calibration_rows(home):
     rows = json.loads((home / "calibration.json").read_text(encoding="utf-8"))
     assert "s:Q4_K_M:vulkan" not in rows
     assert "other:Q4_K_M:vulkan" in rows      # untouched
+
+
+def test_a_cancelled_download_discards_its_partial(tmp_path, monkeypatch):
+    """The worker has to stop when the model it belongs to is deleted; the
+    check runs before each write and once more under the lock before the
+    os.replace, which is the step that used to resurrect the file."""
+    origin = _Origin(b"K" * (2 << 20))
+    monkeypatch.setattr("httpx.stream", origin.stream)
+    dest = tmp_path / "model.gguf"
+    state = {"cancelled": False}
+
+    def report(n):
+        if n:
+            state["cancelled"] = True
+
+    with pytest.raises(HangarError, match="cancel"):
+        hangar._download_file("owner/first", "model.gguf", dest, report,
+                              cancelled=lambda: state["cancelled"])
+    assert not dest.exists()
+    assert not dest.with_name(dest.name + ".part").exists()
+
+
+def test_deleting_a_file_cancels_an_in_flight_pull(home, monkeypatch):
+    """delete_file unlinked the file but the worker kept streaming and its
+    os.replace put it straight back — orphaned and invisible to the library,
+    because list_models iterates the spec. The delete now sets a per-key
+    cancel flag the download checks before it installs."""
+    spec = _spec(GgufFile(repo="owner/first", file="a.gguf", bytes=4,
+                          quant="Q4_K_M"))
+
+    class _Reg:
+        models = {"s": spec}
+
+    target = hangar.models_dir() / "a.gguf"
+    target.write_bytes(b"g" * 4)
+    monkeypatch.setattr(hangar, "_PULLS", {
+        "s::a.gguf": {"status": "downloading", "total": 4, "done": 0,
+                      "error": None, "cancel": False}})
+    hangar.delete_file("s", "a.gguf", registry=_Reg())
+    assert hangar._PULLS["s::a.gguf"]["cancel"] is True
+    assert not target.exists()
+    # the install step refuses even though the bytes are complete
+    part = target.with_name(target.name + ".part")
+    part.write_bytes(b"ABCD")
+    with pytest.raises(HangarError, match="cancel"):
+        hangar._install_download(
+            target, 4, 4, None,
+            cancelled=lambda: hangar._PULLS["s::a.gguf"]["cancel"])
+    assert not target.exists()
+
+
+def test_deleting_a_model_cancels_every_in_flight_pull(home, monkeypatch):
+    spec = _spec(
+        GgufFile(repo="owner/first", file="a.gguf", bytes=4, quant="Q4_K_M"),
+        GgufFile(repo="owner/first", file="b.gguf", bytes=8, quant="Q4_K_M"))
+    hangar._write_spec(spec)
+    for name in ("a.gguf", "b.gguf"):
+        (hangar.models_dir() / name).write_bytes(b"g")
+    monkeypatch.setattr(hangar, "_PULLS", {
+        "s::a.gguf": {"status": "downloading", "total": 4, "done": 0,
+                      "error": None, "cancel": False},
+        "s::b.gguf": {"status": "downloading", "total": 8, "done": 0,
+                      "error": None, "cancel": False}})
+    hangar.delete_model("s")
+    assert hangar._PULLS["s::a.gguf"]["cancel"] is True
+    assert hangar._PULLS["s::b.gguf"]["cancel"] is True
+
+
+def test_a_cancelled_pull_reports_cancelled_not_an_error(home, monkeypatch):
+    """A pull stopped by a delete is not a failure to show in red; the UI
+    simply drops the row and offers Download again."""
+    spec = _spec(GgufFile(repo="owner/first", file="a.gguf", bytes=4,
+                          quant="Q4_K_M"))
+
+    class _Reg:
+        models = {"s": spec}
+
+    monkeypatch.setattr(hangar, "_PULLS", {})
+
+    def _download(repo, file, dest, report, *, expect_bytes=0, sha256=None,
+                  cancelled=None):
+        hangar._PULLS["s::a.gguf"]["cancel"] = True
+        assert cancelled() is True
+        raise HangarError("download cancelled — the model was deleted")
+
+    monkeypatch.setattr(hangar, "_download_file", _download)
+    hangar.start_pull("s", "a.gguf", registry=_Reg())
+    for t in threading.enumerate():
+        if t.name == "pull:a.gguf":
+            t.join(timeout=5)
+    assert hangar._PULLS["s::a.gguf"]["status"] == "cancelled"
 
 
 def test_deleting_a_model_takes_its_resume_files_with_it(home):
