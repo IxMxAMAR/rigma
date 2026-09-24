@@ -4799,6 +4799,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         mission = str((body or {}).get("mission", "")).strip()
         if not mission:
             return JSONResponse({"error": "mission is required"}, status_code=400)
+        # AUDIT 01-5: validate BEFORE `sessions.create` below, so a bad budget
+        # answers 400 instead of 500-ing and leaving an orphaned chat behind it.
+        # `float(None)` is the realistic shape: a UI that serialises
+        # `parseFloat("")` sends NaN as null.
+        try:
+            budget_hours = float((body or {}).get("budget_hours", 8))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "budget_hours: must be a number"}, status_code=400)
+        if budget_hours <= 0:
+            return JSONResponse(
+                {"error": "budget_hours: must be greater than 0"},
+                status_code=400)
         profile = (body or {}).get("profile", "all")
         workspace = str((body or {}).get("workspace", "")).strip()
         # Reasoning is ON by default: a long unattended job benefits from the
@@ -4844,7 +4857,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     run_profile=profile if profile in _runs.PROFILES else "all")
         run = _runs.create(mission, sess["id"], workspace=workspace,
                            profile=profile,
-                           budget_hours=float((body or {}).get("budget_hours", 8)))
+                           budget_hours=budget_hours)
         run["spec"] = None          # compiled by the run loop, see _compile_spec
         _runs.save(run)
         sess["run_id"] = run["id"]
