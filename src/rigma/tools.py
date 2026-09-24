@@ -3121,22 +3121,52 @@ def kill_all_jobs() -> int:
 # false-positived on `git log --format=…` and PowerShell's Format-Table, and a
 # small model told "blocked — destructive" abandons a perfectly good approach
 # (the Python blocklist below learned this same lesson first).
+#
+# AUDIT F04-1/04-3: on win32 run_shell executes POWERSHELL, where `del`/`rd` are
+# aliases that do not even accept `/s` — so the cmd.exe spellings this list was
+# written against are not the ones that run. `Remove-Item -Recurse -Force` and
+# `Stop-Computer` were both absent. The list now names the cmdlets, while
+# keeping the benign-word carve-outs: only the RECURSIVE Remove-Item is
+# destructive (a plain one is an ordinary delete, gated by the run profile), and
+# `format` still needs a drive.
+#
+# AUDIT F04-4: `rm -rf /` required the two flags adjacent and in that order, so
+# `rm -r -f /`, `rm --recursive --force /` and `rm -rf $HOME` all passed. The
+# flags are now matched as a set, in any order, long or short, against a rooted
+# target.
 _BLOCKED_CMD = re.compile(
-    r"(?i)(\b(diskpart|takeown|icacls|shutdown|restart-computer|mkfs|"
-    r"fdisk|reg\s+delete)\b|\bformat\s+[a-z]:|rm\s+-rf\s+[/~]|"
+    r"(?i)(\b(diskpart|takeown|icacls|shutdown|restart-computer|stop-computer|"
+    r"logoff|mkfs|fdisk|format-volume|clear-disk|initialize-disk|"
+    r"remove-partition|new-partition|set-acl|reg\s+delete)\b|"
+    r"\bformat\s+[a-z]:|"
+    r"\brm\b(?=[^|;&\n]*--?[a-z]*r)(?=[^|;&\n]*--?[a-z]*f)"
+    r"[^|;&\n]*\s(?:/|~|\$HOME\b|\$\{HOME\})|"
+    r"\b(?:remove-item|ri)\b(?=[^|;&\n]*-recurse)|"
     r"del\s+/[sq].*[\\/]|rd\s+/s\s+\w:)")
 # deletion verbs, blocked only under the no-delete run profile
 _DELETE_CMD = re.compile(
-    r"(?i)\b(del|erase|rm|rmdir|rd|remove-item|unlink)\b")
+    r"(?i)(\b(del|erase|rm|rmdir|rd|remove-item|unlink)\b|"
+    # AUDIT F04-1: `ri` is PowerShell's alias for Remove-Item. Require a
+    # following argument so the word inside a filename (`ri.tar`) is not a hit.
+    r"\bri\s+(?=[-.\"'/\\$]))")
 
 # The blocklists above are for SHELL text. Running them over PYTHON SOURCE
 # refuses ordinary code: "\bformat\b" matches "{}".format(x) and "\bdel\b" is a
 # Python keyword. That blocked a real run. Python gets its own, narrower rules
 # keyed on destructive APIs rather than English words.
+#
+# AUDIT F04-2: the rmtree branch demanded a drive-letter root, so
+# `shutil.rmtree('/')` — the root of the current drive on Windows — and
+# `shutil.rmtree('.')` both passed, as did shelling out to the delete verbs the
+# shell list itself knows. A plain relative directory name is still allowed:
+# removing `build/` is ordinary work.
 _BLOCKED_PY = re.compile(
-    r"(?i)(shutil\.rmtree\s*\(\s*[\"']?[a-z]:[\\/]*[\"']?\s*[,)]|"
+    r"(?i)(shutil\.rmtree\s*\(\s*[\"']?(?:[a-z]:[\\/]*|[/\\]|\.{1,2})"
+    r"(?:[\\/\"']|\s*[,)]|$)|"
+    r"shutil\.rmtree\s*\(\s*os\.path\.expanduser|"
     r"(os\.system|subprocess\.\w+)\s*\(\s*\[?\s*[\"'](format|diskpart|mkfs|"
-    r"shutdown|fdisk)\b)")
+    r"shutdown|fdisk|rd|del|rm|remove-item|stop-computer|format-volume|"
+    r"clear-disk|initialize-disk)\b)")
 _DELETE_PY = re.compile(
     r"(?i)(os\.(remove|unlink|rmdir)|shutil\.rmtree|\.unlink\s*\(|send2trash)")
 
