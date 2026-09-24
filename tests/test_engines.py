@@ -10,6 +10,9 @@ Each test below fails if the behaviour it names is removed — verified by
 mutation, not by inspection (see docs/design/2026-09-25-vllm-engine-spec.md,
 "how these tests were checked").
 """
+import json
+import platform
+
 import pytest
 
 from rigma import engines
@@ -310,6 +313,111 @@ def test_the_registry_lists_both_runtimes_with_a_verdict(monkeypatch):
     for r in rows:
         d = r.as_dict()
         assert set(d) == {"engine", "available", "state", "reason", "evidence"}
+
+
+# --- the surface the CLI and the UI read -----------------------------------
+# `server_ops.available_backends` answers a DIFFERENT question (which llama.cpp
+# compute backend) and the UI already renders its rows, so the engine runtimes
+# get their own function rather than widening that contract.
+
+def test_server_ops_exposes_both_engine_runtimes(monkeypatch):
+    from rigma import server_ops
+    monkeypatch.setattr(server_ops, "available_backends", lambda registry=None: [
+        {"name": "vulkan", "ready": True, "buildable": True},
+        {"name": "cpu", "ready": False, "buildable": True}])
+    _probe(monkeypatch, os_name="windows", python=(3, 12))
+    rows = server_ops.available_engine_runtimes()
+    assert [r["engine"] for r in rows] == ["llamacpp", "vllm"]
+    assert rows[0]["available"] is True
+    assert rows[0]["state"] == "runnable"
+    assert rows[1]["available"] is False
+
+
+def test_an_unreadable_engine_pin_is_a_verdict_not_a_traceback(monkeypatch):
+    """`rigma engine-runtimes` is a report. A broken engine pin must produce a
+    row that says so, not a stack trace out of a command whose whole job is to
+    explain what is wrong."""
+    from rigma import server_ops
+
+    def boom(registry=None):
+        raise RuntimeError("no pin for linux/vulkan")
+
+    monkeypatch.setattr(server_ops, "available_backends", boom)
+    rows = server_ops.available_engine_runtimes()
+    assert rows[0]["available"] is False
+    assert rows[0]["state"] == "manifest-unreadable"
+    assert "no pin for linux/vulkan" in rows[0]["reason"]
+
+
+def test_the_cli_command_prints_the_verdict(monkeypatch):
+    from typer.testing import CliRunner
+
+    from rigma import cli, server_ops
+    monkeypatch.setattr(server_ops, "available_engine_runtimes",
+                        lambda registry=None: [
+                            {"engine": "llamacpp", "available": True,
+                             "state": "runnable",
+                             "reason": "llama.cpp is the default engine runtime.",
+                             "evidence": {}},
+                            {"engine": "vllm", "available": False,
+                             "state": "unsupported-os",
+                             "reason": "vLLM does not support Windows natively — "
+                                       "use WSL2 or a Linux partition.",
+                             "evidence": {}}])
+    res = CliRunner().invoke(cli.app, ["engine-runtimes"])
+    assert res.exit_code == 0, res.output
+    assert "llamacpp" in res.output and "vllm" in res.output
+    assert "WSL2" in res.output
+    assert "unsupported-os" in res.output
+
+
+def test_the_cli_json_report_is_machine_readable(monkeypatch):
+    from typer.testing import CliRunner
+
+    from rigma import cli, server_ops
+    monkeypatch.setattr(server_ops, "available_engine_runtimes",
+                        lambda registry=None: [
+                            {"engine": "llamacpp", "available": True,
+                             "state": "runnable", "reason": "ok", "evidence": {}}])
+    res = CliRunner().invoke(cli.app, ["engine-runtimes", "--json"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.output) == [
+        {"engine": "llamacpp", "available": True, "state": "runnable",
+         "reason": "ok", "evidence": {}}]
+
+
+def test_the_new_command_is_additive(monkeypatch):
+    """The engine runtime is a NEW command; nothing that already existed may
+    have moved. `rigma doctor` in particular keeps answering the llama.cpp
+    COMPUTE-backend question it always answered."""
+    from rigma import cli
+    names = {c.name or c.callback.__name__ for c in cli.app.registered_commands}
+    assert "engine-runtimes" in names
+    for existing in ("up", "doctor", "harness", "plan", "status",
+                     "sweep", "unload", "load", "bench"):
+        assert existing in names
+
+
+def test_the_real_report_runs_on_this_machine(monkeypatch):
+    """No engine probes replaced: the real manifest, the real GPU probe and the
+    real platform. Catches an import error or a probe that explodes on a real
+    host, which every mocked test above would hide."""
+    from typer.testing import CliRunner
+
+    from rigma import cli
+    # the VRAM counter shells out to PowerShell on Windows; irrelevant here and
+    # the slowest thing in the chain
+    monkeypatch.setattr("rigma.probe.gpu_used_mb", lambda: None)
+    res = CliRunner().invoke(cli.app, ["engine-runtimes", "--json"])
+    assert res.exit_code == 0, res.output
+    rows = {r["engine"]: r for r in json.loads(res.output)}
+    assert set(rows) == {"llamacpp", "vllm"}
+    # a sentence with a source in it, not a state token repeated back
+    assert len(rows["vllm"]["reason"]) > 120
+    assert "vLLM" in rows["vllm"]["reason"]
+    if platform.system() == "Windows":
+        assert rows["vllm"]["state"] == "unsupported-os"
+        assert "WSL" in rows["vllm"]["reason"]
 
 
 # --- failure classification and the launch loop ----------------------------

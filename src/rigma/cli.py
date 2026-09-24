@@ -638,6 +638,35 @@ def doctor(as_json: bool = typer.Option(False, "--json",
         raise typer.Exit(1)
 
 
+@app.command("engine-runtimes")
+def engine_runtimes(as_json: bool = typer.Option(False, "--json",
+                                                 help="machine-readable rows")):
+    """Which ENGINE RUNTIME can serve here: llama.cpp, or vLLM.
+
+    "Backend" means two other things in this tool — the llama.cpp COMPUTE
+    backend (vulkan/cuda/rocm/cpu, see `rigma doctor`) and the agent HARNESS
+    backend (native/dsh/mcode, see `rigma harness`). This is the third axis:
+    WHICH PROGRAM serves the API. llama.cpp is always the default and nothing
+    here changes that.
+
+    vLLM cannot run on this machine today (Windows; its stated requirement is
+    OS: Linux) and saying so precisely is the point — "not installed" and
+    "installed but unsupported here" have different remedies, and on an AMD
+    host a wrong Python version installs the CUDA wheel silently. Never
+    downloads, never installs, never launches anything.
+    """
+    from . import server_ops
+
+    rows = server_ops.available_engine_runtimes()
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        state = "available" if r["available"] else f"unavailable ({r['state']})"
+        typer.echo(f"{r['engine']:<9} {state}")
+        typer.echo(f"          {r['reason']}")
+
+
 @app.command()
 def harness(backend: str = typer.Option(None, "--backend", "-b",
                                         help="check only this one"),
