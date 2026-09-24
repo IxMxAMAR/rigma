@@ -145,6 +145,25 @@ def _ctx_floor(spec: ModelSpec) -> int:
     return min(CTX_FLOOR, spec.native_ctx) if spec.native_ctx > 0 else CTX_FLOOR
 
 
+# AUDIT F06-5
+def _next_ctx_rung(ctx: int, floor: int) -> int:
+    """The next smaller context to try, never stepping PAST the floor.
+
+    `ctx //= 2` skipped the floor rung whenever native_ctx was not a power-of-two
+    multiple of two above it (12288, 10000, 24576, ...): the sequence jumped from
+    the native rung straight below `_ctx_floor`, which is the one rung that
+    function exists to guarantee. The Models page probes 8192/4096/2048 and
+    reported the same model fitting at 8192 while `rigma up` never asked.
+
+    Returns a value below the floor — ending the caller's `while ctx >= floor`
+    loop — when `ctx` is already at or below the floor, so the loop terminates.
+    """
+    nxt = ctx // 2
+    if nxt < floor and ctx > floor:
+        nxt = floor
+    return nxt
+
+
 def kv_bytes_per_token(spec: ModelSpec, k: str, v: str) -> float:
     per_side = spec.full_attn_layers * spec.kv_heads * spec.head_dim
     return per_side * CACHE_BYTES[k] + per_side * CACHE_BYTES[v]
@@ -668,7 +687,7 @@ def _calculate(profile: HardwareProfile, registry: Registry,
                                    backend=_backend(profile, backend),
                                    flags=flags,
                                    origin="calculator", explain=explain)
-                ctx //= 2
+                ctx = _next_ctx_rung(ctx, floor)
     return None
 
 
@@ -686,7 +705,7 @@ def fallback_plans(plan: RunPlan, registry: Registry,
             while ctx >= floor and flags is None:
                 flags = fit_gguf(spec, gguf, profile, ctx, explain)
                 if flags is None:
-                    ctx //= 2
+                    ctx = _next_ctx_rung(ctx, floor)
             if flags is not None:
                 out.append(_apply_calibration(RunPlan(
                     model_slug=spec.slug, gguf=gguf, backend=plan.backend,
