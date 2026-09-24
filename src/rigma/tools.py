@@ -1611,13 +1611,14 @@ def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
 
     The one exemption is a run's progress log, which the run loop hands the
     model by name and which lives under Rigma's state dir; refusing it would
-    break the run for no security gain (it is model-written). A workspace that
-    IS (or lives inside) the state dir is also an explicit choice — the default
-    workspace is the home dir, which CONTAINS the state dir, so that case must
-    stay denied."""
+    break the run for no security gain (it is model-written). It exempts the
+    log from the STATE-DIR rule and nothing else — AUDIT R3-8: it used to be
+    tested first, so it also exempted a file of that name from the credential
+    file/directory and browser-profile rules, and `~/.ssh/progress.md` was
+    readable. A workspace that IS (or lives inside) the state dir is also an
+    explicit choice — the default workspace is the home dir, which CONTAINS the
+    state dir, so that case must stay denied."""
     name = p.name.lower()
-    if name in ("progress.md", "progress.txt"):
-        return ""
     for pat in _CREDENTIAL_FILES:
         if fnmatch.fnmatch(name, pat):
             return "that looks like a credential file"
@@ -1630,6 +1631,8 @@ def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
         from .runtime import rigma_home
         home = rigma_home().resolve()
         if p == home or p.is_relative_to(home):
+            if name in ("progress.md", "progress.txt"):
+                return ""
             ws = str((ctx or {}).get("workspace") or "").strip()
             if ws and Path(ws).resolve().is_relative_to(home):
                 return ""
