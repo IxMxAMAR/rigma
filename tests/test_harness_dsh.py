@@ -389,6 +389,41 @@ def test_a_stop_is_a_notice_not_a_failure(monkeypatch, tmp_path):
     assert not any(e.kind == "error" for e in events)
 
 
+def test_a_hard_stop_kills_the_tree_not_just_the_runner(monkeypatch):
+    """A timeout must not leave the Node agent (and its subagents) running.
+
+    `proc.kill()` is TerminateProcess on the direct child only, and the child is
+    `python -m rigma._dsh_runner` while the dsh CLI is a Node GRANDCHILD. Killing
+    the runner means its `finally: live.close()` never runs, so the agent keeps
+    the model server busy and holds VRAM. The cancel watcher already uses
+    `kill_tree` for exactly this reason; the timeout path went through
+    `proc.kill()` (09-1)."""
+    calls = []
+
+    class FakeProc:
+        pid = 999999
+        stdin = stdout = stderr = None
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            calls.append("proc.kill")
+
+        def terminate(self):
+            calls.append("proc.terminate")
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(harness_dsh._harness, "kill_tree",
+                        lambda proc: calls.append("kill_tree"))
+    run = harness_dsh._Run(proc=FakeProc(), hard=True)
+    harness_dsh._stop(run)
+
+    assert calls == ["kill_tree"], calls
+
+
 def test_a_timeout_is_still_an_error_not_a_stop(monkeypatch, tmp_path):
     """The two must not be confused: a cancel is the user's choice, a timeout is
     a fault. If a timeout were reported as a stop, a hung turn would look like a
