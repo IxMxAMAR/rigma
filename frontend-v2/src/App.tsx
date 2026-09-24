@@ -14,6 +14,7 @@ import WorkflowsSurface from "./workflows/WorkflowsSurface";
 import SettingsSurface from "./settings/SettingsSurface";
 import Palette from "./Palette";
 import WorkspacePanel from "./WorkspacePanel";
+import { parseParamRanges } from "./lib/paramLimits";
 import { SURFACES, useApp } from "./store";
 
 function Sidebar() {
@@ -225,6 +226,7 @@ export default function App() {
             tps: d.last_tg ?? d.tps ?? null,
             healthy: !d.unloaded && !!d.model,
             ctx: d.ctx ?? 0,
+            paramRanges: parseParamRanges(d.param_ranges),
           });
       } catch {
         if (alive) setServer(null);

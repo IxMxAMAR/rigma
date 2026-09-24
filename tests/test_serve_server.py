@@ -34,6 +34,26 @@ def test_server_info_fields_and_verdict(tmp_path, monkeypatch, client):
     assert info["last_tg"] is None
 
 
+def test_server_info_carries_the_sampler_ranges(tmp_path, monkeypatch, client):
+    """AUDIT F11-2: the UI's sampler bounds must come from the validator.
+
+    They were re-declared in Sidecar.tsx and drifted — the panel offered a
+    repeat_penalty the server 400s and capped temperature below what it takes.
+    /api/server now publishes the one definition, so the client cannot drift
+    without a test failing here.
+    """
+    from rigma import sessions
+
+    state.write_state("m", "q", 18500, engine_pid=os.getpid(),
+                      ui_pid=os.getpid(), backend="vulkan",
+                      use_case="creative", ctx=4096)
+    info = client.get("/api/server").json()
+    assert info["param_ranges"]["repeat_penalty"] == [0.5, 2.0]
+    assert info["param_ranges"]["temperature"] == [0.0, 4.0]
+    assert info["param_ranges"] == {
+        k: list(v) for k, v in sessions.PARAM_RANGES.items()}
+
+
 def test_server_log_route(tmp_path, monkeypatch, client):
     logs = tmp_path / "logs"
     logs.mkdir()

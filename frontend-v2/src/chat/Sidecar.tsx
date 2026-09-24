@@ -10,6 +10,7 @@ import {
   type Method,
 } from "../lib/methods";
 import { engineApi, type ServerInfo } from "../lib/engineApi";
+import { clampParam, rangeFor } from "../lib/paramLimits";
 import { useApp } from "../store";
 import MethodBuilder from "./MethodBuilder";
 import { selectAnyStreaming, useChat } from "./chatStore";
@@ -510,9 +511,15 @@ function SamplingCard() {
   // the cap follows the ENGINE's context — a hardcoded 32768 silently
   // clamped a 131072 the user had set (owner report 2026-07-21)
   const maxTok = useApp((s) => s.server?.ctx) || 262144;
+  // AUDIT F11-2: the bounds come from the server (sessions.PARAM_RANGES, which
+  // /api/server publishes) instead of a second table declared here. That table
+  // had drifted: the panel offered a repeat_penalty the server 400s and capped
+  // temperature below what it accepts.
+  const ranges = useApp((s) => s.server?.paramRanges);
   const [params, setParams] = useState<Record<string, number>>({});
   const [prompt, setPrompt] = useState("");
   const [dirty, setDirty] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const [presets, setPresets] = useState<PresetRow[]>([]);
   const [presetId, setPresetId] = useState("");
   // How hard the model thinks. Qwen3.8 publishes four reasoning levels and its
@@ -555,10 +562,14 @@ function SamplingCard() {
                                      system_prompt?: string;
                                      preset_id?: string });
       const loaded = { ...(raw.params ?? {}) };
-      // retro-clamp: values saved before limits existed (the 2,500,000 max
-      // tokens era) must not survive a reload
-      if (loaded.max_tokens != null && loaded.max_tokens > maxTok)
-        loaded.max_tokens = maxTok;
+      // retro-clamp EVERY field to the server's range: a value saved before
+      // these limits existed (the 2,500,000 max-tokens era, or a repeat_penalty
+      // the validator now refuses) must not survive a reload and 400 the next
+      // save. Unknown keys pass through untouched. `ranges` is deliberately not
+      // a dependency — the fallback mirrors the server, and re-running this on
+      // every poll would wipe what the user is typing.
+      for (const k of Object.keys(loaded))
+        loaded[k] = clampParam(k, loaded[k], ranges, maxTok);
       setParams(loaded);
       setPrompt(raw.system_prompt ?? "");
       setPresetId(raw.preset_id ?? "");
@@ -567,36 +578,43 @@ function SamplingCard() {
     }).catch(() => {});
   }, [currentId]);
 
-  const LIMITS: Record<string, number> = {
-    temperature: 2, dry_multiplier: 2, repeat_penalty: 2, max_tokens: maxTok,
-  };
   const save = async () => {
     if (!currentId) return;
     const clamped: Record<string, number> = {};
     for (const [k, v] of Object.entries(params))
-      clamped[k] = Math.min(LIMITS[k] ?? v, Math.max(0, v));
+      clamped[k] = clampParam(k, v, ranges, maxTok);
     setParams(clamped);
-    await api.updateSession(currentId,
-      { params: clamped, system_prompt: prompt }).catch(() => {});
-    setDirty(false);
+    setErr(null);
+    try {
+      await api.updateSession(currentId,
+        { params: clamped, system_prompt: prompt });
+      setDirty(false);
+    } catch (e) {
+      // A rejected save used to clear `dirty` anyway: the button vanished and
+      // the panel kept showing a value the engine was not using. Say what the
+      // server said and leave Save in place.
+      setErr((e as Error).message || "could not save");
+    }
   };
 
-  const num = (key: string, label: string, step: number, max: number,
-               showMax = false) => (
+  const num = (key: string, label: string, step: number,
+               showMax = false) => {
+    const r = rangeFor(key, ranges, maxTok) ?? { min: 0, max: 0 };
+    return (
     <label className="flex items-center gap-2 text-[12.5px]">
       <span className="w-24 text-secondary">
         {label}
         {showMax && (
           <span className="block font-mono text-[10px] text-muted">
-            reply cap · max {max.toLocaleString()}
+            reply cap · max {r.max.toLocaleString()}
           </span>
         )}
       </span>
       <input
         type="number"
         step={step}
-        min={0}
-        max={max}
+        min={r.min}
+        max={r.max}
         value={params[key] ?? ""}
         placeholder="default"
         onChange={(e) => {
@@ -610,20 +628,27 @@ function SamplingCard() {
           setDirty(true);
         }}
         onBlur={() => {
-          // the max attribute only gates the SPINNER; typing walks straight
-          // past it (owner demonstrated with 2,500,000 max tokens). Clamp
-          // for real once focus leaves.
+          // the min/max attributes only gate the SPINNER; typing walks straight
+          // past them (owner demonstrated with 2,500,000 max tokens). Clamp to
+          // the SERVER's range for real once focus leaves, and drop a value
+          // that is not a number at all.
           setParams((p) => {
             const v = p[key];
             if (v == null) return p;
-            const clamped = Math.min(max, Math.max(0, v));
+            if (!Number.isFinite(v)) {
+              const n = { ...p };
+              delete n[key];
+              return n;
+            }
+            const clamped = clampParam(key, v, ranges, maxTok);
             return clamped === v ? p : { ...p, [key]: clamped };
           });
         }}
         className="flex-1 min-w-0 rounded-md bg-surface px-2 py-0.5 font-mono text-[12px] outline-none"
       />
     </label>
-  );
+    );
+  };
 
   return (
     <section className="rounded-lg bg-panel p-3 flex flex-col gap-1.5">
@@ -758,10 +783,10 @@ function SamplingCard() {
         rows={3}
         className="rounded-md bg-surface px-2 py-1.5 text-[12.5px] outline-none resize-y placeholder:text-muted"
       />
-      {num("temperature", "temperature", 0.05, 2)}
-      {num("dry_multiplier", "DRY", 0.05, 2)}
-      {num("repeat_penalty", "repeat pen.", 0.01, 2)}
-      {num("max_tokens", "max tokens", 1024, maxTok, true)}
+      {num("temperature", "temperature", 0.05)}
+      {num("dry_multiplier", "DRY", 0.05)}
+      {num("repeat_penalty", "repeat pen.", 0.01)}
+      {num("max_tokens", "max tokens", 1024, true)}
       <p className="text-[10.5px] text-muted leading-snug">
         max tokens caps ONE reply. The context window (the “of{" "}
         {Math.round(maxTok / 1024)}K” bar) is a different thing — how much of
@@ -769,6 +794,9 @@ function SamplingCard() {
         <span className="text-secondary">engine</span> just below, because
         changing it restarts the engine.
       </p>
+      {err && (
+        <p role="alert" className="text-[11px] text-red">{err}</p>
+      )}
       {dirty && (
         <button
           onClick={() => void save()}
