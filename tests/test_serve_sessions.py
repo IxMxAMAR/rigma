@@ -335,6 +335,86 @@ def test_update_rejects_bad_params(client):
     assert ok.json()["notes"] == "N"
 
 
+@pytest.mark.parametrize("field,bad", [
+    ("title", 5),
+    ("system_prompt", 5),
+    ("notes", 5),
+    ("digest", 5),
+    ("messages", {"role": "user"}),
+    ("params", [1, 2]),
+    ("archive", "not-a-list"),
+    ("pending_nudges", "not-a-list"),
+    ("trigger_state", "not-a-dict"),
+])
+def test_update_rejects_mistyped_fields(client, field, bad):
+    """01-3: a mistyped field used to be stored and the reader 500ed later —
+    export_markdown joined a null into a str-only list, build_messages joined a
+    numeric system_prompt into the system block, and validate_params called
+    `.items()` on a list."""
+    s = client.post("/api/sessions", json={}).json()
+    r = client.post(f"/api/sessions/{s['id']}", json={field: bad})
+    assert r.status_code == 400, (field, r.status_code, r.text)
+    assert field in r.json()["error"]
+
+
+def test_create_session_rejects_mistyped_fields(client):
+    r = client.post("/api/sessions", json={"title": 5})
+    assert r.status_code == 400 and "title" in r.json()["error"]
+    r = client.post("/api/sessions", json={"system_prompt": {"x": 1}})
+    assert r.status_code == 400 and "system_prompt" in r.json()["error"]
+    # nothing was created behind the refusal
+    assert client.get("/api/sessions").json() == []
+
+
+def test_update_accepts_well_typed_values(client):
+    s = client.post("/api/sessions", json={"title": "ok"}).json()
+    body = {"title": "renamed", "system_prompt": "be brief", "notes": "N",
+            "digest": "D", "messages": [{"role": "user", "content": "hi"}],
+            "params": {"temperature": 0.5}}
+    r = client.post(f"/api/sessions/{s['id']}", json=body)
+    assert r.status_code == 200, r.text
+    out = r.json()
+    for k, v in body.items():
+        assert out[k] == v, k
+
+
+def test_update_coerces_null_to_empty(client):
+    """A null box is the same as an omitted one, not a 400 and not a stored
+    null that every reader then trips over."""
+    s = client.post("/api/sessions", json={}).json()
+    r = client.post(f"/api/sessions/{s['id']}",
+                    json={"system_prompt": None, "messages": None,
+                          "params": None, "title": None})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["system_prompt"] == "" and out["messages"] == []
+    assert out["params"] == {} and out["title"] == ""
+
+
+def test_export_survives_null_and_nonstring_message_content(client):
+    s = client.post("/api/sessions", json={}).json()
+    r = client.post(f"/api/sessions/{s['id']}", json={"messages": [
+        {"role": "user", "content": None},
+        {"role": "assistant", "content": {"weird": 1}},
+        {"role": "user", "content": 5}]})
+    assert r.status_code == 200, r.text
+    md = client.get(f"/api/sessions/{s['id']}/export?fmt=md")
+    assert md.status_code == 200, md.text
+
+
+def test_export_survives_values_the_write_guard_now_refuses(client):
+    """Sessions written before the guard existed are still on disk; the export
+    reader must coerce rather than raise on them."""
+    s = client.post("/api/sessions", json={}).json()
+    sess = sessions.load(s["id"])
+    sess["title"] = 5
+    sess["system_prompt"] = 7
+    sess["notes"] = {"x": 1}
+    sessions.save(sess)
+    r = client.get(f"/api/sessions/{s['id']}/export?fmt=md")
+    assert r.status_code == 200, r.text
+
+
 def test_chat_turn_continue_extends_trailing_assistant(tmp_path, monkeypatch,
                                                        oai_upstream):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
