@@ -249,3 +249,42 @@ def test_server_argv_appends_the_slot_save_path():
     assert argv[0] == "llama-server"
     assert argv[-2:] == ["--slot-save-path",
                          str(runtime.rigma_home() / "sessions")]
+
+
+def test_up_failure_message_names_the_real_log_dir(tmp_path, monkeypatch):
+    """AUDIT F15-7: `~/.rigma/logs/` is not expanded by Explorer or cmd, so the
+    one message that says where a failed launch logged pointed nowhere."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    monkeypatch.setattr(cli, "_port_holder", lambda port: "")
+    from rigma import runtime
+
+    def boom(*a, **k):
+        raise RuntimeError("engine download failed")
+
+    monkeypatch.setattr(runtime, "ensure_engine", boom)
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--yes"])
+    assert res.exit_code == 1
+    assert str(tmp_path / "logs") in res.output
+    assert "~/.rigma" not in res.output
+
+
+def test_bench_calibration_message_names_the_real_file(tmp_path, monkeypatch):
+    """AUDIT F15-7: same shorthand in the calibration confirmation."""
+    import httpx
+    _running_state(tmp_path, monkeypatch)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"timings": {"prompt_per_second": 650.0,
+                                "predicted_per_second": 55.5}}
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
+    res = runner.invoke(cli.app, ["bench"])
+    assert res.exit_code == 0
+    assert str(tmp_path / "calibration.json") in res.output
+    assert "~/.rigma" not in res.output
