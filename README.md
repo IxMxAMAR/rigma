@@ -69,7 +69,12 @@ numbers to [rigma-registry](https://github.com/IxMxAMAR/rigma-registry)). Verifi
 
 | Hardware | Model | Backend | Result |
 |---|---|---|---|
-| RX 9070 XT 16GB + 16GB RAM (Windows) | Qwen3.6-35B-A3B UD-Q3_K_XL, ctx 32K, n_cpu_moe 10 | Vulkan (llama.cpp b9867) | **verified 2026-07-06**: 57.1 t/s gen, 689 t/s prefill @ 4K prompt |
+| RX 9070 XT 16GB + 16GB RAM tier (Windows) | Qwen3.6-35B-A3B UD-Q3_K_XL, ctx 32K, n_cpu_moe 10 | Vulkan (llama.cpp b9867) | **verified 2026-07-06**: 57.1 t/s gen, 689 t/s prefill @ 4K prompt |
+
+The 9070 XT combos are keyed to the **ram-16** tier. A machine with more RAM and
+no combo of its own falls back to the nearest lower tier, and `rigma plan
+--explain` names the tier it used — the reference box measures 31.4 GB (tier 32)
+and takes the ram-16 combo above.
 
 ## Methods (set a chat up for the work, then automate it)
 

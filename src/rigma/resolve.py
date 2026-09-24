@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 from .models import ComboFlags, GgufFile, HardwareProfile, ModelSpec, RunPlan
 from .registry import Registry
@@ -707,6 +708,24 @@ def _combo_rejection(combo, spec: ModelSpec, gguf: GgufFile,
     return ""
 
 
+def _tier_note(rel: str, profile: HardwareProfile) -> list[str]:
+    """Say when the matched combo is keyed to a different RAM tier.
+
+    AUDIT F15-4: `find_combo` falls back to the nearest lower RAM tier, so the
+    reference box (31.4 GB, tier 32) now gets the verified ram-16 combo. A silent
+    fallback would hide that the numbers came from a machine with less RAM.
+    """
+    m = re.search(r"/ram-(\d+)/", rel)
+    if m is None:
+        return []
+    keyed = int(m.group(1))
+    if keyed == profile.ram_tier_gb:
+        return []
+    return [f"note: this combo is keyed to the ram-{keyed} tier; this machine's "
+            f"RAM tier is ram-{profile.ram_tier_gb}, so the nearest lower tier "
+            "was used"]
+
+
 def resolve(profile: HardwareProfile, registry: Registry,
             use_case: str = "general", model_override: str | None = None,
             backend_override: str | None = None) -> RunPlan:
@@ -745,7 +764,8 @@ def resolve(profile: HardwareProfile, registry: Registry,
                 return _apply_calibration(RunPlan(
                     model_slug=combo.model, gguf=gguf, backend=combo.backend,
                     flags=combo.flags, origin=f"{kind}:{rel}",
-                    explain=[f"registry match: {rel}"] + combo.sources),
+                    explain=([f"registry match: {rel}"]
+                             + _tier_note(rel, profile) + combo.sources)),
                     profile)
             rejected = [f"registry {kind} '{rel}' NOT used: {why}",
                         "falling back to the fit calculator"]
