@@ -35,8 +35,11 @@ def test_symmetric_kv_untouched():
 
 # --- Task 5: spec_type validation ------------------------------------------
 def test_spec_type_valid_accepted():
-    ComboFlags(ctx=4096, spec_type="draft-mtp")
-    ComboFlags(ctx=4096, spec_type="ngram-simple")
+    # assert the value, not merely "did not raise": if spec_type validation were
+    # deleted the old no-assertion test still passed
+    assert ComboFlags(ctx=4096, spec_type="draft-mtp").spec_type == "draft-mtp"
+    assert ComboFlags(ctx=4096,
+                      spec_type="ngram-simple").spec_type == "ngram-simple"
 
 
 def test_spec_type_unknown_rejected():

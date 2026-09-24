@@ -859,7 +859,11 @@ def test_reprobe_refreshes_the_file_list_even_when_geometry_is_current(
 
 
 def test_reprobe_offline_does_not_touch_the_repo_listing(home, monkeypatch):
-    """--offline means offline: no ranged reads, no listing calls."""
+    """--offline means offline: no ranged reads, no listing calls.
+
+    The monkeypatched boom is the negative half; assert the positive half too,
+    or `reprobe` returning without doing anything would pass."""
+    import json
     (home / "models").mkdir(parents=True, exist_ok=True)
     _hybrid_gguf(home / "models" / "h.gguf")
     _stale_spec(home, "h.gguf")
@@ -867,7 +871,18 @@ def test_reprobe_offline_does_not_touch_the_repo_listing(home, monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("offline reprobe listed the repo")
     monkeypatch.setattr("rigma.hf_browse.repo_files", _boom)
-    hangar.reprobe("hybrid-tune", allow_remote=False)
+    spec = hangar.reprobe("hybrid-tune", allow_remote=False)
+
+    assert spec is not None
+    # the stale 9/9 geometry is healed from the LOCAL file: 8 real layers and
+    # every 4th full-attention (the helper's block_count/interval)
+    assert spec.n_layers == 8 and spec.full_attn_layers == 2, \
+        "offline reprobe did not re-read the local header"
+    saved = json.loads((home / "custom" / "models"
+                        / "hybrid-tune.json").read_text(encoding="utf-8"))
+    assert saved["probe_version"] is not None, "the offline refresh was not saved"
+    assert {g["file"] for g in saved["ggufs"]} == {"h.gguf"}, \
+        "offline reprobe changed the inventory"
 
 
 # --- variant axes: one row per quant, not one row per file -------------------

@@ -252,10 +252,21 @@ def test_concurrent_edits_do_not_lose_a_write(tmp_path):
 
 
 def test_file_lock_is_reentrant():
-    # a nested acquire on one thread must not deadlock
-    with tools._FILE_LOCK:
+    # a nested acquire on one thread must not deadlock. Run it on a worker and
+    # JOIN WITH A TIMEOUT: on the main thread a non-reentrant lock would hang
+    # the whole CI job instead of failing it.
+    done = []
+
+    def _nested():
         with tools._FILE_LOCK:
-            assert True
+            with tools._FILE_LOCK:
+                done.append(True)
+
+    t = threading.Thread(target=_nested, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "the file lock deadlocked on a nested acquire"
+    assert done == [True]
 
 
 # --- Windows long paths -------------------------------------------------------
