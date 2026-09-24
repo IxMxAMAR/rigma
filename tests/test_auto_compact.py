@@ -323,8 +323,9 @@ def test_a_big_session_is_split_into_several_bounded_chunks():
     assert len(chunks) >= 4, "120,000 chars must not go in one request"
     for c in chunks:
         size = sum(len(str(m.get("content") or "")) for m in c)
-        # one oversized message is allowed through alone; otherwise stay bounded
-        assert size <= 24000 or len(c) == 1
+        # no single message here is oversized, so every chunk must be bounded;
+        # the len(c) == 1 escape belongs to the one-enormous-message test
+        assert size <= 24000, (len(c), size)
 
 
 def test_one_enormous_message_still_gets_its_own_chunk():
