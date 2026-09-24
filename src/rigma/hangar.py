@@ -60,6 +60,39 @@ def custom_dir() -> Path:
     return rigma_home() / "custom" / "models"
 
 
+# Windows reserves these as DEVICE names with any extension: `CON.json` is the
+# console, not a file, and `NUL.json` swallows writes. AUDIT F07-1.
+_RESERVED_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)])
+# _slugify only ever emits this alphabet, so anything else is not a slug we
+# wrote. Checked with fullmatch, which is what makes the join below safe.
+_SLUG_OK = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def custom_spec_path(slug: str) -> Path:
+    """`custom_dir()/<slug>.json`, confined to `custom_dir()`.
+
+    AUDIT F07-1: the slug arrives from an HTTP route (and from the registry),
+    and the read/delete paths joined it straight onto custom_dir(). A slug of
+    `..\\..\\x` therefore READ — and in delete_model UNLINKED — a `.json`
+    outside the models directory. Confinement is enforced twice: the alphabet
+    (no separators, no colon, no NUL) and a resolve-and-contain check.
+    """
+    s = str(slug or "")
+    if (not _SLUG_OK.fullmatch(s) or s in (".", "..")
+            or s.lower() in _RESERVED_NAMES):
+        raise HangarError(f"invalid model slug: {slug!r}")
+    p = custom_dir() / f"{s}.json"
+    try:
+        if not p.resolve().is_relative_to(custom_dir().resolve()):
+            raise HangarError(f"invalid model slug: {slug!r}")
+    except OSError as e:
+        raise HangarError(f"invalid model slug: {slug!r}") from e
+    return p
+
+
 def _slugify(name: str) -> str:
     s = re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-.")
     return s or "custom-model"
@@ -246,9 +279,10 @@ def template_override(slug: str) -> bool:
 def _write_spec(spec: ModelSpec) -> None:
     d = custom_dir()
     d.mkdir(parents=True, exist_ok=True)
-    tmp = d / f"{spec.slug}.json.tmp"
+    p = custom_spec_path(spec.slug)   # AUDIT F07-1: same confinement as the readers
+    tmp = p.with_suffix(".json.tmp")
     tmp.write_text(spec.model_dump_json(indent=1), encoding="utf-8")
-    os.replace(tmp, d / f"{spec.slug}.json")
+    os.replace(tmp, p)
 
 
 # Repetition control every model gets, on top of whatever sampling it declares.
@@ -597,7 +631,7 @@ def rename_model(slug: str, new_slug: str) -> ModelSpec:
                 os.replace(tmp, calib)
         except (OSError, ValueError):
             pass          # a lost calibration row costs one re-tune, not data
-    (custom_dir() / f"{slug}.json").unlink(missing_ok=True)
+    custom_spec_path(slug).unlink(missing_ok=True)   # AUDIT F07-1: confined
     return renamed
 
 
@@ -621,7 +655,7 @@ def file_has_mtp(gguf: GgufFile) -> bool | None:
 
 
 def _load_custom(slug: str) -> ModelSpec | None:
-    f = custom_dir() / f"{slug}.json"
+    f = custom_spec_path(slug)   # AUDIT F07-1: confined, not a raw join
     if not f.is_file():
         return None
     return ModelSpec.model_validate_json(f.read_text(encoding="utf-8"))
@@ -706,7 +740,7 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
     try:
         _move(src, dest)
     except OSError:
-        (custom_dir() / f"{slug}.json").unlink(missing_ok=True)
+        custom_spec_path(slug).unlink(missing_ok=True)   # AUDIT F07-1: confined
         raise
     return spec
 
@@ -892,7 +926,7 @@ def delete_model(slug: str, registry=None) -> None:
         path = models_dir() / spec.mmproj.file
         path.unlink(missing_ok=True)
         _discard_partial(path)
-    (custom_dir() / f"{slug}.json").unlink(missing_ok=True)
+    custom_spec_path(slug).unlink(missing_ok=True)   # AUDIT F07-1: confined
 
 
 def set_launch_defaults(slug: str, registry=None, **fields) -> ModelSpec:
