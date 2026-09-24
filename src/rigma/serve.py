@@ -2077,7 +2077,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # what read_file has already sent this turn, so a model
                     # that fires two spellings of one filename in parallel is
                     # not charged twice for the same content (2026-08-21)
-                    "_reads": {}}
+                    "_reads": {},
+                    # UIUX-22: grounded sources, collected by the RAG tool and
+                    # read back after each round so the UI can show WHICH of the
+                    # user's files an answer came from. On the context, not the
+                    # transcript: it is display state, so it must not reach the
+                    # model or survive the turn.
+                    "_citations": []}
             # HOW MUCH of the permitted set goes on the wire.
             #
             # A Run advertised all 32 tools = 16,490 chars (~4,100 tok), 14.6%
@@ -2472,6 +2478,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # checkpoint is forced here and the partial stays in the session,
         # flagged, instead of the reply ceasing to exist.
         try:
+            # UIUX-22: how many grounded sources have already been sent to the UI
+            # this turn, so each round emits only what it added.
+            _cites_sent = 0
             for _round in range(max_rounds):
                 # WHERE A NATIVE TURN STOPS. An external backend's stop kills its
                 # process and lands immediately; here the only safe boundary is
@@ -2862,6 +2871,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                                 "image_url": {"url": u}})
                             msgs.append({"role": "user", "content": content})
                             round_imgs = True
+                    # UIUX-22: the grounded sources this round produced, emitted
+                    # ONCE per round rather than per tool call — several
+                    # `search_my_documents` calls in one round are one set of
+                    # sources to the reader, and a per-call event would render the
+                    # same chip list three times. `_citations` is a list on the
+                    # context, so this is the tail added since the last emit.
+                    _cites = tctx.get("_citations") or []
+                    if len(_cites) > _cites_sent:
+                        yield _sse({"sources": _cites[_cites_sent:]},
+                                   event="citations")
+                        _cites_sent = len(_cites)
                     if one_action:
                         if round_imgs:
                             # the images were appended for the NEXT round's request —

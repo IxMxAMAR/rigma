@@ -1244,12 +1244,60 @@ def _search_docs(args, ctx):
     if not isinstance(a, dict):
         return "documents unavailable."
     cites = a.get("citations") or []
+    _record_citations(ctx, cites)
     out = a.get("answer", "") or "(no answer)"
     if cites:
         out += "\n\nsources: " + ", ".join(
             c.get("source", "") if isinstance(c, dict) else str(c)
             for c in cites[:5])
     return out
+
+
+def _record_citations(ctx, cites) -> None:
+    """Hand this turn's grounded sources to the SERVER, for the UI to show.
+
+    UIUX-22/F11-12 deleted the `citations` half of the streaming pipeline because
+    nothing produced it: the sidecar returns `citations` on every `/ask`, and the
+    only consumer was this tool folding them into the MODEL's plain text as a
+    "sources: …" line. So the sources reached the model and never reached the
+    person reading the answer — which is backwards for the one feature whose whole
+    value is "which of my files said this".
+
+    The list is put on the tool context, which the turn loop owns and reads after
+    the round; nothing here touches the transcript or the model's view, so a
+    change to the display path cannot change an answer. Absent or malformed
+    entries are skipped rather than rendered as empty chips.
+    """
+    if not isinstance(ctx, dict) or not cites:
+        return
+    # `setdefault` is NOT enough here: it only fills an ABSENT key, so a context
+    # that carries an explicit `"_citations": None` (a narrowed ctx built by
+    # `{**tctx, ...}`, a caller from an older version) kept the None and this
+    # raised TypeError inside a tool. Found by its own test.
+    got = ctx.get("_citations")
+    if not isinstance(got, list):
+        got = ctx["_citations"] = []
+    for c in cites:
+        if isinstance(c, dict):
+            src = str(c.get("source") or "").strip()
+            text = str(c.get("text") or c.get("snippet") or "").strip()
+            page = c.get("page")
+        elif isinstance(c, str):
+            src, text, page = c.strip(), "", None
+        else:
+            # `None`, a number, a list: `str()` would turn it into a plausible
+            # fake filename ("None", "7") and the UI would render a source that
+            # does not exist. A citation we cannot name is not a citation.
+            continue
+        if not src:
+            continue
+        row = {"source": src, "snippet": text[:400]}
+        if isinstance(page, int) and page > 0:
+            row["page"] = page
+        if row not in got:
+            got.append(row)
+        if len(got) >= 40:          # a display list, not a corpus
+            break
 
 
 # ---- autonomous-run tools (only offered inside a Run) -----------------------

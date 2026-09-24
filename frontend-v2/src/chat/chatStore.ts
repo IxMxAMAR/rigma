@@ -21,6 +21,14 @@ export interface Chip {
   state: "running" | "done";
 }
 
+/** One grounded passage's origin. `snippet` is a display excerpt, clipped
+ *  server-side; it is never fed back to the model. */
+export interface Source {
+  source: string;
+  snippet?: string;
+  page?: number;
+}
+
 export interface StreamingTurn {
   text: string;
   thinking: string;
@@ -36,6 +44,11 @@ export interface StreamingTurn {
   /** Server-authored status lines for this turn. They used to be dropped here,
    *  including the one that explains an external backend is driving. */
   notices: string[];
+  /** UIUX-22: which of the user's own documents a grounded answer came from.
+   *  The sidecar has always returned these and the tool always folded them into
+   *  the MODEL's text, so the sources reached the model and never the reader —
+   *  backwards for the one feature whose value is "which file said this". */
+  sources: Source[];
 }
 
 /** Marks a reply the user cut short, so the transcript never reads as if the
@@ -114,6 +127,7 @@ export const emptyTurn = (): StreamingTurn => ({
   harness: "",
   harnessLabel: "",
   notices: [],
+  sources: [],
 });
 
 /** Pure: fold one SSE event into the streaming turn. Returns a NEW object —
@@ -165,6 +179,27 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
     // (Transcript renders harness, macro, notices, thinking, chips, text,
     // error). The half was removed rather than left looking like a pipeline
     // that already handles citations; re-adding it needs a producer first.
+    // UIUX-22: grounded sources for this turn. The server emits only what each
+    // round ADDED, so these append — and an entry with no usable `source` is
+    // dropped rather than rendered as an empty chip, because "sourced from
+    // nothing" is worse than saying nothing.
+    case "citations": {
+      const rows = Array.isArray(d.sources) ? d.sources : [];
+      const add: Source[] = [];
+      for (const raw of rows) {
+        if (raw == null || typeof raw !== "object") continue;
+        const r = raw as Record<string, unknown>;
+        const source = String(r.source ?? "").trim();
+        if (!source) continue;
+        const page = Number(r.page);
+        add.push({
+          source,
+          snippet: String(r.snippet ?? ""),
+          ...(Number.isInteger(page) && page > 0 ? { page } : {}),
+        });
+      }
+      return add.length ? { ...turn, sources: [...turn.sources, ...add] } : turn;
+    }
     case "error":
       return { ...turn, error: String(d.message ?? "unknown error") };
     // Which backend owns this turn, named at its start. Its own event name

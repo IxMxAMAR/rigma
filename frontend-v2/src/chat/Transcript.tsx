@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../lib/api";
 import Markdown from "./Markdown";
 import {
-  selectStreaming, useChat, type Chip, type StreamingTurn,
+  selectStreaming, useChat, type Chip, type Source, type StreamingTurn,
 } from "./chatStore";
 import { formatArgs, previewArgs } from "./toolChip";
 
@@ -262,6 +262,7 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         </div>
       )}
       {turn.text && <Markdown text={turn.text} />}
+      {turn.sources.length > 0 && <Sources rows={turn.sources} />}
       {turn.error && (
         <div className="rounded-md bg-red/10 text-red px-3 py-2 text-[13px]">
           {turn.error}
@@ -277,6 +278,47 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         />
       )}
     </div>
+  );
+}
+
+// UIUX-22: which of the user's own documents a grounded answer came from.
+//
+// This is the whole value of grounding a private corpus — "which file said
+// this?" — and it was the one thing the reader could not get: the sidecar
+// returned citations on every /ask, the tool folded them into the MODEL's text as
+// a "sources: …" line, and the streaming pipeline had no citations branch at all
+// (deleted by F11-12 for want of a producer). The model could see the sources;
+// the person deciding whether to trust the answer could not.
+//
+// A disclosure rather than a chip list, because a passage excerpt is long and
+// most turns have several — the reader who wants to check gets the snippet, and
+// the reader who does not is not made to scroll past it.
+function Sources({ rows }: { rows: Source[] }) {
+  return (
+    <details className="rounded-md bg-surface/60 open:bg-surface">
+      <summary className="flex items-center gap-2 px-3 py-1.5 cursor-pointer list-none font-mono text-[12px]">
+        <span className="text-moss" aria-hidden="true">◆</span>
+        <span className="font-semibold text-primary">
+          {rows.length === 1 ? "1 source" : `${rows.length} sources`}
+        </span>
+        <span className="text-muted">from your documents</span>
+      </summary>
+      <ul className="px-3 pb-2 pt-1 flex flex-col gap-1.5">
+        {rows.map((s, i) => (
+          <li key={`${s.source}-${s.page ?? ""}-${i}`} className="min-w-0">
+            <span className="font-mono text-[12px] text-secondary break-all">
+              {s.source}
+              {s.page != null && <span className="text-muted"> p.{s.page}</span>}
+            </span>
+            {s.snippet && (
+              <p className="text-[12px] text-muted leading-snug break-words">
+                {s.snippet}
+              </p>
+            )}
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
