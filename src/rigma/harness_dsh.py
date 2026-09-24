@@ -195,6 +195,12 @@ class _Run:
     proc: subprocess.Popen | None = None
     hard: bool = False  # timed out: kill, do not ask nicely
     done: bool = False
+    # Whether the TREE (not just the runner) is known to be gone. `kill_tree`
+    # cannot always reach the Node grandchild — `taskkill /T` is the only thing
+    # that does, and it can be refused — and `proc.kill()` still ends the turn
+    # either way, so without this the timeout message asserts a kill that may
+    # not have happened while the agent keeps holding VRAM.
+    tree_killed: bool | None = None
     stderr: deque = field(default_factory=lambda: deque(maxlen=400))
     lines: queue.Queue = field(default_factory=queue.Queue)
     hstate: dict | None = None          # the backend-owned handle, in and out
@@ -281,12 +287,24 @@ def _read_events(state: _Run, timeout: float) -> Iterator[TurnEvent]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             state.hard = True
+            # Killed HERE, not left to the caller's cleanup, because the outcome
+            # decides what this message may claim. `kill_tree` cannot always
+            # reach the Node grandchild — `taskkill /T` is the only thing that
+            # does, and it can be refused — while `proc.kill()` still ends the
+            # turn either way. Reporting "was killed" without asking left the
+            # agent running against the model server with VRAM held and nothing
+            # in the transcript to say so.
+            _stop(state)
+            if state.tree_killed:
+                how = "and was killed"
+            else:
+                how = ("— and the process tree could NOT be confirmed dead, so "
+                       "the DSH agent and any subagents it started may STILL BE "
+                       "RUNNING and holding the model server")
             yield TurnEvent(
                 kind="error",
-                text=(
-                    f"DSH turn timed out after {timeout:g}s and was killed. "
-                    f"stderr tail: {_tail(state)}"
-                ),
+                text=(f"DSH turn timed out after {timeout:g}s {how}. "
+                      f"stderr tail: {_tail(state)}"),
             )
             return
         try:
@@ -360,8 +378,16 @@ def _stop(state: _Run) -> None:
                 # GRANDCHILD. `proc.kill()` reaches only the runner, whose
                 # `finally: live.close()` then never runs — so the agent (and
                 # every subagent it spawned) keeps the model server busy and
-                # holds VRAM after Rigma says it killed the turn (09-1).
-                _harness.kill_tree(proc)
+                # holds VRAM after Rigma says it killed the turn (09-1). The
+                # OUTCOME is recorded, not assumed: when taskkill is refused the
+                # grandchild is still out there and the message must not claim
+                # otherwise.
+                state.tree_killed = _harness.kill_tree(proc)
+            else:
+                # Nothing was running to kill, so the tree is gone by definition.
+                # Recorded as True rather than left None: `None` has to keep
+                # meaning "nobody could tell", which is a different sentence.
+                state.tree_killed = True
         elif proc.poll() is None:
             # Not a kill: the runner's own `finally` closes the harness, and that
             # is what reaps the Node child. Terminating first would orphan it.

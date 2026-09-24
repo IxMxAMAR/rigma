@@ -352,8 +352,8 @@ def resolve(name: str | None, *, port: int | None = None) -> Harness:
 _ADAPTERS = {DSH: "harness_dsh", MCODE: "harness_mcode"}
 
 
-def kill_tree(proc) -> None:
-    """Kill a backend process AND everything it started.
+def kill_tree(proc) -> bool:
+    """Kill a backend process AND everything it started. True when it worked.
 
     An adapter is handed a `.cmd` shim on Windows, so the process Rigma holds is
     a SHELL whose real work is a grandchild. Killing only the shell leaves the
@@ -364,17 +364,50 @@ def kill_tree(proc) -> None:
 
     Killing the tree is also what stops an agent's SUBAGENTS. The arm spawns
     child agents of its own, and a stop that leaves them running is not a stop.
+
+    Returns whether the TREE is known to be gone, because the failure is
+    otherwise invisible: `proc.kill()` below still takes the direct child, so
+    the turn ends normally while the grandchild keeps running against the model
+    server and holding VRAM. A caller that reports "was killed" without asking
+    is reporting something it did not do.
+
+    Delegates the kill to `tools._kill_tree`, which already solves this properly
+    (AUDIT F35): it polls the process rather than trusting taskkill's exit code —
+    which is 0 even when the tree walk misses a re-parented grandchild — and it
+    uses `killpg` on POSIX instead of reaching only the direct child. This
+    function adds the one thing a caller needs and that helper does not report:
+    whether the kill was attempted on Windows at all, and whether it succeeded.
     """
+    attempted = False
+    ok = False
     if os.name == "nt":
+        # `tools._kill_tree` discards taskkill's exit code on purpose (it is not
+        # a signal), but it is still the only evidence that the tree walk ran:
+        # when taskkill itself is refused, a confirmed-dead RUNNER says nothing
+        # about the grandchild.
+        attempted = True
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=20)
+            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                  capture_output=True, timeout=20)
+            ok = getattr(done, "returncode", 1) == 0
         except (OSError, subprocess.TimeoutExpired):
-            pass                    # fall through: proc.kill still gets the shell
+            ok = False
     try:
-        proc.kill()
-    except OSError:
-        pass
+        from . import tools as _tools
+        _tools._kill_tree(int(getattr(proc, "pid", 0) or 0), proc)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    if not attempted:
+        # POSIX: `killpg` is a real tree kill, so "the runner is gone" is the
+        # whole answer rather than a guess about a grandchild.
+        try:
+            return proc.poll() is not None
+        except Exception:
+            return False
+    return ok
 
 
 def adapter(name: str):
