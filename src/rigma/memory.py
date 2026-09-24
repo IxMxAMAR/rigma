@@ -33,6 +33,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -124,6 +125,90 @@ def mine_events(actions: list[dict]) -> list[dict]:
 
 # --- the store ---------------------------------------------------------------
 
+# Cross-PROCESS lock. The in-process RLock stops two threads losing each
+# other's writes; it does nothing for two Rigma processes (the CLI and the
+# server, or two servers) opening the same JSONL. This is an OS advisory lock
+# on a sidecar file held across the whole read-modify-write.
+#
+# A sidecar, not the store itself: _write_all replaces the store by rename, so
+# a lock on the store's inode would be dropped by the very write it guards.
+# Locks conflict across independent handles (msvcrt.locking / fcntl.flock), so
+# two handles in ONE process — what the tests can create without spawning a
+# subprocess — prove the primitive.
+_FILE_LOCK_TIMEOUT = 10.0
+
+
+class _FileLock:
+    """Advisory exclusive lock over one byte of a lock file.
+
+    acquire() is non-blocking per attempt and polls until `timeout`, returning
+    False rather than raising: memory is never load-bearing, so a contended
+    store degrades (the caller proceeds and logs) instead of hanging a run.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._fd: int | None = None
+
+    def _take(self, fd: int) -> None:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _drop(self, fd: int) -> None:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+    def acquire(self, timeout: float = _FILE_LOCK_TIMEOUT,
+                poll: float = 0.05) -> bool:
+        if self._fd is not None:
+            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT
+                     | getattr(os, "O_BINARY", 0), 0o600)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                self._take(fd)
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return False
+                time.sleep(poll)
+                continue
+            self._fd = fd
+            return True
+
+    def release(self) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        self._drop(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def __enter__(self) -> "_FileLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
 class MemoryStore:
     """Append-only JSONL. One memory per line."""
 
@@ -135,6 +220,38 @@ class MemoryStore:
         # writers exist: serve.py dispatches scoring through to_thread into
         # tools.py, and asyncio.ensure_future runs add_consolidated alongside.
         self._lock = threading.RLock()
+        # AUDIT 10-1r: the same read-modify-write is also reachable from a
+        # second PROCESS, which the RLock cannot see. Held for the whole
+        # transaction, and re-entrant within one thread (add_consolidated holds
+        # it while calling add) via the depth counter.
+        self.lock_path = self.path.with_name(f"{self.path.name}.lock")
+        self._flock = _FileLock(self.lock_path)
+        self._flock_depth = 0
+
+    def _xlock(self):
+        """Both locks, for the duration of one read-modify-write.
+
+        RLock first (cheap, in-process), then the file lock only at the
+        outermost depth — a nested acquire from the same thread must not open a
+        second descriptor, which the OS would (correctly) see as a conflict and
+        block against ourselves.
+        """
+        @contextmanager
+        def _held():
+            with self._lock:
+                if self._flock_depth == 0:
+                    if not self._flock.acquire():
+                        log.warning(
+                            "memory: could not take the cross-process lock on "
+                            "%s — proceeding unsynchronised", self.lock_path)
+                self._flock_depth += 1
+                try:
+                    yield
+                finally:
+                    self._flock_depth -= 1
+                    if self._flock_depth == 0:
+                        self._flock.release()
+        return _held()
 
     def all(self) -> list[dict]:
         """Every memory. A corrupt line is skipped, never raised — a run must
@@ -163,7 +280,7 @@ class MemoryStore:
         # The temp name is unique per write: the old fixed memories.tmp let two
         # concurrent writers replace/delete each other's file mid-write
         # (PermissionError WinError 32) and lose one of the writes.
-        with self._lock:
+        with self._xlock():
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_name(
                 f"{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
@@ -196,8 +313,9 @@ class MemoryStore:
                 f"Distil it into an imperative first. Got: {text[:80]!r}")
         # Held across the read AND the write: two threads that both read the
         # file and then both write it back lose one add entirely. A plain
-        # interleaving, single event loop or not.
-        with self._lock:
+        # interleaving, single event loop or not. _xlock also takes the
+        # cross-process file lock (AUDIT 10-1r).
+        with self._xlock():
             rows = self.all()
             for r in rows:
                 if r.get("kind") == kind and r.get("text") == text:
@@ -519,8 +637,9 @@ def score_memories(store: MemoryStore, ids: list[str], delta: int,
     try:
         # lock across the whole read-modify-write: scoring read the file, then
         # wrote the snapshot back, so a +1 committed while add_consolidated
-        # awaited the conflict gate was silently clobbered
-        with store._lock:
+        # awaited the conflict gate was silently clobbered. _xlock adds the
+        # cross-process file lock (AUDIT 10-1r).
+        with store._xlock():
             rows = store.all()
             hit = False
             for r in rows:
@@ -566,7 +685,7 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
     text = clean_rule(text) if kind == "pitfall" else str(text or "").strip()
     if not text:
         return None
-    with store._lock:
+    with store._xlock():
         rows = store.all()
         for r in rows:                  # exact text: reinforce, no LLM needed
             if r.get("kind") == kind and r.get("text") == text:
@@ -607,7 +726,7 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
         # draft (the worst possible trade), so verified rules are DEMOTED to
         # draft rather than retired: still retrievable, must re-earn their
         # status. Only drafts die outright.
-        with store._lock:
+        with store._xlock():
             rows = store.all()
             for r in rows:
                 if r.get("id") != best.get("id"):
@@ -624,7 +743,7 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
             store._write_all(rows)
         return store.add(kind=kind, text=text, born_run=run_id)
     if is_duplicate:
-        with store._lock:
+        with store._xlock():
             rows = store.all()
             for r in rows:
                 if r.get("id") != best.get("id"):
