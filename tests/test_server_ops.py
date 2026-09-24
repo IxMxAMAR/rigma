@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from rigma import server_ops, state
-from rigma.models import (CachePolicy, CpuInfo, GgufFile, GpuInfo,
-                          HardwareProfile, ModelSpec)
+from rigma import bench, server_ops, state
+from rigma.models import (CachePolicy, ComboFlags, CpuInfo, GgufFile, GpuInfo,
+                          HardwareProfile, ModelSpec, RunPlan)
 from rigma.registry import Registry
 
 
@@ -348,3 +348,79 @@ def test_the_same_model_with_no_change_requested_is_still_refused(tmp_path,
                       ui_pid=os.getpid(), backend="vulkan", ctx=4096)
     with pytest.raises(RuntimeError, match="already running"):
         server_ops.perform_switch("dual", registry=reg, profile=profile)
+
+
+def _measured_world(tmp_path):
+    reg, profile = _fake_world(tmp_path)
+    gguf = reg.models["small-model"].ggufs[0]
+    rp = RunPlan(model_slug="small-model", gguf=gguf, backend="vulkan",
+                 flags=ComboFlags(ctx=8192), origin="calculator")
+    return rp
+
+
+def test_a_calibration_row_with_a_non_integer_placement_is_ignored(
+        tmp_path, monkeypatch):
+    """AUDIT 06R3-1. `_measured_placement` returned raw values straight out of
+    the user-editable calibration.json, and the caller merged them with
+    `ComboFlags.model_copy(update=...)` — which by design does not validate.
+    A string `n_cpu_moe` then reached RunPlan.server_args and killed the launch
+    with `TypeError: '>' not supported between instances of 'str' and 'int'`,
+    which is the same bypass 06-4 fixed in resolve._apply_calibration."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    rp = _measured_world(tmp_path)
+    bench.save_calibration("small-model:Q4:vulkan", {"tg_tps": 40.0},
+                           flags={"ngl": "not-a-number", "n_cpu_moe": "eight"},
+                           ctx=8192)
+
+    got = server_ops._measured_placement(rp, 8192)
+
+    assert got == {}, "a non-integer placement was replayed verbatim"
+    # and the launch argv must still be buildable from the result
+    assert "--n-cpu-moe" not in rp.server_args("m", 1)
+
+
+def test_a_numeric_calibration_placement_still_wins(tmp_path, monkeypatch):
+    """The stopwatch beats the arithmetic. Nothing about the type check may
+    weaken that — a real measured placement has to keep being applied."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    rp = _measured_world(tmp_path)
+    bench.save_calibration("small-model:Q4:vulkan", {"tg_tps": 40.0},
+                           flags={"ngl": 12, "n_cpu_moe": 3}, ctx=8192)
+
+    got = server_ops._measured_placement(rp, 8192)
+
+    assert got == {"ngl": 12, "n_cpu_moe": 3}
+    assert "-ngl" in rp.server_args("m", 1)
+
+
+def test_a_float_placement_is_coerced_to_an_integer(tmp_path, monkeypatch):
+    """JSON has no integer type, so a whole-number float is a legitimate way
+    for a row to read back. It must not reach `-ngl 62.7`."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    rp = _measured_world(tmp_path)
+    bench.save_calibration("small-model:Q4:vulkan", {"tg_tps": 40.0},
+                           flags={"ngl": 62.0, "n_cpu_moe": 3.0}, ctx=8192)
+
+    got = server_ops._measured_placement(rp, 8192)
+
+    assert got == {"ngl": 62, "n_cpu_moe": 3}
+    assert all(not isinstance(v, float) for v in got.values())
+
+
+def test_a_fractional_placement_is_not_replayed(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    rp = _measured_world(tmp_path)
+    bench.save_calibration("small-model:Q4:vulkan", {"tg_tps": 40.0},
+                           flags={"ngl": 62.7}, ctx=8192)
+
+    assert server_ops._measured_placement(rp, 8192) == {}
+
+
+def test_a_negative_placement_is_not_replayed(tmp_path, monkeypatch):
+    """`-ngl -4` is not a placement; it is a corrupt row."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    rp = _measured_world(tmp_path)
+    bench.save_calibration("small-model:Q4:vulkan", {"tg_tps": 40.0},
+                           flags={"ngl": -4, "n_cpu_moe": -1}, ctx=8192)
+
+    assert server_ops._measured_placement(rp, 8192) == {}

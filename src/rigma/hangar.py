@@ -1229,12 +1229,22 @@ def _object_size(status: int, headers) -> int:
     """The WHOLE object's length as the server states it, 0 if it does not.
 
     On a 206 or 416 that is content-range's total — content-length there
-    describes the slice, not the file — and on a 200 it is content-length."""
+    describes the slice, not the file — and on a 200 it is content-length.
+
+    AUDIT 06R3-4: a negative value is a malformed header (RFC 7230 says
+    `1*DIGIT`), and it was returned as a real size. `-5` is truthy, so the size
+    gate in `_install_download` fired on every attempt, `have > size` took the
+    "these are not this file's bytes" branch, and each retry discarded the
+    accumulated multi-GB `.part`: a download that can never converge, reported
+    as a transport failure. Clamped to 0, which is the same "not declared" this
+    function already reports for an unparseable header — and what the
+    `or expect_bytes` fallback in `_download_file` assumes.
+    """
     if status in (206, 416):
         m = re.search(r"/\s*(\d+)\s*$", headers.get("content-range") or "")
         return int(m.group(1)) if m else 0
     try:
-        return int(headers.get("content-length") or 0)
+        return max(0, int(headers.get("content-length") or 0))
     except (TypeError, ValueError):
         return 0
 
@@ -1266,8 +1276,23 @@ def _install_download(dest, have: int, size: int, sha256: str | None,
 
     `cancelled` (AUDIT 07-4) is re-checked under `_PULL_LOCK` immediately
     before the os.replace, so a delete that lands while the body is streaming
-    cannot be undone by this rename putting the file back."""
+    cannot be undone by this rename putting the file back.
+
+    AUDIT 06R3-2: with NO declared size AND NO hash there is nothing to check,
+    and the two gates below are both conditional — so whatever arrived was
+    renamed in as a complete multi-GB quant. Nine bytes installed as "done" is
+    worse than a refusal: `list_models` marks the row on_disk and the fit math
+    plans against a zero-byte file. The bytes stay in the `.part`, so the
+    refusal costs a retry, not the transfer.
+    """
     part, note = _resume_files(dest)
+    if not size and not sha256:
+        raise HangarError(
+            f"{dest.name} cannot be verified: the server declared no length "
+            f"and the registry has no size or sha256 for it. Refusing to "
+            f"install {have:,} unverified bytes — the bytes are kept in "
+            f"{part.name}, so pressing Download again resumes rather than "
+            f"restarts.")
     if size and have != size:
         if have > size:
             _discard_partial(dest)

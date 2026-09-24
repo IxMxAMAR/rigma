@@ -164,6 +164,84 @@ def test_a_complete_partial_that_gets_a_416_is_installed_not_refetched(
     assert origin.requests == [f"bytes={2 << 20}-"]   # one request, no refetch
 
 
+class _UndeclaredLength:
+    """A chunked origin: 200 with no content-length and no content-range, so
+    `_object_size` has nothing to report and returns 0."""
+
+    def stream(self, method, url, headers=None, **kw):
+        return _Resp(200, b"TRUNCATED", {})
+
+
+def test_a_negative_content_length_is_read_as_undeclared(tmp_path, monkeypatch):
+    """AUDIT 06R3-4. `int(headers.get("content-length") or 0)` accepted any
+    integer, so a lying `Content-Length: -5` became a real size of -5. It is
+    truthy, so the size gate fired on EVERY attempt, `have > size` took the
+    "these are not this file's bytes" branch, and each retry discarded the
+    accumulated multi-GB .part — a download that can never converge, reported
+    as "download kept dropping"."""
+    assert hangar._object_size(200, {"content-length": "-5"}) == 0
+    assert hangar._object_size(200, {"content-length": "100"}) == 100
+    assert hangar._object_size(200, {"content-length": "junk"}) == 0
+
+    # and a 100-byte partial against such an origin installs instead of being
+    # thrown away
+    dest = tmp_path / "model.gguf"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(b"A" * 100)
+    hangar._claim_partial(dest, "owner/first", "model.gguf")
+    size = hangar._object_size(200, {"content-length": "-5"}) or 100
+    hangar._install_download(dest, 100, size, None)
+    assert dest.read_bytes() == b"A" * 100
+
+
+def test_a_body_with_no_declared_length_is_not_installed_unverified(
+        tmp_path, monkeypatch):
+    """AUDIT 06R3-2. `_install_download`'s size gate is `if size and ...`, so
+    when the origin declares no length AND the registry prices the file at
+    `bytes: 0` (hangar.merge_repo_files builds a new entry as
+    `sizes.get(fname, 0)`), both the size and the identity gate are skipped and
+    whatever arrived is renamed in as a complete multi-GB quant. Nine bytes
+    installed as "done" is worse than a refusal: list_models marks the row
+    on_disk and the fit math plans against a zero-byte file."""
+    monkeypatch.setattr("httpx.stream", _UndeclaredLength().stream)
+    dest = tmp_path / "model.gguf"
+
+    with pytest.raises(HangarError, match="declar"):
+        hangar._download_file("owner/first", "model.gguf", dest,
+                              lambda b: None, expect_bytes=0, sha256=None)
+
+    assert not dest.exists(), "an unverifiable body was installed as complete"
+    part = dest.with_name(dest.name + ".part")
+    assert part.exists() and part.stat().st_size == 9   # progress is kept
+
+
+def test_a_body_with_no_declared_length_still_installs_when_the_size_is_known(
+        tmp_path, monkeypatch):
+    """The registry's own byte count is a legitimate gate — the refusal above
+    must not turn a chunked origin into an undownloadable one."""
+    monkeypatch.setattr("httpx.stream", _UndeclaredLength().stream)
+    dest = tmp_path / "model.gguf"
+
+    n = hangar._download_file("owner/first", "model.gguf", dest,
+                              lambda b: None, expect_bytes=9, sha256=None)
+
+    assert n == 9 and dest.read_bytes() == b"TRUNCATED"
+
+
+def test_a_body_with_no_declared_length_still_installs_when_a_hash_is_known(
+        tmp_path, monkeypatch):
+    """A sha256 is the stronger gate and does not need a length at all."""
+    body = b"TRUNCATED"
+    monkeypatch.setattr("httpx.stream", _UndeclaredLength().stream)
+    dest = tmp_path / "model.gguf"
+
+    n = hangar._download_file("owner/first", "model.gguf", dest,
+                              lambda b: None, expect_bytes=0,
+                              sha256=hashlib.sha256(body).hexdigest())
+
+    assert n == 9 and dest.read_bytes() == body
+
+
 def test_a_body_that_ends_early_is_not_installed_as_the_whole_file(
         tmp_path, monkeypatch, nosleep):
     """A short body that closes cleanly raises nothing. It used to be renamed

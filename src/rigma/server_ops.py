@@ -6,6 +6,7 @@ import platform
 
 import psutil
 
+from .models import CACHE_BYTES
 from .runtime import rigma_home
 
 
@@ -213,6 +214,16 @@ def _measured_placement(rp, ctx: int) -> dict:
     Only on an EXACT context match. Placement measured at 32K says nothing about
     256K — the KV cache is most of what moved — so a near miss falls back to the
     calculator rather than guessing.
+
+    AUDIT 06R3-1: the two values are TYPED here, before they leave. The caller
+    merges them with `ComboFlags.model_copy(update=...)`, which by design does
+    not validate, so a string in the user-editable calibration.json reached
+    `RunPlan.server_args` and killed the launch with `TypeError: '>' not
+    supported between instances of 'str' and 'int'` — the same bypass AUDIT
+    06-4 closed in `resolve._apply_calibration`, in the sibling merge site it
+    did not cover. JSON has no integer type, so a whole-number float is a
+    legitimate way for a row to read back and is coerced; anything else is a
+    corrupt row, and a corrupt row is dropped rather than half-applied.
     """
     try:
         from .bench import load_calibration
@@ -221,7 +232,21 @@ def _measured_placement(rp, ctx: int) -> dict:
         if int(entry.get("ctx") or 0) != int(ctx):
             return {}
         flags = entry.get("flags") or {}
-        return {k: v for k, v in flags.items() if k in ("ngl", "n_cpu_moe")}
+        out = {}
+        for key in ("ngl", "n_cpu_moe"):
+            if key not in flags:
+                continue
+            value = flags[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return {}
+            if isinstance(value, float):
+                if not value.is_integer():
+                    return {}
+                value = int(value)
+            if value < 0:
+                return {}
+            out[key] = value
+        return out
     except Exception:
         return {}          # a missing or corrupt calibration is not an error
 
@@ -304,7 +329,15 @@ def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
     return out
 
 
-KV_CACHE_TYPES = ("f16", "q8_0", "q5_1", "q4_0")
+# AUDIT 06R3-3: this used to be a THIRD, narrower cache-type vocabulary
+# ("f16", "q8_0", "q5_1", "q4_0"). AUDIT 06-3 added bf16/q4_1/q5_0 to
+# models.CACHE_BYTES so the fit math prices them and quant_quality publishes a
+# reference loss figure for each — but every HTTP boundary kept rejecting them
+# with `400 kv must be one of f16, q8_0, q5_1, q4_0`, so the Models-page
+# explorer could not ask for a cache type the UI itself compares. Derived from
+# the one table rather than restated, so the vocabularies cannot drift again.
+# test_phase0_contracts asserts the equality in both directions.
+KV_CACHE_TYPES = tuple(CACHE_BYTES)
 
 
 def vram_snapshot(registry=None) -> dict | None:
