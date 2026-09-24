@@ -79,8 +79,20 @@ from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 
-from .harness import TurnEvent
-from . import harness as _harness
+# The mcode release this adapter was measured against. Every fact in the module
+# docstring — the provider mechanics, the exit codes, the event vocabulary, the
+# `--permission` mapping — came from running THIS build, so the number is a fact
+# about the CODE and belongs next to it, not in a config a user could edit into
+# a lie. `harness.conformance` compares it with what is installed.
+#
+# It is defined BEFORE the `.harness` imports on purpose: `harness.py` builds its
+# BACKENDS table at import time and reads this value through `_verified_of`, so
+# when something imports THIS module first the circular import would otherwise
+# read a half-initialised module and cache "" as "nobody verified this".
+VERIFIED = "0.5.1"
+
+from .harness import TurnEvent          # noqa: E402
+from . import harness as _harness       # noqa: E402
 
 # mcode's own id for a provider Rigma adds. The `custom_provider:` prefix is
 # part of the id it prints, and the model reference has to spell it out.
@@ -96,12 +108,6 @@ _MARKER = "provider.json"
 _SETUP_TIMEOUT = 120.0
 # A version check is a menu line and a health check, not a turn.
 _VERSION_TIMEOUT = 20.0
-# The mcode release this adapter was measured against. Every fact in the module
-# docstring — the provider mechanics, the exit codes, the event vocabulary, the
-# `--permission` mapping — came from running THIS build, so the number is a fact
-# about the CODE and belongs next to it, not in a config a user could edit into
-# a lie. `harness.conformance` compares it with what is installed.
-VERIFIED = "0.5.1"
 # (base_url, model, context, output) -> the provider id confirmed IN THIS
 # PROCESS. The marker file survives a restart and can therefore be wrong about a
 # config that changed underneath it; this cannot, so the ask happens once per
