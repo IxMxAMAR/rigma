@@ -1,4 +1,4 @@
-"""R3: the anchoring guard must not be a denial-of-service on long text.
+r"""R3: the anchoring guard must not be a denial-of-service on long text.
 
 `looks_like_raw_trace` runs on every stored rule and on every edit, and the
 `_FILENAME` pattern used to be `\S+\.(?:ext)`. `\S+` can match the dots the
@@ -11,6 +11,9 @@ length is not something the caller controls.
 The fix is `[^\s.]+`, which cannot swallow the literal dot and therefore has
 only one way to match. These tests pin BOTH halves: the timing, and that the
 guard still recognises exactly the filenames it recognised before.
+
+Raw string, because the patterns this file quotes are regexes: `\S` and `\s` in a
+plain docstring are invalid escape sequences and Python says so on every import.
 """
 import time
 
