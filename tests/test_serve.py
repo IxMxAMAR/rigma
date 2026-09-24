@@ -52,6 +52,23 @@ def test_proxy_get_and_streaming_post(upstream):
     assert raw.decode() in r.text and "[DONE]" in r.text, r.text
 
 
+def test_v1_passthrough_engine_down_is_openai_502(tmp_path, monkeypatch):
+    """01-4: a dead engine must not surface as Starlette's plain-text 500 —
+    every OpenAI client parses the body as JSON and then reports a decode
+    error, telling the user their client is broken instead of the engine."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    client = TestClient(build_app(upstream_port=1))   # nothing listens
+    r = client.post("/v1/chat/completions",
+                    json={"model": "x", "messages": []})
+    assert r.status_code == 502, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.json()["error"]["type"] == "upstream_error"
+    assert r.json()["error"]["message"]
+    r = client.get("/v1/models")
+    assert r.status_code == 502, r.text
+    assert r.json()["error"]["type"] == "upstream_error"
+
+
 def test_root_serves_html(upstream):
     client = TestClient(build_app(upstream_port=upstream))
     r = client.get("/")

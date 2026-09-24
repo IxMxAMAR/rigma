@@ -1,8 +1,10 @@
+import asyncio
 import json
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -99,6 +101,61 @@ def test_chat_turn_empty_session_400(tmp_path, monkeypatch):
     s = c.post("/api/sessions", json={}).json()
     assert c.post(f"/api/sessions/{s['id']}/chat",
                   json={"message": None}).status_code == 400
+
+
+def test_concurrent_chat_second_request_is_queued(tmp_path, monkeypatch):
+    """01-2: the guard and the claim must be atomic on the event loop.
+
+    Starlette runs a StreamingResponse's body iterator in a SEPARATE task when
+    the ASGI spec_version is below 2.4 (uvicorn advertises 2.3), so the old
+    `_streaming.add` inside `_drain` let a second POST pass the
+    `sid in _streaming` test before the first turn had even started. Hold the
+    first turn's pre-drain save open, then send the second request: it must see
+    the claim and be queued, never run a turn of its own.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    app = build_app(upstream_port=1, default_prompt="")
+    sid = sessions.create("race")["id"]
+
+    entered, release = threading.Event(), threading.Event()
+    real_save = sessions.save
+
+    def blocking_save(session, **kw):
+        if not entered.is_set() and any(
+                m.get("content") == "first"
+                for m in session.get("messages", [])):
+            entered.set()
+            release.wait(10)          # worker thread: the loop stays free
+        return real_save(session, **kw)
+
+    monkeypatch.setattr(sessions, "save", blocking_save)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://127.0.0.1:11500") as c:
+            async def one(tag):
+                r = await c.post(f"/api/sessions/{sid}/chat",
+                                 json={"message": tag})
+                return r.text
+
+            first = asyncio.ensure_future(one("first"))
+            for _ in range(500):      # first has passed the guard, is saving
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered.is_set(), "first turn never reached its save"
+            second = await asyncio.wait_for(one("second"), timeout=5)
+            release.set()
+            await asyncio.wait_for(first, timeout=10)
+            return second
+
+    try:
+        second = asyncio.run(scenario())
+    finally:
+        release.set()
+    assert "queued behind the running reply" in second, second
 
 
 class _MidStreamCrash(BaseHTTPRequestHandler):
@@ -276,6 +333,86 @@ def test_update_rejects_bad_params(client):
     assert ok.json()["params"] == {"temperature": 0.7}
     assert ok.json()["preset_id"] == "usecase:general"
     assert ok.json()["notes"] == "N"
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("title", 5),
+    ("system_prompt", 5),
+    ("notes", 5),
+    ("digest", 5),
+    ("messages", {"role": "user"}),
+    ("params", [1, 2]),
+    ("archive", "not-a-list"),
+    ("pending_nudges", "not-a-list"),
+    ("trigger_state", "not-a-dict"),
+])
+def test_update_rejects_mistyped_fields(client, field, bad):
+    """01-3: a mistyped field used to be stored and the reader 500ed later —
+    export_markdown joined a null into a str-only list, build_messages joined a
+    numeric system_prompt into the system block, and validate_params called
+    `.items()` on a list."""
+    s = client.post("/api/sessions", json={}).json()
+    r = client.post(f"/api/sessions/{s['id']}", json={field: bad})
+    assert r.status_code == 400, (field, r.status_code, r.text)
+    assert field in r.json()["error"]
+
+
+def test_create_session_rejects_mistyped_fields(client):
+    r = client.post("/api/sessions", json={"title": 5})
+    assert r.status_code == 400 and "title" in r.json()["error"]
+    r = client.post("/api/sessions", json={"system_prompt": {"x": 1}})
+    assert r.status_code == 400 and "system_prompt" in r.json()["error"]
+    # nothing was created behind the refusal
+    assert client.get("/api/sessions").json() == []
+
+
+def test_update_accepts_well_typed_values(client):
+    s = client.post("/api/sessions", json={"title": "ok"}).json()
+    body = {"title": "renamed", "system_prompt": "be brief", "notes": "N",
+            "digest": "D", "messages": [{"role": "user", "content": "hi"}],
+            "params": {"temperature": 0.5}}
+    r = client.post(f"/api/sessions/{s['id']}", json=body)
+    assert r.status_code == 200, r.text
+    out = r.json()
+    for k, v in body.items():
+        assert out[k] == v, k
+
+
+def test_update_coerces_null_to_empty(client):
+    """A null box is the same as an omitted one, not a 400 and not a stored
+    null that every reader then trips over."""
+    s = client.post("/api/sessions", json={}).json()
+    r = client.post(f"/api/sessions/{s['id']}",
+                    json={"system_prompt": None, "messages": None,
+                          "params": None, "title": None})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["system_prompt"] == "" and out["messages"] == []
+    assert out["params"] == {} and out["title"] == ""
+
+
+def test_export_survives_null_and_nonstring_message_content(client):
+    s = client.post("/api/sessions", json={}).json()
+    r = client.post(f"/api/sessions/{s['id']}", json={"messages": [
+        {"role": "user", "content": None},
+        {"role": "assistant", "content": {"weird": 1}},
+        {"role": "user", "content": 5}]})
+    assert r.status_code == 200, r.text
+    md = client.get(f"/api/sessions/{s['id']}/export?fmt=md")
+    assert md.status_code == 200, md.text
+
+
+def test_export_survives_values_the_write_guard_now_refuses(client):
+    """Sessions written before the guard existed are still on disk; the export
+    reader must coerce rather than raise on them."""
+    s = client.post("/api/sessions", json={}).json()
+    sess = sessions.load(s["id"])
+    sess["title"] = 5
+    sess["system_prompt"] = 7
+    sess["notes"] = {"x": 1}
+    sessions.save(sess)
+    r = client.get(f"/api/sessions/{s['id']}/export?fmt=md")
+    assert r.status_code == 200, r.text
 
 
 def test_chat_turn_continue_extends_trailing_assistant(tmp_path, monkeypatch,
