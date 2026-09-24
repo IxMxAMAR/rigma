@@ -102,14 +102,33 @@ def asks(steps: list[dict]) -> list[str]:
 
 # --- safety ---------------------------------------------------------------
 
+_BOOL_WORDS = {"1": True, "true": True, "yes": True, "on": True,
+               "0": False, "false": False, "no": False, "off": False, "": False}
+
+
+def _as_bool(value) -> bool | None:
+    """Explicit boolean coercion, or None for a value that is neither.
+
+    `bool("false")` is True, so a method-builder model that quoted its booleans
+    turned code execution ON and left it on for the chat. Only real booleans and
+    the obvious words are accepted (09-6)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return _BOOL_WORDS.get(value.strip().lower())
+    return None
+
+
 def _elevates(step: dict) -> bool:
-    """A settings step that switches `allow_code` or `use_tools` ON. bool(),
-    not `is True`, because run_macro stores bool(st[f]) -- the gate has to read
-    the value the same way the interpreter will write it."""
+    """A settings step that switches `allow_code` or `use_tools` ON. The same
+    coercion run_macro writes with, so the gate and the interpreter agree."""
     st = step.get("set")
     if not isinstance(st, dict):
         return False
-    return any(bool(st[f]) for f in ("use_tools", "allow_code") if f in st)
+    return any(_as_bool(st[f]) is True
+               for f in ("use_tools", "allow_code") if f in st)
 
 
 def is_effectful(steps: list[dict], *, allow_code: bool = True) -> bool:
@@ -146,7 +165,9 @@ def is_effectful(steps: list[dict], *, allow_code: bool = True) -> bool:
                 return True
             st = step.get("set")
             if isinstance(st, dict) and "allow_code" in st:
-                code = bool(st["allow_code"])   # narrowing only, see above
+                narrowed = _as_bool(st["allow_code"])
+                if narrowed is not None:
+                    code = narrowed          # narrowing only, see above
         if kind == "prompt" and step.get("to", "chat") == "chat" and code:
             return True
     return False
@@ -173,12 +194,14 @@ def preview_line(macro: dict, ctx: dict, *, allow_code: bool = True) -> str:
             st = s.get("set") if isinstance(s.get("set"), dict) else {}
             on = [label for f, label in (("allow_code", "code execution"),
                                          ("use_tools", "tools"))
-                  if bool(st.get(f))]
+                  if _as_bool(st.get(f)) is True]
             if on:
                 bits.append(f"with {' and '.join(on)} switched on, and left "
                             "on for this chat afterwards")
             if "allow_code" in st:
-                code = bool(st["allow_code"])
+                narrowed = _as_bool(st["allow_code"])
+                if narrowed is not None:
+                    code = narrowed
         elif kind == "prompt" and s.get("to", "chat") == "chat" and code:
             bits.append("let the model use its tools")
     what = ", ".join(dict.fromkeys(bits)) or "read-only steps"
@@ -280,7 +303,13 @@ async def run_macro(session: dict, method: dict, macro: dict, *,
                                      **sessions.validate_params(st["params"])}
             for f in ("use_tools", "allow_code"):
                 if f in st:
-                    session[f] = bool(st[f])
+                    # Explicit coercion, not bool(): bool("false") is True, which
+                    # wrote the OPPOSITE of the declared value (09-6). An
+                    # uncoercible value leaves the session as it was; validate()
+                    # rejects it at save time.
+                    b = _as_bool(st[f])
+                    if b is not None:
+                        session[f] = b
             results.append("")
             dirty = True
 
