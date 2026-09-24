@@ -282,6 +282,65 @@ def test_a_pull_that_fits_is_not_refused(home, monkeypatch):
     assert hangar._PULLS["s::small.gguf"]["status"] == "done"
 
 
+def test_an_existing_dest_is_checked_before_it_is_reported_done(tmp_path,
+                                                                monkeypatch):
+    """The dest.exists() short-circuit returned before the size gate, so a
+    case-insensitive filesystem serving a case-only twin (or any stale file
+    under the name) was reported downloaded with whatever bytes were there."""
+    origin = _Origin(b"ABCD")
+    monkeypatch.setattr("httpx.stream", origin.stream)
+    dest = tmp_path / "model.gguf"
+    dest.write_bytes(b"XY")                      # wrong size on disk
+    n = hangar._download_file("owner/first", "model.gguf", dest,
+                              lambda b: None, expect_bytes=4)
+    assert n == 4 and dest.read_bytes() == b"ABCD"
+    assert origin.requests == [""]               # refetched, did not trust it
+
+
+def test_an_existing_dest_that_fails_its_hash_is_refetched(tmp_path,
+                                                           monkeypatch):
+    body = b"GOOD"
+    origin = _Origin(body)
+    monkeypatch.setattr("httpx.stream", origin.stream)
+    dest = tmp_path / "model.gguf"
+    dest.write_bytes(b"EVIL")                    # right length, wrong bytes
+    n = hangar._download_file("owner/first", "model.gguf", dest,
+                              lambda b: None,
+                              sha256=hashlib.sha256(body).hexdigest())
+    assert n == 4 and dest.read_bytes() == body
+
+
+def test_an_existing_dest_that_matches_is_still_short_circuited(tmp_path,
+                                                                monkeypatch):
+    """The point of the short-circuit survives: a matching file is not
+    refetched, so this must not touch the network."""
+    body = b"OK"
+    dest = tmp_path / "model.gguf"
+    dest.write_bytes(body)
+
+    def _boom(*a, **k):
+        raise AssertionError("a matching file must not be refetched")
+    monkeypatch.setattr("httpx.stream", _boom)
+    n = hangar._download_file("owner/first", "model.gguf", dest,
+                              lambda b: None, expect_bytes=2,
+                              sha256=hashlib.sha256(body).hexdigest())
+    assert n == 2 and dest.read_bytes() == body
+
+
+def test_a_case_only_twin_is_rejected_by_a_refresh(home):
+    """Two names differing only in case are one file on Windows, so the spec
+    would carry two rows pointing at one file. Refuse and name both."""
+    old = _spec(GgufFile(repo="acme/spicy", file="Model.gguf", bytes=100,
+                         quant="Q4_K_M"))
+    with pytest.raises(HangarError) as ei:
+        hangar.merge_repo_files(old, {
+            "ggufs": [{"file": "Model.gguf", "bytes": 100},
+                      {"file": "model.gguf", "bytes": 100}],
+            "mmproj": None, "split_skipped": 0})
+    msg = str(ei.value)
+    assert "Model.gguf" in msg and "model.gguf" in msg
+
+
 def test_deleting_a_file_takes_its_resume_file_with_it(home, monkeypatch):
     """Nothing reaped a partial: it outlived the model, and glob("*.gguf")
     does not match ".part", so multi-GB of it was invisible in the library."""

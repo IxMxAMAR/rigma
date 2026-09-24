@@ -220,6 +220,21 @@ def test_an_unparseable_candidate_falls_forward_to_the_next(monkeypatch, home):
     assert d["name"] == "web-tune-7b"
 
 
+def test_a_case_only_twin_is_rejected_naming_both_files(monkeypatch, home):
+    """Windows resolves Model-Q4_K_M.gguf and model-q4_k_m.gguf to one file, so
+    the spec would mark both rows downloaded and one delete would unlink the
+    other row's bytes. Refuse the repo and say which two files collided."""
+    tree = [{"path": "Model-Q4_K_M.gguf", "size": 4 * 2**30},
+            {"path": "model-q4_k_m.gguf", "size": 4 * 2**30}]
+    monkeypatch.setattr(hf_browse, "_get_json", lambda p, params=None: tree)
+    monkeypatch.setattr(hf_browse, "_fetch_head",
+                        lambda repo, file, cap: HEADER)
+    with pytest.raises(HangarError) as ei:
+        hf_browse.add_model("x/y")
+    msg = str(ei.value)
+    assert "Model-Q4_K_M.gguf" in msg and "model-q4_k_m.gguf" in msg
+
+
 def test_a_repo_of_only_unparseable_ggufs_still_says_why(monkeypatch, home):
     """The fall-forward must end in the honest "no usable metadata" error, not
     the first candidate's parse message."""

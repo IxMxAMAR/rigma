@@ -278,6 +278,28 @@ def _distinct_quants(files: list[str]) -> list[str]:
     return [q if len(q) <= 30 else f"{q[:16]}...{q[-11:]}" for q in paths]
 
 
+def _reject_case_twins(files: list[str]) -> None:
+    """Refuse a listing with two names that differ only in case.
+
+    AUDIT 07-3: Windows resolves both to one file, so `list_models` marks both
+    rows on_disk, the pull for the second reports success with the first's
+    bytes, and deleting either row unlinks the file the other row points at.
+    Naming both files and refusing is better than silently merging two
+    different quants into one.
+    """
+    seen: dict[str, str] = {}
+    for f in files:
+        key = f.casefold()
+        other = seen.get(key)
+        if other is not None and other != f:
+            raise HangarError(
+                f"the repo lists both {other!r} and {f!r} — on Windows those "
+                "are the same file, so one of them could never be stored. "
+                "Rigma refuses the listing rather than merge two different "
+                "quants into one file.")
+        seen[key] = f
+
+
 def moe_from_probe(f: dict, biggest_bytes: int) -> MoESpec | None:
     """MoE sizing, measured from the tensor table when the table was readable.
 
@@ -614,6 +636,10 @@ def merge_repo_files(spec: ModelSpec, rf: dict, *,
     kept = [f for f in known
             if f not in sizes and (f in on_disk or known[f].repo == "local")]
     files = listed + kept
+    # AUDIT 07-3: a case-only twin is one file on Windows; never build a spec
+    # with two rows pointing at it.
+    _reject_case_twins(files + ([rf["mmproj"]["file"]]
+                                if rf.get("mmproj") else []))
     ggufs = []
     for fname, label in zip(files, _distinct_quants(files)):
         prev = known.get(fname)
@@ -1283,8 +1309,20 @@ def _download_file(repo: str, file: str, dest, report, *,
     import httpx
     _check_model_file_name(file)   # AUDIT 13-4: the name is untrusted
     if dest.exists():
-        report(dest.stat().st_size)
-        return dest.stat().st_size
+        # AUDIT 07-3: the short-circuit used to run BEFORE the size/sha256
+        # gates, so a file already under the name was reported downloaded with
+        # whatever bytes happened to be there. On Windows a case-only twin
+        # (Model-Q4.gguf / model-q4.gguf) is literally the same file, so the
+        # second row reported success with the first row's bytes. Verify what
+        # the registry says this file is; on a mismatch fall through and
+        # refetch, which overwrites it.
+        size = dest.stat().st_size
+        ok = not expect_bytes or size == expect_bytes
+        if ok and sha256:
+            ok = _sha256_of(dest).lower() == sha256.lower()
+        if ok:
+            report(size)
+            return size
     import time
     tok = os.environ.get("HF_TOKEN", "")
     part, _note = _resume_files(dest)
