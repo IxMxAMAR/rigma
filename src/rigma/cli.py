@@ -952,6 +952,39 @@ def _wants_vision(spec) -> bool:
     return getattr(getattr(spec, "launch", None), "vision", None) is not False
 
 
+def _launch_extra(cand, reg: Registry, mmproj_path=None) -> list[str]:
+    """The flags a launch adds on top of the plan's own args.
+
+    AUDIT F15-3: the vision projector and a repaired chat template used to be
+    built inline in the launch loop, so `--dry-run` (which printed only
+    `plan.server_args`) omitted them. `mmproj_path` is the downloaded projector
+    when the caller already has it; the dry-run preview passes nothing and gets
+    the deterministic path `ensure_model` returns.
+    """
+    from . import runtime
+    spec = reg.models.get(cand.model_slug)
+    extra: list[str] = []
+    if spec is not None and spec.mmproj is not None and _wants_vision(spec):
+        extra += ["--mmproj", str(mmproj_path
+                                  or runtime.rigma_home() / "models"
+                                  / spec.mmproj.file)]
+    tmpl = runtime.rigma_home() / "templates" / f"{cand.model_slug}.jinja"
+    if tmpl.is_file():
+        # repaired-template override, same rule as server_ops.switch_model.
+        # Live-verify 2026-07-20 caught the asymmetry: a model whose fixed
+        # template sat in ~/.rigma/templates booted through `up` with its
+        # BROKEN embedded template, because only the switch path looked.
+        extra += ["--chat-template-file", str(tmpl)]
+    return extra
+
+
+def _launch_argv(cand, reg: Registry, port: int, model_label="<model>") -> list[str]:
+    """The exact argv `rigma up` will launch — the single preview/launch source."""
+    from . import runtime
+    return runtime.server_argv("llama-server", cand, model_label, port,
+                               _launch_extra(cand, reg))
+
+
 @app.command()
 def up(use_case: str = typer.Option("general", "--use-case"),
        model: str = typer.Option(None, "--model"),
@@ -1145,7 +1178,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
                f"({rp.origin})")
-    typer.echo("argv: llama-server " + " ".join(rp.server_args("<model>", port - 1)))
+    # AUDIT F15-3: this prints the SAME argv the launch below passes to
+    # launch_server, including --mmproj/--chat-template-file/--slot-save-path.
+    typer.echo("argv: " + " ".join(_launch_argv(rp, reg, port - 1)))
     if dry_run:
         raise typer.Exit(0)
     for needed in (port, port - 1):
@@ -1175,18 +1210,13 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             # projector's memory and hands it to more GPU layers, so attaching
             # it here anyway overcommits the card (and `ensure_model` DOWNLOADS
             # it first). Asked per candidate: a fallback is a different model
-            # with its own opinion.
+            # with its own opinion. AUDIT F15-3: the flag list itself is built by
+            # the shared `_launch_extra`, the same helper the preview uses.
+            mm_path = None
             if (spec_c is not None and spec_c.mmproj is not None
                     and _wants_vision(spec_c)):
                 mm_path = runtime.ensure_model(spec_c.mmproj)
-                extra = ["--mmproj", str(mm_path)]
-            # repaired-template override, same rule as server_ops.switch_model.
-            # Live-verify 2026-07-20 caught the asymmetry: a model whose fixed
-            # template sat in ~/.rigma/templates booted through `up` with its
-            # BROKEN embedded template, because only the switch path looked.
-            tmpl = runtime.rigma_home() / "templates" / f"{cand.model_slug}.jinja"
-            if tmpl.is_file():
-                extra = extra + ["--chat-template-file", str(tmpl)]
+            extra = _launch_extra(cand, reg, mm_path)
             from .bench import auto_calibrate, is_calibrated
             if (ctx is None and not no_calibrate and cand.backend != "cpu"
                     and os.environ.get("RIGMA_AUTO_CALIBRATE", "1") != "0"
