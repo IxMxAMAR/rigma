@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+from pydantic import ValidationError
+
 from .models import (CACHE_BYTES, ComboFlags, GgufFile, HardwareProfile,
                      ModelSpec, RunPlan)
 from .registry import Registry
@@ -98,7 +100,28 @@ def _apply_calibration(plan: RunPlan,
         if reason:
             plan.explain.append(f"calibration override skipped: {reason}")
             return plan
-        plan.flags = plan.flags.model_copy(update=entry["flags"])
+        # AUDIT F06-4: model_copy(update=...) does not validate, so a stored
+        # entry replayed the flash_attn enum, the spec_type whitelist, the
+        # cache-type table and _symmetric_kv straight onto the plan — `-fa
+        # sideways` and `--cache-type-k q3_k_bogus` reached llama.cpp. The
+        # calibration file is user-editable and is treated as untrusted
+        # everywhere else (server_ops: a corrupt file "is not an error"), so
+        # validate the merge and keep the fresh plan when it fails.
+        # All-or-nothing on purpose: a half-applied placement is not a
+        # placement anyone measured.
+        try:
+            merged = ComboFlags.model_validate(
+                {**plan.flags.model_dump(), **entry["flags"]})
+        except ValidationError as exc:
+            plan.explain.append(
+                f"calibration override ignored: {exc.error_count()} invalid "
+                f"field(s)")
+            return plan
+        except TypeError:
+            plan.explain.append("calibration override ignored: flags is not an "
+                                "object")
+            return plan
+        plan.flags = merged
         plan.origin += "+calibrated"
         plan.explain.append(f"calibration override applied: {entry['flags']} "
                             f"(measured {entry.get('date', '?')})")
