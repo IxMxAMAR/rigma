@@ -1343,7 +1343,7 @@ def _serve_or_exit(port: int) -> None:
         raise typer.Exit(1) from e
 
 
-def _open_when_listening(port: int, url: str, timeout: float = 15.0):
+def _open_when_listening(port: int, url: str, timeout: float = 180.0):
     """Open `url` in a browser once 127.0.0.1:port accepts a connection.
 
     AUDIT F16-2: `webbrowser.open` ran BEFORE `serve.run_ui`, so on a cold start
@@ -1352,11 +1352,25 @@ def _open_when_listening(port: int, url: str, timeout: float = 15.0):
     this site" — on the very first impression. The wait runs in a daemon thread
     so the caller can start the server immediately; `--no-browser` still skips
     this entirely.
+
+    R3 09-7: the deadline was 15 s and reaching it was SILENT — no browser, no
+    message, no retry. Measured: it returned after 0.62 s for a 0.5 s deadline
+    with nothing printed, while `up` had already told the user "chat UI: http://…".
+    15 s is also shorter than the case this helper exists for: a cold start is
+    uvicorn importing FastAPI, building the app, and spawning a 13 GB model load,
+    so the automatic open failed exactly when the user was most likely to be
+    waiting for it. The deadline now outlasts a real cold start, and reaching it
+    says so.
+
+    The thread is a daemon, so Ctrl+C at the terminal ends it; a message written
+    from it during interpreter shutdown is a torn line at worst, which is a better
+    trade than the silence it replaces.
     """
     import threading
 
     def _wait() -> None:
         import socket
+        import sys
         import time
         import webbrowser
         deadline = time.monotonic() + timeout
@@ -1367,6 +1381,9 @@ def _open_when_listening(port: int, url: str, timeout: float = 15.0):
                     return
             except OSError:
                 time.sleep(0.1)
+        # stderr, so a scripted caller reading stdout is not confused by this
+        print(f"the UI did not come up within {timeout:g}s — open {url} yourself",
+              file=sys.stderr)
 
     t = threading.Thread(target=_wait, name="rigma-open-browser", daemon=True)
     t.start()
