@@ -2,7 +2,8 @@
 // Telemetry is mono + instant (CONSTITUTION §6: never animate data values).
 import { useCallback, useEffect, useState } from "react";
 import { engineApi, type EngineFinding, type ServerInfo,
-         type SwitchOption } from "../lib/engineApi";
+         type SwitchOption, type UsageStats } from "../lib/engineApi";
+import { tokens, topModels } from "../lib/usage";
 
 function uptime(startedAt: number): string {
   const s = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
@@ -36,6 +37,7 @@ export default function EngineSurface() {
   const [options, setOptions] = useState<SwitchOption[]>([]);
   const [log, setLog] = useState("");
   const [findings, setFindings] = useState<EngineFinding[]>([]);
+  const [stats, setStats] = useState<UsageStats | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -47,6 +49,9 @@ export default function EngineSurface() {
       setInfo(null);
       setErr((e as Error).message);
     }
+    // IMP-7: the odometer is a local file read, so it rides the same 4s poll
+    // and a reply that finishes while this page is open moves the number.
+    engineApi.stats().then(setStats).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -106,6 +111,7 @@ export default function EngineSurface() {
     );
 
   const tg = info.last_tg ?? null;
+  const usage = topModels(stats?.by_model);
   const verdictTone =
     info.verdict === "healthy" ? "moss" : info.verdict ? "red" : undefined;
 
@@ -244,6 +250,43 @@ export default function EngineSurface() {
             </button>
           </div>
         </section>
+
+        {/* IMP-7: the lifetime odometer stats.json has always kept and no v2
+            screen read. Read-only, no new endpoint. `by_model` counts tokens
+            GENERATED per model; the file has no last-used stamp, so none is
+            shown rather than guessed. */}
+        {stats && (
+          <section className="rounded-lg bg-panel p-5">
+            <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-3">
+              usage
+            </h3>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <Stat label="tokens generated" value={tokens(stats.total_tokens)} />
+              <Stat label="replies" value={stats.total_turns.toLocaleString()} />
+              <Stat label="models used"
+                    value={String(Object.keys(stats.by_model).length)} />
+            </div>
+            {usage.length > 0 && (
+              <ul className="mt-4 flex flex-col gap-1">
+                {usage.map((u) => (
+                  <li key={u.model} className="flex items-center gap-3 text-[12.5px]">
+                    <span className="flex-1 min-w-0 truncate font-mono text-secondary"
+                          title={u.model || "unknown model"}>
+                      {u.model || "(unknown model)"}
+                    </span>
+                    <span className="font-mono text-[12px] text-muted shrink-0">
+                      {tokens(u.tokens)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="text-[11px] text-muted mt-3 leading-snug">
+              Lifetime totals from this machine's stats.json. Tokens are what
+              the model generated, not what it read.
+            </p>
+          </section>
+        )}
 
         {options.length > 0 && (
           <section className="rounded-lg bg-panel p-5">

@@ -247,6 +247,16 @@ export interface EngineFinding {
   example: string;
 }
 
+/** The lifetime odometer, read from ~/.rigma/stats.json by serve.server_stats.
+ *  `by_model` maps a model id to the tokens IT generated. The file does not
+ *  record when a model was last used, so the UI shows no date — inventing one
+ *  would be worse than omitting it (IMP-7). */
+export interface UsageStats {
+  total_tokens: number;
+  total_turns: number;
+  by_model: Record<string, number>;
+}
+
 export const engineApi = {
   server: () => j<ServerInfo>("GET", "/api/server"),
   switchOptions: () => j<SwitchOption[]>("GET", "/api/server/switch-options"),
@@ -270,6 +280,8 @@ export const engineApi = {
   /** Read from the WHOLE log, not the tail: these land in the first few hundred
    *  lines of a launch and are long gone by the time anyone looks. */
   findings: () => j<{ findings: EngineFinding[] }>("GET", "/api/server/findings"),
+  /** Lifetime tokens/turns and the per-model split (IMP-7). */
+  stats: () => j<UsageStats>("GET", "/api/server/stats"),
   log: async (lines = 120): Promise<string> => {
     const r = await fetch(`/api/server/log?lines=${lines}`);
     return r.ok ? r.text() : "";
