@@ -127,6 +127,11 @@ _MAX_STOPS = 4
 # as end-of-document: it answers with instant EOS. See tools._defuse_control_bytes.
 _CTRL_RUN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]+")
 
+# AUDIT 10-9: the stored document's schema version, stamped by save(). It exists
+# so the 50->1000 lift below runs on a body written by an old build and NOT on
+# every load, which is what made a deliberate 50 revert forever.
+_SESSION_SCHEMA = 1
+
 # every field a session is guaranteed to carry — load() backfills these so
 # v0.5.x session files survive an upgrade instead of KeyError-ing the app
 _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
@@ -155,6 +160,10 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # `harness.resolve` refuses an unknown or unusable backend
                      # rather than quietly substituting the built-in.
                      "harness": "native",
+                     # AUDIT 10-9: the schema version this document was written
+                     # at. Stamped by save(); a body that predates the key is
+                     # what the max_tool_rounds migration below keys on.
+                     "schema": _SESSION_SCHEMA,
                      "messages": []}
 
 
@@ -243,6 +252,9 @@ def save(session: dict, *, base_rev: int | None = None) -> int:
     from . import db
     _import_legacy()
     session["updated_at"] = time.time()
+    # AUDIT 10-9: stamp the schema version so the one-time migrations in load()
+    # never run against a document this build wrote.
+    session["schema"] = _SESSION_SCHEMA
     rev = db.upsert_session(session, base_rev=base_rev)
     if rev is None:
         raise StaleWriteError(
@@ -265,13 +277,18 @@ def load(session_id: str) -> dict | None:
         raw = json.loads(body)
     except Exception:
         return None
+    # AUDIT 10-9: this heuristic used to run on EVERY load, so a user who
+    # deliberately lowered max_tool_rounds to 50 had it rewritten to 1000 the
+    # next time the chat was opened. Gate it on the stored schema version,
+    # checked on the RAW body before the defaults backfill below: only a
+    # document written before the field existed is migrated. The old default
+    # WAS 50, so a legacy body at 50 is lifted once; save() then stamps the
+    # current version and a later deliberate 50 survives.
+    if not raw.get("schema") and raw.get("max_tool_rounds") == 50:
+        raw["max_tool_rounds"] = 1000
     # migration: sessions written by older Rigma versions lack newer fields
     for k, v in _SESSION_DEFAULTS.items():
         raw.setdefault(k, json.loads(json.dumps(v)))
-    # stored 50 is the OLD default leash, not a choice anyone made - lift it
-    # to the new backstop (a deliberately lowered value survives untouched)
-    if raw.get("max_tool_rounds") == 50:
-        raw["max_tool_rounds"] = 1000
     # the revision THIS snapshot was taken at, set last so a body that somehow
     # carries the key cannot lie about it. Never persisted: save() strips it.
     raw[REV_KEY] = rev
