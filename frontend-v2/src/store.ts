@@ -30,6 +30,9 @@ interface ServerStatus {
   model: string;
   quant: string;
   tps: number | null;
+  /** The calibrated rate for this model on this machine, so the header's tok/s
+   *  can answer "is this good here?" instead of raising the question. */
+  expectedTg?: number | null;
   healthy: boolean;
   ctx: number;
   /** sessions.PARAM_RANGES, as /api/server publishes it. The sampler panel's

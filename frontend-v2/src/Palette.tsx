@@ -4,6 +4,7 @@
 // register surface-specific commands without touching this component.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useChat } from "./chat/chatStore";
+import { focusChatFilter } from "./lib/chatFilter";
 import { SURFACES, useApp } from "./store";
 
 export interface Command {
@@ -33,6 +34,17 @@ export function usePaletteCommands(): Command[] {
         hint: s.hint,
         run: () => setSurface(s.id),
       })),
+      {
+        id: "filter-chats",
+        // IMP-9: Ctrl+K cannot also focus the rail without breaking the palette,
+        // so the palette is how you get there by keyboard.
+        label: "Filter chats",
+        hint: "focus the session search box (/)",
+        run: () => {
+          setSurface("chat");
+          focusChatFilter();
+        },
+      },
       {
         id: "legacy",
         label: "Open legacy UI",

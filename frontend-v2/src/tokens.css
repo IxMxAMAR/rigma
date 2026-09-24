@@ -33,7 +33,18 @@ body {
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
 }
-* { transition-duration: 150ms; transition-timing-function: var(--ease-app); }
+/* Section 6: 150ms ease-out — but NAME the properties. `transition-property`'s
+   initial value is `all`, so a bare duration on `*` animated data values as
+   well: the context meter's width, the pull progress bar and the composer
+   textarea's autosize height, which is set on every keystroke (AUDIT F11-10).
+   A measurement must read as a measurement, and the composer must keep up with
+   typing. `transform` stays for the pressed scale(0.98) paradigm (§31). */
+* {
+  transition-property: background-color, border-color, color, fill, opacity,
+                       outline-color, box-shadow, transform;
+  transition-duration: 150ms;
+  transition-timing-function: var(--ease-app);
+}
 :focus-visible { outline: 2px solid var(--color-amber); outline-offset: 2px; }
 ::selection { background: rgba(232, 169, 79, 0.2); }
 * { scrollbar-width: thin; scrollbar-color: var(--color-float) transparent; }

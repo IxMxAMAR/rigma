@@ -3,6 +3,10 @@
 // nightmare" (agent-memory spec). Every learned rule, its evidence, delete.
 import { useCallback, useEffect, useState } from "react";
 
+import EmptyState from "../EmptyState";
+import LoadError from "../LoadError";
+import { responseError } from "../lib/listFetch";
+
 interface MemoryRow {
   id: string;
   kind: string;
@@ -56,21 +60,19 @@ export default function MemorySurface() {
           re-learned.
         </p>
         {err && (
-          <div className="rounded-md bg-red/10 text-red px-3 py-2 text-[13px] mb-4">
-            {err}
-          </div>
+          <LoadError message={err} onRetry={() => void refresh()} />
         )}
-        {rows.length === 0 ? (
-          <div className="text-center pt-16">
-            <div className="font-mono text-[12px] text-muted uppercase tracking-[0.1em] mb-2">
-              nothing learned yet
-            </div>
-            <p className="text-secondary text-[13.5px] max-w-[400px] mx-auto">
-              Memories are written when autonomous runs fail and recover.
-              Run a mission and check back.
-            </p>
-          </div>
-        ) : (
+        {/* IMP-10: the empty state means the fetch SUCCEEDED and returned
+            nothing. A failed fetch renders the error above instead — it must
+            never read as "nothing learned yet". */}
+        {!err && rows.length === 0 && (
+          <EmptyState
+            title="nothing learned yet"
+            body="Memories are written when autonomous runs fail and recover. Run a mission and check back."
+            actionLabel="refresh"
+            onAction={() => void refresh()} />
+        )}
+        {rows.length > 0 && (
           <ul className="flex flex-col gap-1.5">
             {rows.map((m) => (
               <li key={m.id} className="group rounded-lg bg-panel px-4 py-2.5 flex items-center gap-3">
@@ -88,10 +90,20 @@ export default function MemorySurface() {
                   </div>
                 </div>
                 <button
-                  className="opacity-0 group-hover:opacity-100 shrink-0 rounded-md px-2 py-1 text-[13px] text-muted hover:text-red hover:bg-surface"
+                  className="shrink-0 rounded-md px-2 py-1 text-[13px] text-muted hover:text-red hover:bg-surface"
                   aria-label={`forget: ${m.text}`}
                   onClick={async () => {
-                    await fetch(`/api/memory/${m.id}`, { method: "DELETE" });
+                    setErr(null);
+                    // AUDIT F11-4: this ignored r.ok and refreshed, so a refused
+                    // forget looked exactly like one that worked — the rule just
+                    // stayed put with no reason.
+                    const r = await fetch(
+                      `/api/memory/${encodeURIComponent(m.id)}`,
+                      { method: "DELETE" });
+                    if (!r.ok) {
+                      setErr(await responseError(r));
+                      return;
+                    }
                     void refresh();
                   }}
                 >

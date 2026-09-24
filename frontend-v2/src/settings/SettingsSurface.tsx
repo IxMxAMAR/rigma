@@ -1,9 +1,13 @@
 // Settings: preset manager. App-level knobs stay minimal — most state is
 // per-chat (sidecar) or per-model (registry), by design.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
+import EmptyState from "../EmptyState";
 import LoadError from "../LoadError";
-import { readList } from "../lib/listFetch";
+import InlineError from "../InlineError";
+import { engineApi } from "../lib/engineApi";
+import { readList, responseError } from "../lib/listFetch";
+import { openaiBase } from "../lib/openaiBase";
 
 interface Preset {
   id: string;
@@ -23,6 +27,23 @@ export default function SettingsSurface() {
   const [editing, setEditing] = useState<string | null>(null); // preset id
   const [err, setErr] = useState<string | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [rowErr, setRowErr] = useState<string | null>(null);
+  // IMP-10: the empty state's action focuses the create form below.
+  const nameRef = useRef<HTMLInputElement>(null);
+  // AUDIT F11-6: this card used to hardcode `http://127.0.0.1:11499/v1` and
+  // call it Rigma's OpenAI API. 11499 is llama-server's upstream port, so a
+  // backend pointed there bypasses the session, the tool-call repair and the
+  // idle-unload bookkeeping — and the URL is dead on any non-default launch.
+  // /api/server publishes the real base (`openai_base`); read it, and fall back
+  // to the origin that served this page rather than to a literal port.
+  const [apiBase, setApiBase] = useState(() =>
+    openaiBase(null, window.location.origin));
+
+  useEffect(() => {
+    engineApi.server()
+      .then((i) => setApiBase(openaiBase(i, window.location.origin)))
+      .catch(() => { /* keep the origin fallback */ });
+  }, []);
 
   const refresh = useCallback(async () => {
     // AUDIT F11-3: a non-array /api/presets body used to reach .map and blank
@@ -57,15 +78,17 @@ export default function SettingsSurface() {
                        onRetry={() => void refresh()} />
           )}
           {!loadErr && presets.length === 0 && (
-            <p className="text-muted text-[13px] mb-2">
-              No presets yet — a preset bundles a system prompt + sampling and
-              can be applied to any chat.
-            </p>
+            <EmptyState
+              title="no presets yet"
+              body="A preset bundles a system prompt and sampling settings and can be applied to any chat."
+              actionLabel="create a preset"
+              onAction={() => nameRef.current?.focus()} />
           )}
           <p className="text-muted text-[12px] mb-2">
             Click a preset to edit it. Built-ins can be viewed, not changed —
             apply presets to a chat from the chat's ⚙ panel.
           </p>
+          {rowErr && <InlineError message={`could not delete: ${rowErr}`} />}
           <ul className="flex flex-col gap-1 mb-3">
             {presets.map((p) => (
               <li key={p.id}
@@ -87,11 +110,20 @@ export default function SettingsSurface() {
                 </span>
                 {!isBuiltin(p) && (
                   <button
-                    className="opacity-0 group-hover:opacity-100 text-muted hover:text-red px-1"
+                    className="text-muted hover:text-red px-1"
                     aria-label={`delete preset ${p.name}`}
                     onClick={async (e) => {
                       e.stopPropagation();
-                      await fetch(`/api/presets/${p.id}`, { method: "DELETE" });
+                      setRowErr(null);
+                      // AUDIT F11-4: this ignored r.ok and refreshed, so a
+                      // refused delete looked exactly like one that worked.
+                      const r = await fetch(
+                        `/api/presets/${encodeURIComponent(p.id)}`,
+                        { method: "DELETE" });
+                      if (!r.ok) {
+                        setRowErr(await responseError(r));
+                        return;
+                      }
                       if (editing === p.id) setEditing(null);
                       void refresh();
                     }}
@@ -128,6 +160,7 @@ export default function SettingsSurface() {
             }}
           >
             <input
+              ref={nameRef}
               value={draft.name}
               onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
               placeholder="preset name"
@@ -175,8 +208,11 @@ export default function SettingsSurface() {
           <p className="text-[13px] text-secondary">
             Legacy UI: <a href="/rizz" className="text-amber hover:underline">/rizz</a>
             {" · "}OpenAI-compatible API:{" "}
-            <code className="font-mono text-[12px] bg-surface rounded px-1.5 py-0.5">
-              http://127.0.0.1:11499/v1
+            <code className="font-mono text-[12px] bg-surface rounded px-1.5 py-0.5"
+                  title={"Rigma's own /v1 passthrough — sessions, tool-call "
+                         + "repair and idle-unload bookkeeping all apply. The "
+                         + "engine's own port is different and bypasses them."}>
+              {apiBase}
             </code>
           </p>
         </section>

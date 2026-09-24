@@ -1,8 +1,12 @@
 // Autonomous dashboard: launch a mission, watch it live, steer or stop it,
 // browse history. Polls the active run at 2s; history at rest.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState,
+         type RefObject } from "react";
 
-import { responseError } from "../lib/listFetch";
+import EmptyState from "../EmptyState";
+import InlineError from "../InlineError";
+import LoadError from "../LoadError";
+import { readList, responseError } from "../lib/listFetch";
 
 interface PlanStep {
   id: number;
@@ -32,7 +36,11 @@ const RESTARTABLE = new Set([
   "interrupted", "stopped", "stalled", "frozen", "budget_exhausted", "error",
 ]);
 
-function Launcher({ onLaunched }: { onLaunched: (id: string) => void }) {
+function Launcher({ onLaunched, missionRef }: {
+  onLaunched: (id: string) => void;
+  /** IMP-10: the empty history's primary action focuses the mission box. */
+  missionRef?: RefObject<HTMLTextAreaElement>;
+}) {
   const [mission, setMission] = useState("");
   const [workspace, setWorkspace] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -43,6 +51,7 @@ function Launcher({ onLaunched }: { onLaunched: (id: string) => void }) {
         new mission
       </h3>
       <textarea
+        ref={missionRef}
         value={mission}
         onChange={(e) => {
           setMission(e.target.value);
@@ -248,14 +257,27 @@ export default function AutonomousSurface() {
   const [history, setHistory] = useState<RunSummary[]>([]);
   const [active, setActive] = useState<Run | null>(null);
   const [histErr, setHistErr] = useState<string | null>(null);
+  // A refused restart is not a load failure: keep the two sentences apart, or
+  // "run is not restartable" renders as "could not load runs".
+  const [actErr, setActErr] = useState<string | null>(null);
   const activeId = useRef<string | null>(null);
+  // IMP-10: the empty history's primary action focuses the mission box.
+  const missionRef = useRef<HTMLTextAreaElement>(null);
 
   const refreshHistory = useCallback(async () => {
+    // IMP-10: a failed fetch must not render as "no runs yet" — keep the last
+    // list, but say the request failed.
     try {
-      const r = await fetch("/api/runs");
-      const d: unknown = await r.json();
-      if (r.ok && Array.isArray(d)) setHistory(d as RunSummary[]);
-    } catch { /* keep last */ }
+      const res = await readList<RunSummary>(await fetch("/api/runs"));
+      if (!res.ok) {
+        setHistErr(res.error);
+        return;
+      }
+      setHistErr(null);
+      setHistory(res.rows);
+    } catch (e) {
+      setHistErr((e as Error).message);
+    }
   }, []);
 
   const pollActive = useCallback(async () => {
@@ -297,6 +319,7 @@ export default function AutonomousSurface() {
           <ActiveRun run={active} onAction={pollActive} />
         ) : (
           <Launcher
+            missionRef={missionRef}
             onLaunched={(id) => {
               activeId.current = id;
               void pollActive();
@@ -313,18 +336,23 @@ export default function AutonomousSurface() {
             </p>
           </section>
         )}
-        {history.length > 0 && (
-          <section className="rounded-lg bg-panel p-4">
-            <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-2">
-              history
-            </h3>
-            {histErr && (
-              <div role="alert"
-                   className="rounded-md bg-red/10 text-red px-2.5 py-1.5 text-[12px] mb-2">
-                {histErr}
-              </div>
-            )}
-            <ul className="flex flex-col gap-1">
+        <section className="rounded-lg bg-panel p-4">
+          <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-2">
+            history
+          </h3>
+          {actErr && <InlineError message={actErr} />}
+          {histErr && (
+            <LoadError message={`could not load runs: ${histErr}`}
+                       onRetry={() => void refreshHistory()} />
+          )}
+          {!histErr && history.length === 0 && (
+            <EmptyState
+              title="no runs yet"
+              body="A mission runs unattended and leaves its files in the workspace you name. Launch one above and its progress appears here."
+              actionLabel="launch a mission"
+              onAction={() => missionRef.current?.focus()} />
+          )}
+          <ul className="flex flex-col gap-1">
               {history.map((h) => (
                 <li key={h.id} className="flex items-center gap-3 text-[12.5px] rounded-md hover:bg-surface px-2 py-1">
                   <span className={`font-mono text-[11px] w-16 shrink-0 ${statusTone(h.status)}`}>
@@ -334,7 +362,7 @@ export default function AutonomousSurface() {
                   {RESTARTABLE.has(h.status) && !active && (
                     <button
                       onClick={async () => {
-                        setHistErr(null);
+                        setActErr(null);
                         try {
                           const r = await fetch(
                             `/api/runs/${h.id}/restart`, { method: "POST" });
@@ -342,13 +370,13 @@ export default function AutonomousSurface() {
                             // AUDIT F11-4: a 409 used to set activeId and poll
                             // anyway, which re-read the old terminal state and
                             // made the resume button vanish with no reason.
-                            setHistErr(await responseError(r));
+                            setActErr(await responseError(r));
                             return;
                           }
                           activeId.current = h.id;
                           void pollActive();
                         } catch (e) {
-                          setHistErr((e as Error).message);
+                          setActErr((e as Error).message);
                         }
                       }}
                       className="shrink-0 rounded-md bg-amber/15 text-amber px-2 py-0.5 text-[11.5px] font-semibold"
@@ -361,7 +389,6 @@ export default function AutonomousSurface() {
               ))}
             </ul>
           </section>
-        )}
       </div>
     </main>
   );
