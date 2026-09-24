@@ -672,12 +672,48 @@ def fallback_plans(plan: RunPlan, registry: Registry,
     return out
 
 
+# How far the machine's usable budget may fall below what a combo was VERIFIED
+# at before the combo stops being trustworthy. Live readings move — the
+# desktop's own VRAM drifts by gigabytes and free RAM by more — so an exact
+# comparison would flap a verified combo off on a busy afternoon. A material
+# shortfall is the case the check exists for.
+_COMBO_BUDGET_SLACK = 0.10
+
+
+def _combo_rejection(combo, spec: ModelSpec, gguf: GgufFile,
+                     profile: HardwareProfile) -> str:
+    """("" | why the curated combo must not be used as-is).
+
+    AUDIT F23: the combo path returned its stored flags with NO fit check at
+    all — `_budgets` was never called and the combo's own declared `budget`
+    field was read nowhere in the codebase. That is the DEFAULT path for exactly
+    the hardware the README's verified table advertises, so on a pressured
+    desktop `rigma sweep` benchmarked an over-budget config and could crown a
+    winner picked by paging noise.
+    """
+    usable_vram, usable_ram = _budgets(profile)
+    if combo.budget is not None:
+        if usable_vram < combo.budget.vram_mb * (1 - _COMBO_BUDGET_SLACK):
+            return (f"verified at {combo.budget.vram_mb}MB usable VRAM; this "
+                    f"machine has {usable_vram:.0f}MB")
+        if usable_ram < combo.budget.ram_mb * (1 - _COMBO_BUDGET_SLACK):
+            return (f"verified at {combo.budget.ram_mb}MB usable RAM; this "
+                    f"machine has {usable_ram:.0f}MB")
+    # Even with no declared budget the PLACEMENT has to still exist: the combo's
+    # own ctx may no longer be placeable at all on this machine right now.
+    if fit_gguf(spec, gguf, profile, combo.flags.ctx, []) is None:
+        return (f"its ctx {combo.flags.ctx} can no longer be placed in "
+                f"{usable_vram:.0f}MB usable VRAM")
+    return ""
+
+
 def resolve(profile: HardwareProfile, registry: Registry,
             use_case: str = "general", model_override: str | None = None,
             backend_override: str | None = None) -> RunPlan:
     if not registry.models:
         raise ResolveError("registry has no models")
     gpu = profile.primary_gpu
+    rejected: list[str] = []
     # A curated combo pins its own backend, so honouring an explicit request
     # means skipping the combo path — otherwise asking for ROCm would silently
     # return a Vulkan combo and the UI would report a backend it never ran.
@@ -686,13 +722,33 @@ def resolve(profile: HardwareProfile, registry: Registry,
                                   profile.ram_tier_gb, use_case)
         if hit:
             combo, rel = hit
-            spec = registry.models[combo.model]
-            gguf = next(g for g in spec.ggufs if g.quant == combo.quant)
             kind = "class" if rel.startswith("_class/") else "combo"
-            return _apply_calibration(RunPlan(
-                model_slug=combo.model, gguf=gguf, backend=combo.backend,
-                flags=combo.flags, origin=f"{kind}:{rel}",
-                explain=[f"registry match: {rel}"] + combo.sources), profile)
+            # AUDIT F24: an unguarded subscript and a bare `next()` meant a
+            # registry snapshot that dropped a model or a quant killed
+            # up/plan/sweep with a raw KeyError/StopIteration, where every other
+            # failure in this module raises ResolveError — and cli.py catches
+            # only that. The registry validates this in CI, but CI runs after
+            # the push and codeload serves master regardless.
+            spec = registry.models.get(combo.model)
+            gguf = next((g for g in (spec.ggufs if spec else [])
+                         if g.quant == combo.quant), None)
+            if spec is None or gguf is None:
+                raise ResolveError(
+                    f"registry {kind} '{rel}' names "
+                    + (f"an unknown model '{combo.model}'" if spec is None
+                       else f"the quant '{combo.quant}', which "
+                            f"'{combo.model}' does not list")
+                    + " — run `rigma update` (your cached registry and the "
+                      "packaged one disagree)")
+            why = _combo_rejection(combo, spec, gguf, profile)
+            if not why:
+                return _apply_calibration(RunPlan(
+                    model_slug=combo.model, gguf=gguf, backend=combo.backend,
+                    flags=combo.flags, origin=f"{kind}:{rel}",
+                    explain=[f"registry match: {rel}"] + combo.sources),
+                    profile)
+            rejected = [f"registry {kind} '{rel}' NOT used: {why}",
+                        "falling back to the fit calculator"]
     if model_override:
         if model_override not in registry.models:
             raise ResolveError(
@@ -703,6 +759,8 @@ def resolve(profile: HardwareProfile, registry: Registry,
                             registry.combos)
     plan = _calculate(profile, registry, use_case, backend_override)
     if plan:
+        if rejected:
+            plan.explain = rejected + list(plan.explain)
         return _apply_calibration(plan, profile)
     # absolute floor: smallest model, smallest quant, CPU
     have_ggufs = [m for m in registry.models.values() if m.ggufs]
@@ -712,4 +770,4 @@ def resolve(profile: HardwareProfile, registry: Registry,
     return _apply_calibration(RunPlan(
         model_slug=spec.slug, gguf=spec.ggufs[-1], backend="cpu",
         flags=ComboFlags(ctx=_ctx_floor(spec), ngl=0), origin="calculator",
-        explain=["floor: nothing larger fits"]), profile)
+        explain=rejected + ["floor: nothing larger fits"]), profile)
