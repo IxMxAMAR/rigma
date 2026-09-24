@@ -648,7 +648,7 @@ def test_prefix_warm_and_snapshot_run_off_the_event_loop(home, engine,
     where = {}
 
     def _spy(key):
-        def _f(_msgs):
+        def _f(_msgs, _chain=""):
             try:
                 asyncio.get_running_loop()
                 where[key] = "event loop"
@@ -663,6 +663,106 @@ def test_prefix_warm_and_snapshot_run_off_the_event_loop(home, engine,
     sid = _seed(c, 2)
     c.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
     assert where == {"warm": "thread", "snapshot": "thread"}
+
+
+def test_a_snapshot_is_not_skipped_after_the_engine_was_replaced(
+        monkeypatch, tmp_path):
+    """AUDIT 02-2: `warm_key` asserts what the LIVE engine's slot 0 holds.
+
+    It used to be the bare prefix key, so after a switch away and back — a new
+    engine process with an empty slot 0 — the matching snapshot on disk was
+    skipped and the whole history re-prefilled: the 20-60K-token stall the
+    snapshot exists to avoid. The key now carries the engine generation, so the
+    assertion cannot outlive the process it describes.
+    """
+    from rigma import prefixcache
+
+    restored: list = []
+    monkeypatch.setattr(serve, "_prefix_ctx",
+                        lambda: (1, tmp_path, "FP", "pid-1"))
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [prefixcache.PrefixPoint(
+                            n_messages=1, key="K", approx_tokens=9000)])
+    monkeypatch.setattr(prefixcache, "available", lambda d: {"K"})
+    monkeypatch.setattr(
+        prefixcache, "warm",
+        lambda port, d, key, slot=0: restored.append(key) or None)
+    monkeypatch.setitem(serve._PREFIX_STATE, "warm_key", "")
+    monkeypatch.setitem(serve._PREFIX_STATE, "last_points", {})
+
+    msgs = [{"role": "user", "content": "hi"}]
+    serve._prefix_warm(msgs)
+    assert restored == ["K"]
+    assert serve._PREFIX_STATE["warm_key"] == "pid-1:K"
+
+    # the same live engine, same prefix: the slot is already at least as warm
+    restored.clear()
+    serve._prefix_warm(msgs)
+    assert restored == [], "restoring what the slot already holds wastes time"
+
+    # a REPLACEMENT engine process: same snapshot on disk, empty slot 0
+    monkeypatch.setattr(serve, "_prefix_ctx",
+                        lambda: (1, tmp_path, "FP", "pid-2"))
+    serve._prefix_warm(msgs)
+    assert restored == ["K"], "the replacement engine's slot 0 is empty"
+
+    # a snapshot just taken leaves slot 0 holding exactly that prefix, so the
+    # snapshot side must record the SAME generation-prefixed key or the next
+    # turn restores what it already has
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [prefixcache.PrefixPoint(
+                            n_messages=2, key="K2", approx_tokens=20000)])
+    monkeypatch.setattr(prefixcache, "snapshot",
+                        lambda port, d, key, slot=0, meta=None: None)
+    monkeypatch.setitem(serve._PREFIX_STATE, "last_points", {})
+    serve._prefix_snapshot(msgs)
+    assert serve._PREFIX_STATE["warm_key"] == "pid-2:K2"
+
+
+def test_a_long_chat_does_not_suppress_a_new_chats_snapshot(monkeypatch,
+                                                            tmp_path):
+    """AUDIT 02-5: the growth heuristic used ONE process-wide `last_point`.
+
+    A 60-message/60K-token chat A therefore made a new chat B that had grown
+    past the snapshot floor but not past A look like it had not grown at all
+    (`point.n_messages <= last.n_messages`), so B was never snapshotted and
+    re-prefilled from zero after a restart. Each chain now measures its own
+    growth.
+    """
+    from rigma import prefixcache
+
+    def _point(key, tokens, n):
+        return prefixcache.PrefixPoint(n_messages=n, key=key,
+                                       approx_tokens=tokens)
+
+    taken: list = []
+    monkeypatch.setattr(serve, "_prefix_ctx",
+                        lambda: (1, tmp_path, "FP", "gen"))
+    monkeypatch.setattr(prefixcache, "snapshot",
+                        lambda port, d, key, slot=0, meta=None:
+                        taken.append(key) or None)
+    monkeypatch.setitem(serve._PREFIX_STATE, "last_points", {})
+
+    # chat A: a long conversation, snapshotted at 60K
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [_point("A", 60000, 60)])
+    serve._prefix_snapshot([{"role": "user", "content": "a"}], "chat-A")
+    assert taken == ["A"]
+
+    # chat B: 30 messages/20K tokens in its OWN chain — well past the 4096-token
+    # floor, but "behind" A on both measures. Under the old global `last_point`
+    # this was suppressed; it must snapshot now.
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [_point("B", 20000, 30)])
+    serve._prefix_snapshot([{"role": "user", "content": "b"}], "chat-B")
+    assert taken == ["A", "B"], "chat B's snapshot was suppressed by chat A"
+
+    # ...and a second turn of B that has not grown enough is still suppressed,
+    # so the per-chain bookkeeping did not just disable the heuristic
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [_point("B2", 21000, 31)])
+    serve._prefix_snapshot([{"role": "user", "content": "b"}], "chat-B")
+    assert taken == ["A", "B"], "the growth floor stopped applying"
 
 
 # --------------------------------------------------------------------------
@@ -1010,3 +1110,69 @@ def test_a_disconnect_cancels_the_rounds_eager_tool_tasks(home, engine,
     assert armed.is_set(), "the delegate never reached the engine"
     assert any(tasks for tasks in seen), (
         "the eager delegate task was abandoned without being cancelled")
+
+
+# --------------------------------------------------------------------------
+# 02-4 — an external harness turn leaked its pump thread and subprocess
+
+
+def test_a_disconnect_stops_an_external_agent_and_keeps_the_partial_reply(
+        home, engine, monkeypatch):
+    """AUDIT 02-4: `_external_turn` had no try/finally.
+
+    A client disconnect throws GeneratorExit / CancelledError at its current
+    `yield`, which unwound straight past `await task` and the save. Nothing set
+    the adapter's `cancel`, so the harness subprocess — and every subagent it
+    owns — kept running and billing against Rigma's /v1 while its events piled
+    into a queue with no consumer. The native loop already had this teardown
+    (AUDIT F7); the external path did not.
+    """
+    import asyncio
+
+    from rigma import harness_dsh
+
+    monkeypatch.setenv("RIGMA_HOME", str(home))
+    monkeypatch.setattr(harness_dsh, "available", lambda: True)
+    cancels: list = []
+    stopped = threading.Event()
+
+    def _drive(**kw):
+        cancels.append(kw.get("cancel"))
+        yield harness_dsh.TurnEvent("text", text="half ")
+        cancel = kw.get("cancel")
+        deadline = time.time() + 5.0        # never hangs the suite, cancel or not
+        while (cancel is not None and not cancel.is_set()
+               and time.time() < deadline):
+            time.sleep(0.01)
+        stopped.set()
+
+    monkeypatch.setattr(harness_dsh, "drive_turn", _drive)
+    _running()
+    c = _client(engine.port)
+    sid = c.post("/api/sessions", json={}).json()["id"]
+    s = sessions.load(sid)
+    s["harness"] = "dsh"
+    s["messages"] = [{"role": "user", "content": "go"}]
+    sessions.save(s)
+    app = build_app(upstream_port=engine.port)
+
+    async def scenario():
+        # chunk 1 is the harness badge, 2 the external notice, 3 the first
+        # delta — so the disconnect lands with the agent mid-turn
+        got = await _stream(app, f"/api/sessions/{sid}/chat",
+                            {"message": "go"}, stop_after=3)
+        for _ in range(200):                # let the pump thread see the cancel
+            if stopped.is_set():
+                break
+            await asyncio.sleep(0.01)
+        return got
+
+    got = asyncio.run(scenario())
+
+    assert got["status"] == 200, got
+    assert cancels and cancels[0] is not None, "no cancel event was handed over"
+    assert cancels[0].is_set(), "the client disconnect never stopped the agent"
+    stored = sessions.load(sid)
+    assert stored["messages"][-1]["role"] == "assistant", stored["messages"]
+    assert "half " in stored["messages"][-1]["content"], (
+        "the partial reply was thrown away with the disconnect")
