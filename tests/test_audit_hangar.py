@@ -232,6 +232,55 @@ def test_a_pull_tells_the_downloader_what_the_registry_says_the_file_is(
     assert seen["sha256"] == "ab" * 32
 
 
+def test_a_pull_without_room_is_refused_with_the_shortfall(home, monkeypatch):
+    """No free-space check meant a multi-GB pull filled the volume to zero and
+    the only signal was an OSError from the write, long after the damage. The
+    upload path already refuses exactly this (507), so the download path was
+    the inconsistent one."""
+    spec = _spec(GgufFile(repo="owner/first", file="big.gguf",
+                          bytes=100 * 2**30, quant="Q4_K_M"))
+
+    class _Reg:
+        models = {"s": spec}
+
+    class _Usage:
+        free = 10 * 2**30
+
+    def _no_download(*a, **k):
+        raise AssertionError("a download must not start without free space")
+
+    monkeypatch.setattr(hangar, "_PULLS", {})
+    monkeypatch.setattr(hangar, "_download_file", _no_download)
+    monkeypatch.setattr(hangar.shutil, "disk_usage", lambda p: _Usage())
+    with pytest.raises(HangarError, match="free space") as ei:
+        hangar.start_pull("s", "big.gguf", registry=_Reg())
+    assert "short" in str(ei.value)
+    assert hangar._PULLS == {}          # nothing was started
+
+
+def test_a_pull_that_fits_is_not_refused(home, monkeypatch):
+    """The check must not block a pull that fits, and must not run for a file
+    already on disk (nothing is downloaded)."""
+    spec = _spec(GgufFile(repo="owner/first", file="small.gguf",
+                          bytes=4 * 2**30, quant="Q4_K_M"))
+
+    class _Reg:
+        models = {"s": spec}
+
+    class _Usage:
+        free = 50 * 2**30
+
+    monkeypatch.setattr(hangar, "_PULLS", {})
+    monkeypatch.setattr(hangar.shutil, "disk_usage", lambda p: _Usage())
+    monkeypatch.setattr(hangar, "_download_file",
+                        lambda *a, **k: 0)
+    hangar.start_pull("s", "small.gguf", registry=_Reg())
+    for t in threading.enumerate():
+        if t.name == "pull:small.gguf":
+            t.join(timeout=5)
+    assert hangar._PULLS["s::small.gguf"]["status"] == "done"
+
+
 def test_deleting_a_file_takes_its_resume_file_with_it(home, monkeypatch):
     """Nothing reaped a partial: it outlived the model, and glob("*.gguf")
     does not match ".part", so multi-GB of it was invisible in the library."""
