@@ -13,11 +13,47 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build sdist + wheel
+  # AUDIT 12-6: a GitHub Release can be published from any commit, and
+  # `release: published` fires immediately — in parallel with, or before, the
+  # `ci` workflow for the tag. Without this job the artifact that reached PyPI
+  # was never required to have passed a single test. Verify the tag names the
+  # version being released and run the suite before anything is built.
+  verify:
+    name: Verify the tagged commit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: the release tag must match the package version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["TAG"]
+          assert tag == f"v{version}", f"release tag {tag!r} != v{version}"
+          print(f"release tag {tag} matches pyproject version {version}")
+          PY
+      - run: pip install -e .[dev]
+      - run: ruff check src tests
+      - run: pytest -m "not hardware"
+
+  build:
+    name: Build sdist + wheel
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
