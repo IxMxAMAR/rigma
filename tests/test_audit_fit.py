@@ -190,7 +190,10 @@ def test_the_fit_reserves_the_windowed_cache():
     fits_blind = fit_gguf(blind, blind.ggufs[0], prof, ctx, [])
     honest = fit_gguf(spec, spec.ggufs[0], prof, ctx, [])
     assert fits_blind is not None and fits_blind.ngl == 99
-    assert honest is None or honest.ngl < 99 or honest.cache_type_k != "f16", \
+    # `honest is None` (no plan at all) is not the outcome this test is about,
+    # so require a plan and assert the cache/placement it chose instead.
+    assert honest is not None, "the honest fit produced no plan at all"
+    assert honest.ngl < 99 or honest.cache_type_k != "f16", \
         "promised full residency for 416 MiB the driver will page"
 
 

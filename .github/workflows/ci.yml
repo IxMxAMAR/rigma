@@ -5,7 +5,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        py: ["3.11", "3.12"]
+        py: ["3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,9 +36,11 @@ jobs:
         working-directory: frontend-v2
       - name: the committed bundle must match the source
         run: |
-          if ! git diff --quiet -- src/rigma/data/ui_v2; then
+          # `git status --porcelain` (not `git diff`) so untracked build output
+          # counts: a build that emits a new hashed chunk is stale too.
+          if [ -n "$(git status --porcelain -- src/rigma/data/ui_v2)" ]; then
             echo "::error::src/rigma/data/ui_v2 is stale - run 'npm run build' in frontend-v2/ and commit the result"
-            git diff --stat -- src/rigma/data/ui_v2
+            git status --porcelain -- src/rigma/data/ui_v2
             exit 1
           fi
 

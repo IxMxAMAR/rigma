@@ -90,20 +90,58 @@ def _norm(path: str) -> str:
     return path.replace("\\", "/").strip().lower()
 
 
+# A coverage line must name the lines it read: `L12`, `L12-L40`, `12-40`, or
+# say so explicitly (`(read fully)`). A bare path is not coverage.
+_LINE_RANGE = re.compile(r"\bL\d+\b|\bL?\d+\s*[-\u2013]\s*L?\d+\b", re.I)
+_READ_FULLY = re.compile(r"\bread fully\b|\bread in full\b|\bread the full\b", re.I)
+_PATH_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789_.-")
+
+
+def _has_line_range(line: str) -> bool:
+    return bool(_LINE_RANGE.search(line) or _READ_FULLY.search(line))
+
+
+def _mentions(line: str, want: str) -> bool:
+    """``want`` as a whole path, never as a substring of a longer name.
+
+    ``src/a.py`` must not be satisfied by ``src/a.py.bak``, and a ``tests/``
+    scope must not be satisfied by ``src/tests_helper.py``.
+    """
+    low = _norm(line)
+    start = 0
+    while True:
+        i = low.find(want, start)
+        if i < 0:
+            return False
+        before = low[i - 1] if i else ""
+        after = low[i + len(want)] if i + len(want) < len(low) else ""
+        if (not before or before in " \t,;([") and \
+                (not after or after not in _PATH_CHARS):
+            return True
+        start = i + 1
+
+
 def _coverage_gaps(files: list[str], text: str) -> list[str]:
-    """Planned files that no ``coverage:`` line accounts for, or that say NOT READ."""
+    """Planned files that no ``coverage:`` line accounts for.
+
+    A line counts only when it names the file as a whole path AND carries a
+    line-range token (``L12``, ``12-40``) or an explicit ``(read fully)``: the
+    module docstring promises "naming the lines it read", so a bare path is not
+    coverage. A ``NOT READ`` note on a line that *also* names line ranges is a
+    partial-read note (the rest of the file was out of scope) and is not a gap.
+    """
     lines = [ln for ln in text.splitlines() if ln.strip().lower().startswith("coverage:")]
     gaps: list[str] = []
     for f in files:
-        want = _norm(f)
-        if want.endswith("/"):
-            hits = [ln for ln in lines if want.rstrip("/") in _norm(ln)]
-        else:
-            hits = [ln for ln in lines if want in _norm(ln)]
+        want = _norm(f).rstrip("/")
+        hits = [ln for ln in lines if _mentions(ln, want)]
         if not hits:
             gaps.append(f"{f} (not mentioned in any coverage line)")
-        elif all(NOT_READ in ln.upper() for ln in hits):
-            gaps.append(f"{f} (marked NOT READ)")
+        elif not any(_has_line_range(ln) for ln in hits):
+            if any(NOT_READ in ln.upper() for ln in hits):
+                gaps.append(f"{f} (marked NOT READ)")
+            else:
+                gaps.append(f"{f} (no line range named)")
     return gaps
 
 

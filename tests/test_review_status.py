@@ -121,6 +121,47 @@ def test_coverage_marked_not_read_is_a_gap(tree):
     assert "NOT READ" in s.gaps[0]
 
 
+def test_a_path_without_a_line_range_is_not_coverage(tree):
+    """The docstring promises "naming the lines it read"; a bare path is not
+    evidence the file was opened."""
+    text = FULL.replace("coverage: src/a.py L1-L10 (read fully)",
+                        "coverage: src/a.py (read it)")
+    _write(tree, "docs/review/findings/01-alpha.md", text)
+    s = rs.scan(tree, rs.load_plan(tree / "docs/review/plan.tsv"))[0]
+    assert not s.ok
+    assert any("src/a.py" in g and "range" in g for g in s.gaps)
+
+
+def test_a_longer_sibling_name_does_not_cover_the_scoped_file(tree):
+    """src/a.py.bak is a different file; it must not satisfy src/a.py."""
+    text = FULL.replace("coverage: src/a.py L1-L10 (read fully)",
+                        "coverage: src/a.py.bak L1-L10 (read fully)")
+    _write(tree, "docs/review/findings/01-alpha.md", text)
+    s = rs.scan(tree, rs.load_plan(tree / "docs/review/plan.tsv"))[0]
+    assert not s.ok
+    assert "src/a.py" in s.gaps[0]
+
+
+def test_a_directory_scope_needs_a_path_boundary(tree):
+    """src/tests_helper.py is not under tests/."""
+    (tree / "docs" / "review" / "plan.tsv").write_text("05\tdir\ttests/\n", encoding="utf-8")
+    _write(tree, "docs/review/findings/05-dir.md",
+           "coverage: src/tests_helper.py L1-L9 (read fully)\n<!-- END 05 -->\n")
+    s = rs.scan(tree, rs.load_plan(tree / "docs/review/plan.tsv"))[0]
+    assert not s.ok
+    assert "tests/" in s.gaps[0]
+
+
+def test_a_partial_read_note_with_ranges_is_not_a_gap(tree):
+    """A NOT READ note that also names the lines read covers the rest of the
+    file being out of scope (areas 13 and 15 of the real review)."""
+    text = FULL.replace("coverage: src/b.py (read fully)",
+                        "coverage: src/b.py L1-L9 (read; L10-L40 not read)")
+    _write(tree, "docs/review/findings/01-alpha.md", text)
+    s = rs.scan(tree, rs.load_plan(tree / "docs/review/plan.tsv"))[0]
+    assert s.ok, s.gaps
+
+
 def test_coverage_matching_is_case_and_separator_insensitive(tree):
     text = FULL.replace("coverage: src/a.py L1-L10 (read fully)", "coverage: SRC\\A.PY L1-L10")
     _write(tree, "docs/review/findings/01-alpha.md", text)
@@ -133,7 +174,8 @@ def test_a_directory_scope_matches_by_prefix(tree):
     _write(
         tree,
         "docs/review/findings/05-dir.md",
-        "coverage: tests/test_a.py (read)\ncoverage: pyproject.toml (read)\n<!-- END 05 -->\n",
+        "coverage: tests/test_a.py L1-L10 (read fully)\n"
+        "coverage: pyproject.toml L1-L5 (read fully)\n<!-- END 05 -->\n",
     )
     s = rs.scan(tree, rs.load_plan(tree / "docs/review/plan.tsv"))[0]
     assert s.ok, s.gaps
@@ -151,7 +193,7 @@ def test_missing_lists_only_what_needs_redispatch(tree, capsys):
 def test_check_fails_until_every_area_is_complete_and_covered(tree):
     _write(tree, "docs/review/findings/01-alpha.md", FULL)
     assert rs.main(["--root", str(tree), "--check"]) == 1
-    _write(tree, "docs/review/findings/02-beta.md", "coverage: src/c.py (read)\n<!-- END 02 -->\n")
+    _write(tree, "docs/review/findings/02-beta.md", "coverage: src/c.py L1-L5 (read fully)\n<!-- END 02 -->\n")
     assert rs.main(["--root", str(tree), "--check"]) == 0
 
 

@@ -58,17 +58,20 @@ def test_alias_actually_runs_the_real_tool(tmp_path):
 
 # --- argument normalisation ---------------------------------------------------
 
-@pytest.mark.parametrize("tool,given,want", [
-    ("read_file", {"file": "a.md"}, "path"),
-    ("read_file", {"filepath": "a.md"}, "path"),
-    ("read_file", {"file_path": "a.md"}, "path"),
-    ("run_shell", {"cmd": "dir"}, "command"),
-    ("run_python", {"source": "print(1)"}, "code"),
-    ("find_files", {"glob": "**/*.py"}, "pattern"),
-    ("edit_file", {"old_string": "a", "new_string": "b", "path": "x"}, "old"),
+@pytest.mark.parametrize("tool,given,want,expected", [
+    ("read_file", {"file": "a.md"}, "path", "a.md"),
+    ("read_file", {"filepath": "a.md"}, "path", "a.md"),
+    ("read_file", {"file_path": "a.md"}, "path", "a.md"),
+    ("run_shell", {"cmd": "dir"}, "command", "dir"),
+    ("run_python", {"source": "print(1)"}, "code", "print(1)"),
+    ("find_files", {"glob": "**/*.py"}, "pattern", "**/*.py"),
+    ("edit_file", {"old_string": "a", "new_string": "b", "path": "x"},
+     "old", "a"),
 ])
-def test_alias_fills_the_declared_parameter(tool, given, want):
-    assert tools.normalize_tool_args(tool, given).get(want) is not None
+def test_alias_fills_the_declared_parameter(tool, given, want, expected):
+    # equality, not presence: `is not None` accepted "" or the wrong arg's
+    # value copied in, so a wrong alias mapping stayed green.
+    assert tools.normalize_tool_args(tool, given)[want] == expected
 
 
 def test_a_declared_parameter_is_never_treated_as_an_alias():
@@ -249,10 +252,21 @@ def test_concurrent_edits_do_not_lose_a_write(tmp_path):
 
 
 def test_file_lock_is_reentrant():
-    # a nested acquire on one thread must not deadlock
-    with tools._FILE_LOCK:
+    # a nested acquire on one thread must not deadlock. Run it on a worker and
+    # JOIN WITH A TIMEOUT: on the main thread a non-reentrant lock would hang
+    # the whole CI job instead of failing it.
+    done = []
+
+    def _nested():
         with tools._FILE_LOCK:
-            assert True
+            with tools._FILE_LOCK:
+                done.append(True)
+
+    t = threading.Thread(target=_nested, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "the file lock deadlocked on a nested acquire"
+    assert done == [True]
 
 
 # --- Windows long paths -------------------------------------------------------

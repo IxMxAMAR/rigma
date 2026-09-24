@@ -13,6 +13,7 @@ import sys
 import textwrap
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -125,6 +126,40 @@ def test_drive_turn_translates_the_stream_and_skips_a_malformed_line(
     assert events[2].name == "read_file" and events[2].args == {"path": "a.py"}
     assert events[3].name == "read_file" and events[3].ok is True
     assert events[-1].text == "final answer"
+    assert not [e for e in events if e.kind == "error"]
+
+
+# A recorded runner stream. `test_harness_dsh_live.py` is the only end-to-end
+# proof of the seam and it is skipif'd without a DSH checkout, so CI never saw
+# the event shapes the runner actually emits. This replay is unconditional.
+GOLDEN = Path(__file__).parent / "golden" / "dsh_turn.ndjson"
+
+
+def test_a_recorded_turn_replays_through_the_translation(monkeypatch, tmp_path):
+    """Replay the committed NDJSON stream of one DSH turn.
+
+    The fixture is synthesised from the documented runner event shapes (never a
+    real session), but it is the CI-visible guard: if `_event_for` stops
+    translating `thinking`/`tool`/`tool_result`, or the final `done` stops
+    surfacing, this fails on a machine with no DSH checkout.
+    """
+    home = _fake_home(tmp_path)
+    script = tmp_path / "replay_runner.py"
+    script.write_text(
+        "import pathlib, sys\n"
+        f"sys.stdout.write(pathlib.Path({str(GOLDEN)!r}).read_text("
+        "encoding='utf-8'))\n"
+        "sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    events = _drive(monkeypatch, [sys.executable, str(script)], home)
+
+    assert [e.kind for e in events] == [
+        "notice", "thinking", "tool", "tool_result", "text", "text"]
+    assert events[2].name == "list_directory"
+    assert events[2].args == {"path": "."}
+    assert events[3].name == "list_directory" and events[3].ok is True
+    assert events[-1].text == "There are two Python files in the workspace."
     assert not [e for e in events if e.kind == "error"]
 
 
