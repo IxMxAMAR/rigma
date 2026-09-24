@@ -71,6 +71,25 @@ def test_session_exec_rejects_a_non_boolean_grant(tmp_path, monkeypatch):
         assert "confirm_exec" in str(e)
 
 
+def test_memory_list_and_forget(tmp_path, monkeypatch):
+    """IMP-6: the CLI can see what Rigma learned and delete one rule."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma.memory import MemoryStore
+    store = MemoryStore(tmp_path / "memory" / "memories.jsonl")
+    m = store.add(kind="pitfall", text="Never type filenames.")
+
+    res = runner.invoke(cli.app, ["memory", "list"])
+    assert res.exit_code == 0
+    assert m["id"] in res.output and "Never type filenames." in res.output
+
+    res = runner.invoke(cli.app, ["memory", "forget", m["id"]])
+    assert res.exit_code == 0 and "forgot" in res.output
+    assert store.all() == []
+
+    res = runner.invoke(cli.app, ["memory", "forget", "nope"])
+    assert res.exit_code == 1 and "no such memory" in res.output
+
+
 def test_plan_explain(monkeypatch):
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
     res = runner.invoke(cli.app, ["plan", "--use-case", "coding", "--explain"])

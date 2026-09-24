@@ -382,6 +382,93 @@ class MemoryStore:
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
 
+    # --- inspect / correct / forget (the trust surface) ----------------------
+    # Rigma silently learns rules and injects them into later prompts, so the
+    # user must be able to see what it believes, fix a wrong rule and delete an
+    # obsolete one. Every mutation is a read-modify-write under ONE lock: a fix
+    # that raced a scoring pass would otherwise either lose the fix or write the
+    # old text back.
+
+    # Fields a person may correct. `id` is the row's identity and must stay put;
+    # `vec` must track `text`, so it is recomputed rather than edited; `born`,
+    # `last_seen` and the counters are evidence, not opinion.
+    EDITABLE = ("text", "kind", "status", "outcome_score")
+    STATUSES = ("draft", "verified", "retired")
+    _KIND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+    def update(self, mid: str, **fields) -> dict | None:
+        """Correct one memory in place. Returns the updated row, or None when
+        no such id. Raises ValueError for a value the store would refuse."""
+        changes = {k: v for k, v in fields.items() if k in self.EDITABLE}
+        if not changes:
+            return None
+        with self._xlock():
+            rows = self.all()
+            hit = next((r for r in rows if r.get("id") == mid), None)
+            if hit is None:
+                return None
+            if "text" in changes:
+                text = str(changes["text"] or "").strip()
+                if not text:
+                    raise ValueError("empty memory")
+                changes["text"] = text
+            kind = str(changes.get("kind", hit.get("kind", "")) or "").strip()
+            if "kind" in changes:
+                if not self._KIND_RE.match(kind):
+                    raise ValueError(
+                        "kind: 1-32 chars of a-z, 0-9, _ or -")
+                changes["kind"] = kind
+            if "status" in changes:
+                status = str(changes["status"] or "")
+                if status not in self.STATUSES:
+                    raise ValueError("status: must be one of "
+                                     + "/".join(self.STATUSES))
+                changes["status"] = status
+            if "outcome_score" in changes:
+                try:
+                    changes["outcome_score"] = int(changes["outcome_score"])
+                except (TypeError, ValueError):
+                    raise ValueError("outcome_score: must be an integer") from None
+            # The same anchoring guard `add` applies: an edit is another way to
+            # put a raw failure transcript into a behavioural rule.
+            if ("text" in changes or "kind" in changes) \
+                    and kind not in _GUARD_EXEMPT_KINDS \
+                    and looks_like_raw_trace(
+                        str(changes.get("text", hit.get("text", "")))):
+                raise ValueError(
+                    "refusing to store a raw trace as a behavioural rule: "
+                    "distil it into an imperative first")
+            hit.update(changes)
+            if "text" in changes:
+                hit["vec"] = embed_one(hit["text"], purpose="doc")
+            hit["edited"] = time.time()
+            self._write_all(rows)
+            return hit
+
+    def delete(self, mid: str) -> bool:
+        """Forget one memory. Returns whether anything was removed."""
+        with self._xlock():
+            rows = self.all()
+            keep = [r for r in rows if r.get("id") != mid]
+            if len(keep) == len(rows):
+                return False
+            self._write_all(keep)
+            return True
+
+    def delete_many(self, ids) -> int:
+        """Forget a selection. An empty selection removes NOTHING — a prune
+        that lost its ids must not empty the store."""
+        want = {str(i) for i in (ids or []) if str(i)}
+        if not want:
+            return 0
+        with self._xlock():
+            rows = self.all()
+            keep = [r for r in rows if r.get("id") not in want]
+            gone = len(rows) - len(keep)
+            if gone:
+                self._write_all(keep)
+            return gone
+
 
 # --- embeddings (optional, never load-bearing) -------------------------------
 
