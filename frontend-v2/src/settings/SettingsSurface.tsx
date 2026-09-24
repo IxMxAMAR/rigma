@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useState } from "react";
 
 import LoadError from "../LoadError";
+import InlineError from "../InlineError";
 import { engineApi } from "../lib/engineApi";
-import { readList } from "../lib/listFetch";
+import { readList, responseError } from "../lib/listFetch";
 import { openaiBase } from "../lib/openaiBase";
 
 interface Preset {
@@ -25,6 +26,7 @@ export default function SettingsSurface() {
   const [editing, setEditing] = useState<string | null>(null); // preset id
   const [err, setErr] = useState<string | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [rowErr, setRowErr] = useState<string | null>(null);
   // AUDIT F11-6: this card used to hardcode `http://127.0.0.1:11499/v1` and
   // call it Rigma's OpenAI API. 11499 is llama-server's upstream port, so a
   // backend pointed there bypasses the session, the tool-call repair and the
@@ -82,6 +84,7 @@ export default function SettingsSurface() {
             Click a preset to edit it. Built-ins can be viewed, not changed —
             apply presets to a chat from the chat's ⚙ panel.
           </p>
+          {rowErr && <InlineError message={`could not delete: ${rowErr}`} />}
           <ul className="flex flex-col gap-1 mb-3">
             {presets.map((p) => (
               <li key={p.id}
@@ -103,11 +106,20 @@ export default function SettingsSurface() {
                 </span>
                 {!isBuiltin(p) && (
                   <button
-                    className="opacity-0 group-hover:opacity-100 text-muted hover:text-red px-1"
+                    className="text-muted hover:text-red px-1"
                     aria-label={`delete preset ${p.name}`}
                     onClick={async (e) => {
                       e.stopPropagation();
-                      await fetch(`/api/presets/${p.id}`, { method: "DELETE" });
+                      setRowErr(null);
+                      // AUDIT F11-4: this ignored r.ok and refreshed, so a
+                      // refused delete looked exactly like one that worked.
+                      const r = await fetch(
+                        `/api/presets/${encodeURIComponent(p.id)}`,
+                        { method: "DELETE" });
+                      if (!r.ok) {
+                        setRowErr(await responseError(r));
+                        return;
+                      }
                       if (editing === p.id) setEditing(null);
                       void refresh();
                     }}
