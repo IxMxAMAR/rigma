@@ -175,9 +175,46 @@ def data_home() -> Path:
     return path
 
 
+# AUDIT 13-6: mcode is a third-party autonomous agent with its own shell and
+# network tools, so `{**os.environ}` handed it HF_TOKEN, GEMINI_API_KEY,
+# TAVILY_API_KEY and every other secret the owner had exported — readable by
+# `printenv` and by anything mcode spawns. Only what a CLI needs to START and
+# find its own caches is passed. A setup that genuinely needs one more name
+# opts it in explicitly with RIGMA_MCODE_ENV_PASSTHROUGH (comma-separated
+# names; a trailing `*` passes a whole namespace), which keeps the old
+# behaviour reachable without making it the default.
+_ENV_ALLOWLIST = (
+    # launching a child process
+    "PATH", "PATHEXT", "SystemRoot", "SystemDrive", "windir", "COMSPEC",
+    "ComSpec",
+    # temp + home, so the child's own caches and config resolve
+    "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    # locale / terminal, so it does not render mojibake
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+    # TLS + proxy knobs the owner may need behind a corporate proxy
+    "NODE_EXTRA_CA_CERTS", "NODE_OPTIONS", "NODE_PATH",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+)
+
+
 def _env() -> dict:
-    return {**os.environ, "MINIMAX_DATA_DIR": str(data_home()),
-            API_KEY_ENV: _API_KEY}
+    env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+    extra = (os.environ.get("RIGMA_MCODE_ENV_PASSTHROUGH") or "").strip()
+    for name in (n.strip() for n in extra.split(",")):
+        if not name:
+            continue
+        if name.endswith("*"):          # a namespace, e.g. MY_MCODE_*
+            pre = name[:-1]
+            env.update({k: v for k, v in os.environ.items()
+                        if k.startswith(pre)})
+        elif name in os.environ:
+            env[name] = os.environ[name]
+    env["MINIMAX_DATA_DIR"] = str(data_home())
+    env[API_KEY_ENV] = _API_KEY
+    return env
 
 
 # Rigma's one channel into the agent, and it is the agent's OWN documented one:
