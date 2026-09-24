@@ -534,12 +534,23 @@ def _tool_surface(run_id: str) -> str:
     return want if want in ("all", "focused") else "all"
 
 
-def _prompt_caps(registry=None, *, run_id: str = "run") -> set[str]:
+def _prompt_caps(registry=None, *, run_id: str = "run",
+                 profile: str = "all") -> set[str]:
     """The capabilities the agent prompt may describe: what the model can do,
-    and what its surface actually carries."""
+    and what its surface actually carries.
+
+    `profile` is the run profile, and it is load-bearing (AUDIT 05-1):
+    `tools.tool_specs` withholds `kind == "exec"` under `confined` and the
+    network tools under `no-network`, so a prompt built without the profile told
+    a confined run to call `run_shell`/`run_python` — tools its own surface had
+    already dropped and `use_tools` cannot unlock."""
     caps = {"vision"} if _engine_has_vision(registry) else set()
     if _tool_surface(run_id) == "all":
         caps.add("extended")
+    if profile != "confined":
+        caps.add("exec")
+    if profile != "no-network":
+        caps.add("network")
     return caps
 
 
@@ -4923,7 +4934,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception:
             pass                   # memory is never load-bearing
         agent_prompt = _prompt.agent_prompt_with_memory(
-            _mem_block, caps=_prompt_caps(registry))
+            _mem_block, caps=_prompt_caps(registry, profile=profile))
         sess.update(use_tools=True, allow_code=True, auto_compact=True,
                     workspace=workspace,
                     mission=mission,       # replaced by the compiled spec
