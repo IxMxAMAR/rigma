@@ -3192,8 +3192,13 @@ def _start_job(args, ctx):
     except Exception as e:
         return f"error: could not start job: {e}"
     jid = max(_JOBS, default=0) + 1
+    # AUDIT 03-3: record WHO started this job. stop_run used to call
+    # kill_all_jobs unconditionally, so pressing Stop on an autonomous run
+    # killed a model download the owner had started in a normal chat. An empty
+    # run_id means "a chat started it" and is never matched by a run.
     job = {"proc": proc, "chunks": deque(), "buflen": 0,
-           "lock": threading.Lock(), "cmd": cmd[:500], "started": time.time()}
+           "lock": threading.Lock(), "cmd": cmd[:500], "started": time.time(),
+           "run_id": str(ctx.get("run_id") or "")}
     _JOBS[jid] = job
     for stream, label in ((proc.stdout, "out"), (proc.stderr, "err")):
         threading.Thread(target=_job_pump, args=(job, stream, label),
@@ -3255,6 +3260,36 @@ def _kill_job(args, ctx):
     # tree died, rebinds the same port and gets "address in use" (AUDIT F35).
     return (f"error: could not confirm job {jid} (pid {job['proc'].pid}) "
             "stopped — it may still be running; check with job_output")
+
+
+# AUDIT 03-3: the ownership-filtered teardown. `stop_run` uses this so an
+# autonomous run's Stop cannot kill a job a normal chat started; the process
+# shutdown hook keeps `kill_all_jobs`, because at shutdown there is no "other"
+# owner left to protect.
+def kill_jobs_for_run(run_id: str) -> int:
+    """Kill the still-running background jobs STARTED BY `run_id`.
+
+    Returns how many were killed. An empty/falsy `run_id` matches nothing —
+    "no run" is a chat, not a run, and must never be treated as a wildcard.
+    Entries are left in `_JOBS` for the same reason as `kill_all_jobs`: so
+    `job_output` can still report the exit code of a job killed mid-run.
+    Never raises — it runs on a cancellation path."""
+    want = str(run_id or "")
+    if not want:
+        return 0
+    killed = 0
+    for job in list(_JOBS.values()):
+        try:
+            if str(job.get("run_id") or "") != want:
+                continue
+            proc = job.get("proc")
+            if proc is None or proc.poll() is not None:
+                continue
+            _kill_tree(proc.pid, proc)
+            killed += 1
+        except Exception:
+            pass
+    return killed
 
 
 # AUDIT F31: docs/audit-2026-09-04-full.md
