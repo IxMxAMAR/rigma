@@ -401,27 +401,40 @@ def log_tool_action(run_id: str, name: str, args, result: str,
 _LOG_TAIL_BYTES = 64 * 1024
 
 
-def get_log_tail(run_id: str, n: int = 5) -> str:
-    p = run_dir(run_id) / "progress.md"
+def read_tail_bytes(path, max_bytes: int = _LOG_TAIL_BYTES) -> tuple[str, bool]:
+    """The last `max_bytes` of a text file, decoded. Returns (text, truncated).
+
+    Never reads more than the bound: an engine log on a long-running server is
+    hundreds of megabytes, and the whole-file read this replaces was the reason
+    opening the log page slowed the server down. A first line cut in half by
+    the seek is dropped, so no caller sees a fragment that reads as a whole
+    line. IMP-11 shares this with the engine-log route instead of each writing
+    its own seek-and-split.
+    """
     try:
-        size = p.stat().st_size
+        size = Path(path).stat().st_size
     except OSError:
-        return ""
+        return "", False
     try:
-        with open(p, "rb") as f:
-            if size > _LOG_TAIL_BYTES:
-                f.seek(size - _LOG_TAIL_BYTES)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
                 data = f.read()
-                nl = data.find(b"\n")       # the first line may be cut in half
+                nl = data.find(b"\n")
                 if nl >= 0:
                     data = data[nl + 1:]
-            else:
-                data = f.read()
+                return data.decode("utf-8", "replace"), True
+            return f.read().decode("utf-8", "replace"), False
     except Exception:
-        return ""
-    lines = data.decode("utf-8", "replace").splitlines()
+        return "", False
+
+
+def get_log_tail(run_id: str, n: int = 5) -> str:
+    p = run_dir(run_id) / "progress.md"
+    text, truncated = read_tail_bytes(p)
+    lines = text.splitlines()
     prog = [ln for ln in lines if "->  next:" in ln]
-    if not prog and size > _LOG_TAIL_BYTES:
+    if not prog and truncated:
         # the last 64 KB held no progress lines (a huge tool dump, say) —
         # fall back to the whole file rather than report nothing
         try:

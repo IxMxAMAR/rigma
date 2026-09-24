@@ -3311,9 +3311,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.get("/api/server/log")
     async def server_log(lines: int = 200):
+        """A BOUNDED tail of the current engine log.
+
+        IMP-11: the read is bounded by bytes (see server_ops.log_tail_bounded),
+        so this no longer pulls a multi-hundred-megabyte log through the event
+        loop to show 200 lines. `x-log-truncated` says whether older lines
+        exist — a viewer that filters should say "not in this window" rather
+        than "not in the log".
+        """
         from . import server_ops
-        return Response(server_ops.log_tail(lines), media_type="text/plain",
-                        headers=_NO_STORE)
+        text, truncated = await asyncio.to_thread(
+            server_ops.log_tail_bounded, lines)
+        return Response(text, media_type="text/plain",
+                        headers={**_NO_STORE,
+                                 "x-log-truncated": "1" if truncated else "0"})
 
     @app.get("/api/server/findings")
     async def server_findings():
