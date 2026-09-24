@@ -833,13 +833,14 @@ def stop():
     if s is None:
         typer.echo("not running")
         raise typer.Exit(0)
-    for key in ("engine_pid", "ui_pid"):
-        if st.pid_alive(int(s.get(key, -1))):
-            st.kill_pid(int(s[key]))
+    killed = [key for key in ("engine_pid", "ui_pid") if st.kill_recorded(s, key)]
     from . import rag as _rag
     _rag.stop_sidecar()
     st.clear_state()
-    typer.echo("stopped")
+    # AUDIT F08-1: this used to print "stopped" unconditionally, so a record
+    # whose pid had been recycled read as a successful stop while the process
+    # it now named was left running — or, before the identity check, killed.
+    typer.echo("stopped" if killed else "stale state — nothing was killed")
 
 
 def _wants_vision(spec) -> bool:
@@ -922,8 +923,8 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             serve.run_ui(port, port - 1)
         finally:
             s_end = st.read_state()
-            if s_end and st.pid_alive(int(s_end.get("engine_pid", -1))):
-                st.kill_pid(int(s_end["engine_pid"]))
+            if s_end:
+                st.kill_recorded(s_end, "engine_pid")   # AUDIT F08-1: identity-checked
             st.clear_state()
         return
 
@@ -1131,8 +1132,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         serve.run_ui(port, port - 1)
     finally:
         s_end = st.read_state()
-        if s_end and st.pid_alive(int(s_end.get("engine_pid", -1))):
-            st.kill_pid(int(s_end["engine_pid"]))   # engine may have been switched
+        if s_end:
+            # AUDIT F08-1: identity-checked — the engine may have been switched
+            st.kill_recorded(s_end, "engine_pid")
         try:
             sp.stop()
         except Exception:
