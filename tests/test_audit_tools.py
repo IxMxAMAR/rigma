@@ -248,8 +248,8 @@ def test_two_parallel_image_calls_do_not_swap_their_notes(tmp_path, monkeypatch)
     real = tools._fuzzy_file
     both_resolved = threading.Barrier(2, timeout=20)
 
-    def synced(p):
-        got = real(p)
+    def synced(p, ctx=None):
+        got = real(p, ctx)
         both_resolved.wait()      # neither call may drain a shared list yet
         return got
 
