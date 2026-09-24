@@ -1654,6 +1654,59 @@ _BROWSER_PROFILE_RE = re.compile(
     r"|vivaldi|librewolf)[\\/]")
 
 
+def credential_exclude_globs() -> list[str]:
+    """The same rules as above, as raggity `exclude` globs.
+
+    AUDIT R3-11: the credential denylist was enforced on the TOOL read path only.
+    `rag.add_source` took any path with no validation, and everything under it was
+    embedded into the local vector index — so adding a home directory or Documents
+    put `.env`, `.ssh/id_rsa`, `.git-credentials` and browser cookie DBs into the
+    index, where `search_my_documents` (a `safe=True`, auto-run tool) retrieved them
+    with no confirmation. That defeats the premise the denylist is built on ("the
+    model has no legitimate reason to put a key into the conversation") through a
+    door 13-2 never considered part of the same surface.
+
+    DERIVED from `_CREDENTIAL_FILES`/`_CREDENTIAL_DIRS` rather than written out
+    again, because a second hand-maintained copy of a denylist is how the first one
+    gets bypassed — that is exactly how R3-2 and R3-11 both happened. A file added
+    to the tuple above is excluded from indexing by construction.
+
+    THE `.*` VARIANTS ARE NOT PADDING. Measured against real raggity 0.13.0: with
+    only the patterns derived from `_CREDENTIAL_FILES`, a file named
+    `credentials.md` or `my.api_key.md` **still got indexed and was still
+    retrievable** (`**/credentials` and `**/*.api_key` are exact basenames, and an
+    appended extension defeats both) — so a README explaining your key rotation, or
+    a `.env.md` note, would have carried its name into the index while the real
+    `.env` was correctly skipped. `fnmatch` has the same gap on the tool read path
+    (`credentials.md` is readable there), and that asymmetry is deliberate: this is
+    the stricter side, because the index is consulted by an auto-run tool with no
+    human in the loop.
+    """
+    globs = [f"**/{pat}" for pat in _CREDENTIAL_FILES]
+    # The same pattern with an extension appended. Measured against real raggity
+    # 0.13.0, WITHOUT this every one of these was indexed and retrievable:
+    # `credentials.md`, `my.api_key.md`, `credentials.json.md`, `token_api_key.txt`
+    # and `server.pem.txt` — because `**/credentials` and `**/*.pem` are exact
+    # basenames and an appended extension defeats all of them. The reachable case is
+    # a README about key rotation, or a `.env.md` note: its NAME carries the secret's
+    # identity into an index an auto-run tool reads.
+    for pat in _CREDENTIAL_FILES:
+        if pat.startswith("*"):
+            # `*.pem` -> `*.pem.*`, i.e. `server.pem.txt`. `*` already spans a dot
+            # in this glob dialect, so `*` + `.pem.*` cannot over-match a name that
+            # does not end in the credential extension.
+            globs.append(f"**/{pat}.*")
+        elif "." not in pat:
+            # a bare name: `credentials` -> `credentials.*`
+            globs.append(f"**/{pat}.*")
+    globs += [f"**/{d}/**" for d in sorted(_CREDENTIAL_DIRS)]
+    # the browser-profile shapes, as the directory names raggity can match on
+    globs += ["**/Login Data", "**/Cookies", "**/cookies.sqlite",
+              "**/logins.json", "**/key4.db"]
+    return globs
+
+
+
 def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
     """Why `p` may not be read, or "" when it may.
 
