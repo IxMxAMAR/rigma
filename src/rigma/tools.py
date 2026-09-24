@@ -1475,6 +1475,92 @@ def _recall(args, ctx):
     return body
 
 
+# A grep/find budget has to bound the INPUT, not the output. The old grep read
+# every file under the workspace (up to 2 MB each, no cap on count or bytes) and
+# `find_files`' "cap the WALK at 5000" counted only file HITS, so a tree of
+# 8000 directories + 3 files walked all 8000 (14-3).
+_GREP_MAX_FILES = 2000
+_GREP_MAX_BYTES = 256 << 20          # 256 MB of file content per grep call
+_GREP_MAX_VISITED = 20000            # directory entries examined per grep call
+_WALK_MAX_ENTRIES = 5000             # directory entries examined by find_files
+
+
+def _glob_re(pat: str) -> re.Pattern:
+    """Compile a path glob the way `Path.glob` reads it: `**` crosses
+    directories (and may match none of them), `*` and `?` do not. `Path.glob`
+    is lazy but cannot prune, so the walkers below match as they go."""
+    out, i, n = [], 0, len(pat)
+    while i < n:
+        c = pat[i]
+        if c == "*":
+            if pat.startswith("**", i):
+                i += 2
+                if i < n and pat[i] == "/":
+                    i += 1
+                    out.append("(?:.*/)?")
+                else:
+                    out.append(".*")
+                continue
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "[":
+            j = i + 1
+            if j < n and pat[j] in "!^":
+                j += 1
+            if j < n and pat[j] == "]":
+                j += 1
+            while j < n and pat[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(re.escape(c))
+            else:
+                inner = pat[i + 1:j]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                out.append("[" + inner + "]")
+                i = j + 1
+                continue
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.compile("(?s:" + "".join(out) + r")\Z")
+
+
+def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict):
+    """Files under `root` whose root-relative posix path matches `rx_glob`.
+
+    Walks with `os.walk` so `IGNORE_DIRS` is pruned BEFORE descending, and
+    counts every directory entry it sees into `state["visited"]` — the caller
+    bounds the WALK, not just the hits. `state["max_visited"]` stops it and
+    sets `state["truncated"]`. A symlinked file is the one way a name under the
+    root can resolve outside it, so only symlinks pay a `resolve()`.
+    """
+    from .watch import IGNORE_DIRS
+    max_visited = state.get("max_visited")
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        state["visited"] = state.get("visited", 0) + len(dirnames) + len(filenames)
+        if max_visited is not None and state["visited"] > max_visited:
+            state["truncated"] = True
+            return
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIRS)
+        for name in sorted(filenames):
+            p = Path(dirpath) / name
+            try:
+                rel = p.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if not rx_glob.match(rel):
+                continue
+            if p.is_symlink():
+                try:
+                    if not p.resolve().is_relative_to(root):
+                        continue
+                except OSError:
+                    continue
+            yield p
+
+
 @tool("find_files",
       "Find files by glob pattern inside the workspace (e.g. '**/*.py', "
       "'src/*.js'). Like a file search. Returns up to 200 paths; if more match, "
@@ -1483,22 +1569,25 @@ def _recall(args, ctx):
           "pattern": {"type": "string"}}, "required": ["pattern"]},
       needs="workspace")
 def _find_files(args, ctx):
-    import itertools
     root = _ws_path(ctx, ".")
     pat = str(args.get("pattern", "*"))
-    # cap the WALK at 5000 so `**/*` on a huge tree can't stall/OOM (glob is
-    # lazy; islice stops it early) — then sort the bounded set for stable output
-    scanned = list(itertools.islice(
-        (p for p in root.glob(pat)
-         if p.is_file() and p.resolve().is_relative_to(root)), 5000))
-    all_hits = sorted(scanned)
-    hits = [p.relative_to(root).as_posix() for p in all_hits[:200]]
-    if not hits:
-        return f"no files match {pat}"
-    body = "\n".join(hits)
+    rx_glob = _glob_re(pat)
+    state = {"visited": 0, "truncated": False, "max_visited": _WALK_MAX_ENTRIES}
+    all_hits = list(_iter_workspace_files(root, rx_glob, state))
+    hits = [p.relative_to(root).as_posix() for p in sorted(all_hits)[:200]]
+    notes = []
     if len(all_hits) > 200:
-        more = f"{len(all_hits)}+" if len(scanned) == 5000 else str(len(all_hits))
-        body += f"\n…(showing 200 of {more} matches — narrow the pattern)"
+        more = f"{len(all_hits)}+" if state["truncated"] else str(len(all_hits))
+        notes.append(f"showing 200 of {more} matches — narrow the pattern")
+    if state["truncated"]:
+        notes.append(f"stopped after examining {state['visited']} entries — "
+                     f"narrow the pattern")
+    if not hits:
+        return ("no files match " + pat
+                + ("\n…(" + "; ".join(notes) + ")" if notes else ""))
+    body = "\n".join(hits)
+    if notes:
+        body += "\n…(" + "; ".join(notes) + ")"
     return body
 
 
@@ -1521,13 +1610,24 @@ def _grep(args, ctx):
     except re.error as e:
         return f"error: bad regex: {e}"
     glob = str(args.get("glob", "") or "**/*")
+    rx_glob = _glob_re(glob)
     out, seen = [], 0
-    for p in sorted(root.glob(glob)):
-        # a symlink named in the glob can point outside the root; glob won't
-        # re-check, so resolve and confirm containment before reading
-        if (not p.is_file() or p.stat().st_size > 2_000_000
-                or not p.resolve().is_relative_to(root)):
+    files_read = 0
+    bytes_read = 0
+    state = {"visited": 0, "truncated": False,
+             "max_visited": _GREP_MAX_VISITED}
+    for p in _iter_workspace_files(root, rx_glob, state):
+        if files_read >= _GREP_MAX_FILES or bytes_read >= _GREP_MAX_BYTES:
+            state["truncated"] = True
+            break
+        try:
+            size = p.stat().st_size
+        except OSError:
             continue
+        if size > 2_000_000:
+            continue
+        files_read += 1
+        bytes_read += size
         try:
             for i, line in enumerate(p.read_text(encoding="utf-8",
                                                  errors="ignore").splitlines(), 1):
@@ -1541,6 +1641,11 @@ def _grep(args, ctx):
                                   "pattern or add a `glob` to see the rest)")
         except OSError:
             continue
+    if state["truncated"]:
+        note = (f"…(searched the first {files_read} files / "
+                f"{bytes_read // (1 << 20)} MB — narrow the pattern or add a "
+                f"`glob` to see the rest)")
+        return ("\n".join(out) + "\n" + note) if out else "no matches\n" + note
     return "\n".join(out) if out else "no matches"
 
 
