@@ -38,6 +38,20 @@ def test_status_not_running(tmp_path, monkeypatch):
     assert res.exit_code == 0 and "not running" in res.output.lower()
 
 
+def test_status_ui_only_reports_no_model(tmp_path, monkeypatch):
+    """AUDIT F15-2: the record `rigma up` (no model) writes has model="" and
+    unloaded=True; status used to print `running:  ()`, which reads as broken."""
+    import os
+    from rigma import state as st
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    st.write_state("", "", 11500, engine_pid=-1, ui_pid=os.getpid(),
+                   backend="", use_case="general", ctx=0, unloaded=True)
+    res = runner.invoke(cli.app, ["status"])
+    assert res.exit_code == 0
+    assert "no model loaded" in res.output
+    assert "running:  ()" not in res.output
+
+
 def test_stop_when_not_running(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     res = runner.invoke(cli.app, ["stop"])
