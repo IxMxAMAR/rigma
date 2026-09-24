@@ -374,3 +374,69 @@ def test_mining_through_the_real_trace_roundtrip(tmp_path, monkeypatch):
     _r.append_action(run["id"], "write_file", base, ok=False)
     events = mine_events(_r.read_actions(run["id"]))
     assert [e for e in events if e["kind"] == "loop"]
+
+
+# ---- concurrency (store had no lock and one fixed memories.tmp) ----
+
+def test_concurrent_writers_do_not_lose_memories(tmp_path, monkeypatch):
+    # The store had no lock and every writer shared the fixed temp path
+    # memories.tmp, so two concurrent writers lost most adds (review measured
+    # 60 concurrent writes -> 14 stored, plus PermissionError WinError 32 on
+    # the shared temp file). The patched all() widens the read->write window so
+    # the outcome is deterministic: without a lock every writer reads the empty
+    # store before any of them writes, and 7 of 8 adds vanish.
+    import threading
+    import time as _time
+    from rigma import memory
+    monkeypatch.setattr(memory, "embed_one", lambda *a, **k: None)
+    real_all = MemoryStore.all
+
+    def slow_all(self):
+        rows = real_all(self)
+        _time.sleep(0.02)
+        return rows
+
+    monkeypatch.setattr(MemoryStore, "all", slow_all)
+    store = MemoryStore(tmp_path / "m.jsonl")
+    n = 8
+    barrier = threading.Barrier(n)
+    errors = []
+
+    def writer(i):
+        try:
+            barrier.wait(timeout=10)        # line all writers up
+            store.add(kind="pitfall", text=f"Concurrent rule number {i}.")
+        except Exception as e:              # noqa: BLE001 — surfaced below
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not errors, errors
+    texts = {m["text"] for m in store.all()}
+    assert texts == {f"Concurrent rule number {i}." for i in range(n)}, texts
+
+
+def test_a_score_committed_during_consolidation_survives(tmp_path, monkeypatch):
+    # add_consolidated read its rows BEFORE awaiting the conflict gate and wrote
+    # that snapshot back after: a +1 committed while the gate was answering was
+    # silently clobbered. Single event loop — a plain interleaving bug.
+    from rigma import memory
+    monkeypatch.setattr(memory, "embed_one", lambda *a, **k: [1.0, 0.0])
+    store = MemoryStore(tmp_path / "m.jsonl")
+    old = store.add(kind="pitfall", text="Prefer q8_0 cache.")
+
+    async def complete(prompt):
+        # a completed step credits the old rule while the gate is "thinking"
+        memory.score_memories(store, [old["id"]], +1, run_id="other-run")
+        return "DUPLICATE"
+
+    result = _run(memory.add_consolidated(store, "pitfall",
+                                          "Prefer q8_0 cache, honestly.",
+                                          complete))
+    row = next(m for m in store.all() if m["id"] == old["id"])
+    assert row["outcome_score"] == 1, row
+    assert row["seen_count"] == 2, row
+    assert result is not None
