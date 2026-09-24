@@ -648,7 +648,7 @@ def test_prefix_warm_and_snapshot_run_off_the_event_loop(home, engine,
     where = {}
 
     def _spy(key):
-        def _f(_msgs):
+        def _f(_msgs, _chain=""):
             try:
                 asyncio.get_running_loop()
                 where[key] = "event loop"
@@ -688,6 +688,7 @@ def test_a_snapshot_is_not_skipped_after_the_engine_was_replaced(
         prefixcache, "warm",
         lambda port, d, key, slot=0: restored.append(key) or None)
     monkeypatch.setitem(serve._PREFIX_STATE, "warm_key", "")
+    monkeypatch.setitem(serve._PREFIX_STATE, "last_points", {})
 
     msgs = [{"role": "user", "content": "hi"}]
     serve._prefix_warm(msgs)
@@ -713,9 +714,55 @@ def test_a_snapshot_is_not_skipped_after_the_engine_was_replaced(
                             n_messages=2, key="K2", approx_tokens=20000)])
     monkeypatch.setattr(prefixcache, "snapshot",
                         lambda port, d, key, slot=0, meta=None: None)
-    monkeypatch.setitem(serve._PREFIX_STATE, "last_point", None)
+    monkeypatch.setitem(serve._PREFIX_STATE, "last_points", {})
     serve._prefix_snapshot(msgs)
     assert serve._PREFIX_STATE["warm_key"] == "pid-2:K2"
+
+
+def test_a_long_chat_does_not_suppress_a_new_chats_snapshot(monkeypatch,
+                                                            tmp_path):
+    """AUDIT 02-5: the growth heuristic used ONE process-wide `last_point`.
+
+    A 60-message/60K-token chat A therefore made a new chat B that had grown
+    past the snapshot floor but not past A look like it had not grown at all
+    (`point.n_messages <= last.n_messages`), so B was never snapshotted and
+    re-prefilled from zero after a restart. Each chain now measures its own
+    growth.
+    """
+    from rigma import prefixcache
+
+    def _point(key, tokens, n):
+        return prefixcache.PrefixPoint(n_messages=n, key=key,
+                                       approx_tokens=tokens)
+
+    taken: list = []
+    monkeypatch.setattr(serve, "_prefix_ctx",
+                        lambda: (1, tmp_path, "FP", "gen"))
+    monkeypatch.setattr(prefixcache, "snapshot",
+                        lambda port, d, key, slot=0, meta=None:
+                        taken.append(key) or None)
+    monkeypatch.setitem(serve._PREFIX_STATE, "last_points", {})
+
+    # chat A: a long conversation, snapshotted at 60K
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [_point("A", 60000, 60)])
+    serve._prefix_snapshot([{"role": "user", "content": "a"}], "chat-A")
+    assert taken == ["A"]
+
+    # chat B: 30 messages/20K tokens in its OWN chain — well past the 4096-token
+    # floor, but "behind" A on both measures. Under the old global `last_point`
+    # this was suppressed; it must snapshot now.
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [_point("B", 20000, 30)])
+    serve._prefix_snapshot([{"role": "user", "content": "b"}], "chat-B")
+    assert taken == ["A", "B"], "chat B's snapshot was suppressed by chat A"
+
+    # ...and a second turn of B that has not grown enough is still suppressed,
+    # so the per-chain bookkeeping did not just disable the heuristic
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [_point("B2", 21000, 31)])
+    serve._prefix_snapshot([{"role": "user", "content": "b"}], "chat-B")
+    assert taken == ["A", "B"], "the growth floor stopped applying"
 
 
 # --------------------------------------------------------------------------

@@ -394,10 +394,10 @@ AUTO_COMPACT_KEEP = 16  # one action = TWO messages now (assistant + TOOL
 MAIN_SLOT = 0
 AUX_SLOT = 1
 
-# What the main slot is currently warm for, and where its last prefix snapshot
-# was taken. Deliberately in-process: losing it on restart costs one extra
-# restore, and persisting it would be another thing that could disagree with
-# what the engine actually holds.
+# What the main slot is currently warm for, and where each conversation's last
+# prefix snapshot was taken. Deliberately in-process: losing it on restart costs
+# one extra restore, and persisting it would be another thing that could
+# disagree with what the engine actually holds.
 #
 # `warm_key` is "<engine generation>:<prefix key>", not the bare prefix key.
 # It asserts what the LIVE engine's slot 0 holds, and that is only true while
@@ -407,7 +407,15 @@ AUX_SLOT = 1
 # restore and re-prefilled the whole history from a snapshot sitting on disk
 # (AUDIT 02-2). The generation changes on every launch, so the assertion cannot
 # outlive the process it describes.
-_PREFIX_STATE: dict = {"warm_key": "", "last_point": None}
+#
+# `last_points` is keyed by (config fingerprint, session), NOT one value for the
+# whole process. The growth heuristic is per-prefix-chain: with one global
+# `last_point`, a long chat A made a new short chat B look like it had not grown
+# ("behind" A by token count and message count), so B was never snapshotted and
+# re-prefilled from zero after a restart (AUDIT 02-5). Keying by fingerprint as
+# well means a config change starts a fresh growth measurement instead of
+# comparing against a chain whose snapshots no longer apply.
+_PREFIX_STATE: dict = {"warm_key": "", "last_points": {}}
 
 
 def _prefix_ctx():
@@ -429,12 +437,13 @@ def _prefix_ctx():
     return int(s["public_port"]) - 1, rigma_home() / "sessions", fp, gen
 
 
-def _prefix_warm(msgs: list[dict]) -> None:
+def _prefix_warm(msgs: list[dict], chain: str = "") -> None:
     """Restore the deepest snapshot that this conversation starts with.
 
     Skipped when the slot is already warm for that exact prefix: the live slot
     holds at least as much as the snapshot and restoring would be a slower way
-    to arrive at the same place.
+    to arrive at the same place. `chain` names the conversation, so the growth
+    bookkeeping below is per-chain rather than process-wide (AUDIT 02-5).
     """
     try:
         ctx = _prefix_ctx()
@@ -449,14 +458,14 @@ def _prefix_warm(msgs: list[dict]) -> None:
             return
         if prefixcache.warm(port, save_dir, hit.key, slot=MAIN_SLOT) is None:
             _PREFIX_STATE["warm_key"] = warm_key
-            _PREFIX_STATE["last_point"] = hit
+            _PREFIX_STATE["last_points"][(fp, chain)] = hit
     except Exception:
         pass          # a cold start is slow, never wrong
 
 
-def _prefix_snapshot(msgs: list[dict]) -> None:
-    """Snapshot the finished turn, if the prefix has grown enough to be worth
-    the gigabytes and the seconds."""
+def _prefix_snapshot(msgs: list[dict], chain: str = "") -> None:
+    """Snapshot the finished turn, if this conversation's prefix has grown
+    enough to be worth the gigabytes and the seconds."""
     try:
         ctx = _prefix_ctx()
         if ctx is None:
@@ -467,13 +476,14 @@ def _prefix_snapshot(msgs: list[dict]) -> None:
         if not points:
             return
         tip = points[-1]
-        if not prefixcache.should_snapshot(tip, _PREFIX_STATE["last_point"]):
+        last = _PREFIX_STATE["last_points"].get((fp, chain))
+        if not prefixcache.should_snapshot(tip, last):
             return
         if prefixcache.snapshot(port, save_dir, tip.key, slot=MAIN_SLOT,
                                 meta={"n_messages": tip.n_messages,
                                       "approx_tokens": tip.approx_tokens}) is None:
             _PREFIX_STATE["warm_key"] = f"{gen}:{tip.key}"
-            _PREFIX_STATE["last_point"] = tip
+            _PREFIX_STATE["last_points"][(fp, chain)] = tip
             prefixcache.evict(save_dir)
     except Exception:
         pass          # never cost the user a turn to save one
@@ -1981,7 +1991,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # snapshot off disk stopped the single-worker event loop outright: every
         # other tab's tokens, the status poll and a run's heartbeat all froze for
         # the duration. The unload path already wraps the same call this way.
-        await asyncio.to_thread(_prefix_warm, msgs)
+        await asyncio.to_thread(_prefix_warm, msgs, str(s.get("id") or ""))
         _mark("prefix_warm")
         # nudges are consumed by the turn that just read them: a reminder
         # that re-injects every turn is nagging, not a trigger. Whether this
@@ -3002,7 +3012,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # AUDIT F13: threaded — see the warm call at the top of the turn
                     await asyncio.to_thread(
                         _prefix_snapshot,
-                        sessions.build_messages(s, _default_prompt(), preset))
+                        sessions.build_messages(s, _default_prompt(), preset),
+                        str(s.get("id") or ""))
                 except Exception:
                     pass
                 _bump_stats(timings)
