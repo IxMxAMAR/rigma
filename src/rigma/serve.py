@@ -1220,7 +1220,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return time.time()
 
     def _bump_stats(timings: dict) -> None:
-        """Lifetime odometer: total tokens + turns, persisted to ~/.rigma."""
+        """Lifetime odometer: total tokens + turns, persisted to ~/.rigma.
+
+        IMP-7: also counts TURNS per model and stamps when each was last used.
+        The meter answers "which model is costing me", which lifetime totals
+        cannot, and it records them HERE rather than recomputing them from the
+        session store — the odometer is the one place a completed turn is
+        already counted, including turns that ran before this build.
+        """
         n = timings.get("predicted_n") or 0
         if not n:
             return
@@ -1234,6 +1241,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             model = (st.read_state() or {}).get("model", "")
             by = cur.setdefault("by_model", {})
             by[model] = int(by.get(model, 0)) + int(n)
+            turns = cur.setdefault("by_model_turns", {})
+            turns[model] = int(turns.get(model, 0)) + 1
+            cur.setdefault("last_used", {})[model] = _now()
             tmp = f.with_suffix(".tmp")
             tmp.write_text(json.dumps(cur), encoding="utf-8")
             tmp.replace(f)
@@ -3262,15 +3272,42 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.get("/api/server/stats")
     async def server_stats():
+        """The usage meter: exactly what the odometer in stats.json stores.
+
+        Nothing is recomputed from the session store — the turn loop already
+        counted every completed turn here, including turns from older builds.
+        `models` is the same data pre-sorted for a panel (most tokens first);
+        the flat fields are kept for the existing UI that reads them.
+        """
+        def _int(v) -> int:
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+
         try:
             f = st.rigma_home() / "stats.json"
             data = json.loads(f.read_text(encoding="utf-8")) if f.exists() \
                 else {}
+            if not isinstance(data, dict):
+                data = {}
         except Exception:
             data = {}
-        return {"total_tokens": data.get("total_tokens", 0),
-                "total_turns": data.get("total_turns", 0),
-                "by_model": data.get("by_model", {})}
+        by = data.get("by_model")
+        turns = data.get("by_model_turns")
+        last = data.get("last_used")
+        by = by if isinstance(by, dict) else {}
+        turns = turns if isinstance(turns, dict) else {}
+        last = last if isinstance(last, dict) else {}
+        models = [{"model": str(name), "tokens": _int(tok),
+                   "turns": _int(turns.get(name)),
+                   "last_used": last.get(name)}
+                  for name, tok in by.items()]
+        models.sort(key=lambda m: m["tokens"], reverse=True)
+        return {"total_tokens": _int(data.get("total_tokens")),
+                "total_turns": _int(data.get("total_turns")),
+                "by_model": by, "by_model_turns": turns,
+                "last_used": last, "models": models}
 
     @app.get("/api/server/log")
     async def server_log(lines: int = 200):
