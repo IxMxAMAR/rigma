@@ -119,6 +119,38 @@ def test_settings_step_applies_validated_params_only():
     assert "banana" not in s["params"]
 
 
+def test_a_quoted_false_does_not_switch_code_or_tools_on():
+    """`bool("false")` is True, so a method-builder model that quotes its
+    booleans turned code execution ON and left it on for the chat (09-6)."""
+    r = Runner()
+    _, s = _run({"id": "m", "label": "M", "steps": [
+        {"kind": "settings",
+         "set": {"allow_code": "false", "use_tools": "0"}}]}, r)
+    assert s["allow_code"] is False
+    assert s["use_tools"] is False
+
+
+def test_boolean_words_are_coerced_explicitly():
+    r = Runner()
+    _, s = _run({"id": "m", "label": "M", "steps": [
+        {"kind": "settings",
+         "set": {"allow_code": "yes", "use_tools": "TRUE"}}]}, r)
+    assert s["allow_code"] is True and s["use_tools"] is True
+    _, s2 = _run({"id": "m", "label": "M", "steps": [
+        {"kind": "settings",
+         "set": {"allow_code": "", "use_tools": "off"}}]}, r)
+    assert s2["allow_code"] is False and s2["use_tools"] is False
+
+
+def test_a_quoted_false_is_not_read_as_an_elevation():
+    """The gate and the interpreter must read the value the same way: a preview
+    that says "switched on" for a declared false is the bug's other half."""
+    steps = [{"kind": "settings", "set": {"allow_code": "false"}}]
+    assert macros.is_effectful(steps, allow_code=False) is False
+    line = macros.preview_line({"id": "m", "label": "M", "steps": steps}, {})
+    assert "switched on" not in line
+
+
 def test_new_chat_carries_only_the_listed_fields():
     r = Runner()
     s = sessions.create("Chapter 3")
