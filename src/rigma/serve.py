@@ -1853,47 +1853,69 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         said: list = []
         thought: list = []
         trace: list = []
-        while True:
-            try:
-                ev = await asyncio.wait_for(q.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                # The adapter is what honours `cancel` — killing mcode's child is
-                # the adapter's job. This is the backstop for one that does not:
-                # a stop that leaves the stream open forever is worse than no
-                # stop button, because the reader cannot tell the difference
-                # between "stopping" and "broken". A cancelled `get` loses no
-                # item; the queue wakes the next waiter instead.
-                if cancel is not None and cancel.is_set():
-                    yield _sse({"note": "stopped"}, event="notice")
-                    break
-                continue
-            if ev is END:
-                break
-            if ev.kind == "text":
-                said.append(ev.text)
-                yield _sse({"delta": ev.text})
-            elif ev.kind == "thinking":
-                thought.append(ev.text)
-                yield _sse({"delta": ev.text}, event="think")
-            elif ev.kind == "tool":
-                yield _sse({"id": ev.name, "name": ev.name,
-                            "args": ev.args or {}}, event="tool")
-            elif ev.kind == "tool_result":
-                yield _sse({"id": ev.name, "name": ev.name,
-                            "result": ev.text}, event="tool_result")
-                trace.append({"name": ev.name, "result": ev.text, "ok": ev.ok,
-                              "ts": _now()})
-            elif ev.kind == "notice":
-                yield _sse({"note": ev.text}, event="notice")
-            elif ev.kind == "error":
-                yield _sse({"message": ev.text}, event="error")
         try:
-            await task                          # the pump is done; reap it
-        except Exception:
-            pass                                # it reports its own failures
-        _save_external_reply(sid, "".join(said), trace, "".join(thought),
-                             backend.name,
-                             backend_session=str(hstate.get("session_id") or ""))
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    # The adapter is what honours `cancel` — killing mcode's child is
+                    # the adapter's job. This is the backstop for one that does not:
+                    # a stop that leaves the stream open forever is worse than no
+                    # stop button, because the reader cannot tell the difference
+                    # between "stopping" and "broken". A cancelled `get` loses no
+                    # item; the queue wakes the next waiter instead.
+                    if cancel is not None and cancel.is_set():
+                        yield _sse({"note": "stopped"}, event="notice")
+                        break
+                    continue
+                if ev is END:
+                    break
+                if ev.kind == "text":
+                    said.append(ev.text)
+                    yield _sse({"delta": ev.text})
+                elif ev.kind == "thinking":
+                    thought.append(ev.text)
+                    yield _sse({"delta": ev.text}, event="think")
+                elif ev.kind == "tool":
+                    yield _sse({"id": ev.name, "name": ev.name,
+                                "args": ev.args or {}}, event="tool")
+                elif ev.kind == "tool_result":
+                    yield _sse({"id": ev.name, "name": ev.name,
+                                "result": ev.text}, event="tool_result")
+                    trace.append({"name": ev.name, "result": ev.text, "ok": ev.ok,
+                                  "ts": _now()})
+                elif ev.kind == "notice":
+                    yield _sse({"note": ev.text}, event="notice")
+                elif ev.kind == "error":
+                    yield _sse({"message": ev.text}, event="error")
+            try:
+                await task                          # the pump is done; reap it
+            except Exception:
+                pass                                # it reports its own failures
+        finally:
+            # AUDIT 02-4: a client disconnect (tab refresh, sleeping laptop)
+            # throws GeneratorExit / CancelledError into this generator at its
+            # current `yield`, which used to unwind straight past the `await
+            # task` above and the save below. Nothing set `cancel`, so the
+            # harness subprocess — and every subagent it owns — kept running and
+            # billing against Rigma's /v1 while its events piled into a queue
+            # with no consumer. This is the external path's half of the AUDIT F7
+            # teardown the native loop already has. Every call here is
+            # synchronous on purpose: a `finally` executing under GeneratorExit
+            # must not await (the same constraint as `_abandon_tasks`).
+            if cancel is not None:
+                try:
+                    cancel.set()
+                except Exception:
+                    pass
+            _abandon_tasks([task])
+            try:
+                _save_external_reply(
+                    sid, "".join(said), trace, "".join(thought), backend.name,
+                    backend_session=str(hstate.get("session_id") or ""))
+            except Exception:
+                _log.exception("could not persist an external turn's partial "
+                               "reply")
         yield b"data: [DONE]\n\n"
 
     async def _llm_turn(s: dict, cont: bool = False, cancel=None):
