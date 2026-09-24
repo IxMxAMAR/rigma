@@ -1809,15 +1809,55 @@ _GREP_MAX_VISITED = 20000            # directory entries examined per grep call
 _WALK_MAX_ENTRIES = 5000             # directory entries examined by find_files
 
 
-def _glob_re(pat: str) -> re.Pattern:
+def _glob_re(pat: str):
     """Compile a path glob the way `Path.glob` reads it: `**` crosses
     directories (and may match none of them), `*` and `?` do not. `Path.glob`
-    is lazy but cannot prune, so the walkers below match as they go."""
+    is lazy but cannot prune, so the walkers below match as they go.
+
+    R3-16. Two defects lived in the lines that built this, and both are about the
+    one thing a model-supplied pattern must never be able to do: stop the server.
+
+    FIRST, `**/` is not idempotent under translation. Each `**/` became its own
+    `(?:.*/)?`, and nesting those makes the match exponentially ambiguous — every
+    prefix of the path can be divided among the groups in many ways, and a
+    failure forces the engine to try all of them. MEASURED on a 24-deep path:
+    `**/`x6 = 7 ms, x10 = 2.19 s, **x12 = 61.5 s** — and this is called once per
+    file in the walk. `find_files("**/**/**/…")` was a self-inflicted denial of
+    service needing no adversarial input, and because the walk is synchronous on
+    the event loop it takes the whole UI with it. Collapsing a RUN of `**/` into
+    one group is not a behaviour change: `(?:.*/)?(?:.*/)?` accepts exactly the
+    strings `(?:.*/)?` does, because `.*` already spans `/` under the `(?s:)`
+    wrapper. The same collapse is applied to runs of `*` and `?`, which are
+    quadratic rather than exponential but free to fix in the same pass.
+
+    SECOND, the character-class branch copied the user's class body into the
+    output verbatim, so `[z-a]` reached `re.compile` and raised `re.error` — out
+    of a TOOL, where nothing catches it, turning a typo into a 500. Every
+    character of a class body is now escaped except a genuine `a-z` range, which
+    makes the translation TOTAL: MEASURED, there is no glob string that can reach
+    `re.compile` and fail, because whatever the scanner hands over is either
+    `re.escape`d or a verified range. `[z-a]` therefore means "one of z, -, a",
+    which is the only reading that is not an error, and `find_files("[z-a].txt")`
+    returns "no files match" rather than 500ing.
+
+    The `except re.error` below is kept as a guard for that invariant rather than
+    for a case anyone has found: if a future edit makes the escaping partial
+    again, the tool still reports a bad pattern instead of dying. The return type
+    is `Pattern | re.error` and callers MUST test it, because this is the one
+    place in the tool layer where a bad ARGUMENT could become a bad RESPONSE.
+    """
     out, i, n = [], 0, len(pat)
     while i < n:
         c = pat[i]
         if c == "*":
             if pat.startswith("**", i):
+                j = i
+                while j + 2 < n and pat[j:j + 3] == "**/":
+                    j += 3
+                if j > i:               # a RUN of `**/` is one group
+                    out.append("(?:.*/)?")
+                    i = j
+                    continue
                 i += 2
                 if i < n and pat[i] == "/":
                     i += 1
@@ -1825,9 +1865,15 @@ def _glob_re(pat: str) -> re.Pattern:
                 else:
                     out.append(".*")
                 continue
-            out.append("[^/]*")
+            while i < n and pat[i] == "*":
+                i += 1
+            out.append("[^/]*")         # `*` is idempotent under `[^/]*`
+            continue
         elif c == "?":
-            out.append("[^/]")
+            while i < n and pat[i] == "?":
+                i += 1
+            out.append("[^/]")          # `?` likewise
+            continue
         elif c == "[":
             j = i + 1
             if j < n and pat[j] in "!^":
@@ -1842,13 +1888,40 @@ def _glob_re(pat: str) -> re.Pattern:
                 inner = pat[i + 1:j]
                 if inner.startswith("!"):
                     inner = "^" + inner[1:]
-                out.append("[" + inner + "]")
+                out.append("[" + _safe_class_body(inner) + "]")
                 i = j + 1
                 continue
         else:
             out.append(re.escape(c))
         i += 1
-    return re.compile("(?s:" + "".join(out) + r")\Z")
+    try:
+        return re.compile("(?s:" + "".join(out) + r")\Z")
+    except re.error as e:
+        return e
+
+
+def _safe_class_body(inner: str) -> str:
+    """`inner` with every character escaped EXCEPT a genuine `a-z` range.
+
+    `[z-a]` is a `re.error`, not a class, and it arrived here straight from the
+    model. Keeping real ranges is what makes `[a-z]` mean what it looks like, so
+    a `-` is preserved only when it sits between two ordinary, ordered
+    characters; every other `-` becomes a literal and the class can no longer
+    fail to compile. A leading `^` (negation, from the `!` form) is preserved as
+    the operator it is rather than escaped into a literal.
+    """
+    body, negated = inner, inner.startswith("^")
+    if negated:
+        body = body[1:]
+    out: list[str] = []
+    for k, ch in enumerate(body):
+        if ch == "-" and 0 < k < len(body) - 1:
+            lo, hi = body[k - 1], body[k + 1]
+            if lo.isalnum() and hi.isalnum() and lo <= hi:
+                out.append("-")
+                continue
+        out.append(re.escape(ch))
+    return ("^" if negated else "") + "".join(out)
 
 
 def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict):
@@ -1903,6 +1976,8 @@ def _find_files(args, ctx):
     root = _ws_path(ctx, ".")
     pat = str(args.get("pattern", "*"))
     rx_glob = _glob_re(pat)
+    if isinstance(rx_glob, re.error):        # R3-16: a typo is not a 500
+        return f"error: bad pattern {pat!r}: {rx_glob}"
     state = {"visited": 0, "truncated": False, "max_visited": _WALK_MAX_ENTRIES}
     all_hits = list(_iter_workspace_files(root, rx_glob, state))
     hits = [p.relative_to(root).as_posix() for p in sorted(all_hits)[:200]]
@@ -1942,6 +2017,8 @@ def _grep(args, ctx):
         return f"error: bad regex: {e}"
     glob = str(args.get("glob", "") or "**/*")
     rx_glob = _glob_re(glob)
+    if isinstance(rx_glob, re.error):        # R3-16: a typo is not a 500
+        return f"error: bad glob {glob!r}: {rx_glob}"
     out, seen = [], 0
     files_read = 0
     bytes_read = 0
