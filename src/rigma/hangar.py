@@ -1266,8 +1266,23 @@ def _install_download(dest, have: int, size: int, sha256: str | None,
 
     `cancelled` (AUDIT 07-4) is re-checked under `_PULL_LOCK` immediately
     before the os.replace, so a delete that lands while the body is streaming
-    cannot be undone by this rename putting the file back."""
+    cannot be undone by this rename putting the file back.
+
+    AUDIT 06R3-2: with NO declared size AND NO hash there is nothing to check,
+    and the two gates below are both conditional — so whatever arrived was
+    renamed in as a complete multi-GB quant. Nine bytes installed as "done" is
+    worse than a refusal: `list_models` marks the row on_disk and the fit math
+    plans against a zero-byte file. The bytes stay in the `.part`, so the
+    refusal costs a retry, not the transfer.
+    """
     part, note = _resume_files(dest)
+    if not size and not sha256:
+        raise HangarError(
+            f"{dest.name} cannot be verified: the server declared no length "
+            f"and the registry has no size or sha256 for it. Refusing to "
+            f"install {have:,} unverified bytes — the bytes are kept in "
+            f"{part.name}, so pressing Download again resumes rather than "
+            f"restarts.")
     if size and have != size:
         if have > size:
             _discard_partial(dest)
