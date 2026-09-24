@@ -875,16 +875,33 @@ def _safe_eval(node):
     raise ValueError("unsupported expression")
 
 
-def _is_public_host(host: str) -> bool:
-    """True only if `host` resolves entirely to public addresses — blocks the
-    model (possibly prompt-injected by a fetched page) from reaching localhost,
-    cloud metadata (169.254.169.254), or the LAN."""
-    import ipaddress
+def _resolve_addresses(host: str):
+    """The resolver, behind one indirection so a test can stub it.
+
+    AUDIT 13-1: the whole point of the fix is that the answer THIS function
+    gives is the address that gets dialed, so the seam has to be callable."""
     import socket
+    return socket.getaddrinfo(host, None)
+
+
+def _vetted_ip(host: str) -> str | None:
+    """Resolve `host` ONCE, validate EVERY address, and return the single IP to
+    dial. None when the name does not resolve or ANY answer is private/loopback/
+    link-local/reserved/multicast/unspecified.
+
+    Returning the address (rather than a bool) is the fix for 13-1: the guard
+    used to decide on a `getaddrinfo` answer that the transport then threw away
+    and re-resolved, so a 0-TTL name could answer a public IP to the check and
+    127.0.0.1 to the connect. Every address is validated, and the returned one
+    is the one `_pinned_transport` dials."""
+    import ipaddress
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = _resolve_addresses(host)
     except OSError:
-        return False
+        return None
+    if not infos:
+        return None
+    ips: list[str] = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         # ::ffff:127.0.0.1 reports itself as global — unwrap the mapped v4 so a
@@ -893,22 +910,75 @@ def _is_public_host(host: str) -> bool:
             ip = ip.ipv4_mapped
         if (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return False
-    return bool(infos)
+            return None
+        ips.append(str(ip))
+    return ips[0] if ips else None
+
+
+def _is_public_host(host: str) -> bool:
+    """True only if `host` resolves entirely to public addresses — blocks the
+    model (possibly prompt-injected by a fetched page) from reaching localhost,
+    cloud metadata (169.254.169.254), or the LAN."""
+    return _vetted_ip(host) is not None
+
+
+def _pin_request(request) -> str:
+    """Vet `request`'s host and record the address to dial on the request.
+
+    The request hook calls this on EVERY hop (httpx re-runs request hooks after
+    a redirect), so a public URL that redirects to an internal one is refused at
+    the hop that would reach it. Raises ValueError when the host is not public.
+    """
+    host = request.url.host or ""
+    ip = _vetted_ip(host)
+    if ip is None:
+        raise ValueError("refusing to reach a private/loopback address")
+    request.extensions = {**request.extensions,
+                          "rigma_pin_ip": ip, "sni_hostname": host}
+    return ip
+
+
+def _pinned_transport():
+    """An httpx transport that dials the vetted IP instead of re-resolving.
+
+    httpx/httpcore resolve the hostname again at connect time (httpcore 1.0.9
+    `_backends/anyio.py` `connect_tcp(remote_host=host, ...)`), so the guard's
+    verdict never reached the socket. Here the host is swapped for the address
+    the hook vetted, while the `Host` header and the TLS `sni_hostname` keep the
+    real name — so virtual hosting and certificate checks still work.
+    """
+    import httpx
+
+    class _PinnedTransport(httpx.HTTPTransport):
+        def handle_request(self, request):
+            host = request.url.host or ""
+            ip = request.extensions.get("rigma_pin_ip") or _vetted_ip(host)
+            if ip is None:
+                raise ValueError("refusing to reach a private/loopback address")
+            if ip == host:
+                return super().handle_request(request)
+            headers = request.headers.copy()
+            headers["Host"] = request.url.netloc.decode("ascii")
+            pinned = httpx.Request(
+                method=request.method,
+                url=request.url.copy_with(host=ip),
+                headers=headers,
+                stream=request.stream,
+                extensions={**request.extensions, "sni_hostname": host})
+            return super().handle_request(pinned)
+
+    return _PinnedTransport()
 
 
 def _public_client():
     """httpx client that refuses private/loopback targets on EVERY hop (the
     request hook fires again on each redirect, so a public URL can't bounce
-    the fetch to an internal address)."""
+    the fetch to an internal address) AND connects to the address it vetted
+    (AUDIT 13-1: no check-then-connect TOCTOU)."""
     import httpx
-    from urllib.parse import urlparse
-
-    def guard(request):
-        if not _is_public_host(urlparse(str(request.url)).hostname or ""):
-            raise ValueError("refusing to reach a private/loopback address")
     return httpx.Client(follow_redirects=True, timeout=25,
-                        event_hooks={"request": [guard]})
+                        transport=_pinned_transport(),
+                        event_hooks={"request": [_pin_request]})
 
 
 _MAX_FETCH_BYTES = 3_000_000   # cap so a 10GB URL / infinite stream can't OOM
@@ -1339,18 +1409,133 @@ def _nearest_hint(root: Path, rel: str) -> str:
 
 
 def _read_path(ctx, raw: str) -> Path:
-    """Resolve a path for READ-ONLY tools, allowing ABSOLUTE paths.
+    """Resolve a path for READ-ONLY tools.
 
-    Missions routinely name folders outside the workspace ("go through
-    D:\\Good Stuff"). Refusing those didn't make anything safer — run_shell can
-    already reach the whole filesystem — it just pushed the model into
-    `run_shell dir`, which dumped thousands of filenames into context and blew
-    the run up. Writes still go through _ws_path; the 'confined' profile keeps
-    everything workspace-relative."""
+    AUDIT 13-2: an absolute read is a capability a prompt-injected page can aim
+    at a credential file, and the result is exfiltrable through the network
+    tools running in the same session. Reads therefore default to the
+    workspace; the pre-13-2 behaviour is one explicit session grant away
+    (`allow_absolute_reads`), so a mission that legitimately works outside its
+    workspace opts in instead of defaulting in. Writes still go through
+    _ws_path.
+
+    The credential-path denylist applies on BOTH branches and cannot be
+    overridden by the grant — the model has no legitimate reason to put a key
+    into the conversation."""
+    raw = str(raw or "").strip()
+    if Path(raw).is_absolute():
+        if ctx.get("profile") == "confined":
+            raise ValueError(
+                f"'{raw}' is an absolute path — the confined profile keeps "
+                "reads RELATIVE to the workspace")
+        p = Path(raw).resolve()
+        # an absolute path that is INSIDE the workspace is not an escape, so it
+        # needs no grant; only one that leaves the workspace does
+        if not _inside_workspace(ctx, p) and not _absolute_reads_allowed(ctx):
+            raise ValueError(
+                "reading an absolute path outside the workspace is disabled "
+                "for this chat — pass a path RELATIVE to the workspace, or "
+                "enable 'allow absolute reads' on the session to restore it")
+        p = _long_path(p)
+    else:
+        p = _ws_path(ctx, raw or ".")
+    denied = _credential_path_reason(p, ctx)
+    if denied:
+        raise ValueError(f"refusing to read {p} — {denied}")
+    return p
+
+
+def _inside_workspace(ctx: dict, p: Path) -> bool:
+    """Is the (already resolved, un-prefixed) path inside the session workspace?"""
+    ws = (ctx.get("workspace") or "").strip()
+    if not ws:
+        return False
+    try:
+        root = Path(ws).resolve()
+        return p == root or p.is_relative_to(root)
+    except (OSError, ValueError):
+        return False
+
+
+# AUDIT 13-2: paths whose contents are credentials or the owner's private
+# state. A read of any of these is refused EVEN when absolute reads are
+# granted. Matched case-insensitively against the resolved path.
+_CREDENTIAL_FILES = (
+    ".env", ".env.*", "*.env",
+    "id_rsa", "id_rsa.*", "id_dsa", "id_dsa.*", "id_ecdsa", "id_ecdsa.*",
+    "id_ed25519", "id_ed25519.*",
+    "*.pem", "*.key", "*.pfx", "*.p12", "*.jks", "*.keystore",
+    ".netrc", ".npmrc", ".pypirc", ".htpasswd", ".git-credentials",
+    "credentials", "credentials.*", "*.credentials",
+    ".gemini_api_key", ".openai_api_key", "*.api_key", "*_api_key",
+)
+_CREDENTIAL_DIRS = frozenset((
+    ".ssh", ".aws", ".azure", ".gcloud", ".kube", ".docker", ".gnupg",
+))
+# A browser profile holds saved logins and cookies. Matched as a path SHAPE,
+# because the profile directory is nested under the vendor's name.
+_BROWSER_PROFILE_RE = re.compile(
+    r"(?i)(google[\\/]chrome|microsoft[\\/]edge|brave-browser|brave[\\/]user"
+    r" data|chromium|mozilla[\\/]firefox[\\/]profiles|opera software"
+    r"|vivaldi|librewolf)[\\/]")
+
+
+def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
+    """Why `p` may not be read, or "" when it may.
+
+    The one exemption is a run's progress log, which the run loop hands the
+    model by name and which lives under Rigma's state dir; refusing it would
+    break the run for no security gain (it is model-written). A workspace that
+    IS (or lives inside) the state dir is also an explicit choice — the default
+    workspace is the home dir, which CONTAINS the state dir, so that case must
+    stay denied."""
+    name = p.name.lower()
+    if name in ("progress.md", "progress.txt"):
+        return ""
+    for pat in _CREDENTIAL_FILES:
+        if fnmatch.fnmatch(name, pat):
+            return "that looks like a credential file"
+    parts = [part.lower() for part in p.parts]
+    if any(part in _CREDENTIAL_DIRS for part in parts):
+        return "that is a credential directory"
+    if _BROWSER_PROFILE_RE.search(str(p)):
+        return "that is a browser profile (saved logins and cookies)"
+    try:
+        from .runtime import rigma_home
+        home = rigma_home().resolve()
+        if p == home or p.is_relative_to(home):
+            ws = str((ctx or {}).get("workspace") or "").strip()
+            if ws and Path(ws).resolve().is_relative_to(home):
+                return ""
+            return "that is Rigma's own state directory"
+    except Exception:
+        pass
+    return ""
+
+
+def _write_path(ctx, raw: str) -> Path:
+    """Resolve a WRITE target (a move/copy destination).
+
+    AUDIT 13-2 confines READS, but a destination was never a read: the pre-fix
+    behaviour (an absolute destination allowed outside the `confined` profile)
+    is preserved, with the credential denylist still applied so a move cannot
+    plant a file in `.ssh`."""
     raw = str(raw or "").strip()
     if Path(raw).is_absolute() and ctx.get("profile") != "confined":
-        return _long_path(Path(raw).resolve())
-    return _ws_path(ctx, raw or ".")
+        p = _long_path(Path(raw).resolve())
+    else:
+        p = _ws_path(ctx, raw or ".")
+    denied = _credential_path_reason(p, ctx)
+    if denied:
+        raise ValueError(f"refusing to write {p} — {denied}")
+    return p
+
+
+def _absolute_reads_allowed(ctx: dict) -> bool:
+    """The explicit grant that restores the pre-13-2 absolute-read behaviour."""
+    if ctx.get("profile") == "confined":
+        return False
+    return bool(ctx.get("allow_absolute_reads"))
 
 
 def _ws_path(ctx, rel: str) -> Path:
@@ -1398,6 +1583,15 @@ def _http_request(args, ctx):
     if method not in ("GET", "POST"):
         return (f"error: method {method} is not allowed — this tool only "
                 "does GET and POST")
+    # AUDIT 13-2: a POST that carries data is the exfiltration half of the
+    # finding. It needs its own explicit grant, so a session that can read a
+    # file cannot also post it out unattended.
+    if method == "POST" and (args.get("json") or args.get("headers")):
+        if not ctx.get("allow_outbound_post"):
+            return ("error: outbound POST with a body is disabled for this "
+                    "chat — a body is how a file read in this session would "
+                    "leave the machine. Enable 'allow outbound POST' on the "
+                    "session to restore it")
     try:
         status, body = _bounded_get(
             url, method=method, headers=args.get("headers") or None,
@@ -2236,10 +2430,12 @@ def _edit_file_locked(args, ctx):
 
 
 @tool("read_file",
-      "Read a text file. Accepts an ABSOLUTE path or one relative to the "
-      "workspace. Use `offset` (1-indexed line) and `limit` to PAGE THROUGH a "
-      "big file instead of pulling it all in at once — the reply tells you the "
-      "exact offset to pass next.",
+      "Read a text file. Takes a path relative to the workspace, or an "
+      "absolute path inside it. An absolute path OUTSIDE the workspace needs "
+      "the session's 'allow absolute reads' grant, and credential files are "
+      "always refused. Use `offset` (1-indexed line) and `limit` to PAGE "
+      "THROUGH a big file instead of pulling it all in at once — the reply "
+      "tells you the exact offset to pass next.",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "absolute path, or one "
                    "relative to the workspace"},
@@ -2444,8 +2640,10 @@ def _folder_listing(p: Path) -> str:
 
 
 @tool("list_directory",
-      "List files and folders. Accepts an ABSOLUTE path (e.g. D:/Art) or one "
-      "relative to the workspace. Large folders are SUMMARISED (counts by type "
+      "List files and folders. Takes a path relative to the workspace, or an "
+      "absolute path inside it (an absolute path OUTSIDE the workspace needs "
+      "the session's 'allow absolute reads' grant). Large folders are "
+      "SUMMARISED (counts by type "
       "+ examples) — use sample_files or find_files to work with them.",
       {"type": "object", "properties": {
           "path": {"type": "string", "description": "folder path relative to "
@@ -2726,7 +2924,7 @@ def _do_transfer(args, ctx, move: bool):
     if not dest_raw:
         return "error: `dest` folder is required"
     try:
-        dest = _read_path(ctx, dest_raw)
+        dest = _write_path(ctx, dest_raw)
     except ValueError as e:
         return f"error: {e}"
     srcs, errs, notes = _transfer_sources(args, ctx)
@@ -3069,6 +3267,10 @@ def _run_python(args, ctx):
                 "string like 'a\\nb', write the backslash TWICE in the JSON "
                 "argument ('a\\\\nb') — a single backslash becomes a real "
                 "newline and splits the literal.")
+    # AUDIT 13-3: same gate as the shell tools (confirmation + profile).
+    allowed, why = exec_decision(code, ctx, python_src=code)
+    if not allowed:
+        return f"error: {why}"
     out = _run_subprocess(["python", "-I", "-c", code], ctx, python_src=code)
     if healed:
         out = (f"(note: {healed} string literal(s) in your code had been "
@@ -3097,19 +3299,16 @@ def _run_shell(args, ctx):
         tmo = max(1, min(int(args.get("timeout", 30) or 30), 300))
     except (TypeError, ValueError):
         tmo = 30
+    # AUDIT 13-3: the gate (confirmation + profile) is the enforcement; the
+    # regex inside exec_decision is only an advisory refusal of the literal form.
+    allowed, why = exec_decision(cmd, ctx)
+    if not allowed:
+        return f"error: {why}"
     # Windows: run through PowerShell, not cmd.exe. Every local model is
     # Unix-trained and reaches for ls/pwd/cat/mv/cp - which are all native
     # PowerShell aliases, but unknown words to cmd (live 2026-07-21: the
-    # model ran `ls`, cmd said "not recognized", turn wasted). The
-    # destructive-command blocklist runs on the TEXT first either way.
+    # model ran `ls`, cmd said "not recognized", turn wasted).
     if sys.platform == "win32":
-        text = cmd
-        if _BLOCKED_CMD.search(text):
-            return ("error: blocked — that looks like a destructive system "
-                    "command; refusing to run it")
-        if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(text):
-            return ("error: blocked — deletion is disabled for this run "
-                    "(no-delete)")
         return _run_subprocess(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
             ctx, shell=False, timeout=tmo)
@@ -3173,11 +3372,10 @@ def _start_job(args, ctx):
     cmd = str(args.get("command", ""))
     if not cmd.strip():
         return "error: `command` is required"
-    if _BLOCKED_CMD.search(cmd):
-        return ("error: blocked — that looks like a destructive system "
-                "command; refusing to run it")
-    if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(cmd):
-        return "error: blocked — deletion is disabled for this run (no-delete)"
+    # AUDIT 13-3: same gate as run_shell (confirmation + profile).
+    allowed, why = exec_decision(cmd, ctx)
+    if not allowed:
+        return f"error: {why}"
     live = [j for j in _JOBS.values() if j["proc"].poll() is None]
     if len(live) >= _JOB_LIMIT:
         return (f"error: {_JOB_LIMIT} jobs already running — kill_job one "
@@ -3341,6 +3539,61 @@ _BLOCKED_PY = re.compile(
     r"clear-disk|initialize-disk)\b)")
 _DELETE_PY = re.compile(
     r"(?i)(os\.(remove|unlink|rmdir)|shutil\.rmtree|\.unlink\s*\(|send2trash)")
+
+
+# AUDIT 13-3: the regexes above are ADVISORY, not the boundary. They match
+# literal text, and the text handed to PowerShell is only the outer wrapper —
+# base64, `-EncodedCommand`, a nested interpreter or string concatenation all
+# decode to a destructive payload the regex never sees. So the enforcement is a
+# separate, explicit per-session confirmation, and the regexes stay as a fast
+# refusal of the obvious literal form (and as a message that says what they
+# are). Tests call `exec_decision` on the TEXT; nothing here executes.
+def _exec_confirmed(ctx: dict) -> bool:
+    """Whether this session has explicitly confirmed it may spawn processes.
+
+    A caller that does not set `confirm_exec` keeps the pre-13-3 behaviour
+    (`allow_code` is the grant) so embedders of the library do not silently
+    lose execution. Every ctx the PRODUCT builds — serve.py, mcp_server, the
+    macro context — sets the field explicitly, so the product default is the
+    safe one.
+    """
+    v = ctx.get("confirm_exec")
+    if v is None:
+        return bool(ctx.get("allow_code"))
+    return bool(v)
+
+
+def exec_decision(cmd: str, ctx: dict, *, python_src: str | None = None
+                  ) -> tuple[bool, str]:
+    """May this execution tool run `cmd`? Returns (allowed, refusal).
+
+    The single decision point for run_shell / start_job / run_python. It only
+    reads TEXT — it never runs anything, which is what lets the tests exercise
+    it with destructive strings (safety rule 7).
+    """
+    prof = ctx.get("profile", "all")
+    if prof == "confined":
+        return False, "code execution is disabled for this run (confined)"
+    if python_src is not None:
+        if _BLOCKED_PY.search(python_src):
+            return False, ("blocked — that code destroys a drive or shells out "
+                           "to a destructive command; refusing to run it")
+    elif _BLOCKED_CMD.search(cmd):
+        return False, ("blocked — that looks like a destructive system "
+                       "command; refusing to run it")
+    if prof == "no-delete":
+        hit = (_DELETE_PY.search(python_src) if python_src is not None
+               else _DELETE_CMD.search(cmd))
+        if hit:
+            return False, ("blocked — deletion is disabled for this run "
+                           "(no-delete)")
+    if not _exec_confirmed(ctx):
+        return False, ("running shell commands or code needs explicit "
+                       "confirmation for this chat — the destructive-command "
+                       "list is only an advisory text check, so it cannot gate "
+                       "what a wrapper decodes. Enable 'confirm execution' on "
+                       "the session to allow it")
+    return True, ""
 
 
 def _launch_killable(cmd, shell, cwd):

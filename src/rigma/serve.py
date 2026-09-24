@@ -90,21 +90,77 @@ def _is_local_host(host: str) -> bool:
     return "." not in h and ":" not in h
 
 
-def guard_request(host: str, origin: str) -> str:
+def guard_request(host: str, origin: str, *, sec_fetch_site: str = "",
+                  path: str = "", method: str = "GET") -> str:
     """Empty when the request may proceed; otherwise why it may not."""
     if not _is_local_host(host):
         return ("this server only answers to a loopback address; refusing a "
                 "request addressed to " + (_split_host(host) or "no host"))
     o = (origin or "").strip()
-    if not o:
-        return ""                                # same-origin GET, or a CLI
-    if "://" not in o:
-        return "refusing a request with an opaque Origin"
-    netloc = o.split("://", 1)[1].split("/", 1)[0].lower()
-    if netloc != (host or "").strip().lower():
-        return (f"refusing a cross-origin request from {o} — this server "
-                "answers only its own page")
+    if o:
+        if "://" not in o:
+            return "refusing a request with an opaque Origin"
+        netloc = o.split("://", 1)[1].split("/", 1)[0].lower()
+        if netloc != (host or "").strip().lower():
+            return (f"refusing a cross-origin request from {o} — this server "
+                    "answers only its own page")
+    # AUDIT 13-1/13-5: a no-Origin GET is admitted by the Host/Origin rule, and
+    # three GET routes do outbound or expensive work, so they need their own
+    # proof that the caller is Rigma's page and not an attacker's <img>.
+    if _work_route(path) and (method or "GET").upper() == "GET":
+        why = _work_route_refusal(sec_fetch_site)
+        if why:
+            return why
     return ""
+
+
+# AUDIT 13-1/13-5: routes that DO work on a GET — an outbound API call, a disk
+# walk, or tens of MB of ranged reads and parsing. A page can drive these with
+# <img>/<script>/<link>, which send no Origin, so the Host/Origin check alone
+# does not cover them.
+WORK_GET_ROUTES = ("/api/hf/repo", "/api/rag/discover", "/api/server/findings")
+
+
+def _work_route(path: str) -> bool:
+    p = (path or "").split("?", 1)[0].rstrip("/") or "/"
+    return any(p == r for r in WORK_GET_ROUTES)
+
+
+def _work_route_refusal(sec_fetch_site: str) -> str:
+    """A browser sends `Sec-Fetch-Site` on EVERY request and a page can neither
+    forge nor suppress it, so `same-origin` proves the request came from
+    Rigma's own UI. An ABSENT header means a non-browser client (httpx, curl,
+    the CLI), which a web page cannot impersonate — that is the fallback for
+    them. Every other value (`cross-site`, `same-site`, `none`) is refused.
+    """
+    sfs = (sec_fetch_site or "").strip().lower()
+    if not sfs or sfs == "same-origin":
+        return ""
+    return ("refusing a cross-site request to an API route that does work — "
+            "only Rigma's own page (Sec-Fetch-Site: same-origin) may call it")
+
+
+# AUDIT 13-1/13-5: a page that gets past the guard can still LOOP a work-doing
+# GET. A per-route sliding window, in-process, is enough to stop the loop from
+# pinning every worker thread and holding tens of MB each.
+_RATE_WINDOW_S = 10.0
+_RATE_MAX_PER_WINDOW = 6
+_rate_hits: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
+
+
+def work_route_rate_limited(path: str, now: float | None = None) -> bool:
+    """Record a hit on `path` and return whether it is now over its budget.
+
+    `now` is injectable so a test can drive the window without sleeping.
+    """
+    key = (path or "").split("?", 1)[0]
+    t = time.monotonic() if now is None else float(now)
+    with _rate_lock:
+        hits = [h for h in _rate_hits.get(key, []) if t - h < _RATE_WINDOW_S]
+        hits.append(t)
+        _rate_hits[key] = hits
+        return len(hits) > _RATE_MAX_PER_WINDOW
 
 
 class LocalOriginGuard:
@@ -118,12 +174,20 @@ class LocalOriginGuard:
             return await self.app(scope, receive, send)
         head = {k.decode("latin-1").lower(): v.decode("latin-1")
                 for k, v in scope.get("headers") or []}
-        why = guard_request(head.get("host", ""), head.get("origin", ""))
+        path = scope.get("path", "")
+        method = (scope.get("method") or "").upper()
+        why = guard_request(head.get("host", ""), head.get("origin", ""),
+                            sec_fetch_site=head.get("sec-fetch-site", ""),
+                            path=path, method=method)
+        status = 403
+        if not why and _work_route(path) and method == "GET" \
+                and work_route_rate_limited(path):
+            why = "too many requests to a work-doing route — retry shortly"
+            status = 429
         if why:
-            _log.warning("refused %s %s: %s", scope.get("method"),
-                         scope.get("path"), why)
+            _log.warning("refused %s %s: %s", scope.get("method"), path, why)
             return await JSONResponse({"error": why},
-                                      status_code=403)(scope, receive, send)
+                                      status_code=status)(scope, receive, send)
         return await self.app(scope, receive, send)
 
 
@@ -1895,6 +1959,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # else, so the model there cannot wander into the real toolset
             builder_only = bool(s.get("method_draft_id"))
             tctx = {"allow_code": bool(s.get("allow_code")),
+                    # AUDIT 13-3: execution needs its own explicit confirmation;
+                    # the destructive-command regex is only an advisory. The
+                    # session setting is the way back to the old behaviour.
+                    "confirm_exec": bool(s.get("confirm_exec")),
+                    # AUDIT 13-2: reads are workspace-confined and outbound
+                    # POSTs carrying a body are refused unless the session
+                    # grants them; both are explicit opt-ins.
+                    "allow_absolute_reads": bool(s.get("allow_absolute_reads")),
+                    "allow_outbound_post": bool(s.get("allow_outbound_post")),
                     "workspace": s.get("workspace") or str(_Path.home()),
                     "has_vision": has_vision,
                     "run_id": run_id, "profile": run_profile,
@@ -1958,6 +2031,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # execution, and no run_id — the run-scoped tools reach the
                 # live run through it (methods_api.py:135 uses this pattern).
                 _sub_ctx = {**tctx, "allow_code": False, "run_id": "",
+                            "confirm_exec": False,
+                            "allow_absolute_reads": False,
+                            "allow_outbound_post": False,
                             "method_draft_id": "", "_reads": {}}
                 q = question + (f"\n(Focus on: {path})" if path else "")
                 msgs = [{"role": "system", "content":
@@ -5025,6 +5101,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     def _macro_tool_ctx(session) -> dict:
         return {"allow_code": bool(session.get("allow_code")),
+                "confirm_exec": bool(session.get("confirm_exec")),
+                "allow_absolute_reads": bool(
+                    session.get("allow_absolute_reads")),
+                "allow_outbound_post": bool(
+                    session.get("allow_outbound_post")),
                 "workspace": session.get("workspace") or "",
                 "session_id": session.get("id", "")}
 
