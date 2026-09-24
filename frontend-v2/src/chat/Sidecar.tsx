@@ -715,6 +715,20 @@ function SamplingCard() {
           ))}
         </select>
       </label>
+      {/* Native <option> never renders `title` — the popup is drawn by the OS,
+          not the page — so the sentence explaining WHY a backend is greyed out
+          sat on the one element that cannot show it (AUDIT F11-11). A disabled
+          option cannot be selected either, so the reason was unreachable by any
+          route. Render it for every unusable backend, under the picker. */}
+      {menu.some((h) => !h.runnable || !h.installed) && (
+        <ul className="flex flex-col gap-0.5 pl-24 pr-1">
+          {menu.filter((h) => !h.runnable || !h.installed).map((h) => (
+            <li key={h.name} className="text-[11px] text-muted leading-snug">
+              <span className="text-secondary">{h.label}</span> — {harnessHint(h)}
+            </li>
+          ))}
+        </ul>
+      )}
       {/* Said out loud, and only when it is TRUE. A backend that moved under us
           is the one thing about this seam the owner cannot see any other way:
           the turn keeps working right up until it quietly does not, and the
