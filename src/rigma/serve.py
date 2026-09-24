@@ -4388,6 +4388,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     if kind in ("tool", "result") or _time.time() - live["last"] > 1.5:
                         _flush_live()
 
+                # AUDIT 03-2: how many messages the session held before this
+                # turn, so the turn's engine usage can be charged exactly once.
+                _msg_n = len(session.get("messages") or [])
                 try:
                     turn_err = await _drain_turn(session, on_wait=_tick,
                                                  on_event=_activity)
@@ -4408,6 +4411,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if live["items"]:
                     _flush_live()                # persist the tail of this turn
                 run = _runs.load(run_id) or run
+                # AUDIT 03-2: charge this turn's engine usage to the run, or
+                # `token_cap`/`tokens_used` are dead fields and the token
+                # clause of budget_exceeded can never bind. The engine's
+                # usage/timings are recorded on the assistant message's
+                # `stats` (prompt_tokens + tokens); sum only the messages THIS
+                # turn added, so a turn that persisted nothing is not charged
+                # again for the previous turn's message.
+                try:
+                    _added = 0
+                    for _m in (session.get("messages") or [])[_msg_n:]:
+                        if _m.get("role") != "assistant":
+                            continue
+                        _stt = _m.get("stats") or {}
+                        _added += int(_stt.get("prompt_tokens") or 0)
+                        _added += int(_stt.get("tokens") or 0)
+                    if _added:
+                        run["tokens_used"] = (int(run.get("tokens_used", 0))
+                                              + _added)
+                except Exception:
+                    pass          # accounting must never kill a run
                 _lv = _runs.load_live(run_id)
                 _lv["waiting_secs"] = 0          # turn is over; clear the notice
                 _runs.save_live(run_id, _lv)
@@ -4872,8 +4895,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     effort=effort, one_action=True,
                     params={**RUN_PARAMS, **(sess.get("params") or {})},
                     run_profile=profile if profile in _runs.PROFILES else "all")
+        # AUDIT 03-2: the token budget was dead — `token_cap` could not be set
+        # through the API and `tokens_used` was never written, so
+        # budget_exceeded's token clause could never bind. Parse the cap here
+        # (0/absent = uncapped, as documented) and charge usage per turn in
+        # _run_loop.
+        try:
+            _token_cap = int(float((body or {}).get("token_cap") or 0))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "token_cap must be a number"},
+                                status_code=400)
         run = _runs.create(mission, sess["id"], workspace=workspace,
-                           profile=profile,
+                           profile=profile, token_cap=max(0, _token_cap),
                            budget_hours=float((body or {}).get("budget_hours", 8)))
         run["spec"] = None          # compiled by the run loop, see _compile_spec
         _runs.save(run)

@@ -28,6 +28,8 @@ class _Engine(BaseHTTPRequestHandler):
     gate = None          # threading.Event: hold the turn OPEN after the 1st chunk
     bodies = []          # every request body the engine received
     compile_reply = "not a spec"   # mission compiler falls back by default
+    usage = None         # AUDIT 03-2: engine usage to report on each turn
+    timings = None       # ...and its timings (predicted_n feeds tokens_used)
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
@@ -80,6 +82,9 @@ class _Engine(BaseHTTPRequestHandler):
                 {"index": j, "id": f"c{i}_{j}", "type": "function",
                  "function": {"name": nm, "arguments": json.dumps(ar)}}
                 for j, (nm, ar) in enumerate(steps)]}}]})
+        if _Engine.usage:                 # AUDIT 03-2: report usage/timings
+            sse({"choices": [{"delta": {}}], "usage": _Engine.usage,
+                 "timings": _Engine.timings or {}})
         if _Engine.gate is not None:      # hold the turn open, deterministically
             _Engine.gate.wait(timeout=10)
         self.wfile.write(b"data: [DONE]\n\n")
@@ -108,6 +113,8 @@ def home(tmp_path, monkeypatch):
     _Engine.gate = None
     _Engine.bodies = []
     _Engine.compile_reply = "not a spec"
+    _Engine.usage = None
+    _Engine.timings = None
     yield tmp_path
     # Stop this test's run so its background loop exits. Nothing cancels those
     # tasks on teardown, so without this every finished test leaves a loop
@@ -578,6 +585,44 @@ def test_run_gets_anti_repetition_samplers_and_a_token_cap(engine):
     # generous: it must fit a real batch of work (25 detailed prompts +
     # a thinking block). 8192 truncated legitimate output mid-sentence.
     assert 16384 <= p["max_tokens"] <= 32768
+
+
+def test_a_run_halts_when_its_token_cap_is_spent(engine):
+    """AUDIT 03-2: `token_cap` could not be set through POST /api/runs and
+    `tokens_used` was never written, so budget_exceeded's token clause was
+    unreachable. Each turn's engine usage is now charged to the run."""
+    _Engine.script = [None]
+    _Engine.usage = {"prompt_tokens": 40, "completion_tokens": 20}
+    _Engine.timings = {"predicted_n": 60, "predicted_per_second": 5.0}
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "spend tokens",
+                                    "budget_hours": 1,
+                                    "token_cap": 100}).json()["id"]
+    r = _wait(c, rid)
+    assert r["status"] == "budget_exhausted", r.get("halt_reason")
+    assert "token budget" in r["halt_reason"]
+    assert runs.load(rid)["tokens_used"] >= 100
+
+
+def test_usage_is_recorded_even_without_a_token_cap(engine):
+    """The counter is honest accounting, not only a halt trigger."""
+    _Engine.script = [None]
+    _Engine.usage = {"prompt_tokens": 10}
+    _Engine.timings = {"predicted_n": 5}
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
+    _wait(c, rid)
+    r = runs.load(rid)
+    assert r["token_cap"] == 0
+    assert r["tokens_used"] > 0
+    assert r["status"] != "budget_exhausted", r.get("halt_reason")
+
+
+def test_a_non_numeric_token_cap_is_a_400(engine):
+    c = _client(engine)
+    r = c.post("/api/runs", json={"mission": "x", "budget_hours": 1,
+                                  "token_cap": "lots"})
+    assert r.status_code == 400, r.text
 
 
 def test_driving_line_states_the_work_not_the_protocol(engine):
