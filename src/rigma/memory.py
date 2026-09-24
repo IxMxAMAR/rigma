@@ -30,7 +30,9 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+import uuid
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -127,6 +129,12 @@ class MemoryStore:
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        # One lock per store, held across the WHOLE read-modify-write by every
+        # writer (add, score_memories, add_consolidated). Reentrant because
+        # add_consolidated holds it while calling add(). Real cross-thread
+        # writers exist: serve.py dispatches scoring through to_thread into
+        # tools.py, and asyncio.ensure_future runs add_consolidated alongside.
+        self._lock = threading.RLock()
 
     def all(self) -> list[dict]:
         """Every memory. A corrupt line is skipped, never raised — a run must
@@ -152,13 +160,23 @@ class MemoryStore:
         # power 19 hours into a run) would leave ZERO memories where months of
         # accumulated rules used to be. os.replace is atomic on Windows and
         # POSIX — the store is always either the old rows or the new rows.
-        # (No cross-process lock: one Rigma process, one active run at a time,
-        # and the store is only written from the run loop's post-mortem.)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text("".join(json.dumps(r) + "\n" for r in rows),
-                       encoding="utf-8")
-        os.replace(tmp, self.path)
+        # The temp name is unique per write: the old fixed memories.tmp let two
+        # concurrent writers replace/delete each other's file mid-write
+        # (PermissionError WinError 32) and lose one of the writes.
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(
+                f"{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            try:
+                tmp.write_text("".join(json.dumps(r) + "\n" for r in rows),
+                               encoding="utf-8")
+                os.replace(tmp, self.path)
+            except BaseException:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
 
     def add(self, kind: str, text: str, **extra) -> dict:
         """Store a memory. Raises ValueError if it carries a raw trace.
@@ -176,33 +194,39 @@ class MemoryStore:
                 "refusing to store a raw trace as a behavioural rule: "
                 "a model that reads a failure transcript imitates it. "
                 f"Distil it into an imperative first. Got: {text[:80]!r}")
-        rows = self.all()
-        for r in rows:
-            if r.get("kind") == kind and r.get("text") == text:
-                r["seen_count"] = r.get("seen_count", 1) + 1
-                r["last_seen"] = time.time()
-                self._write_all(rows)
-                return r
-        import hashlib
-        rec = {"id": hashlib.sha1(f"{kind}:{text}".encode("utf-8", "replace"))
-               .hexdigest()[:12],
-               "kind": kind, "text": text, "status": "draft",
-               "seen_count": 1, "outcome_score": 0,
-               "vec": embed_one(text, purpose="doc"),
-               "born": time.time(), "last_seen": time.time(), **extra}
-        rows.append(rec)
-        # bounded: evict the least-proven pitfall when over cap. Verified rules
-        # outrank drafts; among equals, lowest outcome then lowest seen goes.
-        pits = [r for r in rows if r.get("kind") == "pitfall"]
-        if len(pits) > MAX_PITFALLS:
-            evict = min(pits, key=lambda m: (m.get("status") == "verified",
-                                             m.get("outcome_score", 0),
-                                             m.get("seen_count", 0),
-                                             m.get("last_seen", 0)))
-            rows.remove(evict)
-            log.info("memory: cap reached, evicted %r", evict.get("text", "")[:60])
-        self._write_all(rows)
-        return rec
+        # Held across the read AND the write: two threads that both read the
+        # file and then both write it back lose one add entirely. A plain
+        # interleaving, single event loop or not.
+        with self._lock:
+            rows = self.all()
+            for r in rows:
+                if r.get("kind") == kind and r.get("text") == text:
+                    r["seen_count"] = r.get("seen_count", 1) + 1
+                    r["last_seen"] = time.time()
+                    self._write_all(rows)
+                    return r
+            import hashlib
+            rec = {"id": hashlib.sha1(f"{kind}:{text}".encode("utf-8", "replace"))
+                   .hexdigest()[:12],
+                   "kind": kind, "text": text, "status": "draft",
+                   "seen_count": 1, "outcome_score": 0,
+                   "vec": embed_one(text, purpose="doc"),
+                   "born": time.time(), "last_seen": time.time(), **extra}
+            rows.append(rec)
+            # bounded: evict the least-proven pitfall when over cap. Verified
+            # rules outrank drafts; among equals, lowest outcome then lowest
+            # seen goes.
+            pits = [r for r in rows if r.get("kind") == "pitfall"]
+            if len(pits) > MAX_PITFALLS:
+                evict = min(pits, key=lambda m: (m.get("status") == "verified",
+                                                 m.get("outcome_score", 0),
+                                                 m.get("seen_count", 0),
+                                                 m.get("last_seen", 0)))
+                rows.remove(evict)
+                log.info("memory: cap reached, evicted %r",
+                         evict.get("text", "")[:60])
+            self._write_all(rows)
+            return rec
 
 
 # --- embeddings (optional, never load-bearing) -------------------------------
@@ -493,21 +517,25 @@ def score_memories(store: MemoryStore, ids: list[str], delta: int,
     if not ids:
         return
     try:
-        rows = store.all()
-        hit = False
-        for r in rows:
-            if r.get("id") in ids:
-                r["outcome_score"] = r.get("outcome_score", 0) + delta
-                r["last_seen"] = time.time()
-                if (delta > 0 and r.get("status") == "draft"
-                        and run_id and r.get("born_run")
-                        and r["born_run"] != run_id):
-                    r["status"] = "verified"
-                    log.info("memory: %r graduated to verified",
-                             r.get("text", "")[:60])
-                hit = True
-        if hit:
-            store._write_all(rows)
+        # lock across the whole read-modify-write: scoring read the file, then
+        # wrote the snapshot back, so a +1 committed while add_consolidated
+        # awaited the conflict gate was silently clobbered
+        with store._lock:
+            rows = store.all()
+            hit = False
+            for r in rows:
+                if r.get("id") in ids:
+                    r["outcome_score"] = r.get("outcome_score", 0) + delta
+                    r["last_seen"] = time.time()
+                    if (delta > 0 and r.get("status") == "draft"
+                            and run_id and r.get("born_run")
+                            and r["born_run"] != run_id):
+                        r["status"] = "verified"
+                        log.info("memory: %r graduated to verified",
+                                 r.get("text", "")[:60])
+                    hit = True
+            if hit:
+                store._write_all(rows)
     except Exception:
         log.exception("memory: outcome scoring failed")
 
@@ -538,10 +566,11 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
     text = clean_rule(text) if kind == "pitfall" else str(text or "").strip()
     if not text:
         return None
-    rows = store.all()
-    for r in rows:                      # exact text: reinforce, no LLM needed
-        if r.get("kind") == kind and r.get("text") == text:
-            return store.add(kind=kind, text=text, born_run=run_id)
+    with store._lock:
+        rows = store.all()
+        for r in rows:                  # exact text: reinforce, no LLM needed
+            if r.get("kind") == kind and r.get("text") == text:
+                return store.add(kind=kind, text=text, born_run=run_id)
     nv = embed_one(text, purpose="doc")
     best, best_cos = None, 0.0
     if nv:
@@ -568,6 +597,9 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
     # merge is not, so ambiguity falls through to append.
     is_conflict = "CONFLICT" in verdict and "DUPLICATE" not in verdict
     is_duplicate = "DUPLICATE" in verdict and "CONFLICT" not in verdict
+    # Both branches below RE-READ inside the lock. `rows`/`best` were read
+    # before the await; writing that snapshot back clobbered any outcome score
+    # (a +1 from a completed step) committed while the gate was answering.
     if is_conflict:
         # The NEW observation supersedes — but how far depends on the old
         # rule's standing. A wrong CONFLICT verdict against a VERIFIED rule
@@ -575,22 +607,33 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
         # draft (the worst possible trade), so verified rules are DEMOTED to
         # draft rather than retired: still retrievable, must re-earn their
         # status. Only drafts die outright.
-        if best.get("status") == "verified":
-            best["status"] = "draft"
-            log.info("memory: %r demoted by conflict with %r",
-                     best.get("text", "")[:50], text[:50])
-        else:
-            best["status"] = "retired"
-            log.info("memory: %r superseded %r", text[:50],
-                     best.get("text", "")[:50])
-        store._write_all([r if r.get("id") != best.get("id") else best
-                          for r in rows])
+        with store._lock:
+            rows = store.all()
+            for r in rows:
+                if r.get("id") != best.get("id"):
+                    continue
+                if r.get("status") == "verified":
+                    r["status"] = "draft"
+                    log.info("memory: %r demoted by conflict with %r",
+                             r.get("text", "")[:50], text[:50])
+                else:
+                    r["status"] = "retired"
+                    log.info("memory: %r superseded %r", text[:50],
+                             r.get("text", "")[:50])
+                break
+            store._write_all(rows)
         return store.add(kind=kind, text=text, born_run=run_id)
     if is_duplicate:
-        best["seen_count"] = best.get("seen_count", 1) + 1
-        best["last_seen"] = time.time()
-        store._write_all([r if r.get("id") != best.get("id") else best
-                          for r in rows])
+        with store._lock:
+            rows = store.all()
+            for r in rows:
+                if r.get("id") != best.get("id"):
+                    continue
+                r["seen_count"] = r.get("seen_count", 1) + 1
+                r["last_seen"] = time.time()
+                best = r
+                break
+            store._write_all(rows)
         return best
     return store.add(kind=kind, text=text, born_run=run_id)
 
