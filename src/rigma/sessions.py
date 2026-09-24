@@ -127,6 +127,24 @@ _FIELD_TYPES: dict[str, type] = {
     # the string form of "no" would otherwise have been read as "yes" — the one
     # mistake here that hands a chat process spawning.
     "confirm_exec": bool,
+    # R3-1: the hole the comment above admitted. `bool("false")` is True for
+    # EVERY switch below too, and two of them are grants, so a client that sent
+    # the quoted form of "no" turned the capability ON — the exact mistake
+    # 09-6 fixed for methods/macros (method_schema.SETTINGS_FIELDS) and 13-3
+    # fixed for `confirm_exec` alone. Measured before this: PATCH
+    # {"allow_absolute_reads": "false"} answered 200, stored the string, and
+    # `tools._absolute_reads_allowed` read it as a GRANT; {"use_tools": "false"}
+    # left tools on. The UI's `grants.readGrants` only honours a literal `true`,
+    # so it also DISPLAYED the grant as off while the server honoured it.
+    "use_tools": bool, "use_rag": bool, "allow_code": bool,
+    "auto_compact": bool, "one_action": bool, "carry_reasoning": bool,
+    "allow_absolute_reads": bool, "allow_outbound_post": bool,
+    # int, not bool: `build_messages` does int(...) on the depth and
+    # `_round_cap` does int(...) on the cap, so a string that reached either
+    # raised. True is deliberately NOT accepted (isinstance(True, int) is True,
+    # so it is excluded explicitly) — a boolean where a count belongs is a
+    # client bug worth naming.
+    "authors_note_depth": int, "max_tool_rounds": int,
 }
 
 
@@ -137,6 +155,10 @@ def validate_field_types(body: dict) -> None:
     reader already treats a missing value as empty, so a client that sends
     null for an unset box gets the same result as omitting the key. Any other
     value of the wrong type is refused by name.
+
+    Every name in MUTABLE_FIELDS must appear in _FIELD_TYPES (test_r3_http.py
+    asserts it), so a field added to the PATCH surface cannot inherit the
+    `bool("false") is True` hole.
     """
     for key, want in _FIELD_TYPES.items():
         if key not in body:
@@ -144,7 +166,15 @@ def validate_field_types(body: dict) -> None:
         value = body[key]
         if value is None:
             body[key] = want()      # str() / list() / dict() = the empty value
-        elif not isinstance(value, want):
+        elif want is bool and not isinstance(value, bool):
+            # bool first: isinstance(1, int) is True, so the int branch below
+            # would have accepted 1 for a switch — and `_exec_confirmed` would
+            # then read it as a grant. Only a real boolean is a boolean (09-6).
+            raise ValueError(f"{key}: must be true or false")
+        elif want is int and (isinstance(value, bool)
+                              or not isinstance(value, int)):
+            raise ValueError(f"{key}: must be a whole number")
+        elif want is not int and not isinstance(value, want):
             raise ValueError(f"{key}: must be a {want.__name__}")
 
 PARAM_RANGES = {"temperature": (0.0, 4.0), "top_p": (0.0, 1.0),
@@ -215,6 +245,15 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # an API client — SEE the current value and offer to
                      # change it. `serve.py` and `mcp_server.py` read it.
                      "confirm_exec": False,
+                     # R3-1: the other two grants 13-2 added were left OUT of
+                     # the defaults while `confirm_exec` was named, so a chat
+                     # that predates them loads without the keys at all and any
+                     # reader that subscripts them gets a KeyError. The product
+                     # only ever used .get(), so this was latent — but the whole
+                     # point of naming `confirm_exec` above is that a grant a
+                     # surface cannot SEE is one it cannot offer to change.
+                     "allow_absolute_reads": False,
+                     "allow_outbound_post": False,
                      # AUDIT 10-9: the schema version this document was written
                      # at. Stamped by save(); a body that predates the key is
                      # what the max_tool_rounds migration below keys on.
