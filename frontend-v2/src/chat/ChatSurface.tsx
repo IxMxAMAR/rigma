@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import FloatWindow from "../FloatWindow";
 import { Attach, Close, Download, Duplicate } from "../Icon";
 import { CHAT_FILTER_EVENT } from "../lib/chatFilter";
+import { responseError } from "../lib/listFetch";
 import MacroStrip from "./MacroStrip";
 import ModelPicker from "./ModelPicker";
 import { useApp } from "../store";
@@ -124,6 +125,7 @@ function ContextMeter() {
   const currentId = useChat((s) => s.currentId);
   const ctx = useApp((s) => s.server?.ctx ?? 0);
   const [busy, setBusy] = useState(false);
+  const [compactErr, setCompactErr] = useState<string | null>(null);
   // engine-reported prompt_tokens from the last message that HAS stats —
   // but if newer messages exist past that point (tool-heavy turns could
   // miss stats), extend with a char-based estimate so the meter never
@@ -163,17 +165,39 @@ function ContextMeter() {
       {frac > 0.6 && currentId && (
         <button
           disabled={busy}
+          // One line before it happens: compact shortens the visible transcript,
+          // and without this the reasonable reading is "I just lost my
+          // conversation" — the server archives, it does not delete.
+          title={"Move the earlier turns of this chat into its archive to free " +
+                 "context. Nothing is deleted — the archive stays on disk and " +
+                 "the visible transcript gets shorter."}
           onClick={async () => {
             setBusy(true);
-            await fetch(`/api/sessions/${currentId}/compact`,
-                        { method: "POST" }).catch(() => {});
-            setBusy(false);
-            void useChat.getState().open(currentId);
+            setCompactErr(null);
+            try {
+              const r = await fetch(`/api/sessions/${currentId}/compact`,
+                                    { method: "POST" });
+              if (!r.ok) {
+                // A refused compact used to look like nothing happening at all.
+                setCompactErr(await responseError(r));
+                return;
+              }
+              void useChat.getState().open(currentId);
+            } catch (e) {
+              setCompactErr((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
           }}
           className="font-mono text-[10.5px] text-amber hover:underline disabled:opacity-40"
         >
           {busy ? "compacting…" : "compact"}
         </button>
+      )}
+      {compactErr && (
+        <span role="alert" className="font-mono text-[10.5px] text-red">
+          {compactErr}
+        </span>
       )}
     </div>
   );

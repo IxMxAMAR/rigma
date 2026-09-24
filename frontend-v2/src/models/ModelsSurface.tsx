@@ -728,6 +728,9 @@ function HfSearch({ onAdded, cfg, inputRef }: {
   const [adding, setAdding] = useState<string | null>(null);
   const [addErr, setAddErr] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
+  // The list was silently truncated at 8 with no count, so a user searching a
+  // family concluded the repo they wanted did not exist and gave up.
+  const [shown, setShown] = useState(8);
   const timer = useRef<number | null>(null);
   // AUDIT F11-9: clearing the box cancelled only the PENDING timer. A request
   // already in flight still resolved and called setHits, so repos appeared under
@@ -760,6 +763,9 @@ function HfSearch({ onAdded, cfg, inputRef }: {
     seq.current++;
   }, []);
 
+  // A new result set starts collapsed again.
+  useEffect(() => setShown(8), [hits]);
+
   return (
     <section className="rounded-lg bg-panel p-4">
       <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-2">
@@ -787,7 +793,7 @@ function HfSearch({ onAdded, cfg, inputRef }: {
         </div>
       )}
       <ul className="mt-2 flex flex-col gap-1">
-        {hits.slice(0, 8).map((h) => (
+        {hits.slice(0, shown).map((h) => (
           <li key={h.repo} className="rounded-md hover:bg-surface/60 px-2 py-1.5">
           <div className="flex items-center gap-2">
             <button
@@ -832,6 +838,14 @@ function HfSearch({ onAdded, cfg, inputRef }: {
           </li>
         ))}
       </ul>
+      {hits.length > shown && (
+        <button
+          onClick={() => setShown((n) => n + 8)}
+          className="mt-2 w-full rounded-md bg-surface hover:bg-float py-1 font-mono text-[11.5px] text-secondary"
+        >
+          show {Math.min(8, hits.length - shown)} more of {hits.length}
+        </button>
+      )}
     </section>
   );
 }
