@@ -36,6 +36,12 @@ _FALLBACK_HTML = "<!doctype html><html><body><h1>Rigma</h1></body></html>"
 _HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}
 _NO_STORE = {"Cache-Control": "no-store"}
 
+# IMP-12: the backup document's schema version. Bump it whenever the shape of
+# /api/backup changes, and restore refuses anything it does not recognise —
+# applying an unknown version's fields "best effort" is how a restore silently
+# half-works and the user loses the data they were trying to recover.
+BACKUP_VERSION = 1
+
 # --- who is allowed to talk to this server (AUDIT F39) -----------------------
 # docs/audit-2026-09-04-full.md. rigma binds 127.0.0.1 and has no auth — a
 # documented decision, made when the surface was a chat proxy. It is now ~79
@@ -1243,7 +1249,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return time.time()
 
     def _bump_stats(timings: dict) -> None:
-        """Lifetime odometer: total tokens + turns, persisted to ~/.rigma."""
+        """Lifetime odometer: total tokens + turns, persisted to ~/.rigma.
+
+        IMP-7: also counts TURNS per model and stamps when each was last used.
+        The meter answers "which model is costing me", which lifetime totals
+        cannot, and it records them HERE rather than recomputing them from the
+        session store — the odometer is the one place a completed turn is
+        already counted, including turns that ran before this build.
+        """
         n = timings.get("predicted_n") or 0
         if not n:
             return
@@ -1257,6 +1270,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             model = (st.read_state() or {}).get("model", "")
             by = cur.setdefault("by_model", {})
             by[model] = int(by.get(model, 0)) + int(n)
+            turns = cur.setdefault("by_model_turns", {})
+            turns[model] = int(turns.get(model, 0)) + 1
+            cur.setdefault("last_used", {})[model] = _now()
             tmp = f.with_suffix(".tmp")
             tmp.write_text(json.dumps(cur), encoding="utf-8")
             tmp.replace(f)
@@ -3304,25 +3320,97 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # drifted from the validator that actually rejects the write. One
         # definition, sessions.PARAM_RANGES, is the one the 400 names.
         info["param_ranges"] = {k: list(v) for k, v in sessions.PARAM_RANGES.items()}
+        # IMP-5: the idle auto-unload timeout is a setting, so the surface can
+        # SHOW it (and say "reloading the model" after a break) instead of a
+        # slow first token looking like a bug.
+        from . import app_settings
+        idle = app_settings.idle_unload_minutes()
+        info["idle_unload_minutes"] = idle
+        info["idle_unload"] = idle > 0
         return info
+
+    @app.get("/api/settings")
+    async def get_settings():
+        """Server-level settings — today, the idle auto-unload timeout.
+
+        `idle_unload_minutes` is the EFFECTIVE value (0 = never unload), which
+        may come from RIGMA_KEEP_ALIVE_MIN; `env_override` says so, because a
+        setting the UI changes that has no effect would look broken.
+        """
+        from . import app_settings
+        return {"settings": app_settings.load(),
+                "idle_unload_minutes": app_settings.idle_unload_minutes(),
+                "env_override": os.environ.get("RIGMA_KEEP_ALIVE_MIN")
+                not in (None, "")}
+
+    @app.post("/api/settings")
+    async def post_settings(body: dict | None = None):
+        """Change one server setting. Validated before anything is written."""
+        from . import app_settings
+        try:
+            saved = await asyncio.to_thread(app_settings.save, body or {})
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        return {"settings": saved,
+                "idle_unload_minutes": app_settings.idle_unload_minutes(),
+                "env_override": os.environ.get("RIGMA_KEEP_ALIVE_MIN")
+                not in (None, "")}
 
     @app.get("/api/server/stats")
     async def server_stats():
+        """The usage meter: exactly what the odometer in stats.json stores.
+
+        Nothing is recomputed from the session store — the turn loop already
+        counted every completed turn here, including turns from older builds.
+        `models` is the same data pre-sorted for a panel (most tokens first);
+        the flat fields are kept for the existing UI that reads them.
+        """
+        def _int(v) -> int:
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+
         try:
             f = st.rigma_home() / "stats.json"
             data = json.loads(f.read_text(encoding="utf-8")) if f.exists() \
                 else {}
+            if not isinstance(data, dict):
+                data = {}
         except Exception:
             data = {}
-        return {"total_tokens": data.get("total_tokens", 0),
-                "total_turns": data.get("total_turns", 0),
-                "by_model": data.get("by_model", {})}
+        by = data.get("by_model")
+        turns = data.get("by_model_turns")
+        last = data.get("last_used")
+        by = by if isinstance(by, dict) else {}
+        turns = turns if isinstance(turns, dict) else {}
+        last = last if isinstance(last, dict) else {}
+        models = [{"model": str(name), "tokens": _int(tok),
+                   "turns": _int(turns.get(name)),
+                   "last_used": last.get(name)}
+                  for name, tok in by.items()]
+        models.sort(key=lambda m: m["tokens"], reverse=True)
+        return {"total_tokens": _int(data.get("total_tokens")),
+                "total_turns": _int(data.get("total_turns")),
+                "by_model": by, "by_model_turns": turns,
+                "last_used": last, "models": models}
 
     @app.get("/api/server/log")
     async def server_log(lines: int = 200):
+        """A BOUNDED tail of the current engine log.
+
+        IMP-11: the read is bounded by bytes (see server_ops.log_tail_bounded),
+        so this no longer pulls a multi-hundred-megabyte log through the event
+        loop to show 200 lines. `x-log-truncated` says whether older lines
+        exist — a viewer that filters should say "not in this window" rather
+        than "not in the log".
+        """
         from . import server_ops
-        return Response(server_ops.log_tail(lines), media_type="text/plain",
-                        headers=_NO_STORE)
+        text, truncated = await asyncio.to_thread(
+            server_ops.log_tail_bounded, lines)
+        return Response(text, media_type="text/plain",
+                        headers={**_NO_STORE,
+                                 "x-log-truncated": "1" if truncated else "0"})
 
     @app.get("/api/server/findings")
     async def server_findings():
@@ -5115,7 +5203,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 out.append({"id": r["id"], "status": r.get("status"),
                             "mission": str(r.get("mission", ""))[:140],
                             "workspace": r.get("workspace", ""),
-                            "iteration": r.get("iteration", 0)})
+                            "iteration": r.get("iteration", 0),
+                            # IMP-8: the history list can say WHY, not just that
+                            # it stopped — "finished" and "gave up" look alike
+                            # without this.
+                            "stop_reason": _runs.stop_reason(r)})
                 if len(out) >= 40:
                     break
         except Exception:
@@ -5123,21 +5215,143 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return out
 
     @app.get("/api/memory")
-    async def memory_list():
-        """The memory trust surface: every learned rule, inspectable."""
+    async def memory_list(kind: str = ""):
+        """The memory trust surface: every learned rule, inspectable.
+
+        `kind` filters server-side so a UI tab does not have to know the
+        kinds; the sort (most proven first) is the same order the store
+        injects, so the top of the list is what the model is being told.
+        """
         rows = _memory_store().all()
+        if kind:
+            rows = [m for m in rows if m.get("kind") == kind]
         rows.sort(key=lambda m: (m.get("outcome_score", 0),
                                  m.get("seen_count", 0)), reverse=True)
         for m in rows:
             m.pop("vec", None)          # 768 floats of noise for a UI
         return rows
 
+    @app.patch("/api/memory/{mid}")
+    async def memory_edit(mid: str, body: dict | None = None):
+        """Correct one learned rule. The store takes its lock for the whole
+        read-modify-write, so an edit cannot lose a concurrent score."""
+        store = _memory_store()
+        fields = {k: v for k, v in (body or {}).items()
+                  if k in store.EDITABLE}
+        if not fields:
+            return JSONResponse(
+                {"error": "nothing to change — send one of: "
+                 + ", ".join(store.EDITABLE)}, status_code=400)
+        try:
+            row = await asyncio.to_thread(store.update, mid, **fields)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        if row is None:
+            return JSONResponse({"error": "no such memory"}, status_code=404)
+        row = dict(row)
+        row.pop("vec", None)
+        return row
+
     @app.delete("/api/memory/{mid}")
     async def memory_forget(mid: str):
+        gone = await asyncio.to_thread(_memory_store().delete, mid)
+        if not gone:
+            return JSONResponse({"error": "no such memory"}, status_code=404)
+        return {"remaining": len(_memory_store().all())}
+
+    @app.delete("/api/memory")
+    async def memory_prune(body: dict | None = None):
+        """Forget a selection. `ids` is required and must be non-empty: a
+        prune that lost its list must not empty the store."""
+        ids = [str(i) for i in ((body or {}).get("ids") or []) if str(i)]
+        if not ids:
+            return JSONResponse(
+                {"error": "ids: a non-empty list of memory ids is required "
+                 "(use DELETE /api/memory/{id} for one)"}, status_code=400)
+        gone = await asyncio.to_thread(_memory_store().delete_many, ids)
+        return {"removed": gone, "remaining": len(_memory_store().all())}
+
+    @app.get("/api/backup")
+    async def get_backup():
+        """Settings + methods + memory as ONE versioned JSON document.
+
+        IMP-12: moving to a new machine, or recovering from a bad experiment,
+        used to mean copying several files by hand and knowing where they live.
+        `vec` is stripped from memory rows — it is derived from the text (768
+        floats per row) and retrieval falls back to lexical matching without
+        it, so including it would bloat the file for nothing.
+        """
+        from . import __version__, app_settings
+        from . import methods as _methods
+        rows = _memory_store().all()
+        for m in rows:
+            m.pop("vec", None)
+        return {"rigma_backup": BACKUP_VERSION,
+                "app_version": __version__,
+                "created_at": _now(),
+                "settings": app_settings.load(),
+                "methods": _methods.user_methods(),
+                "memory": rows}
+
+    @app.post("/api/restore")
+    async def post_restore(body: dict | None = None):
+        """Validate a backup document and apply it. Nothing is written until
+        the WHOLE document has passed, and an unknown version is refused
+        outright rather than half-applied."""
+        from . import app_settings
+        from . import memory as _mem
+        from . import methods as _methods
+        doc = body if isinstance(body, dict) else {}
+        got = doc.get("rigma_backup")
+        if got != BACKUP_VERSION:
+            return JSONResponse(
+                {"error": f"unknown backup version {got!r}; this build "
+                          f"restores version {BACKUP_VERSION}"},
+                status_code=400)
+
+        # --- validate EVERYTHING before writing ANYTHING ---
+        patch = doc.get("settings") or {}
+        if not isinstance(patch, dict):
+            return JSONResponse({"error": "settings: must be an object"},
+                                status_code=400)
+        if patch:
+            _, err = app_settings.validate(patch)
+            if err:
+                return JSONResponse({"error": err}, status_code=400)
+        docs = doc.get("methods") or []
+        if not isinstance(docs, list):
+            return JSONResponse({"error": "methods: must be a list"},
+                                status_code=400)
+        normalized = []
+        for i, m in enumerate(docs):
+            full, errs = _methods.validate_user(
+                m if isinstance(m, dict) else {})
+            if errs:
+                return JSONResponse(
+                    {"error": f"method {i}: " + "; ".join(errs)},
+                    status_code=400)
+            normalized.append(full)
+        try:
+            rows = _mem.clean_rows(doc.get("memory") or [])
+        except ValueError as e:
+            return JSONResponse({"error": f"memory: {e}"}, status_code=400)
+
+        # --- apply ---
+        if patch:
+            await asyncio.to_thread(app_settings.save, patch)
+        for full in normalized:
+            _, errs = await asyncio.to_thread(_methods.save_user, full)
+            if errs:      # validated above, so this is a disk/permission fault
+                return JSONResponse(
+                    {"error": f"could not write method {full.get('id')}: "
+                              + "; ".join(errs)}, status_code=500)
         store = _memory_store()
-        rows = [r for r in store.all() if r.get("id") != mid]
-        store._write_all(rows)
-        return {"remaining": len(rows)}
+        before = len(store.all())
+        after = await asyncio.to_thread(store.restore, rows)
+        return {"restored": True, "version": BACKUP_VERSION,
+                "methods": len(normalized),
+                "memory": {"before": before, "after": after},
+                "settings": app_settings.load()}
 
     @app.get("/api/runs/active")
     async def active_run():
@@ -5148,6 +5362,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r["log_tail"] = await asyncio.to_thread(_runs.get_log_tail, r["id"], 40)
         r.update(_runs.load_live(r["id"]))
         r["plan"] = _runs.read_plan(r["id"])
+        r["stop_reason"] = _runs.stop_reason(r)
+        r["budget"] = _runs.budget_snapshot(r)
         return r
 
     @app.get("/api/runs/{rid}")
@@ -5159,6 +5375,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r["log_tail"] = _runs.get_log_tail(rid, 40)
         r["plan"] = _runs.read_plan(rid)
         r.update(_runs.load_live(rid))
+        r["stop_reason"] = _runs.stop_reason(r)
+        r["budget"] = _runs.budget_snapshot(r)
         return r
 
     @app.get("/api/runs/{rid}/log")
@@ -5408,7 +5626,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                  frozen_streak=0, verified_once=False,
                  completion_challenges=0, _echo_streak=0,
                  _paused_at=0,
-                 halt_reason="")
+                 halt_reason="", stop_reason="")
         # a used-up or nearly-used-up clock gets a grace hour — a restart
         # exists to finish work, not to instantly re-die on the old deadline
         if r.get("deadline", 0) < _time.time() + 900:
@@ -5509,18 +5727,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             _log.exception("startup: run reconciliation failed")
 
     def _start_keepalive():
-        """The idle auto-unload poller, or None when it's switched off.
+        """The idle auto-unload poller.
 
-        Returns the task so lifespan can cancel it: an un-cancelled loop keeps
-        polling (and can unload an engine) while the app is shutting down."""
-        mins = float(os.environ.get("RIGMA_KEEP_ALIVE_MIN", "0") or 0)
-        if mins <= 0:
-            return None   # opt-in: 0 disables idle auto-unload
-
+        IMP-5: always running, and it re-reads the setting every poll, so the
+        Settings switch takes effect without a restart. When the timeout is 0
+        (the default) the loop does nothing but sleep. Returns the task so
+        lifespan can cancel it: an un-cancelled loop keeps polling while the
+        app is shutting down."""
         async def _loop():
+            from . import app_settings
             from . import server_ops
             while True:
                 await asyncio.sleep(KEEPALIVE_POLL_SECS)
+                mins = app_settings.idle_unload_minutes()
+                if mins <= 0:
+                    continue          # switched off: never unload
                 s = st.read_state()
                 if not s or s.get("unloaded"):
                     continue
