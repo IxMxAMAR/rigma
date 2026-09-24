@@ -24,7 +24,6 @@ export interface StreamingTurn {
   text: string;
   thinking: string;
   chips: Chip[];
-  citations: unknown[];
   error: string | null;
   /** set while a macro drives this turn, so the UI can say which step */
   macro: { label: string; index: number; total: number } | null;
@@ -101,7 +100,6 @@ export const emptyTurn = (): StreamingTurn => ({
   text: "",
   thinking: "",
   chips: [],
-  citations: [],
   error: null,
   macro: null,
   harness: "",
@@ -152,8 +150,12 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
       };
     case "macro_done":
       return { ...turn, macro: null };
-    case "citations":
-      return { ...turn, citations: (d.citations as unknown[]) ?? [] };
+    // AUDIT F11-12: a `citations` branch and StreamingTurn field lived here.
+    // No server code emits the event (grep over src/rigma/*.py finds only the
+    // RAG tool's plain-text `sources: …` line) and no component read the field
+    // (Transcript renders harness, macro, notices, thinking, chips, text,
+    // error). The half was removed rather than left looking like a pipeline
+    // that already handles citations; re-adding it needs a producer first.
     case "error":
       return { ...turn, error: String(d.message ?? "unknown error") };
     // Which backend owns this turn, named at its start. Its own event name
