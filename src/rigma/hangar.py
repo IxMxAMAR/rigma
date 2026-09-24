@@ -45,6 +45,13 @@ _QUANT_RE = re.compile(
 
 DOWNLOAD_ATTEMPTS = 6   # multi-GB pulls WILL drop; resume and retry
 
+# Headroom a pull must leave free. Same value as serve.UPLOAD_FREE_MARGIN_BYTES
+# (2 GiB), duplicated rather than imported because serve imports hangar.
+# AUDIT 07-5: without this a multi-GB quant could fill the system volume to
+# zero — stalling every other app on the machine — and the only signal was an
+# OSError from the write, arriving after the damage and leaving a huge .part.
+PULL_FREE_MARGIN_BYTES = 2 * 2**30
+
 
 class HangarError(RuntimeError):
     pass
@@ -1057,6 +1064,25 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
     with _PULL_LOCK:
         if key in _PULLS and _PULLS[key]["status"] == "downloading":
             return _PULLS[key]
+        # AUDIT 07-5: refuse BEFORE spawning the thread. A file already on disk
+        # downloads nothing, so it needs no room; a file whose size the repo did
+        # not state cannot be judged and is left to the write's own OSError.
+        target = model_file_path(file)
+        if want and not target.exists():
+            try:
+                free = shutil.disk_usage(models_dir()).free
+            except OSError:
+                free = None
+            need = want + PULL_FREE_MARGIN_BYTES
+            if free is not None and need > free:
+                short = need - free
+                raise HangarError(
+                    f"not enough free space for {file}: "
+                    f"{want / 2**30:.1f} GB to download plus "
+                    f"{PULL_FREE_MARGIN_BYTES / 2**30:.0f} GB headroom needs "
+                    f"{need / 2**30:.1f} GB, but only {free / 2**30:.1f} GB is "
+                    f"free — {short / 2**30:.1f} GB short. Free some space or "
+                    f"choose a smaller quant.")
         _PULLS[key] = {"status": "downloading", "total": want, "done": 0,
                        "error": None}
 
