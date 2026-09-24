@@ -22,6 +22,22 @@ import pytest
 
 from rigma import harness, harness_mcode, rag
 
+
+def _a_different_version(version: str) -> str:
+    """Some version that is definitely NOT `version`, for drift tests.
+
+    Derived rather than written out so a routine bump of `harness_mcode.VERIFIED`
+    cannot turn the drift tests into failures — which is what happened when the
+    pin moved 0.5.1 -> 0.5.4 and two tests here still named the old build. Bumping
+    the LAST component keeps it a plausible version string, so the message the
+    user sees is realistic.
+    """
+    head, _, tail = version.rpartition(".")
+    if head and tail.isdigit():
+        return f"{head}.{int(tail) + 1}"
+    return version + ".1"
+
+
 @pytest.fixture(autouse=True)
 def _a_recorded_sidecar_answers(monkeypatch):
     """A recorded RAG sidecar counts as LIVE for this file.
@@ -248,31 +264,40 @@ def test_a_build_we_were_not_verified_against_says_so_in_the_turn(fake_cli,
 
     `harness.conformance` knows how to say that, but it only runs from
     `rigma harness` and the menu's `?check=1`. Nothing on the TURN path
-    compared anything, so installing 0.5.4 and chatting produced a normal-
-    looking turn on a build nobody measured. The turn is where the owner is.
+    compared anything, so installing a newer build and chatting produced a
+    normal-looking turn on a build nobody measured. The turn is where the owner
+    is.
+
+    The two versions are derived from `VERIFIED` rather than written out: this
+    test is about the MECHANISM, and hardcoding the pinned build made a routine
+    version bump (0.5.1 -> 0.5.4) look like two broken tests. The literal that
+    used to be here is exactly the failure mode
+    `test_the_verified_build_is_a_fact_about_the_code` warns about.
     """
-    monkeypatch.setenv("FAKE_MCODE_VERSION", "0.5.4")
+    other = _a_different_version(harness_mcode.VERIFIED)
+    monkeypatch.setenv("FAKE_MCODE_VERSION", other)
     monkeypatch.setattr(harness_mcode, "_DRIFT_SAID", False)
     got = list(harness_mcode.drive_turn(
         base_url=BASE, model="local-test", prompt="p", state={}, timeout=30))
     notes = [e.text for e in got if e.kind == "notice"]
-    assert any("0.5.1" in n and "0.5.4" in n for n in notes), notes
+    assert any(other in n and harness_mcode.VERIFIED in n for n in notes), notes
     # the turn still runs: drift is a warning, not a refusal
     assert "".join(e.text for e in got if e.kind == "text") == "hello from dsh"
 
 
 def test_a_build_we_were_verified_against_is_not_a_notice(fake_cli, monkeypatch):
-    monkeypatch.setenv("FAKE_MCODE_VERSION", "0.5.1")
+    monkeypatch.setenv("FAKE_MCODE_VERSION", harness_mcode.VERIFIED)
     monkeypatch.setattr(harness_mcode, "_DRIFT_SAID", False)
     got = list(harness_mcode.drive_turn(
         base_url=BASE, model="local-test", prompt="p", state={}, timeout=30))
-    assert not [e for e in got if "0.5.1" in e.text and e.kind == "notice"], got
+    assert not [e for e in got if e.kind == "notice"], got
 
 
 def test_the_drift_notice_is_said_once_not_every_turn(fake_cli, monkeypatch):
     """One subprocess per process, and one line in the transcript — a warning
     repeated every turn is noise the reader learns to skip."""
-    monkeypatch.setenv("FAKE_MCODE_VERSION", "0.5.4")
+    monkeypatch.setenv("FAKE_MCODE_VERSION",
+                       _a_different_version(harness_mcode.VERIFIED))
     monkeypatch.setattr(harness_mcode, "_DRIFT_SAID", False)
     calls = []
     real = harness_mcode.backend_version
