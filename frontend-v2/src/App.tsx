@@ -7,6 +7,7 @@ import { useChat } from "./chat/chatStore";
 import { Copy as CopyIcon, External } from "./Icon";
 import ChatSurface from "./chat/ChatSurface";
 import EngineSurface from "./engine/EngineSurface";
+import ErrorBoundary from "./ErrorBoundary";
 import MemorySurface from "./memory/MemorySurface";
 import ModelsSurface from "./models/ModelsSurface";
 import SkillsSurface from "./skills/SkillsSurface";
@@ -213,6 +214,7 @@ function Canvas() {
 
 export default function App() {
   const setServer = useApp((s) => s.setServer);
+  const surface = useApp((s) => s.surface);
   useEffect(() => {
     let alive = true;
     const poll = async () => {
@@ -245,7 +247,14 @@ export default function App() {
       <Sidebar />
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
         <Header />
-        <Canvas />
+        {/* AUDIT F11-3: keyed by surface, so switching screens clears a crash
+            and one bad surface can never take the whole shell down. */}
+        <ErrorBoundary
+          key={surface}
+          onReset={() => useApp.getState().setSurface("chat")}
+        >
+          <Canvas />
+        </ErrorBoundary>
       </div>
       <Palette />
     </div>

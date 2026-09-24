@@ -2,6 +2,9 @@
 // per-chat (sidecar) or per-model (registry), by design.
 import { useCallback, useEffect, useState } from "react";
 
+import LoadError from "../LoadError";
+import { readList } from "../lib/listFetch";
+
 interface Preset {
   id: string;
   name: string;
@@ -19,12 +22,22 @@ export default function SettingsSurface() {
   });
   const [editing, setEditing] = useState<string | null>(null); // preset id
   const [err, setErr] = useState<string | null>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    // AUDIT F11-3: a non-array /api/presets body used to reach .map and blank
+    // the app; a failed load must not read as "no presets yet".
     try {
-      const r = await fetch("/api/presets");
-      setPresets((await r.json()) as Preset[]);
-    } catch {
+      const res = await readList<Preset>(await fetch("/api/presets"));
+      if (!res.ok) {
+        setLoadErr(res.error);
+        setPresets([]);
+        return;
+      }
+      setLoadErr(null);
+      setPresets(res.rows);
+    } catch (e) {
+      setLoadErr((e as Error).message);
       setPresets([]);
     }
   }, []);
@@ -39,7 +52,11 @@ export default function SettingsSurface() {
           <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-3">
             presets
           </h3>
-          {presets.length === 0 && (
+          {loadErr && (
+            <LoadError message={`could not load presets: ${loadErr}`}
+                       onRetry={() => void refresh()} />
+          )}
+          {!loadErr && presets.length === 0 && (
             <p className="text-muted text-[13px] mb-2">
               No presets yet — a preset bundles a system prompt + sampling and
               can be applied to any chat.

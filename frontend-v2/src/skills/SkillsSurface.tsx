@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 
+import LoadError from "../LoadError";
+import { readList } from "../lib/listFetch";
+
 interface Skill {
   id: string;
   name: string;
@@ -14,12 +17,23 @@ export default function SkillsSurface() {
   });
   const [editing, setEditing] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    // AUDIT F11-3: a 500's {detail} body used to be cast to Skill[] and reach
+    // .map during render, blanking the whole app. Check the status AND the
+    // shape; a failed load must never render as "no skills yet".
     try {
-      const r = await fetch("/api/skills");
-      setSkills((await r.json()) as Skill[]);
-    } catch {
+      const res = await readList<Skill>(await fetch("/api/skills"));
+      if (!res.ok) {
+        setLoadErr(res.error);
+        setSkills([]);
+        return;
+      }
+      setLoadErr(null);
+      setSkills(res.rows);
+    } catch (e) {
+      setLoadErr((e as Error).message);
       setSkills([]);
     }
   }, []);
@@ -37,7 +51,11 @@ export default function SkillsSurface() {
           <p className="text-muted text-[13px] mb-2">
             Skills bundle instructions and domain knowledge. Invoke any skill in chat anytime using <code className="bg-surface px-1.5 py-0.5 rounded font-mono">/skillName</code> or <code className="bg-surface px-1.5 py-0.5 rounded font-mono">/skill:name</code>.
           </p>
-          {skills.length === 0 && (
+          {loadErr && (
+            <LoadError message={`could not load skills: ${loadErr}`}
+                       onRetry={() => void refresh()} />
+          )}
+          {!loadErr && skills.length === 0 && (
             <p className="text-muted text-[13px] mb-2">
               No global skills yet. Create one below!
             </p>
