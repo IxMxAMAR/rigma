@@ -19,10 +19,12 @@ export default function MacroStrip() {
   const [macros, setMacros] = useState<MacroDef[]>([]);
   const [pending, setPending] = useState<MacroPreview | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
     setPending(null);
+    setErr(null);
     if (!currentId) {
       setMacros([]);
       return;
@@ -49,6 +51,7 @@ export default function MacroStrip() {
 
   const click = async (macro: MacroDef) => {
     if (streaming) return;
+    setErr(null);
     try {
       const p = await previewMacro(currentId, macro.id);
       if (p.needs_confirm || p.asks.length > 0) {
@@ -57,8 +60,10 @@ export default function MacroStrip() {
         return;
       }
       await runMacro(macro.id);
-    } catch {
-      /* the composer stays exactly as it is */
+    } catch (e) {
+      // AUDIT F11-4: a preview the server refuses used to leave the strip
+      // exactly as it was — indistinguishable from a dead button.
+      setErr((e as Error).message);
     }
   };
 
@@ -118,18 +123,23 @@ export default function MacroStrip() {
   }
 
   return (
-    <div className="flex items-center gap-1.5 flex-wrap pb-2">
-      {macros.map((m) => (
-        <button
-          key={m.id}
-          onClick={() => void click(m)}
-          disabled={!!streaming}
-          title={m.hint}
-          className="rounded-md bg-surface hover:bg-float text-secondary px-2.5 py-1 text-[12px] disabled:opacity-40"
-        >
-          {m.label}
-        </button>
-      ))}
+    <div className="flex flex-col gap-1 pb-2">
+      {err && (
+        <p role="alert" className="text-red text-[11.5px]">{err}</p>
+      )}
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {macros.map((m) => (
+          <button
+            key={m.id}
+            onClick={() => void click(m)}
+            disabled={!!streaming}
+            title={m.hint}
+            className="rounded-md bg-surface hover:bg-float text-secondary px-2.5 py-1 text-[12px] disabled:opacity-40"
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

@@ -2,6 +2,8 @@
 // browse history. Polls the active run at 2s; history at rest.
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { responseError } from "../lib/listFetch";
+
 interface PlanStep {
   id: number;
   text: string;
@@ -107,13 +109,28 @@ function statusTone(s: string) {
 
 function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
   const [note, setNote] = useState("");
-  const act = async (path: string, body?: unknown) => {
-    await fetch(`/api/runs/${run.id}/${path}`, {
-      method: "POST",
-      headers: body !== undefined ? { "content-type": "application/json" } : {},
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    }).catch(() => {});
+  const [err, setErr] = useState<string | null>(null);
+  const act = async (path: string, body?: unknown): Promise<boolean> => {
+    setErr(null);
+    try {
+      const r = await fetch(`/api/runs/${run.id}/${path}`, {
+        method: "POST",
+        headers: body !== undefined ? { "content-type": "application/json" } : {},
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+      if (!r.ok) {
+        // AUDIT F11-4: a refused pause/stop/resume used to look exactly like
+        // one that worked — the poll just re-read the same old state. Say what
+        // the server said and do not pretend the action landed.
+        setErr(await responseError(r));
+        return false;
+      }
+    } catch (e) {
+      setErr((e as Error).message);
+      return false;
+    }
     onAction();
+    return true;
   };
   const plan = run.plan ?? [];
   const done = plan.filter((s) => s.status === "done").length;
@@ -145,6 +162,12 @@ function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
           </button>
         </div>
       </div>
+      {err && (
+        <div role="alert"
+             className="rounded-md bg-red/10 text-red px-2.5 py-1.5 text-[12px] mb-2">
+          {err}
+        </div>
+      )}
       <p className="text-[13px] text-secondary mb-3">{run.mission}</p>
       {run.pending_question?.q && (
         <div className="rounded-md bg-amber/10 border border-amber/30 p-3 mb-3">
@@ -200,8 +223,10 @@ function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
         onSubmit={(e) => {
           e.preventDefault();
           if (!note.trim()) return;
-          void act("inject", { message: note.trim() });
-          setNote("");
+          // keep the note when the server refused it — clearing it hid the
+          // fact that nothing was delivered (AUDIT F11-4)
+          void act("inject", { message: note.trim() })
+            .then((ok) => { if (ok) setNote(""); });
         }}
       >
         <input
@@ -222,6 +247,7 @@ function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
 export default function AutonomousSurface() {
   const [history, setHistory] = useState<RunSummary[]>([]);
   const [active, setActive] = useState<Run | null>(null);
+  const [histErr, setHistErr] = useState<string | null>(null);
   const activeId = useRef<string | null>(null);
 
   const refreshHistory = useCallback(async () => {
@@ -292,6 +318,12 @@ export default function AutonomousSurface() {
             <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-2">
               history
             </h3>
+            {histErr && (
+              <div role="alert"
+                   className="rounded-md bg-red/10 text-red px-2.5 py-1.5 text-[12px] mb-2">
+                {histErr}
+              </div>
+            )}
             <ul className="flex flex-col gap-1">
               {history.map((h) => (
                 <li key={h.id} className="flex items-center gap-3 text-[12.5px] rounded-md hover:bg-surface px-2 py-1">
@@ -301,14 +333,23 @@ export default function AutonomousSurface() {
                   <span className="flex-1 truncate text-secondary">{h.mission}</span>
                   {RESTARTABLE.has(h.status) && !active && (
                     <button
-                      onClick={() => {
-                        void fetch(`/api/runs/${h.id}/restart`, { method: "POST" })
-                          .then((r) => r.json())
-                          .then(() => {
-                            activeId.current = h.id;
-                            void pollActive();
-                          })
-                          .catch(() => {});
+                      onClick={async () => {
+                        setHistErr(null);
+                        try {
+                          const r = await fetch(
+                            `/api/runs/${h.id}/restart`, { method: "POST" });
+                          if (!r.ok) {
+                            // AUDIT F11-4: a 409 used to set activeId and poll
+                            // anyway, which re-read the old terminal state and
+                            // made the resume button vanish with no reason.
+                            setHistErr(await responseError(r));
+                            return;
+                          }
+                          activeId.current = h.id;
+                          void pollActive();
+                        } catch (e) {
+                          setHistErr((e as Error).message);
+                        }
                       }}
                       className="shrink-0 rounded-md bg-amber/15 text-amber px-2 py-0.5 text-[11.5px] font-semibold"
                     >
