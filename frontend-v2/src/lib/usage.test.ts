@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { tokens, topModels } from "./usage";
+import { sinceLabel, tokens, topModels, usageRows } from "./usage";
 
 describe("usage formatting", () => {
   it("formats token counts compactly", () => {
@@ -30,5 +30,49 @@ describe("usage formatting", () => {
     const by: Record<string, number> = {};
     for (let i = 0; i < 10; i++) by[`m${i}`] = i + 1;
     expect(topModels(by, 3)).toHaveLength(3);
+  });
+});
+
+describe("usage rows across both server shapes", () => {
+  it("prefers the enriched models[] when present", () => {
+    expect(usageRows({
+      by_model: { a: 10 },
+      models: [
+        { model: "b", tokens: 300, turns: 3, last_used: 100 },
+        { model: "a", tokens: 100, turns: 1, last_used: 50 },
+      ],
+    })).toEqual([
+      { model: "b", tokens: 300, turns: 3, last_used: 100 },
+      { model: "a", tokens: 100, turns: 1, last_used: 50 },
+    ]);
+  });
+
+  it("falls back to the flat map on an older server", () => {
+    expect(usageRows({ by_model: { a: 10, b: 30 } })).toEqual([
+      { model: "b", tokens: 30, turns: 0, last_used: null },
+      { model: "a", tokens: 10, turns: 0, last_used: null },
+    ]);
+  });
+
+  it("joins turns and last-used onto the flat map when only those are sent", () => {
+    expect(usageRows({
+      by_model: { a: 10 },
+      by_model_turns: { a: 4 },
+      last_used: { a: 1000 },
+    })).toEqual([{ model: "a", tokens: 10, turns: 4, last_used: 1000 }]);
+  });
+
+  it("survives a null stats body", () => {
+    expect(usageRows(null)).toEqual([]);
+    expect(usageRows(undefined)).toEqual([]);
+  });
+
+  it("labels a last-used stamp, or says nothing", () => {
+    expect(sinceLabel(null, 1000)).toBe("");
+    expect(sinceLabel(0, 1000)).toBe("");
+    expect(sinceLabel(970, 1000)).toBe("just now");
+    expect(sinceLabel(1000 - 120, 1000)).toBe("2m ago");
+    expect(sinceLabel(1000 - 7200, 1000)).toBe("2h ago");
+    expect(sinceLabel(1000 - 3 * 86400, 1000)).toBe("3d ago");
   });
 });
