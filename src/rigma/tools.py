@@ -3758,6 +3758,41 @@ _DELETE_PY = re.compile(
 # separate, explicit per-session confirmation, and the regexes stay as a fast
 # refusal of the obvious literal form (and as a message that says what they
 # are). Tests call `exec_decision` on the TEXT; nothing here executes.
+def _text_refusal(cmd, python_src, prof: str) -> str:
+    """The literal-text refusal for one execution, or "" — the ADVISORY layer.
+
+    ONE copy, shared by `exec_decision` (the gate) and `_run_subprocess` (the
+    last line before a spawn), because two copies of a rule set is how they
+    drift apart.
+
+    AUDIT R3-4: the SHELL text is tested against the PYTHON rules as well.
+    `run_shell` builds `powershell -Command <text>` on win32 and `<text>` is
+    arbitrary, so `python -c "import shutil; shutil.rmtree('/')"` was judged by
+    the cmd/PowerShell wordlist alone — the Python-specific rules
+    (`_BLOCKED_PY`/`_DELETE_PY`, which exist precisely because the shell
+    wordlist false-positives on Python) were bypassed by wrapping the payload in
+    a shell call, and under `no-delete` an ordinary
+    `python -c "import os; os.remove('x')"` passed a profile whose promise is
+    that deletion is disabled. The reverse is NOT done: the shell wordlist
+    matches ordinary Python (`{}`.format, the `del` keyword, `rm` in a string).
+    """
+    if python_src is not None:
+        if _BLOCKED_PY.search(python_src):
+            return ("blocked — that code destroys a drive or shells out to a "
+                    "destructive command; refusing to run it")
+        if prof == "no-delete" and _DELETE_PY.search(python_src):
+            return "blocked — deletion is disabled for this run (no-delete)"
+        return ""
+    text = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+    if _BLOCKED_CMD.search(text) or _BLOCKED_PY.search(text):
+        return ("blocked — that looks like a destructive system command; "
+                "refusing to run it")
+    if prof == "no-delete" and (_DELETE_CMD.search(text)
+                                or _DELETE_PY.search(text)):
+        return "blocked — deletion is disabled for this run (no-delete)"
+    return ""
+
+
 def _exec_confirmed(ctx: dict) -> bool:
     """Whether this session has explicitly confirmed it may spawn processes.
 
@@ -3784,19 +3819,9 @@ def exec_decision(cmd: str, ctx: dict, *, python_src: str | None = None
     prof = ctx.get("profile", "all")
     if prof == "confined":
         return False, "code execution is disabled for this run (confined)"
-    if python_src is not None:
-        if _BLOCKED_PY.search(python_src):
-            return False, ("blocked — that code destroys a drive or shells out "
-                           "to a destructive command; refusing to run it")
-    elif _BLOCKED_CMD.search(cmd):
-        return False, ("blocked — that looks like a destructive system "
-                       "command; refusing to run it")
-    if prof == "no-delete":
-        hit = (_DELETE_PY.search(python_src) if python_src is not None
-               else _DELETE_CMD.search(cmd))
-        if hit:
-            return False, ("blocked — deletion is disabled for this run "
-                           "(no-delete)")
+    why = _text_refusal(cmd, python_src, prof)
+    if why:
+        return False, why
     if not _exec_confirmed(ctx):
         return False, ("running shell commands or code needs explicit "
                        "confirmation for this chat — the destructive-command "
@@ -3898,20 +3923,11 @@ def _read_capped(stream, sink: list, cap: int, overflow: list) -> None:
 
 
 def _run_subprocess(cmd, ctx, shell=False, python_src=None, timeout=30):
-    if python_src is not None:
-        # PYTHON source: never scan it with the shell wordlist (see _BLOCKED_PY)
-        if _BLOCKED_PY.search(python_src):
-            return ("error: blocked — that code destroys a drive or shells out "
-                    "to a destructive command; refusing to run it")
-        if ctx.get("profile") == "no-delete" and _DELETE_PY.search(python_src):
-            return "error: blocked — deletion is disabled for this run (no-delete)"
-    else:
-        text = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
-        if _BLOCKED_CMD.search(text):
-            return ("error: blocked — that looks like a destructive system "
-                    "command; refusing to run it")
-        if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(text):
-            return "error: blocked — deletion is disabled for this run (no-delete)"
+    # The same advisory rules the gate used (AUDIT R3-4: one copy, so the two
+    # can never disagree about what the text says).
+    why = _text_refusal(cmd, python_src, ctx.get("profile", "all"))
+    if why:
+        return f"error: {why}"
     cwd = ctx.get("workspace") or None
     try:
         p = _launch_killable(cmd, shell, cwd)
