@@ -380,6 +380,24 @@ def available_backends(registry=None) -> list[dict]:
             for n in names]
 
 
+def available_engine_runtimes(registry=None) -> list[dict]:
+    """Which ENGINE RUNTIME this machine can run: llama.cpp, and vLLM.
+
+    ADDITIVE, and deliberately a separate function from `available_backends`
+    above. That one answers a different question — which llama.cpp COMPUTE
+    backend (vulkan/cuda/rocm/cpu) this GPU can drive — and the UI already
+    renders its rows. Widening it to carry engine runtimes would change a
+    contract two call sites depend on and would put "vllm" in a list the
+    backend picker iterates.
+
+    The whole body lives in `engines.py` so there is one definition of what
+    "available" means; this is the seam the CLI (and, next, the UI) reads.
+    Never raises: an unreadable manifest is a verdict, not a traceback.
+    """
+    from . import engines
+    return [a.as_dict() for a in engines.engine_runtimes(registry)]
+
+
 def perform_switch(model: str, registry=None, profile=None,
                    ctx: int | None = None, force_calibrate: bool = False,
                    kv: str | None = None, vision: bool | None = None,
