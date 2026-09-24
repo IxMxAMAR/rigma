@@ -1443,10 +1443,16 @@ def _bad_write_char(rel: str):
 
 def _glob_under(root: Path, rel: str) -> list[Path]:
     """Resolve a glob pattern under `root`, but only files, and only inside
-    the workspace (a `..` in the pattern can't escape). Returns real paths."""
+    the workspace (a `..` in the pattern can't escape). Returns real paths.
+
+    AUDIT R3-1: the containment test is on the RESOLVED path, because `glob`
+    hands back names built from `root` — a hit reached through a junction is
+    lexically inside the workspace and physically outside it."""
     try:
+        rroot = root.resolve()
         hits = [p for p in root.glob(rel)
-                if p.is_file() and p.is_relative_to(root)]
+                if p.is_file() and p.is_relative_to(root)
+                and p.resolve().is_relative_to(rroot)]
     except (ValueError, OSError):
         return []
     return sorted(hits)
@@ -1806,14 +1812,21 @@ def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict):
     sets `state["truncated"]`. A symlinked file is the one way a name under the
     root can resolve outside it, so only symlinks pay a `resolve()`.
     """
-    from .watch import IGNORE_DIRS
+    from .watch import IGNORE_DIRS, is_reparse_dir
     max_visited = state.get("max_visited")
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         state["visited"] = state.get("visited", 0) + len(dirnames) + len(filenames)
         if max_visited is not None and state["visited"] > max_visited:
             state["truncated"] = True
             return
-        dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIRS)
+        # AUDIT R3-1: `followlinks=False` does not prune a JUNCTION — it is a
+        # mount-point reparse point, so `os.walk` descends into it and every
+        # name under it is outside the workspace while looking inside. This is
+        # the walker `find_files` and `grep` share, so it is the confinement
+        # boundary for both.
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in IGNORE_DIRS
+                             and not is_reparse_dir(Path(dirpath) / d))
         for name in sorted(filenames):
             p = Path(dirpath) / name
             try:
@@ -2034,7 +2047,11 @@ def _newest_undo_key(idx: dict, ctx) -> str | None:
     best, best_ts = None, None
     for key, entry in idx.items():
         try:
-            q = _unlong(Path(key))
+            # AUDIT R3-1: RESOLVE the key, not just un-prefix it. An entry
+            # recorded through a junction (`ws\link\x`, physically outside) is
+            # lexically inside the workspace, so a lexical test accepts it and
+            # the restore then writes outside through the link.
+            q = _unlong(Path(key)).resolve()
             if q != root and not q.is_relative_to(root):
                 continue
         except (OSError, ValueError):
