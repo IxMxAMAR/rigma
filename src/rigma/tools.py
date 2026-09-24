@@ -3593,7 +3593,8 @@ _BLOCKED_PY = re.compile(
     r"shutdown|fdisk|rd|del|rm|remove-item|stop-computer|format-volume|"
     r"clear-disk|initialize-disk)\b)")
 _DELETE_PY = re.compile(
-    r"(?i)(os\.(remove|unlink|rmdir)|shutil\.rmtree|\.unlink\s*\(|send2trash)")
+    r"(?i)(os\.(remove|unlink|rmdir|replace|truncate)|"
+    r"shutil\.(rmtree|move)|\.unlink\s*\(|\.rmdir\s*\(|send2trash)")
 
 
 # AUDIT 13-3: the regexes above are ADVISORY, not the boundary. They match
