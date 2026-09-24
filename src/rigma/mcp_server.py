@@ -239,7 +239,12 @@ def handle(msg) -> dict | None:
     if method == "tools/list":
         return _ok(mid, {"tools": offered()})
     if method == "tools/call":
-        params = msg.get("params") or {}
+        # `or {}` rescues only FALSY values, so a truthy non-dict (`params:
+        # "hot"`) survived and `.get` raised straight out of the read loop,
+        # killing the server mid-session (09-3).
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            params = {}
         name = str(params.get("name") or "")
         args = params.get("arguments")
         return _ok(mid, call(name, args if isinstance(args, dict) else {}))

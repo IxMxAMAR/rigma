@@ -51,6 +51,11 @@ def config_path():
 def load_config() -> dict:
     try:
         raw = json.loads(config_path().read_text(encoding="utf-8"))
+        # A JSON array/string/null is not a config: `.get` raised AttributeError,
+        # which is not in the caught tuple, so every MCP tool vanished with no
+        # explanation and /api/mcp showed the Python error (09-8).
+        if not isinstance(raw, dict):
+            return {}
         servers = raw.get("mcpServers") or {}
         return servers if isinstance(servers, dict) else {}
     except (FileNotFoundError, OSError, ValueError):
@@ -87,8 +92,17 @@ class McpServer:
             msg = json.loads(line)
         except ValueError:
             return
+        # json.loads may return a list, string, number or null. `.get` on one of
+        # those raised inside `_reader`'s try, which ended the reader for good —
+        # and `_ensure` then tore down and rebuilt EVERY configured server for a
+        # line that carries no protocol meaning (09-2).
+        if not isinstance(msg, dict):
+            return
         mid = msg.get("id")
-        q = self._replies.get(mid) if mid is not None else None
+        try:
+            q = self._replies.get(mid) if mid is not None else None
+        except TypeError:
+            return          # an unhashable JSON-RPC id is not a reply we sent
         if q is not None:
             q.put(msg)
 
