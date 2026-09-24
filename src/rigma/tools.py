@@ -284,6 +284,33 @@ _XML_PARAM = re.compile(r"<parameter=([\w.-]+)>\s*(.*?)\s*(?:</parameter>|$)", r
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S | re.I)
 _REACT_CALL = re.compile(
     r"Action:\s*([\w.-]+)\s*Action\s*Input:\s*(\{.*?\})", re.S | re.I)
+# Tool-call envelope tags a model wraps a REAL call in. They are call syntax,
+# not prose, so the whole-reply tests below may look through them (AUDIT 04-8).
+_TOOL_WRAPPER = re.compile(r"</?tool_calls?>|<\|tool_call\|>", re.I)
+# A ReAct reply opens with a Thought line; anything else before "Action:" is
+# prose ABOUT a call, which is the difference the rescue must respect (05-2).
+_REACT_PREFIX = re.compile(
+    r"^(?:\s*(?:Thought|Thinking|Reasoning)\s*:.*)?\s*$", re.I | re.S)
+
+
+def _is_only_call_syntax(text: str) -> bool:
+    """True when `text` is XML tool-call syntax and nothing else — wrapper tags,
+    whitespace and complete `<function=…>` blocks, with no prose around them.
+
+    THE whole-reply test for the XML shape (AUDIT 04-8, 05-2). A reply that
+    quotes a call while explaining it ("to remove a folder you would write:
+    <function=run_shell>…") has prose outside the tags, and executing it is a
+    call the model never made. The two-call case stays rescued: the second block
+    is itself call syntax, and one-action mode keeps the first.
+    """
+    rest = text
+    for _ in range(64):
+        rest = _TOOL_WRAPPER.sub("", rest)
+        m = _XML_CALL.search(rest)
+        if not m:
+            break
+        rest = rest[:m.start()] + rest[m.end():]
+    return not rest.strip()
 
 # Shapes a lost tool-call wrapper leaves behind: the bare argument object, with
 # no name anywhere. Only UNAMBIGUOUS key sets — an object that could be two
@@ -361,8 +388,12 @@ def rescue_tool_call(text: str):
     What is deliberately NOT scanned: JSON found loose in the middle of prose.
     A reply that explains a call ("you'd pass {"path": "a.txt", "content":
     "hi"}") is discussing one, not making one, and executing it would be a
-    write the model never asked for. Shape 3 requires the object to be the
-    ENTIRE reply, which is the difference between the two.
+    write the model never asked for. Every shape therefore requires the reply to
+    BE the call: shape 3 is one bare JSON object and nothing else, shape 2 is a
+    fence that is the whole reply, shape 1 is XML with no prose outside it, and
+    shape 4 is a ReAct Action block that ends the reply. Prose that merely
+    quotes tool-call syntax — including a fenced example, which used to be
+    accepted anywhere in the text (AUDIT 04-8, 05-2) — is not a call.
 
     Returns (name, args) or (None, None).
     """
@@ -370,7 +401,7 @@ def rescue_tool_call(text: str):
         return None, None
 
     # 1. XML (strict about the OUTER shape, lenient inside it)
-    if "<function=" in text:
+    if "<function=" in text and _is_only_call_syntax(text):
         m = _XML_CALL.search(text)
         if m:
             name, body = m.group(1), m.group(2)
@@ -385,11 +416,17 @@ def rescue_tool_call(text: str):
                     args[pm.group(1)] = val
             return name, args
 
-    # 2/3. a fenced json block, or a reply that is nothing but one JSON object
-    blobs = [m.group(1) for m in _FENCED_JSON.finditer(text)]
-    bare = text.strip()
-    if bare.startswith("{") and bare.endswith("}"):
-        blobs.append(bare)
+    # 2/3. a fenced json block, or a reply that is nothing but one JSON object.
+    # The FENCE must be the whole reply: every fenced block used to be fed to
+    # _call_from_json_obj no matter what prose surrounded it, so a quoted
+    # example was executed as a call (AUDIT 04-8).
+    stripped = text.strip()
+    blobs = []
+    fenced = _FENCED_JSON.fullmatch(stripped)
+    if fenced:
+        blobs.append(fenced.group(1))
+    if stripped.startswith("{") and stripped.endswith("}"):
+        blobs.append(stripped)
     for blob in blobs:
         try:
             got = _call_from_json_obj(json.loads(blob, strict=False))
@@ -398,9 +435,12 @@ def rescue_tool_call(text: str):
         if got:
             return got
 
-    # 4. ReAct: both markers must be present, so prose can't trip it
-    m = _REACT_CALL.search(text)
-    if m:
+    # 4. ReAct: the Action block must END the reply, and only a Thought line may
+    # precede it. Both markers merely appearing somewhere in prose used to be
+    # enough, so quoting an example from a file executed it (AUDIT 05-2).
+    m = _REACT_CALL.search(stripped)
+    if m and m.end() == len(stripped) and _REACT_PREFIX.match(
+            stripped[:m.start()]):
         try:
             args = json.loads(m.group(2).strip(), strict=False)
             if isinstance(args, dict):

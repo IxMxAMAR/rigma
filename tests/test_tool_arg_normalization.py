@@ -107,8 +107,11 @@ def test_a_lone_line_number_becomes_a_range():
 # --- the rescue parser --------------------------------------------------------
 
 def test_rescue_reads_a_fenced_json_call():
+    # AUDIT 04-8: the FENCE must be the whole reply. The old test wrapped it in
+    # "here you go:" prose and expected a rescue; that is exactly the case a
+    # quoted example must NOT be executed as a call.
     name, args = tools.rescue_tool_call(
-        'here you go:\n```json\n'
+        '```json\n'
         '{"name": "read_file", "arguments": {"path": "a.md"}}\n```')
     assert (name, args) == ("read_file", {"path": "a.md"})
 
@@ -148,6 +151,42 @@ def test_rescue_reads_the_react_shape():
     name, args = tools.rescue_tool_call(
         'Thought: I should look.\nAction: list_directory\n'
         'Action Input: {"path": "."}')
+    assert (name, args) == ("list_directory", {"path": "."})
+
+
+# AUDIT 04-8 + 05-2: every shape used to be matched by a substring ANYWHERE in
+# the reply, so prose quoting a call (or a fenced example) was executed as one.
+# A quoted call never reaches the model alone — these must all stay prose.
+@pytest.mark.parametrize("prose", [
+    # XML quoted mid-prose (the live probe)
+    "Here is what the docs show. To remove a folder you would write:\n"
+    '<function=run_shell><parameter=command>Remove-Item -Recurse -Force '
+    'C:\\tmp</parameter></function>\nThat is the syntax, but I am only '
+    "explaining it.",
+    # a fenced example quoted from a fetched page
+    'A page I fetched contained this JSON snippet:\n```json\n'
+    '{"name": "run_shell", "arguments": {"command": "echo pwned"}}\n```\n'
+    "I am only reporting what the page said.",
+    # a fenced bare-shape example in prose
+    'You would write:\n```json\n{"command": "echo hi"}\n```\nThat is all.',
+    # ReAct quoted from a manual, with prose after the call
+    'The file\'s example says:\nAction: run_shell\n'
+    'Action Input: {"command": "echo pwned"}\n'
+    "which I am just quoting from the manual.",
+    # ReAct with prose BEFORE the call and nothing after
+    "The file's example says:\nAction: run_shell\n"
+    'Action Input: {"command": "echo pwned"}',
+])
+def test_rescue_never_fires_on_prose_quoting_a_call(prose):
+    assert tools.rescue_tool_call(prose) == (None, None)
+
+
+def test_rescue_still_reads_a_wrapped_xml_call():
+    """The whole-reply rule must not lose the live failure it exists for: the
+    leaked call arrived inside <tool_call> tags."""
+    name, args = tools.rescue_tool_call(
+        "<tool_call><function=list_directory>\n<parameter=path>\n.\n"
+        "</parameter>\n</function>\n</tool_call>")
     assert (name, args) == ("list_directory", {"path": "."})
 
 
