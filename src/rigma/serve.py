@@ -5851,7 +5851,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         sess["mission"] = sess.get("mission") or _mission_mod.spec_block(
             r.get("spec") or {}, r.get("mission", "")) or r.get("mission", "")
         sess["run_id"] = rid
-        sessions.save(sess)
+        # R3-7: the LAST unguarded whole-row save on the run path. `sess` is
+        # loaded above and then the plan reconciliation runs, so a user who types
+        # into this chat in the meantime loses that message to this write. The
+        # mutations are re-applied to the fresh row on a lost race, which is
+        # exactly what `_save_guarded` exists for (R3-2).
+        await _save_guarded(sess)
         _run_tasks[rid] = asyncio.create_task(_run_loop(rid))
         return {"restarted": True, "recovered_steps": recovered,
                 "next": nxt}
