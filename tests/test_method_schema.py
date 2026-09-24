@@ -121,6 +121,22 @@ def test_settings_step_rejects_unknown_field():
     assert any("banana" in e for e in ms.validate(doc, TOOLS))
 
 
+def test_efforts_are_the_session_levels():
+    """10-8: EFFORTS stopped at the binary switch while sessions gained four
+    named reasoning levels, so a method written for a reasoning model could not
+    save ('effort must be one of off/auto/on')."""
+    from rigma import sessions
+    assert ms.EFFORTS == sessions.EFFORT_LEVELS
+    doc = ms.normalize(_doc(apply={"system_prompt": "p", "effort": "xhigh"}))
+    assert ms.validate(doc, TOOLS) == []
+
+
+def test_a_settings_step_accepts_a_named_effort_level():
+    doc = ms.normalize(_doc(macros=[{"label": "X", "steps": [
+        {"kind": "settings", "set": {"effort": "high"}}]}]))
+    assert ms.validate(doc, TOOLS) == []
+
+
 def test_find_placeholders_walks_nested_structures():
     got = ms.find_placeholders({"a": ["{{x}}", {"b": "{{ask:Pick a file}}"}]})
     assert ("x", "") in got and ("ask", "Pick a file") in got
