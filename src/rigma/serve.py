@@ -2180,18 +2180,38 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 return              # someone else wrote; the next tick retries
             _ckpt["saved"] = True
 
-        def _checkpoint(force: bool = False) -> None:
+        def _checkpoint_due(force: bool) -> bool:
             if _ckpt["final"]:
-                return              # the finished message is already stored
+                return False        # the finished message is already stored
             now = time.monotonic()
             if not force and now - _ckpt["at"] < CHECKPOINT_SECS:
-                return
+                return False
             _ckpt["at"] = now
             activity["last"] = _now()      # AUDIT F14: this turn is alive
+            return True
+
+        def _checkpoint(force: bool = False) -> None:
+            """Synchronous checkpoint, for the end-of-turn and GeneratorExit
+            paths where awaiting is unsafe. The streaming path uses the
+            threaded twin below."""
+            if not _checkpoint_due(force):
+                return
             try:
                 _write_checkpoint()
             except Exception:
                 # a checkpoint is insurance, never the turn's problem
+                _log.exception("turn checkpoint failed")
+
+        async def _checkpoint_threaded(force: bool = False) -> None:
+            """14-5: `_write_checkpoint` is a whole-session load + save (~100 ms
+            on an image-bearing chat) and it used to run on the event loop. The
+            load/save pair stays unbroken inside the worker, which is what the
+            sync docstring asks for."""
+            if not _checkpoint_due(force):
+                return
+            try:
+                await asyncio.to_thread(_write_checkpoint)
+            except Exception:
                 _log.exception("turn checkpoint failed")
 
         def _clear_checkpoint() -> None:
@@ -2396,7 +2416,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         if rdelta:
                             thinking += rdelta
                             yield _sse({"delta": rdelta}, event="think")
-                            _checkpoint()          # AUDIT F7
+                            await _checkpoint_threaded()          # AUDIT F7
                         for tc in d.get("tool_calls") or []:   # accumulate by index
                             idx = tc.get("index", 0)
                             slot = calls.setdefault(idx,
@@ -2432,7 +2452,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             rtext += delta
                             _ckpt["live"] += delta       # AUDIT F7
                             yield _sse({"delta": delta})
-                            _checkpoint()
+                            await _checkpoint_threaded()
                 except Exception as e:
                     failed = True
                     msg = str(e) or "model unreachable"
@@ -2556,7 +2576,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         # AUDIT F7: a completed action is exactly what must not be
                         # lost to a refresh — the file it wrote is already on disk,
                         # so a turn that forgets it happened is worse than no turn.
-                        _checkpoint(force=True)
+                        await _checkpoint_threaded(force=True)
                         msgs.append({"role": "tool", "tool_call_id": c["id"],
                                      "content": result})
                         if imgs:
@@ -2779,12 +2799,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 alive = True
                 for _attempt in range(3):
                     try:
-                        alive = _merge_and_save()
+                        # 14-5: the whole load-merge-save runs in a worker; the
+                        # pair inside stays unbroken there, and base_rev still
+                        # catches a concurrent writer (hence the retry below).
+                        alive = await asyncio.to_thread(_merge_and_save)
                         break
                     except sessions.StaleWriteError:
-                        # nothing awaits between the merge and the write, so
-                        # this should be unreachable; retrying is still the
-                        # right answer if it ever isn't
+                        # another writer landed between the merge and the write;
+                        # merging again is the right answer
                         _log.warning("session %s moved under the turn write; "
                                      "merging again", s.get("id"))
                 if not alive:
@@ -3677,7 +3699,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def chat_turn(sid: str, body: dict):
         activity["last"] = _now()   # keep-alive
         await _ensure_loaded()      # reload if idle-unloaded
-        s = sessions.load(sid)
+        s = await asyncio.to_thread(sessions.load, sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
         # Which agent backend runs this turn. Only the built-in can run one
@@ -3735,7 +3757,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     (p.get("text", "") for p in message
                      if isinstance(p, dict) and p.get("type") == "text"), "chat")
                 s["title"] = str(title)[:40]
-            sessions.save(s)
+            await asyncio.to_thread(sessions.save, s)
         if not s["messages"]:
             return JSONResponse({"error": "session has no messages"},
                                 status_code=400)
@@ -3749,7 +3771,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if s.get("use_rag"):
             from . import rag
             s["use_tools"] = True         # the tool IS the grounding
-            sessions.save(s)
+            await asyncio.to_thread(sessions.save, s)
             try:
                 await asyncio.to_thread(rag.ensure_sidecar)
             except Exception as e:
@@ -3779,9 +3801,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     if not pending:
                         break
                     nxt = pending.pop(0)
-                    cur = sessions.load(sid) or cur
+                    cur = await asyncio.to_thread(sessions.load, sid) or cur
                     cur["messages"].append({"role": "user", "content": nxt})
-                    sessions.save(cur)
+                    await asyncio.to_thread(sessions.save, cur)
                     cont = False       # a queued prompt is a new turn
                     yield _sse({"note": "starting the queued prompt"},
                                event="info")
@@ -4165,7 +4187,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _save_run_merged(run)
                 except Exception:
                     _log.exception("reflection failed")
-                session = sessions.load(sid)
+                session = await asyncio.to_thread(sessions.load, sid)
                 if session is None:
                     _runs.set_status(run, "error", "session was deleted")
                     break
@@ -4200,7 +4222,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 except Exception:
                     _log.exception("memory: per-step recall failed")
                 session["messages"].append({"role": "user", "content": driving})
-                sessions.save(session)
+                await asyncio.to_thread(sessions.save, session)
                 frozen = False
                 turn_err = None
 
@@ -4341,7 +4363,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     prev_sig = None
                     _save_run_merged(run)
                     continue
-                trace = _last_trace(sessions.load(sid))
+                # 14-5: ONE load for the whole post-turn section. It used to hit
+                # sqlite at four more places (the trace read, the tool-result
+                # append, the no-network flip and the two prose probes) with the
+                # same session — ~28 ms each on an image-bearing chat, on the
+                # loop.
+                session = await asyncio.to_thread(sessions.load, sid)
+                trace = _last_trace(session)
                 for t in trace:
                     _runs.append_action(
                         run_id, t.get("name"), t.get("args"),
@@ -4358,7 +4386,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # user role, deliberately: a 2nd system message 400s this chat
                 # template, and role:"tool" needs a matching tool_call_id.
                 if trace:
-                    s4 = sessions.load(sid)
+                    s4 = session
                     if s4 is not None:
                         # generous cap: in one-action mode the turn ends right
                         # after the call, so THIS is the only copy the model
@@ -4378,16 +4406,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 f"TOOL RESULT {t.get('name')}: "
                                 + _clip(str(t.get("result", "")), RESULT_MAX)
                                 for t in trace)})
-                        sessions.save(s4)
+                        await asyncio.to_thread(sessions.save, s4)
                         session = s4
                 ext = sum(1 for t in trace if t.get("name") in _EXTERNAL_TOOLS)
                 run["external_calls"] = run.get("external_calls", 0) + ext
                 if (run["external_calls"] >= MAX_EXTERNAL
-                        and session.get("run_profile") != "no-network"):
-                    s3 = sessions.load(sid)
+                        and (session or {}).get("run_profile") != "no-network"):
+                    s3 = session
                     if s3:
                         s3["run_profile"] = "no-network"
-                        sessions.save(s3)
+                        await asyncio.to_thread(sessions.save, s3)
                     _runs.append_progress(run_id, "external-API budget reached — "
                                           "network tools disabled", "continue "
                                           "offline", run.get("workspace", ""))
@@ -4463,7 +4491,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # mistake exactly — a generic "you produced nothing" nudge
                     # doesn't tell it what it got wrong.
                     tail_txt = ""
-                    for m in reversed((sessions.load(sid) or {}).get("messages", [])):
+                    for m in reversed((session or {}).get("messages", [])):
                         if m.get("role") == "assistant":
                             tail_txt = str(m.get("content") or "").strip()
                             break
@@ -4474,7 +4502,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             run["_echoed_tool"] = hit
                 if not trace:
                     said = ""
-                    for m in reversed((sessions.load(sid) or {}).get("messages", [])):
+                    for m in reversed((session or {}).get("messages", [])):
                         if m.get("role") == "assistant":
                             said = str(m.get("content") or "")
                             break
@@ -4797,7 +4825,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r = _runs.active()
         if r is None:
             return {}
-        r["log_tail"] = _runs.get_log_tail(r["id"], 40)
+        r["log_tail"] = await asyncio.to_thread(_runs.get_log_tail, r["id"], 40)
         r.update(_runs.load_live(r["id"]))
         r["plan"] = _runs.read_plan(r["id"])
         return r
