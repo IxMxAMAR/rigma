@@ -55,6 +55,25 @@ def test_empty_and_none_are_not_errors():
     assert engine_log.findings(None) == []
 
 
+def test_a_bare_n_swa_parameter_dump_is_not_a_warning():
+    """AUDIT 02-6: the pattern used to match `n_swa = 0` on its own.
+
+    That is a parameter dump, not a diagnostic, so every non-SWA model's
+    hparams line reported a `--swa-full` no-op for a flag Rigma never passes —
+    sending the reader looking for a setting they cannot have changed.
+    """
+    assert engine_log.findings(
+        "0.00.1 I srv load_model: n_swa = 0\n") == []
+
+
+def test_a_real_swa_disabled_warning_is_still_reported():
+    # The warning shape (swa + disabled) is what the pattern is for.
+    got = engine_log.findings(
+        "0.00.2 W srv load_model: swa is not supported by this model, "
+        "it will be disabled\n")
+    assert [f["id"] for f in got] == ["swa_disabled"]
+
+
 def test_a_full_context_shift_is_reported():
     got = engine_log.findings("0.1 W srv update_slots: KV cache is full - "
                               "shifting context\n")
