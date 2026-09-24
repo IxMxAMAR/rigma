@@ -5261,6 +5261,25 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 status_code=400)
         profile = (body or {}).get("profile", "all")
         workspace = str((body or {}).get("workspace", "")).strip()
+        # R3-4: an autonomous run could never be granted code execution, and no
+        # surface could turn it on either. `allow_code=True` was set below while
+        # `confirm_exec` stayed at its OFF default, so `run_shell`/`run_python`/
+        # `start_job` were refused for EVERY run — and the refusal told the user to
+        # enable a setting they could not reach, because an active run's chat is
+        # filtered out of `/api/sessions` and the only grants UI is the open
+        # chat's Sidecar. A run whose whole point is to act on the machine could
+        # not run a single command.
+        #
+        # It stays an EXPLICIT, VALIDATED opt-in at creation time, defaulting to
+        # OFF: 13-3 made execution require its own confirmation precisely because
+        # the command blocklist is advisory, and silently turning it on for every
+        # unattended run would undo that decision. `1` and `"true"` are refused
+        # rather than coerced — `bool("false")` is True, which is the exact
+        # stringly-typed grant 13-3 was written to stop.
+        confirm_exec = (body or {}).get("confirm_exec", False)
+        if not isinstance(confirm_exec, bool):
+            return JSONResponse(
+                {"error": "confirm_exec must be true or false"}, status_code=400)
         # Reasoning is ON by default: a long unattended job benefits from the
         # model planning each step. (The near-instant "0 tool calls" stall was
         # never thinking-in-circles — it was the engine 400ing on a bad chat
@@ -5300,6 +5319,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     mission=mission,       # replaced by the compiled spec
                     system_prompt=agent_prompt,          # agent role, not chat
                     effort=effort, one_action=True,
+                    confirm_exec=confirm_exec,   # R3-4: explicit, default off
                     params={**RUN_PARAMS, **(sess.get("params") or {})},
                     run_profile=profile if profile in _runs.PROFILES else "all")
         # AUDIT 03-2: the token budget was dead — `token_cap` could not be set

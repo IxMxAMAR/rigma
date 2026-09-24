@@ -53,6 +53,17 @@ function Launcher({ onLaunched, missionRef }: {
   // the v2 launcher never sent one, so every run silently got "all" and the
   // main safety control was unreachable from this UI.
   const [profile, setProfile] = useState(DEFAULT_PROFILE);
+  // R3-4: code execution for an unattended run. `POST /api/runs` sets
+  // `allow_code=True` for every run, but execution ALSO needs its own explicit
+  // confirmation (13-3) and the run's chat is filtered out of the session list
+  // while it is active — so before this control existed there was NO surface
+  // that could grant it, and run_shell/run_python/start_job were refused for
+  // every run with advice pointing at a setting nobody could reach.
+  //
+  // Deliberately a separate, default-OFF switch rather than part of the profile:
+  // a profile narrows a roster, this one GRANTS a capability, and conflating
+  // them is how "all" came to mean something it did not do.
+  const [exec, setExec] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   return (
@@ -92,6 +103,26 @@ function Launcher({ onLaunched, missionRef }: {
       <p className="text-[11px] text-muted leading-snug pl-24 pr-1">
         {profileSentence(profile)}
       </p>
+      <label className="flex items-start gap-2 mt-2 text-[12.5px]">
+        <input
+          type="checkbox"
+          checked={exec}
+          onChange={(e) => setExec(e.target.checked)}
+          aria-label="Allow code execution in this run"
+          className="mt-0.5 shrink-0"
+        />
+        <span className="text-secondary leading-snug">
+          allow code execution
+          <span className="block text-[11px] text-muted">
+            {exec
+              ? "run_shell, run_python and start_job may run commands on this "
+                + "machine for the whole run. Only enable this for a mission you "
+                + "would run yourself."
+              : "off \u2014 the agent can still read and write files, but cannot "
+                + "run commands. This is the default."}
+          </span>
+        </span>
+      </label>
       <div className="flex gap-2 mt-2">
         <input
           value={workspace}
@@ -114,6 +145,7 @@ function Launcher({ onLaunched, missionRef }: {
                   workspace: workspace.trim(),
                   budget_hours: 8,
                   profile,
+                  confirm_exec: exec,
                 }),
               });
               const d = (await r.json()) as { id?: string; error?: string };
