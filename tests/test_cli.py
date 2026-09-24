@@ -38,6 +38,20 @@ def test_status_not_running(tmp_path, monkeypatch):
     assert res.exit_code == 0 and "not running" in res.output.lower()
 
 
+def test_status_ui_only_reports_no_model(tmp_path, monkeypatch):
+    """AUDIT F15-2: the record `rigma up` (no model) writes has model="" and
+    unloaded=True; status used to print `running:  ()`, which reads as broken."""
+    import os
+    from rigma import state as st
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    st.write_state("", "", 11500, engine_pid=-1, ui_pid=os.getpid(),
+                   backend="", use_case="general", ctx=0, unloaded=True)
+    res = runner.invoke(cli.app, ["status"])
+    assert res.exit_code == 0
+    assert "no model loaded" in res.output
+    assert "running:  ()" not in res.output
+
+
 def test_stop_when_not_running(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     res = runner.invoke(cli.app, ["stop"])
@@ -59,6 +73,25 @@ def test_up_dry_run_with_model(tmp_path, monkeypatch):
                                   "--use-case", "coding", "--dry-run"])
     assert res.exit_code == 0
     assert "qwen3.6-35b-a3b" in res.output and "-fa on" in res.output
+
+
+def test_ui_only_up_does_not_probe_hardware(tmp_path, monkeypatch):
+    """AUDIT F15-1: README says `rigma up` (no --model) does not probe; the
+    probe ran first, above the UI-only branch, and its result was discarded."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    calls = []
+
+    def fake_profile(reg):
+        calls.append(reg)
+        return _fake_probe(reg.gpus)
+
+    monkeypatch.setattr(cli, "_profile", fake_profile)
+    res = runner.invoke(cli.app, ["up", "--dry-run"])
+    assert res.exit_code == 0 and "no model" in res.output.lower()
+    assert calls == []
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run"])
+    assert res.exit_code == 0 and len(calls) == 1
 
 
 def test_chat_requires_running_server(tmp_path, monkeypatch):
@@ -129,3 +162,129 @@ def test_unknown_model_clean_cli_error(tmp_path, monkeypatch):
     assert res.exit_code == 1 and "rigma update" in res.output
     res = runner.invoke(cli.app, ["up", "--model", "not-a-model", "--dry-run"])
     assert res.exit_code == 1 and "rigma update" in res.output
+
+
+def _running_state(tmp_path, monkeypatch):
+    import os
+    from rigma import state as st
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    st.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+
+
+def test_bench_reports_a_dead_engine_without_a_traceback(tmp_path, monkeypatch):
+    """AUDIT F08-8: a refused connection escaped as a raw httpx traceback."""
+    import httpx
+    _running_state(tmp_path, monkeypatch)
+
+    def boom(*a, **k):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "post", boom)
+    res = runner.invoke(cli.app, ["bench"])
+    assert res.exit_code == 1 and "benchmark failed" in res.output
+
+
+def test_bench_reports_a_no_timings_engine_cleanly(tmp_path, monkeypatch):
+    """The RuntimeError 08-7 raises must not become a new traceback either."""
+    import httpx
+    _running_state(tmp_path, monkeypatch)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": []}
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
+    res = runner.invoke(cli.app, ["bench"])
+    assert res.exit_code == 1 and "benchmark failed" in res.output
+    assert "timings" in res.output
+
+
+def _argv_line(output):
+    return next(line for line in output.splitlines()
+                if line.startswith("argv: "))
+
+
+def test_dry_run_preview_shows_every_launch_flag(tmp_path, monkeypatch):
+    """AUDIT F15-3: the preview printed only `plan.server_args`, so it omitted
+    the projector, a repaired chat template and the always-present KV slot dir."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    tmpl = tmp_path / "templates"
+    tmpl.mkdir(parents=True)
+    (tmpl / "qwen3-vl-8b.jinja").write_text("{{ x }}", encoding="utf-8")
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3-vl-8b", "--dry-run"])
+    assert res.exit_code == 0
+    line = _argv_line(res.output)
+    assert "--mmproj" in line
+    assert "--chat-template-file" in line
+    assert "--slot-save-path" in line
+
+
+def test_dry_run_preview_comes_from_the_shared_argv_helper(tmp_path, monkeypatch):
+    """The printed line must be `_launch_argv`'s output, not a hand-built
+    string, so the preview cannot drift from the launch again."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    monkeypatch.setattr(cli, "_launch_argv",
+                        lambda cand, reg, port, model_label="<model>":
+                        ["llama-server", "--sentinel"])
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run"])
+    assert res.exit_code == 0
+    assert _argv_line(res.output) == "argv: llama-server --sentinel"
+
+
+def test_server_argv_appends_the_slot_save_path():
+    """`runtime.server_argv` is the one place the launch argv is assembled."""
+    from rigma import runtime
+    from rigma.models import ComboFlags, GgufFile, RunPlan
+    plan = RunPlan(model_slug="m",
+                   gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                   backend="vulkan", flags=ComboFlags(ctx=8192),
+                   origin="calculator")
+    argv = runtime.server_argv("llama-server", plan, "<model>", 11499)
+    assert argv[0] == "llama-server"
+    assert argv[-2:] == ["--slot-save-path",
+                         str(runtime.rigma_home() / "sessions")]
+
+
+def test_up_failure_message_names_the_real_log_dir(tmp_path, monkeypatch):
+    """AUDIT F15-7: `~/.rigma/logs/` is not expanded by Explorer or cmd, so the
+    one message that says where a failed launch logged pointed nowhere."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    monkeypatch.setattr(cli, "_port_holder", lambda port: "")
+    from rigma import runtime
+
+    def boom(*a, **k):
+        raise RuntimeError("engine download failed")
+
+    monkeypatch.setattr(runtime, "ensure_engine", boom)
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--yes"])
+    assert res.exit_code == 1
+    assert str(tmp_path / "logs") in res.output
+    assert "~/.rigma" not in res.output
+
+
+def test_bench_calibration_message_names_the_real_file(tmp_path, monkeypatch):
+    """AUDIT F15-7: same shorthand in the calibration confirmation."""
+    import httpx
+    _running_state(tmp_path, monkeypatch)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"timings": {"prompt_per_second": 650.0,
+                                "predicted_per_second": 55.5}}
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
+    res = runner.invoke(cli.app, ["bench"])
+    assert res.exit_code == 0
+    assert str(tmp_path / "calibration.json") in res.output
+    assert "~/.rigma" not in res.output

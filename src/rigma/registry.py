@@ -10,10 +10,23 @@ from pathlib import Path
 
 import httpx
 
-from .models import Combo, ModelSpec, UseCase
+from .models import STANDARD_GB, Combo, ModelSpec, UseCase
 
 DEFAULT_REGISTRY_ZIP = (
     "https://codeload.github.com/IxMxAMAR/rigma-registry/zip/refs/heads/master")
+
+
+def _ram_tiers(ram_gb: int) -> list[int]:
+    """The machine's own RAM tier first, then every lower standard tier.
+
+    AUDIT F15-4: a combo is keyed to the RAM tier it was measured at. The
+    reference box measures 31.4 GB (tier 32) while the verified RX 9070 XT combo
+    is filed at ram-16, so an exact-tier-only lookup missed on the very machine
+    it was measured on and fell through to the fit calculator. Never fall UP: a
+    combo budgeted for more RAM than the machine has would overcommit exactly
+    the resource it was sized against.
+    """
+    return [t for t in sorted(STANDARD_GB, reverse=True) if t <= ram_gb]
 
 
 def _fetch_bytes(url: str) -> bytes:
@@ -122,13 +135,17 @@ class Registry:
 
     def find_combo(self, vendor: str, gpu_slug: str, vram_gb: int, ram_gb: int,
                    use_case: str) -> tuple[Combo, str] | None:
-        candidates = [
-            f"{vendor}/{gpu_slug}/ram-{ram_gb}/{use_case}.json",
-            f"{vendor}/{gpu_slug}/ram-{ram_gb}/general.json",
-            f"_class/vram-{vram_gb}/ram-{ram_gb}/{use_case}.json",
-            f"_class/vram-{vram_gb}/ram-{ram_gb}/general.json",
-        ]
-        for rel in candidates:
-            if rel in self.combos:
-                return self.combos[rel], rel
+        # AUDIT F15-4: the exact tier first, then the nearest lower tiers — see
+        # _ram_tiers. Within a tier the preference is unchanged: this card's own
+        # combo before the class fallback, use-case before general.
+        for tier in _ram_tiers(ram_gb):
+            candidates = [
+                f"{vendor}/{gpu_slug}/ram-{tier}/{use_case}.json",
+                f"{vendor}/{gpu_slug}/ram-{tier}/general.json",
+                f"_class/vram-{vram_gb}/ram-{tier}/{use_case}.json",
+                f"_class/vram-{vram_gb}/ram-{tier}/general.json",
+            ]
+            for rel in candidates:
+                if rel in self.combos:
+                    return self.combos[rel], rel
         return None

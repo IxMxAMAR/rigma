@@ -27,9 +27,20 @@ def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128) -> Be
               "max_tokens": gen_tokens},
         timeout=1800)
     r.raise_for_status()
-    t = r.json().get("timings", {})
-    return BenchResult(pp_tps=float(t.get("prompt_per_second", 0.0)),
-                       tg_tps=float(t.get("predicted_per_second", 0.0)),
+    t = r.json().get("timings")
+    # AUDIT F08-7: "the engine answered but did not report timings" used to be
+    # collapsed into "the engine measured 0 tokens/s", with ok=True set from "no
+    # exception". A build/proxy that omits timings then made every sweep row read
+    # 0.0 while looking successful — and `crowned_row` could crown one, writing
+    # its flags and `calibrated: true` so the model was tuned forever on no data.
+    if not t:
+        raise RuntimeError("engine returned no timings — cannot measure speed")
+    pp = float(t.get("prompt_per_second", 0.0))
+    tg = float(t.get("predicted_per_second", 0.0))
+    if pp == 0.0 and tg == 0.0:
+        raise RuntimeError("engine reported 0 tokens/s for both prefill and "
+                           "generation — no usable measurement")
+    return BenchResult(pp_tps=pp, tg_tps=tg,
                        prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
 
 

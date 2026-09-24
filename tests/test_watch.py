@@ -178,6 +178,28 @@ def test_an_unchanged_poll_does_not_re_read_file_bytes(ws, monkeypatch):
     assert reads == [], "an unchanged poll must not re-read any file bytes"
 
 
+def test_a_failed_snapshot_is_retried_on_the_next_pass(ws):
+    """AUDIT F08-6: the baseline used to advance even when the snapshot failed,
+    so the change became permanently un-undoable — the next pass compared
+    against the NEW bytes and never offered the old ones again."""
+    f = ws / "a.txt"
+    f.write_bytes(b"one")
+    calls = []
+    outcomes = [False, True]
+
+    def record(p, data):
+        calls.append((str(p), data))
+        return outcomes.pop(0)
+
+    w = watch.Watcher(ws, record=record)
+    w.poll_once()
+
+    f.write_bytes(b"two")
+    assert w.poll_once() == []           # snapshot failed: not reported
+    assert w.poll_once() == [str(f)]     # retried with the SAME pre-change bytes
+    assert [c[1] for c in calls] == [b"one", b"one"]
+
+
 # -- what it refuses to walk --------------------------------------------------
 
 def test_generated_trees_are_not_watched(ws):

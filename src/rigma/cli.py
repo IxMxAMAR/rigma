@@ -26,22 +26,55 @@ def _main(ctx: typer.Context,
         raise typer.Exit(0)
 
 
-def _port_holder(port: int) -> str:
-    import socket
-    with socket.socket() as s:
-        try:
-            s.bind(("127.0.0.1", port))
-            return ""
-        except OSError:
-            pass
+def _listening_pid(port: int):
+    """The pid LISTENing on `port` on ANY address, or None.
+
+    AUDIT F16-1: the bind probe in `_port_holder` is address-specific. On
+    Windows a bind to 127.0.0.1:port SUCCEEDS while another process already
+    listens on 0.0.0.0:port, because the two addresses do not overlap unless
+    SO_EXCLUSIVEADDRUSE is set — so the psutil fallback, which only ran after a
+    bind FAILURE, never ran in exactly the case it was written for.
+    """
     try:
         import psutil
         for c in psutil.net_connections(kind="tcp"):
-            if c.laddr and c.laddr.port == port and c.status == "LISTEN" and c.pid:
-                return f" (held by pid {c.pid}: {psutil.Process(c.pid).name()})"
+            if (c.laddr and c.laddr.port == port and c.status == "LISTEN"
+                    and c.pid):
+                return c.pid
     except Exception:
         pass
-    return " (holder unknown)"
+    return None
+
+
+def _port_holder(port: int) -> str:
+    import socket
+    free = False
+    with socket.socket() as s:
+        # Windows-only: makes the probe bind conflict with a wildcard listener
+        # on the same port instead of silently overlapping it (see above).
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        try:
+            s.bind(("127.0.0.1", port))
+            free = True
+        except OSError:
+            pass
+    # Consult the OS regardless of how the bind went: a wildcard listener on
+    # this port is a conflict even when our specific-address bind succeeded.
+    pid = _listening_pid(port)
+    if pid is not None:
+        try:
+            import psutil
+            name = psutil.Process(pid).name()
+        except Exception:
+            name = "unknown"
+        return f" (held by pid {pid}: {name})"
+    return "" if free else " (holder unknown)"
+
+
 rag_app = typer.Typer(no_args_is_help=True)
 app.add_typer(rag_app, name="rag",
               help="Chat with your documents (Raggity sidecar).")
@@ -67,6 +100,36 @@ def _active_run_id() -> str:
         typer.echo("no active run")
         raise typer.Exit(1)
     return r["id"]
+
+
+def _response_error(r) -> str:
+    """The error sentence out of a run-control response, never a traceback."""
+    try:
+        body = r.json()
+    except Exception:
+        return str(r.status_code)
+    if isinstance(body, dict) and body.get("error"):
+        return str(body["error"])
+    return str(r.status_code)
+
+
+def _run_action(rid: str, path: str, ok_message: str,
+                payload: dict | None = None) -> None:
+    """POST one run-control action and claim success only when it succeeded.
+
+    AUDIT F08-2: stop/pause/resume/steer discarded the response and always
+    echoed success, so a 409/500 (the run had already finished, or the id went
+    stale between the lookup and the POST) told the user the autonomous run was
+    off while it kept iterating and spending budget. In a script, exit 0 was
+    taken as proof the run stopped.
+    """
+    import httpx
+    r = httpx.post(_run_server_base() + f"/api/runs/{rid}/{path}",
+                   json=payload, timeout=15)
+    if r.status_code != 200:
+        typer.echo("error: " + _response_error(r))
+        raise typer.Exit(1)
+    typer.echo(ok_message)
 
 
 @run_app.command("start")
@@ -118,38 +181,30 @@ def run_status():
 @run_app.command("stop")
 def run_stop():
     """Stop the active run."""
-    import httpx
     rid = _active_run_id()
-    httpx.post(_run_server_base() + f"/api/runs/{rid}/stop", timeout=15)
-    typer.echo(f"stopped run {rid}")
+    _run_action(rid, "stop", f"stopped run {rid}")
 
 
 @run_app.command("pause")
 def run_pause():
     """Pause the active run (frees the GPU without losing progress)."""
-    import httpx
     rid = _active_run_id()
-    httpx.post(_run_server_base() + f"/api/runs/{rid}/pause", timeout=15)
-    typer.echo("paused — resume with: rigma run resume")
+    _run_action(rid, "pause", "paused — resume with: rigma run resume")
 
 
 @run_app.command("resume")
 def run_resume():
     """Resume a paused run."""
-    import httpx
     rid = _active_run_id()
-    httpx.post(_run_server_base() + f"/api/runs/{rid}/resume", timeout=15)
-    typer.echo("resumed")
+    _run_action(rid, "resume", "resumed")
 
 
 @run_app.command("steer")
 def run_steer(message: str = typer.Argument(..., help="guidance for the model")):
     """Inject guidance used on the next step — course-correct without stopping."""
-    import httpx
     rid = _active_run_id()
-    httpx.post(_run_server_base() + f"/api/runs/{rid}/inject",
-               json={"message": message}, timeout=15)
-    typer.echo("guidance queued for the next step")
+    _run_action(rid, "inject", "guidance queued for the next step",
+                payload={"message": message})
 
 
 @run_app.command("log")
@@ -354,37 +409,60 @@ def models():
         typer.echo(f"{slug:24} {spec.kind:5} {fit}")
 
 
-def _spawn_detached(port: int) -> None:
-    """Re-launch `rigma up` as a background process and return the terminal.
-    The child re-runs the same resolution (fast — engine/model already on
-    disk) but this time stays foreground inside its own detached session."""
-    import subprocess
+def _detached_argv() -> list[str]:
+    """The command a detached child re-runs: this one without --detach, plus
+    --no-browser/--yes so it can never prompt into a closed stdin."""
     import sys
     argv = [a for a in sys.argv[1:] if a not in ("--detach", "-d")]
     if "--no-browser" not in argv:
         argv.append("--no-browser")
     if "-y" not in argv and "--yes" not in argv:
         argv.append("--yes")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-              "stderr": subprocess.DEVNULL}
     exe = [sys.executable, "-m", "rigma"] if not getattr(sys, "frozen", False) \
         else [sys.executable]
-    if platform.system() == "Windows":
-        # DETACHED_PROCESS alone is not enough when the launching shell runs
-        # inside a Windows Job Object that kills children on close (many
-        # terminals/tools do) — the server dies with the shell. BREAKAWAY_FROM_
-        # JOB frees it. Some jobs forbid breakaway, so fall back without it.
-        base = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED
-        try:
-            subprocess.Popen(exe + argv,
-                             creationflags=base | 0x01000000,  # BREAKAWAY_FROM_JOB
-                             **kwargs)
-        except OSError:
-            subprocess.Popen(exe + argv, creationflags=base, **kwargs)
-    else:
-        subprocess.Popen(exe + argv, start_new_session=True, **kwargs)
+    return exe + argv
+
+
+def _detached_log_path(port: int):
+    """Where a detached child's stdout/stderr goes.
+
+    AUDIT F08-5: it used to be DEVNULL, so the child's "port already in use",
+    resolve or download error was written nowhere while the parent had already
+    claimed success.
+    """
+    from .runtime import rigma_home
+    return rigma_home() / "logs" / f"detached-{port}.log"
+
+
+def _spawn_detached(port: int, spawn=None) -> None:
+    """Re-launch `rigma up` as a background process and return the terminal.
+    The child re-runs the same resolution (fast — engine/model already on
+    disk) but this time stays foreground inside its own detached session."""
+    import subprocess
+    argv = _detached_argv()
+    log_path = _detached_log_path(port)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if spawn is None:
+        spawn = subprocess.Popen
+    with open(log_path, "a", encoding="utf-8", errors="replace") as log_f:
+        kwargs = {"stdin": subprocess.DEVNULL, "stdout": log_f,
+                  "stderr": subprocess.STDOUT}
+        if platform.system() == "Windows":
+            # DETACHED_PROCESS alone is not enough when the launching shell runs
+            # inside a Windows Job Object that kills children on close (many
+            # terminals/tools do) — the server dies with the shell. BREAKAWAY_FROM_
+            # JOB frees it. Some jobs forbid breakaway, so fall back without it.
+            base = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED
+            try:
+                spawn(argv, creationflags=base | 0x01000000,  # BREAKAWAY_FROM_JOB
+                      **kwargs)
+            except OSError:
+                spawn(argv, creationflags=base, **kwargs)
+        else:
+            spawn(argv, start_new_session=True, **kwargs)
     typer.echo(f"Rigma is starting in the background on port {port}.")
     typer.echo(f"  UI:    http://127.0.0.1:{port}")
+    typer.echo(f"  log:   {log_path}")
     typer.echo("  stop:  rigma stop   ·   status: rigma status")
 
 
@@ -501,6 +579,17 @@ def rm(model: str = typer.Argument(..., help="Model slug (see `rigma list`)"),
     typer.echo(f"deleted {model} ({gb:.1f} GB freed)")
 
 
+def _engine_error(err) -> str:
+    """The human sentence out of an engine error payload.
+
+    llama.cpp sends `{"error": {"message": ...}}` (OpenAI style) and, in older
+    builds, a bare string — print whichever it is, never a Python repr.
+    """
+    if isinstance(err, dict):
+        return str(err.get("message") or err)
+    return str(err)
+
+
 def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> str:
     import json as _json
 
@@ -510,6 +599,11 @@ def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> 
     with httpx.stream("POST", f"http://127.0.0.1:{port}/v1/chat/completions",
                       json={"messages": history, "stream": True, **(params or {})},
                       timeout=600) as r:
+        # AUDIT F08-2: the status was never checked and every non-chunk line was
+        # skipped, so an error body ("context overflow") and a mid-stream
+        # `data: {"error": ...}` chunk ("slot released") both looked exactly like
+        # an empty reply — and `chat` saved that empty turn as the answer.
+        r.raise_for_status()
         for line in r.iter_lines():
             if not line.startswith("data: "):
                 continue
@@ -517,12 +611,24 @@ def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> 
             if payload == "[DONE]":
                 continue
             try:
-                delta = _json.loads(payload)["choices"][0]["delta"].get("content")
-            except Exception:
+                obj = _json.loads(payload)
+            except ValueError:
+                continue          # not a chunk we can read; keep the stream
+            if not isinstance(obj, dict):
                 continue
-            if delta:
-                text += delta
-                typer.echo(delta, nl=False)
+            if obj.get("error"):
+                raise RuntimeError(_engine_error(obj["error"]))
+            choices = obj.get("choices")
+            if not isinstance(choices, list) or not choices:
+                # a 200 that is not a chat chunk is still a failed turn; the old
+                # code swallowed it and returned "" as a successful reply.
+                raise RuntimeError(f"engine returned no choices: {payload[:200]}")
+            first = choices[0]
+            delta = first.get("delta") if isinstance(first, dict) else None
+            content = delta.get("content") if isinstance(delta, dict) else None
+            if content:
+                text += content
+                typer.echo(content, nl=False)
     typer.echo("")
     return text
 
@@ -567,6 +673,13 @@ def chat(session: str = typer.Option(None, "--session",
     s = st.server_running()
     if s is None:
         typer.echo("not running — start with: rigma up")
+        raise typer.Exit(1)
+    # AUDIT F15-2: the UI-only record (`rigma up` with no model) has model=""
+    # and unloaded=True; without this it looked like a running model, so chat
+    # opened a session and the first send died with "model unreachable".
+    if s.get("unloaded") and not s.get("model"):
+        typer.echo(f"Rigma is up, no model loaded — pick one in the Models page "
+                   f"(http://127.0.0.1:{s['public_port']})")
         raise typer.Exit(1)
     created = False
     if session:
@@ -657,6 +770,14 @@ def status():
     if s is None:
         typer.echo("not running  (start with: rigma up)")
         raise typer.Exit(0)
+    # AUDIT F15-2: "a state record exists" is not "a model is loaded". The
+    # UI-only record has model="" and unloaded=True, and printing
+    # "running:  ()" for it read as a broken install.
+    if s.get("unloaded") and not s.get("model"):
+        typer.echo(f"Rigma is up, no model loaded — pick one in the Models page "
+                   f"(http://127.0.0.1:{s['public_port']})")
+        typer.echo("stop with: rigma stop")
+        raise typer.Exit(0)
     up_min = (time.time() - s["started_at"]) / 60
     typer.echo(f"running: {s['model']} ({s['quant']})  up {up_min:.0f} min")
     typer.echo(f"chat UI:  http://127.0.0.1:{s['public_port']}")
@@ -674,15 +795,26 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     import json as _json
     from pathlib import Path
 
+    import httpx
+
     from . import state as st
-    from .bench import run_bench, save_calibration, verdict
+    from .bench import calibration_path, run_bench, save_calibration, verdict
 
     s = st.server_running()
     if s is None:
         typer.echo("not running — start with: rigma up")
         raise typer.Exit(1)
     typer.echo(f"benchmarking {s['model']} ({s['quant']}) ...")
-    r = run_bench(s["public_port"], prompt_tokens, gen_tokens)
+    # AUDIT F08-8: run_bench raises HTTPStatusError/ConnectError, and
+    # server_running() returns the UI-only record (unloaded=True) for a Rigma
+    # with no engine at all — so this reached the user as a multi-frame httpx
+    # traceback instead of "the engine is not answering". RuntimeError covers
+    # the no-timings case 08-7 raises.
+    try:
+        r = run_bench(s["public_port"], prompt_tokens, gen_tokens)
+    except (httpx.HTTPError, RuntimeError) as e:
+        typer.echo(f"benchmark failed: {e}")
+        raise typer.Exit(1) from e
     typer.echo(f"prefill: {r.pp_tps:.0f} t/s   gen: {r.tg_tps:.1f} t/s "
                f"({r.prompt_tokens}-token prompt)")
     reg = Registry.load()
@@ -694,7 +826,9 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     typer.echo(verdict(r, combo_expected))
     key = f"{s['model']}:{s['quant']}:{s.get('backend', 'unknown')}"
     save_calibration(key, r.model_dump())
-    typer.echo("recorded to ~/.rigma/calibration.json")
+    # AUDIT F15-7: `~` is POSIX shorthand — Explorer and cmd do not expand it.
+    # Print the path the file was actually written to.
+    typer.echo(f"recorded to {calibration_path()}")
     if evidence:
         from .runtime import _engines_manifest
         payload = {"combo": f"{s['model']} {s['quant']}",
@@ -720,8 +854,8 @@ def sweep(use_case: str = typer.Option("general", "--use-case"),
     Launches a throwaway engine on a scratch port (default 11601) and measures
     baseline vs FA-off, quantized KV, big prefill batch, coopmat-off, and (for
     MoE) graphics-queue / lighter offload. The fastest config is written to
-    ~/.rigma/calibration.json, which `rigma up` then applies automatically.
-    Your running server is never touched."""
+    Rigma's calibration store (see `rigma bench`), which `rigma up` then applies
+    automatically. Your running server is never touched."""
     from . import runtime
     from .bench import run_sweep
 
@@ -843,6 +977,55 @@ def stop():
     typer.echo("stopped" if killed else "stale state — nothing was killed")
 
 
+def _serve_or_exit(port: int) -> None:
+    """Serve the UI, turning a lost bind race into the pre-check's own message.
+
+    AUDIT F16-3: `_port_holder` is a check-then-bind (TOCTOU). If another
+    process takes the port between that check and uvicorn's bind, `uvicorn.run`
+    raises OSError ("address already in use") or SystemExit, and neither the
+    command nor the `finally` blocks caught it — typer's default handler printed
+    a raw traceback where the pre-check already knew how to say
+    "port N is already in use — free it or pass a different --port".
+    """
+    from . import serve
+    try:
+        serve.run_ui(port, port - 1)
+    except (OSError, SystemExit) as e:
+        typer.echo(f"port {port} is already in use — free it or pass a "
+                   f"different --port")
+        raise typer.Exit(1) from e
+
+
+def _open_when_listening(port: int, url: str, timeout: float = 15.0):
+    """Open `url` in a browser once 127.0.0.1:port accepts a connection.
+
+    AUDIT F16-2: `webbrowser.open` ran BEFORE `serve.run_ui`, so on a cold start
+    (uvicorn imports FastAPI, builds the app and binds after the browser already
+    had the URL) the first navigation could race the bind and show "can't reach
+    this site" — on the very first impression. The wait runs in a daemon thread
+    so the caller can start the server immediately; `--no-browser` still skips
+    this entirely.
+    """
+    import threading
+
+    def _wait() -> None:
+        import socket
+        import time
+        import webbrowser
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    webbrowser.open(url)
+                    return
+            except OSError:
+                time.sleep(0.1)
+
+    t = threading.Thread(target=_wait, name="rigma-open-browser", daemon=True)
+    t.start()
+    return t
+
+
 def _wants_vision(spec) -> bool:
     """This model's own opinion about its vision projector.
 
@@ -851,6 +1034,39 @@ def _wants_vision(spec) -> bool:
     relaunch cannot reload a projector the user turned off.
     """
     return getattr(getattr(spec, "launch", None), "vision", None) is not False
+
+
+def _launch_extra(cand, reg: Registry, mmproj_path=None) -> list[str]:
+    """The flags a launch adds on top of the plan's own args.
+
+    AUDIT F15-3: the vision projector and a repaired chat template used to be
+    built inline in the launch loop, so `--dry-run` (which printed only
+    `plan.server_args`) omitted them. `mmproj_path` is the downloaded projector
+    when the caller already has it; the dry-run preview passes nothing and gets
+    the deterministic path `ensure_model` returns.
+    """
+    from . import runtime
+    spec = reg.models.get(cand.model_slug)
+    extra: list[str] = []
+    if spec is not None and spec.mmproj is not None and _wants_vision(spec):
+        extra += ["--mmproj", str(mmproj_path
+                                  or runtime.rigma_home() / "models"
+                                  / spec.mmproj.file)]
+    tmpl = runtime.rigma_home() / "templates" / f"{cand.model_slug}.jinja"
+    if tmpl.is_file():
+        # repaired-template override, same rule as server_ops.switch_model.
+        # Live-verify 2026-07-20 caught the asymmetry: a model whose fixed
+        # template sat in ~/.rigma/templates booted through `up` with its
+        # BROKEN embedded template, because only the switch path looked.
+        extra += ["--chat-template-file", str(tmpl)]
+    return extra
+
+
+def _launch_argv(cand, reg: Registry, port: int, model_label="<model>") -> list[str]:
+    """The exact argv `rigma up` will launch — the single preview/launch source."""
+    from . import runtime
+    return runtime.server_argv("llama-server", cand, model_label, port,
+                               _launch_extra(cand, reg))
 
 
 @app.command()
@@ -883,9 +1099,8 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
-    import webbrowser
 
-    from . import runtime, serve
+    from . import runtime
     from . import state as st
 
     if st.server_running():
@@ -893,7 +1108,6 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         raise typer.Exit(1)
 
     reg = Registry.load()
-    p = _profile(reg)
 
     # UI-only: `rigma up` with no --model just starts Rigma. You pick a model
     # later in the UI (Models tab / Bazaar), which downloads, tunes, and loads
@@ -902,15 +1116,18 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if dry_run:                              # dry-run never touches ports
             typer.echo(f"would start Rigma (no model) on :{port}")
             raise typer.Exit(0)
-        if detach:
-            _spawn_detached(port)
-            raise typer.Exit(0)
         for needed in (port, port - 1):
             holder = _port_holder(needed)
             if holder:
                 typer.echo(f"port {needed} is already in use{holder} — "
                            f"free it or pass a different --port")
                 raise typer.Exit(1)
+        # AUDIT F08-5: detaching used to happen ABOVE the port check, so the
+        # parent claimed success (and exited 0) before the child could discover
+        # the port was taken — and the child's error went to DEVNULL.
+        if detach:
+            _spawn_detached(port)
+            raise typer.Exit(0)
         st.write_state("", "", port, engine_pid=-1, ui_pid=os.getpid(),
                        backend="", use_case=use_case, ctx=0, unloaded=True)
         typer.echo(f"Rigma:  http://127.0.0.1:{port}")
@@ -918,9 +1135,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                    "tunes, and loads on demand")
         typer.echo("stop:   Ctrl+C here, or `rigma stop` from any terminal")
         if not no_browser:
-            webbrowser.open(f"http://127.0.0.1:{port}")
+            _open_when_listening(port, f"http://127.0.0.1:{port}")
         try:
-            serve.run_ui(port, port - 1)
+            _serve_or_exit(port)
         finally:
             s_end = st.read_state()
             if s_end:
@@ -928,6 +1145,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             st.clear_state()
         return
 
+    # AUDIT F15-1: the hardware probe used to run ABOVE the UI-only branch and
+    # be discarded, so the README's "no probing" first command spent up to 20s
+    # in a PowerShell GPU query (probe.py) before the UI appeared. It is only
+    # needed for the resolve path below.
+    p = _profile(reg)
     try:
         rp = resolve(p, reg, use_case=use_case, model_override=model)
     except ResolveError as e:
@@ -1039,11 +1261,10 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
                f"({rp.origin})")
-    typer.echo("argv: llama-server " + " ".join(rp.server_args("<model>", port - 1)))
+    # AUDIT F15-3: this prints the SAME argv the launch below passes to
+    # launch_server, including --mmproj/--chat-template-file/--slot-save-path.
+    typer.echo("argv: " + " ".join(_launch_argv(rp, reg, port - 1)))
     if dry_run:
-        raise typer.Exit(0)
-    if detach:
-        _spawn_detached(port)
         raise typer.Exit(0)
     for needed in (port, port - 1):
         holder = _port_holder(needed)
@@ -1051,6 +1272,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             typer.echo(f"port {needed} is already in use{holder} — "
                        f"free it or pass a different --port")
             raise typer.Exit(1)
+    # AUDIT F08-5: below the port check, so the parent only claims success once
+    # the port it is about to use has been validated.
+    if detach:
+        _spawn_detached(port)
+        raise typer.Exit(0)
     if not yes:
         typer.confirm(
             f"download engine + model ({rp.gguf.bytes / 2**30:.1f} GB)?", abort=True)
@@ -1067,18 +1293,13 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             # projector's memory and hands it to more GPU layers, so attaching
             # it here anyway overcommits the card (and `ensure_model` DOWNLOADS
             # it first). Asked per candidate: a fallback is a different model
-            # with its own opinion.
+            # with its own opinion. AUDIT F15-3: the flag list itself is built by
+            # the shared `_launch_extra`, the same helper the preview uses.
+            mm_path = None
             if (spec_c is not None and spec_c.mmproj is not None
                     and _wants_vision(spec_c)):
                 mm_path = runtime.ensure_model(spec_c.mmproj)
-                extra = ["--mmproj", str(mm_path)]
-            # repaired-template override, same rule as server_ops.switch_model.
-            # Live-verify 2026-07-20 caught the asymmetry: a model whose fixed
-            # template sat in ~/.rigma/templates booted through `up` with its
-            # BROKEN embedded template, because only the switch path looked.
-            tmpl = runtime.rigma_home() / "templates" / f"{cand.model_slug}.jinja"
-            if tmpl.is_file():
-                extra = extra + ["--chat-template-file", str(tmpl)]
+            extra = _launch_extra(cand, reg, mm_path)
             from .bench import auto_calibrate, is_calibrated
             if (ctx is None and not no_calibrate and cand.backend != "cpu"
                     and os.environ.get("RIGMA_AUTO_CALIBRATE", "1") != "0"
@@ -1102,7 +1323,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                 typer.echo(f"falling back -> {nxt.model_slug} {nxt.gguf.quant} "
                            f"({nxt.origin})")
     if sp is None:
-        typer.echo("all fallbacks failed — see logs in ~/.rigma/logs/")
+        # AUDIT F15-7: `~` is POSIX shorthand — Explorer and cmd do not expand
+        # it, so the one message that says where the failure was logged named a
+        # path the user could not open. Print the directory actually written.
+        typer.echo(f"all fallbacks failed — see logs in "
+                   f"{runtime.rigma_home() / 'logs'}")
         raise typer.Exit(1)
     # Both caches are keyed by `kv_fp`, and an EMPTY one disables them silently
     # rather than loudly: `serve._prefix_ctx` returns None on a falsy fp, so
@@ -1127,9 +1352,9 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     typer.echo(f"OpenAI:   http://127.0.0.1:{port}/v1")
     typer.echo("stop:     Ctrl+C here, or `rigma stop` from any terminal")
     if not no_browser:
-        webbrowser.open(f"http://127.0.0.1:{port}")
+        _open_when_listening(port, f"http://127.0.0.1:{port}")
     try:
-        serve.run_ui(port, port - 1)
+        _serve_or_exit(port)
     finally:
         s_end = st.read_state()
         if s_end:

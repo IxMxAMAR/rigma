@@ -49,6 +49,42 @@ def test_run_bench_reads_timings(oai_server):
     assert r.prompt_tokens == 2048 and r.gen_tokens == 128
 
 
+class _Resp:
+    """A minimal stand-in for the httpx response run_bench reads."""
+
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._body
+
+
+def test_run_bench_rejects_a_response_without_timings(monkeypatch):
+    """AUDIT F08-7: "the engine answered but reported no timings" used to be
+    recorded as a successful 0.0 t/s row, which could then be crowned and
+    written to calibration as if it had been measured."""
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp({"choices": []}))
+    with pytest.raises(RuntimeError, match="timings"):
+        run_bench(11500, prompt_tokens=16, gen_tokens=8)
+
+
+def test_run_bench_rejects_zero_rates(monkeypatch):
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp(
+        {"timings": {"prompt_per_second": 0.0, "predicted_per_second": 0.0}}))
+    with pytest.raises(RuntimeError):
+        run_bench(11500, prompt_tokens=16, gen_tokens=8)
+
+
+def test_run_bench_still_accepts_real_timings(monkeypatch):
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp(
+        {"timings": {"prompt_per_second": 650.0, "predicted_per_second": 55.5}}))
+    r = run_bench(11500, prompt_tokens=16, gen_tokens=8)
+    assert r.pp_tps == 650.0 and r.tg_tps == 55.5
+
+
 def test_calibration_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     save_calibration("m:q:vulkan", {"tg_tps": 57.1}, flags={"n_cpu_moe": 8})
