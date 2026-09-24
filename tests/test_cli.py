@@ -61,6 +61,25 @@ def test_up_dry_run_with_model(tmp_path, monkeypatch):
     assert "qwen3.6-35b-a3b" in res.output and "-fa on" in res.output
 
 
+def test_ui_only_up_does_not_probe_hardware(tmp_path, monkeypatch):
+    """AUDIT F15-1: README says `rigma up` (no --model) does not probe; the
+    probe ran first, above the UI-only branch, and its result was discarded."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    calls = []
+
+    def fake_profile(reg):
+        calls.append(reg)
+        return _fake_probe(reg.gpus)
+
+    monkeypatch.setattr(cli, "_profile", fake_profile)
+    res = runner.invoke(cli.app, ["up", "--dry-run"])
+    assert res.exit_code == 0 and "no model" in res.output.lower()
+    assert calls == []
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run"])
+    assert res.exit_code == 0 and len(calls) == 1
+
+
 def test_chat_requires_running_server(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     res = runner.invoke(cli.app, ["chat"])
