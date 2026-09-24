@@ -68,18 +68,55 @@ class PrefixPoint:
     approx_tokens: int
 
 
+def _part_blob(part) -> str:
+    """A stable digest of ONE content part — text, image, or anything else.
+
+    AUDIT F02-1: this used to keep `part["text"]` and nothing else, so an
+    `image_url` part contributed the empty string. A conversation with an image
+    therefore hashed exactly like the same conversation with a different image,
+    and like the text-only conversation without one: the snapshot taken for one
+    was selected for the other. Layer 2 below (the engine's own token compare)
+    is what kept that from corrupting output, but the key is supposed to make
+    the wrong snapshot unreachable in the first place.
+
+    Hashed rather than embedded, because an image part carries a base64 data
+    URL: the blob only ever feeds a hash, so folding megabytes of it into every
+    prefix would cost time for no discrimination.
+    """
+    if not isinstance(part, dict):
+        return str(part)
+    kind = str(part.get("type", ""))
+    payload = part.get("text")
+    if payload is None and kind == "image_url":
+        iu = part.get("image_url")
+        payload = iu.get("url") if isinstance(iu, dict) else iu
+    if payload is None:
+        # An unrecognised part shape still has to discriminate, so hash the
+        # whole thing rather than silently contributing nothing.
+        payload = json.dumps(part, sort_keys=True, default=str)
+    digest = hashlib.sha256(str(payload).encode("utf-8")).hexdigest()
+    return f"{kind}\x01{digest}"
+
+
 def _message_blob(msg: dict) -> str:
     """The parts of a message that change what the model computed.
 
-    Role and text only. Everything else rigma carries on a message — ids,
+    Role and content. Everything else rigma carries on a message — ids,
     timestamps, tool metadata, UI state — does not reach the model, and folding
-    it in would make every key unique and the cache useless.
+    it in would make every key unique and the cache useless. (That includes
+    `reasoning_content`: grep serve.py/sessions.py and nothing re-sends it.)
     """
     role = str(msg.get("role", ""))
     content = msg.get("content", "")
     if isinstance(content, list):        # vision parts
-        content = "".join(str(p.get("text", "")) for p in content
-                          if isinstance(p, dict))
+        parts = [p for p in content if isinstance(p, dict)]
+        if all(str(p.get("type", "text")) == "text" for p in parts):
+            # All-text parts stay exactly equivalent to the same text sent as a
+            # plain string (test_vision_parts_are_read_as_their_text), so the two
+            # spellings a client may use do not fragment the cache.
+            content = "".join(str(p.get("text", "")) for p in parts)
+        else:
+            content = "".join(_part_blob(p) for p in content)
     return f"{role}\x00{content}"
 
 
