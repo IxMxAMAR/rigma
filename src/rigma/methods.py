@@ -602,4 +602,11 @@ def apply_to_session(session: dict, method_id: str) -> dict | None:
     if not str(session.get("notes") or "").strip():
         session["notes"] = a["notes_template"]
     session["method"] = method_id
+    # AUDIT F46: `method_applied` was declared in TRIGGER_EVENTS, accepted by
+    # validate() and matched by triggers._matches — and produced by nothing, so
+    # a rule watching it validated cleanly and was silently dead. Stamp the
+    # session at this single choke point (both the apply endpoint and the macros
+    # engine come through here); `_fire_triggers` emits the event once, on the
+    # next turn, and clears the stamp.
+    session["_method_applied"] = method_id
     return session

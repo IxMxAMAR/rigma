@@ -229,3 +229,49 @@ def test_a_method_with_no_triggers_stays_untouched(tmp_path, monkeypatch):
     assert fire(s, [{"name": "write_file", "args": {"path": "a.py"}}],
                 user_spoke=True) == []
     assert s.get("pending_nudges", []) == []
+
+
+def _fire_app(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import state as st
+    from rigma.serve import build_app
+
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid())
+    return build_app(upstream_port=1).state.fire_triggers
+
+
+def test_applying_a_method_fires_its_method_applied_rule(tmp_path, monkeypatch):
+    """`method_applied` was declared in TRIGGER_EVENTS, accepted by validate()
+    and matched by triggers._matches — and produced by NOTHING, so a rule
+    watching it validated cleanly and was silently dead (AUDIT F46)."""
+    from rigma import methods, sessions
+    fire = _fire_app(tmp_path, monkeypatch)
+    base = methods.get("book")
+    saved, errs = methods.save_user({
+        **base, "id": "watcher", "label": "Watcher",
+        "rules": [{"kind": "trigger", "id": "on-apply",
+                   "on": {"event": "method_applied"},
+                   "do": {"mode": "nudge", "text": "the method is on"}}]})
+    assert saved is not None, errs
+    s = sessions.create("t")
+    methods.apply_to_session(s, "watcher")
+    assert fire(s, [], user_spoke=True) == []
+    assert s["pending_nudges"] == ["the method is on"], s["pending_nudges"]
+    # once, not every turn
+    fire(s, [], user_spoke=True)
+    assert s["pending_nudges"] == ["the method is on"], s["pending_nudges"]
+
+
+def test_the_method_applied_stamp_never_survives_a_ruleless_turn(
+        tmp_path, monkeypatch):
+    """The stamp must be consumed even when the method has no trigger rules,
+    or a LATER method's rules would fire on an application that happened
+    before they existed (AUDIT F46)."""
+    from rigma import methods, sessions
+    fire = _fire_app(tmp_path, monkeypatch)
+    s = sessions.create("t")
+    methods.apply_to_session(s, "coding")          # no trigger rules
+    assert fire(s, [], user_spoke=True) == []
+    assert "_method_applied" not in s, s.get("_method_applied")

@@ -24,6 +24,12 @@ class _E4(BaseHTTPRequestHandler):
     idx = 0
     compile_reply = "not a spec"
     judge_replies: list = []          # popped per content-judge call
+    # Hold a streaming turn OPEN until `release` is set. The pause tests need a
+    # run that cannot reach a terminal state while the test arranges things;
+    # without this they raced the four fast turns it takes to stall and passed
+    # or failed depending on machine load (they failed in a full-suite run).
+    hold = None                       # threading.Event or None
+    hold_timeout = 30.0
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
@@ -55,6 +61,8 @@ class _E4(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
+        if _E4.hold is not None:
+            _E4.hold.wait(timeout=_E4.hold_timeout)
 
         def sse(o):
             self.wfile.write(b"data: " + json.dumps(o).encode() + b"\n\n")
@@ -88,6 +96,7 @@ def home(tmp_path, monkeypatch):
     _E4.script = []
     _E4.compile_reply = "not a spec"
     _E4.judge_replies = []
+    _E4.hold = None
     yield tmp_path
     try:
         a = runs.active()
@@ -208,6 +217,113 @@ def test_restart_reattaches_and_finishes(engine, tmp_path):
     r = _wait(c, rid)
     assert r["status"] == "done"
     assert "small job" in r["summary"]
+
+
+def test_restart_grants_a_step_budget_grace(engine, tmp_path):
+    """A run halted at the iteration cap is RESTARTABLE, so the resume button
+    flipped it to running, repointed active.json and returned
+    {"restarted": true} — and the loop's first budget check halted it again,
+    forever, because nothing resets `iteration`. Every press also re-persisted
+    plan reconciliation, appended another never-consumed RESUMED steer and
+    re-ran the memory harvest over an unchanged action trace (AUDIT F45)."""
+    _E4.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "small job",
+                                    "budget_hours": 1}).json()["id"]
+    _wait(c, rid, until=lambda r: r.get("iteration", 0) >= 1)
+    c.post(f"/api/runs/{rid}/stop")
+    _wait(c, rid, until=lambda r: r.get("status") in runs.TERMINAL)
+    # spend the whole step budget, as a genuinely long run would
+    r = runs.load(rid)
+    r["iteration"] = runs.MAX_ITERS
+    runs.save(r)
+    assert "iteration cap" in runs.budget_exceeded(runs.load(rid))
+    _E4.idx = 0
+    _E4.script = [("manage_plan", {"action": "complete", "id": 1}),
+                  ("task_complete", {"summary": "finished after the grace"}),
+                  ("task_complete", {"summary": "finished after the grace"})]
+    out = c.post(f"/api/runs/{rid}/restart").json()
+    assert out.get("restarted") is True
+    assert runs.load(rid)["iter_ceiling"] > runs.MAX_ITERS
+    r = _wait(c, rid, until=lambda x: x.get("status") == "done")
+    assert r["status"] == "done", r.get("halt_reason")
+
+
+def test_a_pause_does_not_burn_the_clock(engine, tmp_path):
+    """The pause short-circuited BEFORE `budget_exceeded`, so the clock kept
+    running while nothing happened: an 8-hour run started at 23:00, paused at
+    23:20 by ask_user, was still holding the run slot at 08:00 with nothing
+    done — and answering it resumed straight into budget_exhausted, discarding
+    the answer (AUDIT F44).
+
+    The engine holds its turn open, so the run provably cannot stall while the
+    test arranges the pause."""
+    hold = threading.Event()
+    _E4.hold = hold
+    _E4.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "small job",
+                                    "budget_hours": 1}).json()["id"]
+    # the run is inside its first turn and cannot move until we let it
+    r = runs.load(rid)
+    r["paused"] = True
+    r["pending_question"] = {"q": "which folder?"}
+    r["_paused_at"] = time.time() - 7200
+    before = r["deadline"]
+    runs.save(r)
+    hold.set()
+    # it observes the pause at the top of the next iteration
+    r = _wait(c, rid, until=lambda x: x.get("_paused_at") and x.get("paused"))
+    assert r["paused"] is True, r
+    # answer it: the run resumes, and the two hours come back
+    c.post(f"/api/runs/{rid}/inject", json={"message": "the one on the left"})
+    r = _wait(c, rid, until=lambda x: not x.get("_paused_at"))
+    assert r["deadline"] >= before + 7000, (before, r["deadline"])
+    assert r.get("status") != "budget_exhausted", r.get("halt_reason")
+
+
+def test_a_model_pause_that_is_never_answered_releases_the_slot(engine,
+                                                              tmp_path):
+    """A model-initiated pause is the run asking a question, not the owner
+    choosing to stop, and it otherwise holds the one run slot forever:
+    active.json still points at it, so every subsequent POST /api/runs is
+    refused with 409 (AUDIT F44)."""
+    hold = threading.Event()
+    _E4.hold = hold
+    _E4.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "small job",
+                                    "budget_hours": 1}).json()["id"]
+    r = runs.load(rid)
+    r["paused"] = True
+    r["pending_question"] = {"q": "which folder?"}
+    r["_paused_at"] = time.time() - serve.PAUSE_MAX_SECS - 60
+    runs.save(r)
+    hold.set()
+    r = _wait(c, rid, until=lambda x: x.get("status") == "stalled")
+    assert "answer" in r.get("halt_reason", ""), r.get("halt_reason")
+    assert runs.active() is None, "the slot is still held"
+
+
+def test_an_owner_pause_is_never_expired(engine, tmp_path):
+    """The pause BUTTON is a deliberate choice — only a pending question is
+    bounded (AUDIT F44)."""
+    hold = threading.Event()
+    _E4.hold = hold
+    _E4.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "small job",
+                                    "budget_hours": 1}).json()["id"]
+    r = runs.load(rid)
+    r["paused"] = True
+    r.pop("pending_question", None)
+    r["_paused_at"] = time.time() - serve.PAUSE_MAX_SECS - 60
+    runs.save(r)
+    hold.set()
+    # long past the model-pause bound, and still deliberately paused
+    _wait(c, rid, until=lambda x: x.get("_paused_at"))
+    time.sleep(1.5)                 # let the loop poll it several times
+    assert runs.load(rid)["status"] == "running", runs.load(rid).get("status")
 
 
 def test_content_check_fail_then_pass(engine, tmp_path):

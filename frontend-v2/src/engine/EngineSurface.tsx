@@ -61,7 +61,15 @@ export default function EngineSurface() {
     // Re-read per model, because these are facts about the engine that is
     // RUNNING: a different model is a different set of decisions.
     engineApi.findings().then((d) => setFindings(d.findings))
-      .catch(() => setFindings([]));
+      .catch((e) => setFindings([{
+        id: "log-unreadable",
+        severity: "warn",
+        message: "Could not read the engine log, so load-time decisions are "
+          + `unknown — ${(e as Error).message}`,
+        count: 0,
+        confirmed_here: false,
+        example: "",
+      }]));
   }, [info?.model]);
 
   const act = async (name: string, fn: () => Promise<unknown>) => {

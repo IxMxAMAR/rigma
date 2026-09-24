@@ -63,14 +63,47 @@ def verdict(last_tg: float | None, exp: float | None) -> str:
     return "degraded" if last_tg < 0.6 * exp else "healthy"
 
 
-def log_tail(lines: int = 200) -> str:
+def log_path():
+    """The newest engine log, or None when no engine has ever logged."""
     logs = sorted((rigma_home() / "logs").glob("server-*.log"),
                   key=lambda p: p.stat().st_mtime, reverse=True)
-    if not logs:
+    return logs[0] if logs else None
+
+
+def log_tail(lines: int = 200) -> str:
+    p = log_path()
+    if p is None:
         return ""
     lines = max(10, min(int(lines), 1000))
-    text = logs[0].read_text(encoding="utf-8", errors="replace").splitlines()
+    text = p.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(text[-lines:])
+
+
+# The whole-log reader is bounded by BYTES, not lines: a chatty session can
+# produce a million lines, and nothing here needs more than the launch banner.
+_LOG_MAX_BYTES = 8_000_000
+
+
+def log_text(max_bytes: int = _LOG_MAX_BYTES) -> str:
+    """The WHOLE newest engine log (bounded by bytes).
+
+    `log_tail` hard-caps at 1000 lines, and the load-time warnings
+    `engine_log.findings` exists for land in the first few hundred lines of a
+    launch — so on any session whose log has grown past the cap the feature
+    reports nothing at all (AUDIT F51).
+
+    Raises OSError when there is no readable log, so a caller can tell "nothing
+    found" from "could not look": the endpoint used to answer `{"findings": []}`
+    for both, which reads as "the engine is healthy"."""
+    p = log_path()
+    if p is None:
+        raise FileNotFoundError("no engine log yet")
+    size = p.stat().st_size
+    with p.open("rb") as fh:
+        if size > max_bytes:
+            fh.seek(size - max_bytes)
+        raw = fh.read()
+    return raw.decode("utf-8", errors="replace")
 
 
 def _model_on_disk(gguf) -> bool:
