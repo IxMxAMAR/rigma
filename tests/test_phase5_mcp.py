@@ -26,13 +26,41 @@ FAKE_SERVER = textwrap.dedent("""
                 {"name": "shout",
                  "description": "Uppercase the input text",
                  "inputSchema": {"type": "object", "properties": {
-                     "text": {"type": "string"}}, "required": ["text"]}}]}}
+                     "text": {"type": "string"}}, "required": ["text"]}},
+                {"name": "huge",
+                 "description": "Return a very large single response",
+                 "inputSchema": {"type": "object", "properties": {
+                     "n": {"type": "integer"}}}},
+                {"name": "silent",
+                 "description": "Never answers",
+                 "inputSchema": {"type": "object", "properties": {}}},
+                {"name": "flood",
+                 "description": "Streams one endless line, forever",
+                 "inputSchema": {"type": "object", "properties": {}}}]}}
         elif m == "tools/call":
             args = msg["params"].get("arguments") or {}
             if msg["params"]["name"] == "shout":
                 out = {"jsonrpc": "2.0", "id": mid, "result": {
                     "content": [{"type": "text",
                                  "text": str(args.get("text", "")).upper()}]}}
+            elif msg["params"]["name"] == "huge":
+                out = {"jsonrpc": "2.0", "id": mid, "result": {
+                    "content": [{"type": "text",
+                                 "text": "x" * int(args.get("n", 4000))}]}}
+            elif msg["params"]["name"] == "silent":
+                continue      # never answers: a caller that must be woken
+            elif msg["params"]["name"] == "flood":
+                # ONE ENDLESS LINE: a newline is never written, so a reader
+                # that gives up is the only way this can end. (A finite
+                # 100KB line only failed the reader if the drain budget
+                # happened to run out first, which is a race.)
+                sys.stdout.write('{"jsonrpc": "2.0", "id": %s, "result": '
+                                 '{"content": [{"type": "text", "text": "'
+                                 % mid)
+                sys.stdout.flush()
+                while True:
+                    sys.stdout.write("x" * 8192)
+                    sys.stdout.flush()
             else:
                 out = {"jsonrpc": "2.0", "id": mid, "result": {
                     "isError": True,
@@ -129,3 +157,113 @@ def test_malformed_name_and_missing_server(tmp_path):
     _write_config(tmp_path, _fake_server_config(tmp_path))
     assert tools.run_tool("mcp__nosuchserver__t", {},
                           {"allow_code": True}).startswith("error")
+
+
+# --- F54: shutdown must actually end the server -------------------------------
+def test_stop_kills_the_server_and_releases_its_pipes(tmp_path):
+    """`stop()` called terminate() and dropped the reference: no wait, no kill
+    escalation, no pipe close — so a server that survived terminate could never
+    be killed afterwards and a repeat stop_all() was a no-op, and the reader
+    thread stayed blocked in readline() holding the stdout pipe (AUDIT F54)."""
+    import time
+    _write_config(tmp_path, _fake_server_config(tmp_path))
+    mgr = mcp_client.manager()
+    mgr._ensure()
+    srv = mgr._servers["fake"]
+    proc = srv.proc
+    assert proc.poll() is None
+    srv.stop()
+    deadline = time.monotonic() + 10
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert proc.poll() is not None, "the server survived stop()"
+    assert srv.proc is None
+    srv.stop()                    # a repeat is a harmless no-op, not a crash
+
+
+def test_stop_all_is_idempotent_and_releases_every_server(tmp_path):
+    _write_config(tmp_path, _fake_server_config(tmp_path))
+    mgr = mcp_client.manager()
+    mgr._ensure()
+    procs = [s.proc for s in mgr._servers.values()]
+    assert procs
+    mgr.stop_all()
+    mgr.stop_all()
+    assert all(p.poll() is not None for p in procs)
+    assert mgr._servers == {}
+
+
+def test_a_waiting_caller_is_woken_when_the_server_is_stopped(tmp_path):
+    """A caller blocked on a reply used to sit out the full 60s timeout."""
+    import threading
+    import time
+    _write_config(tmp_path, _fake_server_config(tmp_path))
+    mgr = mcp_client.manager()
+    mgr._ensure()
+    srv = mgr._servers["fake"]
+    got = {}
+
+    def waiter():
+        try:
+            srv._send("tools/call", {"name": "silent", "arguments": {}})
+            got["out"] = "returned"
+        except Exception as e:
+            got["out"] = str(e)
+
+    t = threading.Thread(target=waiter)
+    t.start()
+    time.sleep(0.5)               # the call is issued and now waiting
+    srv.stop()
+    t.join(timeout=10)
+    assert not t.is_alive(), "the waiter was never woken"
+    assert "no longer answering" in got.get("out", ""), got
+
+
+# --- F55: one large result must not be buffered whole -------------------------
+def test_an_oversize_frame_is_dropped_and_the_caller_told(tmp_path, monkeypatch):
+    """The reader used an unbounded readline(), so one response was held in
+    memory whole (twice, after parsing) inside the process that also holds the
+    chat sessions (AUDIT F55)."""
+    import time
+    monkeypatch.setattr(mcp_client, "_FRAME_MAX", 2000)
+    _write_config(tmp_path, _fake_server_config(tmp_path))
+    mgr = mcp_client.manager()
+    mgr._ensure()
+    srv = mgr._servers["fake"]
+    started = time.monotonic()
+    out = tools.run_tool("mcp__fake__huge", {"n": 4000}, {"allow_code": True})
+    elapsed = time.monotonic() - started
+    assert elapsed < 30, f"the caller waited {elapsed:.1f}s for a dropped frame"
+    assert out.startswith("error") and "exceeded" in out, out
+    assert srv.oversize_frames == 1
+    # framing stays in sync: the very next call is served normally
+    assert tools.run_tool("mcp__fake__shout", {"text": "still here"},
+                          {"allow_code": True}) == "STILL HERE"
+
+
+def test_a_server_that_streams_one_endless_line_is_reported_dead(
+        tmp_path, monkeypatch):
+    """A reader that exited was invisible: proc.poll() still said alive, so
+    every later call blocked a worker for the full timeout and _ensure() would
+    not rebuild it (AUDIT F55)."""
+    import time
+    monkeypatch.setattr(mcp_client, "_FRAME_MAX", 2000)
+    _write_config(tmp_path, _fake_server_config(tmp_path))
+    mgr = mcp_client.manager()
+    mgr._ensure()
+    srv = mgr._servers["fake"]
+    out = tools.run_tool("mcp__fake__flood", {}, {"allow_code": True})
+    assert out.startswith("error"), out
+    # The caller is woken by the oversize frame; the READER sets reader_error a
+    # moment later, after it has given up on the rest of the line. Poll for it
+    # rather than assuming the ordering — asserting immediately is what made
+    # this fail only under full-suite load.
+    end = time.monotonic() + 15
+    while time.monotonic() < end and not srv.reader_error:
+        time.sleep(0.05)
+    assert srv.reader_error and "exceeded" in srv.reader_error, srv.reader_error
+    # and the next call reports it instead of blocking for a minute
+    second = tools.run_tool("mcp__fake__shout", {"text": "x"},
+                            {"allow_code": True})
+    assert second.startswith("error") and "exceeded" in second, second
+    assert "fake" in mgr.status()["failed"]

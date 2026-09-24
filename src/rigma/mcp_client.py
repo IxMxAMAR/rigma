@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -36,6 +37,11 @@ PROTOCOL_VERSION = "2025-06-18"
 _START_TIMEOUT = 20.0     # server boot + initialize handshake
 _CALL_TIMEOUT = 60.0
 _RESULT_MAX = 8000        # same cap philosophy as built-in tools
+# One JSON-RPC frame is one line, and a legitimate "read this big file" call can
+# be huge — but it must not be held in memory whole, twice, before the 8000-char
+# display cap is applied (AUDIT F55).
+_FRAME_MAX = 4_000_000
+_ID_RE = re.compile(r'"id"\s*:\s*(\d+)')
 
 
 def config_path():
@@ -66,24 +72,96 @@ class McpServer:
         self._id = 0
         self._lock = threading.Lock()
         self._replies: dict[int, queue.Queue] = {}
+        # A reader that exited is a DEAD server even while proc.poll() still says
+        # alive: every later call would otherwise block a worker thread for the
+        # full timeout with no explanation (AUDIT F55).
+        self.reader_error: str = ""
+        self.oversize_frames = 0
 
     # -- plumbing --------------------------------------------------------------
-    def _reader(self):
+    def _handle_line(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
         try:
-            for line in iter(self.proc.stdout.readline, ""):
-                line = line.strip()
-                if not line:
+            msg = json.loads(line)
+        except ValueError:
+            return
+        mid = msg.get("id")
+        q = self._replies.get(mid) if mid is not None else None
+        if q is not None:
+            q.put(msg)
+
+    def _fail_frame(self, head: str) -> None:
+        """Fail the caller whose reply lives in an OVERSIZE frame, by the id at
+        the frame's head. Without this the caller waits out the full call
+        timeout for a reply that was deliberately dropped, and the model is told
+        nothing at all."""
+        m = _ID_RE.search(head)
+        if not m:
+            return
+        q = self._replies.get(int(m.group(1)))
+        if q is not None:
+            q.put({"jsonrpc": "2.0", "error": {
+                "code": -32001,
+                "message": (f"response exceeded {_FRAME_MAX} characters and "
+                            "was dropped")}})
+
+    def _drain_one_frame(self, budget: int = 4):
+        """Read past the newline that ends an OVERSIZE frame.
+
+        Returns the remainder of the read (so framing stays in sync), or None
+        when the server is gone or streamed one endless line."""
+        for _ in range(budget):
+            tail = self.proc.stdout.readline(_FRAME_MAX + 1)
+            if not tail:
+                return None
+            if "\n" in tail:
+                return tail.split("\n", 1)[1]
+        return None
+
+    def _reader(self):
+        """Read newline-delimited JSON-RPC frames with a HARD bound.
+
+        This used `for line in iter(stdout.readline, "")`, which holds one whole
+        line in memory before parsing — and _RESULT_MAX is applied only
+        afterwards, so two copies of the payload lived inside the process that
+        also holds the chat sessions. Worse, a MemoryError was swallowed by the
+        bare `except`, the thread exited for good, and `proc.poll()` still
+        reported the child alive, so every later call blocked a worker for the
+        full 60s with no explanation and `_ensure()` would not rebuild it
+        (AUDIT F55)."""
+        pending = ""
+        try:
+            while True:
+                chunk = self.proc.stdout.readline(_FRAME_MAX + 1)
+                if not chunk:
+                    break                       # EOF: the child is gone
+                if "\n" not in chunk and len(chunk) > _FRAME_MAX:
+                    self.oversize_frames += 1
+                    self._fail_frame(chunk)
+                    rest = self._drain_one_frame()
+                    if rest is None:
+                        self.reader_error = ("a single response exceeded "
+                                             f"{_FRAME_MAX} characters")
+                        return
+                    pending = rest
                     continue
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    continue
-                mid = msg.get("id")
-                q = self._replies.get(mid) if mid is not None else None
-                if q is not None:
-                    q.put(msg)
-        except Exception:
-            pass
+                pending += chunk
+                while "\n" in pending:
+                    line, _, pending = pending.partition("\n")
+                    self._handle_line(line)
+        except Exception as e:
+            self.reader_error = f"{type(e).__name__}: {e}"[:200]
+        finally:
+            # wake anyone waiting on a reply that can no longer arrive
+            with self._lock:
+                for q in self._replies.values():
+                    q.put({"jsonrpc": "2.0", "error": {
+                        "code": -32000,
+                        "message": (f"mcp server '{self.name}' is no longer "
+                                    "answering")}})
+                self._replies.clear()
 
     def _send(self, method: str, params: dict | None = None,
               notify: bool = False, timeout: float = _CALL_TIMEOUT):
@@ -143,12 +221,61 @@ class McpServer:
                       if isinstance(t, dict) and t.get("name")]
 
     def stop(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
+        """Terminate, escalate, and release the pipes.
+
+        `terminate()` then dropping the reference left a server that survived it
+        unkillable forever — a repeat `stop_all()` was a no-op — and the reader
+        thread stayed blocked in readline() holding the stdout pipe, so every
+        config-change restart and every shutdown leaked a live thread plus a
+        handle. On Windows a server configured as `cmd /c npx …` left the node
+        grandchild running. The codebase gets this right four other times
+        (runtime.py, state.py, rag.py, tools._kill_tree); this mirrors
+        ServerProcess.stop: terminate -> wait -> kill -> wait, then close the
+        pipes. Closing stdin is also the MCP graceful-shutdown signal
+        (AUDIT F54)."""
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()      # MCP's own graceful-shutdown signal
+        except Exception:
+            pass
+        if proc.poll() is None:
+            killed = False
+            if sys.platform == "win32":
+                # terminate() reaches only the direct child, so a server
+                # configured as `cmd /c npx …` leaves the node grandchild
+                # running; taskkill /T takes the tree.
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False,
+                        creationflags=getattr(subprocess,
+                                              "CREATE_NO_WINDOW", 0))
+                    killed = True
+                except Exception:
+                    pass
+            if not killed:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
             try:
-                self.proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
             except Exception:
                 pass
-        self.proc = None
 
     def call(self, tool: str, args: dict) -> str:
         result = self._send("tools/call",
@@ -182,15 +309,23 @@ class McpManager:
         cfg = load_config()
         key = json.dumps(cfg, sort_keys=True)
         with self._lock:
-            if self._started and key == self._cfg_key:
+            # A server whose READER died is dead even though its process is
+            # alive: it can never answer again, so it must not be left in
+            # `_servers` to block a worker thread per call (AUDIT F55).
+            stale = {n: s.reader_error for n, s in self._servers.items()
+                     if s.reader_error}
+            if self._started and key == self._cfg_key and not stale:
                 return
             # config changed (or first use): restart the world
             for s in self._servers.values():
                 s.stop()
-            self._servers, self._failed = {}, {}
+            # a config edit may fix a dead server, so only carry the death
+            # forward when the config is the one it died under
+            carried = dict(stale) if key == self._cfg_key else {}
+            self._servers, self._failed = {}, carried
             self._cfg_key, self._started = key, True
             for name, spec in cfg.items():
-                if not isinstance(spec, dict):
+                if not isinstance(spec, dict) or str(name) in carried:
                     continue
                 srv = McpServer(str(name), spec)
                 try:
@@ -226,6 +361,10 @@ class McpManager:
         if srv is None:
             why = self._failed.get(server, "not configured")
             return f"error: mcp server '{server}' is unavailable ({why})"
+        if srv.reader_error:
+            return (f"error: mcp server '{server}' stopped responding "
+                    f"({srv.reader_error}) — it will be restarted on the next "
+                    "config reload")
         try:
             return srv.call(tool, args)
         except Exception as e:
@@ -237,6 +376,11 @@ class McpManager:
         return {"configured": sorted(cfg),
                 "running": sorted(self._servers),
                 "failed": dict(self._failed),
+                "dead": {n: s.reader_error for n, s in self._servers.items()
+                         if s.reader_error},
+                "oversize_frames": {n: s.oversize_frames
+                                    for n, s in self._servers.items()
+                                    if s.oversize_frames},
                 "tools": [t["function"]["name"] for t in self.tool_specs()]}
 
     def stop_all(self) -> None:
