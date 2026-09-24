@@ -1,9 +1,9 @@
 # Using Rigma as the backend for coding agents
 
 Rigma serves an OpenAI-compatible API at `http://127.0.0.1:11500/v1` (shown in
-the UI under ⚙ → Server → agents). Tool calling and structured outputs pass
+the UI under **Engine → OpenAI API**). Tool calling and structured outputs pass
 straight through to llama.cpp — use a **tools-capable model**
-(`rigma up --use-case coding` picks one automatically; the Server tab shows the
+(`rigma up --use-case coding` picks one automatically; the Engine page shows the
 running model's capabilities).
 
 ## aider
