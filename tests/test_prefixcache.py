@@ -38,6 +38,38 @@ def test_a_shared_opening_shares_its_keys():
     assert a[2].key != b[2].key                    # and diverge where they do
 
 
+# --- AUDIT F02-1: a vision part must change the key --------------------------
+def _vision_chat(url, text="What is in this picture?"):
+    return [{"role": "user", "content": [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": url}}]}]
+
+
+def test_two_different_images_do_not_share_a_prefix_key():
+    # The old blob kept only part["text"], so the image contributed nothing and
+    # these two hashed identically: image A's snapshot was selected for image B.
+    a = prefix_keys(_vision_chat("data:image/png;base64,AAAA"), FP)[-1].key
+    b = prefix_keys(_vision_chat("data:image/png;base64,BBBB"), FP)[-1].key
+
+    assert a != b
+    assert a == prefix_keys(_vision_chat("data:image/png;base64,AAAA"), FP)[-1].key
+
+
+def test_a_text_only_chat_does_not_collide_with_an_image_chat():
+    text_only = [{"role": "user", "content": "What is in this picture?"}]
+    assert (prefix_keys(text_only, FP)[-1].key
+            != prefix_keys(_vision_chat("data:image/png;base64,AAAA"), FP)[-1].key)
+
+
+def test_an_unknown_part_shape_still_discriminates():
+    def chat(extra):
+        return [{"role": "user", "content": [
+            {"type": "text", "text": "hi"}, extra]}]
+    a = prefix_keys(chat({"type": "audio", "data": "AAAA"}), FP)[-1].key
+    b = prefix_keys(chat({"type": "audio", "data": "BBBB"}), FP)[-1].key
+    assert a != b
+
+
 def test_a_different_configuration_shares_nothing():
     # THE safety property: a snapshot taken at another ctx / quant / cache type
     # must be unreachable, because its KV values mean something else entirely.
