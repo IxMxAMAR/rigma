@@ -5106,7 +5106,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 out.append({"id": r["id"], "status": r.get("status"),
                             "mission": str(r.get("mission", ""))[:140],
                             "workspace": r.get("workspace", ""),
-                            "iteration": r.get("iteration", 0)})
+                            "iteration": r.get("iteration", 0),
+                            # IMP-8: the history list can say WHY, not just that
+                            # it stopped — "finished" and "gave up" look alike
+                            # without this.
+                            "stop_reason": _runs.stop_reason(r)})
                 if len(out) >= 40:
                     break
         except Exception:
@@ -5179,6 +5183,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r["log_tail"] = await asyncio.to_thread(_runs.get_log_tail, r["id"], 40)
         r.update(_runs.load_live(r["id"]))
         r["plan"] = _runs.read_plan(r["id"])
+        r["stop_reason"] = _runs.stop_reason(r)
+        r["budget"] = _runs.budget_snapshot(r)
         return r
 
     @app.get("/api/runs/{rid}")
@@ -5190,6 +5196,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r["log_tail"] = _runs.get_log_tail(rid, 40)
         r["plan"] = _runs.read_plan(rid)
         r.update(_runs.load_live(rid))
+        r["stop_reason"] = _runs.stop_reason(r)
+        r["budget"] = _runs.budget_snapshot(r)
         return r
 
     @app.get("/api/runs/{rid}/log")
@@ -5439,7 +5447,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                  frozen_streak=0, verified_once=False,
                  completion_challenges=0, _echo_streak=0,
                  _paused_at=0,
-                 halt_reason="")
+                 halt_reason="", stop_reason="")
         # a used-up or nearly-used-up clock gets a grace hour — a restart
         # exists to finish work, not to instantly re-die on the old deadline
         if r.get("deadline", 0) < _time.time() + 900:
