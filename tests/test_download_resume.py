@@ -32,6 +32,15 @@ class _Flaky(BaseHTTPRequestHandler):
         chunk = BODY[start:]
         self.send_response(206 if start else 200)
         self.send_header("content-length", str(len(chunk)))
+        if start:
+            # AUDIT 06R3-2/06R3-4: on a 206, content-length describes the SLICE
+            # and only content-range states the whole object's length — which is
+            # what `_object_size` reads and what the final size check compares
+            # against. A real origin sends it (RFC 7233 requires it on a 206);
+            # this fake did not, so the transfer looked unverifiable and the new
+            # refusal in `_install_download` correctly declined to install it.
+            self.send_header("content-range",
+                             f"bytes {start}-{len(BODY) - 1}/{len(BODY)}")
         self.end_headers()
         if _Flaky.drops_left > 0:
             _Flaky.drops_left -= 1

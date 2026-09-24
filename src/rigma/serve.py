@@ -2705,18 +2705,29 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 except Exception as e:
                     failed = True
                     msg = str(e) or "model unreachable"
-                    if isinstance(e, _res.RetryExhausted):
+                    # The retry layer wraps the real fault in `RetryExhausted`, so
+                    # the specific handlers below have to look THROUGH it: the
+                    # "engine is unloaded — load it again" message is only
+                    # reachable if the ConnectError underneath is still visible.
+                    # Without this, adding retries silently downgraded the most
+                    # actionable message Rigma has into a generic "failed after 3
+                    # attempts" — the state says the engine was deliberately
+                    # unloaded, and the user is told to check a log.
+                    cause = e.last if isinstance(e, _res.RetryExhausted) else e
+                    if isinstance(cause, httpx.ConnectError):
+                        msg = ("the engine is unloaded — load it again from "
+                               "⚙ → Server (or run: rigma load)"
+                               if (st.read_state() or {}).get("unloaded")
+                               else "engine unreachable — check ⚙ → Server → log")
+                        if isinstance(e, _res.RetryExhausted):
+                            msg += f" (tried {e.attempts} times)"
+                    elif isinstance(e, _res.RetryExhausted):
                         # The retry layer already tried, and its message names the
                         # real transport fault and how many attempts were spent.
                         # Replacing that with a generic "unreachable" would throw
                         # away the only evidence the user has.
                         msg = (f"{e}. Check ⚙ → Server → log; the engine may still "
                                f"be loading a large model.")
-                    elif isinstance(e, httpx.ConnectError):
-                        msg = ("the engine is unloaded — load it again from "
-                               "⚙ → Server (or run: rigma load)"
-                               if (st.read_state() or {}).get("unloaded")
-                               else "engine unreachable — check ⚙ → Server → log")
                     elif engine_breaker.open:
                         # A sustained outage is worth saying out loud, because it
                         # changes what the user should do: nothing will work until
@@ -4001,6 +4012,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # restarted.
     _streaming: set[str] = set()
     _queued: dict[str, list] = {}
+    # R3-5: how many prompts one chat may have waiting behind its running reply.
+    # The queue is in memory only, so an unbounded one is a memory leak a client
+    # can drive; and because a dropped prompt is silent, the cap has to be
+    # enforced at the door with a refusal rather than by discarding later.
+    _QUEUE_MAX = 32
     # session id -> the Event that stops the turn running in it. A THREADING
     # event, not an asyncio one: the chat route sets it from the event loop and
     # an external backend's adapter reads it on the worker thread the turn
@@ -4101,19 +4117,36 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # set, and start a concurrent turn for the same chat.
         cancel = threading.Event()
 
-        def _release_claim() -> None:
+        def _release_claim(dropped: bool = False) -> None:
             # Identity-guarded: by the time a never-started generator is
             # finalised a later turn may already own this sid, and releasing
             # THAT claim would let a third request run alongside it.
-            if _cancels.get(sid) is cancel:
-                _streaming.discard(sid)
-                _cancels.pop(sid, None)
-                # anything still queued can no longer be delivered: this is
-                # the only generator that would have run it
+            if _cancels.get(sid) is not cancel:
+                return
+            _streaming.discard(sid)
+            _cancels.pop(sid, None)
+            if dropped:
+                # The only generator that could have delivered these is this one,
+                # so they are going. That is correct when the reader STOPPED the
+                # turn — they walked away from the reply these were queued behind
+                # — and wrong when the turn FAILED, because then nothing was
+                # declined and the prompt was still wanted. R3-5: this used to
+                # run on every unwind, so an engine error deleted prompts the
+                # user had just been told were "queued behind the running reply".
                 _queued.pop(sid, None)
 
+        # R3-5: the queue was unbounded and in memory only. A client that keeps
+        # typing during a long turn grows the server's memory without limit, and
+        # the prompts are lost on restart. A cap is the honest bound; refusing is
+        # better than accepting a prompt that will never be delivered.
         if message and sid in _streaming:
-            _queued.setdefault(sid, []).append(message)
+            q = _queued.setdefault(sid, [])
+            if len(q) >= _QUEUE_MAX:
+                return JSONResponse(
+                    {"error": f"this chat already has {_QUEUE_MAX} prompts queued "
+                              "behind the running reply — wait for it to finish"},
+                    status_code=429)
+            q.append(message)
 
             async def _ack():
                 yield _sse({"queued": len(_queued[sid]),
@@ -4163,6 +4196,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             stretch of synchronous code: asyncio only switches coroutines at
             an await, so no request can slip in between "queue is empty" and
             "no longer streaming" and have its prompt silently dropped."""
+            _cancelled = False
             try:
                 cur, cont = s, bool(body.get("continue"))
                 while True:
@@ -4173,6 +4207,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # reply the reader then cancelled, and running it now would
                     # answer a question they had already walked away from.
                     if cancel.is_set():
+                        _cancelled = True
                         break
                     pending = _queued.get(sid)
                     if not pending:
@@ -4185,16 +4220,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     yield _sse({"note": "starting the queued prompt"},
                                event="info")
             finally:
-                _release_claim()
+                # R3-5: the queued prompts are discarded ONLY when the reader
+                # stopped the turn. On any other unwind — an engine error, a
+                # cancellation of this task — the prompts were neither delivered
+                # nor declined, so they stay queued and the next turn in this chat
+                # picks them up. Discarding them here is what made an engine error
+                # delete prompts the user had just been told were queued.
+                _release_claim(dropped=_cancelled)
 
         # The background task is the safety net for a body iterator that is
         # cancelled before it ever runs (an immediate client disconnect):
         # without it the claim would leak and every later send would queue
         # forever. `_release_claim` is identity-guarded, so it is a no-op on
-        # the normal path where `_drain`'s finally already released.
+        # the normal path where `_drain`'s finally already released. It drops the
+        # queue because the reader is GONE — there is nobody left to want those
+        # prompts, which is the same reason a stop drops them.
         return StreamingResponse(_drain(), media_type="text/event-stream",
                                  headers=_NO_STORE,
-                                 background=BackgroundTask(_release_claim))
+                                 background=BackgroundTask(_release_claim, True))
 
     @app.post("/api/sessions/{sid}/stop")
     async def stop_chat(sid: str):
