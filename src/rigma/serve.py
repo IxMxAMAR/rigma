@@ -857,6 +857,34 @@ def _workspace_entries(root, cap: int = 200) -> list[dict]:
     found.sort(key=lambda x: (not x["dir"], x["name"].lower()))
     return found[:cap]
 
+
+async def _recall_memories(rows: list, query: str, workspace: str = "") -> list:
+    """Memory recall off the event loop (14-10).
+
+    `memory.retrieve` runs a synchronous embedding forward pass, and on its
+    first call constructs the fastembed model from disk. That is a multi-second
+    stall if it happens on the loop that carries every SSE stream, so it goes to
+    a worker thread.
+    """
+    from . import memory as _mem
+    return await asyncio.to_thread(_mem.retrieve, rows, query,
+                                   workspace=workspace)
+
+
+async def _warm_memory_embedder() -> None:
+    """Load the optional embedding model once, on a worker thread, at startup.
+
+    Otherwise the first per-step recall of a run pays the model load inside a
+    turn. Best-effort: fastembed is optional and its absence is a supported
+    (lexical-only) mode, so a failure here changes nothing.
+    """
+    try:
+        from . import memory as _mem
+        await asyncio.to_thread(_mem.get_embedder)
+    except Exception:
+        _log.exception("memory: embedder warm-up failed")
+
+
 def _round_cap(session: dict) -> int:
     """Per-turn tool-round budget. The session default became 1000 (a
     runaway backstop, not a leash) but the old inline clamp still cut it to
@@ -1075,6 +1103,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         RUNS, and lifespan runs long after build_app has returned, so they are
         all bound by then."""
         await _reconcile_orphaned_runs()
+        if os.environ.get("RIGMA_MEMORY") != "0":
+            # 14-10: the embedding model load must never land inside a turn
+            await _warm_memory_embedder()
         keepalive = _start_keepalive()
         try:
             yield
@@ -4202,10 +4233,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         pend = _runs.pending_tasks(run_id)
                         cur_step = str(pend[0]["id"]) if pend else ""
                         if cur_step and cur_step != run.get("_mem_step"):
-                            from . import memory as _mem
-                            hits = _mem.retrieve(
+                            # 14-10: the embedding inference runs in a worker
+                            hits = await _recall_memories(
                                 _memory_store().all(), pend[0].get("text", ""),
-                                workspace=run.get("workspace", ""))
+                                run.get("workspace", ""))
                             run["_mem_step"] = cur_step
                             if hits:
                                 driving += ("\n### NOTES (from earlier runs)\n"
