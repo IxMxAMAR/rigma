@@ -3,6 +3,7 @@ MCP server (a python one-liner file), plus gating and failure modes."""
 import json
 import sys
 import textwrap
+import types
 
 import pytest
 
@@ -157,6 +158,55 @@ def test_malformed_name_and_missing_server(tmp_path):
     _write_config(tmp_path, _fake_server_config(tmp_path))
     assert tools.run_tool("mcp__nosuchserver__t", {},
                           {"allow_code": True}).startswith("error")
+
+
+# --- 09-2/09-3/09-8: a JSON value that is not an object is not a mapping ------
+
+class _Lines:
+    """A fake stdout: bounded readline, and iteration for the pre-fix path."""
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def readline(self, *a):
+        return self._lines.pop(0) if self._lines else ""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._lines:
+            raise StopIteration
+        return self._lines.pop(0)
+
+
+def test_a_non_object_json_line_does_not_kill_the_reader():
+    """json.loads may return a list, string, number or null, and `.get` then
+    raises inside `_reader`'s try — which ends the reader for good and makes
+    _ensure() tear down EVERY configured server (09-2)."""
+    srv = mcp_client.McpServer("s", {"command": "x"})
+    srv.proc = types.SimpleNamespace(
+        stdout=_Lines(['[1, 2]\n', '123\n', '"hello"\n', 'null\n',
+                       '{"jsonrpc": "2.0", "id": 1, "result": {}}\n']))
+    srv._reader()
+    assert srv.reader_error == ""
+
+
+def test_an_unhashable_jsonrpc_id_is_skipped_not_fatal():
+    """`{"id": [1]}` fails the same way via `self._replies.get([1])` → TypeError
+    (09-2)."""
+    srv = mcp_client.McpServer("s", {"command": "x"})
+    srv._handle_line('{"jsonrpc": "2.0", "id": [1], "result": {}}')
+    assert srv.reader_error == ""
+
+
+def test_a_non_object_mcp_json_reads_as_empty(tmp_path):
+    """A user edits ~/.rigma/mcp.json into a JSON array; `raw.get` then raised
+    AttributeError, which is not in the caught tuple, so every MCP tool vanished
+    and /api/mcp answered the Python error text (09-8)."""
+    (tmp_path / "mcp.json").write_text("[]", encoding="utf-8")
+    assert mcp_client.load_config() == {}
+    (tmp_path / "mcp.json").write_text("null", encoding="utf-8")
+    assert mcp_client.load_config() == {}
 
 
 # --- F54: shutdown must actually end the server -------------------------------
