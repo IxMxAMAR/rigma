@@ -111,6 +111,12 @@ _VERIFIED: dict = {}
 # bounds the RUN; this bounds the PROCESS, so a wedged child cannot outlive the
 # turn it belongs to.
 _KILL_GRACE = 30.0
+# One JSON event is one line, and mcode puts tool results inside those lines.
+# `for line in proc.stdout` held one whole line in memory before parsing and
+# json.loads then made a second copy, in the process that also holds every chat
+# session. The MCP client got this bound after AUDIT F55; mcode's stdout and
+# stderr need the same one (09-4).
+_FRAME_MAX = 4_000_000
 # mcode's documented exit codes. The number alone sends a reader to look it up;
 # the number AND the meaning makes a transcript self-explaining.
 _EXIT_MEANING = {
@@ -601,6 +607,34 @@ def _remember(state: dict | None, obj: dict, *, resumed: bool) -> None:
     state["resumed"] = resumed
 
 
+def _bounded_lines(stream):
+    """Yield `(line, oversize)` from `stream` with a HARD per-line bound.
+
+    `for line in stream` holds one whole line in memory before yielding it, and
+    a JSON parse makes a second copy of it. An oversize frame is skipped with
+    `oversize=True` after draining past its newline, so framing stays in sync;
+    an unterminated one ends the stream rather than spinning the drain (09-4).
+    """
+    while True:
+        line = stream.readline(_FRAME_MAX + 1)
+        if not line:
+            return
+        if "\n" in line or len(line) <= _FRAME_MAX:
+            yield line, False
+            continue
+        found = False
+        for _ in range(4):
+            tail = stream.readline(_FRAME_MAX + 1)
+            if not tail:
+                break
+            if "\n" in tail:
+                found = True
+                break
+        yield "", True
+        if not found:
+            return
+
+
 def drive_turn(*, base_url: str, model: str, prompt: str,
                system_prompt: str = "", session_id: str = "", cwd: str = "",
                max_tokens: int = 4096, context_window: int = 32768,
@@ -679,8 +713,12 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
 
     def _drain() -> None:
         """Keep mcode's stderr from filling its pipe and blocking the child.
-        The tail is only read if the turn dies without saying why."""
-        for ln in proc.stderr:
+        The tail is only read if the turn dies without saying why. The deque
+        bounds the COUNT; the line length is bounded here too (09-4)."""
+        for ln, oversize in _bounded_lines(proc.stderr):
+            if oversize:
+                err_lines.append("(stderr line over the frame bound, skipped)")
+                continue
             err_lines.append(ln.rstrip())
 
     drain = threading.Thread(target=_drain, daemon=True)
@@ -722,7 +760,12 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     said = False
     final_status = ""
     try:
-        for line in proc.stdout:
+        for line, oversize in _bounded_lines(proc.stdout):
+            if oversize:
+                yield TurnEvent("notice", text=(
+                    f"mcode emitted a frame over {_FRAME_MAX} characters "
+                    "and it was skipped"))
+                continue
             line = line.strip()
             if not line:
                 continue
