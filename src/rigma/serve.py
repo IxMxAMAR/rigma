@@ -36,6 +36,12 @@ _FALLBACK_HTML = "<!doctype html><html><body><h1>Rigma</h1></body></html>"
 _HOP_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}
 _NO_STORE = {"Cache-Control": "no-store"}
 
+# IMP-12: the backup document's schema version. Bump it whenever the shape of
+# /api/backup changes, and restore refuses anything it does not recognise —
+# applying an unknown version's fields "best effort" is how a restore silently
+# half-works and the user loses the data they were trying to recover.
+BACKUP_VERSION = 1
+
 # --- who is allowed to talk to this server (AUDIT F39) -----------------------
 # docs/audit-2026-09-04-full.md. rigma binds 127.0.0.1 and has no auth — a
 # documented decision, made when the surface was a chat proxy. It is now ~79
@@ -5218,6 +5224,88 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                  "(use DELETE /api/memory/{id} for one)"}, status_code=400)
         gone = await asyncio.to_thread(_memory_store().delete_many, ids)
         return {"removed": gone, "remaining": len(_memory_store().all())}
+
+    @app.get("/api/backup")
+    async def get_backup():
+        """Settings + methods + memory as ONE versioned JSON document.
+
+        IMP-12: moving to a new machine, or recovering from a bad experiment,
+        used to mean copying several files by hand and knowing where they live.
+        `vec` is stripped from memory rows — it is derived from the text (768
+        floats per row) and retrieval falls back to lexical matching without
+        it, so including it would bloat the file for nothing.
+        """
+        from . import __version__, app_settings
+        from . import methods as _methods
+        rows = _memory_store().all()
+        for m in rows:
+            m.pop("vec", None)
+        return {"rigma_backup": BACKUP_VERSION,
+                "app_version": __version__,
+                "created_at": _now(),
+                "settings": app_settings.load(),
+                "methods": _methods.user_methods(),
+                "memory": rows}
+
+    @app.post("/api/restore")
+    async def post_restore(body: dict | None = None):
+        """Validate a backup document and apply it. Nothing is written until
+        the WHOLE document has passed, and an unknown version is refused
+        outright rather than half-applied."""
+        from . import app_settings
+        from . import memory as _mem
+        from . import methods as _methods
+        doc = body if isinstance(body, dict) else {}
+        got = doc.get("rigma_backup")
+        if got != BACKUP_VERSION:
+            return JSONResponse(
+                {"error": f"unknown backup version {got!r}; this build "
+                          f"restores version {BACKUP_VERSION}"},
+                status_code=400)
+
+        # --- validate EVERYTHING before writing ANYTHING ---
+        patch = doc.get("settings") or {}
+        if not isinstance(patch, dict):
+            return JSONResponse({"error": "settings: must be an object"},
+                                status_code=400)
+        if patch:
+            _, err = app_settings.validate(patch)
+            if err:
+                return JSONResponse({"error": err}, status_code=400)
+        docs = doc.get("methods") or []
+        if not isinstance(docs, list):
+            return JSONResponse({"error": "methods: must be a list"},
+                                status_code=400)
+        normalized = []
+        for i, m in enumerate(docs):
+            full, errs = _methods.validate_user(
+                m if isinstance(m, dict) else {})
+            if errs:
+                return JSONResponse(
+                    {"error": f"method {i}: " + "; ".join(errs)},
+                    status_code=400)
+            normalized.append(full)
+        try:
+            rows = _mem.clean_rows(doc.get("memory") or [])
+        except ValueError as e:
+            return JSONResponse({"error": f"memory: {e}"}, status_code=400)
+
+        # --- apply ---
+        if patch:
+            await asyncio.to_thread(app_settings.save, patch)
+        for full in normalized:
+            _, errs = await asyncio.to_thread(_methods.save_user, full)
+            if errs:      # validated above, so this is a disk/permission fault
+                return JSONResponse(
+                    {"error": f"could not write method {full.get('id')}: "
+                              + "; ".join(errs)}, status_code=500)
+        store = _memory_store()
+        before = len(store.all())
+        after = await asyncio.to_thread(store.restore, rows)
+        return {"restored": True, "version": BACKUP_VERSION,
+                "methods": len(normalized),
+                "memory": {"before": before, "after": after},
+                "settings": app_settings.load()}
 
     @app.get("/api/runs/active")
     async def active_run():

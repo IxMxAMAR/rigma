@@ -239,6 +239,26 @@ class _FileLock:
         self.release()
 
 
+def clean_rows(rows) -> list[dict]:
+    """Validate memory rows from a backup document. Pure: raises, never writes.
+
+    A restore must check the WHOLE document before applying any of it, or a
+    corrupt tail leaves the store half-replaced — and the store is the only
+    copy of months of learned rules. IMP-12.
+    """
+    clean: list[dict] = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            raise ValueError("memory rows must be JSON objects")
+        mid = str(r.get("id") or "").strip()
+        kind = str(r.get("kind") or "").strip()
+        text = str(r.get("text") or "").strip()
+        if not (mid and kind and text):
+            raise ValueError("a memory row needs a non-empty id, kind and text")
+        clean.append({**r, "id": mid, "kind": kind, "text": text})
+    return clean
+
+
 class MemoryStore:
     """Append-only JSONL. One memory per line."""
 
@@ -468,6 +488,18 @@ class MemoryStore:
             if gone:
                 self._write_all(keep)
             return gone
+
+    def restore(self, rows) -> int:
+        """Replace the store with `rows` (a backup). Returns the row count.
+
+        Validated in full BEFORE anything is written: a backup that is corrupt
+        half-way through must leave the existing memories untouched, because
+        the store is the only copy of months of learned rules. IMP-12.
+        """
+        clean = clean_rows(rows)
+        with self._xlock():
+            self._write_all(clean)
+        return len(clean)
 
 
 # --- embeddings (optional, never load-bearing) -------------------------------
