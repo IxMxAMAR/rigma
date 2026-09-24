@@ -69,3 +69,26 @@ def test_ci_bundle_staleness_check_counts_untracked_output():
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "git status --porcelain" in ci
     assert "git diff --quiet -- src/rigma/data/ui_v2" not in ci
+
+
+def test_publish_is_gated_on_tests_and_a_matching_tag():
+    """A GitHub Release can be published from any commit, and `release:
+    published` fires without waiting for CI, so without this gate the wheel
+    reaches PyPI having never run pytest (AUDIT 12-6)."""
+    import yaml
+    text = (ROOT / ".github" / "workflows" / "publish.yml").read_text(
+        encoding="utf-8")
+    jobs = yaml.safe_load(text)["jobs"]
+    seen, frontier, runs_pytest = set(), ["publish"], False
+    while frontier:
+        name = frontier.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        job = jobs.get(name) or {}
+        if any("pytest" in str(s.get("run", "")) for s in job.get("steps", [])):
+            runs_pytest = True
+        needs = job.get("needs", [])
+        frontier.extend([needs] if isinstance(needs, str) else needs)
+    assert runs_pytest, "publish does not depend on any job that runs pytest"
+    assert "github.event.release.tag_name" in text
