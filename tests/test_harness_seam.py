@@ -621,7 +621,12 @@ def test_the_conformance_command_says_drift_out_loud(monkeypatch):
     monkeypatch.setitem(harness.BACKENDS, "mcode", dataclasses.replace(
         harness.BACKENDS["mcode"], verified="0.5.1", probe=lambda: True))
     r = CliRunner().invoke(app, ["harness", "-b", "mcode"])
-    assert r.exit_code == 0, r.output
+    assert "DRIFTED" in r.output, r.output
+    # Drift is the one thing this command exists to surface, so it is a
+    # NON-ZERO exit: `rigma harness && ...` was a green light on a backend
+    # whose event schema nobody had checked. (An UNVERIFIED backend stays 0 —
+    # nobody can say anything changed.)
+    assert r.exit_code == 1, r.output
     assert "DRIFTED" in r.output
     assert "0.5.1" in r.output and "0.6.0" in r.output
 
