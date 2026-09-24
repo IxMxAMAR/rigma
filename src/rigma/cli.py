@@ -83,6 +83,65 @@ run_app = typer.Typer(no_args_is_help=True)
 app.add_typer(run_app, name="run",
               help="Autonomous long-running jobs (give it a mission, walk away).")
 
+session_app = typer.Typer(no_args_is_help=True)
+app.add_typer(session_app, name="session",
+              help="Inspect a chat and change what it may do.")
+
+
+@session_app.command("list")
+def session_list(limit: int = typer.Option(20, "--limit",
+                                           help="how many chats to show")):
+    """Recent chats, with whether each one may run shell commands and code."""
+    from . import sessions
+    for s in sessions.list_sessions()[:max(1, int(limit))]:
+        full = sessions.load(s["id"]) or {}
+        flag = "exec" if full.get("confirm_exec") else "    "
+        typer.echo(f"{s['id']}  {flag}  {str(s.get('title') or '')[:60]}")
+
+
+@session_app.command("exec")
+def session_exec(
+    session_id: str = typer.Argument(..., help="chat id (see: rigma session list)"),
+    on: bool = typer.Option(False, "--on", help="allow shell/code in this chat"),
+    off: bool = typer.Option(False, "--off",
+                             help="revoke it (the default, and the safe one)"),
+):
+    """Show or change whether one chat may run shell commands and code.
+
+    AUDIT 13-3 made spawning a process its OWN grant: `allow_code` alone no
+    longer runs anything, because the destructive-command regex is only an
+    advisory text check and a wrapper can decode past it. The product default
+    is OFF, so this command is the way to grant it from the CLI. The UI toggle
+    is a separate frontend change.
+    """
+    from . import sessions
+    if on and off:
+        typer.echo("pick one of --on / --off")
+        raise typer.Exit(1)
+    s = sessions.load(session_id)
+    if s is None:
+        typer.echo(f"no such session: {session_id}")
+        raise typer.Exit(1)
+    if not on and not off:
+        typer.echo(f"{session_id}: execution is "
+                   f"{'granted' if s.get('confirm_exec') else 'off'}")
+        return
+    want = bool(on)
+    if bool(s.get("confirm_exec")) == want:
+        typer.echo(f"{session_id}: execution is already "
+                   f"{'granted' if want else 'off'}")
+        return
+    s["confirm_exec"] = want
+    try:
+        sessions.save(s, base_rev=s.get(sessions.REV_KEY))
+    except sessions.StaleWriteError:
+        # Another writer (the browser, or a turn in flight) moved the row on.
+        # Writing the stale snapshot anyway would drop their change.
+        typer.echo("the session changed while this ran — nothing was written; "
+                   "try again")
+        raise typer.Exit(1) from None
+    typer.echo(f"{session_id}: execution {'granted' if want else 'revoked'}")
+
 
 def _run_server_base() -> str:
     from . import state as st
