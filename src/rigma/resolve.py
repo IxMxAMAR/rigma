@@ -364,6 +364,12 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         return ComboFlags(ctx=ctx, ngl=n_gpu, cache_type_k=k, cache_type_v=v)
     if strict and file_mb + mm_mb + kv_mb > usable_vram:
         return None                # ditto for MoE expert offload
+    # AUDIT F06-1: a MoE header that omits block_count reports n_layers = 0, and
+    # this divide ran before the `if need_off` test, so even a fully-resident
+    # model raised ZeroDivisionError out of resolve(). The dense branch above
+    # guards the same case; without a layer count there is nothing to place.
+    if spec.n_layers <= 0:
+        return None
     expert_mb = file_mb * spec.moe.expert_weight_fraction
     per_layer = expert_mb / spec.n_layers
     need_off = max(0.0, file_mb + mm_mb + kv_mb - usable_vram)
