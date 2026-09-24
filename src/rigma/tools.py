@@ -294,10 +294,16 @@ _REACT_CALL = re.compile(
 # Tool-call envelope tags a model wraps a REAL call in. They are call syntax,
 # not prose, so the whole-reply tests below may look through them (AUDIT 04-8).
 _TOOL_WRAPPER = re.compile(r"</?tool_calls?>|<\|tool_call\|>", re.I)
-# A ReAct reply opens with a Thought line; anything else before "Action:" is
+# A ReAct reply opens with a Thought LINE; anything else before "Action:" is
 # prose ABOUT a call, which is the difference the rescue must respect (05-2).
+#
+# AUDIT R3-5: this used to be `^(?:\s*(?:Thought|…)\s*:.*)?\s*$` with `re.S`, so
+# the `.*` swallowed newlines and ANY reply that merely started with "Thought:"
+# matched however much explanatory prose followed — the whole-reply test was
+# vacuous for exactly the shape it was added to stop. `[^\n]*` keeps it one
+# line, which is what the docstring always claimed.
 _REACT_PREFIX = re.compile(
-    r"^(?:\s*(?:Thought|Thinking|Reasoning)\s*:.*)?\s*$", re.I | re.S)
+    r"^(?:[ \t]*(?:Thought|Thinking|Reasoning)[ \t]*:[^\n]*)?[ \t\n]*$", re.I)
 
 
 def _is_only_call_syntax(text: str) -> bool:
