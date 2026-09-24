@@ -5077,21 +5077,61 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return out
 
     @app.get("/api/memory")
-    async def memory_list():
-        """The memory trust surface: every learned rule, inspectable."""
+    async def memory_list(kind: str = ""):
+        """The memory trust surface: every learned rule, inspectable.
+
+        `kind` filters server-side so a UI tab does not have to know the
+        kinds; the sort (most proven first) is the same order the store
+        injects, so the top of the list is what the model is being told.
+        """
         rows = _memory_store().all()
+        if kind:
+            rows = [m for m in rows if m.get("kind") == kind]
         rows.sort(key=lambda m: (m.get("outcome_score", 0),
                                  m.get("seen_count", 0)), reverse=True)
         for m in rows:
             m.pop("vec", None)          # 768 floats of noise for a UI
         return rows
 
+    @app.patch("/api/memory/{mid}")
+    async def memory_edit(mid: str, body: dict | None = None):
+        """Correct one learned rule. The store takes its lock for the whole
+        read-modify-write, so an edit cannot lose a concurrent score."""
+        store = _memory_store()
+        fields = {k: v for k, v in (body or {}).items()
+                  if k in store.EDITABLE}
+        if not fields:
+            return JSONResponse(
+                {"error": "nothing to change — send one of: "
+                 + ", ".join(store.EDITABLE)}, status_code=400)
+        try:
+            row = await asyncio.to_thread(store.update, mid, **fields)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        if row is None:
+            return JSONResponse({"error": "no such memory"}, status_code=404)
+        row = dict(row)
+        row.pop("vec", None)
+        return row
+
     @app.delete("/api/memory/{mid}")
     async def memory_forget(mid: str):
-        store = _memory_store()
-        rows = [r for r in store.all() if r.get("id") != mid]
-        store._write_all(rows)
-        return {"remaining": len(rows)}
+        gone = await asyncio.to_thread(_memory_store().delete, mid)
+        if not gone:
+            return JSONResponse({"error": "no such memory"}, status_code=404)
+        return {"remaining": len(_memory_store().all())}
+
+    @app.delete("/api/memory")
+    async def memory_prune(body: dict | None = None):
+        """Forget a selection. `ids` is required and must be non-empty: a
+        prune that lost its list must not empty the store."""
+        ids = [str(i) for i in ((body or {}).get("ids") or []) if str(i)]
+        if not ids:
+            return JSONResponse(
+                {"error": "ids: a non-empty list of memory ids is required "
+                 "(use DELETE /api/memory/{id} for one)"}, status_code=400)
+        gone = await asyncio.to_thread(_memory_store().delete_many, ids)
+        return {"removed": gone, "remaining": len(_memory_store().all())}
 
     @app.get("/api/runs/active")
     async def active_run():

@@ -143,6 +143,49 @@ def session_exec(
     typer.echo(f"{session_id}: execution {'granted' if want else 'revoked'}")
 
 
+memory_app = typer.Typer(no_args_is_help=True)
+app.add_typer(memory_app, name="memory",
+              help="See, correct and forget what Rigma learned.")
+
+
+@memory_app.command("list")
+def memory_list(kind: str = typer.Option("", "--kind",
+                                         help="only this kind of memory"),
+                limit: int = typer.Option(50, "--limit")):
+    """Every learned rule, most proven first (the order it is injected in)."""
+    from .memory import MemoryStore
+    from .runtime import rigma_home
+    store = MemoryStore(rigma_home() / "memory" / "memories.jsonl")
+    rows = store.all()
+    if kind:
+        rows = [m for m in rows if m.get("kind") == kind]
+    rows.sort(key=lambda m: (m.get("outcome_score", 0),
+                             m.get("seen_count", 0)), reverse=True)
+    if not rows:
+        typer.echo("no memories yet"
+                   + (f" of kind {kind}" if kind else ""))
+        return
+    for m in rows[:max(1, int(limit))]:
+        typer.echo(f"{str(m.get('id', '?')):<12} {str(m.get('kind', '')):<9} "
+                   f"score {int(m.get('outcome_score', 0)):>3} "
+                   f"seen {int(m.get('seen_count', 0)):>3}  "
+                   f"{str(m.get('text', ''))[:80]}")
+
+
+@memory_app.command("forget")
+def memory_forget(
+    memory_id: str = typer.Argument(..., help="id (see: rigma memory list)"),
+):
+    """Delete one learned rule. Takes the store's lock, like every writer."""
+    from .memory import MemoryStore
+    from .runtime import rigma_home
+    store = MemoryStore(rigma_home() / "memory" / "memories.jsonl")
+    if not store.delete(memory_id):
+        typer.echo(f"no such memory: {memory_id}")
+        raise typer.Exit(1)
+    typer.echo(f"forgot {memory_id} ({len(store.all())} left)")
+
+
 def _run_server_base() -> str:
     from . import state as st
     s = st.read_state()
