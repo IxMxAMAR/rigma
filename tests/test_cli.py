@@ -129,3 +129,41 @@ def test_unknown_model_clean_cli_error(tmp_path, monkeypatch):
     assert res.exit_code == 1 and "rigma update" in res.output
     res = runner.invoke(cli.app, ["up", "--model", "not-a-model", "--dry-run"])
     assert res.exit_code == 1 and "rigma update" in res.output
+
+
+def _running_state(tmp_path, monkeypatch):
+    import os
+    from rigma import state as st
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    st.write_state("m", "q", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+
+
+def test_bench_reports_a_dead_engine_without_a_traceback(tmp_path, monkeypatch):
+    """AUDIT F08-8: a refused connection escaped as a raw httpx traceback."""
+    import httpx
+    _running_state(tmp_path, monkeypatch)
+
+    def boom(*a, **k):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "post", boom)
+    res = runner.invoke(cli.app, ["bench"])
+    assert res.exit_code == 1 and "benchmark failed" in res.output
+
+
+def test_bench_reports_a_no_timings_engine_cleanly(tmp_path, monkeypatch):
+    """The RuntimeError 08-7 raises must not become a new traceback either."""
+    import httpx
+    _running_state(tmp_path, monkeypatch)
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": []}
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
+    res = runner.invoke(cli.app, ["bench"])
+    assert res.exit_code == 1 and "benchmark failed" in res.output
+    assert "timings" in res.output
