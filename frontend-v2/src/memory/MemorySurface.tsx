@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import EmptyState from "../EmptyState";
+import InlineError from "../InlineError";
 import LoadError from "../LoadError";
 import { responseError } from "../lib/listFetch";
 
@@ -20,7 +21,11 @@ interface MemoryRow {
 
 export default function MemorySurface() {
   const [rows, setRows] = useState<MemoryRow[] | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  // A refused forget is not a failed load: keeping one `err` for both made a
+  // refused delete render as "could not load memory" with a retry that would
+  // not help (the list was fine). Two slots, like the other surfaces.
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [rowErr, setRowErr] = useState<string | null>(null);
   const refresh = useCallback(async () => {
     // guard r.ok AND the shape: a server started before this endpoint existed
     // 404s, and treating {error} as rows rendered pure darkness (owner report
@@ -30,16 +35,16 @@ export default function MemorySurface() {
       const r = await fetch("/api/memory");
       const d: unknown = await r.json();
       if (!r.ok || !Array.isArray(d)) {
-        setErr(r.status === 404
+        setLoadErr(r.status === 404
           ? "This server predates the memory API - restart Rigma to enable it."
           : `memory API: ${(d as { error?: string })?.error ?? r.status}`);
         setRows([]);
         return;
       }
-      setErr(null);
+      setLoadErr(null);
       setRows(d as MemoryRow[]);
     } catch (e) {
-      setErr((e as Error).message);
+      setLoadErr((e as Error).message);
       setRows([]);
     }
   }, []);
@@ -59,13 +64,14 @@ export default function MemorySurface() {
           still on probation. Deleting is safe — a useful rule will be
           re-learned.
         </p>
-        {err && (
-          <LoadError message={err} onRetry={() => void refresh()} />
+        {loadErr && (
+          <LoadError message={loadErr} onRetry={() => void refresh()} />
         )}
+        {rowErr && <InlineError message={rowErr} />}
         {/* IMP-10: the empty state means the fetch SUCCEEDED and returned
             nothing. A failed fetch renders the error above instead — it must
             never read as "nothing learned yet". */}
-        {!err && rows.length === 0 && (
+        {!loadErr && rows.length === 0 && (
           <EmptyState
             title="nothing learned yet"
             body="Memories are written when autonomous runs fail and recover. Run a mission and check back."
@@ -93,7 +99,7 @@ export default function MemorySurface() {
                   className="shrink-0 rounded-md px-2 py-1 text-[13px] text-muted hover:text-red hover:bg-surface"
                   aria-label={`forget: ${m.text}`}
                   onClick={async () => {
-                    setErr(null);
+                    setRowErr(null);
                     // AUDIT F11-4: this ignored r.ok and refreshed, so a refused
                     // forget looked exactly like one that worked — the rule just
                     // stayed put with no reason.
@@ -101,7 +107,7 @@ export default function MemorySurface() {
                       `/api/memory/${encodeURIComponent(m.id)}`,
                       { method: "DELETE" });
                     if (!r.ok) {
-                      setErr(await responseError(r));
+                      setRowErr(await responseError(r));
                       return;
                     }
                     void refresh();
