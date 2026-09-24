@@ -723,22 +723,36 @@ function HfSearch({ onAdded, cfg }: { onAdded: () => void; cfg: FitConfig }) {
   const [addErr, setAddErr] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
   const timer = useRef<number | null>(null);
+  // AUDIT F11-9: clearing the box cancelled only the PENDING timer. A request
+  // already in flight still resolved and called setHits, so repos appeared under
+  // an empty search field — and `q.trim() === ""` suppressed the "no match"
+  // line, so nothing contradicted them. Typing fast had the same race. Every
+  // request carries a sequence number and only the latest may write.
+  const seq = useRef(0);
 
   const search = (text: string) => {
     setQ(text);
     if (timer.current) window.clearTimeout(timer.current);
-    if (!text.trim()) { setHits([]); return; }
+    const mine = ++seq.current;
+    if (!text.trim()) { setHits([]); setState("idle"); return; }
     timer.current = window.setTimeout(async () => {
       setState("busy");
       try {
         const d = await engineApi.hfSearch(text);
+        if (mine !== seq.current) return;   // a newer query owns the box now
         // AUDIT F11-3: a non-array body would reach hits.slice() in render
         if (!Array.isArray(d)) { setHits([]); setState("err"); return; }
         setHits(d);
         setState("idle");
-      } catch { setState("err"); }
+      } catch { if (mine === seq.current) setState("err"); }
     }, 350);
   };
+
+  // A pending debounce and an in-flight response must not outlive the panel.
+  useEffect(() => () => {
+    if (timer.current) window.clearTimeout(timer.current);
+    seq.current++;
+  }, []);
 
   return (
     <section className="rounded-lg bg-panel p-4">
