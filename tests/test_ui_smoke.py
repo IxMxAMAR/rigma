@@ -80,23 +80,25 @@ def test_v2_ui_is_served(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     c = TestClient(build_app(upstream_port=1))
     r = c.get("/v2")
-    assert r.status_code in (200, 503)
-    if r.status_code == 200:                    # dist committed
-        assert "<div id=\"root\">" in r.text
-        import re
-        m = re.search(r'assets/(index-[\w-]+\.js)', r.text)
-        assert m, "index.html must reference the hashed bundle"
-        a = c.get(f"/v2/assets/{m.group(1)}")
-        assert a.status_code == 200
-        assert "immutable" in a.headers.get("cache-control", "")
+    # AUDIT F12-2: 503 used to be accepted here, with every real assertion behind
+    # `if r.status_code == 200`. The dist is committed (src/rigma/data/ui_v2, 3
+    # tracked files) and the wheel ships it, so a /v2 serving regression — the
+    # built folder going missing or the route breaking — shipped green.
+    assert r.status_code == 200
+    assert "<div id=\"root\">" in r.text
+    import re
+    m = re.search(r'assets/(index-[\w-]+\.js)', r.text)
+    assert m, "index.html must reference the hashed bundle"
+    a = c.get(f"/v2/assets/{m.group(1)}")
+    assert a.status_code == 200
+    assert "immutable" in a.headers.get("cache-control", "")
     # traversal dies
     assert c.get("/v2/assets/..%2f..%2fserve.py").status_code == 404
     # / serves v2 when the dist exists (owner cutover call 2026-07-21);
     # the complete legacy UI lives on at /rizz until parity
     root = c.get("/")
     assert root.status_code == 200
-    if r.status_code == 200:
-        assert 'id="root"' in root.text        # v2 shell
+    assert 'id="root"' in root.text            # v2 shell
     rizz = c.get("/rizz")
     assert rizz.status_code == 200
     assert "docs-panel" in rizz.text           # the full legacy app
