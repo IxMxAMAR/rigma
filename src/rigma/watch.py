@@ -75,7 +75,31 @@ POLL_SECS = 1.5
 STAT_SETTLE_NS = 2_000_000_000
 
 
-def _iter_files(root: Path):
+def is_reparse_dir(p) -> bool:
+    """True for a directory that is a link of ANY kind — symlink OR junction.
+
+    AUDIT R3-1: `os.walk(followlinks=False)` and `Path.is_symlink()` only
+    recognise a NAME-SURROGATE reparse point (a real symlink). A Windows
+    JUNCTION is a MOUNT-POINT reparse point, so `is_symlink()` is False for it
+    and `os.walk` descends into it — which is how `find_files`, `grep` and this
+    watcher read files outside the workspace through one. Junctions need no
+    privilege (`mklink /J`), unlike symlinks, so this is the reachable form.
+    Files are deliberately NOT covered: a non-symlink reparse-point FILE is a
+    cloud placeholder (OneDrive), which is ordinary user content, not a link.
+    """
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    return bool(getattr(st, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _iter_files(root: Path, state: dict | None = None):
     """`(path, stat)` for candidate files under `root`, pruned and capped.
 
     Pruning happens on `dirnames` in place, which is what stops `os.walk` from
@@ -83,10 +107,15 @@ def _iter_files(root: Path):
     The stat comes from the same call that decides the file is in scope, so the
     caller never pays a second one: `poll_once` compares `(mtime, size)` and
     skips the read entirely when neither moved.
+
+    `state["truncated"]` is set when the MAX_FILES cap ended the walk early, so
+    a caller that evicts what it did not see knows not to (AUDIT R3-6).
     """
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        dirnames[:] = [d for d in dirnames
+                       if d not in IGNORE_DIRS
+                       and not is_reparse_dir(Path(dirpath) / d)]
         for name in filenames:
             p = Path(dirpath) / name
             try:
@@ -98,6 +127,8 @@ def _iter_files(root: Path):
             yield p, st
             seen += 1
             if seen >= MAX_FILES:
+                if state is not None:
+                    state["truncated"] = True
                 return
 
 
@@ -165,8 +196,11 @@ class Watcher:
         byte-compared every file every 1.5 s (19.7 GB/h on a 2000-file tree).
         """
         changed: list[str] = []
-        for p, st in _iter_files(self.root):
+        seen_keys: set[str] = set()
+        state: dict = {}
+        for p, st in _iter_files(self.root, state):
             key = str(p)
+            seen_keys.add(key)
             mtime, size = st.st_mtime_ns, st.st_size
             with self._lock:
                 prev = self._stats.get(key)
@@ -208,7 +242,26 @@ class Watcher:
                     # advancing the baseline here would make the change
                     # permanently un-undoable.
                     self._stats.pop(key, None)
+        if not state.get("truncated"):
+            self._forget_unseen(seen_keys)
         return changed
+
+    def _forget_unseen(self, seen: set) -> None:
+        """Drop the entries for files that are no longer there (AUDIT R3-6).
+
+        `_bytes` is only ever decremented when the SAME key is re-remembered, so
+        a deleted file held its entry — and its bytes — forever: the budget
+        filled with garbage and `_remember` then refused every NEW file, which
+        is a watcher that looks alive and records nothing. The key count was
+        unbounded too, because a 0-byte file costs nothing against the budget.
+        Called only after a walk that reached the end of the tree, so a pass
+        stopped by MAX_FILES cannot evict live files it never visited.
+        """
+        with self._lock:
+            for key in [k for k in self._known if k not in seen]:
+                self._bytes -= len(self._known.pop(key))
+            for key in [k for k in self._stats if k not in seen]:
+                self._stats.pop(key, None)
 
     def _remember(self, key: str, data: bytes) -> None:
         prev = self._known.get(key)

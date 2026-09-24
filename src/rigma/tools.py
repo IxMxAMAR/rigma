@@ -294,10 +294,16 @@ _REACT_CALL = re.compile(
 # Tool-call envelope tags a model wraps a REAL call in. They are call syntax,
 # not prose, so the whole-reply tests below may look through them (AUDIT 04-8).
 _TOOL_WRAPPER = re.compile(r"</?tool_calls?>|<\|tool_call\|>", re.I)
-# A ReAct reply opens with a Thought line; anything else before "Action:" is
+# A ReAct reply opens with a Thought LINE; anything else before "Action:" is
 # prose ABOUT a call, which is the difference the rescue must respect (05-2).
+#
+# AUDIT R3-5: this used to be `^(?:\s*(?:Thought|…)\s*:.*)?\s*$` with `re.S`, so
+# the `.*` swallowed newlines and ANY reply that merely started with "Thought:"
+# matched however much explanatory prose followed — the whole-reply test was
+# vacuous for exactly the shape it was added to stop. `[^\n]*` keeps it one
+# line, which is what the docstring always claimed.
 _REACT_PREFIX = re.compile(
-    r"^(?:\s*(?:Thought|Thinking|Reasoning)\s*:.*)?\s*$", re.I | re.S)
+    r"^(?:[ \t]*(?:Thought|Thinking|Reasoning)[ \t]*:[^\n]*)?[ \t\n]*$", re.I)
 
 
 def _is_only_call_syntax(text: str) -> bool:
@@ -596,6 +602,29 @@ def _defuse_control_bytes(text: str) -> str:
                   "file corruption?]", text)
 
 
+# The sentinels a `sentinel=True` tool's result may legitimately START with.
+# Resolved lazily inside the function: DELEGATE_SENTINEL is defined further
+# down the module.
+_SENTINEL_MARKS = (IMAGE_SENTINEL, USE_TOOLS_SENTINEL)
+
+
+def _defuse_sentinel_result(result: str) -> str:
+    """Defuse a sentinel tool's result without corrupting the sentinel itself.
+
+    AUDIT R3-3. The payload after a sentinel is a resolved path list or a
+    json-encoded dict (which escapes control bytes), so it is safe to pass
+    through; everything a handler derived from the model's own input is not.
+    serve.py splits the image payload on the first NUL, so the separator is
+    preserved and only the trailing note is defused.
+    """
+    marks = _SENTINEL_MARKS + (DELEGATE_SENTINEL,)
+    for mark in marks:
+        if result.startswith(mark):
+            payload, sep, tail = result[len(mark):].partition("\x00")
+            return mark + payload + sep + _defuse_control_bytes(tail)
+    return _defuse_control_bytes(result)
+
+
 # Names other harnesses (and models trained on them) use for the SAME argument.
 # Applied per-tool against the tool's own schema, so `content` can mean the new
 # text for edit_file without also being aliased onto a tool that has its own
@@ -738,9 +767,16 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
         # (image injection, delegate routing, tool unlock) that serve.py's loop
         # consumes — never model-facing text. The property is declared at
         # registration, not sniffed from the result: file content can forge a
-        # sentinel and switch a text guard off (AUDIT 04-7). Every other
-        # result, read_file and grep included, is defused unconditionally.
-        return result
+        # sentinel and switch a text guard off (AUDIT 04-7).
+        #
+        # AUDIT R3-3: the property exempted the tool's ORDINARY results too, and
+        # a sentinel tool's error path embeds the model's own argument
+        # (`view_image(path="…\u0000\u0000…")` answers "no such file: …"), so it
+        # became the one way to deliver a raw NUL run — the instant-EOS poison
+        # this function exists to stop. Only a result that really IS a sentinel
+        # is passed around the guard, and even then the human-readable tail
+        # (after the NUL separator serve.py splits on) is defused.
+        return _defuse_sentinel_result(result)
     # defuse at the ONE choke point every tool result passes through, so
     # read_file, grep, run_shell, carriers and persistence all inherit it
     return _defuse_control_bytes(result)
@@ -1333,7 +1369,7 @@ def _numbers_in(name: str) -> list[str]:
     return [d.lstrip("0") or "0" for d in re.findall(r"\d+", name)]
 
 
-def _fuzzy_file(p: Path):
+def _fuzzy_file(p: Path, ctx: dict | None = None):
     """Recover a near-miss filename. Weak models retype paths from memory and
     mangle them — dropping zero padding is the classic one, because digit runs
     tokenize awkwardly (ComfyUI_00428_.png -> Comfy_UI_428.png). The file it
@@ -1345,7 +1381,13 @@ def _fuzzy_file(p: Path):
     replaying recorded runs) — and for an image, silently handing back the wrong
     picture is worse than an error, because the model then describes it
     confidently. Punctuation, spacing and zero padding may differ; the numbers
-    may not."""
+    may not.
+
+    AUDIT R3-2: a candidate the credential denylist refuses is not a candidate.
+    The check in `_read_path`/`_write_path` runs on the name the MODEL gave, and
+    the recovery then substituted the real sibling underneath it — so
+    `read_file('.en')` handed back `.env` (and the note named it). `ctx` is
+    optional so a caller with no context keeps the old behaviour."""
     if p.exists():
         return p, ""
     parent = p.parent
@@ -1359,6 +1401,9 @@ def _fuzzy_file(p: Path):
     want = norm(p.name)
     want_nums = _numbers_in(p.name)
     names = [x.name for x in parent.iterdir() if x.is_file()]
+    if ctx is not None:
+        names = [n for n in names
+                 if not _credential_path_reason(parent / n, ctx)]
     for n in names:                       # exact match ignoring case/pad/punct
         if norm(n) == want:
             return parent / n, f" (you asked for '{p.name}' — used '{n}')"
@@ -1443,10 +1488,16 @@ def _bad_write_char(rel: str):
 
 def _glob_under(root: Path, rel: str) -> list[Path]:
     """Resolve a glob pattern under `root`, but only files, and only inside
-    the workspace (a `..` in the pattern can't escape). Returns real paths."""
+    the workspace (a `..` in the pattern can't escape). Returns real paths.
+
+    AUDIT R3-1: the containment test is on the RESOLVED path, because `glob`
+    hands back names built from `root` — a hit reached through a junction is
+    lexically inside the workspace and physically outside it."""
     try:
+        rroot = root.resolve()
         hits = [p for p in root.glob(rel)
-                if p.is_file() and p.is_relative_to(root)]
+                if p.is_file() and p.is_relative_to(root)
+                and p.resolve().is_relative_to(rroot)]
     except (ValueError, OSError):
         return []
     return sorted(hits)
@@ -1560,13 +1611,14 @@ def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
 
     The one exemption is a run's progress log, which the run loop hands the
     model by name and which lives under Rigma's state dir; refusing it would
-    break the run for no security gain (it is model-written). A workspace that
-    IS (or lives inside) the state dir is also an explicit choice — the default
-    workspace is the home dir, which CONTAINS the state dir, so that case must
-    stay denied."""
+    break the run for no security gain (it is model-written). It exempts the
+    log from the STATE-DIR rule and nothing else — AUDIT R3-8: it used to be
+    tested first, so it also exempted a file of that name from the credential
+    file/directory and browser-profile rules, and `~/.ssh/progress.md` was
+    readable. A workspace that IS (or lives inside) the state dir is also an
+    explicit choice — the default workspace is the home dir, which CONTAINS the
+    state dir, so that case must stay denied."""
     name = p.name.lower()
-    if name in ("progress.md", "progress.txt"):
-        return ""
     for pat in _CREDENTIAL_FILES:
         if fnmatch.fnmatch(name, pat):
             return "that looks like a credential file"
@@ -1579,6 +1631,8 @@ def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
         from .runtime import rigma_home
         home = rigma_home().resolve()
         if p == home or p.is_relative_to(home):
+            if name in ("progress.md", "progress.txt"):
+                return ""
             ws = str((ctx or {}).get("workspace") or "").strip()
             if ws and Path(ws).resolve().is_relative_to(home):
                 return ""
@@ -1806,14 +1860,21 @@ def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict):
     sets `state["truncated"]`. A symlinked file is the one way a name under the
     root can resolve outside it, so only symlinks pay a `resolve()`.
     """
-    from .watch import IGNORE_DIRS
+    from .watch import IGNORE_DIRS, is_reparse_dir
     max_visited = state.get("max_visited")
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         state["visited"] = state.get("visited", 0) + len(dirnames) + len(filenames)
         if max_visited is not None and state["visited"] > max_visited:
             state["truncated"] = True
             return
-        dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIRS)
+        # AUDIT R3-1: `followlinks=False` does not prune a JUNCTION — it is a
+        # mount-point reparse point, so `os.walk` descends into it and every
+        # name under it is outside the workspace while looking inside. This is
+        # the walker `find_files` and `grep` share, so it is the confinement
+        # boundary for both.
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in IGNORE_DIRS
+                             and not is_reparse_dir(Path(dirpath) / d))
         for name in sorted(filenames):
             p = Path(dirpath) / name
             try:
@@ -2034,7 +2095,11 @@ def _newest_undo_key(idx: dict, ctx) -> str | None:
     best, best_ts = None, None
     for key, entry in idx.items():
         try:
-            q = _unlong(Path(key))
+            # AUDIT R3-1: RESOLVE the key, not just un-prefix it. An entry
+            # recorded through a junction (`ws\link\x`, physically outside) is
+            # lexically inside the workspace, so a lexical test accepts it and
+            # the restore then writes outside through the link.
+            q = _unlong(Path(key)).resolve()
             if q != root and not q.is_relative_to(root):
                 continue
         except (OSError, ValueError):
@@ -2530,7 +2595,7 @@ def _read_file(args, ctx):
     p = _read_path(ctx, raw)
     _read_note = ""
     if not p.is_file():
-        fixed, _read_note = _fuzzy_file(p)
+        fixed, _read_note = _fuzzy_file(p, ctx)
         if fixed is not None:
             p = fixed
     if not p.is_file():
@@ -2982,7 +3047,7 @@ def _transfer_sources(args, ctx) -> tuple[list, list, list]:
             errs.append(str(e))
             continue
         if not p.is_file():
-            fixed, note = _fuzzy_file(p)
+            fixed, note = _fuzzy_file(p, ctx)
             if fixed is not None:
                 p = fixed
                 if note:
@@ -3130,10 +3195,18 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
         # names that _fuzzy_file resolves in one step. _fuzzy_file only ever
         # returns a file inside p.parent, so an absolute path stays in its own
         # directory and no confinement is lost.
-        found, note = _fuzzy_file(p)
+        found, note = _fuzzy_file(p, ctx)
         if found is None:
             return None, f"no such file: {ps}" + _candidates(p), ""
         p = found
+    # AUDIT R3-7: this branch never consulted the credential denylist, so an
+    # image inside `.ssh`, a browser profile or Rigma's own state dir was the
+    # one read the 13-2 fix did not cover — the grant is irrelevant to it, and
+    # the two image modes disagreed with `view_images(folder=…)`, which goes
+    # through `_read_path` and refuses.
+    denied = _credential_path_reason(p, ctx)
+    if denied:
+        return None, f"refusing to read {p} — {denied}", ""
     if p.suffix.lower() not in _IMAGE_EXTS:
         return None, f"{p.name} is not an image", ""
     if p.stat().st_size > 20_000_000:
@@ -3702,6 +3775,41 @@ _DELETE_PY = re.compile(
 # separate, explicit per-session confirmation, and the regexes stay as a fast
 # refusal of the obvious literal form (and as a message that says what they
 # are). Tests call `exec_decision` on the TEXT; nothing here executes.
+def _text_refusal(cmd, python_src, prof: str) -> str:
+    """The literal-text refusal for one execution, or "" — the ADVISORY layer.
+
+    ONE copy, shared by `exec_decision` (the gate) and `_run_subprocess` (the
+    last line before a spawn), because two copies of a rule set is how they
+    drift apart.
+
+    AUDIT R3-4: the SHELL text is tested against the PYTHON rules as well.
+    `run_shell` builds `powershell -Command <text>` on win32 and `<text>` is
+    arbitrary, so `python -c "import shutil; shutil.rmtree('/')"` was judged by
+    the cmd/PowerShell wordlist alone — the Python-specific rules
+    (`_BLOCKED_PY`/`_DELETE_PY`, which exist precisely because the shell
+    wordlist false-positives on Python) were bypassed by wrapping the payload in
+    a shell call, and under `no-delete` an ordinary
+    `python -c "import os; os.remove('x')"` passed a profile whose promise is
+    that deletion is disabled. The reverse is NOT done: the shell wordlist
+    matches ordinary Python (`{}`.format, the `del` keyword, `rm` in a string).
+    """
+    if python_src is not None:
+        if _BLOCKED_PY.search(python_src):
+            return ("blocked — that code destroys a drive or shells out to a "
+                    "destructive command; refusing to run it")
+        if prof == "no-delete" and _DELETE_PY.search(python_src):
+            return "blocked — deletion is disabled for this run (no-delete)"
+        return ""
+    text = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+    if _BLOCKED_CMD.search(text) or _BLOCKED_PY.search(text):
+        return ("blocked — that looks like a destructive system command; "
+                "refusing to run it")
+    if prof == "no-delete" and (_DELETE_CMD.search(text)
+                                or _DELETE_PY.search(text)):
+        return "blocked — deletion is disabled for this run (no-delete)"
+    return ""
+
+
 def _exec_confirmed(ctx: dict) -> bool:
     """Whether this session has explicitly confirmed it may spawn processes.
 
@@ -3728,19 +3836,9 @@ def exec_decision(cmd: str, ctx: dict, *, python_src: str | None = None
     prof = ctx.get("profile", "all")
     if prof == "confined":
         return False, "code execution is disabled for this run (confined)"
-    if python_src is not None:
-        if _BLOCKED_PY.search(python_src):
-            return False, ("blocked — that code destroys a drive or shells out "
-                           "to a destructive command; refusing to run it")
-    elif _BLOCKED_CMD.search(cmd):
-        return False, ("blocked — that looks like a destructive system "
-                       "command; refusing to run it")
-    if prof == "no-delete":
-        hit = (_DELETE_PY.search(python_src) if python_src is not None
-               else _DELETE_CMD.search(cmd))
-        if hit:
-            return False, ("blocked — deletion is disabled for this run "
-                           "(no-delete)")
+    why = _text_refusal(cmd, python_src, prof)
+    if why:
+        return False, why
     if not _exec_confirmed(ctx):
         return False, ("running shell commands or code needs explicit "
                        "confirmation for this chat — the destructive-command "
@@ -3842,20 +3940,11 @@ def _read_capped(stream, sink: list, cap: int, overflow: list) -> None:
 
 
 def _run_subprocess(cmd, ctx, shell=False, python_src=None, timeout=30):
-    if python_src is not None:
-        # PYTHON source: never scan it with the shell wordlist (see _BLOCKED_PY)
-        if _BLOCKED_PY.search(python_src):
-            return ("error: blocked — that code destroys a drive or shells out "
-                    "to a destructive command; refusing to run it")
-        if ctx.get("profile") == "no-delete" and _DELETE_PY.search(python_src):
-            return "error: blocked — deletion is disabled for this run (no-delete)"
-    else:
-        text = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
-        if _BLOCKED_CMD.search(text):
-            return ("error: blocked — that looks like a destructive system "
-                    "command; refusing to run it")
-        if ctx.get("profile") == "no-delete" and _DELETE_CMD.search(text):
-            return "error: blocked — deletion is disabled for this run (no-delete)"
+    # The same advisory rules the gate used (AUDIT R3-4: one copy, so the two
+    # can never disagree about what the text says).
+    why = _text_refusal(cmd, python_src, ctx.get("profile", "all"))
+    if why:
+        return f"error: {why}"
     cwd = ctx.get("workspace") or None
     try:
         p = _launch_killable(cmd, shell, cwd)
