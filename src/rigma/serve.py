@@ -1309,7 +1309,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     @app.get("/api/sessions")
     async def list_sessions():
         # file scans block the loop with many/large chats — thread them
-        return await asyncio.to_thread(sessions.list_sessions)
+        rows = await asyncio.to_thread(sessions.list_sessions)
+        # AUDIT 03-5: the run's "🤖 …" chat is not a chat the owner can type
+        # into while the run drives it, so it must not appear as an ordinary
+        # writable row in the rail. Only the ACTIVE run is hidden: once a run
+        # ends its session is history and belongs back in the list.
+        try:
+            from . import runs as _runs
+            a = await asyncio.to_thread(_runs.active)
+            if a and a.get("session_id"):
+                rows = [r for r in rows if r.get("id") != a["session_id"]]
+        except Exception:
+            pass          # the rail must never fail on a run-store hiccup
+        return rows
 
     @app.post("/api/sessions")
     async def create_session(body: dict | None = None):
@@ -3733,6 +3745,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = await asyncio.to_thread(sessions.load, sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
+        # AUDIT 03-5: a session an ACTIVE run is driving is not a normal chat.
+        # A run reaches _llm_turn through _drain_turn directly, so it never
+        # joins `_streaming`; without this guard the owner could type into the
+        # run's chat and two agent loops would share one transcript — the
+        # chat's model fed the run's driving lines, the run's action audit
+        # crediting the chat's tool calls, and the run's unguarded save able to
+        # drop the chat's message.
+        if s.get("run_id"):
+            from . import runs as _runs
+            _r = await asyncio.to_thread(_runs.load, str(s["run_id"]))
+            if _r is not None and _r.get("status") in ("running", "paused"):
+                return JSONResponse(
+                    {"error": "this chat is being driven by an autonomous run "
+                              "— stop the run first"}, status_code=409)
         # Which agent backend runs this turn. Only the built-in can run one
         # today, and `resolve` REFUSES rather than quietly running the native
         # loop: a session that asked for another harness and silently got the
@@ -4276,8 +4302,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             _save_run_merged(run)
                 except Exception:
                     _log.exception("memory: per-step recall failed")
-                session["messages"].append({"role": "user", "content": driving})
-                await asyncio.to_thread(sessions.save, session)
+                # AUDIT 03-5: save with base_rev. This whole-row write used to
+                # be unconditional, so a message that landed in the session
+                # while the driving line was being built (a rename, another
+                # writer) was silently dropped by it. On a stale write, reload
+                # and re-append: the driving line is the run's own turn input.
+                for _try in range(3):
+                    session["messages"].append({"role": "user",
+                                                "content": driving})
+                    try:
+                        await asyncio.to_thread(
+                            sessions.save, session,
+                            base_rev=session[sessions.REV_KEY])
+                        break
+                    except sessions.StaleWriteError:
+                        fresh = await asyncio.to_thread(sessions.load, sid)
+                        if fresh is None:
+                            break
+                        session = fresh
                 frozen = False
                 turn_err = None
 
