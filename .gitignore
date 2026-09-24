@@ -9,6 +9,10 @@ dist/
 dist/
 tools/ui-smoke/pwenv/
 frontend-v2/node_modules/
+# raggity's index directory. `raggity serve`/`ingest` creates it in the CWD when
+# no config points elsewhere, so running the RAG sidecar from a checkout drops a
+# LanceDB index here. It is derived data — never source.
+.raggity/
 
 # internal working notes — never published. `docs/*` rather than `docs/` so the
 # one shipped guide can be re-included below: a file inside an excluded
