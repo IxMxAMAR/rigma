@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useState } from "react";
 
 import LoadError from "../LoadError";
+import { engineApi } from "../lib/engineApi";
 import { readList } from "../lib/listFetch";
+import { openaiBase } from "../lib/openaiBase";
 
 interface Preset {
   id: string;
@@ -23,6 +25,20 @@ export default function SettingsSurface() {
   const [editing, setEditing] = useState<string | null>(null); // preset id
   const [err, setErr] = useState<string | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
+  // AUDIT F11-6: this card used to hardcode `http://127.0.0.1:11499/v1` and
+  // call it Rigma's OpenAI API. 11499 is llama-server's upstream port, so a
+  // backend pointed there bypasses the session, the tool-call repair and the
+  // idle-unload bookkeeping — and the URL is dead on any non-default launch.
+  // /api/server publishes the real base (`openai_base`); read it, and fall back
+  // to the origin that served this page rather than to a literal port.
+  const [apiBase, setApiBase] = useState(() =>
+    openaiBase(null, window.location.origin));
+
+  useEffect(() => {
+    engineApi.server()
+      .then((i) => setApiBase(openaiBase(i, window.location.origin)))
+      .catch(() => { /* keep the origin fallback */ });
+  }, []);
 
   const refresh = useCallback(async () => {
     // AUDIT F11-3: a non-array /api/presets body used to reach .map and blank
@@ -175,8 +191,11 @@ export default function SettingsSurface() {
           <p className="text-[13px] text-secondary">
             Legacy UI: <a href="/rizz" className="text-amber hover:underline">/rizz</a>
             {" · "}OpenAI-compatible API:{" "}
-            <code className="font-mono text-[12px] bg-surface rounded px-1.5 py-0.5">
-              http://127.0.0.1:11499/v1
+            <code className="font-mono text-[12px] bg-surface rounded px-1.5 py-0.5"
+                  title={"Rigma's own /v1 passthrough — sessions, tool-call "
+                         + "repair and idle-unload bookkeeping all apply. The "
+                         + "engine's own port is different and bypasses them."}>
+              {apiBase}
             </code>
           </p>
         </section>
