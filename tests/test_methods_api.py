@@ -216,3 +216,21 @@ def test_a_client_disconnect_does_not_wedge_the_server(client, monkeypatch):
                        json={"macro_id": "peek"}) as r:
         assert r.status_code == 200
     assert client.get("/api/methods").status_code == 200
+
+
+@pytest.mark.parametrize("bad, field", [
+    ({"params": "hot"}, "apply.params"),
+    ({"notes_template": 5}, "apply.notes_template"),
+    ({"system_prompt": 5}, "apply.system_prompt"),
+    ({"use_tools": "yes"}, "apply.use_tools"),
+    ({"allow_code": 1}, "apply.allow_code"),
+])
+def test_wrong_typed_apply_values_are_a_400_at_save(client, bad, field):
+    """10-3: apply.params (and the sibling apply values) reach apply_to_session's
+    `**` unpack / build_messages unchecked, so a method that saved cleanly 500'd
+    the moment it was applied. Reject it at save with a field-naming 400."""
+    doc = _doc()
+    doc["apply"].update(bad)
+    r = client.post("/api/methods", json=doc)
+    assert r.status_code == 400, r.text
+    assert any(field in e for e in r.json()["errors"]), r.json()
