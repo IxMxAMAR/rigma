@@ -55,6 +55,36 @@ _GUARD_EXEMPT_KINDS = {"project"}
 # the cap IS the quarantine: overflow evicts the least-proven rule.
 MAX_PITFALLS = 24
 
+
+def _eviction_key(m: dict):
+    """Least-proven first: drafts/retired outrank verified, then lowest outcome
+    score, then fewest sightings, then oldest."""
+    return (m.get("status") == "verified", m.get("outcome_score", 0),
+            m.get("seen_count", 0), m.get("last_seen", 0))
+
+
+def _cap_rows(rows: list[dict], cap: int = MAX_PITFALLS) -> bool:
+    """Bound EVERY kind, not just pitfalls. True when anything was evicted.
+
+    AUDIT 10-10: the cap was written for pitfalls only, and the technique path
+    (one `"When stuck: " + tech` per advisor-assisted step, serve.py) was added
+    later without one. Techniques therefore accumulated forever, and every
+    `retrieve` re-scored the whole unbounded list on each step change.
+    """
+    evicted = False
+    by_kind: dict[str, list[dict]] = {}
+    for r in rows:
+        by_kind.setdefault(str(r.get("kind")), []).append(r)
+    for kind, group in by_kind.items():
+        while len(group) > cap:
+            victim = min(group, key=_eviction_key)
+            group.remove(victim)
+            rows.remove(victim)
+            evicted = True
+            log.info("memory: %s cap reached, evicted %r", kind,
+                     victim.get("text", "")[:60])
+    return evicted
+
 _WIN_PATH = re.compile(r"[A-Za-z]:[\\/]")
 _UNC_PATH = re.compile(r"\\\\[^\\]+\\")
 # enumerated whitelist rather than "any dotted token": the generic form
@@ -331,20 +361,26 @@ class MemoryStore:
                    "vec": embed_one(text, purpose="doc"),
                    "born": time.time(), "last_seen": time.time(), **extra}
             rows.append(rec)
-            # bounded: evict the least-proven pitfall when over cap. Verified
-            # rules outrank drafts; among equals, lowest outcome then lowest
-            # seen goes.
-            pits = [r for r in rows if r.get("kind") == "pitfall"]
-            if len(pits) > MAX_PITFALLS:
-                evict = min(pits, key=lambda m: (m.get("status") == "verified",
-                                                 m.get("outcome_score", 0),
-                                                 m.get("seen_count", 0),
-                                                 m.get("last_seen", 0)))
-                rows.remove(evict)
-                log.info("memory: cap reached, evicted %r",
-                         evict.get("text", "")[:60])
-            self._write_all(rows)
+            # AUDIT 10-10: bounded for EVERY kind, with the same least-proven
+            # eviction key. Nothing but this new line changed if nothing was
+            # evicted, so append it (O(1)) instead of rewriting the whole store
+            # on every add — the cost used to grow with the store.
+            if _cap_rows(rows):
+                self._write_all(rows)
+            else:
+                self._append(rec)
             return rec
+
+    def _append(self, rec: dict) -> None:
+        """Append ONE record. Only valid inside _xlock, and only when no
+        existing row changed — dedup hits and evictions still go through
+        _write_all. A crash mid-append can leave a torn trailing line, which
+        `all()` skips; it can never lose a memory the way truncate-in-place
+        would."""
+        with self._xlock():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
 
 
 # --- embeddings (optional, never load-bearing) -------------------------------

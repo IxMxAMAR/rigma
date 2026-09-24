@@ -360,3 +360,44 @@ def test_clean_rule_skips_chatty_preambles():
         == "Use sample_files for big folders."
     assert clean_rule("Never type filenames.") == "Never type filenames."
     assert clean_rule('"Answer briefly."') == "Answer briefly."
+
+
+# ---- 10-10: every kind is bounded, and a plain add appends ------------------
+
+def test_every_kind_is_capped_not_just_pitfalls(tmp_path):
+    """Techniques (one per advisor-assisted step) used to accumulate forever
+    while only pitfalls were capped, so the store grew without bound and every
+    retrieve re-scored the whole list."""
+    store = MemoryStore(tmp_path / "m.jsonl")
+    for i in range(memory.MAX_PITFALLS + 5):
+        store.add(kind="technique", text=f"When stuck, try approach {i}.")
+    techs = [r for r in store.all() if r["kind"] == "technique"]
+    assert len(techs) == memory.MAX_PITFALLS
+
+
+def test_the_evicted_technique_is_the_least_proven(tmp_path):
+    store = MemoryStore(tmp_path / "m.jsonl")
+    for i in range(memory.MAX_PITFALLS):
+        store.add(kind="technique", text=f"When stuck, try approach {i}.")
+    proven = store.all()[0]
+    score_memories(store, [proven["id"]], +1)
+    store.add(kind="technique", text="When stuck, try the newest approach.")
+    texts = {r["text"] for r in store.all()}
+    assert proven["text"] in texts, "the proven rule was evicted"
+    assert "When stuck, try approach 1." not in texts
+
+
+def test_a_plain_add_appends_instead_of_rewriting(tmp_path, monkeypatch):
+    store = MemoryStore(tmp_path / "m.jsonl")
+    store.add(kind="technique", text="When stuck, try approach 0.")
+    calls = []
+    real = MemoryStore._write_all
+
+    def spy(self, rows):
+        calls.append(1)
+        return real(self, rows)
+
+    monkeypatch.setattr(MemoryStore, "_write_all", spy)
+    store.add(kind="technique", text="When stuck, try approach 1.")
+    assert calls == [], "a plain add must append, not rewrite the whole store"
+    assert len(store.all()) == 2
