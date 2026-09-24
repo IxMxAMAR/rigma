@@ -641,6 +641,13 @@ def chat(session: str = typer.Option(None, "--session",
     if s is None:
         typer.echo("not running — start with: rigma up")
         raise typer.Exit(1)
+    # AUDIT F15-2: the UI-only record (`rigma up` with no model) has model=""
+    # and unloaded=True; without this it looked like a running model, so chat
+    # opened a session and the first send died with "model unreachable".
+    if s.get("unloaded") and not s.get("model"):
+        typer.echo(f"Rigma is up, no model loaded — pick one in the Models page "
+                   f"(http://127.0.0.1:{s['public_port']})")
+        raise typer.Exit(1)
     created = False
     if session:
         sess = sessions.load(session)
@@ -729,6 +736,14 @@ def status():
     s = st.server_running()
     if s is None:
         typer.echo("not running  (start with: rigma up)")
+        raise typer.Exit(0)
+    # AUDIT F15-2: "a state record exists" is not "a model is loaded". The
+    # UI-only record has model="" and unloaded=True, and printing
+    # "running:  ()" for it read as a broken install.
+    if s.get("unloaded") and not s.get("model"):
+        typer.echo(f"Rigma is up, no model loaded — pick one in the Models page "
+                   f"(http://127.0.0.1:{s['public_port']})")
+        typer.echo("stop with: rigma stop")
         raise typer.Exit(0)
     up_min = (time.time() - s["started_at"]) / 60
     typer.echo(f"running: {s['model']} ({s['quant']})  up {up_min:.0f} min")
