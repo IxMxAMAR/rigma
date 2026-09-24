@@ -758,6 +758,7 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     seen: dict = {}
     failed = False
     said = False
+    saw_end = False
     final_status = ""
     try:
         for line, oversize in _bounded_lines(proc.stdout):
@@ -790,6 +791,7 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
                 state["usage"] = obj.get("usage") or {}
                 continue
             if kind == "exec.completed":
+                saw_end = True
                 result = obj.get("result") or {}
                 final_status = str(result.get("status") or "")
                 if state is not None:
@@ -845,3 +847,14 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     # documented advice is to check both, so both are checked.
     if final_status and final_status != "succeeded" and not failed:
         yield TurnEvent("error", f"the run ended as {final_status}")
+        return
+    # An exit 0 with no `exec.completed` is not a finished turn. Without this the
+    # generator ended silently and the caller saved an empty assistant reply as a
+    # success — the DSH adapter has the equivalent `done` check (09-7).
+    if not saw_end and not failed:
+        tail = " / ".join(list(err_lines)[-4:])[:400]
+        code = proc.returncode
+        yield TurnEvent("error", text=(
+            f"mcode exited {code if code is not None else '?'} without "
+            "completing the turn"
+            + (f": {tail}" if tail else "")))
