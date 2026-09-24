@@ -109,6 +109,66 @@ describe("sse parser", () => {
   });
 });
 
+describe("grounded sources (UIUX-22)", () => {
+  it("folds a citations event into the turn", () => {
+    const t = applyEvent(emptyTurn(), {
+      event: "citations",
+      data: { sources: [{ source: "notes/a.md", snippet: "the answer is 42" }] },
+    });
+    expect(t.sources).toEqual([
+      { source: "notes/a.md", snippet: "the answer is 42" },
+    ]);
+  });
+
+  it("appends across rounds, because the server sends only what it added", () => {
+    let t = applyEvent(emptyTurn(), {
+      event: "citations", data: { sources: [{ source: "a.md" }] },
+    });
+    t = applyEvent(t, {
+      event: "citations", data: { sources: [{ source: "b.md" }] },
+    });
+    expect(t.sources.map((s) => s.source)).toEqual(["a.md", "b.md"]);
+  });
+
+  it("carries a page only when it is a real page number", () => {
+    const t = applyEvent(emptyTurn(), {
+      event: "citations",
+      data: { sources: [
+        { source: "a.pdf", page: 7 },
+        { source: "b.pdf", page: 0 },        // not a page
+        { source: "c.pdf", page: "x" },      // not a number
+        { source: "d.pdf", page: 2.5 },      // not a page number
+      ] },
+    });
+    expect(t.sources.map((s) => s.page)).toEqual([7, undefined, undefined,
+                                                  undefined]);
+  });
+
+  it("drops an entry with no usable source rather than rendering an empty chip", () => {
+    const t = applyEvent(emptyTurn(), {
+      event: "citations",
+      data: { sources: [
+        { source: "  " },        // blank
+        { snippet: "orphan" },   // missing
+        "a.md",                  // not an object
+        null,
+        { source: "real.md" },
+      ] },
+    });
+    expect(t.sources).toEqual([{ source: "real.md", snippet: "" }]);
+  });
+
+  it("is a no-op when the event carries nothing usable", () => {
+    const before = emptyTurn();
+    for (const data of [{}, { sources: [] }, { sources: "nope" },
+                        { sources: null }]) {
+      const after = applyEvent(before, { event: "citations", data });
+      // identity, so React does not re-render on an empty event
+      expect(after).toBe(before);
+    }
+  });
+});
+
 describe("macro turns", () => {
   it("folds macro_step into the turn", () => {
     const t = applyEvent(emptyTurn(), {
