@@ -302,6 +302,20 @@ class ServerProcess:
             self.proc.kill()
 
 
+def server_argv(exe, plan: RunPlan, model_path, port: int,
+                extra_args: list[str] | None = None) -> list[str]:
+    """The exact llama-server command line a launch runs.
+
+    AUDIT F15-3: `rigma up --dry-run` printed only `plan.server_args(...)`, so
+    it omitted every flag the real launch adds — `--mmproj`,
+    `--chat-template-file` and the always-present `--slot-save-path`. One
+    helper means the preview cannot drift from what actually launches.
+    """
+    return [str(exe), *(extra_args or []),
+            *plan.server_args(str(model_path), port),
+            "--slot-save-path", str(rigma_home() / "sessions")]
+
+
 def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
                   timeout: float = 300.0,
                   extra_args: list[str] | None = None) -> ServerProcess:
@@ -310,9 +324,7 @@ def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
     logs.mkdir(parents=True, exist_ok=True)
     sessions.mkdir(parents=True, exist_ok=True)
     log_path = logs / f"server-{port}.log"
-    argv = [str(exe), *(extra_args or []),
-            *plan.server_args(str(model_path), port),
-            "--slot-save-path", str(sessions)]
+    argv = server_argv(exe, plan, model_path, port, extra_args)
     # on Windows, suppress the jarring console window llama-server would pop
     popen_kw = {}
     if platform.system() == "Windows":

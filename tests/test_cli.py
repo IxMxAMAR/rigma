@@ -200,3 +200,52 @@ def test_bench_reports_a_no_timings_engine_cleanly(tmp_path, monkeypatch):
     res = runner.invoke(cli.app, ["bench"])
     assert res.exit_code == 1 and "benchmark failed" in res.output
     assert "timings" in res.output
+
+
+def _argv_line(output):
+    return next(line for line in output.splitlines()
+                if line.startswith("argv: "))
+
+
+def test_dry_run_preview_shows_every_launch_flag(tmp_path, monkeypatch):
+    """AUDIT F15-3: the preview printed only `plan.server_args`, so it omitted
+    the projector, a repaired chat template and the always-present KV slot dir."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    tmpl = tmp_path / "templates"
+    tmpl.mkdir(parents=True)
+    (tmpl / "qwen3-vl-8b.jinja").write_text("{{ x }}", encoding="utf-8")
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3-vl-8b", "--dry-run"])
+    assert res.exit_code == 0
+    line = _argv_line(res.output)
+    assert "--mmproj" in line
+    assert "--chat-template-file" in line
+    assert "--slot-save-path" in line
+
+
+def test_dry_run_preview_comes_from_the_shared_argv_helper(tmp_path, monkeypatch):
+    """The printed line must be `_launch_argv`'s output, not a hand-built
+    string, so the preview cannot drift from the launch again."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    monkeypatch.setattr(cli, "_launch_argv",
+                        lambda cand, reg, port, model_label="<model>":
+                        ["llama-server", "--sentinel"])
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run"])
+    assert res.exit_code == 0
+    assert _argv_line(res.output) == "argv: llama-server --sentinel"
+
+
+def test_server_argv_appends_the_slot_save_path():
+    """`runtime.server_argv` is the one place the launch argv is assembled."""
+    from rigma import runtime
+    from rigma.models import ComboFlags, GgufFile, RunPlan
+    plan = RunPlan(model_slug="m",
+                   gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                   backend="vulkan", flags=ComboFlags(ctx=8192),
+                   origin="calculator")
+    argv = runtime.server_argv("llama-server", plan, "<model>", 11499)
+    assert argv[0] == "llama-server"
+    assert argv[-2:] == ["--slot-save-path",
+                         str(runtime.rigma_home() / "sessions")]
