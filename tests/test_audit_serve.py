@@ -189,6 +189,40 @@ async def _stream(app, path, payload, *, stop_after=None):
     return got
 
 
+async def _stream_until_armed(app, path, payload, armed):
+    """POST an SSE route and disconnect the moment `armed` (a threading.Event
+    the test sets from inside the engine) is set.
+
+    `_stream(stop_after=N)` disconnects on a CHUNK COUNT, which cannot express
+    "while this particular tool call is in flight": chunks keep arriving after
+    the eager task has already been collected. Starlette polls `receive()` for
+    the disconnect, so arming from the engine side lands the cancellation
+    exactly where the test needs it."""
+    import asyncio
+    body = json.dumps(payload).encode()
+    got = {"status": None, "chunks": []}
+    state = {"sent": False}
+
+    async def receive():
+        if not state["sent"]:
+            state["sent"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        while not armed.is_set():
+            await asyncio.sleep(0.01)
+        return {"type": "http.disconnect"}
+
+    async def send(msg):
+        if msg["type"] == "http.response.start":
+            got["status"] = msg["status"]
+        elif msg["type"] == "http.response.body":
+            got["chunks"].append(msg.get("body", b""))
+
+    await app(_scope("POST", path,
+                     {"content-length": str(len(body))}), receive, send)
+    got["text"] = b"".join(got["chunks"]).decode("utf-8", "replace")
+    return got
+
+
 def _running(ctx=131072):
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
                    ui_pid=os.getpid(), ctx=ctx)
@@ -884,3 +918,72 @@ def test_a_turn_says_which_backend_drove_it(home, engine):
     assert "event: harness" in got["text"]
     assert '"name": "native"' in got["text"]
     assert '"label": "Rigma (built in)"' in got["text"]
+
+
+# --------------------------------------------------------------------------
+# F36 — eager tool tasks outlived the consumer that started them
+
+
+def test_abandon_tasks_cancels_pending_and_swallows_every_result():
+    """`_abandon_tasks` is the mechanism; it must cancel what is pending and
+    retrieve what is done, so nothing surfaces later as "Task exception was
+    never retrieved" (AUDIT F36)."""
+    import asyncio
+
+    async def main():
+        began = asyncio.Event()
+
+        async def slow():
+            began.set()
+            await asyncio.sleep(30)
+
+        async def boom():
+            raise ValueError("tool blew up")
+
+        pending = asyncio.create_task(slow())
+        done_ok = asyncio.create_task(asyncio.sleep(0))
+        failed = asyncio.create_task(boom())
+        await began.wait()
+        await asyncio.sleep(0)                 # let boom() fail
+        assert failed.done()
+        serve._abandon_tasks([pending, done_ok, failed])   # must not raise
+        await asyncio.sleep(0)
+        assert pending.cancelled()
+        assert done_ok.done() and failed.done()
+
+    asyncio.run(main())
+
+
+def test_a_disconnect_cancels_the_rounds_eager_tool_tasks(home, engine,
+                                                          monkeypatch):
+    """GeneratorExit / CancelledError are BaseException subclasses, so the
+    `if failed:` branch that cancelled eager tool tasks never saw a tab refresh
+    or a sleeping laptop — leaving an orphaned `delegate` sub-loop posting to
+    the engine's aux slot for up to 5 hops at 240s each (AUDIT F36).
+
+    The disconnect is armed from INSIDE the delegate's aux request, so it lands
+    while that eagerly started task is still pending rather than at some
+    chunk-count guess."""
+    import asyncio
+    import threading
+    seen: list = []
+    real = serve._abandon_tasks
+
+    def spy(tasks):
+        seen.append(list(tasks))
+        return real(tasks)
+
+    monkeypatch.setattr(serve, "_abandon_tasks", spy)
+    _running()
+    Engine.script = [_call("delegate", {"question": "what is here?"})]
+    Engine.aux_delay = 5.0
+    armed = threading.Event()
+    Engine.on_aux = armed.set          # runs INSIDE the delegate's aux call
+    c = _client(engine.port)
+    sid = _seed(c, 2)
+    app = build_app(upstream_port=engine.port)
+    asyncio.run(_stream_until_armed(app, f"/api/sessions/{sid}/chat",
+                                    {"message": "go"}, armed))
+    assert armed.is_set(), "the delegate never reached the engine"
+    assert any(tasks for tasks in seen), (
+        "the eager delegate task was abandoned without being cancelled")

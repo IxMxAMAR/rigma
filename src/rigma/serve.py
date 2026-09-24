@@ -411,6 +411,12 @@ LIVE_RESULT_MAX = 900   # per tool-result entry in the feed (display only)
 _BOOKKEEPING_TOOLS = {"manage_plan", "task_complete"}
 K_ERROR = 8             # consecutive all-error turns before "stalled"
 K_LAZY = 3              # consecutive no-tool / repeat turns before "stalled"
+# How long a run may sit paused waiting for an ANSWER (the model paused itself
+# with `ask_user`) before the slot is released. An owner-initiated pause — the
+# pause button, with no pending question — is a deliberate choice and is never
+# expired; this bound is for the run asking a question and then holding the one
+# run slot indefinitely (AUDIT F44).
+PAUSE_MAX_SECS = 3600
 K_STEP_ATTEMPTS = 6     # turns spent on ONE plan step before it's marked
                         # blocked and the run routes around it — the graded
                         # response between "keep hammering" and "give up"
@@ -738,6 +744,34 @@ def _save_run_merged(run: dict) -> None:
             if k in cur:
                 run[k] = cur[k]
     _runs.save(run)
+
+
+def _swallow_task_result(t) -> None:
+    """Retrieve a task's result so a cancelled or failed task does not surface
+    later as "Task exception was never retrieved" at GC."""
+    if not t.cancelled():
+        t.exception()          # retrieves it; never raises
+
+
+def _abandon_tasks(tasks) -> None:
+    """Cancel tasks the turn started and will never await.
+
+    A client disconnect tears the SSE generator down with GeneratorExit /
+    CancelledError, which the `if failed:` branch never sees — so every eagerly
+    started tool task was left pending. Cancelling does not stop work already
+    inside `asyncio.to_thread` (that is not interruptible); what it stops is the
+    task still queued on the semaphore, the "Task was destroyed but it is
+    pending" at shutdown, and above all an orphaned `delegate` sub-loop that
+    kept posting to the engine's aux slot for up to 5 hops at 240s each after
+    its consumer was gone (AUDIT F36).
+
+    Synchronous on purpose: this runs in a `finally` that may be executing under
+    GeneratorExit, where an `await` raises "async generator ignored
+    GeneratorExit"."""
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+        t.add_done_callback(_swallow_task_result)
 
 
 async def _upstream_error(resp) -> str:
@@ -1124,13 +1158,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.get("/rizz", response_class=HTMLResponse)
     async def rizz():
-        """The legacy UI, in full — the daily escape hatch until v2 parity."""
+        """The legacy UI, in full — the escape hatch if v2 misbehaves."""
         return HTMLResponse(_ui_file("index.html"), headers=_NO_STORE)
 
     # ---- /v2: the parallel next-gen UI (docs/design/UI-REWORK-PLAN.md) ----
     # Built by frontend-v2/ (Vite) into data/ui_v2 and committed, so the pip
-    # wheel ships it and the user's machine never needs Node. The legacy UI
-    # at / stays the daily driver until parity; cutover is a route flip.
+    # wheel ships it and the user's machine never needs Node. `/` serves this
+    # (the cutover happened); /v2 and /rizz stay as direct routes to each UI.
+    # AUDIT F62: this comment said the legacy UI at / "stays the daily driver
+    # until parity", which stopped being true when `root()` was switched to v2.
     _V2_MIME = {".html": "text/html", ".js": "text/javascript",
                 ".css": "text/css", ".svg": "image/svg+xml",
                 ".map": "application/json", ".woff2": "font/woff2"}
@@ -1154,7 +1190,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if hit is None:
             return HTMLResponse(
                 "<h1>v2 UI not built</h1><p>run `npm run build` in "
-                "frontend-v2/ — the legacy UI at <a href='/'>/</a> is "
+                "frontend-v2/ — the legacy UI at <a href='/rizz'>/rizz</a> is "
                 "unaffected.</p>", status_code=503)
         return Response(hit[0], media_type=hit[1], headers=_NO_STORE)
 
@@ -1792,6 +1828,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "has_vision": has_vision,
                     "run_id": run_id, "profile": run_profile,
                     "method_draft_id": s.get("method_draft_id", ""),
+                    # this loop IS the host for the sentinel tools (delegate,
+                    # use_tools) — without it run_tool refuses them, which is
+                    # what stops a method macro from receiving raw control
+                    # bytes (AUDIT F37)
+                    "can_host_loop_tools": True,
                     # what read_file has already sent this turn, so a model
                     # that fires two spellings of one filename in parallel is
                     # not charged twice for the same content (2026-08-21)
@@ -2152,6 +2193,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         force_last = False       # one-action: allow a final look-at-images round
         max_rounds = _round_cap(s) if use_tools else 1
         hit_ceiling = False      # distinguishes "ran out of rounds" from
+        # bound before the loop so the cancellation handler below can always
+        # reach the eager tool tasks, even if a round dies before it starts any
+        started: dict = {}
         # "the model chose to stop" — the limit notice used to fire on BOTH,
         # claiming a ceiling after 3 calls of a 1000-round budget (owner
         # report 2026-07-21: 'HUH?')
@@ -2383,8 +2427,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     "think_n": len(thinking), "text_n": len(rtext),
                     "calls": [c.get("name") for c in calls.values()]})
                 if failed:
-                    for task, _ in started.values():
-                        task.cancel()              # don't leak eager tool tasks
+                    _abandon_tasks([t for t, _ in started.values()])
                     break
                 if use_tools and not calls and not last and rtext:
                     # RESCUE: the engine's tool-call parser is nondeterministically
@@ -2910,6 +2953,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                            "auto-compact notice")
         except BaseException:
             _checkpoint(force=True)
+            # A disconnect (GeneratorExit / CancelledError) never reaches the
+            # `if failed:` branch inside the loop, so the eager tool tasks of
+            # the round it died in were abandoned uncancelled (AUDIT F36).
+            _abandon_tasks([t for t, _ in started.values()])
             raise
         if _ckpt["saved"] and not _ckpt["final"]:
             if _ckpt["live"].strip() or trace:
@@ -2975,6 +3022,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             out["vram"] = server_ops.vram_snapshot(registry)
         except Exception:
             out["vram"] = None
+        # Load-time engine decisions, on the response the Engine panel already
+        # polls — so they arrive with everything else instead of only when a
+        # separate call happens to succeed (AUDIT F51).
+        try:
+            from . import engine_log
+            out["engine_findings"] = engine_log.findings(server_ops.log_text())
+        except OSError as e:
+            out["engine_findings"] = []
+            out["engine_findings_error"] = f"cannot read the engine log: {e}"
         _engine_cache.update(at=_now(), key=key, data=dict(out))
         return out
 
@@ -3026,16 +3082,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def server_findings():
         """Decisions the engine announced once at load and never repeated.
 
-        Read from the WHOLE log rather than the tail: these land in the first
-        few hundred lines of a launch and are long gone by the time anyone
-        looks. `cache_reuse is not supported by this context` had appeared
-        fifteen times on this machine without ever being shown to anyone.
+        Read from the WHOLE log rather than a tail: these land in the first few
+        hundred lines of a launch and are long gone by the time anyone looks.
+        `cache_reuse is not supported by this context` had appeared fifteen
+        times on this machine without ever being shown to anyone.
+
+        A read failure is a 503, not an empty list: "I could not look" and "I
+        found nothing" are different answers and only one is reassuring
+        (AUDIT F51).
         """
         from . import engine_log, server_ops
         try:
-            text = server_ops.log_tail(1000)
-        except Exception:
-            return {"findings": []}
+            text = await asyncio.to_thread(server_ops.log_text)
+        except OSError as e:
+            return JSONResponse(
+                {"error": f"cannot read the engine log: {e}", "findings": []},
+                status_code=503, headers=_NO_STORE)
         return {"findings": engine_log.findings(text)}
 
     @app.get("/api/server/switch-options")
@@ -3982,14 +4044,43 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         try:
             while True:
                 run = _runs.load(run_id)
-                if run is None or run.get("status") != "running":
-                    if run and run.get("paused"):
-                        await asyncio.sleep(3)
-                        continue
+                if run is None:
                     break
                 if run.get("paused"):
+                    # BANK the paused interval. The pause short-circuited BEFORE
+                    # `budget_exceeded`, so the clock kept running while nothing
+                    # happened: an 8-hour run started at 23:00, paused at 23:20
+                    # by ask_user, was still holding the run slot at 08:00 with
+                    # nothing done — and answering it resumed straight into
+                    # budget_exhausted, discarding the answer (AUDIT F44).
+                    held_since = run.get("_paused_at") or 0
+                    if not held_since:
+                        run["_paused_at"] = held_since = _time.time()
+                        _save_run_merged(run)
+                    # A MODEL-initiated pause is the run asking a question, not
+                    # the owner choosing to stop, and it otherwise holds the one
+                    # run slot forever: `active.json` still points here, so every
+                    # subsequent POST /api/runs is refused with 409.
+                    if (run.get("status") not in _runs.TERMINAL
+                            and run.get("pending_question")
+                            and _time.time() - held_since > PAUSE_MAX_SECS):
+                        _runs.set_status(
+                            run, "stalled",
+                            f"paused waiting for an answer for over "
+                            f"{PAUSE_MAX_SECS // 60} minutes — answer it and "
+                            f"restart the run")
+                        break
                     await asyncio.sleep(3)
                     continue
+                if run.get("_paused_at"):
+                    # resume: hand back exactly the time the pause cost
+                    run["deadline"] = (run.get("deadline", 0)
+                                       + max(0.0, _time.time()
+                                             - float(run["_paused_at"])))
+                    run["_paused_at"] = 0
+                    _save_run_merged(run)
+                if run.get("status") != "running":
+                    break
                 over = _runs.budget_exceeded(run)
                 if over:
                     _runs.set_status(run, "budget_exhausted", over)
@@ -4730,6 +4821,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         notices the caller must attach to msg["notice"]. Pure logic lives in
         triggers.py; this is only the plumbing that feeds it real events."""
         from . import methods as _methods, triggers as _trig
+        # Consumed unconditionally: a rule set that has no trigger rules (or a
+        # method whose rules were just removed) must not leave the stamp behind
+        # for a LATER method's rules to fire on (AUDIT F46).
+        applied = str(session.pop("_method_applied", "") or "")
         m = _methods.get(str(session.get("method") or ""))
         if not m or not any(r.get("kind") == "trigger"
                             for r in m.get("rules") or []):
@@ -4737,10 +4832,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         state = session.get("trigger_state") or _trig.new_state()
         turn = len([mm for mm in session.get("messages") or []
                     if mm.get("role") == "assistant"])
-        events = [{"kind": "tool_ran", "tool": t.get("name"),
-                   "path": str((t.get("args") or {}).get("path") or ""),
-                   "turn": turn, "by_trigger": False, "user_spoke": user_spoke}
-                  for t in trace or []]
+        events = []
+        if applied:
+            events.append({"kind": "method_applied", "method": applied,
+                           "tool": "", "path": "", "turn": turn,
+                           "by_trigger": False, "user_spoke": user_spoke})
+        events += [{"kind": "tool_ran", "tool": t.get("name"),
+                    "path": str((t.get("args") or {}).get("path") or ""),
+                    "turn": turn, "by_trigger": False, "user_spoke": user_spoke}
+                   for t in trace or []]
         events.append({"kind": "turn_ended", "tool": "", "path": "",
                        "turn": turn, "by_trigger": False,
                        "user_spoke": user_spoke})
@@ -4875,11 +4975,22 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                  force_completion=False, _verify_pending=False,
                  _challenge_pending=False, _step_turns=0, _cur_step_id=None,
                  _reflected_err=False, _reflected_lazy=False,
+                 _paused_at=0,
                  halt_reason="")
         # a used-up or nearly-used-up clock gets a grace hour — a restart
         # exists to finish work, not to instantly re-die on the old deadline
         if r.get("deadline", 0) < _time.time() + 900:
             r["deadline"] = _time.time() + 3600
+        # ...and the SAME grace for the step budget. A run halted at MAX_ITERS
+        # is in RESTARTABLE, so this endpoint flipped it to running, repointed
+        # active.json and returned {"restarted": true} — and the loop's first
+        # budget check halted it again, forever, because nothing resets
+        # `iteration`. Each press also re-persisted plan reconciliation,
+        # appended another never-consumed RESUMED steer and re-ran the memory
+        # harvest over an unchanged action trace (AUDIT F45).
+        if r.get("iteration", 0) >= _runs.iter_ceiling(r):
+            r["iter_ceiling"] = (r.get("iteration", 0)
+                                 + _runs.RESTART_ITER_GRACE)
         done = _runs.done_summary(rid)
         nxt = _runs.next_pending(rid) or "verify the work and finish"
         r.setdefault("steer_queue", []).append(

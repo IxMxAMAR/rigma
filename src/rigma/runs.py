@@ -25,6 +25,10 @@ RESTARTABLE = {"interrupted", "stopped", "stalled", "frozen",
                "budget_exhausted", "error"}
 PROFILES = {"all", "no-network", "no-delete", "confined"}
 MAX_ITERS = 2000
+# What a RESTART grants on top of a used-up step budget, the counterpart of the
+# grace hour `restart_run` gives the clock: a resume exists to finish work, not
+# to instantly re-die on the old cap (AUDIT F45).
+RESTART_ITER_GRACE = 500
 BUDGET_HOURS_DEFAULT = 8.0
 BUDGET_HOURS_MAX = 48.0
 
@@ -358,11 +362,25 @@ def read_actions(run_id: str) -> list:
 
 # --- budget ------------------------------------------------------------------
 
+def iter_ceiling(run: dict) -> int:
+    """The step budget this run is judged against.
+
+    Normally MAX_ITERS; a restart that had already spent it raises it by
+    RESTART_ITER_GRACE (see `serve.restart_run`). The ceiling is a separate
+    field rather than a smaller `iteration` because the counter is also the
+    honest record of how much work the run has done (AUDIT F45)."""
+    try:
+        got = int(run.get("iter_ceiling") or MAX_ITERS)
+    except (TypeError, ValueError):
+        return MAX_ITERS
+    return got if got > 0 else MAX_ITERS
+
+
 def budget_exceeded(run: dict) -> str:
     now = time.time()
     if now >= run.get("deadline", now + 1):
         return "time budget reached"
-    if run.get("iteration", 0) >= MAX_ITERS:
+    if run.get("iteration", 0) >= iter_ceiling(run):
         return "iteration cap reached"
     cap = run.get("token_cap") or 0
     if cap and run.get("tokens_used", 0) >= cap:
