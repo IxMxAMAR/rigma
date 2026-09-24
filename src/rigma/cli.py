@@ -376,37 +376,60 @@ def models():
         typer.echo(f"{slug:24} {spec.kind:5} {fit}")
 
 
-def _spawn_detached(port: int) -> None:
-    """Re-launch `rigma up` as a background process and return the terminal.
-    The child re-runs the same resolution (fast — engine/model already on
-    disk) but this time stays foreground inside its own detached session."""
-    import subprocess
+def _detached_argv() -> list[str]:
+    """The command a detached child re-runs: this one without --detach, plus
+    --no-browser/--yes so it can never prompt into a closed stdin."""
     import sys
     argv = [a for a in sys.argv[1:] if a not in ("--detach", "-d")]
     if "--no-browser" not in argv:
         argv.append("--no-browser")
     if "-y" not in argv and "--yes" not in argv:
         argv.append("--yes")
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-              "stderr": subprocess.DEVNULL}
     exe = [sys.executable, "-m", "rigma"] if not getattr(sys, "frozen", False) \
         else [sys.executable]
-    if platform.system() == "Windows":
-        # DETACHED_PROCESS alone is not enough when the launching shell runs
-        # inside a Windows Job Object that kills children on close (many
-        # terminals/tools do) — the server dies with the shell. BREAKAWAY_FROM_
-        # JOB frees it. Some jobs forbid breakaway, so fall back without it.
-        base = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED
-        try:
-            subprocess.Popen(exe + argv,
-                             creationflags=base | 0x01000000,  # BREAKAWAY_FROM_JOB
-                             **kwargs)
-        except OSError:
-            subprocess.Popen(exe + argv, creationflags=base, **kwargs)
-    else:
-        subprocess.Popen(exe + argv, start_new_session=True, **kwargs)
+    return exe + argv
+
+
+def _detached_log_path(port: int):
+    """Where a detached child's stdout/stderr goes.
+
+    AUDIT F08-5: it used to be DEVNULL, so the child's "port already in use",
+    resolve or download error was written nowhere while the parent had already
+    claimed success.
+    """
+    from .runtime import rigma_home
+    return rigma_home() / "logs" / f"detached-{port}.log"
+
+
+def _spawn_detached(port: int, spawn=None) -> None:
+    """Re-launch `rigma up` as a background process and return the terminal.
+    The child re-runs the same resolution (fast — engine/model already on
+    disk) but this time stays foreground inside its own detached session."""
+    import subprocess
+    argv = _detached_argv()
+    log_path = _detached_log_path(port)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if spawn is None:
+        spawn = subprocess.Popen
+    with open(log_path, "a", encoding="utf-8", errors="replace") as log_f:
+        kwargs = {"stdin": subprocess.DEVNULL, "stdout": log_f,
+                  "stderr": subprocess.STDOUT}
+        if platform.system() == "Windows":
+            # DETACHED_PROCESS alone is not enough when the launching shell runs
+            # inside a Windows Job Object that kills children on close (many
+            # terminals/tools do) — the server dies with the shell. BREAKAWAY_FROM_
+            # JOB frees it. Some jobs forbid breakaway, so fall back without it.
+            base = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED
+            try:
+                spawn(argv, creationflags=base | 0x01000000,  # BREAKAWAY_FROM_JOB
+                      **kwargs)
+            except OSError:
+                spawn(argv, creationflags=base, **kwargs)
+        else:
+            spawn(argv, start_new_session=True, **kwargs)
     typer.echo(f"Rigma is starting in the background on port {port}.")
     typer.echo(f"  UI:    http://127.0.0.1:{port}")
+    typer.echo(f"  log:   {log_path}")
     typer.echo("  stop:  rigma stop   ·   status: rigma status")
 
 
@@ -952,15 +975,18 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if dry_run:                              # dry-run never touches ports
             typer.echo(f"would start Rigma (no model) on :{port}")
             raise typer.Exit(0)
-        if detach:
-            _spawn_detached(port)
-            raise typer.Exit(0)
         for needed in (port, port - 1):
             holder = _port_holder(needed)
             if holder:
                 typer.echo(f"port {needed} is already in use{holder} — "
                            f"free it or pass a different --port")
                 raise typer.Exit(1)
+        # AUDIT F08-5: detaching used to happen ABOVE the port check, so the
+        # parent claimed success (and exited 0) before the child could discover
+        # the port was taken — and the child's error went to DEVNULL.
+        if detach:
+            _spawn_detached(port)
+            raise typer.Exit(0)
         st.write_state("", "", port, engine_pid=-1, ui_pid=os.getpid(),
                        backend="", use_case=use_case, ctx=0, unloaded=True)
         typer.echo(f"Rigma:  http://127.0.0.1:{port}")
@@ -1092,15 +1118,17 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     typer.echo("argv: llama-server " + " ".join(rp.server_args("<model>", port - 1)))
     if dry_run:
         raise typer.Exit(0)
-    if detach:
-        _spawn_detached(port)
-        raise typer.Exit(0)
     for needed in (port, port - 1):
         holder = _port_holder(needed)
         if holder:
             typer.echo(f"port {needed} is already in use{holder} — "
                        f"free it or pass a different --port")
             raise typer.Exit(1)
+    # AUDIT F08-5: below the port check, so the parent only claims success once
+    # the port it is about to use has been validated.
+    if detach:
+        _spawn_detached(port)
+        raise typer.Exit(0)
     if not yes:
         typer.confirm(
             f"download engine + model ({rp.gguf.bytes / 2**30:.1f} GB)?", abort=True)
