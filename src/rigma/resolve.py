@@ -220,12 +220,23 @@ DRAFT_FIXED_MB = 365.0
 DRAFT_KIB_PER_TOKEN = 6.25
 
 
-def draft_cache_mb(spec: ModelSpec, ctx: int, kv: str,
+def draft_cache_mb(spec: ModelSpec, ctx: int,
                    spec_type: str, n_max: int) -> float:
     """VRAM the speculative draft head needs on top of weights and KV.
 
     Zero when speculation is off — the head's WEIGHTS are in the file either
     way, but its caches are only allocated when it is asked to draft.
+
+    AUDIT F06-7: this took a `kv` argument and never used it. DELETED rather
+    than scaled, because the two constants below are a MEASURED TOTAL obtained
+    by differencing, not a KV term: 6.25 KiB/token is ~5.7x the geometry-derived
+    KV size for one draft block, so most of it is the head's own four nextn
+    blocks and compute buffers, which do not scale with cache precision.
+    Scaling the whole term by CACHE_BYTES[kv]/CACHE_BYTES["f16"] would
+    under-reserve for a quantised cache — the unsafe direction — and would
+    contradict the one measured point this repo has (465 MiB at 16K). The
+    parameter implied a precision dependence the function does not have; the
+    honest fix is to stop claiming it.
     """
     if not spec_type or spec_type == "none":
         return 0.0
@@ -236,7 +247,7 @@ def draft_cache_mb(spec: ModelSpec, ctx: int, kv: str,
     return DRAFT_FIXED_MB + DRAFT_KIB_PER_TOKEN * ctx / 1024 * depth
 
 
-def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int, kv: str,
+def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int,
                           spec_type: str = "", n_max: int = 0) -> ModelSpec:
     """A copy of `spec` whose mmproj slot holds what will ACTUALLY be resident.
 
@@ -254,7 +265,7 @@ def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int, kv: str,
     parameter through every fit function.
     """
     mm_bytes = spec.mmproj.bytes if (vision and spec.mmproj) else 0
-    draft = draft_cache_mb(spec, ctx, kv, spec_type, n_max)
+    draft = draft_cache_mb(spec, ctx, spec_type, n_max)
     total = mm_bytes + int(draft * 2**20)
     if total == 0:
         return spec.model_copy(update={"mmproj": None})

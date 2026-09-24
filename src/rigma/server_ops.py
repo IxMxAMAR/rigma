@@ -232,7 +232,6 @@ def launch_fit_spec(spec, flags, *, vision: bool, ctx: int = 0):
     from .resolve import with_launch_overheads
     ctx = int(ctx or flags.ctx)
     fit = with_launch_overheads(spec, vision=vision, ctx=ctx,
-                                kv=flags.cache_type_k,
                                 spec_type=flags.spec_type,
                                 n_max=flags.spec_n_max)
     was = spec.mmproj.bytes if spec.mmproj else 0
