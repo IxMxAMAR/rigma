@@ -16,6 +16,7 @@ import SettingsSurface from "./settings/SettingsSurface";
 import Palette from "./Palette";
 import WorkspacePanel from "./WorkspacePanel";
 import { parseParamRanges } from "./lib/paramLimits";
+import { tpsHint } from "./lib/telemetry";
 import { SURFACES, useApp } from "./store";
 
 function Sidebar() {
@@ -163,14 +164,31 @@ function Header() {
           <>
             <span className="text-secondary">{server.model}</span>
             {server.tps != null && (
-              <span className="text-amber">{server.tps.toFixed(1)} tok/s</span>
+              // The comparison lives on the number: "is 38 tok/s good here?" is
+              // the question a bare rate raises, and the Engine page answers it.
+              <span className="text-amber"
+                    title={tpsHint(server.tps, server.expectedTg)}>
+                {server.tps.toFixed(1)} tok/s
+              </span>
             )}
-            <span
-              className={`inline-block w-2 h-2 rounded-full ${
-                server.healthy ? "bg-moss" : "bg-red"
-              }`}
-              aria-label={server.healthy ? "engine healthy" : "engine down"}
-            />
+            {/* The dot is the only always-visible health signal, so make it
+                actionable: it opens the page that can explain and fix it. */}
+            <button
+              onClick={() => useApp.getState().setSurface("engine")}
+              aria-label={server.healthy
+                ? "engine healthy — open the Engine page"
+                : "engine down — open the Engine page to see why"}
+              title={server.healthy
+                ? "engine healthy — open the Engine page"
+                : "engine down — open the Engine page to see why"}
+              className="inline-flex items-center"
+            >
+              <span
+                className={`inline-block w-2 h-2 rounded-full ${
+                  server.healthy ? "bg-moss" : "bg-red"
+                }`}
+              />
+            </button>
           </>
         ) : (
           <span className="text-muted">connecting…</span>
@@ -226,6 +244,7 @@ export default function App() {
             model: d.model ?? "",
             quant: d.quant ?? "",
             tps: d.last_tg ?? d.tps ?? null,
+            expectedTg: d.expected_tg ?? null,
             healthy: !d.unloaded && !!d.model,
             ctx: d.ctx ?? 0,
             paramRanges: parseParamRanges(d.param_ranges),

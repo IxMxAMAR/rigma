@@ -3,12 +3,15 @@
 import { useEffect, useRef, useState } from "react";
 import FloatWindow from "../FloatWindow";
 import { Attach, Close, Download, Duplicate } from "../Icon";
+import { CHAT_FILTER_EVENT } from "../lib/chatFilter";
+import { responseError } from "../lib/listFetch";
 import MacroStrip from "./MacroStrip";
 import ModelPicker from "./ModelPicker";
 import { useApp } from "../store";
 import Sidecar from "./Sidecar";
 import Transcript from "./Transcript";
 import { selectStreaming, useChat } from "./chatStore";
+import { isSendKey, isStopKey, isTypingTarget } from "./keyboard";
 
 function SessionRail() {
   const sessions = useChat((s) => s.sessions);
@@ -21,6 +24,29 @@ function SessionRail() {
   const drafts = useChat((s) => s.drafts);
   const [q, setQ] = useState("");
   const timer = useRef<number | null>(null);
+  const filterRef = useRef<HTMLInputElement>(null);
+
+  // IMP-9: `/` focuses the filter when the user is not already typing, and the
+  // palette's "Filter chats" command reaches it through Ctrl+K. Ctrl+K itself
+  // stays the palette's — see lib/chatFilter.ts for why.
+  useEffect(() => {
+    const focus = () => {
+      filterRef.current?.focus();
+      filterRef.current?.select();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (isTypingTarget(e.target as HTMLElement | null)) return;
+      e.preventDefault();
+      focus();
+    };
+    window.addEventListener(CHAT_FILTER_EVENT, focus);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener(CHAT_FILTER_EVENT, focus);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
   return (
     <aside className="w-[230px] shrink-0 bg-panel/60 flex flex-col border-r border-white/5">
       <div className="p-2 flex flex-col gap-1.5">
@@ -31,6 +57,7 @@ function SessionRail() {
           + new chat
         </button>
         <input
+          ref={filterRef}
           value={q}
           onChange={(e) => {
             setQ(e.target.value);
@@ -38,7 +65,7 @@ function SessionRail() {
             timer.current = window.setTimeout(
               () => void search(e.target.value), 250);
           }}
-          placeholder="search chats…"
+          placeholder="search chats…  (/)"
           aria-label="Search chats"
           className="w-full rounded-md bg-surface px-3 py-1 text-[12.5px] outline-none placeholder:text-muted"
         />
@@ -65,7 +92,14 @@ function SessionRail() {
                     title="unsent draft"
                     className="shrink-0 pr-1 text-amber">•</span>
             ) : null}
-            <span className="hidden group-hover:flex items-center gap-0.5 pr-1.5 shrink-0">
+            {/* Always rendered, not `hidden group-hover:flex`: a display:none
+                control is outside the tab order, so export/duplicate/delete
+                could not be reached by keyboard at all, and a touch device has
+                no hover state so they did not exist there either (AUDIT F11-8).
+                Muted at rest; full contrast on row hover or when one of them
+                takes focus. */}
+            <span className="flex items-center gap-0.5 pr-1.5 shrink-0 opacity-60
+                             group-hover:opacity-100 focus-within:opacity-100">
               <a href={`/api/sessions/${s.id}/export?fmt=md`} download
                  title="export as markdown" aria-label={`export ${s.title}`}
                  className="p-0.5 text-muted hover:text-amber"><Download /></a>
@@ -91,6 +125,7 @@ function ContextMeter() {
   const currentId = useChat((s) => s.currentId);
   const ctx = useApp((s) => s.server?.ctx ?? 0);
   const [busy, setBusy] = useState(false);
+  const [compactErr, setCompactErr] = useState<string | null>(null);
   // engine-reported prompt_tokens from the last message that HAS stats —
   // but if newer messages exist past that point (tool-heavy turns could
   // miss stats), extend with a char-based estimate so the meter never
@@ -130,17 +165,39 @@ function ContextMeter() {
       {frac > 0.6 && currentId && (
         <button
           disabled={busy}
+          // One line before it happens: compact shortens the visible transcript,
+          // and without this the reasonable reading is "I just lost my
+          // conversation" — the server archives, it does not delete.
+          title={"Move the earlier turns of this chat into its archive to free " +
+                 "context. Nothing is deleted — the archive stays on disk and " +
+                 "the visible transcript gets shorter."}
           onClick={async () => {
             setBusy(true);
-            await fetch(`/api/sessions/${currentId}/compact`,
-                        { method: "POST" }).catch(() => {});
-            setBusy(false);
-            void useChat.getState().open(currentId);
+            setCompactErr(null);
+            try {
+              const r = await fetch(`/api/sessions/${currentId}/compact`,
+                                    { method: "POST" });
+              if (!r.ok) {
+                // A refused compact used to look like nothing happening at all.
+                setCompactErr(await responseError(r));
+                return;
+              }
+              void useChat.getState().open(currentId);
+            } catch (e) {
+              setCompactErr((e as Error).message);
+            } finally {
+              setBusy(false);
+            }
           }}
           className="font-mono text-[10.5px] text-amber hover:underline disabled:opacity-40"
         >
           {busy ? "compacting…" : "compact"}
         </button>
+      )}
+      {compactErr && (
+        <span role="alert" className="font-mono text-[10.5px] text-red">
+          {compactErr}
+        </span>
       )}
     </div>
   );
@@ -150,6 +207,7 @@ function Composer() {
   const send = useChat((s) => s.send);
   const stop = useChat((s) => s.stop);
   const streaming = useChat(selectStreaming);
+  const currentId = useChat((s) => s.currentId);
   const images = useChat((s) => s.images);
   const addImage = useChat((s) => s.addImage);
   const removeImage = useChat((s) => s.removeImage);
@@ -191,6 +249,25 @@ function Composer() {
     el.style.height = Math.min(el.scrollHeight, 168) + "px";
   }, [draft]);
 
+  // IMP-9: switching chats puts the caret where the next message goes.
+  useEffect(() => {
+    ref.current?.focus();
+  }, [currentId]);
+
+  // IMP-9: Esc stops the turn — except when the palette owns Esc (it closes on
+  // Esc) or focus is in a single-line input cancelling its own edit. See
+  // chat/keyboard.ts for the rule.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!isStopKey(e, { streaming: streaming !== null,
+                          paletteOpen: useApp.getState().paletteOpen })) return;
+      e.preventDefault();
+      stop();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [streaming, stop]);
+
   return (
     <div className="shrink-0 px-6 pb-5 pt-2">
       <div className="max-w-[760px] mx-auto">
@@ -230,7 +307,7 @@ function Composer() {
             if (e.clipboardData?.files?.length) stage(e.clipboardData.files);
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            if (isSendKey(e)) {
               e.preventDefault();
               submit();
             }
@@ -256,6 +333,12 @@ function Composer() {
             send
           </button>
         )}
+      </div>
+      {/* IMP-9: the key hints stay visible once the placeholder is gone. */}
+      <div className="flex items-center gap-3 px-1 pt-1 font-mono text-[10.5px] text-muted">
+        <span>enter send</span>
+        <span>shift+enter newline</span>
+        {streaming && <span className="text-amber">esc stop</span>}
       </div>
       </div>
     </div>

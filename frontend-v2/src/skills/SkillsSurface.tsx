@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
+import EmptyState from "../EmptyState";
 import LoadError from "../LoadError";
-import { readList } from "../lib/listFetch";
+import InlineError from "../InlineError";
+import { readList, responseError } from "../lib/listFetch";
 
 interface Skill {
   id: string;
@@ -18,6 +20,9 @@ export default function SkillsSurface() {
   const [editing, setEditing] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [rowErr, setRowErr] = useState<string | null>(null);
+  // IMP-10: the empty state's action focuses the create form below.
+  const nameRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
     // AUDIT F11-3: a 500's {detail} body used to be cast to Skill[] and reach
@@ -56,10 +61,13 @@ export default function SkillsSurface() {
                        onRetry={() => void refresh()} />
           )}
           {!loadErr && skills.length === 0 && (
-            <p className="text-muted text-[13px] mb-2">
-              No global skills yet. Create one below!
-            </p>
+            <EmptyState
+              title="no global skills yet"
+              body="A skill is a SKILL.md the model can pull into any chat with /skillName. Write one below."
+              actionLabel="create a skill"
+              onAction={() => nameRef.current?.focus()} />
           )}
+          {rowErr && <InlineError message={`could not delete: ${rowErr}`} />}
           <ul className="flex flex-col gap-1 mb-3">
             {skills.map((s) => (
               <li key={s.id}
@@ -76,11 +84,20 @@ export default function SkillsSurface() {
                   {s.content.slice(0, 50)}...
                 </span>
                 <button
-                  className="opacity-0 group-hover:opacity-100 text-muted hover:text-red px-1"
+                  className="text-muted hover:text-red px-1"
                   aria-label={`delete skill ${s.name}`}
                   onClick={async (e) => {
                     e.stopPropagation();
-                    await fetch(`/api/skills/${s.name}`, { method: "DELETE" });
+                    setRowErr(null);
+                    // AUDIT F11-4: this ignored r.ok and refreshed, so a
+                    // refused delete looked exactly like one that worked.
+                    const r = await fetch(
+                      `/api/skills/${encodeURIComponent(s.name)}`,
+                      { method: "DELETE" });
+                    if (!r.ok) {
+                      setRowErr(await responseError(r));
+                      return;
+                    }
                     if (editing === s.id) setEditing(null);
                     void refresh();
                   }}
@@ -112,6 +129,7 @@ export default function SkillsSurface() {
             }}
           >
             <input
+              ref={nameRef}
               value={draft.name}
               onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
               placeholder="skill name (e.g. wildcard)"

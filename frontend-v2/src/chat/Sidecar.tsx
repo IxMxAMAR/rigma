@@ -288,6 +288,7 @@ function GroundingCard() {
   const [path, setPath] = useState("");
   const [suggestions, setSuggestions] = useState<RagCandidate[]>([]);
   const [adding, setAdding] = useState<string | null>(null);
+  const [removeErr, setRemoveErr] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -392,14 +393,24 @@ function GroundingCard() {
           <li key={src} className="group flex items-center gap-1.5 font-mono text-[11.5px] text-secondary">
             <span className="flex-1 truncate" dir="rtl" title={src}>{src}</span>
             <button
-              className="opacity-0 group-hover:opacity-100 text-muted hover:text-red px-1"
+              // Keyboard reachable: opacity hides it but keeps it in the tab
+              // order, and focus-within makes it visible when it takes focus.
+              className="opacity-0 group-hover:opacity-100 focus-within:opacity-100 text-muted hover:text-red px-1"
               aria-label={`stop indexing ${src}`}
               onClick={async () => {
-                await fetch("/api/rag/sources", {
+                setRemoveErr(null);
+                // AUDIT F11-4: this ignored r.ok and refreshed, so a refused
+                // removal looked exactly like one that worked.
+                const r = await fetch("/api/rag/sources", {
                   method: "DELETE",
                   headers: { "content-type": "application/json" },
                   body: JSON.stringify({ path: src }),
-                });
+                }).catch(() => null);
+                if (!r || !r.ok) {
+                  setRemoveErr(r ? await responseError(r)
+                                 : "the request failed — is Rigma still up?");
+                  return;
+                }
                 void refresh();
               }}
             >
@@ -408,6 +419,11 @@ function GroundingCard() {
           </li>
         ))}
       </ul>
+      {removeErr && (
+        <p role="alert" className="font-mono text-[11px] text-red mt-1">
+          {removeErr}
+        </p>
+      )}
       {/* Folders raggity found, offered as one click each. The text box below
           stays: this is a suggestion, not a replacement, and a folder nobody
           guessed still has to be reachable. Nothing is indexed until clicked. */}
@@ -715,6 +731,20 @@ function SamplingCard() {
           ))}
         </select>
       </label>
+      {/* Native <option> never renders `title` — the popup is drawn by the OS,
+          not the page — so the sentence explaining WHY a backend is greyed out
+          sat on the one element that cannot show it (AUDIT F11-11). A disabled
+          option cannot be selected either, so the reason was unreachable by any
+          route. Render it for every unusable backend, under the picker. */}
+      {menu.some((h) => !h.runnable || !h.installed) && (
+        <ul className="flex flex-col gap-0.5 pl-24 pr-1">
+          {menu.filter((h) => !h.runnable || !h.installed).map((h) => (
+            <li key={h.name} className="text-[11px] text-muted leading-snug">
+              <span className="text-secondary">{h.label}</span> — {harnessHint(h)}
+            </li>
+          ))}
+        </ul>
+      )}
       {/* Said out loud, and only when it is TRUE. A backend that moved under us
           is the one thing about this seam the owner cannot see any other way:
           the turn keeps working right up until it quietly does not, and the

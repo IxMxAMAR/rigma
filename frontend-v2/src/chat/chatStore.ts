@@ -11,6 +11,7 @@ import { create } from "zustand";
 import { api, type ChatMessage, type SessionSummary } from "../lib/api";
 import { runMacroStream } from "../lib/methods";
 import { streamChat, type SseEvent } from "../lib/sse";
+import { DRAFT_KEY, parseDrafts, saveDrafts } from "./drafts";
 
 export interface Chip {
   id: string;
@@ -24,7 +25,6 @@ export interface StreamingTurn {
   text: string;
   thinking: string;
   chips: Chip[];
-  citations: unknown[];
   error: string | null;
   /** set while a macro drives this turn, so the UI can say which step */
   macro: { label: string; index: number; total: number } | null;
@@ -97,11 +97,18 @@ function without<T>(rec: Record<string, T>, key: string): Record<string, T> {
   return next;
 }
 
+/** IMP-1: drafts read once when the store is created, so a reload does not lose
+ *  a half-written message. Best-effort — a blocked localStorage (private mode)
+ *  must not stop the store from existing. */
+function loadDrafts(): Record<string, string> {
+  try { return parseDrafts(localStorage.getItem(DRAFT_KEY)); }
+  catch { return {}; }
+}
+
 export const emptyTurn = (): StreamingTurn => ({
   text: "",
   thinking: "",
   chips: [],
-  citations: [],
   error: null,
   macro: null,
   harness: "",
@@ -152,8 +159,12 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
       };
     case "macro_done":
       return { ...turn, macro: null };
-    case "citations":
-      return { ...turn, citations: (d.citations as unknown[]) ?? [] };
+    // AUDIT F11-12: a `citations` branch and StreamingTurn field lived here.
+    // No server code emits the event (grep over src/rigma/*.py finds only the
+    // RAG tool's plain-text `sources: …` line) and no component read the field
+    // (Transcript renders harness, macro, notices, thinking, chips, text,
+    // error). The half was removed rather than left looking like a pipeline
+    // that already handles citations; re-adding it needs a producer first.
     case "error":
       return { ...turn, error: String(d.message ?? "unknown error") };
     // Which backend owns this turn, named at its start. Its own event name
@@ -268,7 +279,7 @@ export const useChat = create<ChatState>((set, get) => ({
   pendingVariants: {},
   lastError: null,
   images: [],
-  drafts: {},
+  drafts: loadDrafts(),
   harness: "native",
   permission: "full",
 
@@ -302,6 +313,7 @@ export const useChat = create<ChatState>((set, get) => ({
       drafts: without(st.drafts, id),
       ...(st.currentId === id ? { currentId: null, messages: [] } : {}),
     }));
+    saveDrafts(get().drafts);
     await get().loadSessions();
   },
 
@@ -580,16 +592,21 @@ export const useChat = create<ChatState>((set, get) => ({
   removeImage: (i) =>
     set((st) => ({ images: st.images.filter((_, j) => j !== i) })),
 
-  setDraft: (text, sid) => set((st) => {
-    const key = sid ?? st.currentId ?? "";
-    if ((st.drafts[key] ?? "") === text) return {};
-    const drafts = { ...st.drafts };
-    // An empty draft leaves no entry behind, so the rail's unsent marker and
-    // the map itself cannot accumulate a key per chat the user ever typed in.
-    if (text) drafts[key] = text;
-    else delete drafts[key];
-    return { drafts };
-  }),
+  setDraft: (text, sid) => {
+    const key = sid ?? get().currentId ?? "";
+    if ((get().drafts[key] ?? "") === text) return;
+    set((st) => {
+      const drafts = { ...st.drafts };
+      // An empty draft leaves no entry behind, so the rail's unsent marker and
+      // the map itself cannot accumulate a key per chat the user ever typed in.
+      if (text) drafts[key] = text;
+      else delete drafts[key];
+      return { drafts };
+    });
+    // IMP-1: mirror to localStorage so a reload does not lose a half-written
+    // message. Best-effort and size-capped — see chat/drafts.ts.
+    saveDrafts(get().drafts);
+  },
 
   // Stop ABORTS, and only aborts. Persisting the partial is send()'s job,
   // where the transcript reload already lives — two writers racing over the
