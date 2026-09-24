@@ -47,6 +47,6 @@ def test_load_falls_back_to_bundled_without_cache(tmp_path, monkeypatch):
 def test_update_is_atomic_on_bad_zip(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(reg_mod, "_fetch_bytes", lambda url: b"not a zip")
-    with pytest.raises(Exception):
+    with pytest.raises(zipfile.BadZipFile, match="not a zip"):
         update_registry()
     assert not (tmp_path / "registry" / "gpus.json").exists()

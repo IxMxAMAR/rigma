@@ -14,6 +14,7 @@ import hashlib
 import threading
 
 import pytest
+from pydantic import ValidationError
 
 from rigma import hangar
 from rigma.hangar import HangarError
@@ -343,7 +344,7 @@ def test_refresh_still_forgets_a_flat_quant_that_was_never_downloaded(home):
 # the writes have no equivalent.
 
 def _rejects(name):
-    with pytest.raises(Exception) as ei:
+    with pytest.raises(ValidationError) as ei:
         GgufFile(repo="acme/spicy", file=name, bytes=16, quant="Q4_K_M")
     return str(ei.value)
 
