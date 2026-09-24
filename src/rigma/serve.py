@@ -4428,6 +4428,52 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return ""
         return "ADVISOR: " + text[:400]
 
+    async def _save_guarded(session: dict, tries: int = 3) -> dict:
+        """Save a whole session row against the revision it was loaded at.
+
+        R3-2: the run loop's post-turn section takes ONE load and then writes
+        it back from several places; every one of those writes is a whole-row
+        replace, so an unguarded one erases whatever a second writer landed
+        between the load and the write. On a lost race the row is reloaded and
+        the SAME mutation is re-applied to the fresh row (the caller mutates
+        before calling). Returns the row now in the store — the fresh one after
+        a retry — so the caller's later reads see what actually persisted.
+        A row that vanished (deleted mid-turn) is returned as-is; nothing here
+        resurrects a chat the user removed.
+        """
+        for _ in range(tries):
+            try:
+                await asyncio.to_thread(sessions.save, session,
+                                        base_rev=session[sessions.REV_KEY])
+                return session
+            except sessions.StaleWriteError:
+                fresh = await asyncio.to_thread(sessions.load, session["id"])
+                if fresh is None:
+                    return session
+                # carry this writer's change onto the row that won
+                for k, v in session.items():
+                    if k not in ("messages", sessions.REV_KEY):
+                        fresh.setdefault(k, v)
+                session = fresh
+        return session
+
+    async def _append_guarded(session: dict, entry: dict,
+                              tries: int = 3) -> dict:
+        """`_save_guarded` for the one case that is an append: the entry goes on
+        the FRESH row after a reload, so a retry never duplicates it."""
+        for _ in range(tries):
+            session["messages"].append(entry)
+            try:
+                await asyncio.to_thread(sessions.save, session,
+                                        base_rev=session[sessions.REV_KEY])
+                return session
+            except sessions.StaleWriteError:
+                fresh = await asyncio.to_thread(sessions.load, session["id"])
+                if fresh is None:
+                    return session
+                session = fresh
+        return session
+
     async def _run_loop(run_id):
         import time as _time
 
@@ -4778,7 +4824,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         # ever sees. Truncating hard here silently turns
                         # read_file into "read the first 1200 bytes". Tools
                         # already cap their own output; compaction reclaims it.
-                        s4["messages"].append({
+                        entry = {
                             "role": "user",
                             # tagged so observation masking can find these
                             # structurally instead of sniffing the text prefix.
@@ -4790,8 +4836,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             "content": "\n".join(
                                 f"TOOL RESULT {t.get('name')}: "
                                 + _clip(str(t.get("result", "")), RESULT_MAX)
-                                for t in trace)})
-                        await asyncio.to_thread(sessions.save, s4)
+                                for t in trace)}
+                        # R3-2: GUARDED, the way the driving-line write above is
+                        # (AUDIT 03-5). This whole-row save used to go out with
+                        # no base_rev against the snapshot taken at "ONE load
+                        # for the whole post-turn section" — and there are two
+                        # awaits between that load and here (the two
+                        # append_action/log_tool_action calls), so a rename, a
+                        # PATCH, or any other writer that landed in the window
+                        # was silently erased by this write. On a stale write,
+                        # reload and re-append: the tool result is this turn's
+                        # own work and the other writer's message is not ours
+                        # to drop.
+                        s4 = await _append_guarded(s4, entry)
                         session = s4
                 ext = sum(1 for t in trace if t.get("name") in _EXTERNAL_TOOLS)
                 run["external_calls"] = run.get("external_calls", 0) + ext
@@ -4799,8 +4856,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         and (session or {}).get("run_profile") != "no-network"):
                     s3 = session
                     if s3:
+                        # R3-2: same guard as the tool-result write above — this
+                        # is a whole-row save off the post-turn snapshot, and
+                        # awaits have happened since it was taken.
                         s3["run_profile"] = "no-network"
-                        await asyncio.to_thread(sessions.save, s3)
+                        s3 = await _save_guarded(s3)
+                        session = s3
                     _runs.append_progress(run_id, "external-API budget reached — "
                                           "network tools disabled", "continue "
                                           "offline", run.get("workspace", ""))
@@ -5063,9 +5124,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             _run_tasks.pop(run_id, None)
             s2 = sessions.load(sid)
             if s2 is not None and s2.get("mission"):
-                s2["mission"] = ""
-                s2["run_id"] = ""
-                sessions.save(s2)
+                # R3-2: the LAST unguarded whole-row save in the run. The chat's
+                # own UI is back on this session the moment the run ends (the
+                # rail hides it only while the run is active), so a message that
+                # landed between this load and this write — the owner typing the
+                # instant the run stopped — was erased by it. Guarded, with one
+                # retry: the fields this write owns are cleared on whatever row
+                # won the race, and nothing else in the row is touched.
+                for _try in range(3):
+                    s2["mission"] = ""
+                    s2["run_id"] = ""
+                    try:
+                        sessions.save(s2, base_rev=s2[sessions.REV_KEY])
+                        break
+                    except sessions.StaleWriteError:
+                        fresh2 = sessions.load(sid)
+                        if fresh2 is None:
+                            break
+                        s2 = fresh2
             r = _runs.load(run_id)
             if r:
                 try:
