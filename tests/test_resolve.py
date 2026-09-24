@@ -281,3 +281,93 @@ def test_resolver_prefers_on_disk_quants(tmp_path, monkeypatch):
                            disk_free_gb=100.0)
     plan = resolve(prof, reg, model_override="m")
     assert plan.gguf.quant == "IQ3_M",         f"picked {plan.gguf.quant} — locality must beat quality"
+
+
+# --- F23/F24: the curated-combo path had no fit check and could crash ---------
+
+COMBO_REL = "amd/amd-radeon-rx-9070-xt-16g/ram-16/coding.json"
+
+
+def _broken_combo_registry(**update):
+    """The shipped registry with the ram-16 coding combo replaced."""
+    from rigma.models import Combo
+    r = Registry.load()
+    base = r.combos[COMBO_REL]
+    combos = dict(r.combos)
+    combos[COMBO_REL] = Combo.model_validate(
+        {**base.model_dump(), **update}) if update else base
+    return Registry(r.gpus, r.models, combos, r.use_cases)
+
+
+def _pressured(used_mb, ram_free=20000, ram_mb=16234):
+    """The reference card with `used_mb` of its VRAM held by the desktop."""
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    gpu = GpuInfo(vendor="amd", name="AMD Radeon RX 9070 XT", vram_mb=16368,
+                  arch="rdna4", slug="amd-radeon-rx-9070-xt-16g",
+                  backends=["vulkan", "rocm"])
+    return HardwareProfile(gpus=[gpu], ram_mb=ram_mb, ram_free_mb=ram_free,
+                           cpu=CpuInfo(cores=16), os="windows",
+                           disk_free_gb=400.0, vram_used_mb=used_mb)
+
+
+def test_a_combo_naming_an_unknown_model_raises_resolve_error():
+    """`spec = registry.models[combo.model]` was an unguarded subscript, so a
+    registry snapshot that dropped a model killed up/plan/sweep with a raw
+    KeyError where every other failure raises ResolveError — and cli.py catches
+    only ResolveError (AUDIT F24)."""
+    import pytest
+
+    from rigma.resolve import ResolveError
+    broken = _broken_combo_registry(model="ghost-model")
+    with pytest.raises(ResolveError) as e:
+        resolve(_profile(ram_free=20000), broken, use_case="coding")
+    msg = str(e.value)
+    assert "ghost-model" in msg and "rigma update" in msg
+
+
+def test_a_combo_naming_an_unknown_quant_raises_resolve_error():
+    """The bare `next(...)` raised StopIteration, which is not even an
+    Exception subclass a caller could have caught (AUDIT F24)."""
+    import pytest
+
+    from rigma.resolve import ResolveError
+    broken = _broken_combo_registry(quant="NO_SUCH_QUANT")
+    with pytest.raises(ResolveError) as e:
+        resolve(_profile(ram_free=20000), broken, use_case="coding")
+    msg = str(e.value)
+    assert "NO_SUCH_QUANT" in msg and "does not list" in msg
+
+
+def test_a_combo_verified_for_more_headroom_than_this_box_has_is_rejected():
+    """The combo path returned its stored flags with no fit check at all — the
+    combo's own declared `budget` was read nowhere in the codebase — so on a
+    pressured desktop `rigma sweep` benchmarked an over-budget config and could
+    crown a winner picked by paging noise (AUDIT F23).
+
+    The ram-16 coding combo declares `budget.vram_mb = 15200`; a desktop
+    holding 8.7GB of the card leaves 7.4GB usable."""
+    r = Registry.load()
+    assert r.combos[COMBO_REL].budget is not None, "fixture drifted"
+    plan = resolve(_pressured(used_mb=8780), r, use_case="coding")
+    assert plan.origin == "calculator", plan.explain
+    assert plan.explain[0].startswith("registry"), plan.explain
+    assert "NOT used" in plan.explain[0] and "15200" in plan.explain[0], \
+        plan.explain[0]
+
+
+def test_a_combo_the_machine_still_has_the_headroom_for_is_kept():
+    r = Registry.load()
+    plan = resolve(_pressured(used_mb=0), r, use_case="coding")
+    assert plan.origin.startswith("combo:"), plan.explain
+
+
+def test_a_combo_whose_placement_no_longer_exists_falls_through():
+    """Even with no declared budget the placement has to still EXIST: a combo
+    verified at 32K is not usable on a box that can no longer place it at
+    all (AUDIT F23)."""
+    broken = _broken_combo_registry(budget=None)
+    plan = resolve(_profile(vram=1024, ram_free=1000), broken,
+                   use_case="coding")
+    assert plan.origin == "calculator", plan.explain
+    assert any("can no longer be placed" in line for line in plan.explain), \
+        plan.explain
