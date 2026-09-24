@@ -2612,13 +2612,16 @@ def _read_file(args, ctx):
     # calls were emitted before either result returned.
     #
     # Keyed on the RESOLVED path plus mtime and size, so a read after a write
-    # returns the new content, and on offset/limit so paging still works.
+    # returns the new content, and on offset/limit so paging still works, and on
+    # `numbered` because that call returns DIFFERENT text (AUDIT 05-5): without
+    # it the numbered re-read of unchanged bytes was refused as "already read",
+    # leaving the model without the handle edit_file(start_line=…) needs.
     seen = ctx.get("_reads")
     if seen is not None:
         try:
             st = p.stat()
             key = (str(p.resolve()).lower(), st.st_mtime_ns, st.st_size,
-                   offset, limit)
+                   offset, limit, bool(args.get("numbered")))
         except OSError:
             key = None
         if key is not None:
