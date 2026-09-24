@@ -37,11 +37,16 @@ _PATTERNS: list[tuple[str, re.Pattern, str, str, bool]] = [
      "a setting.",
      True),
     ("swa_disabled",
-     re.compile(r"n_swa\s*=\s*0|swa.*will be disabled", re.I),
+     # AUDIT 02-6: this used to be `n_swa\s*=\s*0|swa.*will be disabled`. The
+     # first alternative is a bare `key = value` parameter dump, not a warning,
+     # so a non-SWA model's hparams line reported a no-op for a flag Rigma never
+     # passes (grep: `--swa-full` appears nowhere in the launch path). Require
+     # the warning shape — `swa` AND `disabl` on the same line.
+     re.compile(r"swa.*disabl", re.I),
      "info",
-     "--swa-full is a no-op here: the engine reports no sliding window, so the "
-     "flag disables itself. On hybrid models the reprocessing trigger is the "
-     "recurrent component, which that flag does not touch.",
+     "The engine reports no sliding window, so it disabled SWA. Nothing to fix: "
+     "it is a property of this architecture, not a setting. On hybrid models the "
+     "reprocessing trigger is the recurrent component, which SWA does not touch.",
      False),
     ("checkpoint_cascade",
      re.compile(r"erasing.*checkpoint|checkpoint.*eras|no checkpoint found",
