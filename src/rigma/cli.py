@@ -677,6 +677,12 @@ def harness(backend: str = typer.Option(None, "--backend", "-b",
         else:
             state = "unverified - no build of this has been checked"
         typer.echo(f"{r['name']:<8} {state}")
+    # Drift is the one outcome this command exists to surface, and it used to
+    # exit 0 either way — so `rigma harness && ...` was a green light on a
+    # backend whose event schema nobody has checked. `unverified` (drift is
+    # None) stays a success on purpose: nobody can say anything changed.
+    if any(r.get("drift") is True for r in rows):
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -1279,7 +1285,14 @@ def stop():
     # AUDIT F08-1: this used to print "stopped" unconditionally, so a record
     # whose pid had been recycled read as a successful stop while the process
     # it now named was left running — or, before the identity check, killed.
-    typer.echo("stopped" if killed else "stale state — nothing was killed")
+    if killed:
+        typer.echo("stopped")
+    else:
+        # The message was already honest; the EXIT CODE was not. A caller that
+        # only reads the status could not tell a stop that happened from a stop
+        # that found nothing to stop — `rigma stop && rigma up` walked past it.
+        typer.echo("stale state — nothing was killed")
+        raise typer.Exit(1)
 
 
 def _serve_or_exit(port: int) -> None:

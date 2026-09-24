@@ -211,6 +211,84 @@ def test_stop_when_not_running(tmp_path, monkeypatch):
     assert res.exit_code == 0 and "not running" in res.output.lower()
 
 
+def test_stop_says_so_in_its_exit_code_when_it_stopped_nothing(
+        tmp_path, monkeypatch):
+    """A stale record is not a successful stop.
+
+    The message was honest — "stale state — nothing was killed" — and the exit
+    code was 0 either way, so `rigma stop && rigma up` walked straight past a
+    stop that did not happen, and a script could not tell the two apart at all.
+
+    The record here names a pid that IS alive (this test process) with a
+    create time that does not match it, which is exactly what a recycled pid
+    looks like to `kill_recorded`. Nothing is killed: the identity check
+    refuses, and that refusal is what has to reach the exit code.
+    """
+    import json as _json
+    import os as _os
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import state as st
+    st.write_state("m", "q4", 11500, engine_pid=-1, ui_pid=-1, backend="",
+                   use_case="general", ctx=0, unloaded=True)
+    path = st.state_path()
+    rec = _json.loads(path.read_text(encoding="utf-8"))
+    rec["ui_pid"] = _os.getpid()          # alive, but not the recorded process
+    rec["ui_started_at"] = 1.0
+    path.write_text(_json.dumps(rec), encoding="utf-8")
+    assert st._is_recorded_process(_os.getpid(), 1.0) is False
+
+    res = runner.invoke(cli.app, ["stop"])
+    assert "stale state" in res.output.lower(), res.output
+    assert res.exit_code == 1, res.output
+
+
+def test_stop_that_stopped_something_exits_zero(tmp_path, monkeypatch):
+    """The other direction: the honest success must stay a success."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import state as st
+    st.write_state("m", "q4", 11500, engine_pid=-1, ui_pid=-1, backend="",
+                   use_case="general", ctx=0, unloaded=True)
+    killed = []
+    monkeypatch.setattr(st, "kill_recorded",
+                        lambda s, key: killed.append(key) or True)
+    res = runner.invoke(cli.app, ["stop"])
+    assert res.exit_code == 0, res.output
+    assert killed
+
+
+def test_harness_exits_nonzero_when_the_build_drifted(monkeypatch):
+    """`rigma harness` exists to be the thing that notices. Reporting drift in
+    its output while exiting 0 makes `rigma harness && deploy` a green light on
+    a backend whose event schema nobody has checked."""
+    import dataclasses
+
+    from rigma import harness as seam
+    from rigma import harness_mcode
+
+    monkeypatch.setattr(harness_mcode, "backend_version",
+                        lambda exe=None: "0.5.4")
+    monkeypatch.setitem(seam.BACKENDS, "mcode", dataclasses.replace(
+        seam.BACKENDS["mcode"], verified="0.5.1", probe=lambda: True))
+    res = runner.invoke(cli.app, ["harness", "-b", "mcode"])
+    assert "DRIFTED" in res.output, res.output
+    assert res.exit_code == 1, res.output
+
+
+def test_harness_exits_zero_when_nothing_drifted(monkeypatch):
+    import dataclasses
+
+    from rigma import harness as seam
+    from rigma import harness_mcode
+
+    monkeypatch.setattr(harness_mcode, "backend_version",
+                        lambda exe=None: "0.5.1")
+    monkeypatch.setitem(seam.BACKENDS, "mcode", dataclasses.replace(
+        seam.BACKENDS["mcode"], verified="0.5.1", probe=lambda: True))
+    res = runner.invoke(cli.app, ["harness", "-b", "mcode"])
+    assert res.exit_code == 0, res.output
+
+
 def test_up_dry_run_ui_only(tmp_path, monkeypatch):
     # bare `up` now starts the UI with no model — dry-run says exactly that
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
