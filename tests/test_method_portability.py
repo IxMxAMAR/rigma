@@ -101,3 +101,15 @@ def test_an_imported_method_is_a_user_method(client):
     assert r.status_code == 200
     assert r.json()["builtin"] is False
     assert r.json()["id"] != "book"      # the built-in is not clobbered
+
+
+@pytest.mark.parametrize("bad", ["boom", 5, {"a": 1}])
+def test_import_with_a_wrong_typed_component_list_is_a_400(home, bad):
+    """10-2: import is the endpoint you use to REPAIR a broken method file, so
+    a wrong-typed component list must answer the documented 400 with an errors
+    array, not an unhandled 500 from dict(c) before the shape guard runs."""
+    c = TestClient(build_app(upstream_port=1), raise_server_exceptions=False)
+    r = c.post("/api/methods/import",
+               json={"id": "badshape", "name": "Bad", "macros": bad})
+    assert r.status_code == 400, r.text
+    assert any("macros" in e for e in r.json()["errors"]), r.json()
