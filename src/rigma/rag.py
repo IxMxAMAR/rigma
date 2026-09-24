@@ -31,11 +31,24 @@ def raggity_cmd() -> list[str] | None:
 
 
 def load_sources() -> list[str]:
+    """The configured source folders/globs. Anything that is not a list of
+    strings reads as "no sources".
+
+    AUDIT 10-7: sources.json is documented as user-editable ("edit sources via
+    `rigma rag add`"), so it can be truncated or hand-edited. Returning the
+    parsed value unchecked handed a dict/str/int to add_source (AttributeError
+    -> 500 on POST /api/rag/sources) and to the Grounding card's sources.length
+    (undefined, so the card said "no folders indexed" while folders WERE
+    configured).
+    """
     p = rag_dir() / "sources.json"
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return []
+    if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+        return []
+    return data
 
 
 def _source_globs() -> list[str]:

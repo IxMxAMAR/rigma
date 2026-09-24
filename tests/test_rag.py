@@ -216,3 +216,26 @@ def test_ensure_sidecar_records_an_identity(home, monkeypatch):
         encoding="utf-8"))
     assert info == {"pid": 4321, "port": DEAD_PORT, "created_at": 1234.5}
 
+
+# --- 10-7: sources.json must be a list of strings ----------------------------
+
+@pytest.mark.parametrize("bad", [{"a": 1}, "just a string", 5, ["ok", 7], None])
+def test_load_sources_rejects_anything_but_a_list_of_strings(home, bad):
+    """sources.json is documented as user-editable, so a truncated or
+    hand-edited file must read as "no sources", not hand a dict/str/int to
+    add_source (AttributeError -> 500 on POST /api/rag/sources) or to the UI's
+    sources.length (which reads as "no folders indexed" while folders ARE
+    configured)."""
+    rag.rag_dir().mkdir(parents=True, exist_ok=True)
+    (rag.rag_dir() / "sources.json").write_text(json.dumps(bad),
+                                                encoding="utf-8")
+    assert rag.load_sources() == []
+
+
+def test_add_source_recovers_from_a_wrong_typed_sources_file(home, monkeypatch):
+    monkeypatch.chdir(home)
+    rag.rag_dir().mkdir(parents=True, exist_ok=True)
+    (rag.rag_dir() / "sources.json").write_text('{"a": 1}', encoding="utf-8")
+    (home / "docs").mkdir()
+    assert rag.add_source("docs") == [str((home / "docs").resolve())]
+
