@@ -158,7 +158,138 @@ def test_reasoning_becomes_thinking():
     assert [e.text for e in of_kind(got, "thinking")] == ["let me think"]
 
 
-def test_a_tool_call_is_announced_once_and_answered_once():
+def test_a_malformed_nested_object_is_skipped_not_fatal():
+    """The adapter's own promise is "a malformed line is a skipped line".
+
+    It held for the OUTER object and stopped there: `map_event` did
+    `item.get(...)` / `toolCall.get(...)` / `error.get(...)` on whatever was
+    nested, so one event whose `item`, `toolCall` or `error` was a string or a
+    list raised AttributeError out of the read loop. `drive_turn` catches that
+    as "mcode stream failed", so a turn that had already streamed half its
+    reply ended in an error and the rest of the stream was thrown away — the
+    same shape 09-2 fixed on the MCP client, one level down.
+    """
+    for bad in ("hot", [1], 7, None):
+        for obj in (
+            {"type": "item.started", "item": bad},
+            {"type": "item.started",
+             "item": {"id": "c", "type": "tool_call", "toolCall": bad}},
+        ):
+            seen: dict = {}
+            assert harness_mcode.map_event(obj, seen) == [], obj
+        # a malformed `error` still has to say the turn failed — it just may
+        # not raise on the way
+        got = harness_mcode.map_event({"type": "turn.failed", "error": bad}, {})
+        assert [e.kind for e in got] == ["error"], got
+        assert got[0].text
+
+
+def test_one_malformed_event_does_not_end_the_turn(fake_cli):
+    """End to end through the real drive_turn: the reply must survive."""
+    import os as _os
+    events = list(TEXT_TURN)
+    events.insert(4, _item(99, "item.started",
+                           {"id": "c", "type": "tool_call",
+                            "toolCall": "bash"}))
+    _os.environ["FAKE_MCODE_EVENTS"] = json.dumps(events)
+    got = list(harness_mcode.drive_turn(
+        base_url=BASE, model="local-test", prompt="p", state={}, timeout=30))
+    assert not [e for e in got if e.kind == "error"], got
+    assert "".join(e.text for e in got if e.kind == "text") == "hello from dsh"
+
+
+def test_a_stream_failure_does_not_leak_the_child(fake_cli, monkeypatch):
+    """A driver failure must not outlive the turn it belonged to.
+
+    Checked rather than assumed: `drive_turn`'s defensive `except` is above a
+    `finally`, so the child IS reaped on that path — this test is what says so,
+    and it fails the day the `finally` is restructured away.
+    """
+    import os as _os
+    _os.environ["FAKE_MCODE_EVENTS"] = json.dumps(TEXT_TURN)
+
+    def boom(obj, seen):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(harness_mcode, "map_event", boom)
+    proc_seen = {}
+    real_popen = harness_mcode.subprocess.Popen
+
+    def spy(*a, **k):
+        p = real_popen(*a, **k)
+        proc_seen["p"] = p
+        return p
+
+    monkeypatch.setattr(harness_mcode.subprocess, "Popen", spy)
+    got = list(harness_mcode.drive_turn(
+        base_url=BASE, model="local-test", prompt="p", state={}, timeout=30))
+    assert [e.kind for e in got] == ["error"], got
+    p = proc_seen["p"]
+    assert p.poll() is not None, "the mcode child outlived the failed turn"
+    assert p.stdout.closed, "the stdout pipe was left open"
+
+
+def test_the_memo_is_per_turn_not_per_process():
+    """A process-wide memo would drop a legitimate item in a later turn whose
+    id happened to repeat. `map_event` must work off the caller's dict."""
+    obj = _item(1, "item.completed",
+                {"id": "same-id", "type": "agent_message", "content": "one"})
+    first = harness_mcode.map_event(obj, {})
+    second = harness_mcode.map_event(obj, {})
+    assert [e.text for e in first] == ["one"]
+    assert [e.text for e in second] == ["one"]
+
+
+def test_a_build_we_were_not_verified_against_says_so_in_the_turn(fake_cli,
+                                                                  monkeypatch):
+    """The whole point of `VERIFIED` is that a released backend can change shape
+    while every turn still LOOKS fine — a renamed item type drops tool calls
+    from the transcript and the reply still arrives.
+
+    `harness.conformance` knows how to say that, but it only runs from
+    `rigma harness` and the menu's `?check=1`. Nothing on the TURN path
+    compared anything, so installing 0.5.4 and chatting produced a normal-
+    looking turn on a build nobody measured. The turn is where the owner is.
+    """
+    monkeypatch.setenv("FAKE_MCODE_VERSION", "0.5.4")
+    monkeypatch.setattr(harness_mcode, "_DRIFT_SAID", False)
+    got = list(harness_mcode.drive_turn(
+        base_url=BASE, model="local-test", prompt="p", state={}, timeout=30))
+    notes = [e.text for e in got if e.kind == "notice"]
+    assert any("0.5.1" in n and "0.5.4" in n for n in notes), notes
+    # the turn still runs: drift is a warning, not a refusal
+    assert "".join(e.text for e in got if e.kind == "text") == "hello from dsh"
+
+
+def test_a_build_we_were_verified_against_is_not_a_notice(fake_cli, monkeypatch):
+    monkeypatch.setenv("FAKE_MCODE_VERSION", "0.5.1")
+    monkeypatch.setattr(harness_mcode, "_DRIFT_SAID", False)
+    got = list(harness_mcode.drive_turn(
+        base_url=BASE, model="local-test", prompt="p", state={}, timeout=30))
+    assert not [e for e in got if "0.5.1" in e.text and e.kind == "notice"], got
+
+
+def test_the_drift_notice_is_said_once_not_every_turn(fake_cli, monkeypatch):
+    """One subprocess per process, and one line in the transcript — a warning
+    repeated every turn is noise the reader learns to skip."""
+    monkeypatch.setenv("FAKE_MCODE_VERSION", "0.5.4")
+    monkeypatch.setattr(harness_mcode, "_DRIFT_SAID", False)
+    calls = []
+    real = harness_mcode.backend_version
+
+    def counted(exe=None):
+        calls.append(exe)
+        return real(exe)
+
+    monkeypatch.setattr(harness_mcode, "backend_version", counted)
+    for _ in range(2):
+        got = list(harness_mcode.drive_turn(
+            base_url=BASE, model="local-test", prompt="p", state={}, timeout=30))
+    assert len(calls) == 1, calls
+    assert got  # the second turn still ran
+
+
+def test_a_tool_call_that_is_announced_once_and_answered_once():
     """mcode re-emits one item four times as it progresses. Without the memo a
     single call becomes four chips — the wrong-row class this project has
     already paid for once."""
@@ -247,6 +378,12 @@ if log:
     with open(log, "a", encoding="utf-8") as f:
         f.write(json.dumps(argv) + "\\n")
 cmd = argv[0] if argv else ""
+if cmd in ("--version", "-V"):
+    # The real CLI answers a stable semver here; `harness.conformance` and the
+    # drift notice both read it. Default it to the build this adapter was
+    # measured against, so a test that wants drift has to ask for it.
+    print(os.environ.get("FAKE_MCODE_VERSION", "0.5.1"))
+    sys.exit(0)
 if cmd == "provider":
     action = argv[1] if len(argv) > 1 else ""
     store = os.environ.get("FAKE_MCODE_PROVIDERS_FILE") or ""

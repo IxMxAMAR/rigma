@@ -352,8 +352,8 @@ def resolve(name: str | None, *, port: int | None = None) -> Harness:
 _ADAPTERS = {DSH: "harness_dsh", MCODE: "harness_mcode"}
 
 
-def kill_tree(proc) -> None:
-    """Kill a backend process AND everything it started.
+def kill_tree(proc) -> bool:
+    """Kill a backend process AND everything it started. True when it worked.
 
     An adapter is handed a `.cmd` shim on Windows, so the process Rigma holds is
     a SHELL whose real work is a grandchild. Killing only the shell leaves the
@@ -364,17 +364,30 @@ def kill_tree(proc) -> None:
 
     Killing the tree is also what stops an agent's SUBAGENTS. The arm spawns
     child agents of its own, and a stop that leaves them running is not a stop.
+
+    Returns whether the TREE is known to be gone, because the failure is
+    otherwise invisible: `proc.kill()` below still takes the direct child, so
+    the turn ends normally while the grandchild keeps running against the model
+    server and holding VRAM. A caller that reports "was killed" without asking
+    is reporting something it did not do.
     """
     if os.name == "nt":
         try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=20)
+            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                  capture_output=True, timeout=20)
+            ok = getattr(done, "returncode", 0) == 0
         except (OSError, subprocess.TimeoutExpired):
-            pass                    # fall through: proc.kill still gets the shell
+            ok = False              # fall through: proc.kill still gets the shell
+    else:
+        # POSIX: there is no job object here, so `proc.kill()` reaches only the
+        # direct child. Reported as unknown rather than as success — a claim of
+        # a tree kill this branch cannot make is the bug this return exists for.
+        ok = False
     try:
         proc.kill()
     except OSError:
         pass
+    return ok
 
 
 def adapter(name: str):
