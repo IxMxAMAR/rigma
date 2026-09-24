@@ -1063,3 +1063,69 @@ def test_a_disconnect_cancels_the_rounds_eager_tool_tasks(home, engine,
     assert armed.is_set(), "the delegate never reached the engine"
     assert any(tasks for tasks in seen), (
         "the eager delegate task was abandoned without being cancelled")
+
+
+# --------------------------------------------------------------------------
+# 02-4 — an external harness turn leaked its pump thread and subprocess
+
+
+def test_a_disconnect_stops_an_external_agent_and_keeps_the_partial_reply(
+        home, engine, monkeypatch):
+    """AUDIT 02-4: `_external_turn` had no try/finally.
+
+    A client disconnect throws GeneratorExit / CancelledError at its current
+    `yield`, which unwound straight past `await task` and the save. Nothing set
+    the adapter's `cancel`, so the harness subprocess — and every subagent it
+    owns — kept running and billing against Rigma's /v1 while its events piled
+    into a queue with no consumer. The native loop already had this teardown
+    (AUDIT F7); the external path did not.
+    """
+    import asyncio
+
+    from rigma import harness_dsh
+
+    monkeypatch.setenv("RIGMA_HOME", str(home))
+    monkeypatch.setattr(harness_dsh, "available", lambda: True)
+    cancels: list = []
+    stopped = threading.Event()
+
+    def _drive(**kw):
+        cancels.append(kw.get("cancel"))
+        yield harness_dsh.TurnEvent("text", text="half ")
+        cancel = kw.get("cancel")
+        deadline = time.time() + 5.0        # never hangs the suite, cancel or not
+        while (cancel is not None and not cancel.is_set()
+               and time.time() < deadline):
+            time.sleep(0.01)
+        stopped.set()
+
+    monkeypatch.setattr(harness_dsh, "drive_turn", _drive)
+    _running()
+    c = _client(engine.port)
+    sid = c.post("/api/sessions", json={}).json()["id"]
+    s = sessions.load(sid)
+    s["harness"] = "dsh"
+    s["messages"] = [{"role": "user", "content": "go"}]
+    sessions.save(s)
+    app = build_app(upstream_port=engine.port)
+
+    async def scenario():
+        # chunk 1 is the harness badge, 2 the external notice, 3 the first
+        # delta — so the disconnect lands with the agent mid-turn
+        got = await _stream(app, f"/api/sessions/{sid}/chat",
+                            {"message": "go"}, stop_after=3)
+        for _ in range(200):                # let the pump thread see the cancel
+            if stopped.is_set():
+                break
+            await asyncio.sleep(0.01)
+        return got
+
+    got = asyncio.run(scenario())
+
+    assert got["status"] == 200, got
+    assert cancels and cancels[0] is not None, "no cancel event was handed over"
+    assert cancels[0].is_set(), "the client disconnect never stopped the agent"
+    stored = sessions.load(sid)
+    assert stored["messages"][-1]["role"] == "assistant", stored["messages"]
+    assert "half " in stored["messages"][-1]["content"], (
+        "the partial reply was thrown away with the disconnect")
