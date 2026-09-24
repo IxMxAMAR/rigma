@@ -1,9 +1,14 @@
-"""Headless-browser smoke of the Cockpit UI against the smoke server."""
+"""Headless-browser smoke of the LEGACY Cockpit UI against the smoke server.
+
+`/` serves the v2 React shell (the cutover); the complete legacy UI — the DOM
+this script drives — now lives at `/rizz`. See smoke_browser_v2.py for the
+shell that actually ships.
+"""
 import sys
 
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:18500"
+BASE = "http://127.0.0.1:18500/rizz"
 SHOT = sys.argv[1] if len(sys.argv) > 1 else "cockpit-smoke.png"
 failures = []
 console_errors = []
