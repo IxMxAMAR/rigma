@@ -186,7 +186,7 @@ def test_the_draft_cache_is_budgeted_before_the_fit(tmp_path, monkeypatch):
                    ui_pid=os.getpid(), backend="vulkan", ctx=4096)
     server_ops.perform_switch("seer", registry=reg, profile=_profile(),
                               ctx=32768)
-    want = draft_cache_mb(reg.models["seer"], 32768, "f16", "ngram-simple", 1)
+    want = draft_cache_mb(reg.models["seer"], 32768, "ngram-simple", 1)
     assert want > 0
     assert fits[-1].mmproj is not None, "the draft cache needs an overhead slot"
     assert fits[-1].mmproj.bytes == int(want * 2**20)

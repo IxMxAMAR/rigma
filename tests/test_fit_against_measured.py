@@ -109,7 +109,7 @@ def test_speculation_reserves_its_draft_cache(profile, spec):
     paper and paged in practice."""
     from rigma.resolve import draft_cache_mb
     # measured: 465 MiB at 16K, 565 MiB at 32K
-    assert 440 <= draft_cache_mb(spec, 16384, "q4_0", "draft-mtp", 1) <= 490
-    assert 540 <= draft_cache_mb(spec, 32768, "q4_0", "draft-mtp", 1) <= 590
+    assert 440 <= draft_cache_mb(spec, 16384, "draft-mtp", 1) <= 490
+    assert 540 <= draft_cache_mb(spec, 32768, "draft-mtp", 1) <= 590
     # no speculation, no reservation
-    assert draft_cache_mb(spec, 32768, "q4_0", "none", 0) == 0
+    assert draft_cache_mb(spec, 32768, "none", 0) == 0

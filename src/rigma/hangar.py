@@ -301,7 +301,7 @@ def moe_from_probe(f: dict, biggest_bytes: int) -> MoESpec | None:
 def spec_fields_from_probe(f: dict) -> dict:
     """The probed facts every ModelSpec carries, in one place so install,
     remote-add and healing cannot drift apart."""
-    return {"n_layers": f["n_layers"],
+    return {"n_layers": max(1, f["n_layers"]),
             "full_attn_layers": f["full_attn_layers"],
             "kv_heads": f["kv_heads"], "head_dim": f["head_dim"],
             "native_ctx": max(2048, f["native_ctx"]),
