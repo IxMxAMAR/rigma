@@ -26,22 +26,55 @@ def _main(ctx: typer.Context,
         raise typer.Exit(0)
 
 
-def _port_holder(port: int) -> str:
-    import socket
-    with socket.socket() as s:
-        try:
-            s.bind(("127.0.0.1", port))
-            return ""
-        except OSError:
-            pass
+def _listening_pid(port: int):
+    """The pid LISTENing on `port` on ANY address, or None.
+
+    AUDIT F16-1: the bind probe in `_port_holder` is address-specific. On
+    Windows a bind to 127.0.0.1:port SUCCEEDS while another process already
+    listens on 0.0.0.0:port, because the two addresses do not overlap unless
+    SO_EXCLUSIVEADDRUSE is set — so the psutil fallback, which only ran after a
+    bind FAILURE, never ran in exactly the case it was written for.
+    """
     try:
         import psutil
         for c in psutil.net_connections(kind="tcp"):
-            if c.laddr and c.laddr.port == port and c.status == "LISTEN" and c.pid:
-                return f" (held by pid {c.pid}: {psutil.Process(c.pid).name()})"
+            if (c.laddr and c.laddr.port == port and c.status == "LISTEN"
+                    and c.pid):
+                return c.pid
     except Exception:
         pass
-    return " (holder unknown)"
+    return None
+
+
+def _port_holder(port: int) -> str:
+    import socket
+    free = False
+    with socket.socket() as s:
+        # Windows-only: makes the probe bind conflict with a wildcard listener
+        # on the same port instead of silently overlapping it (see above).
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        try:
+            s.bind(("127.0.0.1", port))
+            free = True
+        except OSError:
+            pass
+    # Consult the OS regardless of how the bind went: a wildcard listener on
+    # this port is a conflict even when our specific-address bind succeeded.
+    pid = _listening_pid(port)
+    if pid is not None:
+        try:
+            import psutil
+            name = psutil.Process(pid).name()
+        except Exception:
+            name = "unknown"
+        return f" (held by pid {pid}: {name})"
+    return "" if free else " (holder unknown)"
+
+
 rag_app = typer.Typer(no_args_is_help=True)
 app.add_typer(rag_app, name="rag",
               help="Chat with your documents (Raggity sidecar).")
