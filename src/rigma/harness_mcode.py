@@ -117,6 +117,15 @@ _VERIFIED: dict = {}
 # bounds the RUN; this bounds the PROCESS, so a wedged child cannot outlive the
 # turn it belongs to.
 _KILL_GRACE = 30.0
+# Whether this process has already told the user its mcode is not the build the
+# adapter was measured against. `harness.conformance` can answer that, but it
+# only runs from `rigma harness` and the menu's `?check=1` — nothing on the TURN
+# path looked, so installing a new mcode and chatting produced a normal-looking
+# turn on a build nobody measured. A renamed item type drops tool calls from the
+# transcript while the reply still arrives, which is the quiet degradation
+# `VERIFIED` exists to make sayable. One subprocess per process, one line in the
+# transcript.
+_DRIFT_SAID = False
 # One JSON event is one line, and mcode puts tool results inside those lines.
 # `for line in proc.stdout` held one whole line in memory before parsing and
 # json.loads then made a second copy, in the process that also holds every chat
@@ -172,6 +181,30 @@ def backend_version(exe: str | None = None) -> str:
         return ""
     lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
     return lines[0] if lines else ""
+
+
+def _drift_notice(exe: str) -> TurnEvent | None:
+    """One line, once per process, when the installed build is not `VERIFIED`.
+
+    `drift` is True/False/None for the same reason `harness.conformance` says
+    so: a backend that will not answer its version is UNKNOWN, and unknown must
+    not be reported as agreement OR as drift. Never raises — this runs inside a
+    turn, and a version check must not be able to fail one.
+    """
+    global _DRIFT_SAID
+    if _DRIFT_SAID or not VERIFIED:
+        return None
+    _DRIFT_SAID = True          # once per process, even if the probe fails
+    try:
+        have = str(backend_version(exe) or "").strip()
+    except Exception:
+        return None
+    if not have or have == VERIFIED.strip():
+        return None
+    return TurnEvent("notice", text=(
+        f"mcode {have} is not the build this adapter was measured against "
+        f"({VERIFIED}). Tool calls can go missing from the transcript while "
+        f"the reply still arrives — run `rigma harness` for the detail."))
 
 
 def data_home() -> Path:
@@ -584,12 +617,20 @@ def map_event(obj: dict, seen: dict) -> list[TurnEvent]:
     """
     kind = obj.get("type")
     if kind == "turn.failed":
-        err = obj.get("error") or {}
-        msg = str(err.get("message") or "the mcode turn failed")
+        # `error` is whatever mcode put there. `.get` on a string or a list
+        # raised straight out of the read loop (09-R3-1), so the shape is
+        # checked before it is used — the same guard the outer object gets.
+        err = obj.get("error")
+        msg = str(err.get("message") or "the mcode turn failed") \
+            if isinstance(err, dict) else "the mcode turn failed"
         return [TurnEvent("error", msg)]
     if kind not in ("item.started", "item.updated", "item.completed"):
         return []
-    item = obj.get("item") or {}
+    item = obj.get("item")
+    if not isinstance(item, dict):
+        # A malformed nested object must cost one event, not the turn. The
+        # outer object was already guarded; this is the level 09-R3-1 was at.
+        return []
     iid = str(item.get("id") or "")
     itype = item.get("type")
 
@@ -609,7 +650,9 @@ def map_event(obj: dict, seen: dict) -> list[TurnEvent]:
         return []
 
     if itype == "tool_call":
-        call = item.get("toolCall") or {}
+        call = item.get("toolCall")
+        if not isinstance(call, dict):
+            return []          # see above: one bad event, not a dead turn
         name = str(call.get("name") or "?")
         args = call.get("input")
         out = call.get("output")
@@ -715,6 +758,9 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     if exe is None:
         yield TurnEvent("error", "mcode is not on PATH")
         return
+    drift = _drift_notice(exe)
+    if drift is not None:
+        yield drift
     pid, why = ensure_provider(exe, base_url, model, context_window, max_tokens)
     if why:
         yield TurnEvent("error", why)
@@ -835,7 +881,9 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
                 continue
             if kind == "exec.completed":
                 saw_end = True
-                result = obj.get("result") or {}
+                result = obj.get("result")
+                if not isinstance(result, dict):
+                    result = {}
                 final_status = str(result.get("status") or "")
                 if state is not None:
                     state["status"] = final_status
