@@ -14,3 +14,60 @@ jobs:
       - run: pip install -e .[dev]
       - run: ruff check src tests
       - run: pytest -m "not hardware"
+
+  # AUDIT F61: nothing in CI ran Node, so a TypeScript error, a failing
+  # frontend test or an un-rebuilt bundle all shipped silently. `src/rigma/data/
+  # ui_v2/` is a COMMITTED build artifact that the pip wheel ships — the user's
+  # machine never runs Node — so a change under frontend-v2/src that is not
+  # rebuilt is invisible in the product while looking complete in the diff.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22", cache: npm, cache-dependency-path: frontend-v2/package-lock.json }
+      - run: npm ci
+        working-directory: frontend-v2
+      - run: npm run check          # tsc --noEmit
+        working-directory: frontend-v2
+      - run: npm test               # vitest run
+        working-directory: frontend-v2
+      - run: npm run build
+        working-directory: frontend-v2
+      - name: the committed bundle must match the source
+        run: |
+          if ! git diff --quiet -- src/rigma/data/ui_v2; then
+            echo "::error::src/rigma/data/ui_v2 is stale — run 'npm run build' in frontend-v2/ and commit the result"
+            git diff --stat -- src/rigma/data/ui_v2
+            exit 1
+          fi
+
+  # AUDIT F61: every dependency in pyproject.toml is a `>=` floor and CI only
+  # ever installed the NEWEST of each, so the floors were a claim nothing
+  # tested — `pip install rigma` on a machine that already had pydantic 2.7
+  # could break in ways this repo would never see. Install exactly the declared
+  # floors and run the suite against them. 3.11 only: several floor versions
+  # predate 3.12 wheels and would fail to BUILD, which is a packaging fact
+  # about those versions rather than a defect here.
+  floors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: install exactly the declared floors
+        run: |
+          python - <<'PY' > /tmp/floors.txt
+          import tomllib
+          d = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]
+          for spec in d:
+              name, _, floor = spec.partition(">=")
+              print(f"{name.strip()}=={floor.strip()}")
+          PY
+          cat /tmp/floors.txt
+          pip install -r /tmp/floors.txt
+      # --no-deps on purpose: `-e .[dev]` would re-resolve and silently pull the
+      # NEWEST of everything, which is the thing this job exists to avoid.
+      - run: pip install -e . --no-deps
+      - run: pip install "pytest>=8" ruff
+      - run: pytest -m "not hardware"

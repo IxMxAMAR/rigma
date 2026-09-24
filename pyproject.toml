@@ -29,7 +29,14 @@ classifiers = [
 ]
 dependencies = [
   "pydantic>=2.7",
-  "typer>=0.12",
+  # 0.13, not 0.12: two measured reasons, both found by the `floors` job in CI
+  # (AUDIT F61). (1) fastapi 0.111.0 requires fastapi-cli>=0.0.2 in its BASE
+  # dependencies — a packaging slip in that release — and every fastapi-cli
+  # requires typer>=0.12.3, so `typer>=0.12` was a floor no environment could
+  # satisfy. (2) typer 0.12.x raises `Parameter.make_metavar() missing 1
+  # required positional argument: 'ctx'` against click>=8.2, so 0.12.5 breaks
+  # every command in the CLI on a modern click; 0.13.0 is the first that works.
+  "typer>=0.13",
   "httpx>=0.27",
   "psutil>=5.9",
   "huggingface_hub>=0.23",
