@@ -16,6 +16,7 @@ from importlib import resources
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from . import context
 from . import harness as _harness
@@ -1313,7 +1314,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.post("/api/sessions")
     async def create_session(body: dict | None = None):
-        body = body or {}
+        body = dict(body or {})
+        try:
+            sessions.validate_field_types(body)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         return sessions.create(title=body.get("title", "New chat"),
                                system_prompt=body.get("system_prompt", ""))
 
@@ -1378,7 +1383,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
         from urllib.parse import quote
-        raw = s.get("title") or "chat"
+        raw = str(s.get("title") or "chat")
         stem = "".join(ch for ch in raw if ch.isascii()
                        and (ch.isalnum() or ch in " -_")).strip() or "chat"
         ext = ".md" if fmt == "md" else ".json"
@@ -1400,7 +1405,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     @app.post("/api/sessions/{sid}")
     async def update_session(sid: str, body: dict | None = None):
-        body = body or {}
+        body = dict(body or {})
+        # AUDIT 01-3: type-check BEFORE validate_params, which calls `.items()`
+        # on `params` and 500s on a list. `validate_field_types` also coerces
+        # null to the field's empty value.
+        try:
+            sessions.validate_field_types(body)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         if "params" in body:
             try:
                 body["params"] = sessions.validate_params(body["params"])
@@ -3772,6 +3784,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # Queued AFTER the vision guard above, so a queued message is held to
         # the same rules as an immediate one, and BEFORE it joins the history,
         # so the transcript keeps the order the model actually saw.
+        #
+        # AUDIT 01-2: the claim below sits in the SAME synchronous stretch as
+        # this test, with no await between them. It used to live inside
+        # `_drain`, and Starlette runs a response's body iterator in a separate
+        # task when the ASGI spec_version is below 2.4 (uvicorn advertises
+        # 2.3), so a second request could run its whole endpoint, see an empty
+        # set, and start a concurrent turn for the same chat.
+        cancel = threading.Event()
+
+        def _release_claim() -> None:
+            # Identity-guarded: by the time a never-started generator is
+            # finalised a later turn may already own this sid, and releasing
+            # THAT claim would let a third request run alongside it.
+            if _cancels.get(sid) is cancel:
+                _streaming.discard(sid)
+                _cancels.pop(sid, None)
+                # anything still queued can no longer be delivered: this is
+                # the only generator that would have run it
+                _queued.pop(sid, None)
+
         if message and sid in _streaming:
             _queued.setdefault(sid, []).append(message)
 
@@ -3781,32 +3813,41 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                            event="info")
             return StreamingResponse(_ack(), media_type="text/event-stream",
                                      headers=_NO_STORE)
-        if message:
-            s["messages"].append({"role": "user", "content": message})
-            if s.get("title") == "New chat":
-                title = message if isinstance(message, str) else next(
-                    (p.get("text", "") for p in message
-                     if isinstance(p, dict) and p.get("type") == "text"), "chat")
-                s["title"] = str(title)[:40]
-            await asyncio.to_thread(sessions.save, s)
-        if not s["messages"]:
+        if not s["messages"] and not message:
             return JSONResponse({"error": "session has no messages"},
                                 status_code=400)
-        # Grounded chat (owner rework 2026-07-21): grounding no longer swaps
-        # the pipeline for a single-shot sidecar Q&A box (last message only,
-        # no history, no tools, no follow-ups — never used once since it was
-        # built). It now means a NORMAL conversation with the sidecar up and
-        # search_my_documents advertised, so the model pulls document passages
-        # mid-chat when it needs them. A dead sidecar degrades to plain chat —
-        # grounding must never kill the conversation.
-        if s.get("use_rag"):
-            from . import rag
-            s["use_tools"] = True         # the tool IS the grounding
-            await asyncio.to_thread(sessions.save, s)
-            try:
-                await asyncio.to_thread(rag.ensure_sidecar)
-            except Exception as e:
-                _log.warning("grounded chat: sidecar unavailable (%s)", e)
+        _streaming.add(sid)
+        _cancels[sid] = cancel
+        try:
+            if message:
+                s["messages"].append({"role": "user", "content": message})
+                if s.get("title") == "New chat":
+                    title = message if isinstance(message, str) else next(
+                        (p.get("text", "") for p in message
+                         if isinstance(p, dict)
+                         and p.get("type") == "text"), "chat")
+                    s["title"] = str(title)[:40]
+                await asyncio.to_thread(sessions.save, s)
+            # Grounded chat (owner rework 2026-07-21): grounding no longer
+            # swaps the pipeline for a single-shot sidecar Q&A box (last
+            # message only, no history, no tools, no follow-ups — never used
+            # once since it was built). It now means a NORMAL conversation with
+            # the sidecar up and search_my_documents advertised, so the model
+            # pulls document passages mid-chat when it needs them. A dead
+            # sidecar degrades to plain chat — grounding must never kill the
+            # conversation.
+            if s.get("use_rag"):
+                from . import rag
+                s["use_tools"] = True         # the tool IS the grounding
+                await asyncio.to_thread(sessions.save, s)
+                try:
+                    await asyncio.to_thread(rag.ensure_sidecar)
+                except Exception as e:
+                    _log.warning("grounded chat: sidecar unavailable (%s)", e)
+        except BaseException:
+            _release_claim()   # the claim must not outlive a failed request
+            raise
+
         async def _drain():
             """This turn, then anything typed while it was running.
 
@@ -3814,9 +3855,6 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             stretch of synchronous code: asyncio only switches coroutines at
             an await, so no request can slip in between "queue is empty" and
             "no longer streaming" and have its prompt silently dropped."""
-            cancel = threading.Event()
-            _streaming.add(sid)
-            _cancels[sid] = cancel
             try:
                 cur, cont = s, bool(body.get("continue"))
                 while True:
@@ -3839,14 +3877,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     yield _sse({"note": "starting the queued prompt"},
                                event="info")
             finally:
-                _streaming.discard(sid)
-                _cancels.pop(sid, None)
-                # anything still queued can no longer be delivered: this is
-                # the only generator that would have run it
-                _queued.pop(sid, None)
+                _release_claim()
 
+        # The background task is the safety net for a body iterator that is
+        # cancelled before it ever runs (an immediate client disconnect):
+        # without it the claim would leak and every later send would queue
+        # forever. `_release_claim` is identity-guarded, so it is a no-op on
+        # the normal path where `_drain`'s finally already released.
         return StreamingResponse(_drain(), media_type="text/event-stream",
-                                 headers=_NO_STORE)
+                                 headers=_NO_STORE,
+                                 background=BackgroundTask(_release_claim))
 
     @app.post("/api/sessions/{sid}/stop")
     async def stop_chat(sid: str):
@@ -4759,6 +4799,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         mission = str((body or {}).get("mission", "")).strip()
         if not mission:
             return JSONResponse({"error": "mission is required"}, status_code=400)
+        # AUDIT 01-5: validate BEFORE `sessions.create` below, so a bad budget
+        # answers 400 instead of 500-ing and leaving an orphaned chat behind it.
+        # `float(None)` is the realistic shape: a UI that serialises
+        # `parseFloat("")` sends NaN as null.
+        try:
+            budget_hours = float((body or {}).get("budget_hours", 8))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "budget_hours: must be a number"}, status_code=400)
+        if budget_hours <= 0:
+            return JSONResponse(
+                {"error": "budget_hours: must be greater than 0"},
+                status_code=400)
         profile = (body or {}).get("profile", "all")
         workspace = str((body or {}).get("workspace", "")).strip()
         # Reasoning is ON by default: a long unattended job benefits from the
@@ -4804,7 +4857,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     run_profile=profile if profile in _runs.PROFILES else "all")
         run = _runs.create(mission, sess["id"], workspace=workspace,
                            profile=profile,
-                           budget_hours=float((body or {}).get("budget_hours", 8)))
+                           budget_hours=budget_hours)
         run["spec"] = None          # compiled by the run loop, see _compile_spec
         _runs.save(run)
         sess["run_id"] = run["id"]
@@ -5210,7 +5263,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         upstream = client.build_request(
             request.method, f"/v1/{path}", headers=headers,
             content=await request.body())
-        resp = await client.send(upstream, stream=True)
+
+        def _engine_down(e: Exception) -> JSONResponse:
+            # AUDIT 01-4: an OpenAI-compatible client parses the body as JSON.
+            # Letting httpx.ConnectError escape produced Starlette's plain-text
+            # 500, so aider/Cline/Continue reported a decode error instead of
+            # "the engine is down" — the chat route already says it properly.
+            return JSONResponse(
+                {"error": {"message": f"the engine is unreachable: {e}",
+                           "type": "upstream_error"}},
+                status_code=502)
+
+        try:
+            resp = await client.send(upstream, stream=True)
+        except httpx.HTTPError as e:
+            return _engine_down(e)
         media = resp.headers.get("content-type", "application/json")
         # pass upstream headers through (ratelimit, cors, etc.); drop hop-by-hop
         out_headers = {k: v for k, v in resp.headers.items()
@@ -5225,7 +5292,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     await resp.aclose()
             return StreamingResponse(gen(), status_code=resp.status_code,
                                      media_type=media, headers=out_headers)
-        body = await resp.aread()
+        try:
+            body = await resp.aread()
+        except httpx.HTTPError as e:
+            await resp.aclose()
+            return _engine_down(e)
         await resp.aclose()
         return Response(content=body, status_code=resp.status_code,
                         media_type=media, headers=out_headers)

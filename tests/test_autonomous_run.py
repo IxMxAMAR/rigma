@@ -154,6 +154,19 @@ def _wait(client, rid, timeout=25):
     return client.get(f"/api/runs/{rid}").json()
 
 
+def test_start_run_bad_budget_hours_is_400_and_creates_no_session(engine):
+    """01-5: `float(body["budget_hours"])` raised inside the handler, so a
+    non-numeric budget answered 500 AND left the session created just above it
+    orphaned behind the failure."""
+    c = _client(engine)
+    before = {s["id"] for s in c.get("/api/sessions").json()}
+    for bad in ("abc", None, 0, -2):
+        r = c.post("/api/runs", json={"mission": "x", "budget_hours": bad})
+        assert r.status_code == 400, (bad, r.status_code, r.text)
+        assert "budget_hours" in r.json()["error"]
+    assert {s["id"] for s in c.get("/api/sessions").json()} == before
+
+
 def test_run_reaches_done_with_verify_once(engine):
     # plan, plan, complete, task_complete (rejected -> verify), task_complete
     _Engine.script = [
