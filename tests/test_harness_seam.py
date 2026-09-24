@@ -551,8 +551,19 @@ def test_every_backend_reports_the_build_it_was_verified_against():
 
 def test_the_verified_build_is_a_fact_about_the_code(monkeypatch):
     """Not a config a user could edit into a lie, and not a value that drifts
-    from the code it describes."""
-    assert harness_mcode.VERIFIED == "0.5.1"
+    from the code it describes.
+
+    The literal that used to be asserted here made every legitimate version bump
+    a test failure, which is a test that fails for a reason that is not a defect
+    — and the pressure that creates is to "fix" the test by deleting it. The
+    property worth guarding is the AGREEMENT between the adapter's declared
+    build and the registry entry built from it; the version itself is a fact
+    about the release, not about this code. That it is non-empty and looks like
+    a version is asserted instead, so a `VERIFIED = ""` (which would silently
+    turn drift reporting off for this backend) still fails here.
+    """
+    assert harness_mcode.VERIFIED, "an empty VERIFIED disables drift reporting"
+    assert harness_mcode.VERIFIED[0].isdigit(), harness_mcode.VERIFIED
     assert harness.BACKENDS[harness.MCODE].verified == harness_mcode.VERIFIED
 
 

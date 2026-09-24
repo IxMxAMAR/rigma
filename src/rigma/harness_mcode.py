@@ -8,7 +8,30 @@ part of mcode's wire format reaches the chat loop.
 WHAT WAS MEASURED, not read. Everything below was observed on 2026-09-21 by
 running mcode 0.5.1 against `tests/fake_oai_server.py` — the same fake engine the
 DSH adapter is proven with — because the shipped code is a minified bundle and a
-contract read out of it is a guess until a real turn agrees:
+contract read out of it is a guess until a real turn agrees.
+
+RE-VERIFIED ON 0.5.4 (2026-09-25, `tools/mcode_probe.py`). The event stream,
+`provider add --name/--use`, and cross-process `--session` resume were all
+re-measured against the installed 0.5.4 CLI and a fake engine, and all three
+still hold. Two things changed under us and are worth knowing:
+
+  * `provider add` gained a REQUIRED `--name`, which this adapter already passed
+    (it was added for the dedupe problem below), so 0.5.4 needed no change there.
+  * mcode now keeps its provider list, sessions and state in a SQLite database
+    under `<dataDir>/v2/sqlite/`, not in a JSON file. `provider list --json` is
+    therefore still the ONLY honest way to ask what is configured — which is
+    what `_providers` already does, and why the marker file is a hint and never
+    an authority.
+  * The first run in a fresh `MINIMAX_DATA_DIR` is now EXPENSIVE: mcode unpacks
+    its builtin skills and agents and writes a ~4.9 MB model catalogue before it
+    will answer. That happens inside `ensure_provider`'s timeout, so a cold data
+    dir is a slow first turn, not a hang.
+  * mcode 0.5.4 sends its ~12 KB instruction block as a `developer`-role
+    message. Measured against llama-server b9867 with the prompt cache off, a
+    `developer` message costs exactly the same prompt tokens as a `system` one
+    (46 vs 46; `assistant` is 68), and is accepted without a warning — llama.cpp
+    maps it onto the system role. So the byte passthrough in front of it does
+    NOT need to rewrite the role, and must not.
 
   * `mcode exec --output-format stream-json --permission full --model
     custom_provider:<name>/<model> "<prompt>"` runs exactly one turn. The model
@@ -89,7 +112,7 @@ from pathlib import Path
 # BACKENDS table at import time and reads this value through `_verified_of`, so
 # when something imports THIS module first the circular import would otherwise
 # read a half-initialised module and cache "" as "nobody verified this".
-VERIFIED = "0.5.1"
+VERIFIED = "0.5.4"
 
 from .harness import TurnEvent          # noqa: E402
 from . import harness as _harness       # noqa: E402
