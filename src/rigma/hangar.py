@@ -964,10 +964,12 @@ def delete_file(slug: str, file: str, registry=None) -> None:
         raise HangarError("that file is running right now — stop or "
                           "switch models first")
     target = model_file_path(file)   # AUDIT 13-4: confined, not a raw join
-    if not target.exists():
-        raise HangarError(f"{file} is not on disk")
-    target.unlink()
-    _discard_partial(target)   # AUDIT F27: docs/audit-2026-09-04-full.md
+    with _PULL_LOCK:
+        _cancel_pull(slug, file)     # AUDIT 07-4: stop the worker before unlink
+        if not target.exists():
+            raise HangarError(f"{file} is not on disk")
+        target.unlink()
+        _discard_partial(target)   # AUDIT F27: docs/audit-2026-09-04-full.md
 
 
 def delete_model(slug: str, registry=None) -> None:
@@ -984,13 +986,17 @@ def delete_model(slug: str, registry=None) -> None:
     # cancelled multi-GB pull outlived the model it belonged to, invisible in
     # the library because glob("*.gguf") does not match ".part".
     for g in spec.ggufs:
-        path = model_file_path(g.file)   # AUDIT 13-4: confined
-        path.unlink(missing_ok=True)
-        _discard_partial(path)
+        with _PULL_LOCK:               # AUDIT 07-4: cancel before unlink
+            _cancel_pull(slug, g.file)
+            path = model_file_path(g.file)   # AUDIT 13-4: confined
+            path.unlink(missing_ok=True)
+            _discard_partial(path)
     if spec.mmproj is not None:
-        path = model_file_path(spec.mmproj.file)   # AUDIT 13-4: confined
-        path.unlink(missing_ok=True)
-        _discard_partial(path)
+        with _PULL_LOCK:
+            _cancel_pull(slug, spec.mmproj.file)
+            path = model_file_path(spec.mmproj.file)   # AUDIT 13-4: confined
+            path.unlink(missing_ok=True)
+            _discard_partial(path)
     custom_spec_path(slug).unlink(missing_ok=True)   # AUDIT F07-1: confined
     # AUDIT 07-6: a slug keys more than the spec. A repaired chat template
     # lives at templates/<slug>.jinja and calibration rows are keyed
@@ -1107,7 +1113,10 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
                     f"free — {short / 2**30:.1f} GB short. Free some space or "
                     f"choose a smaller quant.")
         _PULLS[key] = {"status": "downloading", "total": want, "done": 0,
-                       "error": None}
+                       "error": None, "cancel": False}
+
+    def _cancelled() -> bool:
+        return bool(_PULLS.get(key, {}).get("cancel"))
 
     def _run():
         try:
@@ -1117,13 +1126,30 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
             # declared in models.py and read nowhere at all.
             _download_file(repo, file, model_file_path(file),   # AUDIT 13-4
                            lambda n: _PULLS[key].update(done=n),
-                           expect_bytes=want, sha256=gguf.sha256)
+                           expect_bytes=want, sha256=gguf.sha256,
+                           cancelled=_cancelled)
             _PULLS[key]["status"] = "done"
         except Exception as e:   # surfaced via /api/models, not lost in a thread
-            _PULLS[key].update(status="error", error=str(e).splitlines()[0])
+            if _cancelled():
+                # AUDIT 07-4: stopped by a delete, not a failure to show red.
+                _PULLS[key].update(status="cancelled", error=None)
+            else:
+                _PULLS[key].update(status="error",
+                                   error=str(e).splitlines()[0])
 
     threading.Thread(target=_run, daemon=True, name=f"pull:{file}").start()
     return _PULLS[key]
+
+
+def _cancel_pull(slug: str, file: str) -> None:
+    """Stop an in-flight pull for this (slug, file) key.
+
+    AUDIT 07-4: the caller holds `_PULL_LOCK`, so the flag cannot be set in
+    the gap between the worker's final check and its os.replace — which is
+    exactly the gap that used to put a deleted file back."""
+    st = _PULLS.get(f"{slug}::{file}")
+    if st is not None:
+        st["cancel"] = True
 
 
 # AUDIT F27: docs/audit-2026-09-04-full.md
@@ -1201,7 +1227,8 @@ class _ShortBody(Exception):
     Raised so the retry loop resumes instead of installing a truncated file."""
 
 
-def _install_download(dest, have: int, size: int, sha256: str | None) -> None:
+def _install_download(dest, have: int, size: int, sha256: str | None,
+                      cancelled=None) -> None:
     """Check a finished .part against what it should be, then move it in.
 
     Size cannot be the only gate: the splice this guards against lands on the
@@ -1209,7 +1236,11 @@ def _install_download(dest, have: int, size: int, sha256: str | None) -> None:
     runs at 4.0 GB/s here (SHA-NI), so an 11GB quant verifies in about three
     seconds against a download measured in minutes — cheap enough to always do
     when the registry carries a hash. It usually does not, which is why the
-    resume note above has to stand on its own."""
+    resume note above has to stand on its own.
+
+    `cancelled` (AUDIT 07-4) is re-checked under `_PULL_LOCK` immediately
+    before the os.replace, so a delete that lands while the body is streaming
+    cannot be undone by this rename putting the file back."""
     part, note = _resume_files(dest)
     if size and have != size:
         if have > size:
@@ -1228,12 +1259,17 @@ def _install_download(dest, have: int, size: int, sha256: str | None) -> None:
                 f"{dest.name} failed its sha256 check (got {got[:12]}, "
                 f"expected {sha256[:12].lower()}) — discarded rather than "
                 f"installed. Press Download again to refetch it.")
-    os.replace(part, dest)
+    with _PULL_LOCK:
+        if cancelled is not None and cancelled():
+            _discard_partial(dest)
+            raise HangarError(f"{dest.name} download was cancelled")
+        os.replace(part, dest)
     note.unlink(missing_ok=True)
 
 
 def _download_file(repo: str, file: str, dest, report, *,
-                   expect_bytes: int = 0, sha256: str | None = None) -> int:
+                   expect_bytes: int = 0, sha256: str | None = None,
+                   cancelled=None) -> int:
     """Stream a HF file straight to `dest` with resume + live byte reporting.
 
     Direct httpx (not hf_hub_download) on purpose: we get the exact byte count
@@ -1290,7 +1326,7 @@ def _download_file(repo: str, file: str, dest, report, *,
                     # other size means the .part outlived some other transfer,
                     # so drop it and re-issue with no Range header at all.
                     if size and have == size:
-                        _install_download(dest, have, size, sha256)
+                        _install_download(dest, have, size, sha256, cancelled)
                         report(have)
                         return have
                     _discard_partial(dest)
@@ -1309,13 +1345,23 @@ def _download_file(repo: str, file: str, dest, report, *,
                 with open(part, "ab" if resumed and have else "wb") as f:
                     report(have)
                     for chunk in r.iter_bytes(1 << 20):
+                        # AUDIT 07-4: stop streaming the moment the model was
+                        # deleted, rather than gigabytes later at the install.
+                        # The .part is discarded by the handler below, once the
+                        # file is closed — Windows refuses to unlink an open
+                        # file, so doing it here would silently leave it.
+                        if cancelled is not None and cancelled():
+                            raise HangarError(
+                                f"{dest.name} download was cancelled")
                         f.write(chunk)
                         have += len(chunk)
                         report(have)
-            _install_download(dest, have, size, sha256)
+            _install_download(dest, have, size, sha256, cancelled)
             report(have)
             return have
         except HangarError:
+            if cancelled is not None and cancelled():
+                _discard_partial(dest)     # file is closed by now
             raise                          # gated/HTTP/identity errors terminal
         except OSError as e:
             # AUDIT F28: not a transport drop. httpx wraps network failures in
