@@ -1,6 +1,8 @@
 // The Hangar: installed models as cards, quants with live download progress,
 // HF search-and-add. Polls fast only while a download is actually running.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState,
+         type RefObject } from "react";
+import EmptyState from "../EmptyState";
 import LoadError from "../LoadError";
 import {
   DEFAULT_FIT, engineApi, eta, gb,
@@ -715,7 +717,11 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
   );
 }
 
-function HfSearch({ onAdded, cfg }: { onAdded: () => void; cfg: FitConfig }) {
+function HfSearch({ onAdded, cfg, inputRef }: {
+  onAdded: () => void; cfg: FitConfig;
+  /** IMP-10: the empty state's primary action focuses this box. */
+  inputRef?: RefObject<HTMLInputElement>;
+}) {
   const [q, setQ] = useState("");
   const [hits, setHits] = useState<HfHit[]>([]);
   const [state, setState] = useState<"idle" | "busy" | "err">("idle");
@@ -760,6 +766,7 @@ function HfSearch({ onAdded, cfg }: { onAdded: () => void; cfg: FitConfig }) {
         add from hugging face
       </h3>
       <input
+        ref={inputRef}
         value={q}
         onChange={(e) => search(e.target.value)}
         placeholder="search GGUF repos…"
@@ -917,6 +924,8 @@ export default function ModelsSurface() {
     localStorage.setItem("rigma.modelsView", v);
   };
   const [loadErr, setLoadErr] = useState<string | null>(null);
+  // IMP-10: the empty state's action focuses the HF search box above.
+  const hfRef = useRef<HTMLInputElement>(null);
   const refresh = useCallback(async () => {
     // AUDIT F11-3: check the body shape before it reaches render. A probe
     // failure or a body without `models` used to be swallowed ("keep last"),
@@ -953,7 +962,7 @@ export default function ModelsSurface() {
       <div className="max-w-[1200px] mx-auto flex flex-col gap-4">
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0">
-            <HfSearch onAdded={refresh} cfg={cfg} />
+            <HfSearch onAdded={refresh} cfg={cfg} inputRef={hfRef} />
           </div>
           <div className="shrink-0 flex rounded-md bg-panel p-0.5 font-mono text-[12px]"
                role="group" aria-label="View">
@@ -975,10 +984,11 @@ export default function ModelsSurface() {
                      onRetry={() => void refresh()} />
         )}
         {!loadErr && cards.length === 0 && (
-          <p className="text-secondary text-[13.5px] text-center pt-12">
-            No models yet — search Hugging Face above, or drop a GGUF into
-            ~/.rigma/models.
-          </p>
+          <EmptyState
+            title="no models yet"
+            body="Nothing is in the hangar. Search Hugging Face above and add a repo, or drop a GGUF into ~/.rigma/models."
+            actionLabel="search hugging face"
+            onAction={() => hfRef.current?.focus()} />
         )}
         {/* grid = CSS column flow (masonry-ish): short cards pack under each
             other instead of leaving row-aligned holes next to tall ones */}
