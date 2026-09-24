@@ -9,18 +9,25 @@ import {
   type FitConfig, type HfHit, type HfRepoDetail, type ModelCard,
   type QuantRow,
 } from "../lib/engineApi";
+import { pct, progressLine } from "../lib/download";
 
+// IMP-2: the server already measures `done`, a rolling `bps` and an `eta` for
+// every pull in flight (serve's pull_samples); the page showed only a
+// percentage, so a stalled download and a slow one looked identical. There is
+// still no cancel route on this server, so there is no cancel control — the
+// honest thing is progress only, not a button that cannot work.
 function PullBar({ q }: { q: QuantRow }) {
   const p = q.pull;
   if (!p || p.status !== "downloading") return null;
-  const pct = p.done != null ? Math.min(100, (p.done / q.bytes) * 100) : 0;
+  const line = progressLine(p, q.bytes, gb, eta);
   return (
     <div className="flex items-center gap-2 flex-1 min-w-0">
       <div className="flex-1 h-1.5 rounded-full bg-canvas overflow-hidden">
-        <div className="h-full bg-amber" style={{ width: `${pct}%` }} />
+        <div className="h-full bg-amber" style={{ width: `${pct(p.done, q.bytes)}%` }} />
       </div>
-      <span className="font-mono text-[11px] text-amber shrink-0">
-        {pct.toFixed(0)}%{p.eta != null ? ` · ${eta(p.eta)}` : ""}
+      <span className="font-mono text-[11px] text-amber shrink-0 whitespace-nowrap"
+            title={`downloading — ${line}`}>
+        {line}
       </span>
     </div>
   );
@@ -344,6 +351,15 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
         <div role="alert"
              className="text-red font-mono text-[11px] pl-3.5 pt-0.5 break-words">
           {err}
+        </div>
+      )}
+      {/* IMP-2: a pull that FAILED is not a pull that finished. hangar keeps
+          the reason on the pull record, and the row used to drop it, so a dead
+          network or a full disk looked like a download that never started. */}
+      {q.pull?.status === "error" && q.pull.error && (
+        <div role="alert"
+             className="text-red font-mono text-[11px] pl-3.5 pt-0.5 break-words">
+          download failed: {q.pull.error}
         </div>
       )}
     </li>
