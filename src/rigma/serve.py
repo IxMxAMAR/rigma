@@ -24,6 +24,7 @@ from . import methods_api
 from . import mission as _mission_mod
 from . import presets
 from . import prompt as _prompt
+from . import resilience as _res
 from . import runtime
 from . import server_ops
 from . import sessions
@@ -1237,6 +1238,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     app.add_middleware(LocalOriginGuard)   # AUDIT F39: see LocalOriginGuard
     base = f"http://127.0.0.1:{upstream_port}"
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(600.0))
+    # One breaker for the engine endpoint this process talks to. A sustained
+    # outage (the engine crashed, the port is held by a corpse) would otherwise
+    # cost every concurrent turn its own full retry budget, and the retries are
+    # themselves load on the thing trying to come back. Per-process, not global:
+    # a breaker shared across ports would let one dead engine close the circuit
+    # for a live one.
+    engine_breaker = _res.CircuitBreaker(threshold=3, cooldown=15.0,
+                                         max_cooldown=120.0)
     ingest_state = {"busy": False, "error": ""}
     ingest_tasks: set = set()
     telemetry = {"tg": None}   # last observed decode speed, for the verdict
@@ -2565,9 +2574,41 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 finish_reason = None
                 try:
                     _mark("request_built")
-                    req = client.build_request("POST", "/v1/chat/completions",
-                                               json=body)
-                    resp = await client.send(req, stream=True)
+
+                    async def _send_once():
+                        """One attempt at the engine, and a response to stream.
+
+                        A transient failure is raised (not swallowed) so the retry
+                        wrapper can see it; a non-200 that means "this request is
+                        wrong" is raised as a PERMANENT one so it is reported at
+                        once instead of being retried into a delay.
+
+                        The response is closed here on every failure path. The
+                        wrapper runs this more than once, so a leaked half-open
+                        streaming response per attempt would hold a socket and,
+                        on llama-server, a SLOT — which is the scarce resource.
+                        """
+                        r = await client.send(
+                            client.build_request("POST", "/v1/chat/completions",
+                                                 json=body), stream=True)
+                        if r.status_code == 200:
+                            return r
+                        try:
+                            detail = await _upstream_error(r)
+                        except Exception:
+                            detail = f"HTTP {r.status_code}"
+                        await r.aclose()
+                        if r.status_code >= 500 or r.status_code in (408, 429):
+                            raise httpx.HTTPStatusError(
+                                detail, request=r.request, response=r)
+                        raise RuntimeError(detail)
+
+                    resp = await _res.retry_async(
+                        _send_once, policy=_res.TURN, breaker=engine_breaker,
+                        what="the engine request",
+                        on_retry=lambda n, d, e: _log.info(
+                            "engine request retry %d in %.1fs: %s",
+                            n, d, _res.describe(e)))
                     if resp.status_code == 400 and "tool_choice" in body:
                         # template/engine rejects forced calls — remember, degrade
                         # to the parse-and-rescue path, and don't try again for
@@ -2580,11 +2621,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         body.pop("tool_choice", None)
                         if "temperature" in params:      # undo the grammar-era lift
                             body["temperature"] = params["temperature"]
-                        req = client.build_request(
-                            "POST", "/v1/chat/completions", json=body)
-                        resp = await client.send(req, stream=True)
-                    if resp.status_code != 200:
-                        raise RuntimeError(await _upstream_error(resp))
+                        resp = await client.send(
+                            client.build_request(
+                                "POST", "/v1/chat/completions", json=body),
+                            stream=True)
+                        if resp.status_code != 200:
+                            raise RuntimeError(await _upstream_error(resp))
                     _mark("engine_responded")
                     _first_delta = True
                     async for line in resp.aiter_lines():
@@ -2663,11 +2705,26 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 except Exception as e:
                     failed = True
                     msg = str(e) or "model unreachable"
-                    if isinstance(e, httpx.ConnectError):
+                    if isinstance(e, _res.RetryExhausted):
+                        # The retry layer already tried, and its message names the
+                        # real transport fault and how many attempts were spent.
+                        # Replacing that with a generic "unreachable" would throw
+                        # away the only evidence the user has.
+                        msg = (f"{e}. Check ⚙ → Server → log; the engine may still "
+                               f"be loading a large model.")
+                    elif isinstance(e, httpx.ConnectError):
                         msg = ("the engine is unloaded — load it again from "
                                "⚙ → Server (or run: rigma load)"
                                if (st.read_state() or {}).get("unloaded")
                                else "engine unreachable — check ⚙ → Server → log")
+                    elif engine_breaker.open:
+                        # A sustained outage is worth saying out loud, because it
+                        # changes what the user should do: nothing will work until
+                        # the engine is back, and retrying by hand will not help.
+                        msg = (f"{msg} (the engine has failed "
+                               f"{engine_breaker.failures} times in a row; further "
+                               f"requests will be refused for "
+                               f"{engine_breaker.retry_after():.0f}s)")
                     yield _sse({"message": msg}, event="error")
                 finally:
                     if resp is not None:
