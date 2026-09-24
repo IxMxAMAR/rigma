@@ -6,6 +6,7 @@ import platform
 
 import psutil
 
+from .models import CACHE_BYTES
 from .runtime import rigma_home
 
 
@@ -328,7 +329,15 @@ def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
     return out
 
 
-KV_CACHE_TYPES = ("f16", "q8_0", "q5_1", "q4_0")
+# AUDIT 06R3-3: this used to be a THIRD, narrower cache-type vocabulary
+# ("f16", "q8_0", "q5_1", "q4_0"). AUDIT 06-3 added bf16/q4_1/q5_0 to
+# models.CACHE_BYTES so the fit math prices them and quant_quality publishes a
+# reference loss figure for each — but every HTTP boundary kept rejecting them
+# with `400 kv must be one of f16, q8_0, q5_1, q4_0`, so the Models-page
+# explorer could not ask for a cache type the UI itself compares. Derived from
+# the one table rather than restated, so the vocabularies cannot drift again.
+# test_phase0_contracts asserts the equality in both directions.
+KV_CACHE_TYPES = tuple(CACHE_BYTES)
 
 
 def vram_snapshot(registry=None) -> dict | None:

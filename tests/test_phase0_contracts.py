@@ -256,6 +256,44 @@ def test_cache_bytes_covers_all_offered_kv_types():
         assert t in CACHE_BYTES, f"{t} offered but never re-fitted"
 
 
+def test_cache_bytes_and_offered_kv_types_are_one_table():
+    """AUDIT 06R3-3. The assertion above only checks the direction that cannot
+    fail: KV_CACHE_TYPES was a THIRD, narrower vocabulary, so bf16 / q4_1 / q5_0
+    were priced by the fit math (06-3 added them to CACHE_BYTES) and rejected by
+    every HTTP boundary with `400 kv must be one of f16, q8_0, q5_1, q4_0`.
+    The Models-page explorer could not ask for a cache type quant_quality
+    publishes a reference loss figure for. One table, both directions."""
+    from rigma.models import CACHE_BYTES
+    from rigma.server_ops import KV_CACHE_TYPES
+    assert set(KV_CACHE_TYPES) == set(CACHE_BYTES), (
+        "offered-but-unpriced: "
+        f"{sorted(set(KV_CACHE_TYPES) - set(CACHE_BYTES))}; "
+        "priced-but-unofferable: "
+        f"{sorted(set(CACHE_BYTES) - set(KV_CACHE_TYPES))}")
+
+
+def test_every_offered_kv_type_gets_a_fit_verdict():
+    """The behavioural half: the explorer's own query parameter must work for
+    every type it advertises."""
+    from rigma.models import CpuInfo, GgufFile, GpuInfo, HardwareProfile, ModelSpec
+    from rigma.resolve import quant_verdicts
+    from rigma.server_ops import KV_CACHE_TYPES
+
+    spec = ModelSpec(
+        slug="m", family="llama", kind="dense", n_layers=32,
+        full_attn_layers=32, kv_heads=8, head_dim=128, native_ctx=32768,
+        ggufs=[GgufFile(repo="r/x", file="m.gguf", bytes=8 * 2**30,
+                        quant="Q4_K_M")])
+    gpu = GpuInfo(vendor="amd", name="X", vram_mb=16368, backends=["vulkan"])
+    profile = HardwareProfile(gpus=[gpu], ram_mb=16234, ram_free_mb=9100,
+                              cpu=CpuInfo(cores=16), os="windows",
+                              disk_free_gb=400.0)
+    for t in KV_CACHE_TYPES:
+        verdicts = quant_verdicts(spec, profile, kv=t)
+        assert verdicts and verdicts[0]["ok"], f"{t} produced no verdict"
+        assert verdicts[0]["kv"] == t, f"{t} was silently changed to {verdicts[0]['kv']}"
+
+
 # --- calibration never crowns q4_0 KV on a tools-capable model ----------------
 def test_sweep_filters_q4_kv_for_tools_models(monkeypatch, tmp_path):
     class _FakeSrv:
