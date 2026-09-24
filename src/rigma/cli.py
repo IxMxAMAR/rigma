@@ -977,6 +977,25 @@ def stop():
     typer.echo("stopped" if killed else "stale state — nothing was killed")
 
 
+def _serve_or_exit(port: int) -> None:
+    """Serve the UI, turning a lost bind race into the pre-check's own message.
+
+    AUDIT F16-3: `_port_holder` is a check-then-bind (TOCTOU). If another
+    process takes the port between that check and uvicorn's bind, `uvicorn.run`
+    raises OSError ("address already in use") or SystemExit, and neither the
+    command nor the `finally` blocks caught it — typer's default handler printed
+    a raw traceback where the pre-check already knew how to say
+    "port N is already in use — free it or pass a different --port".
+    """
+    from . import serve
+    try:
+        serve.run_ui(port, port - 1)
+    except (OSError, SystemExit) as e:
+        typer.echo(f"port {port} is already in use — free it or pass a "
+                   f"different --port")
+        raise typer.Exit(1) from e
+
+
 def _open_when_listening(port: int, url: str, timeout: float = 15.0):
     """Open `url` in a browser once 127.0.0.1:port accepts a connection.
 
@@ -1081,7 +1100,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
 
-    from . import runtime, serve
+    from . import runtime
     from . import state as st
 
     if st.server_running():
@@ -1118,7 +1137,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if not no_browser:
             _open_when_listening(port, f"http://127.0.0.1:{port}")
         try:
-            serve.run_ui(port, port - 1)
+            _serve_or_exit(port)
         finally:
             s_end = st.read_state()
             if s_end:
@@ -1335,7 +1354,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     if not no_browser:
         _open_when_listening(port, f"http://127.0.0.1:{port}")
     try:
-        serve.run_ui(port, port - 1)
+        _serve_or_exit(port)
     finally:
         s_end = st.read_state()
         if s_end:
