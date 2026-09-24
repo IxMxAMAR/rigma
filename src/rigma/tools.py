@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3126,10 +3127,25 @@ _JOB_LIMIT = 8               # concurrent jobs — a runaway-spawn backstop
 
 
 def _job_pump(job: dict, stream, label: str) -> None:
+    """Append this stream's lines to the job's rolling window.
+
+    A bounded deque of chunks, joined once on read — the old
+    `job["buf"] = (job["buf"] + tagged)[-_JOB_MAX_BUF:]` copied the whole
+    64 KB window per line (43 ms of pure copying over 20 000 lines).
+    """
     try:
         for line in iter(stream.readline, ""):
             tagged = line if label == "out" else f"[stderr] {line}"
-            job["buf"] = (job["buf"] + tagged)[-_JOB_MAX_BUF:]
+            with job["lock"]:
+                chunks = job["chunks"]
+                chunks.append(tagged)
+                job["buflen"] += len(tagged)
+                while job["buflen"] > _JOB_MAX_BUF and len(chunks) > 1:
+                    job["buflen"] -= len(chunks.popleft())
+                if job["buflen"] > _JOB_MAX_BUF:
+                    # one line longer than the whole window: keep its tail
+                    chunks[0] = chunks[0][-_JOB_MAX_BUF:]
+                    job["buflen"] = len(chunks[0])
     except Exception:
         pass
     finally:
@@ -3137,6 +3153,12 @@ def _job_pump(job: dict, stream, label: str) -> None:
             stream.close()
         except Exception:
             pass
+
+
+def _job_tail(job: dict, n: int = 4000) -> str:
+    """The last `n` characters of a job's output, joined from its chunks."""
+    with job["lock"]:
+        return "".join(job["chunks"])[-n:]
 
 
 @tool("start_job",
@@ -3170,9 +3192,9 @@ def _start_job(args, ctx):
     except Exception as e:
         return f"error: could not start job: {e}"
     jid = max(_JOBS, default=0) + 1
-    job = {"proc": proc, "buf": "", "cmd": cmd[:500], "started": time.time()}
+    job = {"proc": proc, "chunks": deque(), "buflen": 0,
+           "lock": threading.Lock(), "cmd": cmd[:500], "started": time.time()}
     _JOBS[jid] = job
-    import threading
     for stream, label in ((proc.stdout, "out"), (proc.stderr, "err")):
         threading.Thread(target=_job_pump, args=(job, stream, label),
                          daemon=True).start()
@@ -3207,7 +3229,7 @@ def _job_output(args, ctx):
             f"({int(time.time() - job['started'])}s elapsed)" if rc is None
             else ("job {}: exited {} ({})".format(
                 jid, rc, "ok" if rc == 0 else "FAILED")))
-    tail = job["buf"][-4000:]
+    tail = _job_tail(job, 4000)
     if not tail.strip():
         tail = "(no output yet)" if rc is None else "(no output)"
     return head + "\n" + tail
