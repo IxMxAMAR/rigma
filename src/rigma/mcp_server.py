@@ -84,6 +84,38 @@ _ROSTER = ("search_my_documents", "remember", "recall", "undo_last_change")
 # today; it exists so the `isError` heuristic below is not the only word on it.
 _NOT_AN_ERROR: set[str] = set()
 
+# One JSON-RPC frame is one line. `for line in stdin` held an arbitrarily long
+# request line whole before parsing it, in a process the arm launches per turn;
+# the client side got this bound after AUDIT F55 (09-4).
+_FRAME_MAX = 4_000_000
+
+
+def _bounded_lines(stream):
+    """Yield `(line, oversize)` from `stream` with a HARD per-line bound.
+
+    An oversize frame is skipped with `oversize=True` after draining past its
+    newline, so framing stays in sync; an unterminated one ends the stream
+    rather than spinning the drain (09-4).
+    """
+    while True:
+        line = stream.readline(_FRAME_MAX + 1)
+        if not line:
+            return
+        if "\n" in line or len(line) <= _FRAME_MAX:
+            yield line, False
+            continue
+        found = False
+        for _ in range(4):
+            tail = stream.readline(_FRAME_MAX + 1)
+            if not tail:
+                break
+            if "\n" in tail:
+                found = True
+                break
+        yield "", True
+        if not found:
+            return
+
 
 def workspace() -> str:
     """The workspace this server was pointed at, from the environment.
@@ -265,7 +297,16 @@ def serve(stdin=None, stdout=None) -> None:
     """The loop. Reads until stdin closes, which is how a client stops us."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
-    for line in stdin:
+    for line, oversize in _bounded_lines(stdin):
+        if oversize:
+            # A frame over the bound is refused rather than held whole in a
+            # process the arm launches per turn (09-4).
+            replies = [_err(None, -32600,
+                            f"request exceeded {_FRAME_MAX} characters")]
+            for reply in replies:
+                stdout.write(json.dumps(reply) + "\n")
+            stdout.flush()
+            continue
         line = line.strip()
         if not line:
             continue
