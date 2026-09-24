@@ -114,8 +114,15 @@ def _loop_head_b(caps: frozenset) -> str:
     # run must not get it (AUDIT 05-1): its surface dropped run_shell entirely.
     no_shell = (" — you do NOT need run_shell to reach a folder outside the "
                 "workspace" if "exec" in caps else "")
+    # AUDIT 05-6: "File tools take ABSOLUTE paths" was true for the read tools
+    # and false for write_file/edit_file, which resolve through `_ws_path` and
+    # REFUSE an absolute path. A run whose mission is "tidy up D:\Art" read and
+    # sampled files there, then passed the absolute path it had just been handed
+    # to edit_file and was refused — one wasted turn per file. The rule is
+    # scoped to the tools it is true for.
     return (").\n"
-            "   • File tools take ABSOLUTE paths (D:\\Art\\pic.png)"
+            "   • READ tools take ABSOLUTE paths (D:\\Art\\pic.png); write_file "
+            "and edit_file take paths RELATIVE to the workspace"
             + no_shell + ".\n"
             "   • NEVER RETYPE A FILENAME. You will get long names wrong (you "
             "cannot reliably reproduce ComfyUI_00428_.png).")

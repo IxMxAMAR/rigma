@@ -114,3 +114,25 @@ def test_the_error_paths_do_not_break_the_progress_log_rescue(ws):
     # the new folder/glob branches
     assert not out.startswith("error"), out
     assert "progress log" in out.lower(), out
+
+
+# --- AUDIT 05-6: the prompt's path rule matches what the tools do -------------
+
+def test_the_prompt_scopes_absolute_paths_to_the_read_tools(ws):
+    from rigma import prompt as _prompt
+    text = _prompt.agent_prompt(caps=("vision", "extended", "exec", "network"))
+    assert "READ tools take ABSOLUTE paths" in text
+    assert "write_file and edit_file take paths RELATIVE" in text
+    # the old, unscoped sentence is what sent an absolute path to a write tool
+    assert "File tools take ABSOLUTE paths" not in text
+
+
+def test_write_tools_refuse_absolute_paths_but_reads_accept_them(ws, tmp_path):
+    abs_path = str(tmp_path / "readme.md")
+    # a read accepts an absolute path (inside the workspace, so no grant needed)
+    assert "hi" in run("read_file", {"path": abs_path}, ws)
+    # ...and the write tools refuse it, exactly as the prompt now says
+    out = run("write_file", {"path": abs_path, "content": "x"}, ws)
+    assert out.startswith("error") and "absolute path" in out, out
+    out = run("edit_file", {"path": abs_path, "old": "hi", "new": "yo"}, ws)
+    assert out.startswith("error") and "absolute path" in out, out
