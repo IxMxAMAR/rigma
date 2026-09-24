@@ -71,12 +71,26 @@ def log_path():
 
 
 def log_tail(lines: int = 200) -> str:
+    """The last `lines` lines of the newest engine log (see log_tail_bounded)."""
+    return log_tail_bounded(lines)[0]
+
+
+# A generous per-line allowance for the byte bound. The old reader pulled the
+# WHOLE file into memory and sliced it, which on a server that had been up for
+# days meant hundreds of megabytes through the event loop for a 200-line panel
+# (IMP-11). The READ is now bounded; `lines` only bounds the display.
+_TAIL_LINE_BYTES = 512
+
+
+def log_tail_bounded(lines: int = 200) -> tuple[str, bool]:
+    """(tail, truncated) for the newest engine log, without reading it whole."""
+    from .runs import read_tail_bytes
     p = log_path()
     if p is None:
-        return ""
-    lines = max(10, min(int(lines), 1000))
-    text = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(text[-lines:])
+        return "", False
+    n = max(10, min(int(lines), 1000))
+    text, truncated = read_tail_bytes(p, max(64 * 1024, n * _TAIL_LINE_BYTES))
+    return "\n".join(text.splitlines()[-n:]), truncated
 
 
 # The whole-log reader is bounded by BYTES, not lines: a chatty session can

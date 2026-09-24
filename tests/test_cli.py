@@ -25,11 +25,164 @@ def test_doctor(monkeypatch):
     assert res.exit_code == 0 and "rx-9070-xt" in res.output.lower()
 
 
+def test_session_exec_grants_and_revokes(tmp_path, monkeypatch):
+    """AUDIT 13-3 regression: execution needs an explicit per-session grant,
+    and there was no way to give one. `rigma session exec` is that way."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import sessions
+    sid = sessions.create()["id"]
+    # the safe direction: a fresh chat is NOT granted
+    assert sessions.load(sid)["confirm_exec"] is False
+
+    res = runner.invoke(cli.app, ["session", "exec", sid, "--on"])
+    assert res.exit_code == 0 and "granted" in res.output
+    assert sessions.load(sid)["confirm_exec"] is True
+
+    res = runner.invoke(cli.app, ["session", "exec", sid, "--off"])
+    assert res.exit_code == 0 and "revoked" in res.output
+    assert sessions.load(sid)["confirm_exec"] is False
+
+
+def test_session_exec_without_a_flag_only_reports(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import sessions
+    sid = sessions.create()["id"]
+    res = runner.invoke(cli.app, ["session", "exec", sid])
+    assert res.exit_code == 0 and "off" in res.output
+    assert sessions.load(sid)["confirm_exec"] is False
+
+
+def test_session_exec_refuses_an_unknown_chat(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    res = runner.invoke(cli.app, ["session", "exec", "nope", "--on"])
+    assert res.exit_code == 1 and "no such session" in res.output
+
+
+def test_session_exec_rejects_a_non_boolean_grant(tmp_path, monkeypatch):
+    """`bool("false")` is True: a stringly-typed grant must be refused, not
+    read as a yes."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import sessions
+    sessions.create()
+    try:
+        sessions.validate_field_types({"confirm_exec": "false"})
+        raise AssertionError("a string grant was accepted")
+    except ValueError as e:
+        assert "confirm_exec" in str(e)
+
+
+def test_memory_list_and_forget(tmp_path, monkeypatch):
+    """IMP-6: the CLI can see what Rigma learned and delete one rule."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma.memory import MemoryStore
+    store = MemoryStore(tmp_path / "memory" / "memories.jsonl")
+    m = store.add(kind="pitfall", text="Never type filenames.")
+
+    res = runner.invoke(cli.app, ["memory", "list"])
+    assert res.exit_code == 0
+    assert m["id"] in res.output and "Never type filenames." in res.output
+
+    res = runner.invoke(cli.app, ["memory", "forget", m["id"]])
+    assert res.exit_code == 0 and "forgot" in res.output
+    assert store.all() == []
+
+    res = runner.invoke(cli.app, ["memory", "forget", "nope"])
+    assert res.exit_code == 1 and "no such memory" in res.output
+
+
 def test_plan_explain(monkeypatch):
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
     res = runner.invoke(cli.app, ["plan", "--use-case", "coding", "--explain"])
     assert res.exit_code == 0
     assert "UD-Q3_K_XL" in res.output and "combo:" in res.output
+
+
+def _profile_with(disk=400.0, gpus=True, backends=("vulkan", "rocm")):
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    gpu = []
+    if gpus:
+        gpu = [GpuInfo(vendor="amd", name="AMD Radeon RX 9070 XT",
+                       vram_mb=16368, arch="rdna4",
+                       slug="amd-radeon-rx-9070-xt-16g",
+                       backends=list(backends))]
+    return HardwareProfile(gpus=gpu, ram_mb=16234, ram_free_mb=9100,
+                           cpu=CpuInfo(cores=16), os="windows",
+                           disk_free_gb=disk)
+
+
+def _run_doctor(monkeypatch, args=(), **kw):
+    monkeypatch.setattr(cli, "probe_hardware", lambda gpus: _profile_with(**kw))
+    monkeypatch.setattr(cli, "_port_status", lambda port: "")
+    return runner.invoke(cli.app, ["doctor", *args])
+
+
+def test_doctor_runs_every_check_and_only_warns(monkeypatch):
+    res = _run_doctor(monkeypatch)
+    assert res.exit_code == 0
+    for check in ("gpu", "engine", "model", "port", "disk", "mcp"):
+        assert check in res.output
+    assert "rx-9070-xt" in res.output.lower()
+    assert "fail" not in res.output
+
+
+def test_doctor_fails_without_a_gpu(monkeypatch):
+    res = _run_doctor(monkeypatch, gpus=False)
+    assert res.exit_code == 1
+    assert "fail" in res.output and "GPU" in res.output
+    assert "fix:" in res.output
+
+
+def test_doctor_fails_on_a_gpu_with_no_backend(monkeypatch):
+    res = _run_doctor(monkeypatch, backends=())
+    assert res.exit_code == 1
+    assert "no compute backend" in res.output
+
+
+def test_doctor_warns_when_disk_is_tight(monkeypatch):
+    res = _run_doctor(monkeypatch, disk=6.0)
+    assert res.exit_code == 0
+    assert "warn" in res.output and "disk" in res.output
+
+
+def test_doctor_warns_on_a_broken_mcp_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    (tmp_path / "mcp.json").write_text("{oops", encoding="utf-8")
+    res = _run_doctor(monkeypatch)
+    assert res.exit_code == 0
+    assert "mcp.json does not parse" in res.output
+    assert "fix:" in res.output
+
+
+def test_doctor_reports_a_valid_mcp_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    (tmp_path / "mcp.json").write_text(
+        '{"mcpServers": {"a": {"command": "x"}}}', encoding="utf-8")
+    res = _run_doctor(monkeypatch)
+    assert res.exit_code == 0
+    assert "1 MCP server(s) configured" in res.output
+
+
+def test_doctor_never_binds_a_port(monkeypatch):
+    """The port check is read-only: a doctor that probed by binding would
+    collide with the port of a server that is already running."""
+    monkeypatch.setattr(cli, "probe_hardware", lambda gpus: _profile_with())
+
+    def _boom(port):
+        raise AssertionError("doctor bound a port")
+
+    monkeypatch.setattr(cli, "_port_holder", _boom)
+    monkeypatch.setattr(cli, "_port_status", lambda port: "")
+    res = runner.invoke(cli.app, ["doctor"])
+    assert res.exit_code == 0
+
+
+def test_doctor_json_is_machine_readable(monkeypatch):
+    import json as _json
+    res = _run_doctor(monkeypatch, ["--json"])
+    rows = _json.loads(res.output)
+    assert {r["id"] for r in rows} >= {"gpu", "engine", "model", "port",
+                                       "disk", "mcp"}
+    assert all(r["state"] in ("ok", "warn", "fail") for r in rows)
 
 
 def test_status_not_running(tmp_path, monkeypatch):

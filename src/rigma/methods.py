@@ -573,9 +573,14 @@ def tool_names() -> set[str]:
     return set(toolkit._REGISTRY)
 
 
-def save_user(doc: dict) -> tuple[dict | None, list[str]]:
-    """Validate and persist a user method. Returns (saved, []) or
-    (None, errors) -- errors are phrased for a model to self-correct."""
+def validate_user(doc: dict) -> tuple[dict | None, list[str]]:
+    """Validate and normalize a user method WITHOUT writing it.
+
+    Split out of save_user so a multi-document import (IMP-12 restore) can
+    check every method before writing any of them: a restore that fails on the
+    fourth method must not have applied the first three.
+    Returns (normalized, []) or (None, errors).
+    """
     errs = _shape_errors(doc)
     if errs:
         return None, errs           # before normalize(), which would raise
@@ -584,10 +589,20 @@ def save_user(doc: dict) -> tuple[dict | None, list[str]]:
     if errs:
         return None, errs
     try:
-        f = _method_file(full["id"])
+        _method_file(full["id"])
     except MethodIdError as e:
         return None, [str(e)]       # an id error is a 400, never a traceback
-    f.write_text(json.dumps(full, indent=2), encoding="utf-8")
+    return full, []
+
+
+def save_user(doc: dict) -> tuple[dict | None, list[str]]:
+    """Validate and persist a user method. Returns (saved, []) or
+    (None, errors) -- errors are phrased for a model to self-correct."""
+    full, errs = validate_user(doc)
+    if errs:
+        return None, errs
+    _method_file(full["id"]).write_text(json.dumps(full, indent=2),
+                                        encoding="utf-8")
     return full, []
 
 

@@ -83,6 +83,108 @@ run_app = typer.Typer(no_args_is_help=True)
 app.add_typer(run_app, name="run",
               help="Autonomous long-running jobs (give it a mission, walk away).")
 
+session_app = typer.Typer(no_args_is_help=True)
+app.add_typer(session_app, name="session",
+              help="Inspect a chat and change what it may do.")
+
+
+@session_app.command("list")
+def session_list(limit: int = typer.Option(20, "--limit",
+                                           help="how many chats to show")):
+    """Recent chats, with whether each one may run shell commands and code."""
+    from . import sessions
+    for s in sessions.list_sessions()[:max(1, int(limit))]:
+        full = sessions.load(s["id"]) or {}
+        flag = "exec" if full.get("confirm_exec") else "    "
+        typer.echo(f"{s['id']}  {flag}  {str(s.get('title') or '')[:60]}")
+
+
+@session_app.command("exec")
+def session_exec(
+    session_id: str = typer.Argument(..., help="chat id (see: rigma session list)"),
+    on: bool = typer.Option(False, "--on", help="allow shell/code in this chat"),
+    off: bool = typer.Option(False, "--off",
+                             help="revoke it (the default, and the safe one)"),
+):
+    """Show or change whether one chat may run shell commands and code.
+
+    AUDIT 13-3 made spawning a process its OWN grant: `allow_code` alone no
+    longer runs anything, because the destructive-command regex is only an
+    advisory text check and a wrapper can decode past it. The product default
+    is OFF, so this command is the way to grant it from the CLI. The UI toggle
+    is a separate frontend change.
+    """
+    from . import sessions
+    if on and off:
+        typer.echo("pick one of --on / --off")
+        raise typer.Exit(1)
+    s = sessions.load(session_id)
+    if s is None:
+        typer.echo(f"no such session: {session_id}")
+        raise typer.Exit(1)
+    if not on and not off:
+        typer.echo(f"{session_id}: execution is "
+                   f"{'granted' if s.get('confirm_exec') else 'off'}")
+        return
+    want = bool(on)
+    if bool(s.get("confirm_exec")) == want:
+        typer.echo(f"{session_id}: execution is already "
+                   f"{'granted' if want else 'off'}")
+        return
+    s["confirm_exec"] = want
+    try:
+        sessions.save(s, base_rev=s.get(sessions.REV_KEY))
+    except sessions.StaleWriteError:
+        # Another writer (the browser, or a turn in flight) moved the row on.
+        # Writing the stale snapshot anyway would drop their change.
+        typer.echo("the session changed while this ran — nothing was written; "
+                   "try again")
+        raise typer.Exit(1) from None
+    typer.echo(f"{session_id}: execution {'granted' if want else 'revoked'}")
+
+
+memory_app = typer.Typer(no_args_is_help=True)
+app.add_typer(memory_app, name="memory",
+              help="See, correct and forget what Rigma learned.")
+
+
+@memory_app.command("list")
+def memory_list(kind: str = typer.Option("", "--kind",
+                                         help="only this kind of memory"),
+                limit: int = typer.Option(50, "--limit")):
+    """Every learned rule, most proven first (the order it is injected in)."""
+    from .memory import MemoryStore
+    from .runtime import rigma_home
+    store = MemoryStore(rigma_home() / "memory" / "memories.jsonl")
+    rows = store.all()
+    if kind:
+        rows = [m for m in rows if m.get("kind") == kind]
+    rows.sort(key=lambda m: (m.get("outcome_score", 0),
+                             m.get("seen_count", 0)), reverse=True)
+    if not rows:
+        typer.echo("no memories yet"
+                   + (f" of kind {kind}" if kind else ""))
+        return
+    for m in rows[:max(1, int(limit))]:
+        typer.echo(f"{str(m.get('id', '?')):<12} {str(m.get('kind', '')):<9} "
+                   f"score {int(m.get('outcome_score', 0)):>3} "
+                   f"seen {int(m.get('seen_count', 0)):>3}  "
+                   f"{str(m.get('text', ''))[:80]}")
+
+
+@memory_app.command("forget")
+def memory_forget(
+    memory_id: str = typer.Argument(..., help="id (see: rigma memory list)"),
+):
+    """Delete one learned rule. Takes the store's lock, like every writer."""
+    from .memory import MemoryStore
+    from .runtime import rigma_home
+    store = MemoryStore(rigma_home() / "memory" / "memories.jsonl")
+    if not store.delete(memory_id):
+        typer.echo(f"no such memory: {memory_id}")
+        raise typer.Exit(1)
+    typer.echo(f"forgot {memory_id} ({len(store.all())} left)")
+
 
 def _run_server_base() -> str:
     from . import state as st
@@ -323,14 +425,217 @@ def update():
         typer.echo(f"engine pin: {old_v} (no newer pin published)")
 
 
-@app.command()
-def doctor():
-    """Print detected hardware and registry status."""
+def _port_status(port: int) -> str:
+    """Who is LISTENing on `port`, or "" — READ-ONLY.
+
+    Deliberately not `_port_holder`: that one binds the port to probe it, and
+    `rigma doctor` must not touch a running server's port at all. This only
+    asks the OS who is already there.
+    """
+    pid = _listening_pid(port)
+    if pid is None:
+        return ""
+    try:
+        import psutil
+        return f"pid {pid}: {psutil.Process(pid).name()}"
+    except Exception:
+        return f"pid {pid}"
+
+
+def _engine_row(backend: str, os_name: str) -> dict:
+    """Is the pinned engine for this backend on disk? Never downloads."""
+    from . import runtime
+    try:
+        man = runtime._engines_manifest()
+    except Exception as e:
+        return {"id": "engine", "state": "warn",
+                "detail": f"cannot read the engine pin: {e}",
+                "remedy": "run `rigma update` to fetch a fresh pin"}
+    key = f"{os_name}/{backend}"
+    if key not in (man.get("assets") or {}):
+        return {"id": "engine", "state": "warn",
+                "detail": f"no pinned engine build for {key}",
+                "remedy": "run `rigma plan --explain` and pick a supported "
+                          "backend, then `rigma update`"}
+    root = runtime.rigma_home() / "engines" / man["version"] / backend
+    exe = root / ("llama-server.exe" if os_name == "windows"
+                  else "llama-server")
+    if exe.exists():
+        return {"id": "engine", "state": "ok",
+                "detail": f"{backend} engine {man['version']} present",
+                "remedy": ""}
+    return {"id": "engine", "state": "warn",
+            "detail": f"{backend} engine {man['version']} is not downloaded",
+            "remedy": "run `rigma up` — it downloads and verifies the engine "
+                      "on first run (`rigma up --dry-run` previews it)"}
+
+
+def _model_present(gguf) -> bool:
+    """Is this gguf on disk, in either the managed or the custom models dir?"""
+    from . import hangar, runtime
+    if (runtime.rigma_home() / "models" / gguf.file).exists():
+        return True
+    try:
+        return (hangar.custom_dir() / gguf.file).exists()
+    except Exception:
+        return False
+
+
+def _doctor_rows() -> list[dict]:
+    """Every cheap pre-flight check, as {id, state, detail, remedy} rows.
+
+    Never downloads, never binds a port, never starts or stops anything: a
+    doctor with side effects is worse than none. `state` is ok / warn / fail,
+    and only `fail` is fatal — a missing download is a warn, because `rigma up`
+    fetches it.
+    """
+    from . import state as st
+    rows: list[dict] = []
     reg = Registry.load()
-    p = _profile(reg)
-    typer.echo(p.model_dump_json(indent=2))
-    typer.echo(f"fingerprint: {p.fingerprint}")
-    typer.echo(f"registry: {len(reg.models)} models, {len(reg.combos)} combos")
+    try:
+        p = _profile(reg)
+    except Exception as e:
+        return [{"id": "hardware", "state": "fail",
+                 "detail": f"the hardware probe failed: {e}",
+                 "remedy": "repair the GPU driver, then run `rigma reprobe`"}]
+
+    # --- GPU backend ---
+    if not p.gpus:
+        rows.append({"id": "gpu", "state": "fail",
+                     "detail": "no GPU detected",
+                     "remedy": "install or repair the GPU driver; Rigma needs "
+                               "a Vulkan, ROCm or CUDA device"})
+        backend = "vulkan"
+    else:
+        g = p.gpus[0]
+        backs = ", ".join(g.backends or []) or "no compute backend"
+        rows.append({"id": "gpu",
+                     "state": "ok" if g.backends else "fail",
+                     "detail": f"{g.name} ({g.slug}) — {backs}",
+                     "remedy": "" if g.backends
+                     else "update the GPU driver so a Vulkan/ROCm/CUDA "
+                          "backend is exposed"})
+        backend = (g.backends or ["vulkan"])[0]
+
+    # --- engine binary ---
+    rows.append(_engine_row(backend, getattr(p, "os", "windows")))
+
+    # --- model on disk ---
+    gguf = None
+    size_gb = 0.0
+    try:
+        rp = resolve(p, reg, use_case="general")
+    except ResolveError as e:
+        rows.append({"id": "model", "state": "fail",
+                     "detail": f"no model fits this machine: {e}",
+                     "remedy": "run `rigma plan --explain`; free VRAM/RAM or "
+                               "install a smaller model from the Models page"})
+    except Exception as e:
+        rows.append({"id": "model", "state": "warn",
+                     "detail": f"could not resolve a model: {e}",
+                     "remedy": "run `rigma plan --explain` for the reason"})
+    else:
+        gguf, size_gb = rp.gguf, rp.gguf.bytes / 2**30
+        if _model_present(rp.gguf):
+            rows.append({"id": "model", "state": "ok",
+                         "detail": f"{rp.model_slug} ({rp.gguf.quant}, "
+                                   f"{size_gb:.1f} GB) is on disk",
+                         "remedy": ""})
+        else:
+            rows.append({"id": "model", "state": "warn",
+                         "detail": f"{rp.model_slug} ({size_gb:.1f} GB) is "
+                                   "not downloaded yet",
+                         "remedy": "run `rigma up` — it downloads and verifies "
+                                   "the model on first run"})
+
+    # --- ports (read-only: doctor must not disturb a running server) ---
+    port = 11500
+    holder = _port_status(port)
+    s = st.read_state()
+    if holder and s and int(s.get("public_port", 0) or 0) == port:
+        rows.append({"id": "port", "state": "ok",
+                     "detail": f"Rigma is already running on :{port}",
+                     "remedy": ""})
+    elif holder:
+        rows.append({"id": "port", "state": "warn",
+                     "detail": f"port {port} is in use ({holder})",
+                     "remedy": f"stop that process, or run `rigma up --port "
+                               f"{port + 1}`"})
+    else:
+        rows.append({"id": "port", "state": "ok",
+                     "detail": f"port {port} is free", "remedy": ""})
+
+    # --- disk space ---
+    free = float(getattr(p, "disk_free_gb", 0) or 0)
+    need = 10.0 + (0.0 if gguf is None or _model_present(gguf) else size_gb)
+    if free < 5:
+        rows.append({"id": "disk", "state": "fail",
+                     "detail": f"only {free:.1f} GB free",
+                     "remedy": "free at least 5 GB; the engine plus a model "
+                               "will not fit otherwise"})
+    elif free < need:
+        rows.append({"id": "disk", "state": "warn",
+                     "detail": f"{free:.1f} GB free, about {need:.0f} GB "
+                               "wanted for the first download",
+                     "remedy": "free some space, or install a smaller model "
+                               "from the Models page"})
+    else:
+        rows.append({"id": "disk", "state": "ok",
+                     "detail": f"{free:.1f} GB free", "remedy": ""})
+
+    # --- mcp.json parse ---
+    from . import mcp_client
+    mp = mcp_client.config_path()
+    if not mp.exists():
+        rows.append({"id": "mcp", "state": "ok",
+                     "detail": "no mcp.json (no MCP servers configured)",
+                     "remedy": ""})
+    else:
+        try:
+            raw = json.loads(mp.read_text(encoding="utf-8"))
+        except ValueError as e:
+            rows.append({"id": "mcp", "state": "warn",
+                         "detail": f"mcp.json does not parse: {e}",
+                         "remedy": f"fix the JSON at {mp} — Rigma ignores a "
+                                   "bad file, so every MCP tool silently "
+                                   "disappears"})
+        except OSError as e:
+            rows.append({"id": "mcp", "state": "warn",
+                         "detail": f"cannot read mcp.json: {e}",
+                         "remedy": f"check permissions on {mp}"})
+        else:
+            if not isinstance(raw, dict):
+                rows.append({"id": "mcp", "state": "warn",
+                             "detail": "mcp.json is not a JSON object",
+                             "remedy": f"make {mp} an object with an "
+                                       "`mcpServers` key"})
+            else:
+                servers = raw.get("mcpServers") or {}
+                rows.append({"id": "mcp", "state": "ok",
+                             "detail": f"{len(servers)} MCP server(s) "
+                                       "configured",
+                             "remedy": ""})
+    return rows
+
+
+@app.command()
+def doctor(as_json: bool = typer.Option(False, "--json",
+                                        help="machine-readable rows")):
+    """Run every cheap pre-flight check, with the exact remedy for each.
+
+    One line per check. Exits non-zero only on a hard failure: a missing
+    download is a warning, not a failure, because `rigma up` fetches it.
+    """
+    rows = _doctor_rows()
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2))
+    else:
+        for r in rows:
+            typer.echo(f"{r['state']:<4} {r['id']:<7} {r['detail']}")
+            if r.get("remedy"):
+                typer.echo(f"     fix: {r['remedy']}")
+    if any(r["state"] == "fail" for r in rows):
+        raise typer.Exit(1)
 
 
 @app.command()

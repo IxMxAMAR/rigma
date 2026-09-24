@@ -103,6 +103,7 @@ def create(mission: str, session_id: str, workspace: str = "",
         "last_progress_at": now, "error_streak": 0, "lazy_streak": 0,
         "verified_once": False, "external_calls": 0, "paused": False,
         "steer_queue": [], "summary": "", "halt_reason": "",
+        "stop_reason": "",
     }
     d = run_dir(rid, create=True)
     (d / "outputs").mkdir(exist_ok=True)
@@ -169,11 +170,96 @@ def set_status(run: dict, status: str, halt_reason: str = "") -> None:
     run["status"] = status
     if halt_reason:
         run["halt_reason"] = halt_reason
+    # IMP-8: persist a stable CODE alongside the prose. The run view has to
+    # tell "finished" from "gave up" and name which cap was hit; matching on a
+    # human sentence would break the first time a sentence is reworded.
+    run["stop_reason"] = (stop_code(status, run.get("halt_reason", ""))
+                          if status in TERMINAL else "")
     save(run)
     if status in TERMINAL:
         a = active()
         if a and a["id"] == run["id"]:
             clear_active()
+
+
+# IMP-8: the closed set of ways a run can end. `unknown` is deliberate — a
+# stop nobody classified is reported as unclassified, never guessed at.
+STOP_REASONS = ("completed", "step_cap", "token_cap", "time_budget",
+                "frozen_streak", "tool_errors", "no_progress",
+                "paused_timeout", "user_stop", "session_deleted",
+                "engine_error", "interrupted", "unknown")
+
+# (status, halt_reason prefix) -> code, checked in order.
+_STOP_MATCHES = (
+    ("done", "", "completed"),
+    ("budget_exhausted", "time budget", "time_budget"),
+    ("budget_exhausted", "iteration cap", "step_cap"),
+    ("budget_exhausted", "token budget", "token_cap"),
+    ("frozen", "", "frozen_streak"),
+    ("stalled", "too many tool errors", "tool_errors"),
+    ("stalled", "no progress", "no_progress"),
+    ("stalled", "paused waiting", "paused_timeout"),
+    ("stopped", "", "user_stop"),
+    ("error", "session was deleted", "session_deleted"),
+    ("interrupted", "", "interrupted"),
+    ("error", "", "engine_error"),
+)
+
+
+def stop_code(status: str, halt_reason: str = "") -> str:
+    """Classify one terminal (status, halt_reason) pair into a STOP_REASONS
+    code. Anything unrecognised is `unknown`, which is honest about the gap."""
+    why = str(halt_reason or "")
+    for want_status, prefix, code in _STOP_MATCHES:
+        if status == want_status and why.startswith(prefix):
+            return code
+    return "unknown"
+
+
+def stop_reason(run: dict) -> str:
+    """Why this run is not running, as a code the UI can switch on.
+
+    A run written by an older build has no `stop_reason` field, so it is
+    derived from (status, halt_reason) instead of reported as unknown.
+    """
+    if str(run.get("status") or "") not in TERMINAL:
+        return ""
+    return (str(run.get("stop_reason") or "")
+            or stop_code(str(run.get("status") or ""),
+                         str(run.get("halt_reason") or "")))
+
+
+def budget_snapshot(run: dict) -> dict:
+    """What is LEFT of the run's step, token and wall-clock budgets.
+
+    The run view shows only "stopped" today, so a run that spent its clock and
+    a run that finished look identical. These are the same numbers the loop
+    judges against (`iter_ceiling`, `deadline`, `token_cap`), read for display.
+    """
+    def _int(v) -> int:
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ceiling = iter_ceiling(run)
+    used = _int(run.get("iteration"))
+    started = float(run.get("started_at") or 0.0)
+    deadline = float(run.get("deadline") or 0.0)
+    left = max(0.0, deadline - time.time()) if deadline else 0.0
+    cap = _int(run.get("token_cap"))
+    tokens = _int(run.get("tokens_used"))
+    return {
+        "steps_used": used, "steps_total": ceiling,
+        "steps_remaining": max(0, ceiling - used),
+        "seconds_remaining": int(left),
+        "time_budget_seconds": int(max(0.0, deadline - started))
+        if deadline and started else 0,
+        "tokens_used": tokens, "token_cap": cap,
+        # None (not 0) when no token cap was set: "unlimited" and "exhausted"
+        # are different answers and the UI must not render them the same.
+        "tokens_remaining": max(0, cap - tokens) if cap else None,
+    }
 
 
 # --- plan (todo / working memory) --------------------------------------------
@@ -315,27 +401,40 @@ def log_tool_action(run_id: str, name: str, args, result: str,
 _LOG_TAIL_BYTES = 64 * 1024
 
 
-def get_log_tail(run_id: str, n: int = 5) -> str:
-    p = run_dir(run_id) / "progress.md"
+def read_tail_bytes(path, max_bytes: int = _LOG_TAIL_BYTES) -> tuple[str, bool]:
+    """The last `max_bytes` of a text file, decoded. Returns (text, truncated).
+
+    Never reads more than the bound: an engine log on a long-running server is
+    hundreds of megabytes, and the whole-file read this replaces was the reason
+    opening the log page slowed the server down. A first line cut in half by
+    the seek is dropped, so no caller sees a fragment that reads as a whole
+    line. IMP-11 shares this with the engine-log route instead of each writing
+    its own seek-and-split.
+    """
     try:
-        size = p.stat().st_size
+        size = Path(path).stat().st_size
     except OSError:
-        return ""
+        return "", False
     try:
-        with open(p, "rb") as f:
-            if size > _LOG_TAIL_BYTES:
-                f.seek(size - _LOG_TAIL_BYTES)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
                 data = f.read()
-                nl = data.find(b"\n")       # the first line may be cut in half
+                nl = data.find(b"\n")
                 if nl >= 0:
                     data = data[nl + 1:]
-            else:
-                data = f.read()
+                return data.decode("utf-8", "replace"), True
+            return f.read().decode("utf-8", "replace"), False
     except Exception:
-        return ""
-    lines = data.decode("utf-8", "replace").splitlines()
+        return "", False
+
+
+def get_log_tail(run_id: str, n: int = 5) -> str:
+    p = run_dir(run_id) / "progress.md"
+    text, truncated = read_tail_bytes(p)
+    lines = text.splitlines()
     prog = [ln for ln in lines if "->  next:" in ln]
-    if not prog and size > _LOG_TAIL_BYTES:
+    if not prog and truncated:
         # the last 64 KB held no progress lines (a huge tool dump, say) —
         # fall back to the whole file rather than report nothing
         try:
