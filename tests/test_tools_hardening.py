@@ -245,3 +245,31 @@ def test_write_file_never_authors_control_bytes(tmp_path, monkeypatch):
                    {"path": "out.txt", "content": "good\x00\x00\x00text"},
                    {"workspace": str(tmp_path), "allow_code": True})
     assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "goodtext"
+
+
+def test_file_content_cannot_switch_off_the_control_byte_guard(tmp_path):
+    """AUDIT 04-7. `_defuse_control_bytes` used to return the text UNCHANGED
+    when it contained a loop sentinel, assuming only the agent loop could make
+    one. A corrupted file can contain that marker too, which switched the guard
+    off and delivered its NUL run verbatim — the instant-EOS poison the guard
+    exists to prevent. The defusing decision is now made by tool NAME."""
+    poison = ("\x00__RIGMA_DELEGATE__\x00" + "\x00" * 30 + "tail")
+    # the function itself no longer sniffs: it defuses whatever it is given
+    assert "\x00" not in tools._defuse_control_bytes(poison)
+    # ...and read_file cannot smuggle one in
+    f = tmp_path / "poison.md"
+    f.write_bytes(poison.encode("utf-8"))
+    out = tools.run_tool("read_file", {"path": str(f)},
+                         {"workspace": str(tmp_path), "allow_code": True})
+    assert "\x00" not in out
+    assert "unreadable control byte(s)" in out
+
+
+def test_the_sentinel_tools_still_return_their_sentinel(tmp_path):
+    """The guard is passed around by name for the handlers whose output IS a
+    loop sentinel — defusing one would break the image/delegate/unlock paths."""
+    ctx = {"workspace": str(tmp_path), "allow_code": True,
+           "can_host_loop_tools": True}
+    out = tools.run_tool("use_tools", {"names": ["view_image"]}, ctx)
+    assert out.startswith(tools.USE_TOOLS_SENTINEL)
+    assert "view_image" in out

@@ -54,15 +54,22 @@ class Tool:
     # the property at the registration means a new execution tool is confined
     # on the day it is added rather than when someone remembers both tuples.
     kind: str = ""
+    # AUDIT 04-7: the handler's return value IS a loop sentinel (control bytes
+    # consumed by serve.py's agentic loop), not text for the model. Declared
+    # here so `run_tool` passes it around `_defuse_control_bytes` by PROPERTY,
+    # never by sniffing the result text — file content can contain the marker
+    # and used to switch the control-byte guard off.
+    sentinel: bool = False
 
 
 _REGISTRY: dict[str, Tool] = {}
 
 
-def tool(name, description, parameters, safe=True, needs="", kind=""):
+def tool(name, description, parameters, safe=True, needs="", kind="",
+         sentinel=False):
     def wrap(fn):
         _REGISTRY[name] = Tool(name, description, parameters, fn, safe, needs,
-                               kind)
+                               kind, sentinel)
         return fn
     return wrap
 
@@ -573,17 +580,16 @@ def _defuse_control_bytes(text: str) -> str:
 
     Replacing the run with a readable marker cures generation on the exact
     failing payload (live-verified) AND tells model + owner the file is
-    corrupt instead of silently poisoning the conversation. \\t \\n \\r stay."""
+    corrupt instead of silently poisoning the conversation. \\t \\n \\r stay.
+
+    DEFUSES UNCONDITIONALLY (AUDIT 04-7). This used to skip the substitution
+    whenever the result text contained a loop sentinel, on the assumption that
+    only a loop-hosting caller could produce one — but the text also comes from
+    FILE CONTENT, so a corrupted file holding a sentinel marker switched the
+    guard off and delivered its NUL run verbatim. The sentinel tools are now
+    passed around this function by NAME in `run_tool` (`_SENTINEL_RESULT_TOOLS`)
+    instead of being recognised by sniffing their output."""
     if not text or not _CTRL_RUN.search(text):
-        return text
-    if (IMAGE_SENTINEL in text or DELEGATE_SENTINEL in text
-            or USE_TOOLS_SENTINEL in text):
-        # the legitimate control-byte uses: unfakeable markers consumed by the
-        # agent loop (image injection, delegate routing, tool unlock) and never
-        # fed to the model as text. Only a caller that hosts the loop can
-        # produce them — run_tool refuses `_LOOP_ONLY_TOOLS` otherwise — so
-        # defusing them here would break the contract for its only real user
-        # (AUDIT F37).
         return text
     return _CTRL_RUN.sub(
         lambda m: f"[{len(m.group())} unreadable control byte(s) — "
@@ -724,11 +730,20 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
         return (f"error: '{name}' is only available in a chat turn — it needs "
                 "the chat loop to host it")
     try:
-        # defuse at the ONE choke point every tool result passes through, so
-        # read_file, grep, run_shell, carriers and persistence all inherit it
-        return _defuse_control_bytes(t.handler(args or {}, ctx))
+        result = t.handler(args or {}, ctx)
     except Exception as e:   # a broken tool must not kill the turn
         return f"error running {name}: {e}"
+    if t.sentinel:
+        # This handler's real output is a loop sentinel carrying control bytes
+        # (image injection, delegate routing, tool unlock) that serve.py's loop
+        # consumes — never model-facing text. The property is declared at
+        # registration, not sniffed from the result: file content can forge a
+        # sentinel and switch a text guard off (AUDIT 04-7). Every other
+        # result, read_file and grep included, is defused unconditionally.
+        return result
+    # defuse at the ONE choke point every tool result passes through, so
+    # read_file, grep, run_shell, carriers and persistence all inherit it
+    return _defuse_control_bytes(result)
 
 
 # --- short-TTL cache for idempotent read-only tools ---------------------------
@@ -1128,7 +1143,7 @@ _LOOP_ONLY_TOOLS = frozenset({"delegate", "use_tools"})
                     "description": "tool names to unlock, e.g. ['view_image']"},
           "help": {"type": "string",
                    "description": "pass 'list' to list what is unlockable"}},
-       "required": []})
+       "required": []}, sentinel=True)
 def _use_tools(args, ctx):
     # Execution needs the live session (it persists the unlock beyond this
     # turn), so serve.py intercepts on the sentinel. Returning the payload from
@@ -1155,7 +1170,7 @@ def _use_tools(args, ctx):
        "required": ["question"]},
       # workspace-gated, not run-gated: the context-firewall benefit applies
       # equally to a long interactive chat on a small-context model
-      needs="workspace")
+      needs="workspace", sentinel=True)
 def _delegate(args, ctx):
     # never runs — serve.py intercepts on the sentinel. Returning it from the
     # handler keeps every non-serve caller (tests, cached_run) safe: they get
@@ -3119,7 +3134,7 @@ def encode_image_data_uri(path: str, max_px: int = 1024) -> str:
           "path": {"type": "string", "description": "absolute or "
                    "workspace-relative path to the image file"}},
        "required": ["path"]},
-      needs="vision")
+      needs="vision", sentinel=True)
 def _view_image(args, ctx):
     p, err, note = _resolve_image(args.get("path", ""), ctx)
     if err:
@@ -3148,7 +3163,7 @@ def _view_image(args, ctx):
           "paths": {"type": "array", "items": {"type": "string"},
                     "description": "up to 8 image file paths"}},
        "required": []},
-      needs="vision")
+      needs="vision", sentinel=True)
 def _view_images(args, ctx):
     paths = args.get("paths") or []
     if isinstance(paths, str):
@@ -3202,7 +3217,7 @@ def _view_images(args, ctx):
           "first": {"type": "integer", "description": "1-based index into the "
                     "last sample (default 1)"},
           "count": {"type": "integer", "description": "how many, 1-8 (default 4)"}}},
-      needs="vision")
+      needs="vision", sentinel=True)
 def _view_sample(args, ctx):
     rid = ctx.get("run_id")
     if not rid:
