@@ -219,3 +219,178 @@ def test_an_index_written_before_sizes_were_recorded_still_undoes(ctx):
     out = tools.run_tool("undo_last_change", {"path": "ch.txt"}, ctx)
     assert out.startswith("restored"), out
     assert (ws / "ch.txt").read_text(encoding="utf-8") == "the draft"
+
+
+# --- F38: a note channel shared between concurrent tool calls -----------------
+def _two_image_folders(tmp_path):
+    from PIL import Image
+    out = {}
+    for key, stem in (("a", "Alpha_001"), ("b", "Bravo_001")):
+        d = tmp_path / key
+        d.mkdir()
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(d / f"{stem}.png")
+        out[key] = (d, f"{stem[:-3]}_{stem[-3:]}.png")   # 001 -> 1: a near miss
+    return out
+
+
+def test_two_parallel_image_calls_do_not_swap_their_notes(tmp_path, monkeypatch):
+    """`_FUZZY_NOTES` was a module-level out-parameter.
+
+    serve.py starts every parsed tool call as its own task under a semaphore of
+    8, and the system prompt tells the model to view images "in batches" — so
+    two concurrent view_images calls cleared and drained each other's correction
+    notes (AUDIT F38). The note is a return value now; this pins it by holding
+    both calls inside the resolver until each has its own answer.
+    """
+    import threading
+    folders = _two_image_folders(tmp_path)
+    ctx = {"workspace": str(tmp_path), "has_vision": True}
+    real = tools._fuzzy_file
+    both_resolved = threading.Barrier(2, timeout=20)
+
+    def synced(p):
+        got = real(p)
+        both_resolved.wait()      # neither call may drain a shared list yet
+        return got
+
+    monkeypatch.setattr(tools, "_fuzzy_file", synced)
+    results: dict = {}
+
+    def one(key, mangled):
+        results[key] = tools.run_tool("view_images",
+                                      {"paths": [str(folders[key][0] / mangled)]},
+                                      ctx)
+
+    threads = [threading.Thread(target=one, args=(k, folders[k][1]))
+               for k in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert set(results) == {"a", "b"}, results
+    for key, other in (("a", "b"), ("b", "a")):
+        mine, theirs = folders[key][1], folders[other][1]
+        assert mine in results[key], results[key]
+        assert theirs not in results[key], (
+            f"{key} was handed {other}'s correction: {results[key]}")
+
+
+def test_view_image_alone_reports_its_own_correction(tmp_path):
+    """view_image (singular) had no note channel at all, so its correction was
+    written to the shared list and read by nobody (AUDIT F38)."""
+    from PIL import Image
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(tmp_path / "Alpha_001.png")
+    out = tools.run_tool("view_image",
+                         {"path": str(tmp_path / "Alpha_1.png")},
+                         {"workspace": str(tmp_path), "has_vision": True})
+    assert out.startswith(tools.IMAGE_SENTINEL)
+    assert "Alpha_001.png" in out and "Alpha_1.png" in out, out
+
+
+# --- F34: a move must say which file it actually moved ------------------------
+def test_move_files_reports_the_fuzzy_correction(tmp_path):
+    """`_transfer_sources` computed the "asked X / used Y" note and dropped it.
+
+    The reply listed the real post-fuzzy filenames but never as a pairing, and
+    only for the first 10 of up to 50 — so a misfiled chapter arrived with no
+    explanation (AUDIT F34)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "IMG_0013.png").write_bytes(b"pic")
+    dest = tmp_path / "sorted"
+    out = tools.run_tool("move_files",
+                         {"paths": [str(ws / "IMG_13.png")],
+                          "dest": str(dest)},
+                         {"workspace": str(ws), "allow_code": True})
+    assert out.startswith("moved 1 file(s)"), out
+    assert "IMG_13.png" in out and "IMG_0013.png" in out, out
+    assert (dest / "IMG_0013.png").is_file()
+
+
+# --- F37: sentinel tools need the loop, not a handler -------------------------
+def test_loop_only_tools_are_refused_outside_the_loop(ctx):
+    """`delegate` and `use_tools` are placeholders whose only real
+    implementation is serve.py's loop. Any other caller used to receive the raw
+    control bytes, which the defuser turned into "[1 unreadable control
+    byte(s) — file corruption?]…" and a macro substituted into a note or a
+    written file (AUDIT F37)."""
+    assert tools._LOOP_ONLY_TOOLS == {"delegate", "use_tools"}
+    for name, args in (("delegate", {"question": "q"}),
+                       ("use_tools", {"names": ["read_file"]})):
+        out = tools.run_tool(name, args, ctx)
+        assert out.startswith("error"), f"{name} leaked a sentinel: {out[:80]}"
+        assert "chat turn" in out
+
+
+def test_the_loop_host_flag_is_what_lets_the_sentinel_through(ctx):
+    out = tools.run_tool("delegate", {"question": "q"},
+                         {**ctx, "can_host_loop_tools": True})
+    assert out.startswith(tools.DELEGATE_SENTINEL), out
+
+
+def test_the_loop_only_tools_are_kept_out_of_the_macro_validator():
+    from rigma import method_schema as ms
+    names = set(tools._REGISTRY) - tools._LOOP_ONLY_TOOLS
+    doc = {"name": "M", "apply": {"system_prompt": "s", "effort": "medium"},
+           "macros": [{"id": "m1", "label": "L", "steps": [
+               {"kind": "tool", "name": "delegate", "args": {}}]}]}
+    errs = ms.validate(doc, names)
+    assert any("delegate" in e for e in errs), errs
+
+
+# --- F33: a runaway printer must not be buffered whole ------------------------
+def test_runaway_output_is_stopped_at_the_cap(ctx, monkeypatch):
+    """`_run_subprocess` piped both streams and called communicate(), holding
+    the ENTIRE output in memory before truncating — so a print loop accumulated
+    gigabytes inside the server, on a box whose RAM is committed to the model
+    (AUDIT F33)."""
+    monkeypatch.setattr(tools, "_SHELL_OUT_CAP", 20_000)
+    code = "import sys\nwhile True: sys.stdout.write('x' * 4096)"
+    started = time.monotonic()
+    out = tools._run_subprocess([sys.executable, "-c", code], ctx,
+                                python_src=code, timeout=120)
+    elapsed = time.monotonic() - started
+    assert elapsed < 60, f"the cap took {elapsed:.1f}s to stop a runaway printer"
+    assert out.startswith("error") and "output exceeded" in out, out
+
+
+def test_ordinary_output_still_comes_back_whole(ctx):
+    code = "print('hello'); print('world')"
+    out = tools._run_subprocess([sys.executable, "-c", code], ctx,
+                                python_src=code, timeout=60)
+    assert out.startswith("exit 0 (ok)"), out
+    assert "hello" in out and "world" in out
+
+
+# --- F35: a kill that was never confirmed must not be reported as one ---------
+def test_kill_tree_reports_whether_the_process_is_actually_gone(ctx):
+    proc = tools._launch_killable(
+        [sys.executable, "-c", "import time; time.sleep(30)"], False, None)
+    try:
+        assert proc.poll() is None
+        assert tools._kill_tree(proc.pid, proc) is True
+        assert proc.poll() is not None
+    finally:
+        if proc.poll() is None:
+            tools._kill_tree(proc.pid, proc)
+
+
+def test_kill_job_admits_a_kill_it_could_not_confirm(ctx, monkeypatch):
+    """`_kill_tree` swallowed every failure and `kill_job` claimed success with
+    no re-poll, so the model rebound the port it was told was free (F35)."""
+    started = tools.run_tool("start_job", {"command": _sleep_command()}, ctx)
+    assert started.startswith("started job"), started
+    jid = max(tools._JOBS)
+    proc = tools._JOBS[jid]["proc"]
+    real = tools._kill_tree
+    monkeypatch.setattr(tools, "_kill_tree", lambda *a, **k: False)
+    try:
+        out = tools.run_tool("kill_job", {"id": jid}, ctx)
+        assert out.startswith("error") and "could not confirm" in out, out
+        assert str(proc.pid) in out
+    finally:
+        monkeypatch.setattr(tools, "_kill_tree", real)
+        real(proc.pid, proc)
+        tools._JOBS.pop(jid, None)
+
