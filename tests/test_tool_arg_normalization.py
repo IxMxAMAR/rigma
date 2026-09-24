@@ -58,17 +58,20 @@ def test_alias_actually_runs_the_real_tool(tmp_path):
 
 # --- argument normalisation ---------------------------------------------------
 
-@pytest.mark.parametrize("tool,given,want", [
-    ("read_file", {"file": "a.md"}, "path"),
-    ("read_file", {"filepath": "a.md"}, "path"),
-    ("read_file", {"file_path": "a.md"}, "path"),
-    ("run_shell", {"cmd": "dir"}, "command"),
-    ("run_python", {"source": "print(1)"}, "code"),
-    ("find_files", {"glob": "**/*.py"}, "pattern"),
-    ("edit_file", {"old_string": "a", "new_string": "b", "path": "x"}, "old"),
+@pytest.mark.parametrize("tool,given,want,expected", [
+    ("read_file", {"file": "a.md"}, "path", "a.md"),
+    ("read_file", {"filepath": "a.md"}, "path", "a.md"),
+    ("read_file", {"file_path": "a.md"}, "path", "a.md"),
+    ("run_shell", {"cmd": "dir"}, "command", "dir"),
+    ("run_python", {"source": "print(1)"}, "code", "print(1)"),
+    ("find_files", {"glob": "**/*.py"}, "pattern", "**/*.py"),
+    ("edit_file", {"old_string": "a", "new_string": "b", "path": "x"},
+     "old", "a"),
 ])
-def test_alias_fills_the_declared_parameter(tool, given, want):
-    assert tools.normalize_tool_args(tool, given).get(want) is not None
+def test_alias_fills_the_declared_parameter(tool, given, want, expected):
+    # equality, not presence: `is not None` accepted "" or the wrong arg's
+    # value copied in, so a wrong alias mapping stayed green.
+    assert tools.normalize_tool_args(tool, given)[want] == expected
 
 
 def test_a_declared_parameter_is_never_treated_as_an_alias():
