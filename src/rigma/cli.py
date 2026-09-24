@@ -765,7 +765,7 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     import httpx
 
     from . import state as st
-    from .bench import run_bench, save_calibration, verdict
+    from .bench import calibration_path, run_bench, save_calibration, verdict
 
     s = st.server_running()
     if s is None:
@@ -793,7 +793,9 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     typer.echo(verdict(r, combo_expected))
     key = f"{s['model']}:{s['quant']}:{s.get('backend', 'unknown')}"
     save_calibration(key, r.model_dump())
-    typer.echo("recorded to ~/.rigma/calibration.json")
+    # AUDIT F15-7: `~` is POSIX shorthand — Explorer and cmd do not expand it.
+    # Print the path the file was actually written to.
+    typer.echo(f"recorded to {calibration_path()}")
     if evidence:
         from .runtime import _engines_manifest
         payload = {"combo": f"{s['model']} {s['quant']}",
@@ -819,8 +821,8 @@ def sweep(use_case: str = typer.Option("general", "--use-case"),
     Launches a throwaway engine on a scratch port (default 11601) and measures
     baseline vs FA-off, quantized KV, big prefill batch, coopmat-off, and (for
     MoE) graphics-queue / lighter offload. The fastest config is written to
-    ~/.rigma/calibration.json, which `rigma up` then applies automatically.
-    Your running server is never touched."""
+    Rigma's calibration store (see `rigma bench`), which `rigma up` then applies
+    automatically. Your running server is never touched."""
     from . import runtime
     from .bench import run_sweep
 
@@ -1240,7 +1242,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                 typer.echo(f"falling back -> {nxt.model_slug} {nxt.gguf.quant} "
                            f"({nxt.origin})")
     if sp is None:
-        typer.echo("all fallbacks failed — see logs in ~/.rigma/logs/")
+        # AUDIT F15-7: `~` is POSIX shorthand — Explorer and cmd do not expand
+        # it, so the one message that says where the failure was logged named a
+        # path the user could not open. Print the directory actually written.
+        typer.echo(f"all fallbacks failed — see logs in "
+                   f"{runtime.rigma_home() / 'logs'}")
         raise typer.Exit(1)
     # Both caches are keyed by `kv_fp`, and an EMPTY one disables them silently
     # rather than loudly: `serve._prefix_ctx` returns None on a falsy fp, so

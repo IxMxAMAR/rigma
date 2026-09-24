@@ -109,7 +109,8 @@ a one-line preview naming the real files — *Finish chapter: will run write_fil
 on story_bible.md*. Choose **Always allow** and it stops asking for that macro.
 That choice is stored on your machine and is never part of a shared method.
 
-**Sharing.** A method is a JSON file in `~/.rigma/methods/`. Export it, send
+**Sharing.** A method is a JSON file in Rigma's home — `~/.rigma/methods/`
+(`%USERPROFILE%\.rigma\methods\` on Windows). Export it, send
 it, import theirs. Importing never overwrites one of yours and never carries
 someone else's "always allow".
 
@@ -126,7 +127,8 @@ a checklist, the shape of a file format you keep explaining.
 
 The skill's text goes in front of your ask for that turn only. Manage them in
 the **Skills** panel, or write them by hand: each one is a `.md` file in
-`~/.rigma/skills/`, so they live in your editor and your git repo like anything
+`~/.rigma/skills/` (`%USERPROFILE%\.rigma\skills\` on Windows), so they live in
+your editor and your git repo like anything
 else. `/skill:name` works too, and a message that merely starts with a slash and
 names no skill — a path, a lone `/` — is sent exactly as you typed it.
 
