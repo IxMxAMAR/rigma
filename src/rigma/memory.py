@@ -504,6 +504,15 @@ class MemoryStore:
             if "text" in changes:
                 hit["vec"] = embed_one(hit["text"], purpose="doc")
             hit["edited"] = time.time()
+            # AUDIT R3-10-15: an edit that changes `kind` moves a row into
+            # another kind's group, and nothing re-applied that kind's cap. The
+            # store then sat one row over, and the NEXT add evicted two rows to
+            # get back under it — one more rule silently dropped than the cap
+            # promises, chosen by `_eviction_key` rather than by the add. Only
+            # the kind-changing case can exceed a cap (a text/score edit keeps
+            # the group size), so only that case is re-capped.
+            if "kind" in changes:
+                _cap_rows(rows)
             self._write_all(rows)
             return hit
 
