@@ -362,6 +362,45 @@ def test_args_that_are_neither_a_list_nor_a_string_are_refused_by_name(
     assert "args" in str(exc.value)
 
 
+# --- 09-10: a server name containing `__` must still route correctly ----------
+
+class _RoutedSrv:
+    def __init__(self, name):
+        self.name = name
+        self.reader_error = ""
+        self.tools = []
+        self.called = []
+
+    def call(self, tool, args):
+        self.called.append((tool, args))
+        return f"{self.name}/{tool}"
+
+
+def test_a_server_name_with_a_double_underscore_routes_by_longest_match():
+    """`namespaced.split("__", 2)` assumes the server name has no `__`, so a
+    server named `my__server` advertised its tools but every call answered
+    "server 'my' is unavailable" (09-10)."""
+    mgr = mcp_client.McpManager()
+    deep = _RoutedSrv("my__server")
+    shallow = _RoutedSrv("my")
+    mgr._servers = {"my": shallow, "my__server": deep}
+    mgr._ensure = lambda: None
+    assert mgr.call("mcp__my__server__do_thing", {"x": 1}) == \
+        "my__server/do_thing"
+    assert deep.called == [("do_thing", {"x": 1})]
+    # the shorter name still owns its own tools
+    assert mgr.call("mcp__my__other", {}) == "my/other"
+    assert shallow.called == [("other", {})]
+
+
+def test_an_unknown_server_still_reports_unavailable():
+    mgr = mcp_client.McpManager()
+    mgr._servers = {}
+    mgr._ensure = lambda: None
+    out = mgr.call("mcp__nosuchserver__t", {})
+    assert out.startswith("error") and "unavailable" in out
+
+
 # --- F54: shutdown must actually end the server -------------------------------
 def test_stop_kills_the_server_and_releases_its_pipes(tmp_path):
     """`stop()` called terminate() and dropped the reference: no wait, no kill

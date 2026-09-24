@@ -390,12 +390,33 @@ class McpManager:
                     "parameters": schema}})
         return out
 
+    def _route(self, namespaced: str) -> tuple[str, str] | None:
+        """Resolve `mcp__<server>__<tool>` to (server, tool).
+
+        Names are matched against the known server names LONGEST FIRST, because
+        `split("__", 2)` assumes a server name contains no `__` — and a server
+        named `my__server` then routed every call to `my` (09-10). An unknown
+        name falls back to the first `__` so the error can name it.
+        """
+        if not namespaced.startswith("mcp__"):
+            return None
+        rest = namespaced[len("mcp__"):]
+        for name in sorted(set(self._servers) | set(self._failed),
+                           key=len, reverse=True):
+            prefix = name + "__"
+            if rest.startswith(prefix):
+                return name, rest[len(prefix):]
+        if "__" in rest:
+            server, tool = rest.split("__", 1)
+            return server, tool
+        return None
+
     def call(self, namespaced: str, args: dict) -> str:
         self._ensure()
-        try:
-            _, server, tool = namespaced.split("__", 2)
-        except ValueError:
+        routed = self._route(namespaced)
+        if routed is None:
             return f"error: malformed mcp tool name '{namespaced}'"
+        server, tool = routed
         srv = self._servers.get(server)
         if srv is None:
             why = self._failed.get(server, "not configured")
