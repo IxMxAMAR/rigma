@@ -17,11 +17,13 @@ docs/*
 # the agent-integration guide is user-facing documentation, not a working note —
 # it is shipped in the wheel/repo and pointed at from the legacy UI.
 !docs/AGENTS.md
-# docs/design/ is the other exception: an engineering SPECIFICATION is a
-# deliverable that a reviewer, a future maintainer and CI all have to be able to
-# read, not a working note that only exists on one machine. `!docs/design/`
-# re-includes the directory (which `docs/*` excluded) so git descends into it;
-# without that first line the second cannot work, because a file inside an
-# excluded DIRECTORY can never be re-included.
-!docs/design/
-!docs/design/**
+# A SPECIFICATION is a deliverable that a reviewer, a future maintainer and CI
+# all have to be able to read, not a working note that only exists on one
+# machine — so the vLLM engine spec is shipped.
+#
+# Deliberately a FILE exception and not `!docs/design/`. Re-including the
+# directory drags in every other design note on this machine (`CONSTITUTION.md`,
+# `UI-REWORK-PLAN.md`, `research/`), which is the opposite of what the rule above
+# is for: those are the owner's working notes and were never published. Naming
+# the file means adding a note to `docs/design/` cannot publish it by accident.
+!docs/design/2026-09-25-vllm-engine-spec.md
