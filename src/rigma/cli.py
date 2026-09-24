@@ -1460,12 +1460,51 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        no_calibrate: bool = typer.Option(False, "--no-calibrate",
                                          help="Skip the one-time first-load "
                                               "hardware auto-tune"),
+       engine: str = typer.Option(
+           None, "--engine",
+           help="Engine runtime: llamacpp (default) or vllm. NOTE this is not "
+                "--backend: --backend picks llama.cpp's COMPUTE backend "
+                "(vulkan/rocm/cuda/cpu), --engine picks the engine itself. "
+                "vLLM is refused with a reason on a machine that cannot run it."),
        ):
     """Start Rigma: probe -> resolve -> download -> serve chat UI."""
     import os
 
+    from . import engines as _engines
     from . import runtime
     from . import state as st
+
+    # R3-VLLM-4: THE ENGINE RUNTIME IS CHOSEN HERE, and refused rather than
+    # fallen back from.
+    #
+    # `detect_engine_runtime` already knew the answer but nothing called it, so
+    # `--engine vllm` could not be expressed at all: vLLM was specified,
+    # documented and diagnosable, but unreachable. Worse, its designed behaviour
+    # is to FALL BACK to llama.cpp with the reason recorded — correct for a stored
+    # preference, wrong for a command line. Someone who types `--engine vllm` and
+    # gets a working UI has been told vLLM works. So: an explicit request that
+    # cannot be honoured is an ERROR, and the engine verdict says what to do
+    # instead. A stored preference keeps the fallback behaviour.
+    _want = (engine or "").strip().lower()
+    if _want and _want not in _engines.ENGINE_RUNTIMES:
+        typer.echo(f"unknown engine runtime {engine!r}: must be one of "
+                   f"{', '.join(_engines.ENGINE_RUNTIMES)} "
+                   f"(this is --engine, not --backend)")
+        raise typer.Exit(2)
+    _decision = _engines.detect_engine_runtime(_want or None)
+    if _want == _engines.VLLM and _decision.runtime != _engines.VLLM:
+        typer.echo("vLLM was requested but cannot run on this machine, so "
+                   "Rigma will not start llama.cpp in its place:")
+        # The verdict's own sentence, not `_decision.reason`: that one is written
+        # for the FALLBACK case and reads "…so llama.cpp is used instead", which
+        # contradicts a message whose whole point is that it will not be. The
+        # availability reason says the same thing without the contradiction.
+        _why = (_decision.availability.reason if _decision.availability
+                else _decision.reason)
+        typer.echo(f"  {_why}")
+        typer.echo("  llama.cpp is what works here: `rigma up --engine "
+                   "llamacpp`, or drop --engine entirely.")
+        raise typer.Exit(1)
 
     if st.server_running():
         typer.echo("already running — see: rigma status   (or: rigma stop)")
@@ -1506,6 +1545,57 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             s_end = st.read_state()
             if s_end:
                 st.kill_recorded(s_end, "engine_pid")   # AUDIT F08-1: identity-checked
+            st.clear_state()
+        return
+
+    # R3-VLLM-4: vLLM takes a different launch path, and it has to be entered
+    # BEFORE `resolve()`: that resolves a GGUF against the hardware plan, and a
+    # vLLM model is a HuggingFace repo id or a safetensors directory with no GGUF
+    # and no llama.cpp fit arithmetic at all. `--model` keeps its meaning — for
+    # vLLM it is the model vLLM is asked to serve.
+    if _decision.runtime == _engines.VLLM:
+        _argv = _engines.vllm_argv(
+            model, port=port - 1, served_model_name=model,
+            max_model_len=ctx, executable="vllm")
+        typer.echo(f"starting vllm serve: {model} (first load can take "
+                   f"minutes — vLLM profiles memory and captures graphs)...")
+        if dry_run:
+            typer.echo("would run: " + " ".join(_argv))
+            raise typer.Exit(0)
+        for needed in (port, port - 1):
+            holder = _port_holder(needed)
+            if holder:
+                typer.echo(f"port {needed} is already in use{holder} — "
+                           f"free it or pass a different --port")
+                raise typer.Exit(1)
+        try:
+            sp = _engines.launch_vllm_server(_argv, port - 1)
+        except RuntimeError as e:
+            typer.echo(str(e))
+            raise typer.Exit(1) from None
+        # The ENGINE RUNTIME goes in `engine`; `backend` is llama.cpp's compute
+        # backend and vLLM does not have one, so it is named rather than guessed.
+        # kv_fp stays EMPTY on purpose: it keys llama.cpp's slot cache, and a
+        # snapshot must never cross engine runtimes (see the spec).
+        st.write_state(model, "", port, engine_pid=sp.proc.pid,
+                       ui_pid=os.getpid(), backend="vllm", use_case=use_case,
+                       ctx=ctx or 0, gguf="", kv_cache="", kv_fp="",
+                       engine=_engines.VLLM)
+        typer.echo(f"chat UI:  http://127.0.0.1:{port}")
+        typer.echo(f"OpenAI:   http://127.0.0.1:{port}/v1")
+        typer.echo("stop:     Ctrl+C here, or `rigma stop` from any terminal")
+        if not no_browser:
+            _open_when_listening(port, f"http://127.0.0.1:{port}")
+        try:
+            _serve_or_exit(port)
+        finally:
+            s_end = st.read_state()
+            if s_end:
+                st.kill_recorded(s_end, "engine_pid")
+            try:
+                sp.stop()
+            except Exception:
+                pass
             st.clear_state()
         return
 
@@ -1708,6 +1798,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                    gguf=rp.gguf.file,
                    kv_cache=rp.flags.cache_type_k or "",
                    kv_fp=_kvcache.launch_fingerprint(rp, exe),
+                   engine=_engines.LLAMACPP,
                    # a projector this launch left off must stay off: perform_switch
                    # reads no_vision back when the caller has no opinion, and a
                    # ctx change from the UI would otherwise reload it

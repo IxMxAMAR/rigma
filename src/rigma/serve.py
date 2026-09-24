@@ -3360,6 +3360,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             out["backends"] = server_ops.available_backends(registry)
         except Exception:
             out["backends"] = []
+        # R3-VLLM-4: the ENGINE RUNTIMES (llamacpp/vllm) — a different axis from
+        # `backends` above, which is llama.cpp's COMPUTE backend. Kept a separate
+        # key on purpose: the backend picker iterates `backends`, and putting
+        # "vllm" in that list would offer it as a compute backend for llama.cpp.
+        #
+        # `engine` names the runtime that is RUNNING, which is not the same as the
+        # list of what could. It is passed through as recorded — NOT defaulted to
+        # "llamacpp" — because a default would make this route assert llama.cpp for
+        # every record written before the field existed, including one from a vLLM
+        # launch. The UI shows a label only when the engine was actually recorded.
+        try:
+            out["engine_runtimes"] = server_ops.available_engine_runtimes(registry)
+        except Exception:
+            out["engine_runtimes"] = []
+        out["engine"] = s.get("engine") or None
         # What the DESKTOP is holding. Windows overcommits VRAM rather than
         # refusing, so this is the difference between a plan that is resident
         # and one that is silently paged over PCIe — and it is the one number

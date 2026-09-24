@@ -10,7 +10,7 @@ import {
   listMethods,
   type Method,
 } from "../lib/methods";
-import { engineApi, type ServerInfo } from "../lib/engineApi";
+import { engineApi, engineLabel, type ServerInfo } from "../lib/engineApi";
 import { responseError } from "../lib/listFetch";
 import { clampParam, rangeFor } from "../lib/paramLimits";
 import { useApp } from "../store";
@@ -163,6 +163,36 @@ measure rather than assume.">
           </select>
         </label>
       )}
+
+      {/* R3-VLLM-4: the ENGINE is a different axis from `backend` above, and it is
+          READ-ONLY here on purpose. The engine is chosen when Rigma starts
+          (`rigma up --engine …`) because switching it means stopping one server
+          and starting another with different weights and different fit
+          arithmetic — a control in this panel would imply a hot swap that does
+          not exist. What the panel owes the user is the TRUTH about what is
+          serving, which is what the badge below says. */}
+      {(() => {
+        const eng = engineLabel(srv);
+        if (!eng) return null;      // the record does not say; say nothing
+        return (
+          <div className={row}
+               title={"The engine runtime serving this session. It is fixed for "
+                      + "the life of the process: changing it means `rigma up "
+                      + "--engine llamacpp|vllm`, because the two engines load "
+                      + "different weight formats and do their own memory "
+                      + "arithmetic."
+                      + (eng.warn
+                         ? " NOTE: this machine's own capability report says this "
+                           + "engine is unavailable — that is worth investigating."
+                         : "")}>
+            <span className={label}>engine</span>
+            <span className={eng.warn ? "text-amber" : "text-secondary"}>
+              {eng.name}
+              {eng.warn && "  (reported unavailable here)"}
+            </span>
+          </div>
+        );
+      })()}
 
       {(want.ctx !== undefined || want.kv !== undefined
         || want.vision !== undefined || want.backend !== undefined) && (

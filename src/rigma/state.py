@@ -93,6 +93,11 @@ def _write_record(rec: dict) -> dict:
         # and a re-derivation that disagreed with what actually launched is
         # precisely the mismatch kvcache exists to prevent.
         "kv_fp": rec["kv_fp"],
+        # R3-VLLM-4: the ENGINE RUNTIME (llamacpp/vllm). This dict is a fixed key
+        # list, so a field not named here is SILENTLY dropped from disk — the
+        # first version of this fix added it to write_state's signature only and
+        # `read_state()["engine"]` raised KeyError. Its own test caught it.
+        "engine": rec["engine"],
     }
     state_path().parent.mkdir(parents=True, exist_ok=True)
     state_path().write_text(json.dumps(out, indent=2), encoding="utf-8")
@@ -104,16 +109,29 @@ def write_state(model_slug: str, quant: str, public_port: int,
                 use_case: str = "general", ctx: int = 0,
                 unloaded: bool = False, kv_cache: str = "",
                 no_vision: bool = False, gguf: str = "",
-                kv_fp: str = "") -> None:
+                kv_fp: str = "", engine: str | None = None) -> None:
     """Write a whole record. Every field not named reverts to its default —
     which is what a launch wants and what an edit must never do; see
-    `update_state`."""
+    `update_state`.
+
+    `engine` is the ENGINE RUNTIME (llamacpp/vllm), a different axis from
+    `backend`, which is the llama.cpp COMPUTE backend (vulkan/rocm/cuda/cpu).
+    Recording it matters because `kv_fp`, the GGUF fit arithmetic and the slot
+    cache are all llama.cpp's: a status that showed a vLLM launch under a
+    llama.cpp compute backend would be describing an engine that is not running.
+
+    It defaults to **None, not "llamacpp"**, and that is deliberate. This function
+    is called from places that did not launch an engine at all (the UI-only
+    `rigma up`, `perform_unload`), and a default of "llamacpp" would make every
+    state.json ever written — including one from a vLLM launch that named it —
+    assert llama.cpp. Absent means "not recorded"; a launcher that knows says so.
+    """
     _write_record({"model": model_slug, "quant": quant,
                    "public_port": public_port, "engine_pid": engine_pid,
                    "ui_pid": ui_pid, "backend": backend, "use_case": use_case,
                    "ctx": ctx, "started_at": time.time(), "unloaded": unloaded,
                    "kv_cache": kv_cache, "no_vision": no_vision, "gguf": gguf,
-                   "kv_fp": kv_fp,
+                   "kv_fp": kv_fp, "engine": engine,
                    "engine_started_at": _create_time(engine_pid),
                    "ui_started_at": _create_time(ui_pid)})
 
