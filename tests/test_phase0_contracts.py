@@ -60,6 +60,68 @@ def test_format_drive_still_blocked():
     assert out.startswith("error") and "blocked" in out
 
 
+# --- AUDIT F04-1/04-3: the cmdlets PowerShell actually runs -------------------
+#
+# These assert the guard REGEX on the command TEXT, per safety rule 7. Handing
+# any of these strings to run_shell would be handing a dangerous command to
+# something that executes it, so the end-to-end path is not exercised: a regex
+# that stopped matching would mean the command ran.
+def test_powershell_destructive_cmdlets_are_blocked():
+    for cmd in ("Remove-Item -Recurse -Force C:\\Users\\Bob",
+                "ri -Recurse -Force C:\\Users\\Bob",
+                "Remove-Item C:\\build -Recurse",
+                "Stop-Computer -Force",
+                "Restart-Computer",
+                "Format-Volume -DriveLetter D",
+                "Clear-Disk -Number 1 -RemoveData",
+                "Initialize-Disk -Number 1",
+                "Remove-Partition -DriveLetter D",
+                "Set-Acl C:\\ x",
+                "logoff",
+                "shutdown /s /t 0",
+                "diskpart /s x.txt"):
+        assert tools._BLOCKED_CMD.search(cmd), cmd
+
+
+def test_ordinary_commands_are_not_destructive():
+    # A plain (non-recursive) Remove-Item is an ordinary delete: it is the run
+    # profile's business, not the destructive list's. Same for a relative rmtree.
+    for cmd in ("Remove-Item foo.txt", "ri foo.txt",
+                "git rm -r --cached .", "git log --format=%H",
+                "Get-Process | Format-Table -AutoSize",
+                "python -c \"import shutil; shutil.rmtree('build')\""):
+        assert tools._BLOCKED_CMD.search(cmd) is None, cmd
+    assert tools._BLOCKED_PY.search("import shutil; shutil.rmtree('build')") is None
+
+
+# --- AUDIT F04-4: rm flags in any order, long form, and $HOME -----------------
+def test_rm_recursive_force_against_a_root_is_blocked():
+    for cmd in ("rm -rf /", "rm -r -f /", "rm -fr /", "rm --recursive --force /",
+                "rm -rf ~/", "rm -rf $HOME", "rm -rf ${HOME}",
+                "sudo rm -r -f /"):
+        assert tools._BLOCKED_CMD.search(cmd), cmd
+
+
+# --- AUDIT F04-2: a rooted or relative rmtree, and shelled-out delete verbs ---
+def test_python_blocklist_covers_rooted_and_relative_rmtree():
+    for code in ("import shutil; shutil.rmtree('/')",
+                 "import shutil; shutil.rmtree('.')",
+                 "import shutil; shutil.rmtree('..')",
+                 "import shutil; shutil.rmtree('D:/')",
+                 "import shutil; shutil.rmtree(os.path.expanduser('~'))",
+                 "import os; os.system('rd /s /q D:\\\\')",
+                 "import os; os.system('rm -rf /')",
+                 "import os; os.system('Stop-Computer -Force')"):
+        assert tools._BLOCKED_PY.search(code), code
+
+
+def test_no_delete_profile_knows_the_powershell_alias():
+    assert tools._DELETE_CMD.search("ri -Recurse -Force C:\\Users\\Bob")
+    assert tools._DELETE_CMD.search("Remove-Item -Recurse -Force C:\\Users\\Bob")
+    # ...but not the letters inside a filename
+    assert tools._DELETE_CMD.search("tar -xzf ri.tar") is None
+
+
 # --- view_images: the two modes no longer fight the schema --------------------
 def test_view_images_requires_nothing():
     spec = next(t for t in tools.tool_specs(has_vision=True)
