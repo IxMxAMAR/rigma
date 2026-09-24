@@ -3065,6 +3065,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         info["verdict"] = server_ops.verdict(telemetry["tg"],
                                              info.get("expected_tg"))
         info["openai_base"] = f"http://127.0.0.1:{s['public_port']}/v1"
+        # AUDIT F11-2: the sampling panel used to re-declare these bounds and
+        # drifted from the validator that actually rejects the write. One
+        # definition, sessions.PARAM_RANGES, is the one the 400 names.
+        info["param_ranges"] = {k: list(v) for k, v in sessions.PARAM_RANGES.items()}
         return info
 
     @app.get("/api/server/stats")

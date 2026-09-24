@@ -3,6 +3,8 @@
 // always be keyed by id, never by "last thing rendered".
 import { create } from "zustand";
 
+import type { ParamRanges } from "./lib/paramLimits";
+
 export type Surface =
   | "chat"
   | "autonomous"
@@ -30,6 +32,9 @@ interface ServerStatus {
   tps: number | null;
   healthy: boolean;
   ctx: number;
+  /** sessions.PARAM_RANGES, as /api/server publishes it. The sampler panel's
+   *  min/max come from here so the UI cannot offer a value the server refuses. */
+  paramRanges?: ParamRanges;
 }
 
 interface AppState {
