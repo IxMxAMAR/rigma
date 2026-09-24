@@ -54,15 +54,22 @@ class Tool:
     # the property at the registration means a new execution tool is confined
     # on the day it is added rather than when someone remembers both tuples.
     kind: str = ""
+    # AUDIT 04-7: the handler's return value IS a loop sentinel (control bytes
+    # consumed by serve.py's agentic loop), not text for the model. Declared
+    # here so `run_tool` passes it around `_defuse_control_bytes` by PROPERTY,
+    # never by sniffing the result text — file content can contain the marker
+    # and used to switch the control-byte guard off.
+    sentinel: bool = False
 
 
 _REGISTRY: dict[str, Tool] = {}
 
 
-def tool(name, description, parameters, safe=True, needs="", kind=""):
+def tool(name, description, parameters, safe=True, needs="", kind="",
+         sentinel=False):
     def wrap(fn):
         _REGISTRY[name] = Tool(name, description, parameters, fn, safe, needs,
-                               kind)
+                               kind, sentinel)
         return fn
     return wrap
 
@@ -284,6 +291,33 @@ _XML_PARAM = re.compile(r"<parameter=([\w.-]+)>\s*(.*?)\s*(?:</parameter>|$)", r
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S | re.I)
 _REACT_CALL = re.compile(
     r"Action:\s*([\w.-]+)\s*Action\s*Input:\s*(\{.*?\})", re.S | re.I)
+# Tool-call envelope tags a model wraps a REAL call in. They are call syntax,
+# not prose, so the whole-reply tests below may look through them (AUDIT 04-8).
+_TOOL_WRAPPER = re.compile(r"</?tool_calls?>|<\|tool_call\|>", re.I)
+# A ReAct reply opens with a Thought line; anything else before "Action:" is
+# prose ABOUT a call, which is the difference the rescue must respect (05-2).
+_REACT_PREFIX = re.compile(
+    r"^(?:\s*(?:Thought|Thinking|Reasoning)\s*:.*)?\s*$", re.I | re.S)
+
+
+def _is_only_call_syntax(text: str) -> bool:
+    """True when `text` is XML tool-call syntax and nothing else — wrapper tags,
+    whitespace and complete `<function=…>` blocks, with no prose around them.
+
+    THE whole-reply test for the XML shape (AUDIT 04-8, 05-2). A reply that
+    quotes a call while explaining it ("to remove a folder you would write:
+    <function=run_shell>…") has prose outside the tags, and executing it is a
+    call the model never made. The two-call case stays rescued: the second block
+    is itself call syntax, and one-action mode keeps the first.
+    """
+    rest = text
+    for _ in range(64):
+        rest = _TOOL_WRAPPER.sub("", rest)
+        m = _XML_CALL.search(rest)
+        if not m:
+            break
+        rest = rest[:m.start()] + rest[m.end():]
+    return not rest.strip()
 
 # Shapes a lost tool-call wrapper leaves behind: the bare argument object, with
 # no name anywhere. Only UNAMBIGUOUS key sets — an object that could be two
@@ -361,8 +395,12 @@ def rescue_tool_call(text: str):
     What is deliberately NOT scanned: JSON found loose in the middle of prose.
     A reply that explains a call ("you'd pass {"path": "a.txt", "content":
     "hi"}") is discussing one, not making one, and executing it would be a
-    write the model never asked for. Shape 3 requires the object to be the
-    ENTIRE reply, which is the difference between the two.
+    write the model never asked for. Every shape therefore requires the reply to
+    BE the call: shape 3 is one bare JSON object and nothing else, shape 2 is a
+    fence that is the whole reply, shape 1 is XML with no prose outside it, and
+    shape 4 is a ReAct Action block that ends the reply. Prose that merely
+    quotes tool-call syntax — including a fenced example, which used to be
+    accepted anywhere in the text (AUDIT 04-8, 05-2) — is not a call.
 
     Returns (name, args) or (None, None).
     """
@@ -370,7 +408,7 @@ def rescue_tool_call(text: str):
         return None, None
 
     # 1. XML (strict about the OUTER shape, lenient inside it)
-    if "<function=" in text:
+    if "<function=" in text and _is_only_call_syntax(text):
         m = _XML_CALL.search(text)
         if m:
             name, body = m.group(1), m.group(2)
@@ -385,11 +423,17 @@ def rescue_tool_call(text: str):
                     args[pm.group(1)] = val
             return name, args
 
-    # 2/3. a fenced json block, or a reply that is nothing but one JSON object
-    blobs = [m.group(1) for m in _FENCED_JSON.finditer(text)]
-    bare = text.strip()
-    if bare.startswith("{") and bare.endswith("}"):
-        blobs.append(bare)
+    # 2/3. a fenced json block, or a reply that is nothing but one JSON object.
+    # The FENCE must be the whole reply: every fenced block used to be fed to
+    # _call_from_json_obj no matter what prose surrounded it, so a quoted
+    # example was executed as a call (AUDIT 04-8).
+    stripped = text.strip()
+    blobs = []
+    fenced = _FENCED_JSON.fullmatch(stripped)
+    if fenced:
+        blobs.append(fenced.group(1))
+    if stripped.startswith("{") and stripped.endswith("}"):
+        blobs.append(stripped)
     for blob in blobs:
         try:
             got = _call_from_json_obj(json.loads(blob, strict=False))
@@ -398,9 +442,12 @@ def rescue_tool_call(text: str):
         if got:
             return got
 
-    # 4. ReAct: both markers must be present, so prose can't trip it
-    m = _REACT_CALL.search(text)
-    if m:
+    # 4. ReAct: the Action block must END the reply, and only a Thought line may
+    # precede it. Both markers merely appearing somewhere in prose used to be
+    # enough, so quoting an example from a file executed it (AUDIT 05-2).
+    m = _REACT_CALL.search(stripped)
+    if m and m.end() == len(stripped) and _REACT_PREFIX.match(
+            stripped[:m.start()]):
         try:
             args = json.loads(m.group(2).strip(), strict=False)
             if isinstance(args, dict):
@@ -533,17 +580,16 @@ def _defuse_control_bytes(text: str) -> str:
 
     Replacing the run with a readable marker cures generation on the exact
     failing payload (live-verified) AND tells model + owner the file is
-    corrupt instead of silently poisoning the conversation. \\t \\n \\r stay."""
+    corrupt instead of silently poisoning the conversation. \\t \\n \\r stay.
+
+    DEFUSES UNCONDITIONALLY (AUDIT 04-7). This used to skip the substitution
+    whenever the result text contained a loop sentinel, on the assumption that
+    only a loop-hosting caller could produce one — but the text also comes from
+    FILE CONTENT, so a corrupted file holding a sentinel marker switched the
+    guard off and delivered its NUL run verbatim. The sentinel tools are now
+    passed around this function by NAME in `run_tool` (`_SENTINEL_RESULT_TOOLS`)
+    instead of being recognised by sniffing their output."""
     if not text or not _CTRL_RUN.search(text):
-        return text
-    if (IMAGE_SENTINEL in text or DELEGATE_SENTINEL in text
-            or USE_TOOLS_SENTINEL in text):
-        # the legitimate control-byte uses: unfakeable markers consumed by the
-        # agent loop (image injection, delegate routing, tool unlock) and never
-        # fed to the model as text. Only a caller that hosts the loop can
-        # produce them — run_tool refuses `_LOOP_ONLY_TOOLS` otherwise — so
-        # defusing them here would break the contract for its only real user
-        # (AUDIT F37).
         return text
     return _CTRL_RUN.sub(
         lambda m: f"[{len(m.group())} unreadable control byte(s) — "
@@ -684,11 +730,20 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
         return (f"error: '{name}' is only available in a chat turn — it needs "
                 "the chat loop to host it")
     try:
-        # defuse at the ONE choke point every tool result passes through, so
-        # read_file, grep, run_shell, carriers and persistence all inherit it
-        return _defuse_control_bytes(t.handler(args or {}, ctx))
+        result = t.handler(args or {}, ctx)
     except Exception as e:   # a broken tool must not kill the turn
         return f"error running {name}: {e}"
+    if t.sentinel:
+        # This handler's real output is a loop sentinel carrying control bytes
+        # (image injection, delegate routing, tool unlock) that serve.py's loop
+        # consumes — never model-facing text. The property is declared at
+        # registration, not sniffed from the result: file content can forge a
+        # sentinel and switch a text guard off (AUDIT 04-7). Every other
+        # result, read_file and grep included, is defused unconditionally.
+        return result
+    # defuse at the ONE choke point every tool result passes through, so
+    # read_file, grep, run_shell, carriers and persistence all inherit it
+    return _defuse_control_bytes(result)
 
 
 # --- short-TTL cache for idempotent read-only tools ---------------------------
@@ -1088,7 +1143,7 @@ _LOOP_ONLY_TOOLS = frozenset({"delegate", "use_tools"})
                     "description": "tool names to unlock, e.g. ['view_image']"},
           "help": {"type": "string",
                    "description": "pass 'list' to list what is unlockable"}},
-       "required": []})
+       "required": []}, sentinel=True)
 def _use_tools(args, ctx):
     # Execution needs the live session (it persists the unlock beyond this
     # turn), so serve.py intercepts on the sentinel. Returning the payload from
@@ -1115,7 +1170,7 @@ def _use_tools(args, ctx):
        "required": ["question"]},
       # workspace-gated, not run-gated: the context-firewall benefit applies
       # equally to a long interactive chat on a small-context model
-      needs="workspace")
+      needs="workspace", sentinel=True)
 def _delegate(args, ctx):
     # never runs — serve.py intercepts on the sentinel. Returning it from the
     # handler keeps every non-serve caller (tests, cached_run) safe: they get
@@ -1360,10 +1415,30 @@ def _candidates(p: Path, n: int = 5) -> str:
 # letters / absolute-path rejection) so we don't false-positive on those.
 _ILLEGAL_PATH = set('*?"<>|')
 
+# Windows reserved device names: `write_file('nul')` used to report "wrote 7
+# chars" while writing nothing (AUDIT 04-10). NUL is a device, so
+# `Path.exists()` is true, `write_text` discards into it, and read_file then
+# answers "no such file" — a silent success the model cannot recover from. Any
+# extension is covered: Windows treats `NUL.gguf` as the device too.
+_RESERVED_DEVICE = re.compile(
+    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.I)
+
+
+def _reserved_device_name(rel: str):
+    """The first Windows reserved device name in `rel`, or None."""
+    for part in str(rel).replace("\\", "/").split("/"):
+        # Windows strips trailing dots/spaces before matching the device name
+        if _RESERVED_DEVICE.match(part.rstrip(" .")):
+            return part
+    return None
+
 
 def _bad_write_char(rel: str):
-    """The first illegal character in a path a WRITE would create, or None."""
-    return next((c for c in str(rel) if c in _ILLEGAL_PATH), None)
+    """The first illegal character in a path a WRITE would create, or None.
+
+    A reserved device name is refused too — see `_reserved_device_name`."""
+    return (next((c for c in str(rel) if c in _ILLEGAL_PATH), None)
+            or _reserved_device_name(rel))
 
 
 def _glob_under(root: Path, rel: str) -> list[Path]:
@@ -2537,13 +2612,16 @@ def _read_file(args, ctx):
     # calls were emitted before either result returned.
     #
     # Keyed on the RESOLVED path plus mtime and size, so a read after a write
-    # returns the new content, and on offset/limit so paging still works.
+    # returns the new content, and on offset/limit so paging still works, and on
+    # `numbered` because that call returns DIFFERENT text (AUDIT 05-5): without
+    # it the numbered re-read of unchanged bytes was refused as "already read",
+    # leaving the model without the handle edit_file(start_line=…) needs.
     seen = ctx.get("_reads")
     if seen is not None:
         try:
             st = p.stat()
             key = (str(p.resolve()).lower(), st.st_mtime_ns, st.st_size,
-                   offset, limit)
+                   offset, limit, bool(args.get("numbered")))
         except OSError:
             key = None
         if key is not None:
@@ -2735,9 +2813,21 @@ def _sample_files(args, ctx):
     # Deliberately NOT written as `view_sample()`: a weak model copies
     # callable-looking text out of tool output and emits it as prose instead of
     # making the call (owner watched exactly that). Describe, don't demonstrate.
-    tail = ("\nThese paths are already recorded. Do not retype them — you will "
-            "get them wrong. Use the view_sample tool, with no arguments, to "
-            "look at this sample." if rid else "")
+    #
+    # AUDIT 05-3: view_sample is gated needs="vision", so a text-only model
+    # cannot call it — naming it in this result is the prompt/tool-surface
+    # disagreement prompt.py exists to stop. Give that model the same remedy
+    # `prompt._REMEDY_TEXT_ONLY` gives instead.
+    if rid and ctx.get("has_vision"):
+        tail = ("\nThese paths are already recorded. Do not retype them — you "
+                "will get them wrong. Use the view_sample tool, with no "
+                "arguments, to look at this sample.")
+    elif rid:
+        tail = ("\nThese paths are already recorded. Do not retype them — you "
+                "will get them wrong. Copy the names EXACTLY as written, or "
+                "call read_file with the path above.")
+    else:
+        tail = ""
     found = f"{len(hits)}" if not truncated else f"{len(hits)}+"
     return (f"{found} files match '{pat}' in {p}; random sample of "
             f"{len(picked)}:\n{body}{tail}")
@@ -2808,10 +2898,13 @@ def _write_file_locked(args, ctx):
     # '?' means it is still guessing, not writing.
     bad = _bad_write_char(raw)
     if bad is not None:
-        hint = (" — that looks like a search pattern. Use find_files to "
-                "locate the real path, then write to it exactly."
-                if bad in "*?" else "")
-        return (f"error: '{bad}' can't be in a file path you write to.{hint}")
+        if bad in _ILLEGAL_PATH:
+            hint = (" — that looks like a search pattern. Use find_files to "
+                    "locate the real path, then write to it exactly."
+                    if bad in "*?" else "")
+            return (f"error: '{bad}' can't be in a file path you write to.{hint}")
+        return (f"error: '{bad}' is a reserved device name on Windows, so no "
+                "file can be created with it. Choose a different name.")
     p = _ws_path(ctx, raw)
     p.parent.mkdir(parents=True, exist_ok=True)
     content = str(args.get("content", ""))
@@ -3079,7 +3172,7 @@ def encode_image_data_uri(path: str, max_px: int = 1024) -> str:
           "path": {"type": "string", "description": "absolute or "
                    "workspace-relative path to the image file"}},
        "required": ["path"]},
-      needs="vision")
+      needs="vision", sentinel=True)
 def _view_image(args, ctx):
     p, err, note = _resolve_image(args.get("path", ""), ctx)
     if err:
@@ -3108,7 +3201,7 @@ def _view_image(args, ctx):
           "paths": {"type": "array", "items": {"type": "string"},
                     "description": "up to 8 image file paths"}},
        "required": []},
-      needs="vision")
+      needs="vision", sentinel=True)
 def _view_images(args, ctx):
     paths = args.get("paths") or []
     if isinstance(paths, str):
@@ -3162,7 +3255,7 @@ def _view_images(args, ctx):
           "first": {"type": "integer", "description": "1-based index into the "
                     "last sample (default 1)"},
           "count": {"type": "integer", "description": "how many, 1-8 (default 4)"}}},
-      needs="vision")
+      needs="vision", sentinel=True)
 def _view_sample(args, ctx):
     rid = ctx.get("run_id")
     if not rid:
@@ -3323,6 +3416,28 @@ def _run_shell(args, ctx):
 _JOBS: dict[int, dict] = {}
 _JOB_MAX_BUF = 64_000        # chars of rolling output kept per job
 _JOB_LIMIT = 8               # concurrent jobs — a runaway-spawn backstop
+# AUDIT 05-4: `_JOBS` is never popped, so every finished Popen plus its output
+# window was retained for the server's uptime and `job_output` with no id
+# returned one line per retained job. Keep the most recent few finished records
+# (so a just-finished job's exit code is still reachable) and evict the rest.
+_JOB_KEEP_FINISHED = 32
+
+
+def _prune_jobs(keep_finished: int | None = None) -> int:
+    """Evict the OLDEST finished job records, keeping the newest `keep_finished`.
+
+    Live jobs are never evicted — only records whose process has exited. Returns
+    how many were dropped. `job_output`/`kill_job` already answer "no such job"
+    for an evicted id, and ids increase monotonically, so "oldest" is the
+    smallest id."""
+    keep = _JOB_KEEP_FINISHED if keep_finished is None else keep_finished
+    finished = sorted(jid for jid, j in _JOBS.items()
+                      if j["proc"].poll() is not None)
+    dropped = 0
+    for jid in finished[:max(0, len(finished) - keep)]:
+        _JOBS.pop(jid, None)
+        dropped += 1
+    return dropped
 
 
 def _job_pump(job: dict, stream, label: str) -> None:
@@ -3398,6 +3513,7 @@ def _start_job(args, ctx):
            "lock": threading.Lock(), "cmd": cmd[:500], "started": time.time(),
            "run_id": str(ctx.get("run_id") or "")}
     _JOBS[jid] = job
+    _prune_jobs()          # AUDIT 05-4: bound the table, never the live jobs
     for stream, label in ((proc.stdout, "out"), (proc.stderr, "err")):
         threading.Thread(target=_job_pump, args=(job, stream, label),
                          daemon=True).start()
@@ -3505,7 +3621,9 @@ def kill_all_jobs() -> int:
     shutdown hook are its callers.
 
     Entries are LEFT in place: job_output must still be able to report the
-    exit code of a job that was killed mid-run. Never raises — it runs on
+    exit code of a job that was killed mid-run. The table is bounded by
+    `_prune_jobs` at the next `start_job`, which keeps the newest few finished
+    records and drops older ones (AUDIT 05-4). Never raises — it runs on
     shutdown paths where an exception would strand the rest of the teardown."""
     killed = 0
     for job in list(_JOBS.values()):
@@ -3573,7 +3691,8 @@ _BLOCKED_PY = re.compile(
     r"shutdown|fdisk|rd|del|rm|remove-item|stop-computer|format-volume|"
     r"clear-disk|initialize-disk)\b)")
 _DELETE_PY = re.compile(
-    r"(?i)(os\.(remove|unlink|rmdir)|shutil\.rmtree|\.unlink\s*\(|send2trash)")
+    r"(?i)(os\.(remove|unlink|rmdir|replace|truncate)|"
+    r"shutil\.(rmtree|move)|\.unlink\s*\(|\.rmdir\s*\(|send2trash)")
 
 
 # AUDIT 13-3: the regexes above are ADVISORY, not the boundary. They match

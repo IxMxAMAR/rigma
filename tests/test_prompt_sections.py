@@ -28,11 +28,13 @@ def test_the_assembled_prompt_is_byte_identical_to_what_shipped():
     prompt change is a model-behaviour change that needs a live A/B.
 
     The caps spell out what "what shipped" WAS: a vision model on the full tool
-    surface, because before the tier table existed every run carried every tool
-    and the prompt named `web_search` accordingly. Dropping "extended" here does
-    not reproduce the old prompt — it reproduces the focused one.
-    """
-    assert _prompt.agent_prompt(caps=("vision", "extended")) == _golden()
+    surface with execution and network, because before the tier table and the
+    run profiles existed every run carried every tool and the prompt named
+    `web_search`, `run_shell` and `run_python` accordingly. Dropping a cap does
+    not reproduce the old prompt — it reproduces a focused / confined /
+    no-network one (AUDIT 05-1)."""
+    assert _prompt.agent_prompt(
+        caps=("vision", "extended", "exec", "network")) == _golden()
 
 
 def test_serve_still_exposes_the_same_constant():
@@ -187,6 +189,56 @@ def test_the_prompt_never_names_a_tool_the_surface_withheld():
             assert named <= offered, (
                 f"vision={has_vision} surface={surface}: prompt names "
                 f"{sorted(named - offered)}, which that surface withholds")
+
+
+# AUDIT 05-1: the run PROFILE is a third axis of the same question. `tool_specs`
+# withholds exec tools under `confined` and network tools under `no-network`, so
+# the prompt must not name what the profile's surface dropped. The caps each
+# profile produces, spelled out (vision on, surface "all").
+_PROFILE_CAPS = {
+    "all": {"vision", "extended", "exec", "network"},
+    "no-network": {"vision", "extended", "exec"},
+    "no-delete": {"vision", "extended", "exec", "network"},
+    "confined": {"vision", "extended", "network"},
+}
+
+
+@pytest.mark.parametrize("profile", sorted(_PROFILE_CAPS))
+def test_the_prompt_agrees_with_the_surface_for_every_run_profile(profile):
+    import re
+
+    from rigma import tools as toolkit
+    base = dict(allow_code=True, workspace="C:/x", has_run=True, has_rag=True)
+    vocabulary = {s["function"]["name"] for s in toolkit.tool_specs(
+        surface="all", has_vision=True, **base)}
+    text = _prompt.agent_prompt(caps=_PROFILE_CAPS[profile])
+    offered = {s["function"]["name"] for s in toolkit.tool_specs(
+        surface="all", has_vision=True, profile=profile, **base)}
+    named = {w for w in re.findall(r"[a-z_][a-z0-9_]{3,}", text)
+             if w in vocabulary}
+    assert named <= offered, (
+        f"profile={profile}: prompt names {sorted(named - offered)}, which "
+        "that profile's surface withholds")
+
+
+def test_the_confined_prompt_never_names_an_exec_tool():
+    text = _prompt.agent_prompt(caps=_PROFILE_CAPS["confined"])
+    assert "run_shell" not in text and "run_python" not in text
+    # ...but a normal run still gets them
+    assert "run_shell" in _prompt.agent_prompt(caps=_PROFILE_CAPS["all"])
+
+
+def test_the_no_network_prompt_never_names_web_search():
+    text = _prompt.agent_prompt(caps=_PROFILE_CAPS["no-network"])
+    assert "web_search" not in text
+    assert "web_search" in _prompt.agent_prompt(caps=_PROFILE_CAPS["all"])
+
+
+def test_prompt_caps_reads_the_run_profile():
+    """`_prompt_caps` is the one place the profile reaches the prompt builder."""
+    assert "exec" not in serve._prompt_caps(profile="confined")
+    assert "network" not in serve._prompt_caps(profile="no-network")
+    assert {"exec", "network"} <= serve._prompt_caps(profile="all")
 
 
 def test_the_surface_decision_has_one_home():

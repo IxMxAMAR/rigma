@@ -245,3 +245,113 @@ def test_write_file_never_authors_control_bytes(tmp_path, monkeypatch):
                    {"path": "out.txt", "content": "good\x00\x00\x00text"},
                    {"workspace": str(tmp_path), "allow_code": True})
     assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "goodtext"
+
+
+def test_file_content_cannot_switch_off_the_control_byte_guard(tmp_path):
+    """AUDIT 04-7. `_defuse_control_bytes` used to return the text UNCHANGED
+    when it contained a loop sentinel, assuming only the agent loop could make
+    one. A corrupted file can contain that marker too, which switched the guard
+    off and delivered its NUL run verbatim — the instant-EOS poison the guard
+    exists to prevent. The defusing decision is now made by tool NAME."""
+    poison = ("\x00__RIGMA_DELEGATE__\x00" + "\x00" * 30 + "tail")
+    # the function itself no longer sniffs: it defuses whatever it is given
+    assert "\x00" not in tools._defuse_control_bytes(poison)
+    # ...and read_file cannot smuggle one in
+    f = tmp_path / "poison.md"
+    f.write_bytes(poison.encode("utf-8"))
+    out = tools.run_tool("read_file", {"path": str(f)},
+                         {"workspace": str(tmp_path), "allow_code": True})
+    assert "\x00" not in out
+    assert "unreadable control byte(s)" in out
+
+
+def test_the_sentinel_tools_still_return_their_sentinel(tmp_path):
+    """The guard is passed around by name for the handlers whose output IS a
+    loop sentinel — defusing one would break the image/delegate/unlock paths."""
+    ctx = {"workspace": str(tmp_path), "allow_code": True,
+           "can_host_loop_tools": True}
+    out = tools.run_tool("use_tools", {"names": ["view_image"]}, ctx)
+    assert out.startswith(tools.USE_TOOLS_SENTINEL)
+    assert "view_image" in out
+
+
+# --- AUDIT 04-10: a reserved device name is not a file ------------------------
+def test_reserved_device_names_are_refused_before_the_disk(tmp_path):
+    """`write_file('nul')` used to report "wrote 7 chars" while writing nothing:
+    NUL is a device, so Path.exists() is true, write_text discards into it, and
+    read_file then answers "no such file" — a silent success the model cannot
+    recover from."""
+    for name in ("nul", "NUL.gguf", "con", "aux", "prn", "com1", "lpt9.txt"):
+        out = tools.run_tool("write_file", {"path": name, "content": "PAYLOAD"},
+                             {"workspace": str(tmp_path), "allow_code": True})
+        assert out.startswith("error"), (name, out)
+        assert "reserved device name" in out, (name, out)
+
+
+def test_the_write_path_guard_still_rejects_globs_and_allows_real_names():
+    assert tools._bad_write_char("*") == "*"
+    assert tools._bad_write_char("a?b.txt") == "?"
+    assert tools._bad_write_char("notes.txt") is None
+    assert tools._bad_write_char("aux_data.txt") is None
+    assert tools._bad_write_char("com10.gguf") is None
+    assert tools._reserved_device_name("Q4_K_M/nul.gguf") == "nul.gguf"
+
+
+# --- AUDIT 05-4: the background-job table is bounded --------------------------
+# Fakes only: a test that spawns and kills a real child hangs in this sandbox
+# (taskkill is denied), and the defect is pure bookkeeping anyway.
+class _FakeProc:
+    pid = 4242
+
+    def __init__(self, rc=0):
+        import io
+        self.stdout = io.StringIO("")
+        self.stderr = io.StringIO("")
+        self.rc = rc
+
+    def poll(self):
+        return self.rc
+
+
+def _fake_job(rc=0):
+    import collections
+    import threading
+    return {"proc": _FakeProc(rc), "chunks": collections.deque(),
+            "buflen": 0, "lock": threading.Lock(), "cmd": "echo hi",
+            "started": 0.0}
+
+
+def _with_saved_jobs(fn):
+    saved = dict(tools._JOBS)
+    try:
+        tools._JOBS.clear()
+        return fn()
+    finally:
+        tools._JOBS.clear()
+        tools._JOBS.update(saved)
+
+
+def test_prune_jobs_keeps_live_jobs_and_the_newest_finished():
+    def run():
+        for jid in range(1, 11):
+            tools._JOBS[jid] = _fake_job(rc=0)      # finished
+        tools._JOBS[11] = _fake_job(rc=None)        # live
+        assert tools._prune_jobs(keep_finished=3) == 7
+        assert sorted(tools._JOBS) == [8, 9, 10, 11]
+    _with_saved_jobs(run)
+
+
+def test_start_job_evicts_old_finished_records(monkeypatch, tmp_path):
+    """`_JOBS[jid] = job` was the only writer and nothing ever popped, so every
+    finished Popen and its output window lived for the server's uptime."""
+    def run():
+        monkeypatch.setattr(tools, "_launch_killable",
+                            lambda *a, **k: _FakeProc(0))
+        monkeypatch.setattr(tools, "_JOB_KEEP_FINISHED", 4)
+        ctx = {"allow_code": True, "confirm_exec": True, "profile": "all",
+               "workspace": str(tmp_path)}
+        for _ in range(25):
+            out = tools.run_tool("start_job", {"command": "echo hi"}, ctx)
+            assert out.startswith("started job"), out
+        assert len(tools._JOBS) <= 4
+    _with_saved_jobs(run)
