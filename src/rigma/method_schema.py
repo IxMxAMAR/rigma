@@ -177,6 +177,12 @@ def _validate_steps(steps, where: str, var_names: set[str],
                 if "effort" in st and st["effort"] not in EFFORTS:
                     errs.append(f"{at}: effort must be one of "
                                 f"{', '.join(repr(e) for e in EFFORTS)}")
+                for f in ("use_tools", "allow_code"):
+                    # `bool("false")` is True, so a quoted value turned code
+                    # execution ON and left it on for the chat (09-6). Only a
+                    # real boolean is a boolean.
+                    if f in st and not isinstance(st[f], bool):
+                        errs.append(f"{at}: {f} must be true or false")
         elif kind == "note":
             if step.get("op") not in ("append", "replace"):
                 errs.append(f"{at}: note op must be 'append' or 'replace'")

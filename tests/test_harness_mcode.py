@@ -9,16 +9,18 @@ code is a minified bundle.
 
 Nothing here needs mcode installed, a MiniMax account, or a GPU.
 """
+import io
 import json
 import os
+import subprocess as _sp
 import sys
 import threading
 import time
+import types
 
 import pytest
 
 from rigma import harness, harness_mcode, rag
-
 
 @pytest.fixture(autouse=True)
 def _a_recorded_sidecar_answers(monkeypatch):
@@ -1094,3 +1096,109 @@ def test_a_turn_that_reported_its_own_failure_is_not_reported_twice(
         base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
     assert [e.kind for e in got] == ["error"]
     assert "upstream refused" in got[0].text
+
+
+# --------------------------------------------------------------------------
+# a fake child, so the read loop can be driven without mcode or a process
+
+
+class _RecordingIO(io.StringIO):
+    """A stdout/stderr that records the size each readline asked for."""
+    def __init__(self, text):
+        super().__init__(text)
+        self.sizes = []
+
+    def readline(self, size=-1):
+        self.sizes.append(size)
+        return super().readline(size)
+
+
+def _fake_exec(monkeypatch, *, stdout="", stderr="", code=0):
+    """Drive the real `drive_turn` against a fake child: no process starts."""
+    class FakeProc:
+        def __init__(self):
+            self.stdout = _RecordingIO(stdout)
+            self.stderr = _RecordingIO(stderr)
+            self.returncode = code
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    fake = FakeProc()
+    monkeypatch.setattr(harness_mcode, "bin_path", lambda: "mcode")
+    monkeypatch.setattr(harness_mcode, "ensure_provider",
+                        lambda *a, **k: ("custom_provider:rigma", ""))
+    monkeypatch.setattr(harness_mcode, "ensure_agents_md", lambda: None)
+    monkeypatch.setattr(harness_mcode, "ensure_mcp", lambda cwd="": None)
+    monkeypatch.setattr(harness_mcode, "subprocess",
+                        types.SimpleNamespace(Popen=lambda *a, **k: fake,
+                                              DEVNULL=_sp.DEVNULL,
+                                              PIPE=_sp.PIPE))
+    return fake
+
+
+def test_a_line_over_the_bound_is_skipped_not_buffered(monkeypatch):
+    """`for line in proc.stdout` held one whole line in memory before parsing,
+    and json.loads made a second copy; mcode puts tool results inside those
+    lines, so one large result lived twice inside the process that also holds
+    every chat (09-4)."""
+    monkeypatch.setattr(harness_mcode, "_FRAME_MAX", 200)
+    stream = io.StringIO("x" * 400 + "\n" + json.dumps(
+        {"type": "exec.completed",
+         "result": {"status": "succeeded", "output": "ok"}}) + "\n")
+    got = list(harness_mcode._bounded_lines(stream))
+    assert got[0] == ("", True)
+    assert got[1][1] is False
+    assert json.loads(got[1][0])["result"]["output"] == "ok"
+
+
+def test_an_unterminated_oversize_line_ends_the_stream(monkeypatch):
+    """An endless line must not spin the drain forever: bounded memory is the
+    point, and the watchdog is what ends the process."""
+    monkeypatch.setattr(harness_mcode, "_FRAME_MAX", 8)
+
+    class Endless(io.StringIO):
+        def readline(self, size=-1):
+            return "x" * (size if size and size > 0 else 16)
+
+    assert list(harness_mcode._bounded_lines(Endless(""))) == [("", True)]
+
+
+def test_drive_turn_reads_mcode_with_a_hard_frame_bound(monkeypatch):
+    """The F55 bound was applied to the MCP client and not to mcode's stdout
+    (09-4). Every read must carry it."""
+    monkeypatch.setattr(harness_mcode, "_FRAME_MAX", 200)
+    fake = _fake_exec(monkeypatch, stdout=(
+        "x" * 400 + "\n" + json.dumps(
+            {"type": "exec.completed",
+             "result": {"status": "succeeded", "output": "ok"}}) + "\n"))
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    assert fake.stdout.sizes and all(s == 201 for s in fake.stdout.sizes), \
+        fake.stdout.sizes
+    assert [e.text for e in got if e.kind == "text"] == ["ok"]
+    assert any(e.kind == "notice" and "skipped" in e.text for e in got), got
+
+
+def test_an_exit_zero_with_no_stream_is_an_error_not_an_empty_success(
+        monkeypatch):
+    """mcode can exit 0 without ever emitting `exec.completed` (a shim that
+    fails silently, an output-format mismatch). The tail checked only stopped/
+    killed/exit code/final_status, so the generator ended silently and the
+    caller saved an empty assistant reply as a finished turn (09-7)."""
+    _fake_exec(monkeypatch, stdout="", stderr="shim said nothing\n", code=0)
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    assert [e.kind for e in got] == ["error"], got
+    assert "0" in got[0].text and "without completing" in got[0].text
+
+
+def test_a_completed_stream_is_not_reported_as_unfinished(monkeypatch):
+    """The other half of the same rule: `exec.completed` is the end marker, and
+    a turn that has one must not gain a spurious error."""
+    _fake_exec(monkeypatch, stdout=json.dumps(
+        {"type": "exec.completed",
+         "result": {"status": "succeeded", "output": "hi"}}) + "\n")
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    assert [e.kind for e in got] == ["text"], got

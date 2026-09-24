@@ -36,6 +36,11 @@ from .runtime import rigma_home
 PROTOCOL_VERSION = "2025-06-18"
 _START_TIMEOUT = 20.0     # server boot + initialize handshake
 _CALL_TIMEOUT = 60.0
+# A server that accepts a request and never answers is DEAD for our purposes,
+# but a timeout changed no state — so `reader_error` stayed empty and `_ensure`
+# kept the mute process in `_servers` forever, costing a worker thread per call
+# (09-5). Consecutive timeouts past this mark it wedged and restart it.
+_WEDGE_AFTER = 2
 _RESULT_MAX = 8000        # same cap philosophy as built-in tools
 # One JSON-RPC frame is one line, and a legitimate "read this big file" call can
 # be huge — but it must not be held in memory whole, twice, before the 8000-char
@@ -51,6 +56,11 @@ def config_path():
 def load_config() -> dict:
     try:
         raw = json.loads(config_path().read_text(encoding="utf-8"))
+        # A JSON array/string/null is not a config: `.get` raised AttributeError,
+        # which is not in the caught tuple, so every MCP tool vanished with no
+        # explanation and /api/mcp showed the Python error (09-8).
+        if not isinstance(raw, dict):
+            return {}
         servers = raw.get("mcpServers") or {}
         return servers if isinstance(servers, dict) else {}
     except (FileNotFoundError, OSError, ValueError):
@@ -77,6 +87,11 @@ class McpServer:
         # full timeout with no explanation (AUDIT F55).
         self.reader_error: str = ""
         self.oversize_frames = 0
+        # Consecutive call timeouts, and the flag they set. A live-but-mute
+        # server is the same worker-thread tax as a dead reader, so it has to
+        # become visible to `_ensure` the same way (09-5).
+        self.timeouts = 0
+        self.wedged = False
 
     # -- plumbing --------------------------------------------------------------
     def _handle_line(self, line: str) -> None:
@@ -87,8 +102,17 @@ class McpServer:
             msg = json.loads(line)
         except ValueError:
             return
+        # json.loads may return a list, string, number or null. `.get` on one of
+        # those raised inside `_reader`'s try, which ended the reader for good —
+        # and `_ensure` then tore down and rebuilt EVERY configured server for a
+        # line that carries no protocol meaning (09-2).
+        if not isinstance(msg, dict):
+            return
         mid = msg.get("id")
-        q = self._replies.get(mid) if mid is not None else None
+        try:
+            q = self._replies.get(mid) if mid is not None else None
+        except TypeError:
+            return          # an unhashable JSON-RPC id is not a reply we sent
         if q is not None:
             q.put(msg)
 
@@ -185,7 +209,15 @@ class McpServer:
         try:
             reply = self._replies[mid].get(timeout=timeout)
         except queue.Empty:
+            self.timeouts += 1
+            if self.timeouts >= _WEDGE_AFTER:
+                self.wedged = True
+                if not self.reader_error:
+                    self.reader_error = (f"'{self.name}' timed out "
+                                         f"{self.timeouts} times in a row")
             raise McpError(f"'{self.name}' timed out on {method}") from None
+        else:
+            self.timeouts = 0
         finally:
             self._replies.pop(mid, None)
         if "error" in reply:
@@ -196,8 +228,15 @@ class McpServer:
 
     # -- lifecycle -------------------------------------------------------------
     def start(self) -> None:
-        cmd = [str(self.spec.get("command", ""))] + [
-            str(a) for a in (self.spec.get("args") or [])]
+        # A string `args` is iterable, so `[str(a) for a in args]` launched the
+        # server with one argv element per character; anything else non-list was
+        # a TypeError that never named the field (09-9).
+        args = self.spec.get("args") or []
+        if isinstance(args, str):
+            args = [args]
+        elif not isinstance(args, (list, tuple)):
+            raise McpError(f"'{self.name}': args must be a list of strings")
+        cmd = [str(self.spec.get("command", ""))] + [str(a) for a in args]
         if not cmd[0]:
             raise McpError(f"'{self.name}': no command configured")
         env = {**os.environ, **{str(k): str(v) for k, v in
@@ -351,12 +390,33 @@ class McpManager:
                     "parameters": schema}})
         return out
 
+    def _route(self, namespaced: str) -> tuple[str, str] | None:
+        """Resolve `mcp__<server>__<tool>` to (server, tool).
+
+        Names are matched against the known server names LONGEST FIRST, because
+        `split("__", 2)` assumes a server name contains no `__` — and a server
+        named `my__server` then routed every call to `my` (09-10). An unknown
+        name falls back to the first `__` so the error can name it.
+        """
+        if not namespaced.startswith("mcp__"):
+            return None
+        rest = namespaced[len("mcp__"):]
+        for name in sorted(set(self._servers) | set(self._failed),
+                           key=len, reverse=True):
+            prefix = name + "__"
+            if rest.startswith(prefix):
+                return name, rest[len(prefix):]
+        if "__" in rest:
+            server, tool = rest.split("__", 1)
+            return server, tool
+        return None
+
     def call(self, namespaced: str, args: dict) -> str:
         self._ensure()
-        try:
-            _, server, tool = namespaced.split("__", 2)
-        except ValueError:
+        routed = self._route(namespaced)
+        if routed is None:
             return f"error: malformed mcp tool name '{namespaced}'"
+        server, tool = routed
         srv = self._servers.get(server)
         if srv is None:
             why = self._failed.get(server, "not configured")
@@ -378,6 +438,8 @@ class McpManager:
                 "failed": dict(self._failed),
                 "dead": {n: s.reader_error for n, s in self._servers.items()
                          if s.reader_error},
+                "wedged": {n: s.timeouts for n, s in self._servers.items()
+                           if s.wedged},
                 "oversize_frames": {n: s.oversize_frames
                                     for n, s in self._servers.items()
                                     if s.oversize_frames},

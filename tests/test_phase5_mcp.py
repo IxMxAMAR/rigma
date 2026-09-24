@@ -3,6 +3,7 @@ MCP server (a python one-liner file), plus gating and failure modes."""
 import json
 import sys
 import textwrap
+import types
 
 import pytest
 
@@ -157,6 +158,247 @@ def test_malformed_name_and_missing_server(tmp_path):
     _write_config(tmp_path, _fake_server_config(tmp_path))
     assert tools.run_tool("mcp__nosuchserver__t", {},
                           {"allow_code": True}).startswith("error")
+
+
+# --- 09-2/09-3/09-8: a JSON value that is not an object is not a mapping ------
+
+class _Lines:
+    """A fake stdout: bounded readline, and iteration for the pre-fix path."""
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def readline(self, *a):
+        return self._lines.pop(0) if self._lines else ""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._lines:
+            raise StopIteration
+        return self._lines.pop(0)
+
+
+def test_a_non_object_json_line_does_not_kill_the_reader():
+    """json.loads may return a list, string, number or null, and `.get` then
+    raises inside `_reader`'s try — which ends the reader for good and makes
+    _ensure() tear down EVERY configured server (09-2)."""
+    srv = mcp_client.McpServer("s", {"command": "x"})
+    srv.proc = types.SimpleNamespace(
+        stdout=_Lines(['[1, 2]\n', '123\n', '"hello"\n', 'null\n',
+                       '{"jsonrpc": "2.0", "id": 1, "result": {}}\n']))
+    srv._reader()
+    assert srv.reader_error == ""
+
+
+def test_an_unhashable_jsonrpc_id_is_skipped_not_fatal():
+    """`{"id": [1]}` fails the same way via `self._replies.get([1])` → TypeError
+    (09-2)."""
+    srv = mcp_client.McpServer("s", {"command": "x"})
+    srv._handle_line('{"jsonrpc": "2.0", "id": [1], "result": {}}')
+    assert srv.reader_error == ""
+
+
+def test_a_non_object_mcp_json_reads_as_empty(tmp_path):
+    """A user edits ~/.rigma/mcp.json into a JSON array; `raw.get` then raised
+    AttributeError, which is not in the caught tuple, so every MCP tool vanished
+    and /api/mcp answered the Python error text (09-8)."""
+    (tmp_path / "mcp.json").write_text("[]", encoding="utf-8")
+    assert mcp_client.load_config() == {}
+    (tmp_path / "mcp.json").write_text("null", encoding="utf-8")
+    assert mcp_client.load_config() == {}
+
+
+# --- 09-5: a server that accepts but never answers must be marked dead --------
+
+class _FakeStdin:
+    def write(self, s):
+        pass
+
+    def flush(self):
+        pass
+
+
+class _MuteProc:
+    """A live child whose stdin swallows requests and whose stdout never
+    answers. No process is started."""
+    pid = 4242
+    stdin = _FakeStdin()
+    stdout = None
+
+    def poll(self):
+        return None
+
+
+def _wedge(srv):
+    for _ in range(mcp_client._WEDGE_AFTER):
+        with pytest.raises(mcp_client.McpError):
+            srv._send("tools/call", {"name": "t"}, timeout=0.01)
+
+
+def test_a_server_that_accepts_but_never_answers_is_marked_wedged():
+    """A timeout changed no state, so `reader_error` stayed empty and `_ensure`
+    kept the mute process in `_servers` forever (09-5)."""
+    srv = mcp_client.McpServer("mute", {"command": "x"})
+    srv.proc = _MuteProc()
+    _wedge(srv)
+    assert srv.wedged is True
+    assert srv.timeouts == mcp_client._WEDGE_AFTER
+    assert "timed out" in srv.reader_error
+
+
+def test_one_real_reply_clears_the_consecutive_timeout_count():
+    """One slow call is not a dead server: the count has to be CONSECUTIVE."""
+    import threading
+    import time
+    srv = mcp_client.McpServer("mute", {"command": "x"})
+    srv.proc = _MuteProc()
+    with pytest.raises(mcp_client.McpError):
+        srv._send("m", {}, timeout=0.01)
+    assert srv.timeouts == 1
+    out = {}
+
+    def call():
+        out["r"] = srv._send("m", {}, timeout=5)
+
+    t = threading.Thread(target=call)
+    t.start()
+    deadline = time.monotonic() + 5
+    while not srv._replies and time.monotonic() < deadline:
+        time.sleep(0.01)
+    mid = next(iter(srv._replies))
+    srv._replies[mid].put({"jsonrpc": "2.0", "id": mid, "result": "ok"})
+    t.join(timeout=5)
+
+    assert out.get("r") == "ok"
+    assert srv.timeouts == 0 and srv.wedged is False
+
+
+def test_a_wedged_server_is_rebuilt_on_the_next_ensure(monkeypatch):
+    mgr = mcp_client.McpManager()
+    srv = mcp_client.McpServer("mute", {"command": "x"})
+    srv.proc = _MuteProc()
+    _wedge(srv)
+    mgr._servers = {"mute": srv}
+    mgr._started = True
+    mgr._cfg_key = json.dumps({"mute": {"command": "x"}}, sort_keys=True)
+    monkeypatch.setattr(mcp_client, "load_config",
+                        lambda: {"mute": {"command": "x"}})
+    stopped = []
+    monkeypatch.setattr(srv, "stop", lambda: stopped.append("old"))
+    monkeypatch.setattr(
+        mcp_client.McpServer, "start",
+        lambda self: (_ for _ in ()).throw(mcp_client.McpError("down")))
+    mgr._ensure()
+    assert stopped == ["old"], "the wedged server must be stopped and rebuilt"
+    assert "mute" in mgr._failed
+
+
+def test_status_reports_the_wedged_server_and_its_count(monkeypatch):
+    mgr = mcp_client.McpManager()
+    srv = mcp_client.McpServer("mute", {"command": "x"})
+    srv.proc = _MuteProc()
+    _wedge(srv)
+    mgr._servers = {"mute": srv}
+    mgr._started = True
+    mgr._cfg_key = json.dumps({"mute": {"command": "x"}}, sort_keys=True)
+    monkeypatch.setattr(mcp_client, "load_config",
+                        lambda: {"mute": {"command": "x"}})
+    monkeypatch.setattr(mgr, "_ensure", lambda: None)
+    st = mgr.status()
+    assert st["wedged"] == {"mute": mcp_client._WEDGE_AFTER}
+    assert "mute" in st["dead"]
+
+
+# --- 09-9: a string `args` must not become one argv element per character -----
+
+class _StartProc:
+    pid = 4242
+    stdin = _FakeStdin()
+    stdout = None
+
+    def poll(self):
+        return None
+
+
+class _FakeThread:
+    def __init__(self, *a, **k):
+        pass
+
+    def start(self):
+        pass
+
+
+def _stub_start(monkeypatch):
+    recorded = {}
+
+    def fake_popen(cmd, **kw):
+        recorded["cmd"] = cmd
+        return _StartProc()
+
+    monkeypatch.setattr(mcp_client.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(mcp_client.threading, "Thread", _FakeThread)
+    return recorded
+
+
+def test_a_string_args_is_wrapped_not_split_into_characters(monkeypatch):
+    """`[str(a) for a in (spec.get("args") or [])]` iterates a string one
+    character at a time, launching the server with ~40 single-character
+    arguments and failing with an error that never mentions `args` (09-9)."""
+    recorded = _stub_start(monkeypatch)
+    srv = mcp_client.McpServer("files", {"command": "npx",
+                                         "args": "-y @scope/pkg D:/docs"})
+    monkeypatch.setattr(srv, "_send", lambda *a, **k: {})
+    srv.start()
+    assert recorded["cmd"] == ["npx", "-y @scope/pkg D:/docs"]
+
+
+def test_args_that_are_neither_a_list_nor_a_string_are_refused_by_name(
+        monkeypatch):
+    _stub_start(monkeypatch)
+    srv = mcp_client.McpServer("bad", {"command": "npx", "args": 5})
+    with pytest.raises(mcp_client.McpError) as exc:
+        srv.start()
+    assert "args" in str(exc.value)
+
+
+# --- 09-10: a server name containing `__` must still route correctly ----------
+
+class _RoutedSrv:
+    def __init__(self, name):
+        self.name = name
+        self.reader_error = ""
+        self.tools = []
+        self.called = []
+
+    def call(self, tool, args):
+        self.called.append((tool, args))
+        return f"{self.name}/{tool}"
+
+
+def test_a_server_name_with_a_double_underscore_routes_by_longest_match():
+    """`namespaced.split("__", 2)` assumes the server name has no `__`, so a
+    server named `my__server` advertised its tools but every call answered
+    "server 'my' is unavailable" (09-10)."""
+    mgr = mcp_client.McpManager()
+    deep = _RoutedSrv("my__server")
+    shallow = _RoutedSrv("my")
+    mgr._servers = {"my": shallow, "my__server": deep}
+    mgr._ensure = lambda: None
+    assert mgr.call("mcp__my__server__do_thing", {"x": 1}) == \
+        "my__server/do_thing"
+    assert deep.called == [("do_thing", {"x": 1})]
+    # the shorter name still owns its own tools
+    assert mgr.call("mcp__my__other", {}) == "my/other"
+    assert shallow.called == [("other", {})]
+
+
+def test_an_unknown_server_still_reports_unavailable():
+    mgr = mcp_client.McpManager()
+    mgr._servers = {}
+    mgr._ensure = lambda: None
+    out = mgr.call("mcp__nosuchserver__t", {})
+    assert out.startswith("error") and "unavailable" in out
 
 
 # --- F54: shutdown must actually end the server -------------------------------
