@@ -169,7 +169,8 @@ function MessageActions({ m }: { m: ChatMessage }) {
   const flipVariant = useChat((s) => s.flipVariant);
   const takes = (m.variants?.length ?? 0) + 1;
   return (
-    <div className="flex items-center gap-3 pt-1 opacity-0 group-hover/msg:opacity-100 font-mono text-[11.5px] text-muted">
+    <div className="flex items-center gap-3 pt-1 opacity-0 group-hover/msg:opacity-100
+                    group-focus-within/msg:opacity-100 font-mono text-[11.5px] text-muted">
       <button onClick={() => void regenerate()} className="hover:text-amber">
         regenerate
       </button>
