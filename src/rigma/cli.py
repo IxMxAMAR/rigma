@@ -69,6 +69,36 @@ def _active_run_id() -> str:
     return r["id"]
 
 
+def _response_error(r) -> str:
+    """The error sentence out of a run-control response, never a traceback."""
+    try:
+        body = r.json()
+    except Exception:
+        return str(r.status_code)
+    if isinstance(body, dict) and body.get("error"):
+        return str(body["error"])
+    return str(r.status_code)
+
+
+def _run_action(rid: str, path: str, ok_message: str,
+                payload: dict | None = None) -> None:
+    """POST one run-control action and claim success only when it succeeded.
+
+    AUDIT F08-2: stop/pause/resume/steer discarded the response and always
+    echoed success, so a 409/500 (the run had already finished, or the id went
+    stale between the lookup and the POST) told the user the autonomous run was
+    off while it kept iterating and spending budget. In a script, exit 0 was
+    taken as proof the run stopped.
+    """
+    import httpx
+    r = httpx.post(_run_server_base() + f"/api/runs/{rid}/{path}",
+                   json=payload, timeout=15)
+    if r.status_code != 200:
+        typer.echo("error: " + _response_error(r))
+        raise typer.Exit(1)
+    typer.echo(ok_message)
+
+
 @run_app.command("start")
 def run_start(mission: str = typer.Argument(..., help="the job to accomplish"),
               hours: float = typer.Option(8.0, "--hours",
@@ -118,38 +148,30 @@ def run_status():
 @run_app.command("stop")
 def run_stop():
     """Stop the active run."""
-    import httpx
     rid = _active_run_id()
-    httpx.post(_run_server_base() + f"/api/runs/{rid}/stop", timeout=15)
-    typer.echo(f"stopped run {rid}")
+    _run_action(rid, "stop", f"stopped run {rid}")
 
 
 @run_app.command("pause")
 def run_pause():
     """Pause the active run (frees the GPU without losing progress)."""
-    import httpx
     rid = _active_run_id()
-    httpx.post(_run_server_base() + f"/api/runs/{rid}/pause", timeout=15)
-    typer.echo("paused — resume with: rigma run resume")
+    _run_action(rid, "pause", "paused — resume with: rigma run resume")
 
 
 @run_app.command("resume")
 def run_resume():
     """Resume a paused run."""
-    import httpx
     rid = _active_run_id()
-    httpx.post(_run_server_base() + f"/api/runs/{rid}/resume", timeout=15)
-    typer.echo("resumed")
+    _run_action(rid, "resume", "resumed")
 
 
 @run_app.command("steer")
 def run_steer(message: str = typer.Argument(..., help="guidance for the model")):
     """Inject guidance used on the next step — course-correct without stopping."""
-    import httpx
     rid = _active_run_id()
-    httpx.post(_run_server_base() + f"/api/runs/{rid}/inject",
-               json={"message": message}, timeout=15)
-    typer.echo("guidance queued for the next step")
+    _run_action(rid, "inject", "guidance queued for the next step",
+                payload={"message": message})
 
 
 @run_app.command("log")
@@ -501,6 +523,17 @@ def rm(model: str = typer.Argument(..., help="Model slug (see `rigma list`)"),
     typer.echo(f"deleted {model} ({gb:.1f} GB freed)")
 
 
+def _engine_error(err) -> str:
+    """The human sentence out of an engine error payload.
+
+    llama.cpp sends `{"error": {"message": ...}}` (OpenAI style) and, in older
+    builds, a bare string — print whichever it is, never a Python repr.
+    """
+    if isinstance(err, dict):
+        return str(err.get("message") or err)
+    return str(err)
+
+
 def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> str:
     import json as _json
 
@@ -510,6 +543,11 @@ def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> 
     with httpx.stream("POST", f"http://127.0.0.1:{port}/v1/chat/completions",
                       json={"messages": history, "stream": True, **(params or {})},
                       timeout=600) as r:
+        # AUDIT F08-2: the status was never checked and every non-chunk line was
+        # skipped, so an error body ("context overflow") and a mid-stream
+        # `data: {"error": ...}` chunk ("slot released") both looked exactly like
+        # an empty reply — and `chat` saved that empty turn as the answer.
+        r.raise_for_status()
         for line in r.iter_lines():
             if not line.startswith("data: "):
                 continue
@@ -517,12 +555,24 @@ def _stream_chat(port: int, history: list[dict], params: dict | None = None) -> 
             if payload == "[DONE]":
                 continue
             try:
-                delta = _json.loads(payload)["choices"][0]["delta"].get("content")
-            except Exception:
+                obj = _json.loads(payload)
+            except ValueError:
+                continue          # not a chunk we can read; keep the stream
+            if not isinstance(obj, dict):
                 continue
-            if delta:
-                text += delta
-                typer.echo(delta, nl=False)
+            if obj.get("error"):
+                raise RuntimeError(_engine_error(obj["error"]))
+            choices = obj.get("choices")
+            if not isinstance(choices, list) or not choices:
+                # a 200 that is not a chat chunk is still a failed turn; the old
+                # code swallowed it and returned "" as a successful reply.
+                raise RuntimeError(f"engine returned no choices: {payload[:200]}")
+            first = choices[0]
+            delta = first.get("delta") if isinstance(first, dict) else None
+            content = delta.get("content") if isinstance(delta, dict) else None
+            if content:
+                text += content
+                typer.echo(content, nl=False)
     typer.echo("")
     return text
 
