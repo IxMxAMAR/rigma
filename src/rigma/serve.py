@@ -5250,7 +5250,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         upstream = client.build_request(
             request.method, f"/v1/{path}", headers=headers,
             content=await request.body())
-        resp = await client.send(upstream, stream=True)
+
+        def _engine_down(e: Exception) -> JSONResponse:
+            # AUDIT 01-4: an OpenAI-compatible client parses the body as JSON.
+            # Letting httpx.ConnectError escape produced Starlette's plain-text
+            # 500, so aider/Cline/Continue reported a decode error instead of
+            # "the engine is down" — the chat route already says it properly.
+            return JSONResponse(
+                {"error": {"message": f"the engine is unreachable: {e}",
+                           "type": "upstream_error"}},
+                status_code=502)
+
+        try:
+            resp = await client.send(upstream, stream=True)
+        except httpx.HTTPError as e:
+            return _engine_down(e)
         media = resp.headers.get("content-type", "application/json")
         # pass upstream headers through (ratelimit, cors, etc.); drop hop-by-hop
         out_headers = {k: v for k, v in resp.headers.items()
@@ -5265,7 +5279,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     await resp.aclose()
             return StreamingResponse(gen(), status_code=resp.status_code,
                                      media_type=media, headers=out_headers)
-        body = await resp.aread()
+        try:
+            body = await resp.aread()
+        except httpx.HTTPError as e:
+            await resp.aclose()
+            return _engine_down(e)
         await resp.aclose()
         return Response(content=body, status_code=resp.status_code,
                         media_type=media, headers=out_headers)
