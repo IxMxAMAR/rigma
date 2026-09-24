@@ -398,15 +398,26 @@ AUX_SLOT = 1
 # was taken. Deliberately in-process: losing it on restart costs one extra
 # restore, and persisting it would be another thing that could disagree with
 # what the engine actually holds.
+#
+# `warm_key` is "<engine generation>:<prefix key>", not the bare prefix key.
+# It asserts what the LIVE engine's slot 0 holds, and that is only true while
+# that engine process is the one running: a switch away and back, a crash plus
+# a manual Load, or `rigma up` under a UI that stayed alive all leave the same
+# snapshot keyed identically but slot 0 empty. A bare key then skipped the
+# restore and re-prefilled the whole history from a snapshot sitting on disk
+# (AUDIT 02-2). The generation changes on every launch, so the assertion cannot
+# outlive the process it describes.
 _PREFIX_STATE: dict = {"warm_key": "", "last_point": None}
 
 
 def _prefix_ctx():
-    """(engine port, snapshot dir, config fingerprint) or None.
+    """(port, snapshot dir, config fingerprint, engine generation) or None.
 
     The fingerprint is the one recorded at launch — the same value the whole-
     slot cache uses — so a snapshot can never be selected for an engine running
-    a different quant, context or layer split.
+    a different quant, context or layer split. The generation names the engine
+    PROCESS (pid plus its create time), which is what `warm_key` is really an
+    assertion about: a fresh process starts with an empty slot 0.
     """
     from . import state as _st
     from .runtime import rigma_home
@@ -414,7 +425,8 @@ def _prefix_ctx():
     fp = s.get("kv_fp") or ""
     if not fp or s.get("unloaded") or not s.get("public_port"):
         return None
-    return int(s["public_port"]) - 1, rigma_home() / "sessions", fp
+    gen = f"{s.get('engine_pid')}:{s.get('engine_started_at')}"
+    return int(s["public_port"]) - 1, rigma_home() / "sessions", fp, gen
 
 
 def _prefix_warm(msgs: list[dict]) -> None:
@@ -428,14 +440,15 @@ def _prefix_warm(msgs: list[dict]) -> None:
         ctx = _prefix_ctx()
         if ctx is None:
             return
-        port, save_dir, fp = ctx
+        port, save_dir, fp, gen = ctx
         from . import prefixcache
         points = prefixcache.prefix_keys(msgs, fp)
         hit = prefixcache.best_match(points, prefixcache.available(save_dir))
-        if hit is None or hit.key == _PREFIX_STATE["warm_key"]:
+        warm_key = f"{gen}:{hit.key}" if hit is not None else ""
+        if hit is None or warm_key == _PREFIX_STATE["warm_key"]:
             return
         if prefixcache.warm(port, save_dir, hit.key, slot=MAIN_SLOT) is None:
-            _PREFIX_STATE["warm_key"] = hit.key
+            _PREFIX_STATE["warm_key"] = warm_key
             _PREFIX_STATE["last_point"] = hit
     except Exception:
         pass          # a cold start is slow, never wrong
@@ -448,7 +461,7 @@ def _prefix_snapshot(msgs: list[dict]) -> None:
         ctx = _prefix_ctx()
         if ctx is None:
             return
-        port, save_dir, fp = ctx
+        port, save_dir, fp, gen = ctx
         from . import prefixcache
         points = prefixcache.prefix_keys(msgs, fp)
         if not points:
@@ -459,7 +472,7 @@ def _prefix_snapshot(msgs: list[dict]) -> None:
         if prefixcache.snapshot(port, save_dir, tip.key, slot=MAIN_SLOT,
                                 meta={"n_messages": tip.n_messages,
                                       "approx_tokens": tip.approx_tokens}) is None:
-            _PREFIX_STATE["warm_key"] = tip.key
+            _PREFIX_STATE["warm_key"] = f"{gen}:{tip.key}"
             _PREFIX_STATE["last_point"] = tip
             prefixcache.evict(save_dir)
     except Exception:

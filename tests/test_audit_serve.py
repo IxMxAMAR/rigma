@@ -665,6 +665,59 @@ def test_prefix_warm_and_snapshot_run_off_the_event_loop(home, engine,
     assert where == {"warm": "thread", "snapshot": "thread"}
 
 
+def test_a_snapshot_is_not_skipped_after_the_engine_was_replaced(
+        monkeypatch, tmp_path):
+    """AUDIT 02-2: `warm_key` asserts what the LIVE engine's slot 0 holds.
+
+    It used to be the bare prefix key, so after a switch away and back — a new
+    engine process with an empty slot 0 — the matching snapshot on disk was
+    skipped and the whole history re-prefilled: the 20-60K-token stall the
+    snapshot exists to avoid. The key now carries the engine generation, so the
+    assertion cannot outlive the process it describes.
+    """
+    from rigma import prefixcache
+
+    restored: list = []
+    monkeypatch.setattr(serve, "_prefix_ctx",
+                        lambda: (1, tmp_path, "FP", "pid-1"))
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [prefixcache.PrefixPoint(
+                            n_messages=1, key="K", approx_tokens=9000)])
+    monkeypatch.setattr(prefixcache, "available", lambda d: {"K"})
+    monkeypatch.setattr(
+        prefixcache, "warm",
+        lambda port, d, key, slot=0: restored.append(key) or None)
+    monkeypatch.setitem(serve._PREFIX_STATE, "warm_key", "")
+
+    msgs = [{"role": "user", "content": "hi"}]
+    serve._prefix_warm(msgs)
+    assert restored == ["K"]
+    assert serve._PREFIX_STATE["warm_key"] == "pid-1:K"
+
+    # the same live engine, same prefix: the slot is already at least as warm
+    restored.clear()
+    serve._prefix_warm(msgs)
+    assert restored == [], "restoring what the slot already holds wastes time"
+
+    # a REPLACEMENT engine process: same snapshot on disk, empty slot 0
+    monkeypatch.setattr(serve, "_prefix_ctx",
+                        lambda: (1, tmp_path, "FP", "pid-2"))
+    serve._prefix_warm(msgs)
+    assert restored == ["K"], "the replacement engine's slot 0 is empty"
+
+    # a snapshot just taken leaves slot 0 holding exactly that prefix, so the
+    # snapshot side must record the SAME generation-prefixed key or the next
+    # turn restores what it already has
+    monkeypatch.setattr(prefixcache, "prefix_keys",
+                        lambda msgs, fp: [prefixcache.PrefixPoint(
+                            n_messages=2, key="K2", approx_tokens=20000)])
+    monkeypatch.setattr(prefixcache, "snapshot",
+                        lambda port, d, key, slot=0, meta=None: None)
+    monkeypatch.setitem(serve._PREFIX_STATE, "last_point", None)
+    serve._prefix_snapshot(msgs)
+    assert serve._PREFIX_STATE["warm_key"] == "pid-2:K2"
+
+
 # --------------------------------------------------------------------------
 # F14 — idle auto-unload killed the engine under a running job
 
