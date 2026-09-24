@@ -1,0 +1,6 @@
+{"type": "notice", "text": "session.status working"}
+{"type": "thinking", "text": "The user asked what is in the workspace; list it before answering."}
+{"type": "tool", "name": "list_directory", "args": {"path": "."}}
+{"type": "tool_result", "name": "list_directory", "text": "a.py\nb.py", "ok": true}
+{"type": "text", "text": "There are two Python files."}
+{"type": "done", "text": "There are two Python files in the workspace.", "finish_reason": "stop", "session_id": "dsh-fixture-0001"}

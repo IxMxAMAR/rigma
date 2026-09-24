@@ -51,10 +51,11 @@ def test_no_organize_macro_declares_a_destructive_tool_step():
     paths only exist once it has explored. So the safety property to assert
     is that no step NAMES a mutating tool -- not that the macro is inert."""
     org = methods.get("organize")
-    for mac in org["macros"]:
-        for step in mac["steps"]:
-            if step["kind"] == "tool":
-                assert step["name"] in ms.SAFE_TOOLS, mac["id"]
+    tool_steps = [s for mac in org["macros"] for s in mac["steps"]
+                  if s["kind"] == "tool"]
+    assert tool_steps, "no tool step anywhere: the safety property is vacuous"
+    for step in tool_steps:
+        assert step["name"] in ms.SAFE_TOOLS, step["name"]
 
 
 def test_organize_macros_confirm_when_the_session_can_run_code():

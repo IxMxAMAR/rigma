@@ -5,7 +5,11 @@ from pathlib import Path
 
 import httpx
 import pytest
+from typer.testing import CliRunner
 
+import rigma.bench as bench
+import rigma.cli as cli
+import rigma.runtime as runtime
 from rigma.bench import (
     BenchResult,
     crowned_row,
@@ -14,6 +18,7 @@ from rigma.bench import (
     save_calibration,
     verdict,
 )
+from rigma.models import ComboFlags, GgufFile, RunPlan
 
 
 @pytest.fixture
@@ -100,14 +105,68 @@ def test_crowned_row_is_none_when_everything_failed():
     assert crowned_row([]) is None
 
 
-def test_the_sweep_and_the_cli_report_the_same_winner():
+def test_the_sweep_and_the_cli_report_the_same_winner(monkeypatch, tmp_path):
     """The CLI used to recompute the winner with its own rule and no margin
     gate, so `rigma sweep` could print "winner: spec-mtp-2 ... saved to
-    calibration" while calibration.json held the baseline."""
-    rows = [_row("spec-mtp-2", 44.0, {"spec_type": "draft-mtp"}),
-            _row("baseline", 40.0)]
+    calibration" while calibration.json held the baseline.
+
+    Both REAL paths are driven here on the same fake rows: `bench.run_sweep`
+    and the `rigma sweep` command through `typer.testing.CliRunner`. The
+    fixture makes the old rule (first row with flags) and `crowned_row`
+    disagree — spec-mtp-2 at 44.0 t/s is flagged and fastest, but it fails the
+    margin gate against fa-off at 41.0 (44.0 < 41.0 * 1.15), so fa-off is the
+    one crowned. Reinstating the old CLI rule makes this test fail.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    plan = RunPlan(model_slug="m",
+                   gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                   backend="vulkan", flags=ComboFlags(ctx=8192),
+                   origin="calculator")
+    configs = [("spec-mtp-2", {"spec_type": "draft-mtp", "spec_n_max": 2}),
+               ("fa-off", {"flash_attn": "off"}),
+               ("baseline", {})]
+
+    class _Srv:
+        def stop(self):
+            pass
+
+    measured = {"tg": 40.0}
+
+    def _launch(exe, trial, model_path, **kw):
+        if trial.flags.spec_type == "draft-mtp":
+            measured["tg"] = 44.0
+        elif trial.flags.flash_attn == "off":
+            measured["tg"] = 41.0
+        else:
+            measured["tg"] = 40.0
+        return _Srv()
+
+    monkeypatch.setattr(bench, "launch_server", _launch)
+    monkeypatch.setattr(bench, "run_bench",
+                        lambda port, **kw: BenchResult(
+                            pp_tps=600.0, tg_tps=measured["tg"],
+                            prompt_tokens=8, gen_tokens=8))
+    monkeypatch.setattr(bench, "sweep_configs",
+                        lambda base, moe, caps=(): configs)
+
+    # path 1: the sweep the resolver/CLI share
+    rows = bench.run_sweep(plan, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601)
     crowned = crowned_row(rows)
-    cli_winner = next((r for r in rows if r["ok"] and r["flags"]), None)
-    assert crowned is not None
-    assert cli_winner is not None and cli_winner["label"] != crowned["label"], \
-        "this test is worthless if the old and new rules already agree"
+    assert crowned is not None and crowned["label"] == "fa-off"
+
+    # path 2: the shipped CLI command, on the same fake rows
+    monkeypatch.setattr(cli.Registry, "load", lambda: None)
+    monkeypatch.setattr(cli, "_profile", lambda reg: None)
+    monkeypatch.setattr(cli, "resolve",
+                        lambda p, reg, use_case="general", model_override=None:
+                        plan)
+    monkeypatch.setattr(runtime, "ensure_engine", lambda backend, os_name: "exe")
+    monkeypatch.setattr(runtime, "ensure_model", lambda gguf: "m.gguf")
+
+    res = CliRunner().invoke(cli.app, ["sweep"])
+    assert res.exit_code == 0, res.output
+    # the real run_sweep ran inside the CLI, not a reimplementation
+    assert "trying spec-mtp-2 ..." in res.output
+    assert f"winner: {crowned['label']}" in res.output
+    assert "winner: spec-mtp-2" not in res.output

@@ -268,7 +268,10 @@ def test_k_and_v_are_always_symmetric():
     back symmetric — an asymmetric one could never be launched."""
     from rigma.resolve import quant_verdicts
     for kv in ("", "f16", "q8_0", "q4_0"):
-        for v in quant_verdicts(_hybrid_spec(11.0), _prof(), kv=kv):
+        rows = quant_verdicts(_hybrid_spec(11.0), _prof(), kv=kv)
+        assert any(v["ok"] for v in rows), \
+            f"no launchable verdict for kv={kv!r}: symmetry is untested"
+        for v in rows:
             if v["ok"]:
                 assert v["kv"] == v["kv_v"], (kv, v)
 

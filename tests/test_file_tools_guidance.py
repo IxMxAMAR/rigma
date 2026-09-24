@@ -112,4 +112,5 @@ def test_the_error_paths_do_not_break_the_progress_log_rescue(ws):
               {**ws, "run_id": "r1"})
     # no such run -> empty tail, but it must take the progress branch, not
     # the new folder/glob branches
-    assert "progress" in out.lower() or out.startswith("error")
+    assert not out.startswith("error"), out
+    assert "progress log" in out.lower(), out

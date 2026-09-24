@@ -13,8 +13,11 @@ requires-python = ">=3.11"
 # expression (PEP 639), and declaring both is an error on current build
 # backends. PyPI reads the license from that field.
 #
-# 3.11 and 3.12 only, because those are the versions CI actually runs. Listing
-# 3.13 would be a claim nothing tests.
+# 3.11, 3.12 and 3.13: `requires-python` is what pip enforces, so every
+# version it admits must be one CI actually runs (AUDIT 12-12). 3.13 was
+# grepped for the APIs removed in 3.13/3.14 (imp, distutils, cgi, telnetlib,
+# asyncio.get_event_loop, ...) and uses none, so it joined the matrix rather
+# than narrowing the claim. 3.14 is not claimed by a classifier yet.
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -25,6 +28,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
