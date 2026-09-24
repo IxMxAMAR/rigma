@@ -3,7 +3,10 @@ from __future__ import annotations
 import math
 import re
 
-from .models import ComboFlags, GgufFile, HardwareProfile, ModelSpec, RunPlan
+from pydantic import ValidationError
+
+from .models import (CACHE_BYTES, ComboFlags, GgufFile, HardwareProfile,
+                     ModelSpec, RunPlan)
 from .registry import Registry
 
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
@@ -23,7 +26,10 @@ RAM_RESERVE_MB = 2048
 # Still ~2x the largest observation. MoE and larger batches allocate more, which
 # is what the margin is for.
 COMPUTE_BUFFER_MB = 150
-CACHE_BYTES = {"f16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q4_0": 0.5625}
+# CACHE_BYTES lives in models.py: the fit math here and ComboFlags' K/V
+# normalisation must read ONE table, and the validators that reject an unknown
+# cache type live next to it. Re-exported here because this module is where the
+# cache arithmetic lives and callers import it from `rigma.resolve`.
 CTX_DEFAULT = {"coding": 32768}
 CTX_FLOOR = 8192
 
@@ -95,7 +101,28 @@ def _apply_calibration(plan: RunPlan,
         if reason:
             plan.explain.append(f"calibration override skipped: {reason}")
             return plan
-        plan.flags = plan.flags.model_copy(update=entry["flags"])
+        # AUDIT F06-4: model_copy(update=...) does not validate, so a stored
+        # entry replayed the flash_attn enum, the spec_type whitelist, the
+        # cache-type table and _symmetric_kv straight onto the plan — `-fa
+        # sideways` and `--cache-type-k q3_k_bogus` reached llama.cpp. The
+        # calibration file is user-editable and is treated as untrusted
+        # everywhere else (server_ops: a corrupt file "is not an error"), so
+        # validate the merge and keep the fresh plan when it fails.
+        # All-or-nothing on purpose: a half-applied placement is not a
+        # placement anyone measured.
+        try:
+            merged = ComboFlags.model_validate(
+                {**plan.flags.model_dump(), **entry["flags"]})
+        except ValidationError as exc:
+            plan.explain.append(
+                f"calibration override ignored: {exc.error_count()} invalid "
+                f"field(s)")
+            return plan
+        except TypeError:
+            plan.explain.append("calibration override ignored: flags is not an "
+                                "object")
+            return plan
+        plan.flags = merged
         plan.origin += "+calibrated"
         plan.explain.append(f"calibration override applied: {entry['flags']} "
                             f"(measured {entry.get('date', '?')})")
@@ -117,6 +144,25 @@ def _ctx_floor(spec: ModelSpec) -> int:
     has, so its own window is the floor.
     """
     return min(CTX_FLOOR, spec.native_ctx) if spec.native_ctx > 0 else CTX_FLOOR
+
+
+# AUDIT F06-5
+def _next_ctx_rung(ctx: int, floor: int) -> int:
+    """The next smaller context to try, never stepping PAST the floor.
+
+    `ctx //= 2` skipped the floor rung whenever native_ctx was not a power-of-two
+    multiple of two above it (12288, 10000, 24576, ...): the sequence jumped from
+    the native rung straight below `_ctx_floor`, which is the one rung that
+    function exists to guarantee. The Models page probes 8192/4096/2048 and
+    reported the same model fitting at 8192 while `rigma up` never asked.
+
+    Returns a value below the floor — ending the caller's `while ctx >= floor`
+    loop — when `ctx` is already at or below the floor, so the loop terminates.
+    """
+    nxt = ctx // 2
+    if nxt < floor and ctx > floor:
+        nxt = floor
+    return nxt
 
 
 def kv_bytes_per_token(spec: ModelSpec, k: str, v: str) -> float:
@@ -175,12 +221,23 @@ DRAFT_FIXED_MB = 365.0
 DRAFT_KIB_PER_TOKEN = 6.25
 
 
-def draft_cache_mb(spec: ModelSpec, ctx: int, kv: str,
+def draft_cache_mb(spec: ModelSpec, ctx: int,
                    spec_type: str, n_max: int) -> float:
     """VRAM the speculative draft head needs on top of weights and KV.
 
     Zero when speculation is off — the head's WEIGHTS are in the file either
     way, but its caches are only allocated when it is asked to draft.
+
+    AUDIT F06-7: this took a `kv` argument and never used it. DELETED rather
+    than scaled, because the two constants below are a MEASURED TOTAL obtained
+    by differencing, not a KV term: 6.25 KiB/token is ~5.7x the geometry-derived
+    KV size for one draft block, so most of it is the head's own four nextn
+    blocks and compute buffers, which do not scale with cache precision.
+    Scaling the whole term by CACHE_BYTES[kv]/CACHE_BYTES["f16"] would
+    under-reserve for a quantised cache — the unsafe direction — and would
+    contradict the one measured point this repo has (465 MiB at 16K). The
+    parameter implied a precision dependence the function does not have; the
+    honest fix is to stop claiming it.
     """
     if not spec_type or spec_type == "none":
         return 0.0
@@ -191,7 +248,7 @@ def draft_cache_mb(spec: ModelSpec, ctx: int, kv: str,
     return DRAFT_FIXED_MB + DRAFT_KIB_PER_TOKEN * ctx / 1024 * depth
 
 
-def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int, kv: str,
+def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int,
                           spec_type: str = "", n_max: int = 0) -> ModelSpec:
     """A copy of `spec` whose mmproj slot holds what will ACTUALLY be resident.
 
@@ -209,7 +266,7 @@ def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int, kv: str,
     parameter through every fit function.
     """
     mm_bytes = spec.mmproj.bytes if (vision and spec.mmproj) else 0
-    draft = draft_cache_mb(spec, ctx, kv, spec_type, n_max)
+    draft = draft_cache_mb(spec, ctx, spec_type, n_max)
     total = mm_bytes + int(draft * 2**20)
     if total == 0:
         return spec.model_copy(update={"mmproj": None})
@@ -365,6 +422,12 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         return ComboFlags(ctx=ctx, ngl=n_gpu, cache_type_k=k, cache_type_v=v)
     if strict and file_mb + mm_mb + kv_mb > usable_vram:
         return None                # ditto for MoE expert offload
+    # AUDIT F06-1: a MoE header that omits block_count reports n_layers = 0, and
+    # this divide ran before the `if need_off` test, so even a fully-resident
+    # model raised ZeroDivisionError out of resolve(). The dense branch above
+    # guards the same case; without a layer count there is nothing to place.
+    if spec.n_layers <= 0:
+        return None
     expert_mb = file_mb * spec.moe.expert_weight_fraction
     per_layer = expert_mb / spec.n_layers
     need_off = max(0.0, file_mb + mm_mb + kv_mb - usable_vram)
@@ -636,7 +699,7 @@ def _calculate(profile: HardwareProfile, registry: Registry,
                                    backend=_backend(profile, backend),
                                    flags=flags,
                                    origin="calculator", explain=explain)
-                ctx //= 2
+                ctx = _next_ctx_rung(ctx, floor)
     return None
 
 
@@ -654,7 +717,7 @@ def fallback_plans(plan: RunPlan, registry: Registry,
             while ctx >= floor and flags is None:
                 flags = fit_gguf(spec, gguf, profile, ctx, explain)
                 if flags is None:
-                    ctx //= 2
+                    ctx = _next_ctx_rung(ctx, floor)
             if flags is not None:
                 out.append(_apply_calibration(RunPlan(
                     model_slug=spec.slug, gguf=gguf, backend=plan.backend,
