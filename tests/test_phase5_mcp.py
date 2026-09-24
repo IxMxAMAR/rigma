@@ -310,6 +310,58 @@ def test_status_reports_the_wedged_server_and_its_count(monkeypatch):
     assert "mute" in st["dead"]
 
 
+# --- 09-9: a string `args` must not become one argv element per character -----
+
+class _StartProc:
+    pid = 4242
+    stdin = _FakeStdin()
+    stdout = None
+
+    def poll(self):
+        return None
+
+
+class _FakeThread:
+    def __init__(self, *a, **k):
+        pass
+
+    def start(self):
+        pass
+
+
+def _stub_start(monkeypatch):
+    recorded = {}
+
+    def fake_popen(cmd, **kw):
+        recorded["cmd"] = cmd
+        return _StartProc()
+
+    monkeypatch.setattr(mcp_client.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(mcp_client.threading, "Thread", _FakeThread)
+    return recorded
+
+
+def test_a_string_args_is_wrapped_not_split_into_characters(monkeypatch):
+    """`[str(a) for a in (spec.get("args") or [])]` iterates a string one
+    character at a time, launching the server with ~40 single-character
+    arguments and failing with an error that never mentions `args` (09-9)."""
+    recorded = _stub_start(monkeypatch)
+    srv = mcp_client.McpServer("files", {"command": "npx",
+                                         "args": "-y @scope/pkg D:/docs"})
+    monkeypatch.setattr(srv, "_send", lambda *a, **k: {})
+    srv.start()
+    assert recorded["cmd"] == ["npx", "-y @scope/pkg D:/docs"]
+
+
+def test_args_that_are_neither_a_list_nor_a_string_are_refused_by_name(
+        monkeypatch):
+    _stub_start(monkeypatch)
+    srv = mcp_client.McpServer("bad", {"command": "npx", "args": 5})
+    with pytest.raises(mcp_client.McpError) as exc:
+        srv.start()
+    assert "args" in str(exc.value)
+
+
 # --- F54: shutdown must actually end the server -------------------------------
 def test_stop_kills_the_server_and_releases_its_pipes(tmp_path):
     """`stop()` called terminate() and dropped the reference: no wait, no kill
