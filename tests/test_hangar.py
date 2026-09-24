@@ -10,6 +10,44 @@ from rigma.registry import Registry
 T_U32, T_STR, T_ARR = 4, 8, 9
 
 
+# --- AUDIT F07-1: a slug is not a path ---------------------------------------
+def test_a_normal_slug_resolves_inside_custom_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    p = hangar.custom_spec_path("qwen3.6-35b-a3b")
+    assert p.parent == hangar.custom_dir()
+    assert p.name == "qwen3.6-35b-a3b.json"
+
+
+def test_a_slug_cannot_escape_the_custom_models_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    for slug in ("..\\..\\outside", "../../outside", "..\\outside",
+                 "a/b", "a\\b", "C:\\x", "con", "NUL", ".", "..", "", "x\x00y"):
+        with pytest.raises(HangarError):
+            hangar.custom_spec_path(slug)
+
+
+def test_delete_model_refuses_a_traversing_slug(tmp_path, monkeypatch):
+    # The delete path unlinks what _load_custom found. Before the fix a slug of
+    # ..\..\outside read and unlinked <rigma_home>/outside.json.
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    with pytest.raises(HangarError):
+        hangar.delete_model("..\\..\\outside")
+    assert outside.is_file()
+
+
+def test_a_spec_is_written_inside_custom_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    spec = hangar.ModelSpec(
+        slug="a-model", family="test", kind="dense", n_layers=1,
+        full_attn_layers=1, kv_heads=1, head_dim=1, native_ctx=2048, ggufs=[])
+    hangar._write_spec(spec)
+    assert (hangar.custom_dir() / "a-model.json").is_file()
+    assert hangar._load_custom("a-model") is not None
+    assert hangar._load_custom("no-such-model") is None
+
+
 def _s(b):
     return struct.pack("<Q", len(b)) + b
 
