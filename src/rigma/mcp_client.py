@@ -228,8 +228,15 @@ class McpServer:
 
     # -- lifecycle -------------------------------------------------------------
     def start(self) -> None:
-        cmd = [str(self.spec.get("command", ""))] + [
-            str(a) for a in (self.spec.get("args") or [])]
+        # A string `args` is iterable, so `[str(a) for a in args]` launched the
+        # server with one argv element per character; anything else non-list was
+        # a TypeError that never named the field (09-9).
+        args = self.spec.get("args") or []
+        if isinstance(args, str):
+            args = [args]
+        elif not isinstance(args, (list, tuple)):
+            raise McpError(f"'{self.name}': args must be a list of strings")
+        cmd = [str(self.spec.get("command", ""))] + [str(a) for a in args]
         if not cmd[0]:
             raise McpError(f"'{self.name}': no command configured")
         env = {**os.environ, **{str(k): str(v) for k, v in
