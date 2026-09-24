@@ -126,6 +126,20 @@ def test_only_jsonrpc_ever_reaches_stdout(nodocs, capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_an_oversize_request_line_is_refused_not_buffered(nodocs, monkeypatch):
+    """`for line in stdin` buffered an arbitrarily long request line before
+    json.loads, in a process the arm launches per turn (09-4)."""
+    monkeypatch.setattr(mcp_server, "_FRAME_MAX", 64)
+    inp = io.StringIO("x" * 200 + "\n" + json.dumps(_req(2, "ping")) + "\n")
+    out = io.StringIO()
+    mcp_server.serve(inp, out)
+    got = [json.loads(ln) for ln in out.getvalue().splitlines()]
+    assert got[0]["error"]["code"] == -32600
+    assert "exceeded" in got[0]["error"]["message"]
+    # framing stays in sync: the next request is served normally
+    assert got[1]["id"] == 2
+
+
 # -- what is offered, and why -------------------------------------------------
 
 def test_the_roster_is_exactly_what_was_justified():
@@ -242,6 +256,16 @@ def test_arguments_that_are_not_an_object_do_not_crash_the_call(docs):
     survivable, not fatal."""
     res = mcp_server.call("search_my_documents", {})
     assert isinstance(res["content"][0]["text"], str)
+
+
+def test_params_that_are_not_an_object_do_not_kill_the_server(nodocs):
+    """`params = msg.get("params") or {}` rescues only FALSY values, so a truthy
+    non-dict survives and `.get` raises straight out of `serve()` — killing the
+    process mid-session and taking every Rigma tool with it (09-3)."""
+    for params in ("hot", [1], 3):
+        got = _drive(_req(1, "tools/call", params))
+        assert got[0]["id"] == 1, params
+        assert "not offered" in got[0]["result"]["content"][0]["text"], params
 
 
 def test_the_server_is_pessimistic_about_code(monkeypatch):

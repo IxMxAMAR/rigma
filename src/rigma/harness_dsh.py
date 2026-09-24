@@ -355,7 +355,13 @@ def _stop(state: _Run) -> None:
     try:
         if state.hard:
             if proc.poll() is None:
-                proc.kill()
+                # The TREE, not the runner: the process Rigma holds is
+                # `python -m rigma._dsh_runner`, and the dsh CLI is a Node
+                # GRANDCHILD. `proc.kill()` reaches only the runner, whose
+                # `finally: live.close()` then never runs — so the agent (and
+                # every subagent it spawned) keeps the model server busy and
+                # holds VRAM after Rigma says it killed the turn (09-1).
+                _harness.kill_tree(proc)
         elif proc.poll() is None:
             # Not a kill: the runner's own `finally` closes the harness, and that
             # is what reaps the Node child. Terminating first would orphan it.

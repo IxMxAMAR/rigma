@@ -137,6 +137,19 @@ def test_a_settings_step_accepts_a_named_effort_level():
     assert ms.validate(doc, TOOLS) == []
 
 
+def test_settings_booleans_must_be_real_booleans():
+    """A quoted `"false"` saved and imported cleanly and then turned code
+    execution ON (`bool("false")` is True), so validate() has to reject the
+    type at the door (09-6)."""
+    doc = ms.normalize(_doc(macros=[{"label": "X", "steps": [
+        {"kind": "settings", "set": {"use_tools": "false"}}]}]))
+    errs = ms.validate(doc, TOOLS)
+    assert any("use_tools" in e for e in errs), errs
+    doc2 = ms.normalize(_doc(macros=[{"label": "X", "steps": [
+        {"kind": "settings", "set": {"allow_code": 1}}]}]))
+    assert any("allow_code" in e for e in ms.validate(doc2, TOOLS))
+
+
 def test_find_placeholders_walks_nested_structures():
     got = ms.find_placeholders({"a": ["{{x}}", {"b": "{{ask:Pick a file}}"}]})
     assert ("x", "") in got and ("ask", "Pick a file") in got
