@@ -10,6 +10,7 @@ import {
   type Method,
 } from "../lib/methods";
 import { engineApi, type ServerInfo } from "../lib/engineApi";
+import { responseError } from "../lib/listFetch";
 import { clampParam, rangeFor } from "../lib/paramLimits";
 import { useApp } from "../store";
 import MethodBuilder from "./MethodBuilder";
@@ -868,18 +869,25 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
 
   const apply = async (id: string) => {
     if (!currentId) return;
+    setImportError("");
     try {
       const r = await fetch(`/api/sessions/${currentId}/method`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ id }),
       });
-      if (r.ok) {
-        setActive(id);
-        setApplied(id);
-        onApplied?.();
+      if (!r.ok) {
+        // AUDIT F11-4: a refused apply used to do nothing at all — no state,
+        // no message, no way to tell it from a dead button.
+        setImportError(await responseError(r));
+        return;
       }
-    } catch { /* stays unapplied */ }
+      setActive(id);
+      setApplied(id);
+      onApplied?.();
+    } catch (e) {
+      setImportError((e as Error).message);
+    }
   };
 
   return (

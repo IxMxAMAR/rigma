@@ -50,4 +50,12 @@ describe("reading a list endpoint", () => {
     expect(await responseError(res(400, "plain text"))).toBe("server replied 400");
     expect(bodyError(null, res(503, null))).toBe("server replied 503");
   });
+
+  it("names a refused action's reason, not just its status", async () => {
+    // AUDIT F11-4: pause/stop/resume/restart and the per-quant actions render
+    // this sentence; a bare status would still be better than the silence they
+    // replaced, but the server's own words are what tells the user what to do.
+    expect(await responseError(res(409, { error: "run is not restartable" })))
+      .toBe("run is not restartable");
+  });
 });

@@ -238,15 +238,26 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
   showSpec?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const downloading = q.pull?.status === "downloading";
   const run = async (fn: () => Promise<unknown>) => {
     setBusy(true);
-    try { await fn(); } catch { /* surfaced via next poll */ }
+    setErr(null);
+    try {
+      await fn();
+    } catch (e) {
+      // AUDIT F11-4: the 1.5-8s poll only re-reads /api/models, so it can show
+      // that the file is still not there but never WHY the pull was refused
+      // (bad repo, dead network, full disk). Keep the server's sentence on the
+      // row instead of discarding it.
+      setErr((e as Error).message);
+    }
     setBusy(false);
     onAction();
   };
   return (
-    <li className="flex items-center gap-2 px-3 py-1.5 rounded-md hover:bg-surface/70">
+    <li className="flex flex-col px-3 py-1.5 rounded-md hover:bg-surface/70">
+      <div className="flex items-center gap-2">
       <span
         className={`w-1.5 h-1.5 rounded-full shrink-0 ${
           q.running ? "bg-amber ring-2 ring-amber/30"
@@ -326,6 +337,13 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
           </button>
         )}
       </div>
+      </div>
+      {err && (
+        <div role="alert"
+             className="text-red font-mono text-[11px] pl-3.5 pt-0.5 break-words">
+          {err}
+        </div>
+      )}
     </li>
   );
 }
@@ -531,7 +549,13 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
             disabled={busy}
             onClick={async () => {
               setBusy(true);
-              try { await engineApi.switchTo(card.slug); } catch { /* poll */ }
+              setErr(null);
+              try {
+                await engineApi.switchTo(card.slug);
+              } catch (e) {
+                // AUDIT F11-4: a refused switch is not "still polling"
+                setErr((e as Error).message);
+              }
               setBusy(false);
               onAction();
             }}
