@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 STANDARD_GB = [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+
+# AUDIT 04-10: `NUL.gguf` is the NUL device, not a file — the download/delete
+# sinks would "succeed" against the device and the model would never exist.
+_RESERVED_DEVICE = re.compile(
+    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.I)
 
 
 def ram_tier(mb: int) -> int:
@@ -128,6 +135,11 @@ class GgufFile(BaseModel):
             raise ValueError(
                 f"model file must stay inside the models directory, got {v!r}: "
                 "it is joined onto that directory to be downloaded and deleted")
+        if any(_RESERVED_DEVICE.match(p.rstrip(" .")) for p in parts):
+            raise ValueError(
+                f"model file may not be a Windows reserved device name, got "
+                f"{v!r}: it is joined onto the models directory to be "
+                "downloaded and deleted")
         return v
 
 

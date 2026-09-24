@@ -1415,10 +1415,30 @@ def _candidates(p: Path, n: int = 5) -> str:
 # letters / absolute-path rejection) so we don't false-positive on those.
 _ILLEGAL_PATH = set('*?"<>|')
 
+# Windows reserved device names: `write_file('nul')` used to report "wrote 7
+# chars" while writing nothing (AUDIT 04-10). NUL is a device, so
+# `Path.exists()` is true, `write_text` discards into it, and read_file then
+# answers "no such file" — a silent success the model cannot recover from. Any
+# extension is covered: Windows treats `NUL.gguf` as the device too.
+_RESERVED_DEVICE = re.compile(
+    r"^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$", re.I)
+
+
+def _reserved_device_name(rel: str):
+    """The first Windows reserved device name in `rel`, or None."""
+    for part in str(rel).replace("\\", "/").split("/"):
+        # Windows strips trailing dots/spaces before matching the device name
+        if _RESERVED_DEVICE.match(part.rstrip(" .")):
+            return part
+    return None
+
 
 def _bad_write_char(rel: str):
-    """The first illegal character in a path a WRITE would create, or None."""
-    return next((c for c in str(rel) if c in _ILLEGAL_PATH), None)
+    """The first illegal character in a path a WRITE would create, or None.
+
+    A reserved device name is refused too — see `_reserved_device_name`."""
+    return (next((c for c in str(rel) if c in _ILLEGAL_PATH), None)
+            or _reserved_device_name(rel))
 
 
 def _glob_under(root: Path, rel: str) -> list[Path]:
@@ -2863,10 +2883,13 @@ def _write_file_locked(args, ctx):
     # '?' means it is still guessing, not writing.
     bad = _bad_write_char(raw)
     if bad is not None:
-        hint = (" — that looks like a search pattern. Use find_files to "
-                "locate the real path, then write to it exactly."
-                if bad in "*?" else "")
-        return (f"error: '{bad}' can't be in a file path you write to.{hint}")
+        if bad in _ILLEGAL_PATH:
+            hint = (" — that looks like a search pattern. Use find_files to "
+                    "locate the real path, then write to it exactly."
+                    if bad in "*?" else "")
+            return (f"error: '{bad}' can't be in a file path you write to.{hint}")
+        return (f"error: '{bad}' is a reserved device name on Windows, so no "
+                "file can be created with it. Choose a different name.")
     p = _ws_path(ctx, raw)
     p.parent.mkdir(parents=True, exist_ok=True)
     content = str(args.get("content", ""))

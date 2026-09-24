@@ -273,3 +273,25 @@ def test_the_sentinel_tools_still_return_their_sentinel(tmp_path):
     out = tools.run_tool("use_tools", {"names": ["view_image"]}, ctx)
     assert out.startswith(tools.USE_TOOLS_SENTINEL)
     assert "view_image" in out
+
+
+# --- AUDIT 04-10: a reserved device name is not a file ------------------------
+def test_reserved_device_names_are_refused_before_the_disk(tmp_path):
+    """`write_file('nul')` used to report "wrote 7 chars" while writing nothing:
+    NUL is a device, so Path.exists() is true, write_text discards into it, and
+    read_file then answers "no such file" — a silent success the model cannot
+    recover from."""
+    for name in ("nul", "NUL.gguf", "con", "aux", "prn", "com1", "lpt9.txt"):
+        out = tools.run_tool("write_file", {"path": name, "content": "PAYLOAD"},
+                             {"workspace": str(tmp_path), "allow_code": True})
+        assert out.startswith("error"), (name, out)
+        assert "reserved device name" in out, (name, out)
+
+
+def test_the_write_path_guard_still_rejects_globs_and_allows_real_names():
+    assert tools._bad_write_char("*") == "*"
+    assert tools._bad_write_char("a?b.txt") == "?"
+    assert tools._bad_write_char("notes.txt") is None
+    assert tools._bad_write_char("aux_data.txt") is None
+    assert tools._bad_write_char("com10.gguf") is None
+    assert tools._reserved_device_name("Q4_K_M/nul.gguf") == "nul.gguf"
