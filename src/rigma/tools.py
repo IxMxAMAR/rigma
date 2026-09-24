@@ -13,6 +13,7 @@ the result back. Tools are tiered by risk:
 from __future__ import annotations
 
 import ast
+import fnmatch
 import html
 import json
 import operator
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +76,11 @@ IMAGE_SENTINEL = "\x00__RIGMA_IMAGE__\x00"
 _NETWORK_TOOLS = {"web_search", "fetch_url", "http_request", "ask_gemini"}
 
 _LIST_MAX = 200          # above this, summarise a folder instead of dumping names
+
+# Entries examined per directory listing before the cap applies. A listing only
+# ever shows `_LIST_MAX` names, so reading (and stat-ing, and sorting) a 100k
+# entry folder to produce 200 of them was pure waste on the caller's thread.
+_SCAN_MAX = 2000
 
 
 # --- tool tiers --------------------------------------------------------------
@@ -1469,6 +1476,92 @@ def _recall(args, ctx):
     return body
 
 
+# A grep/find budget has to bound the INPUT, not the output. The old grep read
+# every file under the workspace (up to 2 MB each, no cap on count or bytes) and
+# `find_files`' "cap the WALK at 5000" counted only file HITS, so a tree of
+# 8000 directories + 3 files walked all 8000 (14-3).
+_GREP_MAX_FILES = 2000
+_GREP_MAX_BYTES = 256 << 20          # 256 MB of file content per grep call
+_GREP_MAX_VISITED = 20000            # directory entries examined per grep call
+_WALK_MAX_ENTRIES = 5000             # directory entries examined by find_files
+
+
+def _glob_re(pat: str) -> re.Pattern:
+    """Compile a path glob the way `Path.glob` reads it: `**` crosses
+    directories (and may match none of them), `*` and `?` do not. `Path.glob`
+    is lazy but cannot prune, so the walkers below match as they go."""
+    out, i, n = [], 0, len(pat)
+    while i < n:
+        c = pat[i]
+        if c == "*":
+            if pat.startswith("**", i):
+                i += 2
+                if i < n and pat[i] == "/":
+                    i += 1
+                    out.append("(?:.*/)?")
+                else:
+                    out.append(".*")
+                continue
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+        elif c == "[":
+            j = i + 1
+            if j < n and pat[j] in "!^":
+                j += 1
+            if j < n and pat[j] == "]":
+                j += 1
+            while j < n and pat[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(re.escape(c))
+            else:
+                inner = pat[i + 1:j]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                out.append("[" + inner + "]")
+                i = j + 1
+                continue
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.compile("(?s:" + "".join(out) + r")\Z")
+
+
+def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict):
+    """Files under `root` whose root-relative posix path matches `rx_glob`.
+
+    Walks with `os.walk` so `IGNORE_DIRS` is pruned BEFORE descending, and
+    counts every directory entry it sees into `state["visited"]` — the caller
+    bounds the WALK, not just the hits. `state["max_visited"]` stops it and
+    sets `state["truncated"]`. A symlinked file is the one way a name under the
+    root can resolve outside it, so only symlinks pay a `resolve()`.
+    """
+    from .watch import IGNORE_DIRS
+    max_visited = state.get("max_visited")
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        state["visited"] = state.get("visited", 0) + len(dirnames) + len(filenames)
+        if max_visited is not None and state["visited"] > max_visited:
+            state["truncated"] = True
+            return
+        dirnames[:] = sorted(d for d in dirnames if d not in IGNORE_DIRS)
+        for name in sorted(filenames):
+            p = Path(dirpath) / name
+            try:
+                rel = p.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if not rx_glob.match(rel):
+                continue
+            if p.is_symlink():
+                try:
+                    if not p.resolve().is_relative_to(root):
+                        continue
+                except OSError:
+                    continue
+            yield p
+
+
 @tool("find_files",
       "Find files by glob pattern inside the workspace (e.g. '**/*.py', "
       "'src/*.js'). Like a file search. Returns up to 200 paths; if more match, "
@@ -1477,22 +1570,25 @@ def _recall(args, ctx):
           "pattern": {"type": "string"}}, "required": ["pattern"]},
       needs="workspace")
 def _find_files(args, ctx):
-    import itertools
     root = _ws_path(ctx, ".")
     pat = str(args.get("pattern", "*"))
-    # cap the WALK at 5000 so `**/*` on a huge tree can't stall/OOM (glob is
-    # lazy; islice stops it early) — then sort the bounded set for stable output
-    scanned = list(itertools.islice(
-        (p for p in root.glob(pat)
-         if p.is_file() and p.resolve().is_relative_to(root)), 5000))
-    all_hits = sorted(scanned)
-    hits = [p.relative_to(root).as_posix() for p in all_hits[:200]]
-    if not hits:
-        return f"no files match {pat}"
-    body = "\n".join(hits)
+    rx_glob = _glob_re(pat)
+    state = {"visited": 0, "truncated": False, "max_visited": _WALK_MAX_ENTRIES}
+    all_hits = list(_iter_workspace_files(root, rx_glob, state))
+    hits = [p.relative_to(root).as_posix() for p in sorted(all_hits)[:200]]
+    notes = []
     if len(all_hits) > 200:
-        more = f"{len(all_hits)}+" if len(scanned) == 5000 else str(len(all_hits))
-        body += f"\n…(showing 200 of {more} matches — narrow the pattern)"
+        more = f"{len(all_hits)}+" if state["truncated"] else str(len(all_hits))
+        notes.append(f"showing 200 of {more} matches — narrow the pattern")
+    if state["truncated"]:
+        notes.append(f"stopped after examining {state['visited']} entries — "
+                     f"narrow the pattern")
+    if not hits:
+        return ("no files match " + pat
+                + ("\n…(" + "; ".join(notes) + ")" if notes else ""))
+    body = "\n".join(hits)
+    if notes:
+        body += "\n…(" + "; ".join(notes) + ")"
     return body
 
 
@@ -1515,13 +1611,24 @@ def _grep(args, ctx):
     except re.error as e:
         return f"error: bad regex: {e}"
     glob = str(args.get("glob", "") or "**/*")
+    rx_glob = _glob_re(glob)
     out, seen = [], 0
-    for p in sorted(root.glob(glob)):
-        # a symlink named in the glob can point outside the root; glob won't
-        # re-check, so resolve and confirm containment before reading
-        if (not p.is_file() or p.stat().st_size > 2_000_000
-                or not p.resolve().is_relative_to(root)):
+    files_read = 0
+    bytes_read = 0
+    state = {"visited": 0, "truncated": False,
+             "max_visited": _GREP_MAX_VISITED}
+    for p in _iter_workspace_files(root, rx_glob, state):
+        if files_read >= _GREP_MAX_FILES or bytes_read >= _GREP_MAX_BYTES:
+            state["truncated"] = True
+            break
+        try:
+            size = p.stat().st_size
+        except OSError:
             continue
+        if size > 2_000_000:
+            continue
+        files_read += 1
+        bytes_read += size
         try:
             for i, line in enumerate(p.read_text(encoding="utf-8",
                                                  errors="ignore").splitlines(), 1):
@@ -1535,6 +1642,11 @@ def _grep(args, ctx):
                                   "pattern or add a `glob` to see the rest)")
         except OSError:
             continue
+    if state["truncated"]:
+        note = (f"…(searched the first {files_read} files / "
+                f"{bytes_read // (1 << 20)} MB — narrow the pattern or add a "
+                f"`glob` to see the rest)")
+        return ("\n".join(out) + "\n" + note) if out else "no matches\n" + note
     return "\n".join(out) if out else "no matches"
 
 
@@ -2273,30 +2385,59 @@ def _read_file(args, ctx):
             + ("\n…(" + "; ".join(notes) + ")" if notes else ""))
 
 
+def _scan_entries(p: Path, limit: int | None = None):
+    """`(entries, truncated)` for at most `limit` entries of `p`.
+
+    Each entry is `(name, is_dir, size)`. `os.scandir` caches the stat from the
+    directory read, so this pays no extra syscall per entry — and it stops
+    reading at `limit` instead of materialising a 100k-entry listing to show 200
+    of them, which is what the old `sorted(p.iterdir(), key=...)` did.
+    """
+    limit = _SCAN_MAX if limit is None else limit
+    out: list[tuple[str, bool, int]] = []
+    truncated = False
+    try:
+        with os.scandir(p) as it:
+            for e in it:
+                if len(out) >= limit:
+                    truncated = True
+                    break
+                try:
+                    is_dir = e.is_dir()
+                    size = 0 if is_dir else e.stat().st_size
+                except OSError:
+                    continue
+                out.append((e.name, is_dir, size))
+    except OSError:
+        return [], False
+    return out, truncated
+
+
 def _folder_listing(p: Path) -> str:
     """Shared by list_directory and read_file's directory-redirect: a compact
     listing that summarises big folders instead of dumping every name."""
-    items = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-    if not items:
+    entries, truncated = _scan_entries(p)
+    if not entries:
         return "(this is a folder, and it is empty)"
+    items = sorted(entries, key=lambda x: (not x[1], x[0].lower()))
     lead = "(that is a folder — its contents:)\n"
-    if len(items) <= _LIST_MAX:
-        body = "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
-                         for x in items)
+    if not truncated and len(items) <= _LIST_MAX:
+        body = "\n".join(("📁 " if d else "📄 ") + n for n, d, _ in items)
         return lead + body + f"\n({len(items)} entries)"
     from collections import Counter
-    files = [x for x in items if x.is_file()]
-    dirs = [x for x in items if x.is_dir()]
+    files = [(n, s) for n, d, s in items if not d]
+    dirs = [n for n, d, _ in items if d]
     kinds = ", ".join(f"{n}× {e}" for e, n in
-                      Counter((x.suffix.lower() or "(no ext)")
-                              for x in files).most_common(8))
+                      Counter((Path(n).suffix.lower() or "(no ext)")
+                              for n, _ in files).most_common(8))
+    count = f"{len(items)}" if not truncated else f"{len(items)}+"
     out = [lead.rstrip(),
-           f"{len(items)} entries in {p} — too many to list in full.",
+           f"{count} entries in {p} — too many to list in full.",
            f"{len(files)} files ({kinds}); {len(dirs)} folders."]
     if dirs:
-        out.append("folders: " + ", ".join(d.name for d in dirs[:10]))
+        out.append("folders: " + ", ".join(dirs[:10]))
     out.append("example files:\n"
-               + "\n".join("📄 " + x.name for x in files[:15]))
+               + "\n".join("📄 " + n for n, _ in files[:15]))
     out.append("To work with this folder use sample_files (random sample) or "
                "find_files (glob). Do NOT dump the whole listing.")
     return "\n".join(out)
@@ -2314,28 +2455,29 @@ def _list_dir(args, ctx):
     p = _read_path(ctx, str(args.get("path", "") or "."))
     if not p.is_dir():
         return f"error: not a folder: {args.get('path')}"
-    items = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-    if not items:
+    entries, truncated = _scan_entries(p)
+    if not entries:
         return "(empty)"
-    if len(items) <= _LIST_MAX:
-        body = "\n".join(("📄 " if x.is_file() else "📁 ") + x.name
-                         for x in items)
+    items = sorted(entries, key=lambda x: (not x[1], x[0].lower()))
+    if not truncated and len(items) <= _LIST_MAX:
+        body = "\n".join(("📁 " if d else "📄 ") + n for n, d, _ in items)
         return body + f"\n({len(items)} entries)"
     # BIG folder: a summary beats 200 raw filenames — it's a fraction of the
     # tokens and actually tells the model what's in there. Dumping names is
     # what ballooned context and stalled runs.
     from collections import Counter
-    files = [x for x in items if x.is_file()]
-    dirs = [x for x in items if x.is_dir()]
+    files = [(n, s) for n, d, s in items if not d]
+    dirs = [n for n, d, _ in items if d]
     kinds = ", ".join(f"{n}× {e}" for e, n in
-                      Counter((x.suffix.lower() or "(no ext)")
-                              for x in files).most_common(8))
-    out = [f"{len(items)} entries in {p} — too many to list in full.",
+                      Counter((Path(n).suffix.lower() or "(no ext)")
+                              for n, _ in files).most_common(8))
+    count = f"{len(items)}" if not truncated else f"{len(items)}+"
+    out = [f"{count} entries in {p} — too many to list in full.",
            f"{len(files)} files ({kinds}); {len(dirs)} folders."]
     if dirs:
-        out.append("folders: " + ", ".join(d.name for d in dirs[:10]))
+        out.append("folders: " + ", ".join(dirs[:10]))
     out.append("example files:\n"
-               + "\n".join("📄 " + x.name for x in files[:15]))
+               + "\n".join("📄 " + n for n, _ in files[:15]))
     out.append("To work with this folder use sample_files (random sample) or "
                "find_files (glob). Do NOT dump the whole listing.")
     return "\n".join(out)
@@ -2363,17 +2505,25 @@ def _sample_files(args, ctx):
         n = max(1, min(int(args.get("count", 20) or 20), 50))
     except (TypeError, ValueError):
         n = 20
-    try:
-        # AUDIT F04-5: mirror _find_files. Filtering on is_file() alone let a
-        # `..` glob hand back files outside the workspace — including under the
-        # confined profile, whose whole promise is that nothing leaves it — and
-        # the hits were then remembered with runs.set_last_sample, so a later
-        # move_files/copy_files with no paths acted on outside files.
-        root = p.resolve()
-        hits = [x for x in p.glob(pat)
-                if x.is_file() and x.resolve().is_relative_to(root)]
-    except Exception as e:
-        return f"error: bad pattern '{pat}': {e}"
+    # AUDIT F04-5 + 14-1: containment is tested on (directory, name) — the
+    # directory is already known to be inside the root and a scandir name can
+    # never contain a separator, so only a symlink entry can point out, and only
+    # symlinks pay the resolve(). The old per-file x.resolve() ran for every
+    # candidate before the sample was taken (1.5 s on a 10 000-file folder).
+    root = p.resolve()
+    entries, truncated = _scan_entries(p)
+    hits = []
+    for name, is_dir, _size in entries:
+        if is_dir or not fnmatch.fnmatch(name, pat):
+            continue
+        f = p / name
+        if f.is_symlink():
+            try:
+                if not f.resolve().is_relative_to(root):
+                    continue
+            except OSError:
+                continue
+        hits.append(f)
     if not hits:
         return f"no files match '{pat}' in {p}"
     picked = sorted(random.sample(hits, min(n, len(hits))), key=lambda x: x.name)
@@ -2390,7 +2540,8 @@ def _sample_files(args, ctx):
     tail = ("\nThese paths are already recorded. Do not retype them — you will "
             "get them wrong. Use the view_sample tool, with no arguments, to "
             "look at this sample." if rid else "")
-    return (f"{len(hits)} files match '{pat}' in {p}; random sample of "
+    found = f"{len(hits)}" if not truncated else f"{len(hits)}+"
+    return (f"{found} files match '{pat}' in {p}; random sample of "
             f"{len(picked)}:\n{body}{tail}")
 
 
@@ -2976,10 +3127,25 @@ _JOB_LIMIT = 8               # concurrent jobs — a runaway-spawn backstop
 
 
 def _job_pump(job: dict, stream, label: str) -> None:
+    """Append this stream's lines to the job's rolling window.
+
+    A bounded deque of chunks, joined once on read — the old
+    `job["buf"] = (job["buf"] + tagged)[-_JOB_MAX_BUF:]` copied the whole
+    64 KB window per line (43 ms of pure copying over 20 000 lines).
+    """
     try:
         for line in iter(stream.readline, ""):
             tagged = line if label == "out" else f"[stderr] {line}"
-            job["buf"] = (job["buf"] + tagged)[-_JOB_MAX_BUF:]
+            with job["lock"]:
+                chunks = job["chunks"]
+                chunks.append(tagged)
+                job["buflen"] += len(tagged)
+                while job["buflen"] > _JOB_MAX_BUF and len(chunks) > 1:
+                    job["buflen"] -= len(chunks.popleft())
+                if job["buflen"] > _JOB_MAX_BUF:
+                    # one line longer than the whole window: keep its tail
+                    chunks[0] = chunks[0][-_JOB_MAX_BUF:]
+                    job["buflen"] = len(chunks[0])
     except Exception:
         pass
     finally:
@@ -2987,6 +3153,12 @@ def _job_pump(job: dict, stream, label: str) -> None:
             stream.close()
         except Exception:
             pass
+
+
+def _job_tail(job: dict, n: int = 4000) -> str:
+    """The last `n` characters of a job's output, joined from its chunks."""
+    with job["lock"]:
+        return "".join(job["chunks"])[-n:]
 
 
 @tool("start_job",
@@ -3020,9 +3192,9 @@ def _start_job(args, ctx):
     except Exception as e:
         return f"error: could not start job: {e}"
     jid = max(_JOBS, default=0) + 1
-    job = {"proc": proc, "buf": "", "cmd": cmd[:500], "started": time.time()}
+    job = {"proc": proc, "chunks": deque(), "buflen": 0,
+           "lock": threading.Lock(), "cmd": cmd[:500], "started": time.time()}
     _JOBS[jid] = job
-    import threading
     for stream, label in ((proc.stdout, "out"), (proc.stderr, "err")):
         threading.Thread(target=_job_pump, args=(job, stream, label),
                          daemon=True).start()
@@ -3057,7 +3229,7 @@ def _job_output(args, ctx):
             f"({int(time.time() - job['started'])}s elapsed)" if rc is None
             else ("job {}: exited {} ({})".format(
                 jid, rc, "ok" if rc == 0 else "FAILED")))
-    tail = job["buf"][-4000:]
+    tail = _job_tail(job, 4000)
     if not tail.strip():
         tail = "(no output yet)" if rc is None else "(no output)"
     return head + "\n" + tail

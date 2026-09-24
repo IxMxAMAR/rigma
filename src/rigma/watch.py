@@ -36,6 +36,7 @@ called directly from a test. `start()` is a thread around it.
 from __future__ import annotations
 
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -66,12 +67,22 @@ MAX_FILES = 20000
 
 POLL_SECS = 1.5
 
+# A file's mtime can be coarser than the wall clock (1 ms on NTFS, 2 s on FAT),
+# so two writes inside one clock tick share an mtime and the second is invisible
+# to a stat-only check. A recorded signature is trusted only once the file's
+# mtime is at least this old relative to when its bytes were read; a file edited
+# more recently is re-read on the next pass — at most a handful of files.
+STAT_SETTLE_NS = 2_000_000_000
+
 
 def _iter_files(root: Path):
-    """Candidate files under `root`, pruned and capped.
+    """`(path, stat)` for candidate files under `root`, pruned and capped.
 
     Pruning happens on `dirnames` in place, which is what stops `os.walk` from
     descending — skipping entries after the fact would still have walked them.
+    The stat comes from the same call that decides the file is in scope, so the
+    caller never pays a second one: `poll_once` compares `(mtime, size)` and
+    skips the read entirely when neither moved.
     """
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -79,11 +90,12 @@ def _iter_files(root: Path):
         for name in filenames:
             p = Path(dirpath) / name
             try:
-                if not p.is_file() or p.stat().st_size > MAX_FILE_BYTES:
-                    continue
+                st = p.stat()
             except OSError:
                 continue
-            yield p
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES:
+                continue
+            yield p, st
             seen += 1
             if seen >= MAX_FILES:
                 return
@@ -132,6 +144,9 @@ class Watcher:
     def __init__(self, workspace, *, record=None):
         self.root = Path(workspace).resolve()
         self._known: dict[str, bytes] = {}
+        # key -> (st_mtime_ns, st_size, read_at_ns). Change detection reads this
+        # FIRST: a file whose stat has not moved is not read at all.
+        self._stats: dict[str, tuple[int, int, int]] = {}
         self._bytes = 0
         self._record = record if record is not None else record_snapshot
         self._lock = threading.Lock()
@@ -142,28 +157,53 @@ class Watcher:
     # -- the testable core ----------------------------------------------------
 
     def poll_once(self) -> list[str]:
-        """One pass. Returns the paths whose change was recorded."""
+        """One pass. Returns the paths whose change was recorded.
+
+        Metadata-first: a file whose `(mtime, size)` has not moved since the pass
+        that read it is skipped, so a steady-state poll of an unchanged tree does
+        no I/O beyond the walk's own stats. The old version re-read and
+        byte-compared every file every 1.5 s (19.7 GB/h on a 2000-file tree).
+        """
         changed: list[str] = []
-        for p in _iter_files(self.root):
+        for p, st in _iter_files(self.root):
             key = str(p)
+            mtime, size = st.st_mtime_ns, st.st_size
+            with self._lock:
+                prev = self._stats.get(key)
+            # prev[2] is when those bytes were READ; prev[0] + settle is the
+            # first moment no later write could still carry prev[0]'s mtime.
+            if (prev is not None and prev[0] == mtime and prev[1] == size
+                    and prev[0] + STAT_SETTLE_NS <= prev[2]):
+                continue
             try:
                 data = p.read_bytes()
             except OSError:
                 continue
+            read_at = time.time_ns()
             with self._lock:
                 old = self._known.get(key)
                 if old is None:
                     # First sight: this is the baseline, and nothing has changed
                     # yet, so there is nothing to record.
                     self._remember(key, data)
+                    self._stats[key] = (mtime, size, read_at)
                     continue
                 if old == data:
+                    self._stats[key] = (mtime, size, read_at)
                     continue
                 # The change has already happened and `old` is the version to go
                 # back to — which only exists because the previous pass read it.
                 if self._record(p, old):
                     changed.append(key)
-                self._remember(key, data)
+                    self._remember(key, data)
+                    self._stats[key] = (mtime, size, read_at)
+                else:
+                    # AUDIT F08-6: a change whose snapshot could not be stored is
+                    # NOT seen. Drop the cached stat so the next pass re-reads
+                    # and retries, and keep `old` as the version to restore —
+                    # advancing the baseline here would make the change
+                    # permanently un-undoable.
+                    self._stats.pop(key, None)
         return changed
 
     def _remember(self, key: str, data: bytes) -> None:
