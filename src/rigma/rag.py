@@ -113,12 +113,40 @@ def recorded_sidecar_port() -> int | None:
         return None
 
 
+def _is_raggity_health(body) -> bool:
+    """Does this /healthz body come from a raggity sidecar?
+
+    AUDIT R3-10-13: `sidecar_health` accepted ANY local HTTP service that
+    answered 200 with parseable JSON, and every decision about document search
+    goes through it — `live_sidecar_port` (which advertises
+    `search_my_documents` to the model and then POSTs /retrieve and /ask at that
+    port), `ensure_sidecar` (which records the answering process's pid in
+    sidecar.json), and therefore `stop_sidecar` (which later terminates that
+    pid; 10-5 can only check the pid is the one we RECORDED, not that the record
+    was written about the right process). The port is not proof of identity:
+    ports are recycled, and sidecar.json is a hand-editable file.
+
+    raggity's /healthz carries at least a version and an index backend (see
+    tests/fake_raggity_server.py, which mirrors the real shape). An empty or
+    unrelated body is treated as "not ours" — a false negative costs a
+    restarted sidecar, a false positive hands a stranger the document tool and
+    its own termination.
+    """
+    if not isinstance(body, dict):
+        return False
+    return bool(body.get("version") or body.get("documents") is not None
+                or body.get("index_backend"))
+
+
 def sidecar_health(port: int = RAG_PORT) -> dict | None:
     try:
         r = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=3)
-        return r.json() if r.status_code == 200 else None
+        if r.status_code != 200:
+            return None
+        body = r.json()
     except Exception:
         return None
+    return body if _is_raggity_health(body) else None
 
 
 def _create_time(pid: int) -> float:
