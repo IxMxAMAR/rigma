@@ -481,20 +481,39 @@ def test_start_requires_a_model(engine, tmp_path, monkeypatch):
 def test_run_control_endpoints(engine):
     from rigma import sessions
     c = _client(engine)
+    # AUDIT 03-6: a run with NO driver must refuse. The old code wrote the
+    # field and answered 200, so resume on a terminal run claimed an effect
+    # nothing would service and inject queued guidance nothing would consume.
     sess = sessions.create()
-    rid = runs.create("m", sess["id"])["id"]        # active run, no live loop
-    assert c.post(f"/api/runs/{rid}/inject",
-                  json={"message": "use bs4"}).json()["queued"] is True
-    assert runs.load(rid)["steer_queue"] == ["use bs4"]
-    c.post(f"/api/runs/{rid}/pause")
-    assert runs.load(rid)["paused"] is True
-    c.post(f"/api/runs/{rid}/resume")
-    assert runs.load(rid)["paused"] is False
-    runs.append_progress(rid, "did x", "do y")
-    runs.plan_add(rid, "step one")
-    g = c.get(f"/api/runs/{rid}").json()
-    assert g["plan"][0]["text"] == "step one" and "did x" in g["log_tail"]
-    assert "did x" in c.get(f"/api/runs/{rid}/log").json()["log"]
+    dead = runs.create("m", sess["id"])["id"]        # active run, no live loop
+    assert c.post(f"/api/runs/{dead}/inject",
+                  json={"message": "use bs4"}).status_code == 409
+    assert c.post(f"/api/runs/{dead}/pause").status_code == 409
+    assert c.post(f"/api/runs/{dead}/resume").status_code == 409
+    assert runs.load(dead)["paused"] is False        # nothing was written
+    runs.set_status(runs.load(dead), "stopped", "test teardown")
+
+    # A LIVE run accepts the same three, and the writes land.
+    hold = threading.Event()
+    _Engine.gate = hold                 # keep the driver alive, mid-turn
+    _Engine.script = [None]
+    rid = c.post("/api/runs", json={"mission": "control",
+                                    "budget_hours": 1}).json()["id"]
+    try:
+        assert c.post(f"/api/runs/{rid}/inject",
+                      json={"message": "use bs4"}).json()["queued"] is True
+        assert runs.load(rid)["steer_queue"] == ["use bs4"]
+        c.post(f"/api/runs/{rid}/pause")
+        assert runs.load(rid)["paused"] is True
+        c.post(f"/api/runs/{rid}/resume")
+        assert runs.load(rid)["paused"] is False
+        runs.append_progress(rid, "did x", "do y")
+        runs.plan_add(rid, "step one")
+        g = c.get(f"/api/runs/{rid}").json()
+        assert g["plan"][0]["text"] == "step one" and "did x" in g["log_tail"]
+        assert "did x" in c.get(f"/api/runs/{rid}/log").json()["log"]
+    finally:
+        hold.set()
     c.post(f"/api/runs/{rid}/stop")
     assert runs.load(rid)["status"] == "stopped"
     assert c.get("/api/runs/active").json() == {}    # active released
