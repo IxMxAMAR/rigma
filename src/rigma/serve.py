@@ -5115,12 +5115,31 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    def _run_control_refusal(rid: str, r: dict) -> str:
+        """Why a pause/resume/inject must be refused, or "" if it is honest.
+
+        AUDIT 03-6: all three used to write the field and return the run
+        without consulting the status or `_run_tasks`, so resume on a `done`
+        run answered 200, inject answered {"queued": true} for guidance nothing
+        would ever consume, and pause left `paused: true` on a terminal run.
+        A control request is only honest when a driver will service it."""
+        status = r.get("status")
+        if status not in ("running", "paused"):
+            return f"run is {status} — restart it first"
+        t = _run_tasks.get(rid)
+        if t is None or t.done():
+            return "run has no driver — restart it first"
+        return ""
+
     @app.post("/api/runs/{rid}/pause")
     async def pause_run(rid: str):
         from . import runs as _runs
         r = _runs.load(rid)
         if r is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
+        refusal = _run_control_refusal(rid, r)
+        if refusal:
+            return JSONResponse({"error": refusal}, status_code=409)
         r["paused"] = True
         _runs.save(r)
         return r
@@ -5131,6 +5150,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r = _runs.load(rid)
         if r is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
+        refusal = _run_control_refusal(rid, r)
+        if refusal:
+            return JSONResponse({"error": refusal}, status_code=409)
         r["paused"] = False
         _runs.save(r)
         return r
@@ -5225,6 +5247,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         r = _runs.load(rid)
         if r is None:
             return JSONResponse({"error": "no such run"}, status_code=404)
+        # AUDIT 03-6: guidance queued onto a run no driver will service is
+        # silently discarded, but the caller is told {"queued": true}.
+        refusal = _run_control_refusal(rid, r)
+        if refusal:
+            return JSONResponse({"error": refusal}, status_code=409)
         note = str((body or {}).get("message", "")).strip()
         if not note:
             return JSONResponse({"error": "message required"}, status_code=400)
