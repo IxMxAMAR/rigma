@@ -92,12 +92,23 @@ _UNC_PATH = re.compile(r"\\\\[^\\]+\\")
 # The list covers what THIS box's tools actually produce — review found the
 # first cut missed .ps1/.log/.bat etc., so "check server.log for the trace"
 # passed the guard and would have been pinned into every future run.
+# `\b[^\s.]+` and not `\S+`, and `\b\w+\(` and not `\w+\(`: BOTH were
+# quadratic backtrackers on a long token containing no dot / no "(" — the
+# second one worse than the first. `looks_like_raw_trace` runs on every stored
+# rule and every edit, and the store is fed by a local model, so the length is
+# not something a caller controls. Measured on this box (AUDIT R3-10-11), on a
+# 200 000-char run of "A": 76 s for the filename pattern and 130 s for the call
+# pattern, synchronously on whichever thread called add()/update(). The leading
+# \b is what removes the ambiguity — a token can only start at a word boundary
+# — and neither pattern's semantics change: a filename is still a non-space
+# token with a dot and a known extension, a call is still name(...'...').
+# Both are now ~0.002 s at 200 000 chars.
 _FILENAME = re.compile(
-    r"\S+\.(?:png|jpe?g|webp|gif|bmp|md|txt|json|jsonl|py|csv|gguf"
+    r"\b[^\s.]+\.(?:png|jpe?g|webp|gif|bmp|md|txt|json|jsonl|py|csv|gguf"
     r"|safetensors|ps1|bat|cmd|log|ya?ml|ini|cfg|toml|pt|pth|ckpt|onnx"
     r"|bin|zip|7z|exe|html?|pdf|sh|js|ts|css)\b",
     re.I)
-_CALL_SYNTAX = re.compile(r"\w+\([^)]*['\"][^)]*\)")
+_CALL_SYNTAX = re.compile(r"\b\w+\([^)]*['\"][^)]*\)")
 
 
 def looks_like_raw_trace(text: str) -> bool:
