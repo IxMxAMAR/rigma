@@ -1180,3 +1180,25 @@ def test_drive_turn_reads_mcode_with_a_hard_frame_bound(monkeypatch):
         fake.stdout.sizes
     assert [e.text for e in got if e.kind == "text"] == ["ok"]
     assert any(e.kind == "notice" and "skipped" in e.text for e in got), got
+
+
+def test_an_exit_zero_with_no_stream_is_an_error_not_an_empty_success(
+        monkeypatch):
+    """mcode can exit 0 without ever emitting `exec.completed` (a shim that
+    fails silently, an output-format mismatch). The tail checked only stopped/
+    killed/exit code/final_status, so the generator ended silently and the
+    caller saved an empty assistant reply as a finished turn (09-7)."""
+    _fake_exec(monkeypatch, stdout="", stderr="shim said nothing\n", code=0)
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    assert [e.kind for e in got] == ["error"], got
+    assert "0" in got[0].text and "without completing" in got[0].text
+
+
+def test_a_completed_stream_is_not_reported_as_unfinished(monkeypatch):
+    """The other half of the same rule: `exec.completed` is the end marker, and
+    a turn that has one must not gain a spurious error."""
+    _fake_exec(monkeypatch, stdout=json.dumps(
+        {"type": "exec.completed",
+         "result": {"status": "succeeded", "output": "hi"}}) + "\n")
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    assert [e.kind for e in got] == ["text"], got
