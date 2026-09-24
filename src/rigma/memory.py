@@ -55,6 +55,29 @@ _GUARD_EXEMPT_KINDS = {"project"}
 # the cap IS the quarantine: overflow evicts the least-proven rule.
 MAX_PITFALLS = 24
 
+# A stored memory is injected into a prompt, and its text is MODEL-GENERATED
+# from untrusted material: `harvest_run` stores a distilled rule, and the run
+# loop stores an advisor's reflection verbatim (`serve.py`: "When stuck: " +
+# tech[:280]). A newline in that text used to end the bullet it was rendered
+# into, so a stored rule could forge a heading, a "SYSTEM:" directive or a
+# fenced block inside the autonomous agent's system prompt. `MAX_PITFALLS` is a
+# COUNT cap and says nothing about size: five rules of unbounded length are an
+# unbounded prompt. So the injection points bound the bytes too.
+MAX_INJECTED_RULE_CHARS = 240
+MAX_INJECTED_BLOCK_CHARS = 4000
+
+
+def injected_text(text, limit: int = MAX_INJECTED_RULE_CHARS) -> str:
+    """One stored rule as ONE prompt line, bounded.
+
+    Collapses every run of whitespace (newlines included) to a single space and
+    truncates. Applied at the two places memory becomes prompt text — the
+    pitfalls block and per-step recall — never at rest, so the Memory panel
+    still shows what was actually learned.
+    """
+    flat = " ".join(str(text or "").split())
+    return flat[:limit]
+
 
 def _eviction_key(m: dict):
     """Least-proven first: drafts/retired outrank verified, then lowest outcome
@@ -92,12 +115,23 @@ _UNC_PATH = re.compile(r"\\\\[^\\]+\\")
 # The list covers what THIS box's tools actually produce — review found the
 # first cut missed .ps1/.log/.bat etc., so "check server.log for the trace"
 # passed the guard and would have been pinned into every future run.
+# `\b[^\s.]+` and not `\S+`, and `\b\w+\(` and not `\w+\(`: BOTH were
+# quadratic backtrackers on a long token containing no dot / no "(" — the
+# second one worse than the first. `looks_like_raw_trace` runs on every stored
+# rule and every edit, and the store is fed by a local model, so the length is
+# not something a caller controls. Measured on this box (AUDIT R3-10-11), on a
+# 200 000-char run of "A": 76 s for the filename pattern and 130 s for the call
+# pattern, synchronously on whichever thread called add()/update(). The leading
+# \b is what removes the ambiguity — a token can only start at a word boundary
+# — and neither pattern's semantics change: a filename is still a non-space
+# token with a dot and a known extension, a call is still name(...'...').
+# Both are now ~0.002 s at 200 000 chars.
 _FILENAME = re.compile(
-    r"\S+\.(?:png|jpe?g|webp|gif|bmp|md|txt|json|jsonl|py|csv|gguf"
+    r"\b[^\s.]+\.(?:png|jpe?g|webp|gif|bmp|md|txt|json|jsonl|py|csv|gguf"
     r"|safetensors|ps1|bat|cmd|log|ya?ml|ini|cfg|toml|pt|pth|ckpt|onnx"
     r"|bin|zip|7z|exe|html?|pdf|sh|js|ts|css)\b",
     re.I)
-_CALL_SYNTAX = re.compile(r"\w+\([^)]*['\"][^)]*\)")
+_CALL_SYNTAX = re.compile(r"\b\w+\([^)]*['\"][^)]*\)")
 
 
 def looks_like_raw_trace(text: str) -> bool:
@@ -361,6 +395,14 @@ class MemoryStore:
                 "refusing to store a raw trace as a behavioural rule: "
                 "a model that reads a failure transcript imitates it. "
                 f"Distil it into an imperative first. Got: {text[:80]!r}")
+        # The read is INSIDE the lock, and it must stay there. 10-1r locked the
+        # read-modify-write but left this one read outside it: the snapshot was
+        # taken, then `_xlock` was entered, and the cap/eviction branch writes
+        # that snapshot back with `_write_all`. A rule another Rigma process
+        # committed in between was therefore destroyed by our whole-file
+        # rewrite — the same lost update 10-1r closed elsewhere, still open
+        # here. `_append` (the common branch) only adds a row, so it was never
+        # the visible half; a capped store is what makes it bite.
         # Held across the read AND the write: two threads that both read the
         # file and then both write it back lose one add entirely. A plain
         # interleaving, single event loop or not. _xlock also takes the
@@ -462,6 +504,15 @@ class MemoryStore:
             if "text" in changes:
                 hit["vec"] = embed_one(hit["text"], purpose="doc")
             hit["edited"] = time.time()
+            # AUDIT R3-10-15: an edit that changes `kind` moves a row into
+            # another kind's group, and nothing re-applied that kind's cap. The
+            # store then sat one row over, and the NEXT add evicted two rows to
+            # get back under it — one more rule silently dropped than the cap
+            # promises, chosen by `_eviction_key` rather than by the add. Only
+            # the kind-changing case can exceed a cap (a text/score edit keeps
+            # the group size), so only that case is re-capped.
+            if "kind" in changes:
+                _cap_rows(rows)
             self._write_all(rows)
             return hit
 
@@ -653,7 +704,12 @@ def retrieve(rows: list[dict], query: str, kinds: tuple = ("pitfall",
                            / (1.0 - _DENSE_BASELINE))
         scored.append((s, r))
     scored.sort(key=lambda t: t[0], reverse=True)
-    return [r for s, r in scored[:k] if s >= 0.12]
+    # The caller appends these to the driving user message ("### NOTES (from
+    # earlier runs)"), so the text is flattened to one bounded line per hit on
+    # the way out — see injected_text. Copies: the store's own row is left
+    # exactly as learned, so the Memory panel still shows the real text.
+    return [{**r, "text": injected_text(r.get("text", ""))}
+            for s, r in scored[:k] if s >= 0.12]
 
 
 # --- distillation ------------------------------------------------------------
@@ -943,5 +999,10 @@ def render_pitfall_block(memories: list[dict], limit: int = 5,
                              m.get("seen_count", 0)), reverse=True)
     lines = ["WHAT YOU LEARNED BEFORE — these are rules, not suggestions:"]
     for m in rows[:limit]:
-        lines.append(f"  • {m.get('text', '')}")
-    return "\n".join(lines)
+        # ONE line per rule, bounded. The stored text is model-generated and
+        # this block lands in the autonomous agent's SYSTEM PROMPT, so a
+        # newline in a rule used to let it forge a heading or a "SYSTEM:"
+        # directive inside that prompt. See injected_text.
+        lines.append(f"  • {injected_text(m.get('text', ''))}")
+    block = "\n".join(lines)
+    return block[:MAX_INJECTED_BLOCK_CHARS]

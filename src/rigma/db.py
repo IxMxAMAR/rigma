@@ -113,6 +113,33 @@ def has_fts() -> bool:
     return _fts_available.get(str(db_path()), True)
 
 
+def _fts_write(c: sqlite3.Connection, sid: str, title: str | None = None,
+               text: str = "") -> None:
+    """Replace (title given) or drop the FTS row for `sid`, degrading to "no
+    FTS" if the table is not there.
+
+    AUDIT R3-10-14: `has_fts()` defaults to True for a path this process has
+    not decided about, and only `connect()` ever decides — once per process.
+    So a database whose `session_fts` table is absent (a build without FTS5
+    created it and left the file without the table; a restart, or another
+    interpreter, then sees the same file) reads as FTS-available, and
+    `upsert_session`'s DELETE/INSERT raised OperationalError straight out of
+    every save. The chat was never stored. `search_sessions` already treated a
+    missing table as "search degrades to LIKE"; this makes the write side agree
+    with it, and remembers the verdict so the failure is not rediscovered on
+    every write.
+    """
+    try:
+        c.execute("DELETE FROM session_fts WHERE id=?", (sid,))
+        if title is not None:
+            c.execute("INSERT INTO session_fts(id, title, text) VALUES(?,?,?)",
+                      (sid, title, text))
+    except sqlite3.OperationalError as e:
+        if "no such table" not in str(e).lower():
+            raise
+        _fts_available[str(db_path())] = False
+
+
 def _fts_text(session: dict, cap: int = 1_000_000) -> str:
     """The searchable text of a session: title + message bodies (vision parts
     contribute their text only).
@@ -200,9 +227,7 @@ def upsert_session(session: dict, base_rev: int | None = None) -> int | None:
                 return None
             new_rev = int(base_rev) + 1
         if has_fts() and (prev is None or prev[1] != digest):
-            c.execute("DELETE FROM session_fts WHERE id=?", (sid,))
-            c.execute("INSERT INTO session_fts(id, title, text) "
-                      "VALUES(?,?,?)", (sid, title, text))
+            _fts_write(c, sid, title, text)
     return new_rev
 
 
@@ -224,7 +249,9 @@ def delete_session(session_id: str) -> bool:
     with connect() as c:
         cur = c.execute("DELETE FROM sessions WHERE id=?", (session_id,))
         if has_fts():
-            c.execute("DELETE FROM session_fts WHERE id=?", (session_id,))
+            # same missing-table degradation as upsert_session (AUDIT R3-10-14):
+            # a failed index delete must not stop the row delete
+            _fts_write(c, session_id)
     return cur.rowcount > 0
 
 
