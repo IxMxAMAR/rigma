@@ -105,3 +105,14 @@ def test_the_browser_smokes_target_the_right_ui():
     assert v2_path.is_file(), "no browser smoke for the v2 shell at /"
     assert re.search(r'BASE\s*=\s*"http://127\.0\.0\.1:18500"',
                      v2_path.read_text(encoding="utf-8"))
+
+
+def test_ci_runs_the_newest_python_the_metadata_admits():
+    """`requires-python = ">=3.11"` is what pip enforces, so a version it admits
+    but CI never runs ships untested (AUDIT 12-12). The source uses none of the
+    APIs removed in 3.13/3.14, so 3.13 is claimed and must be in the matrix."""
+    import yaml
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"))
+    matrix = ci["jobs"]["test"]["strategy"]["matrix"]["py"]
+    assert "3.13" in matrix, matrix
