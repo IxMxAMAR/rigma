@@ -205,6 +205,32 @@ def test_probe_falls_forward_past_metadata_less_gguf(monkeypatch, home):
     assert d["name"] == "web-tune-7b"
 
 
+def test_an_unparseable_candidate_falls_forward_to_the_next(monkeypatch, home):
+    """A stray non-gguf `.gguf` (a text file, a 0-byte LFS pointer) that the
+    name filter cannot catch used to abort the whole probe: `remote_inspect`
+    raised straight out of the candidate loop, so a repo whose every real quant
+    parses fine could not be added or even previewed."""
+    tree = [{"path": "broken.gguf", "size": 5},
+            {"path": "Model-Q4_K_M.gguf", "size": 4 * 2**30}]
+    monkeypatch.setattr(hf_browse, "_get_json", lambda p, params=None: tree)
+    monkeypatch.setattr(hf_browse, "_fetch_head",
+                        lambda repo, file, cap:
+                        b"nope" if file == "broken.gguf" else HEADER)
+    d = hf_browse.inspect_repo("x/y")
+    assert d["name"] == "web-tune-7b"
+
+
+def test_a_repo_of_only_unparseable_ggufs_still_says_why(monkeypatch, home):
+    """The fall-forward must end in the honest "no usable metadata" error, not
+    the first candidate's parse message."""
+    tree = [{"path": "broken.gguf", "size": 5}]
+    monkeypatch.setattr(hf_browse, "_get_json", lambda p, params=None: tree)
+    monkeypatch.setattr(hf_browse, "_fetch_head",
+                        lambda repo, file, cap: b"nope")
+    with pytest.raises(HangarError, match="usable model"):
+        hf_browse.inspect_repo("x/y")
+
+
 def test_fetch_head_caps_when_server_ignores_range(monkeypatch, home):
     """Review 2026-07-18: a mirror ignoring Range and returning the whole
     40GB file must not be pulled into memory — stream + hard cap."""

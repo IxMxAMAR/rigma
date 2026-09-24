@@ -196,17 +196,28 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
     # probe cheapest header first; skip odd non-model ggufs (live find
     # 2026-07-17: bartowski repos ship imatrix data as .gguf) and fall
     # forward to the next smallest before giving up
-    info, probed = None, ""
+    info, probed, last_err = None, "", None
     for probe in sorted(rf["ggufs"], key=lambda g: g["bytes"])[:3]:
-        cand = remote_inspect(repo, probe["file"])
+        # The fall-forward has to cover a candidate that cannot be READ, not
+        # just one that parses without metadata: a stray text file with a
+        # .gguf extension, a 0-byte LFS pointer or a >64MB header used to
+        # raise straight out of this loop and fail the whole repo, although
+        # every real quant in it parses fine. Keep the last error so a repo
+        # with nothing usable still says what was wrong.
+        try:
+            cand = remote_inspect(repo, probe["file"])
+        except (HangarError, OSError, ValueError) as e:
+            last_err = e
+            continue
         f = cand.spec_fields
         if not cand.is_mmproj and f["n_layers"] > 0 and f["kv_heads"] > 0 \
                 and f["head_dim"] > 0:
             info, probed = cand, probe["file"]
             break
     if info is None:
+        detail = f" (last error: {last_err})" if last_err is not None else ""
         raise HangarError("no gguf in that repo carries usable model "
-                          "metadata — Rigma can't compute memory fit")
+                          f"metadata — Rigma can't compute memory fit{detail}")
     f = info.spec_fields
     caps = sorted(set(info.capabilities)
                   | ({"vision"} if rf["mmproj"] else set()))
