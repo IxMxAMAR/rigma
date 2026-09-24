@@ -1,5 +1,6 @@
 """Tools must SIGNAL truncation so the model never mistakes a partial view for
 the whole thing (regression: a 2330-file folder showed only 200 silently)."""
+import io
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -132,6 +133,24 @@ def test_find_files_bounds_the_walk_by_entries_not_hits(tmp_path, monkeypatch):
         (d / "x.txt").write_text("x")
     out = tools.run_tool("find_files", {"pattern": "**/*.txt"}, _ws(tmp_path))
     assert "stopped after examining" in out, out
+
+
+# --- 14-9: the job buffer is a bounded deque, not per-line concatenation ------
+
+def test_job_pump_keeps_a_bounded_window_and_the_same_tail():
+    job = {"chunks": tools.deque(), "buflen": 0,
+           "lock": tools.threading.Lock()}
+    lines = [f"line {i}\n" for i in range(20000)]
+    tools._job_pump(job, io.StringIO("".join(lines)), "out")
+    assert job["buflen"] <= tools._JOB_MAX_BUF
+    assert tools._job_tail(job, 4000) == "".join(lines)[-4000:]
+
+
+def test_job_pump_tags_stderr():
+    job = {"chunks": tools.deque(), "buflen": 0,
+           "lock": tools.threading.Lock()}
+    tools._job_pump(job, io.StringIO("boom\n"), "err")
+    assert tools._job_tail(job) == "[stderr] boom\n"
 
 
 def test_read_file_marks_truncation(tmp_path):
