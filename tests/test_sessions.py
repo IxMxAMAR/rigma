@@ -388,3 +388,30 @@ def test_dry_penalty_last_n_survives_validation():
     from rigma.sessions import validate_params
     out = validate_params({"dry_penalty_last_n": 4096})
     assert out == {"dry_penalty_last_n": 4096}
+
+
+def test_a_deliberate_max_tool_rounds_of_50_survives(tmp_path, monkeypatch):
+    """10-9: the `max_tool_rounds == 50` migration reran on every load, so a
+    user who lowered the per-turn cap to 50 had it rewritten to 1000 the next
+    time the chat was opened — silently, with no way to tell."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    s = sessions.create()
+    s["max_tool_rounds"] = 50
+    sessions.save(s)
+    assert sessions.load(s["id"])["max_tool_rounds"] == 50
+
+
+def test_a_legacy_session_at_the_old_default_is_lifted_once(tmp_path,
+                                                            monkeypatch):
+    """The migration's original intent survives: a body stored by an old build
+    (no schema version) at the old default 50 is lifted to the new backstop —
+    and once saved, a later deliberate 50 is left alone."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import db
+    db.upsert_session({"id": "legacy50", "title": "old", "updated_at": 1.0,
+                       "messages": [], "max_tool_rounds": 50})
+    got = sessions.load("legacy50")
+    assert got["max_tool_rounds"] == 1000
+    got["max_tool_rounds"] = 50          # the user now lowers it deliberately
+    sessions.save(got)
+    assert sessions.load("legacy50")["max_tool_rounds"] == 50

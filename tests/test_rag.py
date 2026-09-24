@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -117,4 +118,124 @@ def test_a_stale_record_cannot_advertise_document_search(home):
         "a dead sidecar must not put a document tool in front of the arm")
     assert {"remember", "recall"} <= names, (
         "the memory tools do not need documents and must still be offered")
+
+
+# --- 10-5: stop_sidecar must not terminate whatever now owns the pid ---------
+#
+# sidecar.json outlives the sidecar it names, and Windows recycles pids, so
+# `rigma rag stop` (and shutdown) could terminate the owner's editor, browser or
+# build. This is the rag.py twin of the 08-1 fix in state.py. Every test here
+# uses a FAKE psutil.Process: no real process is ever signalled.
+
+class _FakeProc:
+    def __init__(self, pid, created=1000.0, name="raggity.EXE",
+                 argv=None):
+        self.pid = pid
+        self._created = created
+        self._name = name
+        self._argv = argv if argv is not None else [r"C:\x\raggity.EXE", "serve"]
+        self.terminated = False
+        self.killed = False
+
+    def create_time(self):
+        return self._created
+
+    def name(self):
+        return self._name
+
+    def cmdline(self):
+        return self._argv
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.killed = True
+
+
+def _write_record(**fields):
+    rag.rag_dir().mkdir(parents=True, exist_ok=True)
+    (rag.rag_dir() / "sidecar.json").write_text(
+        json.dumps(fields), encoding="utf-8")
+
+
+def test_stop_sidecar_leaves_a_recycled_pid_alone(home, monkeypatch):
+    """A record whose create time no longer matches belongs to another process.
+    It must be unlinked WITHOUT a signal."""
+    _write_record(pid=4321, port=DEAD_PORT, created_at=1000.0)
+    fake = _FakeProc(4321, created=2000.0, name="explorer.exe",
+                     argv=[r"C:\Windows\explorer.exe"])
+    monkeypatch.setattr("psutil.Process", lambda pid: fake)
+    assert rag.stop_sidecar() is True
+    assert fake.terminated is False, "an unrelated process was terminated"
+    assert not (rag.rag_dir() / "sidecar.json").exists()
+
+
+def test_stop_sidecar_terminates_the_matching_process(home, monkeypatch):
+    _write_record(pid=4321, port=DEAD_PORT, created_at=1000.0)
+    fake = _FakeProc(4321, created=1000.0)
+    monkeypatch.setattr("psutil.Process", lambda pid: fake)
+    assert rag.stop_sidecar() is True
+    assert fake.terminated is True
+
+
+def test_a_legacy_record_is_still_stoppable_by_its_command(home, monkeypatch):
+    """A record written before created_at existed has no identity to compare;
+    fall back to the process's own name/cmdline, so a live sidecar is not made
+    unkillable by the upgrade."""
+    _write_record(pid=4321, port=DEAD_PORT)      # no created_at
+    monkeypatch.setattr(rag, "raggity_cmd",
+                        lambda: [r"C:\tools\raggity.EXE"])
+    fake = _FakeProc(4321, name="raggity.EXE",
+                     argv=[r"C:\tools\raggity.EXE", "serve"])
+    monkeypatch.setattr("psutil.Process", lambda pid: fake)
+    assert rag.stop_sidecar() is True
+    assert fake.terminated is True
+
+
+def test_a_legacy_record_does_not_kill_an_unrelated_process(home, monkeypatch):
+    _write_record(pid=4321, port=DEAD_PORT)      # no created_at
+    monkeypatch.setattr(rag, "raggity_cmd",
+                        lambda: [r"C:\tools\raggity.EXE"])
+    fake = _FakeProc(4321, name="notepad.exe",
+                     argv=[r"C:\Windows\notepad.exe"])
+    monkeypatch.setattr("psutil.Process", lambda pid: fake)
+    assert rag.stop_sidecar() is True
+    assert fake.terminated is False, "an unrelated process was terminated"
+    assert not (rag.rag_dir() / "sidecar.json").exists()
+
+
+def test_ensure_sidecar_records_an_identity(home, monkeypatch):
+    """The record must carry the identity stop_sidecar checks against."""
+    monkeypatch.setattr(rag, "_create_time", lambda pid: 1234.5)
+    rag._record_sidecar(4321, DEAD_PORT)
+    info = json.loads((rag.rag_dir() / "sidecar.json").read_text(
+        encoding="utf-8"))
+    assert info == {"pid": 4321, "port": DEAD_PORT, "created_at": 1234.5}
+
+
+# --- 10-7: sources.json must be a list of strings ----------------------------
+
+@pytest.mark.parametrize("bad", [{"a": 1}, "just a string", 5, ["ok", 7], None])
+def test_load_sources_rejects_anything_but_a_list_of_strings(home, bad):
+    """sources.json is documented as user-editable, so a truncated or
+    hand-edited file must read as "no sources", not hand a dict/str/int to
+    add_source (AttributeError -> 500 on POST /api/rag/sources) or to the UI's
+    sources.length (which reads as "no folders indexed" while folders ARE
+    configured)."""
+    rag.rag_dir().mkdir(parents=True, exist_ok=True)
+    (rag.rag_dir() / "sources.json").write_text(json.dumps(bad),
+                                                encoding="utf-8")
+    assert rag.load_sources() == []
+
+
+def test_add_source_recovers_from_a_wrong_typed_sources_file(home, monkeypatch):
+    monkeypatch.chdir(home)
+    rag.rag_dir().mkdir(parents=True, exist_ok=True)
+    (rag.rag_dir() / "sources.json").write_text('{"a": 1}', encoding="utf-8")
+    (home / "docs").mkdir()
+    assert rag.add_source("docs") == [str((home / "docs").resolve())]
 

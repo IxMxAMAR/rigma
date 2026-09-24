@@ -3,15 +3,17 @@
 A Method used to be a preset with a nicer name. It is now an authorable
 document whose Rules, Macros and Workflows are three presentations of ONE
 primitive -- a step list. That is what makes a single validator and a single
-interpreter possible, and it is why this module has no rigma imports: it is
-pure data rules, so both the save path and the builder tools can lean on it
-without dragging the server in.
+interpreter possible. The only rigma import is sessions' effort vocabulary
+(AUDIT 10-8), so the schema cannot drift from the levels the engine actually
+accepts; everything else is pure data rules.
 
 Spec: the custom-methods design note (local)
 """
 from __future__ import annotations
 
 import re
+
+from .sessions import EFFORT_LEVELS
 
 # --- the safety allowlist -------------------------------------------------
 # Deliberately explicit, and deliberately NOT tools.Tool.safe: `remember` and
@@ -47,7 +49,13 @@ def _with_apply_defaults(apply: dict) -> dict:
            for k, v in _APPLY_DEFAULTS.items()}
     out.update(apply)
     return out
-EFFORTS = ("", "off", "auto", "on")
+# AUDIT 10-8: this used to be a private copy ("", "off", "auto", "on") that
+# stopped at the binary thinking switch. sessions gained four named reasoning
+# levels (low/medium/high/xhigh) that serve.py maps onto
+# chat_template_kwargs.reasoning_effort, so a method authored for a reasoning
+# model was refused with an error listing only off/auto/on. One vocabulary, one
+# source: sessions.EFFORT_LEVELS.
+EFFORTS = EFFORT_LEVELS
 VAR_KINDS = ("text", "path", "number")
 
 # placeholders: {{name}} or {{name:argument}}

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import httpx
+import psutil
 
 from .runtime import rigma_home
 
@@ -30,11 +31,24 @@ def raggity_cmd() -> list[str] | None:
 
 
 def load_sources() -> list[str]:
+    """The configured source folders/globs. Anything that is not a list of
+    strings reads as "no sources".
+
+    AUDIT 10-7: sources.json is documented as user-editable ("edit sources via
+    `rigma rag add`"), so it can be truncated or hand-edited. Returning the
+    parsed value unchecked handed a dict/str/int to add_source (AttributeError
+    -> 500 on POST /api/rag/sources) and to the Grounding card's sources.length
+    (undefined, so the card said "no folders indexed" while folders WERE
+    configured).
+    """
     p = rag_dir() / "sources.json"
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return []
+    if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+        return []
+    return data
 
 
 def _source_globs() -> list[str]:
@@ -107,10 +121,71 @@ def sidecar_health(port: int = RAG_PORT) -> dict | None:
         return None
 
 
+def _create_time(pid: int) -> float:
+    """When this process started, or 0.0 if that cannot be established.
+
+    AUDIT 10-5: a pid alone does not identify a process. Recorded at sidecar
+    start so `stop_sidecar` can tell "our sidecar" from "whatever now owns that
+    number" — the twin of the 08-1 fix in state.py.
+    """
+    try:
+        if pid <= 0:
+            return 0.0
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        return 0.0
+
+
+def _looks_like_raggity(proc) -> bool:
+    """Does this process's own name/cmdline match the configured raggity
+    command? The fallback for a sidecar.json written before created_at existed,
+    so an upgrade does not make a live sidecar unkillable."""
+    cmd = raggity_cmd()
+    if not cmd:
+        return False
+    want = {os.path.basename(str(c)).lower() for c in cmd if str(c).strip()}
+    want.discard("")
+    if not want:
+        return False
+    try:
+        argv = {os.path.basename(str(a)).lower() for a in proc.cmdline()}
+    except Exception:
+        argv = set()
+    if want & argv:
+        return True
+    try:
+        return os.path.basename(str(proc.name())).lower() in want
+    except Exception:
+        return False
+
+
+def _is_recorded_sidecar(proc, created_at) -> bool:
+    """Is `proc` still the raggity sidecar a record was written about?
+
+    AUDIT 10-5: sidecar.json outlives the sidecar it names, and Windows
+    recycles pids, so `rigma rag stop` (and shutdown) could terminate an
+    unrelated process that inherited the number. A recorded create time must
+    still match; with no recorded identity the process's own name/cmdline must
+    match the raggity command. Anything unreadable counts as "not ours" — the
+    only action gated on this is a kill.
+    """
+    try:
+        want = float(created_at)
+    except (TypeError, ValueError):
+        want = 0.0
+    if want > 0.0:
+        try:
+            return abs(float(proc.create_time()) - want) < 1.0
+        except Exception:
+            return False
+    return _looks_like_raggity(proc)
+
+
 def _record_sidecar(pid: int, port: int) -> None:
     try:
         (rag_dir() / "sidecar.json").write_text(
-            json.dumps({"pid": pid, "port": port}), encoding="utf-8")
+            json.dumps({"pid": pid, "port": port,
+                        "created_at": _create_time(pid)}), encoding="utf-8")
     except OSError:
         pass          # a sidecar that is up but unrecorded still answers
 
@@ -194,21 +269,37 @@ def ensure_sidecar(port: int = RAG_PORT, timeout: float = 90.0) -> dict:
 
 
 def stop_sidecar() -> bool:
+    """Stop the recorded sidecar — but only if it is still that sidecar.
+
+    AUDIT 10-5: the old body terminated `psutil.Process(int(info["pid"]))` with
+    no check that the pid was still a raggity sidecar. A record left behind by a
+    crash can name the owner's editor, browser or build once Windows recycles
+    the number. On a mismatch the record is cleared WITHOUT signalling.
+    """
     p = rag_dir() / "sidecar.json"
     try:
         info = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return False
-    import psutil
     try:
-        proc = psutil.Process(int(info["pid"]))
-        proc.terminate()
+        pid = int(info["pid"])
+    except (KeyError, TypeError, ValueError):
+        p.unlink(missing_ok=True)
+        return False
+    proc = None
+    try:
+        proc = psutil.Process(pid)
+    except Exception:
+        proc = None          # gone, or not ours to inspect
+    if proc is not None and _is_recorded_sidecar(proc, info.get("created_at")):
         try:
-            proc.wait(timeout=10)
-        except psutil.TimeoutExpired:
-            proc.kill()
-    except psutil.NoSuchProcess:
-        pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except psutil.TimeoutExpired:
+                proc.kill()
+        except psutil.NoSuchProcess:
+            pass
     p.unlink(missing_ok=True)
     return True
 

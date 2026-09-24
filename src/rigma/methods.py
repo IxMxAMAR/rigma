@@ -488,6 +488,22 @@ def _shape_errors(doc) -> list[str]:
         for k, v in doc["vars"].items():
             if not isinstance(v, dict):
                 errs.append(f"var '{k}': must be an object with a 'kind'")
+    # AUDIT 10-3: `apply` being a dict was checked, its VALUES were not.
+    # apply_to_session unpacks apply.params with `**` and stores
+    # use_tools/allow_code/notes_template/system_prompt verbatim, so a method
+    # with "params": "hot" saved cleanly and then 500'd on every apply
+    # (TypeError: 'str' object is not a mapping); notes_template=5 later broke
+    # build_messages. Report each field so the model can fix it in one turn.
+    if isinstance(doc.get("apply"), dict):
+        a = doc["apply"]
+        if "params" in a and not isinstance(a["params"], dict):
+            errs.append("apply.params must be an object")
+        for key in ("notes_template", "system_prompt"):
+            if key in a and not isinstance(a[key], str):
+                errs.append(f"apply.{key} must be a string")
+        for key in ("use_tools", "allow_code"):
+            if key in a and not isinstance(a[key], bool):
+                errs.append(f"apply.{key} must be true or false")
     for key in ("rules", "macros", "workflows"):
         if isinstance(doc.get(key), list):
             for i, c in enumerate(doc[key]):

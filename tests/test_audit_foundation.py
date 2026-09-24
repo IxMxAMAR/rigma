@@ -206,6 +206,39 @@ def test_an_old_database_migrates_in_place(home):
     assert len(sessions.load("old1")["messages"]) == 2
 
 
+def test_losing_the_migration_race_is_not_fatal(home, monkeypatch):
+    """10-4: db.connect's `_initialised`/`have` check-then-ALTER is not atomic,
+    so two threads (the server opens connections from to_thread workers) or two
+    processes can both decide a column is missing and one gets
+    "duplicate column name: rev" straight out of connect().
+
+    The loser's exact sequence is simulated deterministically: the `have` test
+    says a column is missing while the DDL adds one that now exists.
+    """
+    db._initialised.discard(str(db.db_path()))
+    db.connect().close()
+    db._initialised.discard(str(db.db_path()))
+    monkeypatch.setattr(db, "_MIGRATIONS", (
+        ("rev_missing",
+         "ALTER TABLE sessions ADD COLUMN rev INTEGER NOT NULL DEFAULT 0"),))
+    c = db.connect()          # must not raise: the column is already there
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
+        assert "rev" in cols
+    finally:
+        c.close()
+
+
+def test_a_genuinely_broken_migration_still_raises(home, monkeypatch):
+    """The duplicate-column swallow must be narrow: any other OperationalError
+    from a migration is a real failure and must still surface."""
+    db._initialised.discard(str(db.db_path()))
+    monkeypatch.setattr(db, "_MIGRATIONS", (("broken", "ALTER TABLE sessions"),))
+    with pytest.raises(sqlite3.OperationalError):
+        db.connect()
+    db._initialised.discard(str(db.db_path()))
+
+
 # ------------------------------------------------------------ F16: indexing
 
 def test_search_follows_an_edit_and_a_rename():

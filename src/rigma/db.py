@@ -86,7 +86,17 @@ def connect() -> sqlite3.Connection:
         have = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
         for col, ddl in _MIGRATIONS:
             if col not in have:
-                c.execute(ddl)
+                # AUDIT 10-4: `have` is read once, outside any transaction, so
+                # two connections opened at the same moment (the server opens
+                # one per worker thread) can both decide a column is missing and
+                # one gets "duplicate column name". That error IS the condition
+                # this check tests, so swallow exactly it — a genuine SQL error
+                # in a migration must still surface.
+                try:
+                    c.execute(ddl)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
         try:
             c.executescript(_FTS_SCHEMA)
             _fts_available[key] = True
