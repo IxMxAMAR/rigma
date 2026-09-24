@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
+import EmptyState from "../EmptyState";
 import LoadError from "../LoadError";
 import { readListField } from "../lib/listFetch";
 
@@ -52,9 +53,11 @@ export default function WorkflowsSurface() {
                        onRetry={() => void refresh()} />
           )}
           {!err && methods.length === 0 && (
-            <p className="text-muted text-[13px] mb-2">
-              No workflows found.
-            </p>
+            <EmptyState
+              title="no workflows found"
+              body="Methods are the reusable missions Rigma ships and the ones you build in a chat. If you expected one here, reload."
+              actionLabel="reload"
+              onAction={() => void refresh()} />
           )}
           <ul className="flex flex-col gap-2">
             {methods.map((m) => (

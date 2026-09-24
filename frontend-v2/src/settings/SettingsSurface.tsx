@@ -1,7 +1,8 @@
 // Settings: preset manager. App-level knobs stay minimal — most state is
 // per-chat (sidecar) or per-model (registry), by design.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
+import EmptyState from "../EmptyState";
 import LoadError from "../LoadError";
 import InlineError from "../InlineError";
 import { engineApi } from "../lib/engineApi";
@@ -27,6 +28,8 @@ export default function SettingsSurface() {
   const [err, setErr] = useState<string | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [rowErr, setRowErr] = useState<string | null>(null);
+  // IMP-10: the empty state's action focuses the create form below.
+  const nameRef = useRef<HTMLInputElement>(null);
   // AUDIT F11-6: this card used to hardcode `http://127.0.0.1:11499/v1` and
   // call it Rigma's OpenAI API. 11499 is llama-server's upstream port, so a
   // backend pointed there bypasses the session, the tool-call repair and the
@@ -75,10 +78,11 @@ export default function SettingsSurface() {
                        onRetry={() => void refresh()} />
           )}
           {!loadErr && presets.length === 0 && (
-            <p className="text-muted text-[13px] mb-2">
-              No presets yet — a preset bundles a system prompt + sampling and
-              can be applied to any chat.
-            </p>
+            <EmptyState
+              title="no presets yet"
+              body="A preset bundles a system prompt and sampling settings and can be applied to any chat."
+              actionLabel="create a preset"
+              onAction={() => nameRef.current?.focus()} />
           )}
           <p className="text-muted text-[12px] mb-2">
             Click a preset to edit it. Built-ins can be viewed, not changed —
@@ -156,6 +160,7 @@ export default function SettingsSurface() {
             }}
           >
             <input
+              ref={nameRef}
               value={draft.name}
               onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
               placeholder="preset name"

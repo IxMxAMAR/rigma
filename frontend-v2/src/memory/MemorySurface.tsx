@@ -3,6 +3,8 @@
 // nightmare" (agent-memory spec). Every learned rule, its evidence, delete.
 import { useCallback, useEffect, useState } from "react";
 
+import EmptyState from "../EmptyState";
+import LoadError from "../LoadError";
 import { responseError } from "../lib/listFetch";
 
 interface MemoryRow {
@@ -58,21 +60,19 @@ export default function MemorySurface() {
           re-learned.
         </p>
         {err && (
-          <div className="rounded-md bg-red/10 text-red px-3 py-2 text-[13px] mb-4">
-            {err}
-          </div>
+          <LoadError message={err} onRetry={() => void refresh()} />
         )}
-        {rows.length === 0 ? (
-          <div className="text-center pt-16">
-            <div className="font-mono text-[12px] text-muted uppercase tracking-[0.1em] mb-2">
-              nothing learned yet
-            </div>
-            <p className="text-secondary text-[13.5px] max-w-[400px] mx-auto">
-              Memories are written when autonomous runs fail and recover.
-              Run a mission and check back.
-            </p>
-          </div>
-        ) : (
+        {/* IMP-10: the empty state means the fetch SUCCEEDED and returned
+            nothing. A failed fetch renders the error above instead — it must
+            never read as "nothing learned yet". */}
+        {!err && rows.length === 0 && (
+          <EmptyState
+            title="nothing learned yet"
+            body="Memories are written when autonomous runs fail and recover. Run a mission and check back."
+            actionLabel="refresh"
+            onAction={() => void refresh()} />
+        )}
+        {rows.length > 0 && (
           <ul className="flex flex-col gap-1.5">
             {rows.map((m) => (
               <li key={m.id} className="group rounded-lg bg-panel px-4 py-2.5 flex items-center gap-3">
