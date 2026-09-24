@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 
+import LoadError from "../LoadError";
+import { readListField } from "../lib/listFetch";
+
 interface WorkflowMethod {
   id: string;
   name: string;
@@ -10,14 +13,23 @@ interface WorkflowMethod {
 
 export default function WorkflowsSurface() {
   const [methods, setMethods] = useState<WorkflowMethod[]>([]);
-  const [err] = useState<string | null>(null);
+  // AUDIT F11-3: this state had no setter, so the banner below was dead code
+  // and a failed fetch could only ever render as "No workflows found."
+  const [err, setErr] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const r = await fetch("/api/methods");
-      const data = (await r.json()) as { methods?: WorkflowMethod[] };
-      setMethods(data.methods ?? []);
-    } catch {
+      const res = await readListField<WorkflowMethod>(
+        await fetch("/api/methods"), "methods");
+      if (!res.ok) {
+        setErr(res.error);
+        setMethods([]);
+        return;
+      }
+      setErr(null);
+      setMethods(res.rows);
+    } catch (e) {
+      setErr((e as Error).message);
       setMethods([]);
     }
   }, []);
@@ -35,8 +47,11 @@ export default function WorkflowsSurface() {
           <p className="text-muted text-[13px] mb-4">
             Workflow methods bundle instructions, macros, and rules into reusable structured missions.
           </p>
-          {err && <div className="text-red text-[12.5px] mb-3">{err}</div>}
-          {methods.length === 0 && (
+          {err && (
+            <LoadError message={`could not load workflows: ${err}`}
+                       onRetry={() => void refresh()} />
+          )}
+          {!err && methods.length === 0 && (
             <p className="text-muted text-[13px] mb-2">
               No workflows found.
             </p>

@@ -1,6 +1,7 @@
 // The Hangar: installed models as cards, quants with live download progress,
 // HF search-and-add. Polls fast only while a download is actually running.
 import { useCallback, useEffect, useRef, useState } from "react";
+import LoadError from "../LoadError";
 import {
   DEFAULT_FIT, engineApi, eta, gb,
   type FitConfig, type HfHit, type HfRepoDetail, type ModelCard,
@@ -604,7 +605,15 @@ function RepoPreview({ id, cfg }: { id: string; cfg: FitConfig }) {
     setD(null);
     setErr(null);
     engineApi.hfRepo(id, cfg)
-      .then((r) => { if (live) setD(r); })
+      .then((r) => {
+        if (!live) return;
+        // AUDIT F11-3: the preview renders r.capabilities/r.ggufs directly
+        if (!Array.isArray(r?.ggufs) || !Array.isArray(r?.capabilities)) {
+          setErr("the repo API returned an unexpected body");
+          return;
+        }
+        setD(r);
+      })
       .catch((e) => { if (live) setErr((e as Error).message); });
     return () => { live = false; };
   }, [id, cfg]);
@@ -698,7 +707,10 @@ function HfSearch({ onAdded, cfg }: { onAdded: () => void; cfg: FitConfig }) {
     timer.current = window.setTimeout(async () => {
       setState("busy");
       try {
-        setHits(await engineApi.hfSearch(text));
+        const d = await engineApi.hfSearch(text);
+        // AUDIT F11-3: a non-array body would reach hits.slice() in render
+        if (!Array.isArray(d)) { setHits([]); setState("err"); return; }
+        setHits(d);
         setState("idle");
       } catch { setState("err"); }
     }, 350);
@@ -866,10 +878,23 @@ export default function ModelsSurface() {
     setView(v);
     localStorage.setItem("rigma.modelsView", v);
   };
+  const [loadErr, setLoadErr] = useState<string | null>(null);
   const refresh = useCallback(async () => {
+    // AUDIT F11-3: check the body shape before it reaches render. A probe
+    // failure or a body without `models` used to be swallowed ("keep last"),
+    // and on a cold load the page said "No models yet" — sending the user to
+    // download one they already had.
     try {
-      setCards((await engineApi.models(cfg)).models);
-    } catch { /* keep last */ }
+      const d = await engineApi.models(cfg);
+      if (!Array.isArray(d?.models)) {
+        setLoadErr("the models API returned an unexpected body");
+        return;
+      }
+      setLoadErr(null);
+      setCards(d.models);
+    } catch (e) {
+      setLoadErr((e as Error).message);
+    }
   }, [cfg]);
 
   useEffect(() => {
@@ -907,7 +932,11 @@ export default function ModelsSurface() {
           </div>
         </div>
         <FitControls cfg={cfg} onChange={setCfgPersist} />
-        {cards.length === 0 && (
+        {loadErr && (
+          <LoadError message={`could not load models: ${loadErr}`}
+                     onRetry={() => void refresh()} />
+        )}
+        {!loadErr && cards.length === 0 && (
           <p className="text-secondary text-[13.5px] text-center pt-12">
             No models yet — search Hugging Face above, or drop a GGUF into
             ~/.rigma/models.
