@@ -4,6 +4,35 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 STANDARD_GB = [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 
+# Bytes of KV cache per element, per side (K or V), for every cache type Rigma
+# accepts. GGML block sizes: q4_0 18B/32, q4_1 20B/32, q5_0 22B/32, q5_1 24B/32,
+# q8_0 34B/32, f16 and bf16 2B per element.
+#
+# ONE table, deliberately. The fit math (resolve.kv_bytes_per_token) sizes the
+# cache from it and ComboFlags._symmetric_kv ranks precision with it; when those
+# were two tables they disagreed, and a type the ranker did not list scored 0 and
+# lost to q4_0 — the LEAST precise type — so a q5_1/q4_0 pair was silently
+# rewritten to q4_0/q4_0. The validators below reject anything not in here, so a
+# registry typo is a ValidationError where the spec is parsed rather than a
+# KeyError from inside the arithmetic.
+CACHE_BYTES = {
+    "bf16": 2.0,
+    "f16": 2.0,
+    "q8_0": 1.0625,
+    "q5_1": 0.75,
+    "q5_0": 0.6875,
+    "q4_1": 0.625,
+    "q4_0": 0.5625,
+}
+
+
+def _valid_cache_type(v: str) -> str:
+    if v not in CACHE_BYTES:
+        raise ValueError(
+            f"cache type must be one of {', '.join(sorted(CACHE_BYTES))}, "
+            f"got {v!r}")
+    return v
+
 
 def ram_tier(mb: int) -> int:
     gb = mb / 1024
@@ -68,6 +97,11 @@ class CachePolicy(BaseModel):
     # answer. Never set on a stored spec; a real launch keeps the ladder so a
     # too-large f16 cache degrades instead of failing.
     pinned: bool = False
+
+    @field_validator("k", "v")
+    @classmethod
+    def _known_cache_type(cls, v: str) -> str:
+        return _valid_cache_type(v)
 
 
 class GgufFile(BaseModel):
@@ -294,17 +328,27 @@ class ComboFlags(BaseModel):
             raise ValueError(f"spec_type must be one of {sorted(ok)}")
         return v
 
+    @field_validator("cache_type_k", "cache_type_v")
+    @classmethod
+    def _known_cache_types(cls, v: str) -> str:
+        return _valid_cache_type(v)
+
     @model_validator(mode="after")
     def _symmetric_kv(self):
         # llama.cpp's fused flash-attn kernel only fires when ctk==ctv; a
         # mismatch SILENTLY drops to a slow non-fused path (RDNA4 finding
         # 2026-07-17). Normalize both to the more-precise type to keep the
         # fast path without silently degrading quality.
-        rank = {"f16": 3, "q8_0": 2, "q4_0": 1}
+        #
+        # Precision IS CACHE_BYTES: bytes per element per side. The old local
+        # rank table listed only f16/q8_0/q4_0 and defaulted every other type to
+        # 0, so q5_1, q5_0, q4_1 and bf16 all lost to q4_0 — the least precise
+        # type in the table — and an asymmetric pair was silently rewritten to
+        # the worst one. Ties (bf16 vs f16) keep K, as before.
         if self.cache_type_k != self.cache_type_v:
-            best = self.cache_type_k if rank.get(self.cache_type_k, 0) >= \
-                rank.get(self.cache_type_v, 0) else self.cache_type_v
-            self.cache_type_k = self.cache_type_v = best
+            self.cache_type_k = self.cache_type_v = max(
+                (self.cache_type_k, self.cache_type_v),
+                key=lambda t: CACHE_BYTES[t])
         return self
 
 
