@@ -97,7 +97,8 @@ def test_flash_attn_tristate_and_bool_coercion():
     assert ComboFlags(ctx=1024, flash_attn=False).flash_attn == "off"
     assert ComboFlags(ctx=1024, flash_attn="auto").flash_attn == "auto"
     import pytest as _p
-    with _p.raises(Exception):
+    from pydantic import ValidationError
+    with _p.raises(ValidationError, match="flash_attn"):
         ComboFlags(ctx=1024, flash_attn="sideways")
     for mode in ("on", "off", "auto"):
         plan = RunPlan(model_slug="m",
