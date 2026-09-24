@@ -42,6 +42,31 @@ def test_run_python_no_output_still_reports_exit():
     assert out.startswith("exit 0") and "no output" in out
 
 
+# --- AUDIT F04-5/04-6: the confined profile really confines -------------------
+def test_sample_files_cannot_glob_outside_the_workspace(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "inside.txt").write_text("in", encoding="utf-8")
+    (tmp_path / "outside.txt").write_text("out", encoding="utf-8")
+    ctx = {"workspace": str(ws), "profile": "confined"}
+
+    out = tools.run_tool("sample_files", {"path": ".", "pattern": "..\\*"}, ctx)
+
+    assert "outside.txt" not in out
+
+
+def test_view_image_refuses_an_absolute_path_under_confined(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "private.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    ctx = {"workspace": str(ws), "profile": "confined"}
+
+    path, err, _note = tools._resolve_image(str(outside), ctx)
+
+    assert path is None and err
+
+
 # --- blocklist: `format` matches the drive-wipe form only ---------------------
 def test_format_flags_and_cmdlets_not_blocked():
     # `git log --format=…` and PowerShell Format-Table were refused as

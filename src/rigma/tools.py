@@ -24,7 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import Callable
 
 # Serialises the read-modify-write inside edit_file/write_file. Re-entrant so a
@@ -2364,7 +2364,14 @@ def _sample_files(args, ctx):
     except (TypeError, ValueError):
         n = 20
     try:
-        hits = [x for x in p.glob(pat) if x.is_file()]
+        # AUDIT F04-5: mirror _find_files. Filtering on is_file() alone let a
+        # `..` glob hand back files outside the workspace — including under the
+        # confined profile, whose whole promise is that nothing leaves it — and
+        # the hits were then remembered with runs.set_last_sample, so a later
+        # move_files/copy_files with no paths acted on outside files.
+        root = p.resolve()
+        hits = [x for x in p.glob(pat)
+                if x.is_file() and x.resolve().is_relative_to(root)]
     except Exception as e:
         return f"error: bad pattern '{pat}': {e}"
     if not hits:
@@ -2650,13 +2657,6 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif",
                ".tiff", ".jfif", ".avif", ".heic", ".ppm"}
 
 
-def _is_abs_anyos(ps: str) -> bool:
-    """Absolute under EITHER path flavour. The product runs on Windows but CI
-    runs on linux, where Path('D:/x').is_absolute() is False and every
-    windows-style absolute silently became workspace-relative."""
-    return PureWindowsPath(ps).is_absolute() or ps.startswith("/")
-
-
 def _resolve_image(ps: str, ctx: dict) -> tuple:
     """(resolved_path, error, note). Validates it exists, is an image, and is
     ≤20MB. Absolute paths are allowed (images live outside the workspace);
@@ -2669,11 +2669,11 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
     if not ps:
         return None, "empty path", ""
     p = Path(ps)
-    if not p.is_absolute():
-        if _is_abs_anyos(ps):
-            # A Windows-style absolute path on a host that cannot open it
-            # (CI on POSIX). There is no such directory here to repair against.
-            return None, f"no such file: {ps}", ""
+    if not p.is_absolute() or ctx.get("profile") == "confined":
+        # AUDIT F04-6: the profile was consulted by _read_path but not here, so
+        # a confined run could view_image("C:\\Users\\...\\private.png") and have
+        # the bytes base64'd into the conversation — a read the profile exists to
+        # refuse, and one read_file/view_images under the same profile rejected.
         try:
             p = _ws_path(ctx, ps)
         except ValueError as e:
