@@ -26,6 +26,7 @@ BASE = {
     "n_cpu_moe": 0,
     "spec_type": "draft-mtp",
     "spec_n_max": 1,
+    "flash_attn": "on",
 }
 
 
@@ -51,6 +52,7 @@ def test_key_order_does_not_change_the_name():
     ("n_cpu_moe", 18),
     ("spec_type", ""),
     ("spec_n_max", 2),
+    ("flash_attn", "off"),
 ])
 def test_every_field_that_invalidates_a_cache_changes_the_name(field, value):
     # Each of these changes what the KV cache means. If any stopped affecting
