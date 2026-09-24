@@ -32,8 +32,24 @@ export interface ServerInfo {
   openai_base?: string;
   /** Compute backends THIS GPU can run. `ready` means the engine build is
    *  already unpacked; choosing one that isn't costs a ~1.2GB download, so the
-   *  UI has to say so before it relaunches. */
+   *  UI has to say so before it relaunches.
+   *
+   *  NOTE this is llama.cpp's COMPUTE backend (vulkan/rocm/cuda/cpu). The ENGINE
+   *  itself is `engine`/`engineRuntimes` below — two different axes, and
+   *  conflating them is what would put "vllm" in this picker. */
   backends?: { name: string; ready: boolean; buildable: boolean }[];
+  /** Which ENGINE RUNTIME is actually serving — "llamacpp" or "vllm".
+   *
+   *  Undefined/null when the record predates the field or the launch did not name
+   *  one, and the UI must show NOTHING in that case rather than assume llama.cpp:
+   *  a wrong label here is worse than no label. (R3-VLLM-4) */
+  engine?: string | null;
+  /** Which engine runtimes this machine could run, and exactly why not for the
+   *  ones it cannot. Separate from `backends` on purpose. Named with the
+   *  server's own snake_case, because this layer does NOT rename keys. */
+  engine_runtimes?: {
+    engine: string; available: boolean; state: string; reason: string;
+  }[];
   /** Where the card's memory has gone. `desktop_mb` is what OTHER processes
    *  hold; on Windows that is the difference between a resident model and one
    *  the driver silently pages over PCIe, and it is the only number here the
@@ -51,6 +67,33 @@ export interface SwitchOption {
   ctx: number;
   backend: string;
   reason: string;
+}
+
+/** R3-VLLM-4: what the Sidecar should say about the running engine, or null to
+ *  say nothing.
+ *
+ *  Pure and separate from the component so it can be tested, which matters here
+ *  because the two ways to get this wrong are both silent:
+ *
+ *   1. Assuming llama.cpp when the record does not say. Records written before
+ *      the field existed have no engine, and the whole class of bug this fixes is
+ *      a UI that names an engine that is not running.
+ *   2. Not flagging the contradiction when the running engine is one this machine
+ *      reports as UNAVAILABLE. That is a real inconsistency — a vLLM serving on a
+ *      host whose verdict says it cannot — and quietly rendering "vllm" as if it
+ *      were expected hides the thing worth looking at.
+ *
+ *  Returns the label plus a `warn` flag rather than a formatted string, so the
+ *  caller owns the styling and this stays testable.
+ */
+export function engineLabel(srv: {
+  engine?: string | null;
+  engine_runtimes?: { engine: string; available: boolean }[];
+}): { name: string; warn: boolean } | null {
+  const name = (srv.engine ?? "").trim();
+  if (!name) return null;                       // (1) never assume
+  const row = (srv.engine_runtimes ?? []).find((r) => r.engine === name);
+  return { name, warn: row ? !row.available : false };   // (2) flag it
 }
 
 export interface Pull {
