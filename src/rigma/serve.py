@@ -3888,7 +3888,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception:
             return event, None
 
-    async def _drain_turn(session, on_wait=None, on_event=None):
+    async def _drain_turn(session, on_wait=None, on_event=None, agen=None):
         """Drain one agentic turn headless with an idle-watchdog: a turn is only
         frozen if it emits nothing for its whole budget (tolerates slow-but-working
         generation). Returns the engine error message if the turn errored (the
@@ -3896,9 +3896,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         progress'); else None. aclose swallows BaseException so its cleanup can't
         clobber the outcome; the call site converts a leaked CancelledError ->
         frozen. `on_wait(waited, kind)` fires every TICK_SECS while waiting so the
-        UI can show the run is alive instead of a blank screen."""
-        agen = _llm_turn(session)
+        UI can show the run is alive instead of a blank screen.
+
+        `agen` overrides the SSE stream — tests drive the cancellation contract
+        with a scripted generator instead of a real engine (AUDIT 03-4)."""
+        if agen is None:
+            agen = _llm_turn(session)
         err = None
+        # The inner __anext__ task currently in flight. Held so an EXTERNAL
+        # cancellation can cancel it too (AUDIT 03-4): cancelling only this
+        # coroutine orphaned the generator, which kept reading the engine and
+        # wrote a partial message after the run was already "stopped".
+        task = None
         # The generous PREFILL budget covers the slow gaps: the first token of a
         # turn, a tool that takes a while to run, and the continuation request
         # that prefills a big context after a tool. A normal token->token gap
@@ -3967,6 +3976,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     except Exception:
                         err = "engine error"
         finally:
+            # AUDIT 03-4: an external cancellation (stop_run cancelling the
+            # driver task) only cancels THIS coroutine at the `asyncio.wait`
+            # above; the inner `agen.__anext__()` task was orphaned, so the
+            # generator stayed alive, kept reading the engine's SSE response and
+            # persisted a partial message after the run said "stopped". Cancel
+            # it and let it unwind BEFORE aclose — aclose on a still-running
+            # generator raises RuntimeError, which the bare except swallowed, so
+            # the response was never closed. Mirrors the watchdog path, which
+            # already cancels the task before raising FrozenTurnError.
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
             try:
                 await agen.aclose()
             except BaseException:
@@ -4988,6 +5012,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # drive the REAL wiring instead of trusting it matches triggers.py's
     # unit tests
     app.state.fire_triggers = _fire_triggers
+    # same reason: the turn drain's cancellation contract is a closure, so a
+    # test drives the REAL one with a scripted engine generator (AUDIT 03-4)
+    app.state.drain_turn = _drain_turn
 
     @app.get("/api/mcp")
     async def mcp_status():
