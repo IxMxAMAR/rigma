@@ -78,7 +78,14 @@ def _is_local_host(host: str) -> bool:
     if h in ("localhost", "::1", "0:0:0:0:0:0:0:1") or h.endswith(".localhost"):
         return True
     if h.startswith("127."):
-        return True
+        # AUDIT F01-1: a loopback LITERAL, not merely a string that starts with
+        # "127.". `Host: 127.0.0.1.evil.example` is a name the attacker can
+        # publish and point at this server — the exact rebinding case this
+        # guard exists for — and `startswith` waved it through.
+        parts = h.split(".")
+        return (len(parts) == 4 and all(
+            p.isascii() and p.isdigit() and len(p) <= 3 and int(p) <= 255
+            for p in parts))
     return "." not in h and ":" not in h
 
 

@@ -26,6 +26,29 @@ from rigma.serve import build_app
 BASE = "http://127.0.0.1:11500"
 
 
+# --- AUDIT F01-1: the rebinding guard was a prefix test -----------------------
+def test_a_host_that_merely_starts_with_127_is_not_loopback():
+    # A publishable name an attacker can point at 127.0.0.1. The guard used
+    # `h.startswith("127.")`, so every one of these was treated as the local UI.
+    for h in ("127.0.0.1.evil.example:11500", "127.0.0.1.evil.example",
+              "127.evil.example", "127.0.0.1.attacker.test"):
+        assert serve._is_local_host(h) is False, h
+        assert serve.guard_request(h, "") != "", h
+
+
+def test_real_loopback_hosts_are_still_accepted():
+    for h in ("127.0.0.1:11500", "127.0.0.1", "127.1.2.3:11500",
+              "localhost:11500", "localhost", "[::1]:11500", "testserver"):
+        assert serve._is_local_host(h) is True, h
+        assert serve.guard_request(h, "") == "", h
+
+
+def test_a_non_loopback_address_is_still_refused():
+    for h in ("192.168.1.5:11500", "10.0.0.1", "evil.example:11500",
+              "127.0.0.1.5.6"):
+        assert serve._is_local_host(h) is False, h
+
+
 # --------------------------------------------------------------------------
 # a scriptable llama-server
 
