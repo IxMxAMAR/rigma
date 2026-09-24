@@ -159,6 +159,15 @@ def ctx() -> dict:
         "workspace": workspace(),
         "profile": profile(),
         "allow_code": allow_code(),
+        # AUDIT 13-3: execution is its own grant. This server already requires
+        # an explicit RIGMA_MCP_ALLOW_CODE=1 opt-in, which IS the confirmation,
+        # so the two move together here rather than defaulting to the library
+        # fallback.
+        "confirm_exec": allow_code(),
+        # AUDIT 13-2: absolute reads are a capability, so this second entry
+        # point does not inherit them; a caller who needs them says so.
+        "allow_absolute_reads":
+            os.environ.get("RIGMA_MCP_ALLOW_ABSOLUTE_READS") == "1",
         "run_id": "",
     }
 

@@ -93,6 +93,64 @@ def custom_spec_path(slug: str) -> Path:
     return p
 
 
+def _check_model_file_name(file: str) -> str:
+    """Validate a model FILE name — the untrusted component of `models_dir()/X`.
+
+    AUDIT 13-4: the name arrives from a remote repo's tree listing
+    (`hf_browse.repo_files` -> `GgufFile.file`). `models.py` validates it at the
+    model boundary; this is the same rule at the SINKS, so a name that reaches
+    one by another route still cannot escape. A subdirectory is legitimate
+    (`Q4_K_M/model.gguf` is a real repo layout), so nesting is allowed and only
+    what can ESCAPE is refused:
+
+      * empty, or a NUL that truncates at the syscall boundary
+      * a colon, which is the Windows drive-relative `D:x.gguf`
+      * an absolute path (a leading separator, or the UNC `//host/share`)
+      * any `..` component
+      * a Windows reserved device name (CON/NUL/COM1...) in any component,
+        which `GgufFile` does not check and which opens a device, not a file
+    """
+    f = str(file or "")
+    if not f or "\x00" in f:
+        raise HangarError(f"invalid model file name: {file!r}")
+    if ":" in f:
+        raise HangarError(
+            f"model file name may not contain a drive or colon: {file!r}")
+    norm = f.replace("\\", "/")
+    if norm.startswith("/"):
+        raise HangarError(f"model file name must be relative: {file!r}")
+    parts = norm.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise HangarError(
+            f"model file name must stay inside the models directory: {file!r}")
+    for p in parts:
+        if p.split(".", 1)[0].lower() in _RESERVED_NAMES:
+            raise HangarError(
+                f"model file name uses a reserved device name: {file!r}")
+    return f
+
+
+def model_file_path(file: str) -> Path:
+    """`models_dir()/<file>`, confined to `models_dir()`.
+
+    AUDIT 13-4: ONE helper for every sink that joins an untrusted model file
+    name onto the models directory (`start_pull`, `delete_file`,
+    `delete_model`, `_download_file`, `pull_progress`). The name rules live in
+    `_check_model_file_name`; the resolve-and-contain check below is the belt to
+    that braces (it also catches a symlinked subdirectory).
+    """
+    _check_model_file_name(file)
+    root = models_dir().resolve()
+    p = root / str(file).replace("\\", "/")
+    try:
+        if not p.resolve().is_relative_to(root):
+            raise HangarError(
+                f"model file name escapes the models directory: {file!r}")
+    except OSError as e:
+        raise HangarError(f"invalid model file name: {file!r}") from e
+    return p
+
+
 def _slugify(name: str) -> str:
     s = re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-.")
     return s or "custom-model"
@@ -898,7 +956,7 @@ def delete_file(slug: str, file: str, registry=None) -> None:
             file in _running_files(state, reg):
         raise HangarError("that file is running right now — stop or "
                           "switch models first")
-    target = models_dir() / file
+    target = model_file_path(file)   # AUDIT 13-4: confined, not a raw join
     if not target.exists():
         raise HangarError(f"{file} is not on disk")
     target.unlink()
@@ -919,11 +977,11 @@ def delete_model(slug: str, registry=None) -> None:
     # cancelled multi-GB pull outlived the model it belonged to, invisible in
     # the library because glob("*.gguf") does not match ".part".
     for g in spec.ggufs:
-        path = models_dir() / g.file
+        path = model_file_path(g.file)   # AUDIT 13-4: confined
         path.unlink(missing_ok=True)
         _discard_partial(path)
     if spec.mmproj is not None:
-        path = models_dir() / spec.mmproj.file
+        path = model_file_path(spec.mmproj.file)   # AUDIT 13-4: confined
         path.unlink(missing_ok=True)
         _discard_partial(path)
     custom_spec_path(slug).unlink(missing_ok=True)   # AUDIT F07-1: confined
@@ -1008,7 +1066,7 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
             # What the registry says this file IS. gguf.bytes was in scope all
             # along and drove nothing but the progress bar; gguf.sha256 was
             # declared in models.py and read nowhere at all.
-            _download_file(repo, file, models_dir() / file,
+            _download_file(repo, file, model_file_path(file),   # AUDIT 13-4
                            lambda n: _PULLS[key].update(done=n),
                            expect_bytes=want, sha256=gguf.sha256)
             _PULLS[key]["status"] = "done"
@@ -1138,6 +1196,7 @@ def _download_file(repo: str, file: str, dest, report, *,
     declares wins, because a repo that re-uploads a file leaves the registry
     stale and a stale number must not make a good file undownloadable."""
     import httpx
+    _check_model_file_name(file)   # AUDIT 13-4: the name is untrusted
     if dest.exists():
         report(dest.stat().st_size)
         return dest.stat().st_size
@@ -1234,5 +1293,5 @@ def pull_progress(file: str, total: int) -> int:
     for key, st in list(_PULLS.items()):
         if key.rsplit("::", 1)[-1] == file and st.get("status") == "downloading":
             return min(int(st.get("done", 0)), total)
-    final = models_dir() / file
+    final = model_file_path(file)   # AUDIT 13-4: confined, not a raw join
     return min(final.stat().st_size, total) if final.exists() else 0

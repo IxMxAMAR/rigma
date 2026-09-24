@@ -357,6 +357,10 @@ def fake_cli(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_MCODE_LOG", str(log))
     monkeypatch.setenv("FAKE_MCODE_PROVIDERS_FILE", str(store))
     monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps(TEXT_TURN))
+    # AUDIT 13-6: the child's environment is an explicit allowlist now, so a
+    # wrapper that needs extra names declares them through the passthrough hook
+    # (this is also the escape hatch a real owner would use).
+    monkeypatch.setenv("RIGMA_MCODE_ENV_PASSTHROUGH", "FAKE_MCODE_*")
     # module-level state, so it must not leak between tests
     monkeypatch.setattr(harness_mcode, "_VERIFIED", {})
     return log
