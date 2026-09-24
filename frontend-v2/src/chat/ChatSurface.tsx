@@ -18,6 +18,7 @@ function SessionRail() {
   const deleteChat = useChat((s) => s.deleteChat);
   const duplicateChat = useChat((s) => s.duplicateChat);
   const search = useChat((s) => s.search);
+  const drafts = useChat((s) => s.drafts);
   const [q, setQ] = useState("");
   const timer = useRef<number | null>(null);
   return (
@@ -56,6 +57,14 @@ function SessionRail() {
             >
               {s.title || "untitled"}
             </button>
+            {/* An unsent draft is otherwise invisible: you cannot tell whether
+                the paragraph belongs to this chat or the last one. Shown at
+                rest, not on hover — it is state, not an action. */}
+            {drafts[s.id]?.trim() ? (
+              <span role="img" aria-label={`unsent draft in ${s.title}`}
+                    title="unsent draft"
+                    className="shrink-0 pr-1 text-amber">•</span>
+            ) : null}
             <span className="hidden group-hover:flex items-center gap-0.5 pr-1.5 shrink-0">
               <a href={`/api/sessions/${s.id}/export?fmt=md`} download
                  title="export as markdown" aria-label={`export ${s.title}`}
@@ -144,7 +153,11 @@ function Composer() {
   const images = useChat((s) => s.images);
   const addImage = useChat((s) => s.addImage);
   const removeImage = useChat((s) => s.removeImage);
-  const [draft, setDraft] = useState("");
+  // The draft is keyed to the chat on screen (chatStore.drafts). As component
+  // state it outlived the chat it was written for, so a paragraph typed in one
+  // chapter and Entered after a switch was sent — and saved — in the other.
+  const draft = useChat((s) => s.drafts[s.currentId ?? ""] ?? "");
+  const setDraft = useChat((s) => s.setDraft);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -160,11 +173,14 @@ function Composer() {
   const submit = () => {
     const text = draft.trim();
     if (!text || streaming) return;
-    setDraft("");
+    // The key is captured here, not read back after the await: send() creates a
+    // session when there is none, and the rail stays clickable across it.
+    const key = useChat.getState().currentId ?? "";
+    setDraft("", key);
     // AUDIT F50: docs/audit-2026-09-04-full.md — the draft was cleared before
     // send()'s first await. A backend that was restarting took the typed
     // paragraph with it: no bubble, no error, no spinner, just an empty box.
-    void send(text).then((started) => { if (!started) setDraft(text); });
+    void send(text).then((started) => { if (!started) setDraft(text, key); });
   };
 
   // autosize: content height up to ~7 lines
