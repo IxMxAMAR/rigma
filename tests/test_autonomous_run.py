@@ -519,6 +519,38 @@ def test_run_control_endpoints(engine):
     assert c.get("/api/runs/active").json() == {}    # active released
 
 
+def test_restart_resets_every_per_attempt_counter(engine):
+    """AUDIT 03-7: restart rehydrated the streaks and step fields but left
+    `frozen_streak`, `verified_once`, `completion_challenges` and `_echo_streak`
+    spent, so a restarted `frozen` run re-froze after one freeze instead of two
+    and a run that had spent both completion challenges had its first
+    task_complete accepted with plan steps still pending."""
+    from rigma import sessions
+    hold = threading.Event()
+    _Engine.gate = hold                  # hold the restarted loop mid-turn
+    _Engine.script = [None]
+    c = _client(engine)
+    sess = sessions.create("restart chat")
+    rid = runs.create("m", sess["id"])["id"]
+    r = runs.load(rid)
+    r.update(frozen_streak=2, verified_once=True, completion_challenges=2,
+             _echo_streak=3, error_streak=4, lazy_streak=5)
+    runs.set_status(r, "frozen", "engine unresponsive")   # clears active.json
+    try:
+        out = c.post(f"/api/runs/{rid}/restart")
+        assert out.status_code == 200, out.text
+        assert out.json().get("restarted") is True
+        r = runs.load(rid)
+        assert r["status"] == "running"
+        assert r["frozen_streak"] == 0
+        assert r["verified_once"] is False
+        assert r["completion_challenges"] == 0
+        assert r.get("_echo_streak", 0) == 0
+        assert r["error_streak"] == 0 and r["lazy_streak"] == 0
+    finally:
+        hold.set()
+
+
 def test_run_fails_fast_on_template_parser_error(engine):
     # engine can't build a tool-call parser for this model's chat template ->
     # every turn 400s the same way, so the run must FAIL FAST with the reason,
