@@ -50,3 +50,41 @@ def test_update_is_atomic_on_bad_zip(tmp_path, monkeypatch):
     with pytest.raises(zipfile.BadZipFile, match="not a zip"):
         update_registry()
     assert not (tmp_path / "registry" / "gpus.json").exists()
+
+
+def test_update_refuses_a_zip_with_no_top_level_directory(tmp_path, monkeypatch):
+    """AUDIT 06R3-5. `next(p for p in tmp.iterdir() if p.is_dir())` raised a
+    bare StopIteration — which no caller catches (cli.py catches ResolveError)
+    — and escaped before the rmtree, leaving registry.tmp behind. A registry
+    re-packaged flat, with no `rigma-registry-master/` wrapper, hits this: the
+    generator is empty, so there is no inner directory to rename into place."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.delenv("RIGMA_REGISTRY_DIR", raising=False)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("gpus.json", "[]")          # flat: no directory at all
+        z.writestr("models.json", "{}")
+    monkeypatch.setattr(reg_mod, "_fetch_bytes", lambda url: buf.getvalue())
+
+    with pytest.raises(RuntimeError, match="no top-level directory"):
+        update_registry()
+
+    # the half-extracted tree is cleaned up, so the next update is not confused
+    assert not (tmp_path / "registry.tmp").exists()
+    assert not (tmp_path / "registry" / "gpus.json").exists()
+
+
+def test_update_refuses_a_wrapper_that_is_missing_gpus_json(tmp_path,
+                                                            monkeypatch):
+    """The neighbouring malformed case, kept as the shape the new error
+    matches: a named RuntimeError, not a bare StopIteration."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.delenv("RIGMA_REGISTRY_DIR", raising=False)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("rigma-registry-master/models/x.json", "{}")
+    monkeypatch.setattr(reg_mod, "_fetch_bytes", lambda url: buf.getvalue())
+
+    with pytest.raises(RuntimeError, match="missing gpus.json"):
+        update_registry()
+    assert not (tmp_path / "registry.tmp").exists()

@@ -54,7 +54,17 @@ def update_registry(url: str = DEFAULT_REGISTRY_ZIP) -> Path:
         shutil.rmtree(tmp)
     with zipfile.ZipFile(io.BytesIO(_fetch_bytes(url))) as z:
         z.extractall(tmp)
-    inner = next(p for p in tmp.iterdir() if p.is_dir())
+    # AUDIT 06R3-5: a registry re-packaged flat — no `rigma-registry-master/`
+    # wrapper — made this `next()` raise a bare StopIteration, which nothing
+    # catches (cli.py catches ResolveError) and which escaped before the rmtree
+    # below, leaving registry.tmp behind. Named the same way as the sibling
+    # malformed case so `rigma update` reports rather than tracebacks.
+    inner = next((p for p in tmp.iterdir() if p.is_dir()), None)
+    if inner is None:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(
+            "downloaded registry has no top-level directory — the archive "
+            "layout is not the expected <repo>/gpus.json")
     if not (inner / "gpus.json").exists():
         shutil.rmtree(tmp)
         raise RuntimeError("downloaded registry is missing gpus.json")
