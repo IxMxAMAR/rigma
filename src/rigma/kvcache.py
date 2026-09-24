@@ -44,6 +44,17 @@ FINGERPRINT_FIELDS = (
     "model", "quant", "gguf", "backend", "engine",
     "ctx", "cache_type_k", "cache_type_v",
     "ngl", "n_cpu_moe", "spec_type", "spec_n_max",
+    # AUDIT 02-3: the calibration sweep always trials `flash_attn: off`
+    # (bench.quick_configs/sweep_configs) and the winner is applied on a later
+    # launch, so two engines that differ only in `-fa` used to name the SAME
+    # kv-<fp>.bin. llama.cpp selects the KV layout with flash attention
+    # (quantised V is stored transposed on the FA path), so a restore across
+    # that flip is exactly the "cache that does not describe its own history"
+    # this naming scheme exists to make impossible. Including the flag is the
+    # conservative direction even though the save/load format could not be
+    # exercised here: an unnecessary extra cache costs disk, a missing one
+    # costs correctness.
+    "flash_attn",
 )
 
 # How many saved caches to keep. Each is roughly ctx x the KV bytes per token —
@@ -111,7 +122,7 @@ def config_of(plan, engine: str = "") -> dict:
         "ctx": f.ctx, "cache_type_k": f.cache_type_k,
         "cache_type_v": f.cache_type_v, "ngl": f.ngl,
         "n_cpu_moe": f.n_cpu_moe, "spec_type": f.spec_type,
-        "spec_n_max": f.spec_n_max,
+        "spec_n_max": f.spec_n_max, "flash_attn": f.flash_attn,
     }
 
 

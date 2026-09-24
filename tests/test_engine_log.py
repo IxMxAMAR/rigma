@@ -41,18 +41,44 @@ def test_repeats_across_restarts_collapse_to_one_finding_with_a_count():
 
 def test_the_example_is_the_most_recent_occurrence():
     # Earlier launches may have run a different model; the last line is the one
-    # describing the engine that is up now.
-    text = (REAL.replace("RVN-Q3_K_M", "OLD-MODEL")
-            + REAL.replace("RVN-Q3_K_M", "CURRENT-MODEL"))
+    # describing the engine that is up now. The marker has to be ON the matched
+    # line: the loading-model line is not what this finding quotes, so putting
+    # the model name there let the old assertion pass whichever occurrence
+    # `findings` picked (AUDIT 02-7).
+    text = (REAL.replace("it will be disabled",
+                         "it will be disabled (OLD-MODEL)")
+            + REAL.replace("it will be disabled",
+                           "it will be disabled (CURRENT-MODEL)"))
     got = engine_log.findings(text)
 
     assert got[0]["count"] == 2
-    assert "cache_reuse" in got[0]["example"]
+    assert "CURRENT-MODEL" in got[0]["example"]
+    assert "OLD-MODEL" not in got[0]["example"], (
+        "the panel would describe a previous launch's model as the one running")
 
 
 def test_empty_and_none_are_not_errors():
     assert engine_log.findings("") == []
     assert engine_log.findings(None) == []
+
+
+def test_a_bare_n_swa_parameter_dump_is_not_a_warning():
+    """AUDIT 02-6: the pattern used to match `n_swa = 0` on its own.
+
+    That is a parameter dump, not a diagnostic, so every non-SWA model's
+    hparams line reported a `--swa-full` no-op for a flag Rigma never passes —
+    sending the reader looking for a setting they cannot have changed.
+    """
+    assert engine_log.findings(
+        "0.00.1 I srv load_model: n_swa = 0\n") == []
+
+
+def test_a_real_swa_disabled_warning_is_still_reported():
+    # The warning shape (swa + disabled) is what the pattern is for.
+    got = engine_log.findings(
+        "0.00.2 W srv load_model: swa is not supported by this model, "
+        "it will be disabled\n")
+    assert [f["id"] for f in got] == ["swa_disabled"]
 
 
 def test_a_full_context_shift_is_reported():
