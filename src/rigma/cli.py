@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import platform
 import time
+from pathlib import Path
 
 import typer
 
@@ -717,7 +718,11 @@ def harness(backend: str = typer.Option(None, "--backend", "-b",
 @app.command()
 def plan(use_case: str = typer.Option("general", "--use-case"),
          model: str = typer.Option(None, "--model"),
-         explain: bool = typer.Option(False, "--explain")):
+         explain: bool = typer.Option(False, "--explain"),
+         verify: bool = typer.Option(
+             False, "--verify",
+             help="Ask the engine itself what the plan will use, instead of "
+                  "trusting Rigma's arithmetic")):
     """Show what `rigma up` would run, and why."""
     reg = Registry.load()
     try:
@@ -732,6 +737,75 @@ def plan(use_case: str = typer.Option("general", "--use-case"),
     if explain:
         for line in rp.explain:
             typer.echo(f"  {line}")
+    if verify:
+        _verify_plan_or_explain(rp)
+
+
+def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
+    """R3-MEM-1: check the plan against the engine's own measurement.
+
+    Rigma's VRAM figure is a formula over GGUF metadata that nothing has ever
+    validated. The pinned llama.cpp ships `llama-fit-params`, which does a
+    no-alloc dummy load and reports exact per-device accounting against real free
+    memory. This runs it and prints both numbers.
+
+    It never blocks a launch: a disagreement is worth telling the user about, but
+    the two numbers are not the same quantity, and refusing to start on a
+    modelling difference would be worse than starting.
+    """
+    from . import hangar, memtruth
+    from pathlib import Path
+    server_exe = _engine_server_exe(rp)
+    if server_exe is None:
+        typer.echo("verify: the pinned engine is not downloaded "
+                   "(`rigma up` fetches it first)")
+        return
+    # Resolved from the PLAN, not from state: `rigma plan --verify` has to work
+    # before anything is running, which is the whole point of a pre-flight check.
+    model_path = hangar.models_dir() / rp.gguf.file
+    if not Path(model_path).exists():
+        typer.echo(f"verify: {rp.gguf.file} is not downloaded yet "
+                   "(`rigma up` fetches it first)")
+        return
+    res, disagree = memtruth.verify_plan(rp, str(model_path), server_exe)
+    if res.primary is None:
+        typer.echo(f"verify: {res.reason}")
+        return
+    d = res.primary
+    typer.echo(f"verify:  engine measures {d.self_mb} MiB "
+               f"(model {d.model} + context {d.context} + compute {d.compute}) "
+               f"against {d.free} MiB free of {d.total} MiB")
+    typer.echo(f"         engine's own fit verdict: "
+               f"{'fits' if res.ok else 'DOES NOT FIT'}"
+               + (f" (target margin {res.target_mb} MiB)"
+                  if res.target_mb else ""))
+    if disagree:
+        typer.echo(f"         {disagree}")
+    if not res.ok and res.reason:
+        typer.echo(f"         {res.reason}")
+    if refuse and not res.ok:
+        raise typer.Exit(1)
+
+
+def _engine_server_exe(rp) -> Path | None:
+    """The pinned `llama-server` for a plan's backend, or None if not present."""
+    from . import runtime
+    try:
+        man = runtime._engines_manifest()
+    except Exception:
+        return None
+    key = f"{_os_key()}/{rp.backend}"
+    if key not in (man.get("assets") or {}):
+        return None
+    root = runtime.rigma_home() / "engines" / man["version"] / rp.backend
+    exe = root / ("llama-server.exe" if _os_key() == "windows"
+                  else "llama-server")
+    return exe if exe.exists() else None
+
+
+def _os_key() -> str:
+    return {"Windows": "windows", "Linux": "linux",
+            "Darwin": "darwin"}.get(platform.system(), "linux")
 
 
 @app.command()
@@ -1449,6 +1523,10 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        model: str = typer.Option(None, "--model"),
        yes: bool = typer.Option(False, "--yes", "-y"),
        dry_run: bool = typer.Option(False, "--dry-run"),
+       verify: bool = typer.Option(
+           False, "--verify",
+           help="Before launching, ask the engine what the plan will actually "
+                "use and compare it with Rigma's own estimate"),
        port: int = typer.Option(11500, "--port"),
        no_browser: bool = typer.Option(False, "--no-browser"),
        ctx: int = typer.Option(None, "--ctx",
@@ -1777,6 +1855,14 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                     progress=lambda lbl: typer.echo(f"  trying {lbl} ..."))
             typer.echo(f"starting llama-server: {cand.model_slug} "
                        f"{cand.gguf.quant} (first load can take minutes)...")
+            # R3-MEM-1: the pre-flight check, HERE because this is the first point
+            # where both the engine binary and the model file exist — the oracle
+            # needs the real GGUF and cannot run before `ensure_model` fetched it.
+            # Deliberately placed BEFORE launch_server and deliberately never
+            # blocking: it reports, and only a plan that provably does not fit is
+            # worth refusing, which the caller opts into with --verify.
+            if verify:
+                _verify_plan_or_explain(cand)
             sp = runtime.launch_server(exe, cand, model_path, port=port - 1,
                                        extra_args=extra or None)
             rp = cand
