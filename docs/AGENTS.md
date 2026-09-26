@@ -42,4 +42,11 @@ Base URL `http://127.0.0.1:11500/v1`, API key `local`, model id = anything
 - Keep an eye on the context meter — agent transcripts grow fast. The
   resolver's grow-to-fit already targets the largest context that FITS;
   `rigma up --ctx N` overrides it (clamped to the model's native window, but
-  NOT re-fit-checked — oversize values can fail at engine launch).
+  NOT re-fit-checked — oversize values can fail at engine launch). To check a
+  value before committing to it, `rigma plan --verify` asks the engine itself what
+  the plan will use, and `rigma up --verify` does the same at launch.
+- **On Windows, "the server started" is NOT evidence that the model fits.** WDDM
+  and NVIDIA's Sysmem Fallback Policy let an over-budget allocation succeed out of
+  system RAM: the model runs over PCIe at a fraction of the speed and no error is
+  printed. `--verify` compares the engine's own numbers rather than trusting the
+  launch.
