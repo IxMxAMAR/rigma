@@ -74,7 +74,12 @@ def test_spec_crown_needs_decisive_margin(monkeypatch, tmp_path):
                    origin="test")
     bench.run_sweep(plan, tmp_path / "s.exe", tmp_path / "m.gguf",
                     port=11601, configs=cfgs, mark_calibrated=True)
-    crowned = bench.load_calibration()["m:Q4:vulkan"]["flags"]
+    # R3-CAL-1: the key carries a per-machine hardware digest now, so take the
+    # single entry the sweep wrote rather than a literal key that only existed on
+    # machines before the identity change.
+    cal = bench.load_calibration()
+    assert len(cal) == 1, cal
+    crowned = next(iter(cal.values()))["flags"]
     assert "spec_type" not in crowned      # narrow bench win never crowns spec
 
 
