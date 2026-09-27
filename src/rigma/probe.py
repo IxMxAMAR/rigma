@@ -28,20 +28,28 @@ def _slugify(name: str, vram_mb: int) -> str:
 def classify_gpu(raw: dict, gpu_table: list[dict], os_name: str) -> GpuInfo:
     vendor = VENDOR_IDS.get(raw["vendor_id"], "unknown")
     name, vram = raw["name"], raw["vram_mb"]
+    # R3-CAL-1: the identity components travel with the GPU so a calibration can
+    # say which CARD it was measured on. `vendor_id` was previously read only to
+    # pick a vendor string and then discarded, which is why two different 24 GB
+    # cards were indistinguishable to the calibration cache.
+    ident = {"vendor_id": raw.get("vendor_id"),
+             "device_id": raw.get("device_id"),
+             "device_uuid": raw.get("device_uuid", ""),
+             "driver_version": raw.get("driver_version", "")}
     for row in gpu_table:
         if row["match"].lower() in name.lower():
             backends = row.get(f"backends_{os_name}",
                                row.get("backends_windows", ["vulkan"]))
             return GpuInfo(vendor=row["vendor"], name=name, vram_mb=vram,
                            arch=row["arch"], slug=_slugify(name, vram),
-                           backends=backends)
+                           backends=backends, **ident)
     # unknown card: pick a sane backend by vendor. A new NVIDIA card missing
     # from the table should still try CUDA (Vulkan leaves big perf on the table)
     default_backends = {"nvidia": ["cuda", "vulkan"],
                         "amd": ["vulkan"],
                         "intel": ["vulkan"]}.get(vendor, ["vulkan"])
     return GpuInfo(vendor=vendor, name=name, vram_mb=vram,
-                   slug=_slugify(name, vram), backends=default_backends)
+                   slug=_slugify(name, vram), backends=default_backends, **ident)
 
 
 _PID_INSTANCE = re.compile(r"^pid_(\d+)_luid_", re.I)
@@ -185,9 +193,55 @@ if ctypes.sizeof(_VkPhysicalDeviceProperties) != _VK_PHYSICAL_DEVICE_PROPERTIES_
         f"{_VK_PHYSICAL_DEVICE_PROPERTIES_SIZE}: the driver would write past it")
 
 
+class _VkPhysicalDeviceIDProperties(ctypes.Structure):
+    """`VkPhysicalDeviceIDProperties`, reached through a pNext chain.
+
+    R3-CAL-1 needs a stable per-CARD identity, and `VkPhysicalDeviceProperties`
+    does not carry one. `deviceID` identifies the MODEL, not the card — Vulkan
+    says "the same device ID should be used for all physical implementations of
+    that device version", so four RX 7900 XTXes report identically. `deviceUUID`
+    is the per-card value: "must be immutable ... across instances, processes,
+    driver APIs, driver versions, and system reboots".
+
+    `pipelineCacheUUID` is deliberately NOT used even though it is right there in
+    the other struct: it identifies "a compatible device and driver combination",
+    so it changes on a driver update and would invalidate a calibration that is
+    still valid. `deviceName` is not used either — it embeds the driver
+    ("... (RADV NAVI31)" vs "... (AMD proprietary driver)"), which is why Ollama
+    has to match it heuristically.
+
+    Same ABI discipline as the properties struct: the driver writes
+    sizeof(VkPhysicalDeviceIDProperties) bytes through the pNext pointer, so the
+    layout is asserted rather than trusted.
+    """
+    _fields_ = [("sType", ctypes.c_int), ("pNext", ctypes.c_void_p),
+                ("deviceUUID", ctypes.c_uint8 * 16),
+                ("driverUUID", ctypes.c_uint8 * 16),
+                ("deviceLUID", ctypes.c_uint8 * 8),
+                ("deviceNodeMask", ctypes.c_uint32),
+                ("deviceLUIDValid", ctypes.c_uint32)]
+
+
+# VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
+_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES = 1000071004
+_VK_PHYSICAL_DEVICE_ID_PROPERTIES_SIZE = 64
+if ctypes.sizeof(_VkPhysicalDeviceIDProperties) != _VK_PHYSICAL_DEVICE_ID_PROPERTIES_SIZE:
+    raise RuntimeError(
+        "_VkPhysicalDeviceIDProperties is "
+        f"{ctypes.sizeof(_VkPhysicalDeviceIDProperties)} bytes, not "
+        f"{_VK_PHYSICAL_DEVICE_ID_PROPERTIES_SIZE}: the driver would write past it")
+
+
+class _VkPhysicalDeviceProperties2(ctypes.Structure):
+    _fields_ = [("sType", ctypes.c_int), ("pNext", ctypes.c_void_p),
+                ("properties", _VkPhysicalDeviceProperties)]
+
+
+_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059000
+
+
 class _VkMemoryHeap(ctypes.Structure):
     _fields_ = [("size", ctypes.c_uint64), ("flags", ctypes.c_uint32)]
-
 
 class _VkMemoryType(ctypes.Structure):
     _fields_ = [("propertyFlags", ctypes.c_uint32), ("heapIndex", ctypes.c_uint32)]
@@ -236,12 +290,43 @@ def enumerate_vulkan() -> list[dict]:
                 out.append({"vendor_id": props.vendorID,
                             "name": props.deviceName.decode(errors="replace"),
                             "device_type": int(props.deviceType),
+                            "device_id": int(props.deviceID),
+                            "driver_version": int(props.driverVersion),
+                            "device_uuid": _vulkan_device_uuid(lib, d),
                             "vram_mb": int(max(local, default=0) / (1024 * 1024))})
             return out
         finally:
             lib.vkDestroyInstance(inst, None)
     except Exception:
         return []
+
+
+def _vulkan_device_uuid(lib, device) -> str:
+    """The per-card `deviceUUID` as hex, or "" if the loader cannot give one.
+
+    `vkGetPhysicalDeviceProperties2` is Vulkan 1.1+. When it is missing (an old
+    loader) or the driver fills nothing, this returns "" and identity falls back
+    to vendor+device, which is weaker but never wrong-by-invention: an empty
+    component is treated as unknown rather than as a value.
+    """
+    try:
+        fn = lib.vkGetPhysicalDeviceProperties2
+    except AttributeError:
+        return ""
+    try:
+        idp = _VkPhysicalDeviceIDProperties(
+            sType=_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+            pNext=None)
+        p2 = _VkPhysicalDeviceProperties2(
+            sType=_VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            pNext=ctypes.cast(ctypes.pointer(idp), ctypes.c_void_p))
+        fn(ctypes.c_void_p(device), ctypes.byref(p2))
+        raw = bytes(bytearray(idp.deviceUUID))
+    except Exception:
+        return ""
+    if not any(raw):
+        return ""          # all-zero means the driver did not fill it
+    return raw.hex()
 
 
 def _nvml_gpus() -> list[dict]:

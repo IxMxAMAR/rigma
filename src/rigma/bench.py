@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 from pydantic import BaseModel
 
+from . import hwid
 from .models import ComboFlags, RunPlan
 from .runtime import launch_server, rigma_home
 
@@ -97,8 +98,114 @@ def load_calibration() -> dict:
         return {}
 
 
+def current_identity(backend: str = "", gpu=None) -> hwid.HardwareIdentity:
+    """The hardware this process is running on, for keying a calibration.
+
+    Never raises: an identity that cannot be read is an EMPTY one, which degrades
+    to the old model:quant:backend behaviour rather than losing the calibration
+    entirely. A probe failure must not make the tool refuse to measure.
+
+    Reads the raw enumeration directly rather than going through
+    `probe_hardware()`, which needs the registry's GPU table. The table only picks
+    which BACKENDS a card advertises, and the backend is passed in here already —
+    so the table would add a registry dependency to a cache key and change nothing
+    about the identity itself.
+    """
+    try:
+        if gpu is None:
+            from .probe import enumerate_vulkan
+            rows = enumerate_vulkan()
+            gpu = rows[0] if rows else None
+        if gpu is None:
+            return hwid.HardwareIdentity(backend=backend or "cpu")
+        if isinstance(gpu, dict):
+            return hwid.identity_from_gpu(backend or "vulkan", gpu)
+        return hwid.identity_from_gpu(backend or "vulkan", {
+            "vendor_id": getattr(gpu, "vendor_id", None),
+            "device_id": getattr(gpu, "device_id", None),
+            "device_uuid": getattr(gpu, "device_uuid", ""),
+            "driver_version": getattr(gpu, "driver_version", ""),
+            "name": getattr(gpu, "name", ""),
+        })
+    except Exception:
+        return hwid.HardwareIdentity(backend=backend or "")
+
+
+def _identity_cache_key(backend: str) -> hwid.HardwareIdentity:
+    """Cached per backend: `probe_hardware()` is a subprocess away from slow, and
+    the calibration key is built on several hot paths.
+
+    An EMPTY identity is deliberately not cached. A transient probe failure would
+    otherwise be frozen for the life of the process, and every calibration key
+    built afterwards would silently lose its hardware component — the exact
+    silent-degradation this module exists to prevent.
+    """
+    got = _IDENT_CACHE.get(backend)
+    if got is not None:
+        return got
+    ident = current_identity(backend)
+    if ident.vendor_id or ident.uuid:
+        _IDENT_CACHE[backend] = ident
+    return ident
+
+
+_IDENT_CACHE: dict[str, hwid.HardwareIdentity] = {}
+
+
+def calibration_key(model: str, quant: str, backend: str) -> str:
+    """The current calibration key for a model+quant+backend."""
+    return hwid.calibration_key(model, quant, _identity_cache_key(backend))
+
+
+def legacy_key(model: str, quant: str, backend: str) -> str:
+    """The key used before R3-CAL-1: model:quant:backend, no hardware.
+
+    Kept because entries written under it are still valid ON THE MACHINE THAT
+    WROTE THEM — discarding every existing calibration on upgrade would make the
+    tool worse for the person upgrading, which is not what fixing a cache key is
+    supposed to do.
+    """
+    return f"{model}:{quant}:{backend}"
+
+
+def calibration_entry(cal: dict, model: str, quant: str,
+                      backend: str) -> tuple[str, dict]:
+    """The entry for a model+quant+backend, and the key it was found under.
+
+    Tries the identity key, then the legacy key. Returns ("", {}) on a miss, which
+    callers already treat as "not calibrated".
+    """
+    for k in (calibration_key(model, quant, backend), legacy_key(model, quant, backend)):
+        if k in cal:
+            return k, cal[k]
+    return "", {}
+
+
+def prune_calibration(cal: dict, keep_per_identity: int = 1) -> dict:
+    """Keep only the newest `keep_per_identity` entries for each hardware identity.
+
+    A single machine has 1-4 identities (iGPU + dGPU, plus a backend each), so this
+    is about not letting the file grow without bound across GPU swaps and driver
+    experiments. Entries with no recorded hardware are kept — they are from before
+    identity existed and cannot be attributed to an identity to prune.
+    """
+    by_ident: dict[str, list[tuple[str, str]]] = {}
+    keep: set[str] = set()
+    for k, entry in cal.items():
+        ident = (entry.get("hardware") or {}).get("id")
+        if not ident:
+            keep.add(k)
+            continue
+        by_ident.setdefault(ident, []).append((entry.get("date") or "", k))
+    for rows in by_ident.values():
+        rows.sort(reverse=True)          # newest date first, then key
+        keep.update(k for _, k in rows[:keep_per_identity])
+    return {k: v for k, v in cal.items() if k in keep}
+
+
 def save_calibration(key: str, measured: dict, flags: dict | None = None,
-                     calibrated: bool = False, ctx: int = 0) -> None:
+                     calibrated: bool = False, ctx: int = 0,
+                     identity: hwid.HardwareIdentity | None = None) -> None:
     cal = load_calibration()
     entry = cal.get(key, {})
     entry["measured"] = measured
@@ -111,8 +218,14 @@ def save_calibration(key: str, measured: dict, flags: dict | None = None,
     # predated an engine bump or was measured at a different context — it simply
     # kept being applied. `schema` marks entries that carry this; anything
     # without it is from before and is read leniently.
-    entry["schema"] = 2
+    entry["schema"] = 3
     entry["engine"] = _engine_version()
+    # R3-CAL-1: WHICH CARD. Without it a 3090 silently inherits a 4090's number,
+    # which is the failure mode that is invisible rather than loud. The identity is
+    # recorded as a field as well as being part of the key so a stale entry can
+    # explain itself instead of just being absent.
+    if identity is not None:
+        entry["hardware"] = identity.as_dict()
     # What the desktop was holding when this was measured. Without it there is
     # nothing in the entry to distinguish 9.95 tok/s from 37.59 for the same
     # model on the same engine (measured 2026-08-21).
@@ -127,6 +240,7 @@ def save_calibration(key: str, measured: dict, flags: dict | None = None,
         entry["ctx"] = ctx
     entry["date"] = datetime.date.today().isoformat()
     cal[key] = entry
+    cal = prune_calibration(cal)
     calibration_path().parent.mkdir(parents=True, exist_ok=True)
     calibration_path().write_text(json.dumps(cal, indent=2), encoding="utf-8")
 
@@ -140,15 +254,41 @@ VRAM_DRIFT_TOLERANCE_MB = 700
 
 
 def calibration_stale(entry: dict, vram_used_mb: float | None,
-                      engine: str = "", ctx: int = 0) -> str | None:
+                      engine: str = "", ctx: int = 0,
+                      identity: hwid.HardwareIdentity | None = None) -> str | None:
     """Why this calibration should not be trusted, or None if it should.
 
     Speed on a fixed model+quant+engine is not a constant: it depends on whether
     the weights actually fit in VRAM, and on Windows that depends on what ELSE
     is holding VRAM. A calibration taken while a browser held 4GB describes a
     machine that no longer exists once the browser closes.
+
+    R3-CAL-1 adds two more ways to be stale, and they are NOT the same:
+      * a different CARD (hard) — the number is about other hardware entirely;
+      * the same card under a new DRIVER (soft) — real, but a re-measure rather
+        than a discard. A driver update made non-FA PP 5% and FA 15% faster.
+    Both are reported here as reasons not to trust the number, which is the one
+    thing callers do with them.
     """
     if not entry:
+        return None
+    if identity is not None:
+        hard = hwid.hard_mismatch(entry, identity)
+        if hard:
+            return hard
+        soft = hwid.soft_reasons(entry, identity, engine=engine, ctx=ctx)
+        if soft:
+            return "; ".join(soft)
+        # Identity already covered engine/ctx/driver, so fall through only to the
+        # VRAM check rather than repeating the same comparisons below.
+        was = entry.get("vram_used_mb")
+        if was is None or vram_used_mb is None:
+            return None
+        drift = abs(float(vram_used_mb) - float(was))
+        if drift > VRAM_DRIFT_TOLERANCE_MB:
+            return (f"measured with {was:,.0f} MiB of VRAM held by other apps, "
+                    f"now {vram_used_mb:,.0f} MiB — a {drift:,.0f} MiB shift changes "
+                    "whether the model fits on the GPU at all")
         return None
     if engine and entry.get("engine") and entry["engine"] != engine:
         return f"measured on engine {entry['engine']}, now on {engine}"
@@ -169,17 +309,35 @@ def calibration_stale(entry: dict, vram_used_mb: float | None,
 
 
 def is_calibrated(model: str, quant: str, backend: str) -> bool:
-    """True once a model+quant+backend has been auto-tuned on this machine —
-    so first-load calibration runs exactly once, never on every load."""
-    return bool(load_calibration().get(f"{model}:{quant}:{backend}", {})
-                .get("calibrated"))
+    """True once a model+quant+backend has been auto-tuned on THIS HARDWARE —
+    so first-load calibration runs exactly once, never on every load.
+
+    R3-CAL-1: the lookup is identity-aware, so a calibration measured on another
+    GPU does not count as calibrated here. The legacy key is still honoured for
+    the machine that wrote it, which is why this is not simply a key change.
+    """
+    _, entry = calibration_entry(load_calibration(), model, quant, backend)
+    if not entry:
+        return False
+    # A calibrated flag from different hardware is not a calibration for this one:
+    # re-tune rather than serve a number measured elsewhere.
+    if hwid.hard_mismatch(entry, _identity_cache_key(backend)):
+        return False
+    return bool(entry.get("calibrated"))
 
 
 def clear_calibration(model: str, quant: str, backend: str) -> bool:
     """Forget one model's tune so it re-optimizes on next load (or falls back to
-    the safe defaults). Returns True if there was an entry to clear."""
+    the safe defaults). Returns True if there was an entry to clear.
+
+    Clears BOTH the identity key and the legacy key: "forget this tune" should mean
+    forgotten, and leaving a legacy entry behind would make the next lookup find it
+    and report the model as still calibrated.
+    """
     cal = load_calibration()
-    if cal.pop(f"{model}:{quant}:{backend}", None) is None:
+    hit = [k for k in (calibration_key(model, quant, backend),
+                       legacy_key(model, quant, backend)) if cal.pop(k, None) is not None]
+    if not hit:
         return False
     calibration_path().parent.mkdir(parents=True, exist_ok=True)
     calibration_path().write_text(json.dumps(cal, indent=2), encoding="utf-8")
@@ -372,10 +530,11 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     best = crowned_row(rows)
     _log_rows(plan, rows, best)
     if best is not None and (best["flags"] or mark_calibrated):
-        key = f"{plan.model_slug}:{plan.gguf.quant}:{plan.backend}"
+        key = calibration_key(plan.model_slug, plan.gguf.quant, plan.backend)
         save_calibration(key, {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"]},
                          flags=best["flags"], calibrated=mark_calibrated,
-                         ctx=plan.flags.ctx)
+                         ctx=plan.flags.ctx,
+                         identity=_identity_cache_key(plan.backend))
     return rows
 
 
@@ -385,8 +544,18 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
     calibrated on this machine, A/B the quick config set on `port` and return
     the plan with the winning flags applied. Cached forever after (subsequent
     loads return instantly). No-op on CPU or when already calibrated."""
-    key = f"{plan.model_slug}:{plan.gguf.quant}:{plan.backend}"
-    entry = load_calibration().get(key, {})
+    # Read under whichever key has the entry (identity first, legacy second) but
+    # always WRITE and re-read under the identity key: `run_sweep` persists to the
+    # identity key, so reading flags back under a legacy key would miss the tune
+    # that was just measured and silently apply nothing.
+    key = calibration_key(plan.model_slug, plan.gguf.quant, plan.backend)
+    ident = _identity_cache_key(plan.backend)
+    _, entry = calibration_entry(load_calibration(), plan.model_slug,
+                                plan.gguf.quant, plan.backend)
+    # R3-CAL-1: an entry measured on other hardware is not a calibration for this
+    # one. Ignore it (rather than erroring) and re-measure.
+    if entry and hwid.hard_mismatch(entry, ident):
+        entry = {}
 
     def _apply(p: RunPlan) -> RunPlan:
         flags = load_calibration().get(key, {}).get("flags") or {}
@@ -398,6 +567,12 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
             else p.origin + "+calibrated"})
 
     if entry.get("calibrated"):
+        # Adopt a legacy entry onto the identity key so the next lookup is a
+        # direct hit and the stale key can be pruned away.
+        if key not in load_calibration():
+            save_calibration(key, entry.get("measured", {}),
+                             flags=entry.get("flags"), calibrated=True,
+                             ctx=entry.get("ctx", 0), identity=ident)
         return _apply(plan)
     if plan.backend == "cpu":
         return plan   # nothing worth measuring on CPU

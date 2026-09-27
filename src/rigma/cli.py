@@ -767,7 +767,9 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
         typer.echo(f"verify: {rp.gguf.file} is not downloaded yet "
                    "(`rigma up` fetches it first)")
         return
-    res, disagree = memtruth.verify_plan(rp, str(model_path), server_exe)
+    res, disagree = memtruth.verify_plan(
+        rp, str(model_path), server_exe,
+        os_free_probe=_adapter_vram_used_mb)
     if res.primary is None:
         typer.echo(f"verify: {res.reason}")
         return
@@ -775,16 +777,37 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
     typer.echo(f"verify:  engine measures {d.self_mb} MiB "
                f"(model {d.model} + context {d.context} + compute {d.compute}) "
                f"against {d.free} MiB free of {d.total} MiB")
-    typer.echo(f"         engine's own fit verdict: "
-               f"{'fits' if res.ok else 'DOES NOT FIT'}"
-               + (f" (target margin {res.target_mb} MiB)"
-                  if res.target_mb else ""))
+    # When the two readings disagree, the engine's verdict was made against a
+    # number that was wrong, so printing "fits" would state a conclusion the
+    # evidence does not support — the whole point of the cross-check.
+    if res.reason.startswith("the engine reports"):
+        typer.echo("         engine's own fit verdict: UNRELIABLE (see below)")
+    else:
+        typer.echo(f"         engine's own fit verdict: "
+                   f"{'fits' if res.ok else 'DOES NOT FIT'}"
+                   + (f" (target margin {res.target_mb} MiB)"
+                      if res.target_mb else ""))
     if disagree:
         typer.echo(f"         {disagree}")
-    if not res.ok and res.reason:
+    if not res.ok and res.reason and not res.reason.startswith("the engine reports"):
         typer.echo(f"         {res.reason}")
     if refuse and not res.ok:
         raise typer.Exit(1)
+
+
+def _adapter_vram_used_mb() -> float | None:
+    """Dedicated VRAM in use across all processes, from the OS.
+
+    Needed because the engine's own reading is not trustworthy on every platform:
+    measured on ROCm/Windows, `llama-fit-params` reported 16,140 MiB free on a
+    16,304 MiB card that had 13,149 MiB in use. The OS counter is the tiebreak.
+    None where it cannot be read, which leaves the engine's figure alone.
+    """
+    try:
+        from .probe import gpu_used_mb
+        return gpu_used_mb()
+    except Exception:
+        return None
 
 
 def _engine_server_exe(rp) -> Path | None:
@@ -1249,8 +1272,10 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
             combo_expected = c.expected
             break
     typer.echo(verdict(r, combo_expected))
-    key = f"{s['model']}:{s['quant']}:{s.get('backend', 'unknown')}"
-    save_calibration(key, r.model_dump())
+    from .bench import calibration_key, current_identity
+    _be = s.get("backend", "unknown")
+    save_calibration(calibration_key(s["model"], s["quant"], _be), r.model_dump(),
+                     identity=current_identity(_be))
     # AUDIT F15-7: `~` is POSIX shorthand — Explorer and cmd do not expand it.
     # Print the path the file was actually written to.
     typer.echo(f"recorded to {calibration_path()}")

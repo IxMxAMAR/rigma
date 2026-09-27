@@ -756,10 +756,15 @@ def measured_rates() -> tuple[float, float]:
     """(prefill, decode) tok/s for the running combo, from calibration."""
     try:
         from . import state as st
-        from .bench import load_calibration
+        from .bench import calibration_entry, load_calibration
         s = st.read_state() or {}
-        key = f"{s.get('model')}:{s.get('quant')}:{s.get('backend')}"
-        m = (load_calibration().get(key) or {}).get("measured") or {}
+        # R3-CAL-1: identity-aware, so a calibration measured on another GPU is
+        # not reported as this machine's throughput. The legacy key is still read
+        # for the machine that wrote it.
+        _, entry = calibration_entry(load_calibration(), s.get("model") or "",
+                                     s.get("quant") or "",
+                                     s.get("backend") or "")
+        m = (entry or {}).get("measured") or {}
         return float(m.get("pp_tps") or 0.0), float(m.get("tg_tps") or 0.0)
     except Exception:
         return 0.0, 0.0

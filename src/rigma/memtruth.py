@@ -62,6 +62,11 @@ from pathlib import Path
 # stderr is where the numbers are.
 _TIMEOUT_S = 120.0
 
+# How far the engine's "free" may exceed the OS counter's before Rigma stops
+# believing it. Small enough to catch a full card, large enough not to fire on
+# the ordinary lag between two readings taken milliseconds apart.
+_FREE_DISAGREE_MB = 512.0
+
 # `|   - ROCm0 (RX 9070 XT) | 16304 = 16140 + ( 899 =    82 +     720 +      97) +        -735 |`
 # Device lines are the ones carrying a parenthesised self/model/context/compute
 # group; the `Host` line has the same first columns and no such group, so
@@ -365,6 +370,46 @@ def compare(plan_mb: float, result: FitResult) -> str | None:
             f"{d.context} + compute {d.compute}).")
 
 
+def free_memory_disagreement(oracle_free_mb: int | None,
+                             adapter_used_mb: float | None,
+                             total_mb: int | None) -> str | None:
+    """Why the engine's idea of "free" cannot be trusted, or None.
+
+    MEASURED, and it changes how the rest of this module must be read. On the
+    owner's machine (RX 9070 XT, ROCm on Windows), with ComfyUI holding 13,137 MiB
+    of DEDICATED VRAM out of 16,304 MiB, `llama-fit-params` reported:
+
+        common_memory_breakdown_print: | - ROCm0 (RX 9070 XT) | 16304 = 16140 + (899 = 82 + 720 + 97) + -735 |
+        common_params_fit_impl: projected to use 899 MiB of device memory vs. 16140 MiB of free device memory
+        common_params_fit_impl: will leave 15240 >= 1024 MiB of free device memory, no changes needed
+
+    The Windows GPU performance counter read 13,149 MiB dedicated in use at that
+    same moment, i.e. 3,155 MiB actually free. So the engine believed it had the
+    whole card while the card was full, and its own `--fit` verdict said "fits".
+    Whatever `hipMemGetInfo` returns on this driver, it is not available VRAM.
+
+    This is the AMD/Windows form of the trap the NVIDIA sysmem-fallback research
+    described: the allocation succeeds, nothing errors, and the model runs over
+    PCIe. It means the engine's fit VERDICT is not evidence on this platform, and
+    its per-device ACCOUNTING is the only part of its output worth using.
+
+    Rigma therefore compares the two readings and believes the operating system's
+    counter, which is per-adapter and vendor-neutral. A disagreement is reported
+    rather than silently corrected, because a wrong "free" also means the engine's
+    fit decision was made against a wrong number.
+    """
+    if oracle_free_mb is None or adapter_used_mb is None or total_mb is None:
+        return None            # nothing to cross-check against; stay silent
+    os_free = float(total_mb) - float(adapter_used_mb)
+    if oracle_free_mb - os_free <= _FREE_DISAGREE_MB:
+        return None
+    return (f"the engine reports {oracle_free_mb:,} MiB free but the OS says "
+            f"{os_free:,.0f} MiB is free ({adapter_used_mb:,.0f} MiB of "
+            f"{total_mb:,} MiB is in use by other processes) — the engine's fit "
+            f"verdict was made against the wrong number, so only its accounting "
+            f"is usable here")
+
+
 def planned_mb(plan) -> float:
     """What Rigma's own arithmetic says the plan will hold, in MiB.
 
@@ -434,14 +479,42 @@ def fit_argv(plan, model_path: str, *, backend_args: list[str] | None = None
 
 def verify_plan(plan, model_path: str, server_exe, *,
                 backend_args: list[str] | None = None,
-                popen=subprocess.run) -> tuple[FitResult, str | None]:
+                popen=subprocess.run,
+                adapter_used_mb: float | None = None,
+                os_free_probe=None) -> tuple[FitResult, str | None]:
     """Run the oracle for a plan. Returns (result, disagreement-or-None).
 
     The caller decides what to do with a disagreement. This function never
     refuses anything itself: a wrong estimate is worth reporting, and whether it
     is worth blocking a launch is a policy question that belongs with the launch.
+
+    `adapter_used_mb` is the OS's own view of what the card is holding, and it
+    takes precedence over the engine's `free`. MEASURED: on ROCm/Windows the
+    engine reported 16,140 MiB free while Windows read 13,149 MiB in use on a
+    16,304 MiB card — so the engine's fit verdict said "fits" on a full card.
+    When the two disagree the accounting is kept and the verdict is marked
+    unusable, because a fit decision made against a wrong "free" is not a fit
+    decision. Passing None (a non-Windows host, or an unreadable counter) leaves
+    the engine's reading alone rather than inventing one.
     """
     argv = fit_argv(plan, model_path, backend_args=backend_args)
     res = run_fit(server_exe, argv, popen=popen)
+    d = res.primary
+    if d is not None:
+        if adapter_used_mb is None and os_free_probe is not None:
+            try:
+                adapter_used_mb = os_free_probe()
+            except Exception:
+                adapter_used_mb = None
+        why = free_memory_disagreement(d.free, adapter_used_mb, d.total)
+        if why:
+            # Keep the accounting, discard the verdict. `free` is rewritten to
+            # the OS figure so the printed numbers are the real ones, and the
+            # overcommit check in parse_fit_output is re-run against it — the
+            # engine said this fits because it could not see ComfyUI.
+            res.free_mb = d.free = int(float(d.total) - float(adapter_used_mb))
+            res.reason = why
+            res.ok = d.self_mb <= d.free
+            return res, why
     return res, compare(planned_mb(plan), res)
 
