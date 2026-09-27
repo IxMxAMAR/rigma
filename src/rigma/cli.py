@@ -669,9 +669,194 @@ def engine_runtimes(as_json: bool = typer.Option(False, "--json",
 
 
 @app.command()
+def engines(as_json: bool = typer.Option(False, "--json",
+                                         help="machine-readable rows")):
+    """Which engine BINARY is actually on disk, and what else you have registered.
+
+    R3-ENG-1. Rigma used to identify its engine by the manifest's version STRING,
+    which is a claim about what was downloaded rather than a fact about what is
+    there. On the owner's machine four directories all sat under
+    `~/.rigma/engines/b9867/` — all claiming to be the pin — and one of them was a
+    third-party fork ~1,800 builds newer. This runs `--version` on each and says
+    what it really is.
+
+    A build that is NOT the pin is not an error: it is the only way some models can
+    run at all (see `rigma engine-register`). It is reported so that a calibration,
+    a bug report and a support question all refer to the same binary.
+    """
+    from . import engine_build, engine_registry, runtime
+
+    man = runtime._engines_manifest()
+    pinned = str(man.get("version", ""))
+    rows = []
+
+    for backend in ("vulkan", "rocm", "cuda", "cpu"):
+        exe = _engine_server_exe_for(backend)
+        if exe is None:
+            continue
+        b, ok = engine_build.verify_engine(exe, pinned)
+        rows.append({
+            "kind": "pinned", "backend": backend, "path": str(exe),
+            "build": b.build, "identity": b.identity if b.ok else "",
+            "version": b.version, "commit": b.commit, "ok": b.ok,
+            "is_pin": ok,
+            "detail": (f"the pin ({pinned})" if ok else
+                       f"NOT the pin ({pinned})" if b.ok else b.reason),
+        })
+
+    for e in sorted(engine_registry.load().values(), key=lambda x: x.name):
+        b = engine_build.cached_build(e.exe) if e.exe.exists() else None
+        rows.append({
+            "kind": "registered", "backend": e.backend or "(any)",
+            "name": e.name, "path": e.path,
+            "build": b.build if b else None,
+            "identity": b.identity if (b and b.ok) else "",
+            "version": b.version if b else "", "commit": b.commit if b else "",
+            "ok": bool(b and b.ok), "is_pin": False,
+            "source": e.source, "note": e.note,
+            "types": sorted(e.types) if e.types_known else None,
+            "detail": (b.reason if (b and not b.ok) else
+                       "the binary is missing" if not e.exe.exists() else
+                       e.source or "registered by hand"),
+        })
+
+    if as_json:
+        typer.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        typer.echo("no engine is downloaded yet (`rigma up` fetches the pinned one)")
+        return
+    for r in rows:
+        label = r.get("name") or r["backend"]
+        typer.echo(f"{r['kind']:<10} {label:<22} {r['identity'] or '-':<22} "
+                   f"{r['detail']}")
+    unpinned = [r for r in rows if r["kind"] == "pinned" and not r["is_pin"]]
+    if unpinned:
+        typer.echo("")
+        typer.echo("note: a directory claiming to hold the pin holds a different "
+                   "build. That is allowed — some models need a fork — but any "
+                   "calibration measured on it is not a measurement of the pin.")
+
+
+def _engine_server_exe_for(backend: str):
+    """The pinned `llama-server` for a backend, or None if it is not downloaded."""
+    from . import runtime
+    import os
+    man = runtime._engines_manifest()
+    if f"{_os_key()}/{backend}" not in (man.get("assets") or {}):
+        return None
+    root = runtime.rigma_home() / "engines" / str(man.get("version", "")) / backend
+    exe = root / ("llama-server.exe" if os.name == "nt" else "llama-server")
+    if exe.exists():
+        return exe
+    return next(root.rglob(exe.name), None) if root.exists() else None
+
+
+@app.command("engine-register")
+def engine_register(
+    name: str = typer.Argument(..., help="handle to refer to this build by"),
+    path: str = typer.Argument(..., help="path to its llama-server binary"),
+    backend: str = typer.Option("", "--backend", "-b",
+                                help="compute backend it serves (default: any)"),
+    source: str = typer.Option("", "--source",
+                               help="where it came from, e.g. 'owner/repo branch X'"),
+    note: str = typer.Option("", "--note", help="why it is here"),
+    types: str = typer.Option("", "--types",
+                              help="comma-separated ggml type ids it accepts; "
+                                   "'scan' reads them from --reference"),
+    reference: str = typer.Option("", "--reference",
+                                  help="a GGUF to prove it can load, with --types scan"),
+):
+    """Register an engine build that is not the pin (R3-ENG-3).
+
+    Some models cannot run on mainline llama.cpp AT ALL, and not because it is old:
+    `Ternary-Bonsai-2-27B-PQ2_0` uses `GGML_TYPE_PQ2_0 = 142`, private to
+    PrismML-Eng/llama.cpp, while mainline numbers its types only up to 42. No
+    mainline build, however new, will load it. Registering the fork is how that
+    becomes supported instead of a hand-edit inside `~/.rigma/engines/`.
+
+    Rigma never downloads it. A registered engine is one YOU obtained and vouched
+    for, which is why `ENGINE_URL_ALLOWLIST` is untouched and the pin stays the
+    default for everything else.
+
+    `--types scan --reference model.gguf` runs the build against a real file and
+    records which types it accepts, so later selection is decided by measurement
+    rather than by a version guess.
+    """
+    from . import engine_build, engine_registry
+
+    exe = Path(path)
+    if not exe.exists():
+        typer.echo(f"no such file: {exe}")
+        raise typer.Exit(2)
+
+    b = engine_build.read_build(exe)
+    known: list[int] = []
+    types_known = False
+    if types.strip().lower() == "scan":
+        if not reference:
+            typer.echo("--types scan needs --reference <a .gguf this build loads>")
+            raise typer.Exit(2)
+        from .gguf_meta import read_tensor_index
+        try:
+            idx = read_tensor_index(Path(reference))
+        except Exception as e:
+            typer.echo(f"could not read {reference}: {e}")
+            raise typer.Exit(2)
+        if not idx.types_complete:
+            typer.echo(f"{reference}'s tensor table was cut short; cannot record "
+                       f"its types as this build's capability")
+            raise typer.Exit(2)
+        # A reference model proves the build accepts THAT model's types, not that it
+        # accepts only those. A llama.cpp fork is mainline plus additions — verified
+        # on the owner's PrismML build, which loads ordinary mainline models
+        # (RVN-Q3_K_M, SmolLM2-Q2_K) as well as its own ternary file. Recording the
+        # scan alone would therefore mark a perfectly good engine as unable to load
+        # every mainline model, so the mainline baseline is included and said out
+        # loud rather than assumed silently.
+        from .engine_compat import KNOWN_TYPES
+        scanned = set(idx.type_counts)
+        known = sorted(set(KNOWN_TYPES) | scanned)
+        types_known = True
+        typer.echo(f"  scanned {len(scanned)} type(s) from {Path(reference).name}; "
+                   f"assuming mainline's {len(KNOWN_TYPES)} as well "
+                   f"(a fork is mainline plus additions)")
+    elif types.strip():
+        try:
+            known = sorted({int(t) for t in types.replace(" ", "").split(",") if t})
+        except ValueError:
+            typer.echo(f"--types must be comma-separated integers: {types!r}")
+            raise typer.Exit(2)
+        types_known = True
+
+    engine_registry.register(engine_registry.CustomEngine(
+        name=name, path=str(exe), backend=backend, source=source, note=note,
+        types=known, types_known=types_known))
+
+    typer.echo(f"registered {name}")
+    typer.echo(f"  binary: {b.identity if b.ok else b.reason}")
+    if types_known:
+        from . import engine_compat
+        typer.echo("  accepts: " + ", ".join(
+            f"{engine_compat.type_name(t)}={t}" for t in known))
+    else:
+        typer.echo("  accepts: not recorded — Rigma will not rule it in or out "
+                   "until you record them (`--types scan --reference <gguf>`)")
+
+
+@app.command("engine-forget")
+def engine_forget(name: str = typer.Argument(...)):
+    """Remove a registered engine. The pin is never affected."""
+    from . import engine_registry
+    if not engine_registry.forget(name):
+        typer.echo(f"no engine registered as {name!r}")
+        raise typer.Exit(1)
+    typer.echo(f"forgot {name}")
+
+
+@app.command()
 def harness(backend: str = typer.Option(None, "--backend", "-b",
-                                        help="check only this one"),
-            as_json: bool = typer.Option(False, "--json")):
+                                        help="check only this one"),            as_json: bool = typer.Option(False, "--json")):
     """Check each agent backend against the build Rigma was verified with.
 
     The failure this exists for: an external agent updates underneath Rigma.

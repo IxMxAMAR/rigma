@@ -53,6 +53,21 @@ _MODERN_RE = re.compile(
     re.I)
 _COMPILER_RE = re.compile(r"built with\s+(?P<what>.+)", re.I)
 
+# Lenient fallbacks, used when neither known format matches.
+#
+# The research for this module (see _research/reports/engine-versioning-landscape.md)
+# was explicit that format-matching must not be the only path: the format already
+# differs between the two builds involved in this very defect, and `llama-bench
+# --version` was only added in PR #28971, so older and future binaries vary. A
+# `bNNNN` is `git rev-list --count HEAD`, i.e. a plain integer, so any 3-6 digit
+# number in a version-looking line is a credible build number.
+#
+# These are deliberately NOT used before the exact patterns: a loose match could
+# pick a number out of a commit hash or a date, so it is a last resort that still
+# beats reporting "unknown".
+_LOOSE_BUILD_RE = re.compile(r"\bb?(\d{3,6})\b")
+_LOOSE_COMMIT_RE = re.compile(r"\b([0-9a-f]{7,40})\b", re.I)
+
 
 @dataclass(frozen=True)
 class EngineBuild:
@@ -122,7 +137,30 @@ def parse_version(text: str) -> EngineBuild:
             ok=True,
         )
 
-    return EngineBuild(raw=raw, reason="could not find a version line in the output")
+    return _loose(raw)
+
+
+def _loose(raw: str) -> EngineBuild:
+    """Last resort: pull a build number and a commit out of whatever was printed.
+
+    Only reached when the output carries a version line at all — a binary that
+    printed nothing version-like still reports unknown, because inventing a build
+    from arbitrary text is how a calibration gets labelled with a build that was
+    never measured.
+    """
+    if "version" not in raw.lower():
+        return EngineBuild(raw=raw, reason="could not find a version line in the output")
+    m = _LOOSE_BUILD_RE.search(raw)
+    c = _LOOSE_COMMIT_RE.search(raw)
+    return EngineBuild(
+        raw=raw,
+        version=m.group(1) if m else "",
+        build=int(m.group(1)) if m else None,
+        commit=c.group(1).lower() if c else "",
+        compiler=_compiler(raw),
+        ok=m is not None,
+        reason="" if m else "found a version line but no build number in it",
+    )
 
 
 def _compiler(text: str) -> str:
@@ -166,3 +204,50 @@ def matches_manifest(build: EngineBuild, expected_version: str) -> bool:
         return build.build == int(m.group(1))
     # A non-numeric manifest version can only be compared as a string.
     return build.version == want
+
+
+# Running `--version` is a process spawn, and the answer cannot change unless the
+# file does, so it is cached on (path, size, mtime). `--verify` and any status
+# surface can then call this freely.
+_BUILD_CACHE: dict[tuple, EngineBuild] = {}
+
+
+def _file_key(exe: Path) -> tuple:
+    try:
+        st = exe.stat()
+        return (str(exe), st.st_size, int(st.st_mtime))
+    except OSError:
+        return (str(exe), -1, -1)
+
+
+def cached_build(exe: str | Path, *, popen=subprocess.run) -> EngineBuild:
+    """`read_build`, memoised on the file's identity.
+
+    Keyed on size and mtime as well as path, so replacing the binary at the same
+    path — which is exactly how a hand-installed fork arrives — invalidates the
+    cache instead of reporting the old build forever.
+    """
+    exe = Path(exe)
+    key = _file_key(exe)
+    hit = _BUILD_CACHE.get(key)
+    if hit is not None:
+        return hit
+    got = read_build(exe, popen=popen)
+    if got.ok:
+        # An unreadable binary is not cached: a transient failure would otherwise
+        # freeze "unknown" for the life of the process, which is the same
+        # silent-degradation trap the identity cache in bench.py guards against.
+        _BUILD_CACHE[key] = got
+    return got
+
+
+def verify_engine(exe: str | Path, expected_version: str, *,
+                  popen=subprocess.run) -> tuple[EngineBuild, bool]:
+    """The engine on disk, and whether it is the one the manifest pins.
+
+    Returns (build, matches). A build that cannot be read is NOT reported as a
+    match — unknown is not a match, and treating it as one is how a fork goes
+    unnoticed.
+    """
+    got = cached_build(exe, popen=popen)
+    return got, matches_manifest(got, expected_version)
