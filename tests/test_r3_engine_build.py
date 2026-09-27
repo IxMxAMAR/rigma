@@ -260,3 +260,47 @@ def test_verify_engine_accepts_the_real_pin(tmp_path):
     engine_build._BUILD_CACHE.clear()
     got, ok = engine_build.verify_engine(exe, "b9867", popen=fake)
     assert ok is True and got.build == 9867
+
+
+# --- comparing engine strings from two producers ------------------------------
+# Engine strings are written by two different producers and must compare equal across
+# both, or every calibration measured before R3-ENG-6 would be discarded the moment
+# R3-ENG-6 started recording the fuller answer.
+
+def test_the_bare_manifest_form_matches_the_measured_identity():
+    """`b9867` (what older entries recorded) vs `b9867+152d337fa` (what is recorded
+    now). A plain != would call these different and throw away valid calibrations."""
+    assert engine_build.same_build("b9867", "b9867+152d337fa") is True
+    assert engine_build.same_build("b9867+152d337fa", "b9867") is True
+
+
+def test_the_fork_does_not_match_the_pin():
+    """The whole point. The owner's rocm directory held build 10709 while the
+    manifest said b9867, and a calibration measured on the fork must not be replayed
+    as if it described the pin."""
+    assert engine_build.same_build("b10709+9a9394a89", "b9867+152d337fa") is False
+    assert engine_build.same_build("b10709+9a9394a89", "b9867") is False
+
+
+def test_a_different_commit_on_the_same_build_number_is_a_different_build():
+    """A re-tagged release and a fork can share the counter, which is exactly why
+    identity carries the commit at all."""
+    assert engine_build.same_build("b9867+152d337fa", "b9867+deadbeef0") is False
+
+
+def test_a_truncated_commit_still_matches_its_full_form():
+    """`--version` prints a short hash; a longer recorded one is the same commit."""
+    assert engine_build.same_build("b9867+152d337fa", "b9867+152d337fadb93c2a") is True
+
+
+def test_empty_never_matches():
+    """Unknown must not compare equal to a real build, or a failed probe would look
+    like a match."""
+    assert engine_build.same_build("", "b9867") is False
+    assert engine_build.same_build("b9867", "") is False
+    assert engine_build.same_build("", "") is True
+
+
+def test_unparseable_strings_fall_back_to_exact_comparison():
+    assert engine_build.same_build("weird", "weird") is True
+    assert engine_build.same_build("weird", "other") is False

@@ -205,7 +205,8 @@ def prune_calibration(cal: dict, keep_per_identity: int = 1) -> dict:
 
 def save_calibration(key: str, measured: dict, flags: dict | None = None,
                      calibrated: bool = False, ctx: int = 0,
-                     identity: hwid.HardwareIdentity | None = None) -> None:
+                     identity: hwid.HardwareIdentity | None = None,
+                     backend: str = "") -> None:
     cal = load_calibration()
     entry = cal.get(key, {})
     entry["measured"] = measured
@@ -219,7 +220,12 @@ def save_calibration(key: str, measured: dict, flags: dict | None = None,
     # kept being applied. `schema` marks entries that carry this; anything
     # without it is from before and is read leniently.
     entry["schema"] = 3
-    entry["engine"] = _engine_version()
+    # R3-ENG-6: the MEASURED build, via the backend this calibration was taken on.
+    # Recording the manifest string here made this field useless: calibration_stale
+    # compared it against the same manifest string, so an engine change could never
+    # invalidate anything. On the owner's machine the fork in `rocm/` was labelled
+    # `b9867` for exactly this reason.
+    entry["engine"] = _engine_version(backend)
     # R3-CAL-1: WHICH CARD. Without it a 3090 silently inherits a 4090's number,
     # which is the failure mode that is invisible rather than loud. The identity is
     # recorded as a field as well as being part of the key so a stale entry can
@@ -389,7 +395,7 @@ def _log_rows(plan, rows: list[dict], best: dict | None) -> None:
         for r in rows:
             _log_row({"date": stamp, "model": plan.model_slug,
                       "quant": plan.gguf.quant, "backend": plan.backend,
-                      "ctx": plan.flags.ctx, "engine": _engine_version(),
+                      "ctx": plan.flags.ctx, "engine": _engine_version(plan.backend),
                       "label": r.get("label"), "flags": r.get("flags") or {},
                       "tg_tps": r.get("tg_tps"), "pp_tps": r.get("pp_tps"),
                       "ok": bool(r.get("ok")), "error": r.get("error", ""),
@@ -398,12 +404,18 @@ def _log_rows(plan, rows: list[dict], best: dict | None) -> None:
         pass          # a sweep that lost its log is still a sweep
 
 
-def _engine_version() -> str:
+def _engine_version(backend: str = "") -> str:
     """Which llama.cpp build produced these numbers. A calibration measured on
-    one engine is not evidence about another, and nothing recorded this."""
+    one engine is not evidence about another, and nothing recorded this.
+
+    R3-ENG-6: takes the backend because the builds on disk can differ per backend —
+    on the owner's machine `rocm` held a third-party fork while `vulkan`/`cpu` held
+    the pin — and `server_ops.engine_version` now measures the binary rather than
+    returning the manifest string.
+    """
     try:
         from .server_ops import engine_version
-        return engine_version()
+        return engine_version(backend)
     except Exception:
         return ""
 
@@ -533,7 +545,7 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
         key = calibration_key(plan.model_slug, plan.gguf.quant, plan.backend)
         save_calibration(key, {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"]},
                          flags=best["flags"], calibrated=mark_calibrated,
-                         ctx=plan.flags.ctx,
+                         ctx=plan.flags.ctx, backend=plan.backend,
                          identity=_identity_cache_key(plan.backend))
     return rows
 
@@ -572,7 +584,8 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
         if key not in load_calibration():
             save_calibration(key, entry.get("measured", {}),
                              flags=entry.get("flags"), calibrated=True,
-                             ctx=entry.get("ctx", 0), identity=ident)
+                             ctx=entry.get("ctx", 0), backend=plan.backend,
+                             identity=ident)
         return _apply(plan)
     if plan.backend == "cpu":
         return plan   # nothing worth measuring on CPU

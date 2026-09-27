@@ -38,11 +38,16 @@ class ResolveError(RuntimeError):
     pass
 
 
-def _engine_now() -> str:
-    """The llama.cpp build this plan will launch on, or "" if unknowable."""
+def _engine_now(backend: str = "") -> str:
+    """The llama.cpp build this plan will launch on, or "" if unknowable.
+
+    Takes the backend because a plan runs on ONE backend and the builds on disk can
+    differ: on the owner's machine `rocm` held a third-party fork while `vulkan` and
+    `cpu` held the pin, so asking without a backend could report the wrong one.
+    """
     try:
         from .server_ops import engine_version
-        return engine_version()
+        return engine_version(backend)
     except Exception:
         return ""
 
@@ -97,7 +102,7 @@ def _apply_calibration(plan: RunPlan,
         # server_ops._measured_placement gated the very same keys on an exact
         # ctx match. Two policies for one set of flags; this is the strict one.
         reason = calibration_stale(entry, _desktop_vram_mb(profile),
-                                   _engine_now(), plan.flags.ctx,
+                                   _engine_now(plan.backend), plan.flags.ctx,
                                    current_identity(plan.backend))
         if reason:
             plan.explain.append(f"calibration override skipped: {reason}")

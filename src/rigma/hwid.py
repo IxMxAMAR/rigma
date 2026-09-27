@@ -196,6 +196,25 @@ def hard_mismatch(entry: dict, identity: HardwareIdentity) -> str | None:
     return None
 
 
+def _same_engine(a: str, b: str) -> bool:
+    """Whether two engine strings name the same build.
+
+    Delegates to `engine_build.same_build`, which exists because engine strings come
+    from two producers: older entries recorded the bare manifest version ("b9867")
+    and current code records the measured identity ("b9867+152d337fa"). A plain `!=`
+    would call those different and discard every valid calibration on upgrade.
+
+    Falls back to a strict compare if `engine_build` cannot be imported, so a partial
+    install degrades to the old behaviour rather than raising inside a staleness
+    check.
+    """
+    try:
+        from .engine_build import same_build
+        return same_build(a, b)
+    except Exception:
+        return a == b
+
+
 def soft_reasons(entry: dict, identity: HardwareIdentity, *,
                  engine: str = "", ctx: int = 0) -> list[str]:
     """Conditions that changed on the SAME card. Stale, not wrong.
@@ -210,7 +229,7 @@ def soft_reasons(entry: dict, identity: HardwareIdentity, *,
             and old.driver_version != identity.driver_version:
         out.append(f"measured on driver {old.driver_version}, "
                    f"now {identity.driver_version}")
-    if engine and entry.get("engine") and entry["engine"] != engine:
+    if engine and entry.get("engine") and not _same_engine(entry["engine"], engine):
         out.append(f"measured on engine {entry['engine']}, now {engine}")
     if ctx and entry.get("ctx") and entry["ctx"] != ctx:
         out.append(f"measured at ctx {entry['ctx']:,}, now {ctx:,}")
