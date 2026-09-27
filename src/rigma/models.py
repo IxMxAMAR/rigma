@@ -54,6 +54,14 @@ class GpuInfo(BaseModel):
     arch: str = "unknown"
     slug: str = "unknown"
     backends: list[str] = Field(default_factory=list)
+    # R3-CAL-1: what a calibration needs to say WHICH card it was measured on.
+    # `device_id` identifies the model, not the card, so it is not enough alone —
+    # `device_uuid` is the per-card value. All three are optional because the CPU
+    # backend has none and an old loader may not report a UUID.
+    vendor_id: int | None = None
+    device_id: int | None = None
+    device_uuid: str = ""
+    driver_version: int | str | None = None
 
 
 class CpuInfo(BaseModel):

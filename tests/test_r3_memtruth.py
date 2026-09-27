@@ -258,6 +258,107 @@ def test_comparison_says_nothing_without_a_measurement():
     assert memtruth.compare(1000.0, memtruth.parse_fit_output("")) is None
 
 
+# --- the engine's "free" is not always true ---------------------------------
+#
+# MEASURED on the owner's machine (RX 9070 XT, ROCm on Windows). With a real
+# llama-server holding ~13 GB of a 16 GB card, `llama-fit-params` reported:
+#
+#   projected to use 359 MiB of device memory vs. 16140 MiB of free device memory
+#   will leave 15780 >= 1024 MiB of free device memory, no changes needed
+#
+# while the Windows GPU performance counter read 13,149 MiB dedicated in use. The
+# engine believed it had the whole card while the card was full, and its own
+# `--fit` verdict said "fits". These tests pin that.
+
+def test_the_engine_overstating_free_memory_is_caught():
+    """16140 claimed vs ~3155 actually free, on a 16304 MiB card."""
+    why = memtruth.free_memory_disagreement(16140, 13149, 16304)
+    assert why is not None
+    assert "16140" in why or "16,140" in why
+    assert "OS says" in why
+    assert "wrong number" in why, "it must say the VERDICT is unusable, not just differ"
+
+
+def test_agreement_stays_silent():
+    """A cross-check that fires on ordinary lag would be noise, and noise gets
+    ignored — which is how a real warning stops working."""
+    assert memtruth.free_memory_disagreement(16140, 200, 16304) is None
+    assert memtruth.free_memory_disagreement(16140, 300, 16304) is None
+
+
+def test_a_small_disagreement_is_tolerated():
+    """Two readings taken milliseconds apart legitimately differ a little.
+
+    16,000 claimed vs 15,904 actual is ~96 MiB, inside the tolerance.
+    """
+    assert memtruth.free_memory_disagreement(16000, 400, 16304) is None   # ~96 MiB
+    assert memtruth.free_memory_disagreement(16000, 5000, 16304) is not None
+
+
+def test_no_os_reading_leaves_the_engine_alone():
+    """None is not zero: a non-Windows host must not be treated as a full card."""
+    assert memtruth.free_memory_disagreement(16140, None, 16304) is None
+    assert memtruth.free_memory_disagreement(None, 13149, 16304) is None
+    assert memtruth.free_memory_disagreement(16140, 13149, None) is None
+
+
+def test_a_disagreement_replaces_the_free_reading_and_the_verdict(tmp_path):
+    """The accounting is kept, the verdict is discarded: a fit decision made
+    against a wrong "free" is not a fit decision.
+
+    Here the engine says a 9000 MiB plan fits in 16140 MiB free, while the OS
+    reports 13000 MiB in use on a 16304 MiB card — so the plan does NOT fit and
+    must not be reported as fitting.
+    """
+    (tmp_path / "llama-server.exe").write_bytes(b"x")
+    (tmp_path / "llama-fit-params.exe").write_bytes(b"x")
+    engine_output = (
+        "0.00.1 I common_memory_breakdown_print: |   - ROCm0 (RX 9070 XT) "
+        "| 16304 = 16140 + (9000 =    82 +    8918 +      97) +      -3983 |\n"
+        "0.00.2 I common_params_fit_impl: projected to use 9000 MiB of device "
+        "memory vs. 16140 MiB of free device memory\n"
+        "0.00.3 I common_params_fit_impl: will leave 7140 >= 1024 MiB of free "
+        "device memory, no changes needed\n")
+
+    def fake(*a, **k):
+        return subprocess.CompletedProcess(a[0], 0, SMOL_STDOUT, engine_output)
+
+    res, why = memtruth.verify_plan(
+        _a_plan(), "m.gguf", tmp_path / "llama-server.exe", popen=fake,
+        adapter_used_mb=13000)
+    assert why is not None
+    assert res.ok is False, "a plan that does not fit was reported as fitting"
+    assert res.free_mb == 3304, "free must be the OS figure, not the engine's"
+    assert res.primary.self_mb == 9097, "the accounting must survive"  # 82+8918+97
+
+
+def test_a_plan_that_fits_against_the_real_free_still_fits(tmp_path):
+    """The correction must not turn every plan into a refusal.
+
+    Here the engine and the OS agree (~16140 vs 16104), so the engine's figure is
+    left exactly as it was — the cross-check corrects a WRONG reading, it does not
+    substitute its own when there is nothing wrong.
+    """
+    (tmp_path / "llama-server.exe").write_bytes(b"x")
+    (tmp_path / "llama-fit-params.exe").write_bytes(b"x")
+    engine_output = (
+        "0.00.1 I common_memory_breakdown_print: |   - ROCm0 (RX 9070 XT) "
+        "| 16304 = 16140 + ( 899 =    82 +     720 +      97) +       -735 |\n"
+        "0.00.2 I common_params_fit_impl: projected to use 899 MiB of device "
+        "memory vs. 16140 MiB of free device memory\n"
+        "0.00.3 I common_params_fit_impl: will leave 15240 >= 1024 MiB of free "
+        "device memory, no changes needed\n")
+
+    def fake(*a, **k):
+        return subprocess.CompletedProcess(a[0], 0, SMOL_STDOUT, engine_output)
+
+    res, _ = memtruth.verify_plan(
+        _a_plan(), "m.gguf", tmp_path / "llama-server.exe", popen=fake,
+        adapter_used_mb=200)
+    assert res.ok is True
+    assert res.free_mb == 16140, "an agreeing reading must not be rewritten"
+
+
 # --- the plan-side helpers --------------------------------------------------
 
 def _a_plan(slug="qwen3-0.6b", ctx=8192, k="f16", v="f16"):

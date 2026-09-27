@@ -80,9 +80,9 @@ def _desktop_vram_mb(profile: HardwareProfile | None) -> float | None:
 
 def _apply_calibration(plan: RunPlan,
                        profile: HardwareProfile | None = None) -> RunPlan:
-    from .bench import calibration_stale, load_calibration
-    key = f"{plan.model_slug}:{plan.gguf.quant}:{plan.backend}"
-    entry = load_calibration().get(key)
+    from .bench import calibration_entry, calibration_stale, current_identity, load_calibration
+    key, entry = calibration_entry(load_calibration(), plan.model_slug,
+                                   plan.gguf.quant, plan.backend)
     if entry and entry.get("flags"):
         # AUDIT F17: docs/audit-2026-09-04-full.md
         # The key is model:quant:backend and nothing else, so a stored
@@ -97,7 +97,8 @@ def _apply_calibration(plan: RunPlan,
         # server_ops._measured_placement gated the very same keys on an exact
         # ctx match. Two policies for one set of flags; this is the strict one.
         reason = calibration_stale(entry, _desktop_vram_mb(profile),
-                                   _engine_now(), plan.flags.ctx)
+                                   _engine_now(), plan.flags.ctx,
+                                   current_identity(plan.backend))
         if reason:
             plan.explain.append(f"calibration override skipped: {reason}")
             return plan
