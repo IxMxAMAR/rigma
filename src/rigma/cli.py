@@ -952,6 +952,18 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
         typer.echo(f"verify: {rp.gguf.file} is not downloaded yet "
                    "(`rigma up` fetches it first)")
         return
+    # R3-ENG-2/4: can this engine load this model AT ALL? Asked before the memory
+    # oracle, because a file the engine cannot open makes the memory question moot —
+    # and the oracle would report it as a load failure after doing real work, which is
+    # how the owner met this: an opaque `invalid ggml type 142. should be in [0, 42)`.
+    #
+    # The engine's own `[0, N)` bound is measured, not assumed, so the verdict is for
+    # THIS build rather than for mainline in general.
+    _compat_note = _engine_compat_note(model_path, server_exe, rp.backend)
+    if _compat_note:
+        typer.echo(_compat_note)
+        if refuse:
+            raise typer.Exit(1)
     res, disagree = memtruth.verify_plan(
         rp, str(model_path), server_exe,
         os_free_probe=_adapter_vram_used_mb)
@@ -978,6 +990,73 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
         typer.echo(f"         {res.reason}")
     if refuse and not res.ok:
         raise typer.Exit(1)
+
+
+def _engine_compat_note(model_path, server_exe, backend: str) -> str:
+    """Whether this engine can load this model, as a printable note (R3-ENG-2/4).
+
+    Returns "" when it can, or when the answer is not knowable — an unknown is never
+    printed as a problem, because a false warning about a model that loads fine is
+    worse than no warning.
+
+    The engine's type-table size is read from its own `should be in [0, N)` error by
+    running the cheap `llama-fit-params` oracle, so the bound describes THIS build:
+    the pinned b9867 accepts ids below 42 and therefore rejects Q2_0 = 42, which
+    exists on master only.
+    """
+    from . import engine_compat
+    try:
+        c = engine_compat.check_gguf(model_path)
+    except Exception:
+        return ""
+    if c.ok:
+        return ""
+
+    # The model side says it needs something mainline lacks. Before saying so, ASK
+    # THE ENGINE — a registered fork may load this file perfectly well, and warning
+    # about a model that loads is exactly the false alarm this must not produce.
+    # `_engine_type_count` returns None precisely when the engine did NOT refuse the
+    # file, which is the authoritative answer and overrides the model-side guess.
+    count = _engine_type_count(server_exe, model_path)
+    if count is None:
+        return ""
+    try:
+        from .gguf_meta import read_tensor_index
+        idx = read_tensor_index(model_path)
+        c = engine_compat.check_engine(idx.type_counts, engine_type_count=count,
+                                       backend=backend, complete=idx.types_complete)
+    except Exception:
+        pass
+    if c.ok:
+        return ""
+    lines = ["verify: THIS ENGINE CANNOT LOAD THIS MODEL", f"         {c.reason}"]
+    if c.advice:
+        lines.append(f"         fix: {c.advice}")
+    return "\n".join(lines)
+
+
+def _engine_type_count(server_exe, model_path) -> int | None:
+    """The engine's `GGML_TYPE_COUNT`, read from its own refusal to load a model.
+
+    llama.cpp prints `should be in [0, N)` where N is the binary's compiled-in type
+    count, which fingerprints which enum it was built from — 42 for the pinned
+    b9867, 43 for current mainline, 144 for the PrismML fork. There is no flag or API
+    that reports it (the research checked), so a deliberate failed load is the only
+    way to ask.
+
+    Cheap: `llama-fit-params` does no allocation and rejects an unloadable file in
+    about a tenth of a second.
+    """
+    from . import engine_compat, memtruth
+    exe = memtruth.fit_params_bin(server_exe)
+    if exe is None:
+        return None
+    try:
+        res = memtruth.run_fit(str(exe), ["-m", str(model_path), "-c", "512",
+                                          "-ngl", "1"], timeout=30.0)
+    except Exception:
+        return None
+    return engine_compat.parse_type_count(getattr(res, "load_error", "") or "")
 
 
 def _adapter_vram_used_mb() -> float | None:
