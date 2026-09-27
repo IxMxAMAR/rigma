@@ -95,9 +95,12 @@ def test_a_placement_measured_at_another_context_is_not_replayed(home, monkeypat
 def test_a_placement_measured_on_another_engine_is_not_replayed(home, monkeypatch):
     from rigma import server_ops
     monkeypatch.setattr(probe, "gpu_used_mb", lambda: 1100.0)
-    monkeypatch.setattr(server_ops, "engine_version", lambda: "b9867")
+    # R3-ENG-6: engine_version now takes the backend, because the builds on disk can
+    # differ per backend. The stub has to accept it or the lookup raises, falls back
+    # to "" and silently disables the very check under test.
+    monkeypatch.setattr(server_ops, "engine_version", lambda backend="": "b9867")
     save_calibration(_COMBO_KEY, {"tg_tps": 57.1}, flags={"n_cpu_moe": 8})
-    monkeypatch.setattr(server_ops, "engine_version", lambda: "b9999")
+    monkeypatch.setattr(server_ops, "engine_version", lambda backend="": "b9999")
 
     plan = resolve(_profile(), Registry.load(), use_case="coding")
 

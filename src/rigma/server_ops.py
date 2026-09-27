@@ -16,10 +16,51 @@ def ram_snapshot() -> dict:
             "ram_total_mb": int(m.total / 2**20)}
 
 
-def engine_version() -> str:
+def engine_version(backend: str = "") -> str:
+    """Which engine build is actually installed — measured, not the manifest claim.
+
+    R3-ENG-6. This used to return the MANIFEST's version string, which is a claim
+    about what was downloaded rather than a fact about what is on disk. That broke
+    calibration in a way nothing could detect: `bench.save_calibration` stamps every
+    entry with this value, and `bench.calibration_stale` compares a stored entry
+    against this same value — so an engine change compared the manifest to itself and
+    could never invalidate anything. On the owner's machine the pinned directory
+    `~/.rigma/engines/b9867/rocm/` held a THIRD-PARTY FORK, build 10709, and every
+    calibration measured on it was labelled `b9867`.
+
+    Now the binary is asked. `engine_build.cached_build` memoises on (path, size,
+    mtime), so this is one process spawn per binary per process rather than per call,
+    and replacing a binary at the same path invalidates it.
+
+    Falls back to the manifest string when no binary can be found or run: the honest
+    answer is then "we do not know", and the manifest is at least the intended value.
+    A backend of "" checks every installed backend and returns the first that answers,
+    which is what a caller with no plan context wants.
+    """
+    from . import engine_build, runtime
     try:
-        from .runtime import _engines_manifest
-        return str(_engines_manifest().get("version", ""))
+        man = runtime._engines_manifest()
+        want = str(man.get("version", ""))
+        assets = man.get("assets") or {}
+        backends = [backend] if backend else [
+            b for b in ("vulkan", "rocm", "cuda", "cpu")
+            if f"windows/{b}" in assets or f"linux/{b}" in assets]
+        name = "llama-server.exe" if os.name == "nt" else "llama-server"
+        for b in backends:
+            root = runtime.rigma_home() / "engines" / want / b
+            if not root.exists():
+                continue
+            exe = root / name
+            if not exe.exists():
+                exe = next(root.rglob(name), None)
+            if exe is None:
+                continue
+            got = engine_build.cached_build(exe)
+            if got.ok:
+                # The real build, so a calibration can go stale when it changes and a
+                # fork can be told apart from the pin.
+                return got.identity
+        return want
     except Exception:
         return ""
 

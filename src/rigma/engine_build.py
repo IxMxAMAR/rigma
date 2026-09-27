@@ -251,3 +251,45 @@ def verify_engine(exe: str | Path, expected_version: str, *,
     """
     got = cached_build(exe, popen=popen)
     return got, matches_manifest(got, expected_version)
+
+
+def same_build(a: str, b: str) -> bool:
+    """Whether two engine strings name the same build.
+
+    Engine strings are written by two different producers and must compare equal
+    across both, or a calibration measured before R3-ENG-6 would be discarded the
+    moment R3-ENG-6 started recording a fuller answer:
+
+      * `"b9867"`             — the manifest version, recorded by older entries
+      * `"b9867+152d337fa"`   — the measured identity recorded now
+      * `"b10709+9a9394a89"`  — the fork, which must NOT match either of the above
+
+    Compared by build number and, when both sides carry one, by commit. A commit
+    mismatch on the same build number is treated as a DIFFERENT build, because a
+    re-tagged release and a fork can share the counter — that is the whole reason
+    identity carries the commit at all.
+    """
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+
+    def split(s: str) -> tuple[int | None, str]:
+        head, _, tail = s.partition("+")
+        m = re.fullmatch(r"b?(\d+)", head.strip())
+        return (int(m.group(1)) if m else None), tail.strip().lower()
+
+    na, ca = split(a)
+    nb, cb = split(b)
+    if na is None or nb is None:
+        return False
+    if na != nb:
+        return False
+    # Both name a commit: they must agree.
+    if ca and cb:
+        return ca.startswith(cb) or cb.startswith(ca)
+    # Only one names a commit (the older, shorter form): the build number is all we
+    # have to go on, and refusing to match would throw away a valid calibration.
+    return True
