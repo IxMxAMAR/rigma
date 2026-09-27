@@ -89,6 +89,43 @@ def test_unrecognised_output_is_not_a_version():
     assert "version line" in b.reason
 
 
+# --- lenient fallback --------------------------------------------------------
+# The research for this module was explicit that format-matching must not be the
+# only path: the format already differs between the two builds in this defect, and
+# `llama-bench --version` only gained the flag in PR #28971. A `bNNNN` is
+# `git rev-list --count HEAD`, so any plausible build number is better than nothing.
+
+def test_an_unfamiliar_format_still_yields_a_build_number():
+    b = engine_build.parse_version("version b4321, commit deadbeefcafe\n")
+    assert b.ok is True
+    assert b.build == 4321
+    assert b.commit == "deadbeefcafe"
+
+
+def test_a_version_line_with_no_number_is_still_unknown():
+    """Leniency must not become invention: text that says 'version' but carries no
+    build number is an unknown, not a guess."""
+    b = engine_build.parse_version("version: unknown\n")
+    assert b.ok is False
+    assert b.build is None
+
+
+def test_text_with_no_version_line_is_never_guessed_at():
+    """The guard that keeps the loose path honest. Without it, any stray number in
+    a binary's output would be read as its build."""
+    b = engine_build.parse_version("built with Clang 20.1.8 for Windows x86_64\n")
+    assert b.ok is False
+    assert b.build is None
+
+
+def test_the_exact_patterns_win_over_the_loose_one():
+    """Loose matching is a last resort, so a well-formed line must not be misread.
+    The commit hash here contains digits that a loose scan could grab."""
+    b = engine_build.parse_version(LEGACY)
+    assert b.build == 9867
+    assert b.commit == "152d337fa"
+
+
 def test_a_missing_binary_is_not_a_version(tmp_path):
     b = engine_build.read_build(tmp_path / "nope.exe")
     assert b.ok is False and "does not exist" in b.reason
