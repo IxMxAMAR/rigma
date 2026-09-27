@@ -141,3 +141,85 @@ def test_matches_manifest_is_false_when_nothing_was_measured():
     how a fork goes unnoticed."""
     assert engine_build.matches_manifest(engine_build.parse_version(""), "b9867") is False
     assert engine_build.matches_manifest(engine_build.parse_version(LEGACY), "") is False
+
+
+# --- cached verification -----------------------------------------------------
+
+def _exe(tmp_path, name="llama-server.exe"):
+    p = tmp_path / name
+    p.write_bytes(b"x")
+    return p
+
+
+def test_cached_build_spawns_once(tmp_path):
+    """`--version` is a process spawn on a hot-ish path, and the answer cannot
+    change unless the file does."""
+    exe = _exe(tmp_path)
+    calls = {"n": 0}
+
+    def fake(*a, **k):
+        calls["n"] += 1
+        return subprocess.CompletedProcess(a[0], 0, "", LEGACY)
+
+    engine_build._BUILD_CACHE.clear()
+    assert engine_build.cached_build(exe, popen=fake).build == 9867
+    assert engine_build.cached_build(exe, popen=fake).build == 9867
+    assert calls["n"] == 1
+
+
+def test_replacing_the_binary_invalidates_the_cache(tmp_path):
+    """Exactly how the owner's fork arrived: a different binary written to the same
+    path. A path-keyed cache would report the old build forever and hide it."""
+    exe = _exe(tmp_path)
+    modern = {"v": False}
+
+    def fake(*a, **k):
+        return subprocess.CompletedProcess(a[0], 0, "", MODERN if modern["v"] else LEGACY)
+
+    engine_build._BUILD_CACHE.clear()
+    assert engine_build.cached_build(exe, popen=fake).build == 9867
+    # same path, different file: change size and mtime
+    modern["v"] = True
+    exe.write_bytes(b"a much longer replacement binary")
+    assert engine_build.cached_build(exe, popen=fake).build == 10709
+
+
+def test_an_unreadable_build_is_not_cached(tmp_path):
+    """A transient failure must not freeze 'unknown' for the life of the process."""
+    exe = _exe(tmp_path)
+    state = {"fail": True}
+
+    def fake(*a, **k):
+        if state["fail"]:
+            raise OSError("transient")
+        return subprocess.CompletedProcess(a[0], 0, "", LEGACY)
+
+    engine_build._BUILD_CACHE.clear()
+    assert engine_build.cached_build(exe, popen=fake).ok is False
+    state["fail"] = False
+    assert engine_build.cached_build(exe, popen=fake).build == 9867
+
+
+def test_verify_engine_flags_the_fork_against_the_pin(tmp_path):
+    """The real situation, end to end: a directory claiming to be b9867 that holds
+    build 10709."""
+    exe = _exe(tmp_path)
+
+    def fake(*a, **k):
+        return subprocess.CompletedProcess(a[0], 0, "", MODERN)
+
+    engine_build._BUILD_CACHE.clear()
+    got, ok = engine_build.verify_engine(exe, "b9867", popen=fake)
+    assert ok is False
+    assert got.build == 10709
+
+
+def test_verify_engine_accepts_the_real_pin(tmp_path):
+    exe = _exe(tmp_path)
+
+    def fake(*a, **k):
+        return subprocess.CompletedProcess(a[0], 0, "", LEGACY)
+
+    engine_build._BUILD_CACHE.clear()
+    got, ok = engine_build.verify_engine(exe, "b9867", popen=fake)
+    assert ok is True and got.build == 9867
