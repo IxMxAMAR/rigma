@@ -9,6 +9,20 @@ def _plan(**fl):
                    origin="calculator")
 
 
+def _only_entry():
+    """The single entry a sweep wrote.
+
+    R3-CAL-1 put the hardware identity in the key, so the literal
+    "m:Q4:vulkan" is no longer the key on any machine — it is
+    "m:Q4:vulkan:<digest>", and the digest differs per machine. A sweep writes
+    exactly one entry, so taking the only one keeps these tests deterministic
+    instead of making them depend on which GPU happens to be installed.
+    """
+    cal = bench.load_calibration()
+    assert len(cal) == 1, cal
+    return next(iter(cal.values()))
+
+
 def test_sweep_configs_moe_includes_key_axes():
     cfgs = dict(bench.sweep_configs(ComboFlags(ctx=8192, n_cpu_moe=4), moe=True))
     labels = " ".join(cfgs)
@@ -41,7 +55,7 @@ def test_run_sweep_picks_best_and_saves(monkeypatch, tmp_path):
     rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
                            port=11601)
     assert rows[0]["label"] == "fa-off" and rows[0]["tg_tps"] == 70
-    cal = bench.load_calibration()["m:Q4:vulkan"]
+    cal = _only_entry()
     assert cal["flags"]["flash_attn"] == "off"
 
 
@@ -66,7 +80,7 @@ def test_a_config_with_no_usable_measurement_is_a_loss(monkeypatch, tmp_path):
                            port=11601)
     assert all(r["ok"] is False for r in rows)
     assert bench.crowned_row(rows) is None
-    assert "m:Q4:vulkan" not in bench.load_calibration()
+    assert bench.load_calibration() == {}
 
 
 def test_quick_configs_is_short_and_baseline_first():
@@ -273,7 +287,7 @@ def test_the_rows_log_never_breaks_a_sweep(monkeypatch, tmp_path):
     rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
                            port=11601)
     assert rows and rows[0]["label"] == "fa-off"
-    assert bench.load_calibration()["m:Q4:vulkan"]["flags"]["flash_attn"] == "off"
+    assert _only_entry()["flags"]["flash_attn"] == "off"
 
 
 def test_a_calibration_entry_says_what_it_was_measured_on(monkeypatch, tmp_path):
@@ -287,7 +301,12 @@ def test_a_calibration_entry_says_what_it_was_measured_on(monkeypatch, tmp_path)
                 [("fa-off", {"flash_attn": "off"})])
     bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
                     port=11601)
-    entry = bench.load_calibration()["m:Q4:vulkan"]
-    assert entry["schema"] == 2
+    entry = _only_entry()
+    assert entry["schema"] == 3
     assert entry["ctx"] == 8192
     assert "engine" in entry
+    # R3-CAL-1: and now WHICH CARD, so a 3090 cannot silently inherit a 4090's
+    # number. The identity is in the key AND recorded in the entry, so a stale
+    # entry can explain itself rather than just being absent.
+    assert entry["hardware"]["id"]
+    assert entry["hardware"]["backend"] == "vulkan"
