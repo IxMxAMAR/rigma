@@ -139,6 +139,39 @@ class TensorIndex:
     mtp_blocks: int = 0
     max_block: int = -1
     truncated: bool = False   # ranged read ended mid-table: absence proves nothing
+    # R3-ENG-2: ggml type id -> how many tensors use it.
+    #
+    # The type id was ALREADY being read and thrown away (it sits between the dims
+    # and the offset, so skipping it is unavoidable to reach the offset). Capturing
+    # it therefore costs nothing — no extra byte is read — and it is the one piece of
+    # information that predicts whether an engine can load this file at all.
+    #
+    # The motivating case: Ternary-Bonsai-2-27B-PQ2_0 uses ggml type 142, which is
+    # PRIVATE to a third-party llama.cpp fork (PrismML-Eng, GGML_TYPE_PQ2_0). Mainline
+    # numbers stop at GGML_TYPE_Q2_0 = 42. Rigma planned that model, launched the
+    # pinned mainline build, and the engine died at load with an opaque
+    # `invalid ggml type 142. should be in [0, 42)` — a fact that was sitting in the
+    # file's own header the whole time.
+    #
+    # Only meaningful when the table was read whole; see `types_complete`.
+    type_counts: dict = field(default_factory=dict)
+
+    @property
+    def types_complete(self) -> bool:
+        """True when `type_counts` covers every tensor.
+
+        A ranged read can stop mid-table, and a partial histogram is actively
+        misleading here: it would suggest a file uses only the types seen so far.
+        `truncated` already carries this distinction for the same reason.
+        """
+        return not self.truncated
+
+    @property
+    def ggml_types(self) -> list[int] | None:
+        """The distinct ggml type ids in the file, or None if not fully read."""
+        if self.truncated:
+            return None
+        return sorted(self.type_counts)
 
     @property
     def has_mtp(self) -> bool | None:
@@ -167,12 +200,13 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
             n = 1
             for _ in range(n_dims):
                 n *= _read(f, "<Q", 8)
-            _read(f, "<I", 4)         # ggml type
+            gtype = _read(f, "<I", 4)  # ggml type — kept, see TensorIndex.type_counts
             _read(f, "<Q", 8)         # offset
         except GgufParseError:
             idx.truncated = True
             return idx
         idx.params += n
+        idx.type_counts[gtype] = idx.type_counts.get(gtype, 0) + 1
         if name.startswith("blk."):
             head = name.split(".", 2)
             if len(head) > 1 and head[1].isdigit():
