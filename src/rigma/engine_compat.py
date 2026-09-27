@@ -29,6 +29,7 @@ fork's `prism` branch.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 # ggml type ids, from mainline `ggml/include/ggml.h` (master). Deprecated and
@@ -93,8 +94,24 @@ def type_name(tid: int) -> str:
 
 
 def check_types(type_counts: dict | None, *,
-                complete: bool = True) -> Compatibility:
-    """Judge a tensor-type histogram against mainline's type table.
+                complete: bool = True,
+                engine_type_count: int | None = None) -> Compatibility:
+    """Judge a tensor-type histogram against an engine's type table.
+
+    `engine_type_count` is the engine's own `GGML_TYPE_COUNT` — the `N` from its
+    `should be in [0, N)` error. **This matters and is not cosmetic.** An engine
+    rejects any type id `>= N`, so `N` is the authoritative bound for THAT build:
+
+      * pinned b9867 reports `[0, 42)`  -> accepts 0..41, rejects Q2_0 = 42
+      * mainline master reports `[0, 43)` -> accepts 0..42
+      * the PrismML fork reports `[0, 144)`
+
+    A single module-level bound describes only one of those. Using master's 42 as
+    the bound for b9867 produces a FALSE NEGATIVE: a Q2_0 file passes the check and
+    then dies on the pinned engine with `invalid ggml type 42. should be in [0, 42)`.
+    `KNOWN_TYPES` therefore says what each id MEANS, and the engine's own count says
+    whether that build HAS it. Defaulting to mainline's current count keeps the
+    no-engine-context case useful without pretending to be build-specific.
 
     `complete=False` (a truncated ranged read) returns ok=True with a caveat rather
     than a verdict: a partial histogram cannot show that a file is loadable, and
@@ -104,12 +121,25 @@ def check_types(type_counts: dict | None, *,
     if not type_counts:
         return Compatibility(ok=True, reason="no tensor types were read")
 
+    # A partial histogram is not a verdict, and this must return BEFORE any bound
+    # logic: a truncated read cannot show that a file is loadable, but it also must
+    # not manufacture an incompatibility from the types it happened to see.
+    if not complete:
+        return Compatibility(
+            ok=True,
+            reason="the model's tensor table was only partly read, so its types "
+                   "cannot be judged")
+
+    bound = MAINLINE_TYPE_COUNT if engine_type_count is None else int(engine_type_count)
     ids = sorted(type_counts)
     unknown = [t for t in ids if t not in KNOWN_TYPES and t not in FORK_TYPES]
     forks = {t: FORK_TYPES[t][0] for t in ids if t in FORK_TYPES}
-    above = [t for t in ids if t > MAINLINE_MAX_TYPE]
+    # Types this build is too old for: known to mainline, but at or above its count.
+    too_new = [t for t in ids if t not in forks and t >= bound]
+    # Above mainline entirely, i.e. not mainline numbering at all.
+    above = [t for t in ids if t > MAINLINE_MAX_TYPE and t not in forks]
 
-    if not unknown and not forks and not above:
+    if not unknown and not forks and not too_new and not above:
         return Compatibility(ok=True)
 
     if forks:
@@ -127,6 +157,9 @@ def check_types(type_counts: dict | None, *,
             advice=(f"install a build of {' or '.join(repos)} and point Rigma at it; "
                     f"upgrading the pinned mainline engine will not help"))
 
+    # `above` is checked before `too_new` on purpose. A type beyond mainline's whole
+    # range is not a newer type this build lacks — it is different numbering, and
+    # telling that user to "upgrade mainline" would send them somewhere useless.
     if above:
         names = ", ".join(f"{type_name(t)}={t}" for t in above)
         return Compatibility(
@@ -135,6 +168,17 @@ def check_types(type_counts: dict | None, *,
             reason=(f"this model uses {names}, above mainline's highest type id "
                     f"({MAINLINE_MAX_TYPE}); it was made for a different engine"),
             advice="install the engine this model was made for and point Rigma at it")
+
+    if too_new:
+        names = ", ".join(f"{type_name(t)}={t}" for t in too_new)
+        return Compatibility(
+            ok=False,
+            unknown_types=too_new,
+            reason=(f"this model uses {names}, which mainline llama.cpp defines but "
+                    f"this engine build does not have — its type table ends at "
+                    f"{bound}, so it accepts only ids below that"),
+            advice=("upgrade the engine build: this one predates that type. A newer "
+                    "mainline build accepts it; no fork is needed"))
 
     names = ", ".join(f"{type_name(t)}={t}" for t in unknown)
     return Compatibility(
@@ -158,3 +202,84 @@ def check_gguf(path) -> Compatibility:
     except Exception as e:
         return Compatibility(ok=True, reason=f"could not read the model's types: {e}")
     return check_types(idx.type_counts, complete=idx.types_complete)
+
+
+# --- the engine side: fingerprint a build from its own error ------------------
+
+# Verbatim from llama.cpp's gguf.cpp:
+#   "%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n"
+# The bound is GGML_TYPE_COUNT — a raw enum count that includes permanently-unused
+# holes, so it is NOT a capability list. It is, however, a precise readout of which
+# enum the binary was compiled from, which makes it a cheap provenance fingerprint.
+_TYPE_COUNT_RE = re.compile(r"should be in\s*\[\s*\d+\s*,\s*(?P<n>\d+)\s*\)", re.I)
+
+# Counts measured or sourced for real builds. `GGML_TYPE_COUNT` moves only when a
+# type is appended, so these are stable and few.
+KNOWN_TYPE_COUNTS: dict[int, tuple[str, str]] = {
+    40: ("mainline llama.cpp", "before MXFP4 was appended"),
+    42: ("mainline llama.cpp", "before Q2_0 was appended (this is b9867)"),
+    43: ("mainline llama.cpp", "current master"),
+    144: ("PrismML-Eng/llama.cpp", "branch 'prism' — adds PQ2_0=142, PTQ1_0=143"),
+}
+
+
+def parse_type_count(text: str) -> int | None:
+    """The `N` from `should be in [0, N)`, or None. Pure, never raises."""
+    m = _TYPE_COUNT_RE.search(text or "")
+    return int(m.group("n")) if m else None
+
+
+def provenance(type_count: int | None) -> tuple[str, str]:
+    """(who made this build, how we know) from its type-table size.
+
+    Unknown counts return ("", reason) rather than a guess: a count we have never
+    seen is evidence of nothing, and naming the wrong vendor would send a user to
+    install the wrong engine.
+    """
+    if type_count is None:
+        return "", "the engine did not report its type table size"
+    hit = KNOWN_TYPE_COUNTS.get(type_count)
+    if hit:
+        return hit[0], hit[1]
+    return "", (f"an engine whose type table ends at {type_count}; not a count this "
+                f"build of Rigma recognises")
+
+
+def check_engine(type_counts: dict | None, *, engine_type_count: int | None = None,
+                 backend: str = "", complete: bool = True) -> Compatibility:
+    """Judge a model against an engine, using the engine's own reported table size.
+
+    Same verdict as `check_types`, but when the engine's `GGML_TYPE_COUNT` is known
+    the message can say *which* build the engine is, not merely that it refused:
+
+        before: the engine cannot load this model: invalid ggml type 142
+        after:  this engine's type table ends at 42, which is mainline llama.cpp
+                before Q2_0 — the model needs PQ2_0=142, private to
+                PrismML-Eng/llama.cpp
+
+    `engine_type_count` is the `N` from the engine's own `[0, N)` error, so it is
+    measured rather than declared.
+    """
+    c = check_types(type_counts, complete=complete,
+                    engine_type_count=engine_type_count)
+    if c.ok:
+        # Includes the truncated-read case, where check_types deliberately declines
+        # to give a verdict at all. Decorating that with an engine-side explanation
+        # would manufacture a refusal out of a partial histogram.
+        return c
+
+    who, why = provenance(engine_type_count)
+    if who:
+        c.reason = f"this engine's type table ends at {engine_type_count} ({who}: {why}); {c.reason}"
+    elif engine_type_count is not None:
+        c.reason = f"this engine's type table ends at {engine_type_count}; {c.reason}"
+
+    # PQ2_0 has no Vulkan kernel even on the fork that defines it: its own README
+    # lists Metal/CUDA/HIP/CPU as preferred and points Vulkan users at the
+    # group-64 Q2_0 file instead. A third-party fork exists solely to add the
+    # Vulkan kernel, which is a fair sign it is not in the main line.
+    if backend == "vulkan" and any(t in c.fork_types for t in (142, 143)):
+        c.advice += ("; note that PQ2_0 has no Vulkan kernel even on a PrismML "
+                     "build — use the group-64 Q2_0 variant on Vulkan")
+    return c
+

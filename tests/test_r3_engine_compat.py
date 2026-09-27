@@ -87,6 +87,67 @@ def test_the_boundary_is_exactly_mainline_max():
     assert engine_compat.check_types({0: 1, 43: 1}).ok is False
 
 
+# --- the bound belongs to the ENGINE, not to a constant -----------------------
+# The live false negative this fixes. MAINLINE_MAX_TYPE = 42 describes master, but
+# the PINNED b9867 has GGML_TYPE_COUNT = 42 and so rejects id 42. A module-level
+# bound therefore passed Q2_0 files that then died on the pinned engine with
+# `invalid ggml type 42. should be in [0, 42)` — a check that says "fine" about a
+# file the engine cannot open is worse than no check.
+
+Q2_0_FILE = {0: 1, 8: 5, 42: 40}
+
+
+def test_the_pinned_build_rejects_q2_0_even_though_master_has_it():
+    """b9867 reports `[0, 42)`, i.e. COUNT = 42, i.e. it accepts 0..41 only."""
+    c = engine_compat.check_types(Q2_0_FILE, engine_type_count=42)
+    assert c.ok is False
+    assert "Q2_0" in c.reason
+    assert "42" in c.reason
+
+
+def test_master_accepts_q2_0():
+    """The same file on a build with COUNT = 43. Both answers are correct for their
+    own build, which is exactly why the bound cannot be a constant."""
+    assert engine_compat.check_types(Q2_0_FILE, engine_type_count=43).ok is True
+
+
+def test_the_pinned_build_accepts_q1_0():
+    """b9867 DOES have Q1_0 = 41 — the type added immediately before Q2_0. Getting
+    this wrong in the other direction would refuse a file the pin loads."""
+    assert engine_compat.check_types({0: 1, 41: 1}, engine_type_count=42).ok is True
+
+
+def test_the_too_new_message_says_a_pin_bump_WILL_help():
+    """The opposite advice to the fork case, and the distinction matters: a fork
+    needs that fork, whereas a too-new mainline type needs a newer MAINLINE build.
+    Telling a Q2_0 user to install a fork would send them somewhere useless."""
+    c = engine_compat.check_types(Q2_0_FILE, engine_type_count=42)
+    assert "no fork is needed" in c.advice
+    assert not c.fork_types
+
+
+def test_a_fork_type_is_never_excused_by_a_high_count():
+    """The fork case must not be reachable by raising the bound: 142 is not a newer
+    mainline type, it is different numbering, and a fork build reporting COUNT = 144
+    still does not make it mainline."""
+    c = engine_compat.check_types(BONSAI, engine_type_count=144)
+    assert c.ok is False
+    assert "NO mainline build" in c.reason
+
+
+def test_the_default_bound_describes_current_mainline():
+    """With no engine context the checker is still useful, but it must be describing
+    mainline's current table rather than pretending to know a specific build."""
+    assert engine_compat.check_types(Q2_0_FILE).ok is True
+
+
+def test_an_engine_count_below_every_used_type_rejects_the_file():
+    """A very old build. The mechanism must be general, not special-cased to Q2_0."""
+    c = engine_compat.check_types({0: 1, 14: 5}, engine_type_count=10)
+    assert c.ok is False
+    assert "Q6_K" in c.reason
+
+
 # --- honest degradation ------------------------------------------------------
 
 def test_a_truncated_read_is_not_a_verdict():
@@ -136,3 +197,91 @@ def test_a_truncated_index_reports_no_types():
     idx = TensorIndex(n_tensors=99, type_counts={0: 5}, truncated=True)
     assert idx.ggml_types is None
     assert idx.types_complete is False
+
+
+# --- the engine side: fingerprinting a build from its own error ---------------
+# Verbatim from llama.cpp gguf.cpp:
+#   "%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n"
+# The bound is GGML_TYPE_COUNT. It is NOT a capability list (it counts seven
+# permanently-unused holes), but it IS a precise readout of which enum the binary
+# was compiled from, so it fingerprints mainline-vs-fork.
+
+REAL_ERROR = ("0.00.128.269 E gguf_init_from_reader: tensor 'output.weight' has "
+              "invalid ggml type 142. should be in [0, 42)")
+
+
+def test_the_bound_is_parsed_out_of_a_real_error():
+    assert engine_compat.parse_type_count(REAL_ERROR) == 42
+
+
+def test_a_missing_bound_is_none_not_zero():
+    """0 would read as a real (and absurd) count and fingerprint the engine as
+    something it is not."""
+    assert engine_compat.parse_type_count("") is None
+    assert engine_compat.parse_type_count("some other error") is None
+
+
+def test_b9867s_bound_fingerprints_it_as_mainline_before_q2_0():
+    who, why = engine_compat.provenance(42)
+    assert who == "mainline llama.cpp"
+    assert "Q2_0" in why
+
+
+def test_the_forks_bound_fingerprints_it_as_prismml():
+    who, why = engine_compat.provenance(144)
+    assert who == "PrismML-Eng/llama.cpp"
+    assert "142" in why
+
+
+def test_an_unrecognised_count_names_no_vendor():
+    """A count we have never seen is evidence of nothing. Naming the wrong vendor
+    would send a user to install the wrong engine — worse than saying nothing."""
+    who, why = engine_compat.provenance(777)
+    assert who == ""
+    assert "777" in why
+
+
+def test_a_missing_count_names_no_vendor():
+    who, _ = engine_compat.provenance(None)
+    assert who == ""
+
+
+def test_the_verdict_now_says_which_build_the_engine_is():
+    """The improvement over the raw error: not 'it refused' but 'this engine is
+    mainline before Q2_0, and the model needs a fork'."""
+    c = engine_compat.check_engine(BONSAI, engine_type_count=42)
+    assert c.ok is False
+    assert "42" in c.reason
+    assert "mainline llama.cpp" in c.reason
+    assert "PQ2_0" in c.reason
+
+
+def test_an_engine_that_accepts_the_model_is_still_ok():
+    c = engine_compat.check_engine(SMOL, engine_type_count=43)
+    assert c.ok is True
+
+
+def test_an_unknown_engine_count_still_reports_the_model_problem():
+    """The model-side verdict must not depend on recognising the engine."""
+    c = engine_compat.check_engine(BONSAI, engine_type_count=None)
+    assert c.ok is False
+    assert "PQ2_0" in c.reason
+
+
+def test_vulkan_gets_an_extra_warning_about_the_missing_kernel():
+    """PQ2_0 has no Vulkan kernel even on the fork that defines it — its README
+    points Vulkan users at the group-64 Q2_0 file instead."""
+    c = engine_compat.check_engine(BONSAI, engine_type_count=144, backend="vulkan")
+    assert c.ok is False
+    assert "Vulkan" in c.advice
+
+
+def test_a_non_vulkan_backend_gets_no_kernel_warning():
+    c = engine_compat.check_engine(BONSAI, engine_type_count=144, backend="rocm")
+    assert "Vulkan" not in c.advice
+
+
+def test_a_truncated_read_is_still_not_a_verdict_on_the_engine_path():
+    """The engine path must inherit the same honesty rule as the model path."""
+    c = engine_compat.check_engine(BONSAI, engine_type_count=42, complete=False)
+    assert c.ok is True
