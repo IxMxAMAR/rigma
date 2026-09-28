@@ -56,6 +56,15 @@ export default function SkillsSurface() {
           <p className="text-muted text-[13px] mb-2">
             Skills bundle instructions and domain knowledge. Invoke any skill in chat anytime using <code className="bg-surface px-1.5 py-0.5 rounded font-mono">/skillName</code> or <code className="bg-surface px-1.5 py-0.5 rounded font-mono">/skill:name</code>.
           </p>
+          {/* R4-SKILL-1: the agent reaches these too, which was not true before —
+              DSH's skill provider scanned only its own roots, so a skill authored
+              here was invisible to every harness turn. Said out loud because the
+              capability is otherwise indistinguishable from a Rigma-only feature. */}
+          <p className="text-muted text-[13px]">
+            These live in <code className="bg-surface px-1.5 py-0.5 rounded font-mono">~/.rigma/skills</code>, and an
+            agent harness (DeepSeek Harness) is pointed at the same directory, so it can discover and load them
+            itself with its own skill tool — not only when you type <code className="bg-surface px-1.5 py-0.5 rounded font-mono">/name</code>.
+          </p>
           {loadErr && (
             <LoadError message={`could not load skills: ${loadErr}`}
                        onRetry={() => void refresh()} />

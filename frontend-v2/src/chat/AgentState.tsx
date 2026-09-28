@@ -60,7 +60,14 @@ function SubagentRow({ row }: { row: Subagent }) {
       <span className={`font-mono mt-px ${tone}`} aria-hidden="true">{glyph}</span>
       <span className="flex-1 min-w-0">
         <span className="font-mono text-[11.5px] text-secondary">
-          {row.state === "running" ? "subagent running" : "subagent finished"}
+          {/* R4-MCODE-2: the child's NAME when the backend supplied one. DSH's
+              lifecycle pair carries no name, so before this a row could only say
+              "subagent running" — unreadable as soon as two ran at once. The name
+              arrives on `subagent/descriptor`/`catalog` (`label`) and on mcode's
+              task details (`agent_name`), and both were previously discarded. */}
+          {row.name && <span className="text-primary">{row.name}</span>}
+          {row.name && " — "}
+          {row.state === "running" ? "running" : "finished"}
         </span>
         {title && <span className="font-mono text-[10.5px] text-muted"> · {title}</span>}
         {row.last && (

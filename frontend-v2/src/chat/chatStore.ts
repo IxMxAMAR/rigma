@@ -14,7 +14,7 @@ import { runMacroStream } from "../lib/methods";
 import { streamChat, type SseEvent } from "../lib/sse";
 import { DRAFT_KEY, parseDrafts, saveDrafts } from "./drafts";
 import { foldSubagent, type Subagent } from "./subagents";
-import { normaliseGoal, type NormalGoal } from "./goal";
+import { isGoalCleared, normaliseGoal, type NormalGoal } from "./goal";
 import { EMPTY_GOVERNANCE, foldApproval, type Governance } from "./governance";
 import { EMPTY_COMPACTIONS, foldCompaction, type Compactions } from "./compaction";
 import { EMPTY_RETRY, foldRetry, type Retry } from "./retry";
@@ -317,9 +317,13 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
       // second opinion.
       return { ...turn, title: String(d.title ?? "") || turn.title };
     case "goal": {
-      // A payload with no objective is not a goal — `get_goal` answers
-      // `{goal: null}` and an error answers `{error}`. Returning the turn
-      // unchanged keeps whatever the panel was already showing.
+      // R4-GOAL-1: an explicit CLEAR is an instruction, not an unrecognised
+      // payload. DSH sends `{operation: "clear", cleared: true}` with no `goal`
+      // key, and treating that like "not a goal" left the cleared objective on
+      // screen forever. Only the tombstone clears; everything else keeps the
+      // panel as it was, because `get_goal` answers `{goal: null}` and an error
+      // answers `{error}` — neither of which means the goal is gone.
+      if (isGoalCleared(d)) return { ...turn, goal: null };
       const g = normaliseGoal(d);
       return g ? { ...turn, goal: g } : turn;
     }

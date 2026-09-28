@@ -157,3 +157,87 @@ describe("foldSubagent", () => {
     expect(before).toEqual(copy);
   });
 });
+
+
+// R4-MCODE-2: the shape the SERVER actually produces.
+//
+// The block above folds mcode's payload FLAT, but the server wraps every
+// subagent payload as `{event, data}` (serve.py, the `_ev.startswith("subagent")`
+// arm) — for mcode too. So the flat branch was reachable only from these tests,
+// and in the running product an mcode subagent rendered NOTHING: the wrapped
+// branch read `data.childSessionId`, mcode's data has no such field, and the fold
+// returned the list unchanged. These pin the shape that really arrives.
+describe("foldSubagent — mcode WRAPPED by the server (the real wire shape)", () => {
+  const wrapped = (extra: Record<string, unknown>) => ({
+    event: "subagent",
+    data: { taskId: "bg_1", subSessionId: "s1", name: "explore", status: "started", ...extra },
+  });
+
+  it("starts a row from the wrapped payload", () => {
+    const rows = foldSubagent([], wrapped({}));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: "s1", state: "running" });
+  });
+
+  it("closes the row on a wrapped terminal status", () => {
+    let rows = foldSubagent([], wrapped({}));
+    rows = foldSubagent(rows, wrapped({ status: "succeeded" }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].state).toBe("done");
+  });
+
+  it("keeps the agent name mcode sent, which was previously discarded", () => {
+    const rows = foldSubagent([], wrapped({}));
+    expect(rows[0].name).toBe("explore");
+  });
+});
+
+// R4-MCODE-2: DSH carries a subagent's NAME, just not on the lifecycle pair.
+//
+// `subagent.started` is `{parentSessionId, childSessionId}` and nothing else, so
+// a row could only ever read "subagent running". `subagent/descriptor` and
+// `subagent/catalog` carry `label` keyed by the same child id, and both were
+// forwarded by the server and then dropped by this fold.
+describe("foldSubagent — the name DSH sends on subagent/catalog", () => {
+  const start = { event: "subagent.started", data: { childSessionId: "c1" } };
+  // Verified shape, not guessed: SubagentCatalogEvent is
+  // {version, childId, childCreatedAt, mode, label?}
+  // (packages/subagent/subagent/src/catalog.ts:24-32). It names the child
+  // `childId`, where the lifecycle pair says `childSessionId` — reading only one
+  // of the two is how this name was lost.
+  const catalog = (extra: Record<string, unknown>) => ({
+    event: "subagent/catalog",
+    data: { version: 0, childId: "c1", childCreatedAt: 1, mode: "one-shot", ...extra },
+  });
+
+  it("applies a label arriving AFTER the start", () => {
+    let rows = foldSubagent([], start);
+    expect(rows[0].name).toBeUndefined();
+    rows = foldSubagent(rows, catalog({ label: "scout" }));
+    expect(rows[0].name).toBe("scout");
+    expect(rows[0].state).toBe("running");
+  });
+
+  it("does not resurrect a row for a label naming an unknown child", () => {
+    // A catalog entry for a child this turn never saw is not a reason to invent
+    // a row — the fold must not append on a non-lifecycle event.
+    expect(foldSubagent([], catalog({ childId: "ghost", label: "x" }))).toEqual([]);
+  });
+
+  it("still ignores a payload with neither id", () => {
+    expect(foldSubagent([], { event: "subagent", data: { status: "started" } })).toEqual([]);
+  });
+
+  it("ignores subagent/descriptor, which carries no child id at all", () => {
+    // Worth pinning: `subagent/descriptor` is NOT about a child. Its fields are
+    // {mode, version, provider} + {label, agentProvider, agentModel, persona,
+    // toolFilter} — it describes the subagent PROVIDER (dispositions.ts:92-95).
+    // Its `label` is the provider's name, not a child's, so folding it onto a row
+    // would be wrong rather than merely useless.
+    const rows = foldSubagent([], start);
+    expect(foldSubagent(rows, {
+      event: "subagent/descriptor",
+      data: { mode: "one-shot", version: 0, provider: "spawn", label: "spawn" },
+    })).toEqual(rows);
+  });
+});

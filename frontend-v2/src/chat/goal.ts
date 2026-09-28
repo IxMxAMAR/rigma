@@ -97,6 +97,31 @@ export function normaliseGoal(payload: unknown): NormalGoal | null {
   };
 }
 
+/**
+ * Whether this payload is DSH telling us the goal was CLEARED.
+ *
+ * R4-GOAL-1. `goal/change` is a union, not a snapshot: an ordinary change is
+ * `{operation: "set"|..., goal: {...}}`, but a clear is
+ * `{operation: "clear", cleared: true, clearedAt}` with NO `goal` key at all.
+ * Both used to fold to the same thing here — `null` — and the store then kept
+ * whatever it was already showing, so clearing a goal left the old objective on
+ * screen indefinitely.
+ *
+ * The distinction is the whole point: `null` means "this payload is not a goal,
+ * keep what you have" (a `get_goal` answering `{goal: null}`, an error, a
+ * payload this build does not recognise), whereas a clear is an INSTRUCTION to
+ * forget. Only an explicit tombstone clears.
+ */
+export function isGoalCleared(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const p = payload as Record<string, unknown>;
+  // `operation` is the authoritative verb; `cleared` is the flag DSH sets
+  // alongside it. Either is enough, because a backend that sends only one of
+  // them still means the same thing, and requiring both would silently keep a
+  // stale objective when one is omitted.
+  return String(p.operation ?? "").toLowerCase() === "clear" || p.cleared === true;
+}
+
 /** A goal's phase, as a colour class. Unknown phases read as neutral. */
 export function goalTone(phase: string): string {
   if (phase === "complete" || phase === "completed") return "text-moss";
