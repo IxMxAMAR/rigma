@@ -16,6 +16,7 @@ import { DRAFT_KEY, parseDrafts, saveDrafts } from "./drafts";
 import { foldSubagent, type Subagent } from "./subagents";
 import { normaliseGoal, type NormalGoal } from "./goal";
 import { EMPTY_GOVERNANCE, foldApproval, type Governance } from "./governance";
+import { EMPTY_COMPACTIONS, foldCompaction, type Compactions } from "./compaction";
 
 export interface Chip {
   id: string;
@@ -83,6 +84,11 @@ export interface StreamingTurn {
    *  SDK wire has no approval-response method, so approval is decided by the
    *  policy engine. See chat/governance.ts. */
   governance: Governance;
+  /** DSH's compaction lifecycle. Rigma's NATIVE compaction reports itself through
+   *  `housekeeping`/`masked`/`compacted` below; a DSH turn reported none of it,
+   *  so a long turn busy summarising its own context looked hung. Folded rather
+   *  than appended because `compaction/start`…`compaction/end` is a bracket. */
+  compactions: Compactions;
   /** These five names were emitted by the server and dropped here by the
    *  default arm, so a compaction, an observation-masking pass, a queued
    *  prompt and the server's own retitling were all silent. */
@@ -172,6 +178,7 @@ export const emptyTurn = (): StreamingTurn => ({
   sources: [],
   goal: null,
   governance: EMPTY_GOVERNANCE,
+  compactions: EMPTY_COMPACTIONS,
   todos: [],
   planMode: false,
   subagents: [],
@@ -280,6 +287,10 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
     // none of them is folded into `text`.
     case "approval":
       return { ...turn, governance: foldApproval(turn.governance, d) };
+    case "compaction":
+      // `foldCompaction` returns the state unchanged for a non-compaction
+      // payload, so this arm needs no guard of its own.
+      return { ...turn, compactions: foldCompaction(turn.compactions, d) };
     case "sandbox":
       return {
         ...turn,

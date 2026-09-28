@@ -349,3 +349,111 @@ def test_the_runner_no_longer_drops_governance_as_internal_chatter():
                                              "title": "t", "toolName": "bash"}))
         assert evs, kind
         assert evs[0]["type"] == "state", kind
+
+# --------------------------------------------------------------------------
+# DSH's compaction lifecycle. Rigma's NATIVE compaction already reports itself
+# (`masked`, `housekeeping`, `compacted`, drawn at Transcript.tsx:310-322), but a
+# DSH turn reported none of it — so a long turn busy summarising its own context
+# looked exactly like a turn that had hung.
+#
+# The four events are a BRACKET, not four facts: `compaction/start` opens it and
+# `compaction/end` closes it, paired by `compactionId`. The fold in
+# frontend-v2/src/chat/compaction.ts does the pairing; these tests cover the
+# transport half, which is that the events survive the runner at all.
+#
+# Shapes quoted from DSH's own declarations
+# (packages/compaction/compaction/src/types.ts:24-89):
+#   compaction/start    {compactionId, turn, sourceCommandId?}
+#   compaction/summary  {compactionId, summary: ContentBlock[], shadowedRange,
+#                        shadowedSeqs, shadowedTokenCount, provider, model, ...}
+#   compaction/prune    {shadowedRange, shadowedSeqs, shadowedTokenCount}
+#   compaction/end      {compactionId, turn, sourceCommandId?, error?}
+
+
+def test_a_compaction_start_opens_a_bracket():
+    evs = _project(_session_event("compaction/start",
+                                  {"compactionId": "c1", "turn": 1}))
+    assert len(evs) == 1
+    assert evs[0]["type"] == "state"
+    assert evs[0]["event"] == "compaction/start"
+    assert evs[0]["data"]["compactionId"] == "c1"
+
+
+def test_a_compaction_summary_passes_through_whole():
+    """The server deliberately does NOT reshape this payload.
+
+    `summary` is a ContentBlock list and `shadowedSeqs` is a list. Flattening
+    either in serve.py would mean the fold in the UI could no longer COUNT what
+    it was given — `shadowedSeqs` is how the message count is known at all.
+    """
+    seqs = [0, 1, 2, 3]
+    evs = _project(_session_event("compaction/summary", {
+        "compactionId": "c1",
+        "summary": [{"type": "text", "text": "they discussed the sea"}],
+        "shadowedRange": {"start": 0, "end": 3},
+        "shadowedSeqs": seqs,
+        "shadowedTokenCount": 12345,
+        "provider": "deepseek-official",
+        "model": "DeepSeek-V4.1-Flash",
+    }))
+    assert evs[0]["event"] == "compaction/summary"
+    d = evs[0]["data"]
+    assert d["summary"] == [{"type": "text", "text": "they discussed the sea"}]
+    assert d["shadowedSeqs"] == seqs
+    assert d["shadowedTokenCount"] == 12345
+    assert d["provider"] == "deepseek-official"
+    assert d["model"] == "DeepSeek-V4.1-Flash"
+
+
+def test_a_compaction_prune_carries_its_token_price():
+    """`prune` is a model-free replacement and has NO compactionId of its own —
+    it is priced by the metering event immediately before it, so the fold has to
+    attribute it to whichever bracket is open. Losing `shadowedTokenCount` here
+    would lose the only number it carries."""
+    evs = _project(_session_event("compaction/prune", {
+        "shadowedRange": {"start": 0, "end": 4},
+        "shadowedSeqs": [0, 1, 2, 3],
+        "shadowedTokenCount": 900,
+    }))
+    assert evs[0]["event"] == "compaction/prune"
+    assert evs[0]["data"]["shadowedTokenCount"] == 900
+    assert "compactionId" not in evs[0]["data"]
+
+
+def test_a_failed_compaction_carries_its_error():
+    """The one compaction fact a reader must not miss: the context did NOT
+    shrink, so the turn may be about to fail for want of room."""
+    evs = _project(_session_event("compaction/end", {
+        "compactionId": "c1", "turn": 1,
+        "error": "summariser returned nothing",
+    }))
+    assert evs[0]["event"] == "compaction/end"
+    assert evs[0]["data"]["error"] == "summariser returned nothing"
+
+
+def test_a_successful_compaction_end_has_no_error():
+    evs = _project(_session_event("compaction/end",
+                                  {"compactionId": "c1", "turn": 1}))
+    assert evs[0]["event"] == "compaction/end"
+    assert evs[0]["data"].get("error") in (None, "")
+
+
+def test_every_compaction_event_is_a_recognised_state_event():
+    """A guard against the list drifting: if one of these leaves `_STATE_EVENTS`
+    the runner drops it silently, and every test above still passes because they
+    build their own payload."""
+    from rigma import _dsh_runner as runner
+    for name in ("compaction/start", "compaction/summary",
+                 "compaction/prune", "compaction/end"):
+        assert name in runner._STATE_EVENTS, name
+
+
+def test_the_runner_no_longer_treats_compaction_as_internal_chatter():
+    """`_notice_text` matched six keywords against a truncated summary, so these
+    fell through it and a DSH turn compacting its context showed nothing."""
+    for kind in ("compaction/start", "compaction/summary",
+                 "compaction/prune", "compaction/end"):
+        evs = _project(_session_event(kind, {"compactionId": "c1", "turn": 1}))
+        assert evs, kind
+        assert evs[0]["type"] == "state", kind
+

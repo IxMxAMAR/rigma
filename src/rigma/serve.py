@@ -2157,6 +2157,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _title = str(_data.get("title") or "").strip()
                         if _title:
                             yield _sse({"title": _title}, event="session_title")
+                    elif _ev.startswith("compaction/"):
+                        # The DSH compaction lifecycle, which the native path
+                        # already reports through `masked`/`housekeeping`/
+                        # `compacted`. One SSE name, with the DSH name carried
+                        # alongside so the UI can fold the four into one bracket.
+                        #
+                        # The payload is passed through WHOLE rather than
+                        # reshaped here: `summary` is a ContentBlock list and
+                        # `shadowedSeqs` is a list, and flattening either in the
+                        # server would mean the fold in the UI could no longer
+                        # count what it was given.
+                        yield _sse({"event": _ev, "data": _data},
+                                   event="compaction")
                     # An event name from a NEWER DSH than this Rigma knows is
                     # dropped rather than guessed at, the same way an unknown
                     # TurnEvent kind is: a wrong rendering is worse than none.
