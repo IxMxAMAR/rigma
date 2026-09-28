@@ -2157,6 +2157,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _title = str(_data.get("title") or "").strip()
                         if _title:
                             yield _sse({"title": _title}, event="session_title")
+                    elif _ev.startswith("llm/retry"):
+                        # A scheduled retry, or the moment its wait ended. Passed
+                        # through whole: `failure` is an object and `maxRetries` is
+                        # ABSENT for an unbounded policy, and the UI needs to be
+                        # able to tell "attempt 3 of 5" from "attempt 3, no limit".
+                        yield _sse({"event": _ev, "data": _data},
+                                   event="llm_retry")
                     elif _ev.startswith("compaction/"):
                         # The DSH compaction lifecycle, which the native path
                         # already reports through `masked`/`housekeeping`/

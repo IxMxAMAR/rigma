@@ -17,6 +17,7 @@ import { foldSubagent, type Subagent } from "./subagents";
 import { normaliseGoal, type NormalGoal } from "./goal";
 import { EMPTY_GOVERNANCE, foldApproval, type Governance } from "./governance";
 import { EMPTY_COMPACTIONS, foldCompaction, type Compactions } from "./compaction";
+import { EMPTY_RETRY, foldRetry, type Retry } from "./retry";
 
 export interface Chip {
   id: string;
@@ -89,6 +90,10 @@ export interface StreamingTurn {
    *  so a long turn busy summarising its own context looked hung. Folded rather
    *  than appended because `compaction/start`…`compaction/end` is a bracket. */
   compactions: Compactions;
+  /** The most recent LLM retry, if DSH had to make one. `dsh-llm-retry` is a
+   *  dependency of sdk-minimal itself, so this fires whether or not anyone asked
+   *  for it — and a silent retry against a local engine reads as a frozen turn. */
+  retry: Retry | null;
   /** These five names were emitted by the server and dropped here by the
    *  default arm, so a compaction, an observation-masking pass, a queued
    *  prompt and the server's own retitling were all silent. */
@@ -179,6 +184,7 @@ export const emptyTurn = (): StreamingTurn => ({
   goal: null,
   governance: EMPTY_GOVERNANCE,
   compactions: EMPTY_COMPACTIONS,
+  retry: EMPTY_RETRY,
   todos: [],
   planMode: false,
   subagents: [],
@@ -287,6 +293,10 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
     // none of them is folded into `text`.
     case "approval":
       return { ...turn, governance: foldApproval(turn.governance, d) };
+    case "llm_retry":
+      // `foldRetry` returns the state unchanged for a non-retry payload, so this
+      // arm needs no guard of its own.
+      return { ...turn, retry: foldRetry(turn.retry, d) };
     case "compaction":
       // `foldCompaction` returns the state unchanged for a non-compaction
       // payload, so this arm needs no guard of its own.

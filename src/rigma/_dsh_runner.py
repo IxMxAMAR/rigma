@@ -88,6 +88,12 @@ _STATE_EVENTS = (
     "compaction/summary",
     "compaction/prune",
     "compaction/end",
+    # A retry is the same class of problem as a compaction: the turn is working and
+    # says nothing. `dsh-llm-retry` is a dependency of sdk-minimal itself, so it is
+    # always loaded and always firing — with a local llama-server that stalls or
+    # returns a malformed tool call, the visible effect is a turn that sits there.
+    "llm/retry",
+    "llm/retry-started",
 )
 
 # `assistant/message` carries the step's token accounting. It is the ONLY
