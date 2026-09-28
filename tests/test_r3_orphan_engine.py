@@ -181,7 +181,16 @@ def test_reattach_writes_a_record_the_ui_can_stop(home, monkeypatch, fake_engine
     assert rec["engine_pid"] == 4242
     assert rec["ctx"] == 65536
     assert rec["gguf"] == "Ternary-Bonsai-2-27B-PQ2_0.gguf"
-    assert "reattached" in capsys.readouterr().out
+    # kv_fp is empty ON PURPOSE and must be present as empty. It hashes THIRTEEN
+    # launch fields; the launch that computed it is gone and /props reports only
+    # the window, so any value here would be a different hash than the original
+    # recorded — and a cache restored under a mismatched fingerprint generates
+    # fluent text from a history that never happened. Empty disables save and
+    # restore. The suite's own guard (test_launch_records_fingerprint) is what
+    # caught this being absent rather than empty, which is why it is asserted
+    # here: absent and empty read the same downstream, and only one is a decision.
+    assert rec["kv_fp"] == ""
+    assert "prompt caching is OFF" in capsys.readouterr().out
 
 
 def test_reattach_refuses_an_engine_that_does_not_answer_health(home, monkeypatch,

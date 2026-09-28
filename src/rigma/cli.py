@@ -1743,10 +1743,13 @@ def stop():
             except Exception:
                 _exe = ""
             _rec = orphan.record_from_props(_props, _pid, _exe, 11500)
+            # kv_fp empty for the same reason as `_adopt_or_refuse`: the launch
+            # that computed it is gone, and a wrong fingerprint is worse than
+            # none. This record exists to be STOPPED, not to restore a cache.
             st.write_state(_rec["model_slug"], _rec["quant"], 11500,
                            engine_pid=_pid, ui_pid=-1,
                            backend=_rec["backend"], ctx=_rec["ctx"],
-                           gguf=_rec["gguf"], engine=_rec["engine"])
+                           gguf=_rec["gguf"], kv_fp="", engine=_rec["engine"])
             s = st.read_state()
         elif len(_found) > 1:
             typer.echo("several Rigma engines are listening on 11499 — "
@@ -1829,13 +1832,25 @@ def _adopt_or_refuse(port: int, reattach: bool, dry_run: bool) -> None:
             except Exception:
                 exe = ""
             rec = orphan.record_from_props(props, pid, exe, port)
+            # kv_fp stays EMPTY, explicitly and for the same reason the vLLM
+            # path leaves it empty: it keys llama.cpp's slot cache, and it is
+            # a hash of THIRTEEN launch fields (ctx, cache_type_k/v, ngl,
+            # n_cpu_moe, spec_type, spec_n_max, flash_attn, ...). An adopted
+            # engine was launched by a process that is gone, and /props reports
+            # the window but not the rest, so any value computed here would be a
+            # DIFFERENT hash than the one the original launch recorded — which is
+            # worse than none: a cache restored under a mismatched fingerprint
+            # generates fluent text from a history that never happened. Empty
+            # disables save and restore, and the user is told so below.
             st.write_state(rec["model_slug"], rec["quant"], port,
                            engine_pid=pid, ui_pid=-1, backend=rec["backend"],
-                           ctx=rec["ctx"], gguf=rec["gguf"],
+                           ctx=rec["ctx"], gguf=rec["gguf"], kv_fp="",
                            engine=rec["engine"])
             typer.echo(f"reattached to {orphan.describe(needed, pid, props)}")
             typer.echo("        the UI will stop this engine when it exits, as if "
                        "it had started it")
+            typer.echo("        prompt caching is OFF for this session: the "
+                       "launch that would key the cache is gone")
             return
         typer.echo(f"port {needed} is already in use{holder}")
         typer.echo("        that is RIGMA'S OWN engine from an earlier session — "
