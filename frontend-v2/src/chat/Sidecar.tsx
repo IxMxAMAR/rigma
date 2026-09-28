@@ -316,6 +316,9 @@ interface RagCandidate {
 
 function GroundingCard() {
   const currentId = useChat((s) => s.currentId);
+  // R3-UI-1: the Grounded toggle writes to a chat, so it needs the same
+  // create-on-demand path the rest of the panel uses.
+  const ensureSession = useChat((s) => s.ensureSession);
   const [status, setStatus] = useState<RagStatus | null>(null);
   const [grounded, setGrounded] = useState(false);
   const [path, setPath] = useState("");
@@ -398,11 +401,14 @@ function GroundingCard() {
   }, [currentId]);
 
   const toggle = async () => {
-    if (!currentId) return;
+    // R3-UI-1: this checkbox renders with no chat open, so `if (!currentId)
+    // return` made it a switch that visibly flipped and saved nothing.
+    const sid = await ensureSession();
+    if (!sid) return;
     const next = !grounded;
     setGrounded(next);
     try {
-      await api.updateSession(currentId, { use_rag: next });
+      await api.updateSession(sid, { use_rag: next });
     } catch {
       setGrounded(!next);
     }
@@ -660,14 +666,17 @@ function SamplingCard() {
   };
 
   const save = async () => {
-    if (!currentId) return;
+    // R3-UI-1: Save is on screen whenever the panel is, so it must not be a
+    // button that does nothing. It makes the chat it is saving into.
+    const sid = await ensureSession();
+    if (!sid) return;
     const clamped: Record<string, number> = {};
     for (const [k, v] of Object.entries(params))
       clamped[k] = clampParam(k, v, ranges, maxTok);
     setParams(clamped);
     setErr(null);
     try {
-      await api.updateSession(currentId,
+      await api.updateSession(sid,
         { params: clamped, system_prompt: prompt });
       setDirty(false);
     } catch (e) {
@@ -949,6 +958,8 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
   const currentId = useChat((s) => s.currentId);
   const open = useChat((s) => s.open);
   const loadSessions = useChat((s) => s.loadSessions);
+  // R3-UI-1: a method is applied to a chat; make one rather than drop the click.
+  const ensureSession = useChat((s) => s.ensureSession);
   const [making, setMaking] = useState(false);
   const [importError, setImportError] = useState("");
   const importRef = useRef<HTMLInputElement>(null);
@@ -999,10 +1010,15 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
   };
 
   const apply = async (id: string) => {
-    if (!currentId) return;
+    // R3-UI-1: a method is applied TO a chat, so make the chat rather than
+    // dropping the click. The error path below already exists because a refused
+    // apply used to be indistinguishable from a dead button — the guard was the
+    // same dead button, one line earlier.
+    const sid = await ensureSession();
+    if (!sid) return;
     setImportError("");
     try {
-      const r = await fetch(`/api/sessions/${currentId}/method`, {
+      const r = await fetch(`/api/sessions/${sid}/method`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ id }),
