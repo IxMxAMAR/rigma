@@ -746,5 +746,31 @@ is the same assertion with no line-number indirection. The lesson is the same on
 the whole round is about: an assertion that resolves its subject indirectly is
 testing the resolution as much as the subject.
 
-Full suite, frontend suite, `tsc --noEmit` and `ruff` results are recorded in the
-commit messages for this batch.
+A sixth is not a test failure at all, and is the reason the full suite is not
+optional: **two of the guards added in this round each collided with an existing
+test that was asserting defect-adjacent behaviour**, and neither collision is
+visible from the focused runs. The pre-send compaction fired on a run (see
+R3-CHAT-3) and the repeat breaker stopped
+`test_runaway_tool_loop_keeps_tools_on_last_round`, whose upstream asks for the
+same call every round on purpose. Both are fixed above; the point is that a guard
+added to one path can be wrong about another, and only the whole suite says so.
+
+## 12. Result
+
+```
+$ pytest tests -m "not hardware" -q     # junit-xml: 2566 tests
+2566 passed, 3 skipped
+$ ruff check src tests tools
+All checks passed!
+$ node node_modules/vitest/vitest.mjs run     # frontend-v2
+Test Files  17 passed (17)
+     Tests  184 passed (184)
+$ node node_modules/typescript/bin/tsc --noEmit
+(clean)
+```
+
+`tests/test_r3_adversarial_fixes.py` carries 50 of those; every one was checked
+**red against HEAD** before being accepted as green, and the measurements behind
+each are quoted in the sections above rather than asserted from memory. Full-suite,
+frontend and lint results for the intermediate commits are recorded in their commit
+messages.
