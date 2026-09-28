@@ -4729,6 +4729,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # mcode waits forever on silence.
     _APPROVAL_WAIT_SECS = 120.0
 
+    # How long a control-plane operation may take. It is a handshake plus one request
+    # on a fresh process, not a turn, so a minute is generous — and a BOUNDED wait
+    # matters because the route is awaited by a panel that is drawing itself, and an
+    # unbounded one would leave the UI spinning forever.
+    _CONTROL_TIMEOUT_SECS = 60.0
+
     def _apply_skill(text: str) -> str:
         """`/name` (or `/skill:name`) pulls a global skill in front of the ask.
 
@@ -5022,6 +5028,64 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         slot["allow"] = allow
         slot["event"].set()
         return {"ok": True, "requestId": slot.get("requestId"), "allow": allow}
+
+    @app.post("/api/sessions/{sid}/control")
+    async def control_plane(sid: str, body: dict):
+        """Perform ONE operation on this chat's mcode control plane.
+
+        R6-ACP-CONTROL. The queue, the goal, steering and the delegation tree were all
+        READABLE before this and none of them was INVOCABLE: every one arrived as a
+        notification, so the panel could draw them and a user could not touch them. A
+        control plane you can only watch is not a control plane.
+
+        ACP ONLY, and the refusal is explicit. `exec` projects a single turn and holds no
+        session, so there is nothing to steer and no queue to add to. Silently doing
+        nothing would be worse than refusing, because the UI would show a control that
+        appeared to work.
+
+        The operation names are validated against the adapter's own allowlist BEFORE any
+        process is opened. An HTTP body supplies the name, so this is also what stops a
+        request from naming an arbitrary protocol method — including `session/prompt`,
+        which would be a model turn smuggled through a control route.
+        """
+        op = str(body.get("op") or "")
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        s = await asyncio.to_thread(sessions.load, sid)
+        if not s:
+            return JSONResponse({"error": "no such chat"}, status_code=404)
+        if str(s.get("harness") or "") != "mcode":
+            return JSONResponse(
+                {"error": "this chat is not an mcode chat"}, status_code=409)
+        if str(s.get("mcode_transport") or "exec") != "acp":
+            return JSONResponse(
+                {"error": "the control plane needs the acp transport; this chat runs "
+                          "on exec, which holds no session",
+                 "transport": str(s.get("mcode_transport") or "exec")},
+                status_code=409)
+        backend_session = str(
+            (s.get("harness_sessions") or {}).get("mcode") or "")
+        # Validated here as well as in the adapter, so an unknown operation is a 400
+        # rather than a 200 carrying an error field — the caller sent a bad request.
+        # Imported here rather than at module scope: `serve.py` reaches every adapter
+        # through `_harness.resolve` so that one backend's import cost — and any
+        # failure inside it — is not paid by a UI that never selects that backend.
+        from . import harness_mcode
+
+        why = harness_mcode.control_op_error(op, params)
+        if why:
+            return JSONResponse({"error": why, "ops": list(harness_mcode.CONTROL_OPS)},
+                                status_code=400)
+        state_now = await asyncio.to_thread(st.read_state)
+        exe = harness_mcode.bin_path() or ""
+        out = await asyncio.to_thread(
+            harness_mcode.drive_control, op, params, exe=exe,
+            session_id=backend_session,
+            cwd=str((state_now or {}).get("cwd") or "") or "",
+            timeout=_CONTROL_TIMEOUT_SECS)
+        if not out.get("ok"):
+            return JSONResponse({"error": out.get("error") or "control failed",
+                                 "op": op}, status_code=502)
+        return {"ok": True, "op": op, "result": out.get("result")}
 
     # ================= Autonomous Mode (Runs) =========================
     _run_tasks: dict = {}   # run_id -> asyncio.Task (for cancellation)

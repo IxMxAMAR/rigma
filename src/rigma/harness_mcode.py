@@ -125,7 +125,12 @@ from . import harness as _harness       # noqa: E402
 # Imported HERE rather than inside the caller so a missing module is an ImportError at
 # load, not a silent `None` at turn time. `harness_mcode_acp` imports nothing from this
 # module at module level (it resolves `bin_path` lazily), so there is no cycle.
-from .harness_mcode_acp import drive_turn_acp    # noqa: E402,F401
+from .harness_mcode_acp import (                 # noqa: E402,F401
+    CONTROL_OPS,
+    control_op_error,
+    drive_control,
+    drive_turn_acp,
+)
 
 
 # mcode's own id for a provider Rigma adds. The `custom_provider:` prefix is
@@ -854,9 +859,25 @@ def _interaction_dead_end(stderr_tail: str) -> str:
     Both the guard's message and the in-band failure carry the same distinctive
     phrases, so this keys on those rather than on an exit code, which is generic.
 
-    NOT fixable here: answering the question needs an interaction channel that
-    neither the exec path nor mcode's ACP path offers Rigma (ACP needs
-    `mcode login`). What IS fixable is saying so, and saying the one thing that
+    R6-ACP-REACH: this docstring used to say the dead end was "not fixable here"
+    because "mcode's ACP path" was unavailable to Rigma and "ACP needs `mcode
+    login`". BOTH claims are false, and both had ALREADY been corrected elsewhere:
+    `c9f9f4a` established that ACP needs no login (the earlier "blocked on
+    authentication" was a probe bug — stdin was attached to a file, so mcode hit EOF
+    before it answered), and `a7caded` shipped Rigma's own ACP client. The correction
+    reached the docs and never reached this function, so the code went on telling a
+    stuck user that the one thing which fixes their chat does not exist.
+
+    WHAT IS TRUE NOW. The chat is still blocked on `exec`: the pending request is
+    durable in mcode's own store and `exec` has no host to answer it, so every later
+    turn fails the same way. But `acp` IS such a host — it is the whole reason Rigma
+    grew an ACP client — so switching this chat's transport is a real remedy rather
+    than a different dead end. Whether mcode REPLAYS the pending request on a resumed
+    session is NOT verified here (no live ACP session has been driven), so the
+    sentence below offers the switch without promising the replay.
+
+    What is not fixable is retrying on `exec`, which is the one thing a stuck user
+    tries first. What IS fixable is saying so.
     works — a NEW chat, because retrying this one cannot succeed.
     """
     low = stderr_tail.lower()
@@ -868,10 +889,10 @@ def _interaction_dead_end(stderr_tail: str) -> str:
         "This mcode chat is blocked and cannot continue. The agent asked a question "
         "(or requested permission) that only an interactive host can answer, and "
         "mcode will not start a session that still has one pending — so every later "
-        "turn in THIS chat fails the same way, immediately. Answering it needs "
-        "mcode's own TUI or ACP client, which Rigma cannot drive. Start a NEW chat "
-        "to carry on; retrying this one cannot succeed. (Choosing the `full` "
-        "permission mode avoids the permission-request half of this.)"
+        "turn in THIS chat fails the same way, immediately. Retrying cannot succeed. "
+        "Switch this chat's transport to `acp`, which IS an interactive host, or "
+        "start a NEW chat. (Choosing the `full` permission mode avoids the "
+        "permission-request half of this.)"
     )
 
 

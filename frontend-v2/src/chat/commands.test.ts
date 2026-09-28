@@ -5,6 +5,7 @@ import {
   commandQuery,
   helpText,
   isPermissionMode,
+  permissionTrap,
   matching,
   parseSlash,
   planFor,
@@ -192,5 +193,53 @@ describe("R6-EXPORT: /export", () => {
     // The parser's strictness is the feature: `/exports/2026/report.md` is a path, and
     // eating it would be indistinguishable from the app being broken.
     expect(parseSlash("/exports/2026/report.md")).toBeNull();
+  });
+});
+
+// R6-ACP-REACH: `smart` + `exec` is a BROKEN pairing, not a risky one.
+//
+// mcode's `smart` mode asks before risky actions. On the `exec` wire there is nobody to
+// ask, so mcode raises the request, the turn fails, and its guard then refuses to start
+// ANY later session in that chat — the chat is blocked permanently and retrying fails
+// again in seconds. The combination lived only in a tooltip, which is not where anyone
+// looks before choosing.
+describe("R6-ACP-REACH: permissionTrap", () => {
+  it("fires on the one combination that cannot work", () => {
+    const msg = permissionTrap("mcode", "smart", "exec");
+    expect(msg).not.toBe("");
+    // The remedy has to be named, or the warning is just bad news.
+    expect(msg).toContain("acp");
+    expect(msg).toContain("full");
+  });
+
+  it("says PERMANENTLY, because that is the part that matters", () => {
+    // The old option label said "a turn can fail", which understates it: the turn is
+    // recoverable, the CHAT is not.
+    expect(permissionTrap("mcode", "smart", "exec")).toContain("permanently");
+  });
+
+  it("is silent once the transport can answer", () => {
+    // `acp` IS an interactive host, so this is the fix rather than a different trap.
+    expect(permissionTrap("mcode", "smart", "acp")).toBe("");
+  });
+
+  it("is silent for the modes that never ask", () => {
+    expect(permissionTrap("mcode", "full", "exec")).toBe("");
+    expect(permissionTrap("mcode", "off", "exec")).toBe("");
+  });
+
+  it("is silent on a backend that has no such wires", () => {
+    // `exec`/`acp` are mcode's transports, so the same pairing elsewhere would be a
+    // warning about nothing. DSH's `honours_permission` is false and its approvals are
+    // display-only, so there is no equivalent trap to warn about.
+    expect(permissionTrap("dsh", "smart", "exec")).toBe("");
+    expect(permissionTrap("native", "smart", "exec")).toBe("");
+    expect(permissionTrap("", "smart", "exec")).toBe("");
+  });
+
+  it("does not fire on a transport it has never heard of", () => {
+    // An unknown value must not be read as `exec`, or a future transport would inherit
+    // a warning that may not apply to it.
+    expect(permissionTrap("mcode", "smart", "something-new")).toBe("");
   });
 });

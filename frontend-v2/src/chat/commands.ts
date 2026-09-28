@@ -128,6 +128,33 @@ export function helpText(): string {
  *  made — the server validates too, and refusing early is the better error. */
 export const PERMISSION_MODES = ["off", "smart", "full"] as const;
 
+/** R6-ACP-REACH: is this chat configured into a combination that CANNOT work?
+ *
+ *  `smart` means "ask before risky actions". On mcode's `exec` wire there is nobody to
+ *  ask: mcode raises the request, the turn fails, and its own guard then refuses to
+ *  start ANY later session in that chat — so the chat is blocked PERMANENTLY, and
+ *  retrying makes it fail again in seconds. That is not a risk to warn about, it is a
+ *  broken pairing, and it lived only in a tooltip until now.
+ *
+ *  Returns the sentence to show, or "" for every combination that works. A STRING
+ *  rather than a boolean so the reason travels with the decision and cannot drift from
+ *  it — and so this is testable without a renderer, which is how this project covers
+ *  its UI.
+ *
+ *  Only mcode: `exec`/`acp` are mcode's two wires, so the same pairing on another
+ *  backend would be a warning about nothing.
+ */
+export function permissionTrap(
+  harness: string, permission: string, transport: string,
+): string {
+  if (harness !== "mcode") return "";
+  if (permission !== "smart") return "";
+  if (transport !== "exec") return "";
+  return "smart asks, and exec has nobody to answer \u2014 so the first time it asks, "
+    + "this chat is blocked permanently and every later turn fails immediately. "
+    + "Switch transport to acp to make it answerable, or choose full.";
+}
+
 export function isPermissionMode(v: string): boolean {
   return (PERMISSION_MODES as readonly string[]).includes(v);
 }
