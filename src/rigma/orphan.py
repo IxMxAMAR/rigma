@@ -131,15 +131,61 @@ def record_from_props(props: dict, pid: int, exe: str,
         ctx = 0
     model_path = str(props.get("model_path") or "")
     gguf = Path(model_path).name if model_path else ""
-    # The slug is the file's stem: Rigma's own slug for a custom install is not
-    # recoverable from the engine, and a wrong slug is worse than a plain one.
-    slug = Path(gguf).stem if gguf else ""
+    # The slug MUST be the registry's, not the file's stem. They differ —
+    # "Ternary-Bonsai-2-27B-PQ2_0.gguf" lives under the slug
+    # "ternary-bonsai-2-27b" — and the difference is not cosmetic. Every caller
+    # that reasons about the running engine looks the slug up in the registry,
+    # and `server_ops._free_current`, the function that credits the outgoing
+    # engine's VRAM back to the budget before a relaunch, does NOTHING when that
+    # lookup fails. A record carrying a stem for a slug therefore makes the card
+    # look full of someone else's memory, and the next context change is refused
+    # with "tops out around 8,192" while the engine is running at 65,536.
+    # Measured on this machine: usable VRAM 6,254 MiB (refused) versus
+    # 13,726 MiB (accepted) for the same card, differing only in this string.
+    slug = ""
+    quant = ""
+    if gguf:
+        try:
+            from .registry import Registry
+            reg = Registry.load()
+            for _slug, _spec in reg.models.items():
+                for _g in (_spec.ggufs or []):
+                    if _g.file == gguf:
+                        slug, quant = _slug, _g.quant
+                        break
+                if slug:
+                    break
+        except Exception:
+            slug, quant = "", ""
+        if not slug:
+            # Not a registry model (a custom install, or a registry that could
+            # not be read). The stem is then a label rather than an identity, and
+            # `_free_current` falls back to probing the live engine.
+            slug = Path(gguf).stem
     return {
-        "model_slug": slug, "quant": "", "public_port": int(public_port),
+        "model_slug": slug, "quant": quant, "public_port": int(public_port),
         "engine_pid": int(pid), "ui_pid": -1, "backend": _backend_from_exe(exe),
         "ctx": ctx, "gguf": gguf, "engine": "llamacpp",
     }
 
+
+def running_gguf_file(ui_port: int) -> str:
+    """The model FILE Rigma's engine is serving, read from the engine itself.
+
+    The fallback for a state record that cannot identify what is running — an
+    empty one, or one written before `gguf` existed. `server_ops._free_current`
+    needs the file to credit the outgoing engine's VRAM back to the budget, and
+    without a fallback the only source was a record that can be missing while the
+    engine is not.
+
+    Returns "" when nothing is running or it is not Rigma's engine, which is the
+    same answer as "there is nothing to credit".
+    """
+    found = find_engines(int(ui_port) - 1)
+    if len(found) != 1:
+        return ""
+    _pid, props = found[0]
+    return Path(str((props or {}).get("model_path") or "")).name
 
 def find_engines(port: int) -> list[tuple[int, dict]]:
     """Every listener on `port` that is Rigma's own healthy engine.
@@ -173,6 +219,44 @@ def find_engines(port: int) -> list[tuple[int, dict]]:
             found.append((int(c.pid), props))
     return found
 
+
+def adopt(port: int) -> dict | None:
+    """Record the engine already serving on `port - 1`, if it is Rigma's.
+
+    Returns the record it wrote, or None when there is nothing to adopt. This
+    exists because a record can be MISSING while the engine is not — a hard kill
+    skips the `finally` that stops it — and because a UI-only `rigma up` used to
+    write an empty record on top of a live engine, which is how the UI came to
+    say "no model loaded" while a model sat in VRAM answering /health.
+
+    Writing the engine's real identity is the fix for a whole family of
+    downstream confusion, not just the popup: `_free_current` needs the registry
+    slug to credit the outgoing engine's VRAM back to the budget, `rigma stop`
+    needs the pid to stop it, and the Models page needs `gguf` to match the
+    running row.
+    """
+    from . import state as st
+
+    engine_port = int(port) - 1
+    found = find_engines(engine_port)
+    if len(found) != 1:
+        # None, or more than one: neither is something to silently adopt.
+        return None
+    pid, props = found[0]
+    exe = ""
+    try:
+        import psutil
+        exe = psutil.Process(pid).exe() or ""
+    except Exception:
+        exe = ""
+    rec = record_from_props(props, pid, exe, port)
+    # kv_fp stays empty for the reason spelled out in cli._adopt_or_refuse: the
+    # launch that computed it is gone, and a partial reconstruction is a
+    # different hash, which is worse than none.
+    st.write_state(rec["model_slug"], rec["quant"], port, engine_pid=pid,
+                   ui_pid=-1, backend=rec["backend"], ctx=rec["ctx"],
+                   gguf=rec["gguf"], kv_fp="", engine=rec["engine"])
+    return rec
 
 def describe(port: int, pid: int, props: dict) -> str:
     """One sentence naming the engine and the model it has loaded."""

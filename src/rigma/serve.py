@@ -2025,6 +2025,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         q: asyncio.Queue = asyncio.Queue()
         END = object()
 
+        # R3-CTX-1: an external harness cannot run a turn with no model. Its
+        # adapters are handed `model=str(state.get("model") or "")`, so an empty
+        # state (a UI started with no engine behind it) reaches mcode as "at least
+        # one --model <id> is required" and DSH as a runner that exits 1 with an
+        # empty stderr tail. Both are true and neither names the cause, which is
+        # two screens away: there is no model loaded. Say so here instead.
+        if not str(state.get("model") or "").strip():
+            yield _sse({"error": "no model is loaded, so there is nothing for "
+                                 "this harness to run against — load a model "
+                                 "from the Models tab, or start one with "
+                                 "`rigma up --model <slug>`"}, event="error")
+            yield b"data: [DONE]\n\n"
+            return
+
         def _pump() -> None:
             """Drain the adapter on a worker thread. It never raises: a driver
             failure comes back as an error event, so the turn still ends."""

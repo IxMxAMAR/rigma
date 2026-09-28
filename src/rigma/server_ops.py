@@ -210,6 +210,32 @@ def _free_current(profile, state: dict, reg):
     desktop actually holds (2026-08-21). Without it the outgoing engine's own
     13GB would count as "someone else's", and a ctx change on the running model
     would plan against a card that looks entirely full."""
+    # R3-CTX-1: a record that cannot name the model is not proof that nothing is
+    # running. A hard kill leaves the engine holding the card with no record, and
+    # a UI-only `up` used to write an empty one on top of a live engine. Either
+    # way this returned the profile UNCHANGED, so the engine's own VRAM counted
+    # as someone else's, the budget collapsed to what is left on an apparently
+    # full card, and a ctx change was refused with "tops out around 8,192" while
+    # the engine was running at 65,536. Ask the engine, which knows.
+    #
+    # This runs BEFORE the `not state` early return on purpose: an empty record
+    # is the case where it matters most, and the first version of this fallback
+    # sat after it, so `_free_current(prof, {}, reg)` still credited nothing.
+    # The repro caught that, not the reasoning.
+    if not state or not reg.models.get(state.get("model", "")):
+        live = ""
+        try:
+            from . import orphan
+            live = orphan.running_gguf_file(
+                int((state or {}).get("public_port") or 11500))
+        except Exception:
+            live = ""
+        if live:
+            for _slug, _spec in reg.models.items():
+                if any(g.file == live for g in (_spec.ggufs or [])):
+                    state = {**(state or {}), "model": _slug, "gguf": live,
+                             "unloaded": False}
+                    break
     if not state:
         return profile
     spec = reg.models.get(state.get("model", ""))

@@ -2081,11 +2081,40 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if detach:
             _spawn_detached(port)
             raise typer.Exit(0)
-        st.write_state("", "", port, engine_pid=-1, ui_pid=os.getpid(),
-                       backend="", use_case=use_case, ctx=0, unloaded=True)
+        # A UI-only `up` used to write an empty record unconditionally, and that
+        # is how the UI came to say "no model loaded" while an engine was
+        # answering /health on the inference port: the record it overwrote was
+        # the only thing naming the model, the pid and the gguf. Adopt what is
+        # actually running instead of erasing it. `server_running()` above does
+        # not cover this — it reads the same record, so an engine with no record
+        # looks like no engine at all.
+        from . import orphan as _orphan
+        _adopted = _orphan.adopt(port)
+        if reattach and not _adopted:
+            # R3-CTX-1: asking to reattach to nothing must FAIL, not quietly start
+            # a UI with no model. That is the state that produces "no model loaded"
+            # and then a harness turn dying with "no model" from the adapter — the
+            # failure surfaces two screens away from its cause, and the user has no
+            # way to connect them.
+            typer.echo(f"--reattach: nothing of Rigma's is serving on "
+                       f":{port - 1}, so there is nothing to reattach to")
+            typer.echo("        start a model first:  rigma up --model <slug>")
+            typer.echo("        or just drop --reattach to get the UI on its own")
+            raise typer.Exit(1)
+        if _adopted:
+            typer.echo(f"adopted the engine already running on :{port - 1} — "
+                       f"{_adopted['model_slug']} ({_adopted['quant']}) at "
+                       f"{_adopted['ctx']:,} ctx")
+            typer.echo("        prompt caching is OFF for this session: the "
+                       "launch that would key the cache is gone")
+            st.update_state(ui_pid=os.getpid())
+        else:
+            st.write_state("", "", port, engine_pid=-1, ui_pid=os.getpid(),
+                           backend="", use_case=use_case, ctx=0, unloaded=True)
         typer.echo(f"Rigma:  http://127.0.0.1:{port}")
-        typer.echo("        pick a model in the UI (Models tab) — it downloads, "
-                   "tunes, and loads on demand")
+        if not _adopted:
+            typer.echo("        pick a model in the UI (Models tab) — it "
+                       "downloads, tunes, and loads on demand")
         typer.echo("stop:   Ctrl+C here, or `rigma stop` from any terminal")
         if not no_browser:
             _open_when_listening(port, f"http://127.0.0.1:{port}")
