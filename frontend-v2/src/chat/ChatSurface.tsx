@@ -11,6 +11,15 @@ import { useApp } from "../store";
 import Sidecar from "./Sidecar";
 import Transcript from "./Transcript";
 import { selectStreaming, useChat } from "./chatStore";
+import {
+  commandQuery,
+  helpText,
+  isPermissionMode,
+  matching,
+  parseSlash,
+  planFor,
+  type SlashCommand,
+} from "./commands";
 import { isSendKey, isStopKey, isTypingTarget } from "./keyboard";
 
 function SessionRail() {
@@ -205,6 +214,8 @@ function ContextMeter() {
 
 function Composer() {
   const send = useChat((s) => s.send);
+  const notice = useChat((s) => s.notice);
+  const clearNotice = useChat((s) => s.clearNotice);
   const stop = useChat((s) => s.stop);
   const streaming = useChat(selectStreaming);
   const currentId = useChat((s) => s.currentId);
@@ -228,9 +239,80 @@ function Composer() {
     }
   };
 
+  // The half-typed command name, or null. Non-null is exactly when the menu
+  // should be up: `/com` yes, `/compact` no — a finished command must not keep
+  // a menu hovering over the line it was typed on.
+  const query = commandQuery(draft.trim());
+  const menuRows = query === null ? [] : matching(query);
+  const [pick, setPick] = useState(0);
+  // A shrinking list must not leave the highlight past its end, which would make
+  // Enter run nothing at all.
+  const selected = Math.min(pick, Math.max(0, menuRows.length - 1));
+
+  /** Complete a partially typed name, keeping the caret at the end. */
+  const complete = (name: string) => {
+    setDraft(`/${name} `, useChat.getState().currentId ?? "");
+    setPick(0);
+  };
+
+  /** Run one command and report what it did.
+   *
+   *  Everything goes through `planFor` first so the DECISION — including
+   *  refusing a command whose argument is missing — is the tested pure part,
+   *  and this switch only performs effects. */
+  const runCommand = (name: string, args: string) => {
+    const plan = planFor(name, args);
+    if (plan.kind === "usage") {
+      // Shown as a notice rather than an error: nothing failed, the user just
+      // needs to know what to type. The transcript's notice line already exists
+      // and is the right weight for it.
+      useChat.getState().pushNotice(plan.message);
+      return;
+    }
+    switch (plan.name) {
+      case "help":
+        useChat.getState().pushNotice(helpText());
+        break;
+      case "stop":
+        stop();
+        break;
+      case "new":
+        void useChat.getState().newChat();
+        break;
+      case "skills":
+        useApp.getState().setSurface("skills");
+        break;
+      case "compact":
+        void useChat.getState().compactChat().then((msg) => {
+          useChat.getState().pushNotice(msg);
+        });
+        break;
+      case "permission": {
+        if (!isPermissionMode(plan.args)) {
+          useChat.getState().pushNotice(
+            `unknown permission "${plan.args}" — off, smart or full`);
+          return;
+        }
+        void useChat.getState().setPermission(plan.args);
+        break;
+      }
+    }
+  };
+
   const submit = () => {
     const text = draft.trim();
     if (!text || streaming) return;
+    // A slash command is INTERCEPTED, never sent. That is the whole point: DSH's
+    // own commands cannot be reached by typing them (see chat/commands.ts), so
+    // sending `/compact` as prose would just ask the model to talk about
+    // compacting.
+    const cmd = parseSlash(text);
+    if (cmd !== null) {
+      setDraft("", useChat.getState().currentId ?? "");
+      setPick(0);
+      runCommand(cmd.name, cmd.args);
+      return;
+    }
     // The key is captured here, not read back after the await: send() creates a
     // session when there is none, and the rail stays clickable across it.
     const key = useChat.getState().currentId ?? "";
@@ -288,7 +370,29 @@ function Composer() {
           ))}
         </div>
       )}
-      <div className="flex items-end gap-2 rounded-xl bg-surface px-3 py-2 focus-within:bg-float">
+      {/* What a command did. Above the composer rather than in the transcript
+          because a command can run with no turn in flight, and the transcript
+          belongs to the turn. Neutral colours, not red: "compacted" is not a
+          failure, and an error-styled banner would teach the user to ignore it. */}
+      {notice && (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-md bg-surface px-3 py-1.5 mb-1.5"
+        >
+          <span className="flex-1 min-w-0 whitespace-pre-wrap break-words text-[12px] text-secondary">
+            {notice}
+          </span>
+          <button
+            onClick={clearNotice}
+            aria-label="dismiss"
+            className="shrink-0 text-muted hover:text-secondary text-[12px] leading-none"
+          >
+            ×
+          </button>
+        </div>
+      )}
+      <div className="relative flex items-end gap-2 rounded-xl bg-surface px-3 py-2 focus-within:bg-float">
+        <CommandMenu rows={menuRows} selected={selected} onPick={complete} />
         <input ref={fileRef} type="file" accept="image/*" multiple hidden
                onChange={(e) => { stage(e.target.files); e.target.value = ""; }} />
         <button
@@ -307,6 +411,41 @@ function Composer() {
             if (e.clipboardData?.files?.length) stage(e.clipboardData.files);
           }}
           onKeyDown={(e) => {
+            // The menu owns the arrows and Enter ONLY while it is open. Guarding
+            // on `menuRows.length` is what keeps Enter as "send" for ordinary
+            // prose — an unconditional arrow handler would break caret movement
+            // in every multi-line message.
+            if (menuRows.length > 0) {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setPick((p) => (p + 1) % menuRows.length);
+                return;
+              }
+              if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setPick((p) => (p - 1 + menuRows.length) % menuRows.length);
+                return;
+              }
+              if (e.key === "Tab") {
+                e.preventDefault();
+                complete(menuRows[selected].name);
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                // Close the menu without clearing the draft: dropping what the
+                // user typed to dismiss a hint would be hostile.
+                setDraft(draft + " ", useChat.getState().currentId ?? "");
+                return;
+              }
+              // Enter accepts the highlighted command rather than sending a
+              // half-typed one. Shift+Enter still inserts a newline.
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                complete(menuRows[selected].name);
+                return;
+              }
+            }
             if (isSendKey(e)) {
               e.preventDefault();
               submit();
@@ -341,6 +480,55 @@ function Composer() {
         {streaming && <span className="text-amber">esc stop</span>}
       </div>
       </div>
+    </div>
+  );
+}
+
+/** The command menu, shown only while the user is still typing a command NAME.
+ *
+ *  Keyboard-first and mouse-second, because this appears directly above a box
+ *  the user is already typing in: moving a hand to the mouse mid-word is the
+ *  thing a command menu is supposed to save you from. The parent owns the
+ *  selected index so Up/Down and Enter work without this component needing to
+ *  steal focus from the textarea.
+ */
+function CommandMenu({ rows, selected, onPick }: {
+  rows: SlashCommand[];
+  selected: number;
+  onPick: (name: string) => void;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <div
+      className="absolute bottom-full left-0 right-0 mb-1 rounded-md border border-line bg-panel shadow-lg overflow-hidden"
+      role="listbox"
+      aria-label="Commands"
+    >
+      {rows.map((c, i) => (
+        <button
+          key={c.name}
+          role="option"
+          aria-selected={i === selected}
+          // onMouseDown, not onClick: the textarea's blur fires before a click
+          // lands, and the menu unmounts on blur — so onClick never runs and the
+          // command silently does nothing.
+          onMouseDown={(e) => {
+            e.preventDefault();
+            onPick(c.name);
+          }}
+          className={`w-full text-left px-2.5 py-1.5 flex items-baseline gap-2 ${
+            i === selected ? "bg-amber/10" : "hover:bg-surface"
+          }`}
+        >
+          <span className="font-mono text-[12px] text-amber">/{c.name}</span>
+          {c.takesArgs && c.argHint && (
+            <span className="font-mono text-[10.5px] text-muted">{c.argHint}</span>
+          )}
+          <span className="text-[11.5px] text-secondary flex-1 min-w-0 truncate">
+            {c.summary}
+          </span>
+        </button>
+      ))}
     </div>
   );
 }

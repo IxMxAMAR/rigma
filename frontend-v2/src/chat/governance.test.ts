@@ -1,0 +1,155 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  EMPTY_GOVERNANCE,
+  foldApproval,
+  outcomeLabel,
+  outcomeTone,
+  sandboxLabel,
+  sandboxTone,
+} from "./governance";
+
+const ask = (id: string, toolName = "bash", reason = "") => ({
+  event: "approval/asked",
+  data: { id, toolName, ...(reason ? { reason } : {}) },
+});
+const decided = (id: string, outcome: string) => ({
+  event: "approval/decided",
+  data: { id, outcome },
+});
+
+// DSH records its own governance as `log-only` events: durable and replayable,
+// never part of the model transcript. Rigma could not see any of them.
+describe("foldApproval", () => {
+  it("records an ask as pending", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, ask("a1", "write", "outside the workspace"));
+    expect(g.approvals).toHaveLength(1);
+    expect(g.approvals[0]).toMatchObject({
+      kind: "asked",
+      id: "a1",
+      toolName: "write",
+      reason: "outside the workspace",
+      outcome: "",
+    });
+  });
+
+  // The whole reason `decided` is folded rather than appended: two rows per
+  // decision would double the trail and separate a question from its answer.
+  it("folds a decision onto its own ask instead of adding a row", () => {
+    let g = foldApproval(EMPTY_GOVERNANCE, ask("a1", "write"));
+    g = foldApproval(g, decided("a1", "allowed-once"));
+    expect(g.approvals).toHaveLength(1);
+    expect(g.approvals[0]).toMatchObject({ kind: "asked", toolName: "write", outcome: "allowed-once" });
+  });
+
+  it("pairs each decision with the RIGHT ask when several are open", () => {
+    let g = foldApproval(EMPTY_GOVERNANCE, ask("a1", "first"));
+    g = foldApproval(g, ask("a2", "second"));
+    // Out of order on purpose: the second ask is answered first.
+    g = foldApproval(g, decided("a2", "rejected"));
+    g = foldApproval(g, decided("a1", "allowed-once"));
+    expect(g.approvals.map((a) => [a.toolName, a.outcome])).toEqual([
+      ["first", "allowed-once"],
+      ["second", "rejected"],
+    ]);
+  });
+
+  // An ask that predates this turn has no visible question. Dropping the
+  // decision would hide that a tool was refused.
+  it("keeps an orphaned decision rather than discarding it", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, decided("gone", "rejected"));
+    expect(g.approvals).toHaveLength(1);
+    expect(g.approvals[0]).toMatchObject({ kind: "decided", id: "gone", outcome: "rejected" });
+  });
+
+  it("does not overwrite an ask that is already decided", () => {
+    let g = foldApproval(EMPTY_GOVERNANCE, ask("a1", "write"));
+    g = foldApproval(g, decided("a1", "allowed-once"));
+    g = foldApproval(g, decided("a1", "rejected"));
+    // A second decision for the same id is a NEW row, not a silent rewrite: the
+    // first verdict is what actually happened.
+    expect(g.approvals).toHaveLength(2);
+    expect(g.approvals[0].outcome).toBe("allowed-once");
+    expect(g.approvals[1].outcome).toBe("rejected");
+  });
+
+  it("records a policy switch", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, {
+      event: "approval/policy", data: { policy: "ask", source: "delegation" },
+    });
+    expect(g.approvals[0]).toMatchObject({ kind: "policy", policy: "ask" });
+  });
+
+  // An audit trail must not silently swallow an event it does not recognise.
+  it("keeps an unknown approval kind", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, { event: "approval/something-new", data: { id: "x" } });
+    expect(g.approvals).toHaveLength(1);
+    expect(g.approvals[0].kind).toBe("something-new");
+  });
+
+  it("ignores a payload that is not an approval", () => {
+    expect(foldApproval(EMPTY_GOVERNANCE, null)).toBe(EMPTY_GOVERNANCE);
+    expect(foldApproval(EMPTY_GOVERNANCE, {})).toBe(EMPTY_GOVERNANCE);
+    expect(foldApproval(EMPTY_GOVERNANCE, { event: "goal", data: {} })).toBe(EMPTY_GOVERNANCE);
+  });
+
+  it("never mutates the governance it was given", () => {
+    const before = foldApproval(EMPTY_GOVERNANCE, ask("a1", "write"));
+    const snapshot = JSON.parse(JSON.stringify(before));
+    foldApproval(before, decided("a1", "rejected"));
+    expect(before).toEqual(snapshot);
+  });
+});
+
+describe("outcomeLabel", () => {
+  it("spells out the verdict rather than showing the identifier", () => {
+    expect(outcomeLabel("allowed-once")).toBe("allowed once");
+    expect(outcomeLabel("rejected")).toBe("rejected");
+  });
+
+  // DSH's fail-closed outcome. "unavailable" alone reads like a network blip;
+  // it actually means the tool was NOT permitted.
+  it("makes the fail-closed outcome unmistakable", () => {
+    expect(outcomeLabel("unavailable")).toContain("not permitted");
+  });
+
+  it("shows an unknown outcome rather than hiding it", () => {
+    expect(outcomeLabel("new-verdict")).toBe("new-verdict");
+  });
+});
+
+describe("outcomeTone", () => {
+  it("marks only an allow as amber, and refusals as red", () => {
+    expect(outcomeTone("allowed-once")).toContain("amber");
+    expect(outcomeTone("rejected")).toContain("red");
+    expect(outcomeTone("unavailable")).toContain("red");
+  });
+});
+
+describe("sandboxLabel", () => {
+  it("says what the mode MEANS, not just its identifier", () => {
+    expect(sandboxLabel("workspace-write")).toContain("workspace");
+    expect(sandboxLabel("read-only")).toBe("read-only");
+  });
+
+  // The one mode a reader must not skim past.
+  it("does not let full access read as neutral", () => {
+    expect(sandboxLabel("danger-full-access")).toContain("unrestricted");
+  });
+
+  it("shows an unknown mode rather than hiding it", () => {
+    expect(sandboxLabel("something-new")).toBe("something-new");
+  });
+});
+
+describe("sandboxTone", () => {
+  it("grades the three real modes by how much they permit", () => {
+    expect(sandboxTone("read-only")).toContain("moss");
+    expect(sandboxTone("workspace-write")).toContain("amber");
+    expect(sandboxTone("danger-full-access")).toContain("red");
+  });
+
+  it("is neutral for an unknown mode", () => {
+    expect(sandboxTone("something-new")).toContain("muted");
+  });
+});
