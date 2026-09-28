@@ -229,15 +229,70 @@ describe("foldSubagent — the name DSH sends on subagent/catalog", () => {
   });
 
   it("ignores subagent/descriptor, which carries no child id at all", () => {
-    // Worth pinning: `subagent/descriptor` is NOT about a child. Its fields are
-    // {mode, version, provider} + {label, agentProvider, agentModel, persona,
-    // toolFilter} — it describes the subagent PROVIDER (dispositions.ts:92-95).
-    // Its `label` is the provider's name, not a child's, so folding it onto a row
-    // would be wrong rather than merely useless.
+    // F5 CORRECTION. This test used to justify the ignore with "its `label` is the
+    // provider's name, not a child's" — and the FIXTURE was built to match, with
+    // `label: "spawn"` equal to `provider: "spawn"`. That shape is one DSH does not
+    // produce, so the fixture confirmed the error instead of catching it.
+    //
+    // DSH is explicit: `descriptor.ts:63-68` calls `label` "the child's durable
+    // creation label". The label IS a child's name, so folding it would be USEFUL.
+    // What actually blocks the fold is the missing ID: the descriptor has no
+    // `childId` and no `childSessionId` in any variant, because DSH appends it inside
+    // the CHILD's session (`descriptor.ts:32-38`) rather than the parent's.
+    //
+    // So the fixture now carries a realistic label — a child's name, NOT equal to the
+    // provider — and the assertion is unchanged, because the reason for it is the id
+    // and not the label. If someone later "fixes" the label semantics, this still
+    // holds; if someone carries the child id across, this test SHOULD fail, which is
+    // the signal that the fold can now use it.
     const rows = foldSubagent([], start);
     expect(foldSubagent(rows, {
       event: "subagent/descriptor",
-      data: { mode: "one-shot", version: 0, provider: "spawn", label: "spawn" },
+      data: {
+        mode: "one-shot", version: 3, provider: "spawn",
+        label: "scout the parser",       // the CHILD's creation label
+      },
     })).toEqual(rows);
+  });
+});
+
+// mcode #8: a background `bash` task must become a row that tells the truth about its
+// state. Two layers had to agree for that: the adapter must classify the result as a
+// task (Python, pinned in tests/test_mcode_background_task.py), and this fold must
+// classify its status correctly.
+describe("mcode #8: background shell tasks", () => {
+  /** mcode's background-bash result, as serve.py wraps it for the wire. */
+  const bg = (status: string) => ({
+    event: "subagent",
+    data: { taskId: "t1", name: "run the suite", status },
+  });
+
+  it("opens a row for a running background task", () => {
+    const rows = foldSubagent([], bg("started"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe("t1");
+    expect(rows[0].state).toBe("running");
+    expect(rows[0].name).toBe("run the suite");
+  });
+
+  it("treats auto_promoted as RUNNING, which is what mcode says it is", () => {
+    // The trap: an unrecognised status falls to "finished", so a promoted command —
+    // which mcode describes as "still running and ... yielded to a managed background
+    // task without restarting it" — would draw as a completed row. That is the same
+    // class of lie the row was added to remove.
+    const rows = foldSubagent([], bg("auto_promoted"));
+    expect(rows[0].state).toBe("running");
+  });
+
+  it("treats a completed task as done", () => {
+    const rows = foldSubagent([], bg("completed"));
+    expect(rows[0].state).toBe("done");
+  });
+
+  it("keys the row by taskId, since a shell task has no sub-session", () => {
+    // A background command is a local background task, not a child conversation, so
+    // there is no `subSessionId` — `taskId` is the only id it has.
+    const rows = foldSubagent([], bg("started"));
+    expect(rows[0].id).toBe("t1");
   });
 });

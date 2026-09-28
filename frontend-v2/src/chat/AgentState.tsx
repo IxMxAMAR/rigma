@@ -29,6 +29,9 @@ import type {
   AcpDelegation,
   AcpQueueItem,
 } from "./chatStore";
+// R6-WORKFLOW: the run shape lives in api.ts, beside `SavedAgentState`, because the
+// DURABLE copy of a run is stored in the same shape the live one is drawn from.
+import type { WorkflowAgent, WorkflowRun } from "../lib/api";
 import {
   outcomeLabel,
   outcomeTone,
@@ -105,6 +108,108 @@ function SubagentRow({ row }: { row: Subagent }) {
  *  marks all of these `log-only` — durable, replayable, never in the model
  *  transcript — which is exactly why they belong beside the turn, not in it.
  */
+/**
+ * R6-WORKFLOW: one programmatic-tool-calling run.
+ *
+ * WHY THIS IS A BLOCK AND NOT A CHIP. A run is a group of agents working together, and
+ * the four DSH events that describe it arrive as separate lines. Before this they
+ * arrived as the literal string "session.event tool-workflow/agent-start" — four lines
+ * naming an event nobody could interpret — so the run's name, each agent's label and
+ * phase, each agent's outcome and the run's stop reason were all discarded. This draws
+ * the run those events were describing.
+ *
+ * The outcome glyph is deliberately the SAME vocabulary as the approval trail's
+ * (`✓` / `✕` / `?`): an agent's verdict and a permission verdict are both verdicts, and
+ * inventing a second glyph set would make the reader learn two.
+ */
+function WorkflowBlock({ runs }: { runs: WorkflowRun[] }) {
+  if (runs.length === 0) return null;
+  return (
+    <div className="border-t border-line pt-1.5 flex flex-col gap-1.5">
+      <span className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em]">
+        agent workflows
+      </span>
+      {runs.map((r: WorkflowRun) => (
+        <div key={r.runId} className="flex flex-col gap-0.5">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="font-mono text-[11.5px] text-secondary">
+              {r.name || "(unnamed run)"}
+            </span>
+            {/* A run still going is worth saying, because that is the state a reader
+                is most likely to be looking at and the one that looks like a hang. */}
+            {r.done ? (
+              r.stopReason && (
+                <span className="font-mono text-[10.5px] text-muted">
+                  — {r.stopReason}
+                </span>
+              )
+            ) : (
+              <span className="font-mono text-[10.5px] text-amber">— running</span>
+            )}
+          </div>
+          {r.agents.length > 0 && (
+            <ul className="flex flex-col gap-0.5 pl-3">
+              {r.agents.map((a: WorkflowAgent, i: number) => (
+                <li
+                  key={`${String(a.seq)}-${String(i)}`}
+                  className="text-[11.5px] flex items-start gap-1.5"
+                >
+                  <span
+                    className={`font-mono mt-px ${workflowTone(a.outcome)}`}
+                    aria-hidden="true"
+                  >
+                    {workflowGlyph(a.outcome)}
+                  </span>
+                  <span className="flex-1 min-w-0">
+                    <span className="font-mono text-secondary">
+                      {a.label || `agent ${String(a.seq)}`}
+                    </span>
+                    {a.phase && (
+                      <span className="font-mono text-muted"> · {a.phase}</span>
+                    )}
+                    {a.outcome && (
+                      <span className={`font-mono ${workflowTone(a.outcome)}`}>
+                        {" "}— {a.outcome}
+                      </span>
+                    )}
+                    {a.childId && (
+                      <span className="block text-muted font-mono break-all">
+                        {a.childId}
+                      </span>
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** The glyph for an agent's outcome. Same three states as the approval trail: a
+ *  verdict in favour, a verdict against, and no verdict yet — and the empty case is
+ *  `?` rather than a blank, so a still-running agent is visibly unfinished rather
+ *  than looking like one that reported nothing. */
+function workflowGlyph(outcome: string): string {
+  if (!outcome) return "?";
+  const o = outcome.toLowerCase();
+  if (o === "ok" || o === "success" || o === "succeeded" || o === "completed") {
+    return "✓";
+  }
+  return "✕";
+}
+
+function workflowTone(outcome: string): string {
+  if (!outcome) return "text-amber";
+  const o = outcome.toLowerCase();
+  if (o === "ok" || o === "success" || o === "succeeded" || o === "completed") {
+    return "text-moss";
+  }
+  return "text-red";
+}
+
 function GovernanceBlock({ gov, onAnswer }: {
   gov: Governance;
   /** R6-ACP-APPROVE: answer a request that is BLOCKING a turn, or absent when there
@@ -484,6 +589,7 @@ export default function AgentState({
   acpConfig = [],
   acpCommands = [],
   acpPlan = null,
+  workflow = [],
   onAnswerApproval,
 }: {
   goal: NormalGoal | null;
@@ -502,6 +608,9 @@ export default function AgentState({
   acpConfig?: AcpConfigOption[];
   acpCommands?: AcpCommand[];
   acpPlan?: Record<string, unknown> | null;
+  /** R6-WORKFLOW: programmatic-tool-calling runs. Defaulted empty for the same reason
+   *  the ACP props are — the durable panel and older call sites have none. */
+  workflow?: WorkflowRun[];
   /** R6-ACP-APPROVE: answers a permission request that is BLOCKING the turn. Absent
    *  on the DURABLE panel, which has no live turn to unblock. */
   onAnswerApproval?: (requestId: string, allow: boolean) => void;
@@ -518,7 +627,7 @@ export default function AgentState({
     acpConfig.length > 0 || acpCommands.length > 0 || acpPlan != null;
   if (
     !hasGoal && todos.length === 0 && !planMode && subagents.length === 0 &&
-    !hasUsage && !hasGov && !hasAcp
+    !hasUsage && !hasGov && !hasAcp && workflow.length === 0
   ) {
     return null;
   }
@@ -613,6 +722,11 @@ export default function AgentState({
           )}
         </div>
       )}
+
+      {/* R6-WORKFLOW: programmatic tool calling. Above the ACP block because a
+          workflow is the work itself, and the ACP block describes the session the
+          work is happening in. */}
+      <WorkflowBlock runs={workflow} />
 
       {/* R6-ACP: the control plane, above governance because it is about the
           WORK (what is queued, what was delegated, which plan) rather than about

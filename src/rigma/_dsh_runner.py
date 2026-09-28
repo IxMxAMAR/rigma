@@ -94,6 +94,44 @@ _STATE_EVENTS = (
     # returns a malformed tool call, the visible effect is a turn that sits there.
     "llm/retry",
     "llm/retry-started",
+    # R6-WORKFLOW: programmatic tool calling, which Rigma mounts
+    # (`data/dsh/agent-capabilities.patch.yml` rows `ptc-runtime`, `workflow-ptc`,
+    # `tool-workflow`) and therefore fires in a real PTC turn.
+    #
+    # WHY THIS IS NOT COSMETIC. These four were reaching the UI as the literal
+    # string "session.event tool-workflow/agent-start", and that was an ACCIDENT:
+    # the notice path matches on `_NOTICE_WORTHY`, whose list contains "tool", and
+    # "tool-workflow" contains it. So a run's name, each agent's label and phase,
+    # each agent's outcome and the run's stop reason were all discarded — the user
+    # saw a line naming an event they could not interpret and nothing else.
+    #
+    # The payloads (`dispositions.ts:102-105`):
+    #   run-start   {runId, name}
+    #   agent-start {runId, seq, label, childId, phase?}
+    #   agent-end   {runId, seq, outcome}
+    #   run-end     {runId, stopReason}
+    # `runId` and `seq` are what let the frontend join the four into one run rather
+    # than four unrelated lines.
+    # DELIBERATELY ABSENT: `subagent/model-selection-policy`, and the reason is worth
+    # recording because the name LOOKS like something that should be here. It is
+    # appended only by `recordSubagentModelSelection`, whose sole caller is gated on
+    # `config.modelSelectionSettings === true` — which defaults FALSE
+    # (`tool-subagent/src/index.ts:109`) and which Rigma's two `dsh-tool-subagent` rows
+    # do not set (`data/dsh/agent-capabilities.patch.yml`; a row's `config:` REPLACES
+    # the object, so there is no inherited value). So the event never fires in this
+    # build: adding it here would create a branch nothing can reach, which is worse
+    # than its absence because it reads as coverage.
+    #
+    # AND IT WOULD NOT BE USEFUL IF IT DID FIRE. Its payload is
+    # `{allowedModels: [{provider, model}]}` — the routes a session may pick a child
+    # model from. Rigma points DSH at ONE local model, so the list would be a choice of
+    # one, and the opt-in exists to let a MODEL choose its children's routes. Rigma's
+    # user picks the model in the UI instead, which is the same decision made in the
+    # place a person can see it. Declared under `unsupported` in harness.py.
+    "tool-workflow/run-start",
+    "tool-workflow/agent-start",
+    "tool-workflow/agent-end",
+    "tool-workflow/run-end",
 )
 
 # `assistant/message` carries the step's token accounting. It is the ONLY

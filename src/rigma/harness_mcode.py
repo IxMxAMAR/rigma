@@ -705,6 +705,38 @@ _TODO_TOOLS = ("todowrite",)
 _TASK_TOOLS = ("task", "task_append", "task_query", "task_output",
                 "task_stop")
 
+# A `bash` call can START a background task, and when it does the result carries
+# `details.task_id` — verified in mcode's own bundle
+# (`chunk-QWAB5G2D.js` @5981148): the background result is
+# `{tool_name, text, content, details: {...config, status, task_id}}`, with
+# `status` one of `direct_foreground` / `auto_promoted` / a queued or running word.
+#
+# WHY IT IS IN THE TASK FAMILY RATHER THAN ITS OWN. mcode's `task_query` describes
+# itself as "Query local desktop background tasks started in this session", and
+# `task_stop` takes the same `task_id` — so a background shell command IS a local
+# background task, the same family as a delegated subagent. Emitting it as the
+# `subagent` state event therefore reuses the row the UI already draws, keyed by
+# `taskId`, rather than growing a second panel for the same idea.
+#
+# The trigger is `details.task_id` and NOT the tool name. A foreground `bash` is not a
+# task and must not grow a row; the presence of the id is exactly the fact that
+# distinguishes them, so it is what is tested.
+_BACKGROUND_TASK_TOOLS = ("bash",)
+
+# The statuses that mean a background task has just STARTED. Both are verified in
+# mcode's bundle (`chunk-QWAB5G2D.js` @5981148):
+#
+#   "started"       `run_in_background: true` was accepted — "Background Bash task
+#                   accepted; command startup may still be in progress"
+#   "auto_promoted" a FOREGROUND command outran its timeout and was yielded to a managed
+#                   background task "without restarting it" — so it is running, even
+#                   though the model asked for a foreground run
+#
+# Deliberately NOT here: `"completed"` (the job is over, so a live row would lie) and
+# `"direct_foreground"` (it was never a task). An unrecognised status is also excluded:
+# reporting "running" for a word this build does not know would invent state.
+_BACKGROUND_TASK_STARTED = ("started", "auto_promoted")
+
 
 def _details(out) -> dict:
     """The structured `details` of a tool result, or {}.
@@ -750,6 +782,32 @@ def _state_events(name: str, out) -> list[TurnEvent]:
         if not isinstance(todos, list):
             return []
         return [TurnEvent(kind="state", event="todos", data={"todos": todos})]
+
+    if name in _BACKGROUND_TASK_TOOLS:
+        # mcode #8. `_flatten` keeps only `content`, so before this the id and status
+        # were discarded even though the text named them — a task could be running with
+        # nothing in the UI saying so.
+        #
+        # THE TRIGGER IS THE START, NOT THE ID, and a pre-existing test is why.
+        # `test_a_bash_result_carrying_a_task_id_is_not_a_subagent` pinned from a real
+        # capture that a bash result with `details.task_id` emits nothing, because that
+        # capture's status was `"completed"` — a finished background JOB, which is not a
+        # live child agent. Keying on the id alone would have drawn a row claiming work
+        # that was over, so the status is what decides.
+        #
+        # It also avoids a duplicate: mcode's `task_output` results carry the same
+        # `task_id`, and `_TASK_TOOLS` below already turns those into rows.
+        status = str(d.get("status") or "")
+        if status not in _BACKGROUND_TASK_STARTED:
+            return []
+        task_id = d.get("task_id")
+        if not task_id:
+            return []
+        return [TurnEvent(kind="state", event="subagent", data={
+            "taskId": task_id,
+            "name": d.get("description") or d.get("command") or "background shell",
+            "status": d.get("status"),
+        })]
 
     if name in _TASK_TOOLS:
         # mcode emits snake_case (`task_id`, `sub_session_id`, `sub_turn_id`);

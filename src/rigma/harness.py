@@ -331,6 +331,22 @@ BACKENDS: dict[str, Harness] = {
             "not mounted at all",
             "asking you a question mid-turn: `ask_user_question` needs the same "
             "missing `dsh-user-questions` channel",
+            # R6-WEBFETCH: the OTHER half of the old web decision. Named rather than
+            # left implied, because the absence of a search tool is otherwise
+            # indistinguishable from an oversight — and because a reader who sees
+            # `web_fetch` in the capability list will reasonably ask where
+            # `web_search` went.
+            # F6: named because the capability EXISTS upstream and is off here, which
+            # is exactly the case a capability menu is for. Left unsaid it would read
+            # as an oversight, and a reader comparing against DSH's docs would file it
+            # as a gap.
+            "letting the model choose its subagents' model: DSH gates that behind "
+            "`modelSelectionSettings`, which is off, and the choice would be between "
+            "one route — Rigma points DSH at a single local model, so you pick the "
+            "model in Rigma's own UI instead",
+            "web search: every search provider DSH ships reads an API key "
+            "(`dsh-web-search-deepseek` wants DEEPSEEK_API_KEY), and Rigma's premise "
+            "is a local model — so `web_fetch` is mounted and `web_search` is not",
         ),
         # R3-HARN-1: `harness_dsh.run_turn` accepts `permission` and ignores it
         # by design — DSH's confinement is its own bundle's business. Declared so
@@ -356,6 +372,10 @@ BACKENDS: dict[str, Harness] = {
             "Rigma's own tools, as an MCP server: `mcp__rigma__search_my_documents`, "
             "`mcp__rigma__remember`, `mcp__rigma__recall` and "
             "`mcp__rigma__undo_last_change`, mounted through `dsh-mcp-client`",
+            # R6-WEBFETCH: mounted, and it is keyless — which is why it is here and
+            # search is not. `web_search` is declared under `unsupported` below, so the
+            # two halves of the old single decision are now visible separately.
+            "`web_fetch`, to read a public HTTP(S) page",
         ),
     ),
     MCODE: Harness(

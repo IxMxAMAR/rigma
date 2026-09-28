@@ -345,6 +345,7 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         acpConfig={turn.acpConfig}
         acpCommands={turn.acpCommands}
         acpPlan={turn.acpPlan}
+        workflow={turn.workflow}
         onAnswerApproval={answerApproval}
       />
       {/* Compaction, observation-masking and the prompt queue. All three were
@@ -500,9 +501,14 @@ export default function Transcript() {
   // field names are reconciled. `undefined` for no goal, which AgentState treats
   // the same as null.
   const durableGoal = saved?.goal ? normaliseGoal(saved.goal) : null;
+  // R6-WORKFLOW: a run counts as something to show, so it joins the condition as well
+  // as the payload. Leaving it out of the CONDITION would mean a chat whose only
+  // durable state is a workflow rendered no durable panel at all.
   const durable = saved && (durableGoal || (saved.todos?.length ?? 0) > 0 ||
-                            saved.plan_mode === true)
-    ? { goal: durableGoal, todos: saved.todos ?? [], plan: saved.plan_mode === true }
+                            saved.plan_mode === true ||
+                            (saved.workflow?.length ?? 0) > 0)
+    ? { goal: durableGoal, todos: saved.todos ?? [], plan: saved.plan_mode === true,
+        workflow: saved.workflow ?? [] }
     : null;
 
   useEffect(() => {
@@ -566,6 +572,13 @@ export default function Transcript() {
             goal={durable.goal}
             todos={durable.todos}
             planMode={durable.plan}
+            /* R6-WORKFLOW: restored, UNLIKE the ACP block below, and the difference is
+               the point. A queue or a delegation snapshot describes a session that is
+               running right now, so restoring one would claim live state that is gone.
+               A workflow run is a RECORD of work this conversation already did — the
+               same class of fact as `todos`, which is also restored — and dropping it
+               would show a chat whose agents had never run. */
+            workflow={durable.workflow ?? []}
             subagents={[]}
             usage={null}
             governance={EMPTY_GOVERNANCE}

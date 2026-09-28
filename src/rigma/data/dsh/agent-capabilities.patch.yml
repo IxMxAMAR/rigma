@@ -196,14 +196,38 @@
       name: '@deepseek-ai/dsh-compaction-basic'
 
     # ---- web ---------------------------------------------------------------
-    # Omitted deliberately: `dsh-web-search-deepseek` needs a live
-    # DEEPSEEK_API_KEY, and Rigma's whole premise is a LOCAL model. A web tool
-    # that fails on every call is worse than an absent one. Add the three rows
-    # below if the key is ever guaranteed:
+    # R6-WEBFETCH: `web_fetch` is mounted; `web_search` is NOT, and the split is the
+    # whole point of this block.
     #
-    #   - id: web
-    #     name: '@deepseek-ai/dsh-web'
-    #   - id: web-fetch-http
-    #     name: '@deepseek-ai/dsh-web-fetch-http'
-    #   - id: tool-web
-    #     name: '@deepseek-ai/dsh-tool-web'
+    # It used to be one decision for two capabilities, justified by an API key. The
+    # key belongs to the SEARCH provider only: `dsh-web-search-deepseek` reads
+    # DEEPSEEK_API_KEY, while `dsh-web-fetch-http` is an anonymous public fetcher with
+    # no credentials to check at all (`web-fetch-http/src/provider.ts:51` — "No
+    # credentials to check — an anonymous public fetcher is always usable"). So the
+    # old comment named a package that was not even in its own list, and used it to
+    # omit a capability it does not constrain. That is a gap wearing the costume of a
+    # decision.
+    #
+    # `search: false` is what makes this a fetch-only mount. Without it,
+    # `dsh-tool-web` registers `web_search` too — and with no search provider mounted,
+    # that tool would be visible and fail on every call, which is the outcome the
+    # original comment was right to want to avoid. `fetch` defaults true and is left
+    # alone. `web-fetch-http` is the only registered fetch provider, so it
+    # auto-selects (`web/src/index.ts`: "exactly one registered usable provider → that
+    # provider"); there is no ambiguity to resolve and no id to pin.
+    #
+    # NOT mounted, and this is the deliberate half: any search provider. Add one row
+    # below AND set `search: true` if a key is ever guaranteed.
+    #
+    #   - id: web-search-deepseek
+    #     name: '@deepseek-ai/dsh-web-search-deepseek'
+    - id: web
+      name: '@deepseek-ai/dsh-web'
+
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+
+    - id: tool-web
+      name: '@deepseek-ai/dsh-tool-web'
+      config:
+        search: false

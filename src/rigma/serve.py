@@ -2283,6 +2283,77 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _agent_state["todos"] = _todos
                         _persist_agent_state()
                         yield _sse({"todos": _todos}, event="todos")
+                    elif _ev.startswith("tool-workflow/"):
+                        # R6-WORKFLOW: one SSE name for the four lifecycle events,
+                        # with the DSH name carried alongside so the store can tell a
+                        # run from an agent and a start from an end. Same shape as the
+                        # `approval/` arm below, and for the same reason: the four are
+                        # one fact evolving, so four SSE names would mean four arms
+                        # that must be kept in step.
+                        #
+                        # The run is also ACCUMULATED here, and written only when it
+                        # ends. A reload has no turn to fold four events into, so the
+                        # durable copy has to be the FOLDED run — and folding means
+                        # keeping the agents, which arrive one `agent-start` at a time.
+                        # Persisting only what `run-end` carries would store a run with
+                        # no agents in it, which is the panel's whole content.
+                        #
+                        # The write happens on `run-end` and nowhere else: mid-flight
+                        # writes would be one per agent, and a run restored from a
+                        # reload could never finish, because the turn that would have
+                        # ended it is gone.
+                        #
+                        # Keyed by `runId` because the four events are one run
+                        # evolving; a row per event would show a run four times.
+                        _rid = str(_data.get("runId") or "")
+                        _runs = list(_agent_state.get("workflow") or [])
+                        _run = next((r for r in _runs
+                                     if str(r.get("runId") or "") == _rid), None)
+                        if _run is None:
+                            # An unseen id OPENS a run. `agent-start` can arrive with no
+                            # `run-start` — the runner only began forwarding these in
+                            # R6-WORKFLOW, and a resumed session carries a run's later
+                            # events without its first. Refusing it would drop real
+                            # activity to avoid drawing a header.
+                            _run = {"runId": _rid, "name": "", "stopReason": "",
+                                    "done": False, "agents": []}
+                            _runs.append(_run)
+                        if _ev == "tool-workflow/run-start":
+                            _run["name"] = str(_data.get("name") or "")
+                        elif _ev == "tool-workflow/agent-start":
+                            _seq = _data.get("seq")
+                            _run["agents"].append({
+                                "seq": _seq if isinstance(_seq, int) else -1,
+                                "label": str(_data.get("label") or ""),
+                                "childId": str(_data.get("childId") or ""),
+                                "phase": str(_data.get("phase") or ""),
+                                "outcome": "",
+                            })
+                        elif _ev == "tool-workflow/agent-end":
+                            _seq = _data.get("seq")
+                            _hit = next((a for a in _run["agents"]
+                                         if a.get("seq") == _seq), None)
+                            if _hit is None:
+                                # An outcome with no start is still a fact; dropping
+                                # it would make a run look shorter than it was.
+                                _run["agents"].append({
+                                    "seq": _seq if isinstance(_seq, int) else -1,
+                                    "label": "", "childId": "", "phase": "",
+                                    "outcome": str(_data.get("outcome") or ""),
+                                })
+                            else:
+                                _hit["outcome"] = str(_data.get("outcome") or "")
+                        elif _ev == "tool-workflow/run-end":
+                            _run["done"] = True
+                            _run["stopReason"] = str(_data.get("stopReason") or "")
+                        # Kept in memory either way so the next event of this run
+                        # continues it; CAPPED because a long PTC session runs many
+                        # times and the durable copy is a record, not a log.
+                        _agent_state["workflow"] = _runs[-20:]
+                        if _ev == "tool-workflow/run-end":
+                            _persist_agent_state()
+                        yield _sse({"event": _ev, "data": _data},
+                                   event="workflow")
                     elif _ev == "plan/mode":
                         _active = bool(_data.get("active"))
                         _agent_state["plan_mode"] = _active
