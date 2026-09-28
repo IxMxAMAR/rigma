@@ -361,10 +361,16 @@ BACKENDS: dict[str, Harness] = {
     MCODE: Harness(
         name=MCODE,
         label="MiniMax Code",
-        # The design note said "acp for streaming, exec for batch". Stale: use
-        # exec's versioned NDJSON stream, and treat ACP as a later upgrade —
-        # ACP would additionally mean implementing the ACP *client* side.
-        drives="a subprocess turn: `mcode exec --output-format stream-json`",
+        # R6-ACP: this comment used to read "use exec's versioned NDJSON stream,
+        # and treat ACP as a later upgrade — ACP would additionally mean
+        # implementing the ACP *client* side." The client now EXISTS
+        # (`harness_mcode_acp.py`), so the upgrade is built rather than pending.
+        # The turn is still driven over `exec`, deliberately: swapping the live
+        # transport is a separate, riskier change than building the client, and the
+        # client is what makes the control plane reachable at all.
+        drives="a subprocess turn: `mcode exec --output-format stream-json`. Its "
+               "Agent Client Protocol surface is reachable too — Rigma has a "
+               "working ACP client — but the chat turn does not use it yet",
         runnable=True,
         needs="mcode",
         probe=_mcode_available,
@@ -411,6 +417,18 @@ BACKENDS: dict[str, Harness] = {
             "the chat's workspace and its AGENTS.md, written in before a turn",
             "a session that survives the process, so its plan, subagents and "
             "goals continue across turns instead of restarting each one",
+            # R6-ACP: what the ACP client adds. These are capabilities mcode has
+            # ALWAYS had and Rigma could not reach, because `exec` is a projection
+            # of one turn and these are all session-scoped. Disclosed because the
+            # menu's job is to say what is reachable, and "unreachable with no line
+            # saying so" is the defect this whole round is about.
+            "over ACP, its session control plane: goals, a prompt queue, "
+            "steering, delegation of a turn to a child session, plan mode, and "
+            "switching the model or the permission policy mid-session",
+            "over ACP, an ANSWERABLE permission prompt — mcode asks and waits, so "
+            "a permission request can be granted or refused instead of only "
+            "displayed. This is the one interaction channel mcode offers that DSH "
+            "does not",
         ),
     ),
 }

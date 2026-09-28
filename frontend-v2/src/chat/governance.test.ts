@@ -153,3 +153,61 @@ describe("sandboxTone", () => {
     expect(sandboxTone("something-new")).toContain("muted");
   });
 });
+
+// R6-ACP: an mcode ACP permission decision reaches this SAME fold.
+//
+// `drive_turn_acp` translates ACP's permission answer into `approval/asked` +
+// `approval/decided` rather than inventing a second vocabulary, which is why
+// answering a permission prompt needed no new UI. These tests pin the payload shape
+// the Python side actually emits — an `asked` with a title and no outcome, then a
+// `decided` carrying only the id and the outcome — so a change on either side of the
+// seam is caught here rather than showing as a blank row in the panel.
+describe("R6-ACP: mcode's permission decision on the shared trail", () => {
+  const acpAsked = (id: string, toolName: string) => ({
+    event: "approval/asked",
+    data: { id, toolName, reason: "decided by Rigma's policy", auto: false },
+  });
+  const acpDecided = (id: string, outcome: string) => ({
+    event: "approval/decided",
+    data: { id, outcome, optionId: "allow-once", policy: "auto" },
+  });
+
+  it("pairs an ACP ask with its decision instead of adding two rows", () => {
+    let g = foldApproval(EMPTY_GOVERNANCE, acpAsked("call_1", "write file"));
+    g = foldApproval(g, acpDecided("call_1", "allowed-once"));
+    expect(g.approvals).toHaveLength(1);
+    expect(g.approvals[0]).toMatchObject({
+      kind: "asked", toolName: "write file", outcome: "allowed-once",
+    });
+  });
+
+  it("renders an ACP grant in the SAME words and colour as a DSH one", () => {
+    // The point of translating rather than inventing: the panel's label and tone
+    // functions are keyed on this exact word, so a third vocabulary would have shown
+    // a granted permission as an unexplained neutral event.
+    expect(outcomeLabel("allowed-once")).toBe("allowed once");
+    expect(outcomeTone("allowed-once")).toBe("text-amber");
+  });
+
+  it("renders an ACP refusal as a refusal", () => {
+    expect(outcomeLabel("rejected")).toBe("rejected");
+    expect(outcomeTone("rejected")).toBe("text-red");
+  });
+
+  it("keeps an ACP decision with no visible question", () => {
+    // An orphaned decision is still a decision: the ask can predate this turn.
+    const g = foldApproval(EMPTY_GOVERNANCE, acpDecided("call_9", "rejected"));
+    expect(g.approvals).toHaveLength(1);
+    expect(g.approvals[0].outcome).toBe("rejected");
+  });
+
+  it("does not treat an automatic ACP decision as a user decision", () => {
+    // `auto: true` is what tells the reader nobody was asked. Dropping it would make
+    // a policy decision look like a human click.
+    const g = foldApproval(EMPTY_GOVERNANCE, {
+      event: "approval/asked",
+      data: { id: "call_2", toolName: "rm -rf", auto: true },
+    });
+    expect(g.approvals[0].id).toBe("call_2");
+  });
+});

@@ -22,7 +22,9 @@ Invoked as: python fake_acp_server.py [--modes a,b] [--no-extensions]
 
 from __future__ import annotations
 
+import atexit
 import json
+import pathlib
 import sys
 
 MODES = ["default", "plan"]
@@ -53,6 +55,9 @@ def main(argv: list[str]) -> int:
     ask_question = False
     silent = False
     prompt_error = ""
+    resume_renames = False
+    resume_unknown = False
+    record_path = ""
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -72,6 +77,14 @@ def main(argv: list[str]) -> int:
             # unanswered request as a refusal. Only `initialize` is answered, so a
             # test can get a session and then observe true silence.
             silent = True
+        elif a == "--record" and i + 1 < len(argv):
+            record_path = argv[i + 1]
+            i += 2
+            continue
+        elif a == "--resume-renames":
+            resume_renames = True
+        elif a == "--resume-unknown":
+            resume_unknown = True
         elif a == "--prompt-error" and i + 1 < len(argv):
             prompt_error = argv[i + 1]
             i += 2
@@ -87,8 +100,39 @@ def main(argv: list[str]) -> int:
              # declaration is tested rather than assumed:
              #   function po(e){let t=e._meta?.["minimax-code/extensions"];
              #     return t===!0||oh(t)&&t.version===1&&t.notifications===!0}
-             "extensions_enabled": False}
+             "extensions_enabled": False,
+             # R6-ACP-TURN: the resume surface. `resume_renames` makes the server
+             # answer with a DIFFERENT id than the one asked for, which the real
+             # server may do and which a client trusting its own id would miss.
+             # `resume_unknown` errors an id the server does not have, so the
+             # driver's "start a new session and say so" path is reachable.
+             "known_sessions": ["mvs_fake_session", "mvs_older_session"],
+             "resumed": "", "renamed_session": "mvs_renamed_session",
+             "resume_renames": resume_renames,
+             "resume_unknown": resume_unknown,
+             # Every config value the server REFUSED. Recorded because the driver
+             # deliberately does not fail a turn over a refused option, so from the
+             # client side "the server refused it" and "the driver never asked" are
+             # otherwise indistinguishable.
+             "rejected_config": []}
     server_id = 900
+
+    def _dump_rejections() -> None:
+        """Write the refused config values where a test can read them.
+
+        WHY A FILE. The fake owns stdout for JSON-RPC, so it cannot print, and the
+        rejections are the only evidence that a pass-through mode reached the server
+        and was refused. `--record <path>` names the file.
+        """
+        if not record_path:
+            return
+        # Deliberately NOT wrapped in a bare except: a recorder that fails silently
+        # makes a test read "nothing was refused" when the truth is "nothing was
+        # written", which is the exact false-negative this whole round is about.
+        pathlib.Path(record_path).write_text(
+            json.dumps(state.get("rejected_config", [])), encoding="utf-8")
+
+    atexit.register(_dump_rejections)
 
     def ask(method: str, params: dict):
         """Send a SERVER-INITIATED request and block for its reply."""
@@ -171,6 +215,42 @@ def main(argv: list[str]) -> int:
                 ]}})
             continue
 
+        if method in ("session/resume", "session/load"):
+            # The real handlers are `onRequest(ee.agent.session.resume, async z =>
+            # s(z.params.sessionId, ...))` and the same shape for `load`: the
+            # parameter is `sessionId` and the answer carries `sessionId` back.
+            # The server may answer with a DIFFERENT id than the one asked for, and
+            # it does here when `--resume-renames` is set, so a client that assumes
+            # its own id was accepted is caught.
+            asked = str(params.get("sessionId") or "")
+            if not asked:
+                emit({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32602,
+                                "message": "Invalid params: sessionId is required"}})
+                continue
+            if state.get("resume_unknown") and asked not in state["known_sessions"]:
+                emit({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32602,
+                                "message": f"Invalid params: unknown session: {asked}"}})
+                continue
+            state["sessionId"] = (state["renamed_session"]
+                                  if state.get("resume_renames") else asked)
+            state["resumed"] = asked
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "sessionId": state["sessionId"],
+                "modes": {"currentModeId": state["mode"],
+                          "availableModes": [{"id": m, "name": m.title()}
+                                             for m in modes]},
+                "configOptions": [
+                    {"id": "permissionMode", "currentValue": state["permission"]},
+                ]}})
+            continue
+
+        if method == "session/list":
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "sessions": [{"sessionId": s} for s in state["known_sessions"]]}})
+            continue
+
         if method == "session/set_mode":
             want = str(params.get("modeId") or "")
             if want not in modes:
@@ -186,6 +266,13 @@ def main(argv: list[str]) -> int:
         if method == "session/set_config_option":
             key = str(params.get("configId") or "")
             val = params.get("value")
+            # Recorded FIRST, before the `continue` at the end of this branch. A
+            # recorder placed after the branch is skipped by exactly the rejection
+            # path it exists to capture, so the file reads `[]` and the test reads
+            # "nothing was refused" from "nothing was recorded".
+            if key == "permissionMode" and val not in ("default", "auto",
+                                                       "bypassPermissions"):
+                state["rejected_config"].append({"configId": key, "value": val})
             if key == "permissionMode" and val not in ("default", "auto",
                                                        "bypassPermissions"):
                 # The REAL rejection, copied from the runtime's own guard:

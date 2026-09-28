@@ -818,16 +818,31 @@ def _acp_event_names() -> set:
 
 
 def _serve_routes() -> set:
+    """Every backend event name `serve.py` accepts.
+
+    TWO SHAPES, and missing the second made this guard report routed events as
+    unrouted. `serve.py` matches most names exactly (`_ev == "goal"`), but a family
+    is matched by prefix (`_ev.startswith("approval/")`), which is how one SSE name
+    carries `approval/asked`, `approval/decided` and `approval/policy`. A guard that
+    only understood `==` would have been "fixed" by weakening it.
+    """
     import re
 
     from rigma import serve
 
     src = pathlib.Path(serve.__file__).read_text(encoding="utf-8")
     # The character class includes `/` because backend-side names carry one —
-    # `plan/mode` and `session/title`. Excluding it made the guard report two
-    # routed events as unrouted, which is a false positive that would have been
-    # "fixed" by weakening the guard instead of the regex.
-    return set(re.findall(r'_ev == "([a-z_/]+)":', src))
+    # `plan/mode` and `session/title`.
+    exact = set(re.findall(r'_ev == "([a-z_/]+)":', src))
+    prefixes = set(re.findall(r'_ev\.startswith\("([a-z_/]+)"\)', src))
+    return exact | prefixes
+
+
+def _is_routed(name: str) -> bool:
+    """Whether `serve.py` accepts this name, by either shape."""
+    routes = _serve_routes()
+    return name in routes or any(
+        p.endswith("/") and name.startswith(p) for p in routes)
 
 
 def _store_arms() -> set:
@@ -841,15 +856,15 @@ def _store_arms() -> set:
 def test_every_acp_event_the_mapper_emits_is_routed_by_serve():
     """Hop 1 -> 2. An unrouted name reaches the frontend as nothing at all."""
     emitted = _acp_event_names()
-    routed = _serve_routes()
-    missing = sorted(n for n in emitted if n not in routed)
+    missing = sorted(n for n in emitted if not _is_routed(n))
     assert not missing, f"the ACP mapper emits these and serve.py drops them: {missing}"
 
 
 def test_every_acp_event_serve_routes_has_a_store_arm():
     """Hop 2 -> 3. A routed name with no arm falls through the reducer's default
     case, so the panel stays empty while the server believes it delivered."""
-    routed = {n for n in _serve_routes() if n.startswith("acp_")} - _ACP_NO_STORE_ARM
+    routed = {n for n in _serve_routes()
+              if n.startswith("acp_")} - _ACP_NO_STORE_ARM
     arms = _store_arms()
     missing = sorted(n for n in routed if n not in arms)
     assert not missing, f"serve.py emits these and chatStore.ts ignores them: {missing}"

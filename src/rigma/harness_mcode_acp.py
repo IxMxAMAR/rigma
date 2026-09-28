@@ -55,6 +55,21 @@ PROTOCOL_VERSION = 1
 # `_meta["minimax-code/extensions"]` on `initialize`. Recorded rather than
 # hardcoded into calls so a version that drops or renames one is visible instead
 # of producing a confusing "Method not found" at the point of use.
+# The standard ACP session methods Rigma uses, kept beside the extension list so the
+# drift guard in the tests covers both. `session/load` and `session/resume` take
+# `{sessionId}` and answer `{sessionId}`, measured from the handlers:
+#   onRequest(ee.agent.session.resume, async z => s(z.params.sessionId, ...))
+#   onRequest(ee.agent.session.load,   async z => s(z.params.sessionId, ...))
+STANDARD_METHODS = (
+    "session/new",
+    "session/load",
+    "session/resume",
+    "session/list",
+    "session/set_mode",
+    "session/set_config_option",
+    "session/prompt",
+)
+
 EXTENSION_METHODS = (
     "session/activate",
     "mcode/session/activate",
@@ -456,6 +471,54 @@ class AcpClient:
         self.modes = res.get("modes") or {}
         self.config_options = res.get("configOptions") or []
         return res
+
+    def session_resume(self, session_id: str, cwd: str = "",
+                       mcp_servers: list | None = None,
+                       timeout: float | None = None) -> dict:
+        """Reattach to a session mcode already has, so a turn CONTINUES it.
+
+        This is what makes the chat a conversation rather than a series of unrelated
+        questions, and it is the ACP equivalent of `exec`'s `--session <id>`. The
+        handler is `onRequest(ee.agent.session.resume, async z =>
+        s(z.params.sessionId, ...))`, so the parameter is `sessionId` and the answer
+        carries `sessionId` back.
+
+        `session/load` takes the same parameter and is registered to a near-identical
+        handler; `resume` is used because it is the one whose name says what is
+        wanted here. `session_load` is kept as an alias for a version that drops one.
+        """
+        body: dict = {"sessionId": session_id}
+        if cwd:
+            body["cwd"] = cwd
+        if mcp_servers is not None:
+            body["mcpServers"] = mcp_servers
+        res = self.request("session/resume", body, timeout=timeout) or {}
+        # The server may answer with a DIFFERENT id than the one asked for. Record
+        # what it said, not what was requested — the same rule `exec`'s `--model`
+        # follows, where Rigma uses "the id mcode actually gave us".
+        self.session_id = str(res.get("sessionId") or session_id)
+        self.modes = res.get("modes") or self.modes
+        self.config_options = res.get("configOptions") or self.config_options
+        return res
+
+    def session_load(self, session_id: str, cwd: str = "",
+                     mcp_servers: list | None = None,
+                     timeout: float | None = None) -> dict:
+        """The other spelling of reattaching. Same parameter, same handler shape."""
+        body: dict = {"sessionId": session_id}
+        if cwd:
+            body["cwd"] = cwd
+        if mcp_servers is not None:
+            body["mcpServers"] = mcp_servers
+        res = self.request("session/load", body, timeout=timeout) or {}
+        self.session_id = str(res.get("sessionId") or session_id)
+        self.modes = res.get("modes") or self.modes
+        self.config_options = res.get("configOptions") or self.config_options
+        return res
+
+    def session_list(self, timeout: float | None = None) -> Any:
+        """Every session mcode is holding, so Rigma can offer to continue one."""
+        return self.request("session/list", {}, timeout=timeout)
 
     def available_modes(self) -> list[dict]:
         return list(self.modes.get("availableModes") or [])
@@ -925,3 +988,276 @@ def probe_surface(argv: list[str], *, cwd: str = "", env: dict | None = None,
     finally:
         client.stop()
     return out
+
+
+# --- driving a chat turn over ACP ---------------------------------------------
+#
+# WHY THIS IS THE POINT OF THE WHOLE MODULE. Everything above is transport. A
+# control plane nobody can reach during a turn is still unreachable, and the
+# features that motivated the client — answering a permission prompt, plan mode,
+# steering, the queue — only become LIVE when a chat turn runs here instead of
+# through `mcode exec`.
+#
+# WHAT IT DELIBERATELY IS NOT. It is not a replacement for `drive_turn`. Switching
+# the default transport is a separate decision with its own risk, so this is a
+# parallel path the caller opts into. `exec` stays the default until this has been
+# exercised for real, which the standing order currently forbids.
+#
+# THE PERMISSION POLICY IS THE INTERESTING PART. `exec` has no way to ask, so
+# `smart` could dead-end a chat permanently (R5-MCODE-DEADEND). Here the server
+# asks and WAITS, so the answer has to come from somewhere. It comes from the mode
+# Rigma already has, translated — and the translation is NOT a pass-through, because
+# the two vocabularies share no member (`exec`: smart|full|off; ACP:
+# default|auto|bypassPermissions). Every decision is reported as a `state` event so
+# the transcript shows what was granted rather than silently proceeding, which is the
+# same discipline the governance panel already follows.
+
+# `exec`'s mode -> ACP's mode. The two sets share NO member, so this is a
+# translation rather than a rename. Measured: passing `full` to ACP is rejected with
+# `Unsupported permission mode: full`.
+_EXEC_TO_ACP_PERMISSION = {
+    "full": "bypassPermissions",
+    "smart": "auto",
+    "off": "default",
+}
+
+
+def _acp_approval_outcome(outcome: dict, option_id: str) -> str:
+    """Translate an ACP permission outcome into the vocabulary Rigma already reads.
+
+    COPIED FROM DSH'S OWN BRIDGE, deliberately, because the two transports must
+    produce the SAME words or the governance panel renders one of them as a bare
+    identifier. `packages/acp/acp/src/index.ts:171` is the whole rule:
+
+        if (outcome.outcome === 'cancelled') return 'cancelled'
+        return outcome.optionId === 'allow-once' ? 'allowed-once' : 'rejected'
+
+    `ApprovalOutcome` there is `'allowed-once' | 'rejected' | 'cancelled' |
+    'unavailable'`, and `outcomeTone`/`outcomeLabel` in `chat/governance.ts` know
+    exactly those four. An earlier version of this function returned
+    "allowed"/"denied", which is a THIRD vocabulary: `outcomeTone` would have
+    coloured a grant grey and `outcomeLabel` would have shown the raw word, so a
+    granted permission would have looked like an unexplained neutral event.
+
+    Note the strictness: only `allow-once` is a grant. `allow-always` is NOT, which
+    matches DSH — a durable grant is not something either transport infers from a
+    one-shot answer.
+    """
+    if str(outcome.get("outcome") or "") == "cancelled":
+        return "cancelled"
+    return "allowed-once" if option_id == "allow-once" else "rejected"
+
+
+def acp_permission_mode(permission: str) -> str:
+    """Translate one of `exec`'s permission words into ACP's vocabulary.
+
+    Falls back to `auto` rather than to `bypassPermissions`: an unrecognised mode
+    must not silently become the most permissive one. `auto` is the middle — it
+    answers, and every answer is reported.
+    """
+    return _EXEC_TO_ACP_PERMISSION.get(str(permission or "").strip().lower(), "auto")
+
+
+def drive_turn_acp(prompt: str, *, exe: str = "", base_url: str = "",
+                   model: str = "", system_prompt: str = "", session_id: str = "",
+                   cwd: str = "", max_tokens: int = 4096,
+                   context_window: int = 32768, timeout: float = 1800.0,
+                   state: dict | None = None, cancel=None,
+                   permission: str = "full", on_permission=None,
+                   on_question=None):
+    """Run one mcode turn over ACP and yield what happened, in Rigma's vocabulary.
+
+    A generator, matching `drive_turn`'s contract: the caller owns the thread, so a
+    stalled mcode stalls a worker rather than the event loop streaming a chat.
+
+    `session_id` (or `state["session_id"]`) CONTINUES a session rather than starting
+    one. The session this turn actually ran in is written back to `state`, so the
+    next turn continues the same conversation — the same contract `drive_turn` has.
+
+    `on_permission(method, params) -> bool | None` decides a permission request.
+    Returning None means "no policy for this", which is reported as a decline and
+    never as a denial — the server is told `cancelled`, which is its own word for
+    "no answer". `on_question(method, params) -> dict | None` does the same for an
+    elicitation. Neither has a default that answers, because a default that granted
+    permission would be Rigma deciding something the user did not.
+    """
+    import queue as _queue
+    import threading as _threading
+
+    from .harness import TurnEvent
+
+    mode = acp_permission_mode(permission)
+    exe = exe or _default_exe()
+    if not exe:
+        yield TurnEvent("error", "mcode is not on PATH")
+        return
+
+    events: "_queue.Queue" = _queue.Queue()
+    stopped = _threading.Event()
+    # Set once the prompt request has returned or failed, so the drain loop knows
+    # there is nothing more coming and does not wait out its timeout.
+    finished = _threading.Event()
+    outcome: dict = {}
+
+    def _on_event(notification: dict) -> None:
+        for ev in map_acp_update(notification):
+            events.put(ev)
+
+    def _on_request(method: str, params: dict):
+        """Answer a server-initiated request.
+
+        THE ANSWER IS A REAL ANSWER. An unanswered request leaves mcode waiting
+        forever, which is worse than a decline — so every branch returns something.
+        """
+        if method == "session/request_permission":
+            allow = None
+            if on_permission is not None:
+                try:
+                    allow = on_permission(method, params)
+                except Exception:
+                    allow = None
+            if allow is None:
+                # No policy: decline in the server's own words. `allow-once` is used
+                # when allowing because a one-shot grant is the narrow one, and
+                # `allow-always` would be Rigma inventing a durable policy the user
+                # never set.
+                allow = mode == "bypassPermissions"
+            reply = answer_permission(params, allow=allow)
+            # REPORTED THROUGH THE CHANNEL THAT ALREADY EXISTS. DSH reports its
+            # approvals as `approval/asked` and `approval/decided`, and
+            # `chat/governance.ts` folds that pair into the governance trail — a
+            # panel with a UI, tested, and already on screen. A second vocabulary
+            # here would mean a second panel for the same concept and one more
+            # place for the two to disagree, so the ACP decision is translated into
+            # it instead. `asked` and `decided` share an `id`, which is what lets
+            # the fold pair a question with its answer.
+            tool_call = params.get("toolCall") or {}
+            call_id = str(tool_call.get("toolCallId") or "")
+            outcome = reply.get("outcome", {})
+            option_id = str(outcome.get("optionId") or "")
+            events.put(TurnEvent("state", event="approval/asked", data={
+                "id": call_id,
+                "toolName": str(tool_call.get("title") or ""),
+                # The ACP surface has no `reason` field, so the reason is derived
+                # from what the transport actually carries rather than invented: an
+                # automatic decision is explained by the mode that made it.
+                "reason": ("decided automatically by the session's permission mode"
+                           if on_permission is None else "decided by Rigma's policy"),
+                "auto": on_permission is None,
+            }))
+            events.put(TurnEvent("state", event="approval/decided", data={
+                "id": call_id,
+                "outcome": _acp_approval_outcome(outcome, option_id),
+                "optionId": option_id,
+                "policy": mode,
+            }))
+            return reply
+        if method == "elicitation/create":
+            content = None
+            if on_question is not None:
+                try:
+                    content = on_question(method, params)
+                except Exception:
+                    content = None
+            if content is None:
+                # Declining is what makes mcode take its non-interactive fallback —
+                # the same place it already lands today, so this changes nothing
+                # except that the server is told rather than left waiting.
+                events.put(TurnEvent("notice", text=(
+                    "mcode asked a question and no answer was available, so it "
+                    "continued without one")))
+                return answer_elicitation(params, accepted=False)
+            return answer_elicitation(params, accepted=True, content=content)
+        # Anything else the server asks for: answer `None`, which is the protocol's
+        # "declined", rather than leaving it unanswered.
+        return None
+
+    client = AcpClient([exe, "acp"], cwd=cwd or "", on_event=_on_event,
+                       on_request=_on_request, default_timeout=timeout)
+
+    def _run() -> None:
+        try:
+            client.start()
+            client.initialize(timeout=min(timeout, 60.0))
+            resume = str(session_id or (state or {}).get("session_id") or "").strip()
+            if resume:
+                try:
+                    client.session_resume(resume, cwd=cwd, timeout=min(timeout, 60.0))
+                except AcpError as exc:
+                    # A session mcode no longer has is not a failed turn: start a new
+                    # one and SAY SO, rather than continuing a conversation whose
+                    # earlier half is gone without the user being told.
+                    events.put(TurnEvent("notice", text=(
+                        f"could not continue the previous mcode session "
+                        f"({exc}); starting a new one")))
+                    client.session_new(cwd or "", timeout=min(timeout, 60.0))
+            else:
+                client.session_new(cwd or "", timeout=min(timeout, 60.0))
+            if state is not None:
+                state["session_id"] = client.session_id
+            # The permission policy is set through the protocol, which is how a
+            # session changes it mid-flight — something `exec` cannot do at all.
+            try:
+                client.set_config_option("permissionMode", mode,
+                                         timeout=min(timeout, 30.0))
+            except AcpError:
+                # Not fatal: the session keeps mcode's own default and the turn runs.
+                pass
+            if mode == "bypassPermissions":
+                events.put(TurnEvent("notice", text=(
+                    "mcode is running with permission prompts bypassed for this "
+                    "turn; a workspace-scoped policy still bounds writes and "
+                    "deletes")))
+            res = client.prompt(prompt, timeout=timeout)
+            outcome["stop"] = (res or {}).get("stopReason")
+        except Exception as exc:
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            finished.set()
+
+    worker = _threading.Thread(target=_run, name="acp-turn", daemon=True)
+    worker.start()
+
+    try:
+        while True:
+            if cancel is not None and cancel.is_set() and not stopped.is_set():
+                stopped.set()
+                # A NOTIFICATION, not a kill: ACP can ask the server to stop the
+                # turn without ending the session, which `exec` cannot do at all.
+                try:
+                    client.cancel()
+                except Exception:
+                    pass
+            try:
+                ev = events.get(timeout=0.2)
+            except _queue.Empty:
+                if finished.is_set() and events.empty():
+                    break
+                if stopped.is_set() and finished.is_set():
+                    break
+                continue
+            yield ev
+    finally:
+        client.stop()
+        worker.join(timeout=5.0)
+
+    if stopped.is_set():
+        # Nothing failed: the session id is already recorded, so the next turn
+        # continues this conversation.
+        yield TurnEvent("notice", text="stopped at your request")
+    if outcome.get("error"):
+        yield TurnEvent("error", outcome["error"])
+
+
+def _default_exe() -> str:
+    """The mcode binary, resolved by the SAME function the `exec` adapter uses.
+
+    `bin_path()` honours `RIGMA_MCODE_BIN` and then `PATH`, so the two transports
+    can never disagree about which mcode is running.
+    """
+    try:
+        from .harness_mcode import bin_path
+
+        return bin_path() or ""
+    except Exception:
+        return ""
