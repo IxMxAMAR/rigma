@@ -639,6 +639,49 @@ def _load_run_for_loop(runs_mod, run_id: str):
     return None, False
 
 
+def _patch_session(sid: str, body: dict) -> dict | None:
+    """Apply only the fields in `body` to a session, without clobbering a turn.
+
+    R3-STORE-3. The grants endpoint is used WHILE a turn is running — that is
+    what it is for: the model asks to run a command, the user arms `allow_code`,
+    the turn continues. The old code did `s = sessions.load(sid)`, mutated it and
+    `sessions.save(s)`, and `save` writes the WHOLE row. The turn loop appends
+    assistant and tool messages to its own copy and saves that copy, so whichever
+    wrote last won outright: arming a grant mid-turn could silently discard the
+    messages the turn had just produced, and the next turn started from a
+    transcript missing its own last exchange.
+
+    The mechanism to prevent exactly this already existed and was simply not
+    used here: `sessions.save(s, base_rev=...)` writes only while the stored row
+    is still at that revision and raises `StaleWriteError` otherwise. So the fix
+    is to pass the revision we read and, when it has moved, re-read and re-apply
+    — the concurrent writer's messages are then preserved and only the named
+    fields are ours.
+    """
+    from . import sessions as _sess
+    for _ in range(5):
+        s = _sess.load(sid)
+        if s is None:
+            return None
+        rev = s.get(_sess.REV_KEY)
+        for k in _sess.MUTABLE_FIELDS:
+            if k in body:
+                s[k] = body[k]
+        if "title" in body:
+            # an explicit rename is the user's word — auto-titling never
+            # overwrites it afterwards
+            s["title_source"] = "user"
+        try:
+            _sess.save(s, base_rev=rev)
+            return s
+        except _sess.StaleWriteError:
+            continue        # a turn wrote first: re-read and re-apply
+    # Five collisions in a row means a turn is saving continuously; the grants
+    # still have to land, so take the unconditional write rather than fail.
+    _sess.save(s)
+    return s
+
+
 def _prune_spills(out) -> None:
     """Bound the spill directory: newest `SPILL_KEEP` files, or 256 MB.
 
@@ -1698,17 +1741,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     body["harness"], port=upstream_port).name
             except _harness.HarnessError as e:
                 return JSONResponse({"error": str(e)}, status_code=400)
-        s = sessions.load(sid)
+        s = await asyncio.to_thread(_patch_session, sid, body)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
-        for k in sessions.MUTABLE_FIELDS:
-            if k in body:
-                s[k] = body[k]
-        if "title" in body:
-            # an explicit rename is the user's word — auto-titling never
-            # overwrites it afterwards
-            s["title_source"] = "user"
-        sessions.save(s)
         return s
 
     async def _compact(s: dict, keep: int):
@@ -4302,7 +4337,29 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # typing during a long turn grows the server's memory without limit, and
         # the prompts are lost on restart. A cap is the honest bound; refusing is
         # better than accepting a prompt that will never be delivered.
-        if message and sid in _streaming:
+        # R3-CHAT-1: this guard was `if message and sid in _streaming`, and the
+        # `message` half is what made it bypassable. `regenerate` and the
+        # queued-prompt replay both call this endpoint with NO message — a
+        # continuation of an existing transcript — so `message` is falsy for the
+        # exact callers that must not start a second turn. Measured: two
+        # concurrent `{"message": null}` requests on one session both passed,
+        # both reached `_cancels[sid] = cancel`, and the second overwrote the
+        # first's cancel token. The first turn then became unstoppable by the
+        # Stop button (the UI cancels the token it last saw, which was the
+        # second's), and two agent loops shared one transcript — the same
+        # interleaving AUDIT 03-5 closed for autonomous runs, reached through the
+        # other door.
+        #
+        # The queue below is for a NEW prompt typed while a reply is streaming;
+        # a continuation cannot be queued, because it is not a new instruction,
+        # it is the same turn's next step. So it is refused, and the caller
+        # retries once the reply lands.
+        if sid in _streaming:
+            if not message:
+                return JSONResponse(
+                    {"error": "this chat is already producing a reply — wait for "
+                              "it to finish before continuing it"},
+                    status_code=409)
             q = _queued.setdefault(sid, [])
             if len(q) >= _QUEUE_MAX:
                 return JSONResponse(

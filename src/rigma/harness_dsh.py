@@ -581,7 +581,19 @@ def drive_turn(
             "data_home": str(data_home()),
             "patch_path": "",       # the runner owns the patch for its lifetime
         }
-        env = os.environ.copy()
+        # R3-HARN-6: `os.environ.copy()` handed the agent every secret the owner
+        # had exported. AUDIT 13-6 fixed exactly this for mcode and left DSH
+        # passing the whole environment, so the same leak survived in the other
+        # adapter — DSH's runner spawns a Node child and that child inherits
+        # this, and DSH's own shell tools read it. Same shared allowlist now, so
+        # the next adapter cannot repeat it.
+        from .harness import harness_env
+        # `also` is the narrow set DSH cannot start without: the provider key the
+        # generated patch names via `apiKeyEnv` (it is the local server's own
+        # placeholder, not a cloud secret), and the two Rigma-owned overrides the
+        # adapter and its conformance checks read.
+        env = harness_env(also=("DEEPSEEK_API_KEY", "RIGMA_DSH_HOME",
+                                "RIGMA_MCODE_BIN"))
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(src) + (os.pathsep + existing if existing else "")
 
