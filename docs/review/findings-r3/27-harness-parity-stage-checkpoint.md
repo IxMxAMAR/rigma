@@ -735,12 +735,33 @@ kinds: unmounted plugins, adapter-internal drops, and false comments.
    and cross in the transcript. Needs one observed mcode turn with a known success and
    a known failure. The docstring now states this instead of asserting a mapping.
 
-3. **Plan mode is mounted, advertised, and impossible to enter or leave.** Entry needs
-   the `commands` service (`plan-mode/src/index.ts:225`) and exit needs `userQuestions`
-   (`:298`); neither `dsh-commands` nor `dsh-user-questions` is mounted. Rigma's whole
-   rendering chain for it is dead. **Same shape on mcode**, where `EnterPlanMode`/
-   `ExitPlanMode` require a local user decision. Either build the answerer or stop
-   advertising it — the patch mounts it and `harness.py` claims it.
+3. **Plan mode: FIXED by removing the false claim (R5-PLANMODE).** It was mounted,
+   advertised, and impossible to enter or leave. Verified in the plugin source
+   (`packages/plan/plan-mode/src/index.ts`) — the plugin registers exactly TWO things:
+
+   - `:225` `ctx.inject(['commands'], ...)` → the `/plan` command, the ONLY way IN
+   - `:273` `ctx.tools.register(EXIT_PLAN_MODE)` → the only way OUT, and it is
+     registered **unconditionally, outside that inject**
+   - `:298-300` `const interaction = ctx.get('userQuestions')` → else
+     `throw new Error('no user-questions channel is available to review the plan;
+     ask the user to switch the session mode instead')`
+
+   `dsh-commands` and `dsh-user-questions` are absent from sdk-minimal AND from Rigma's
+   patch (the only `commands` hits in the profile are shell-prompt prose). So there was
+   no way in, while `exit_plan_mode` sat in the tool catalog and threw
+   `is only available in plan mode` on its first call — the model was handed a tool that
+   could only fail, and the plugin's own section text told it to ask the user to switch
+   modes manually, which the user also could not do.
+
+   **The row is now gone from the patch**, `harness.py` lists plan mode (and
+   `ask_user_question`, which needs the same channel) under `unsupported` instead of
+   `capabilities`, and `test_plan_mode_is_not_mounted_and_why` is a drift guard: it fails
+   if the row returns, with the reason in the message. The row's config is preserved in a
+   comment where it used to live, so restoring it after mounting the two services is a
+   copy rather than a re-derivation.
+
+   **Still open on mcode**, where `EnterPlanMode`/`ExitPlanMode` require a local user
+   decision and no equivalent removal has been done.
 
 4. **The approval/governance panel is a dead four-hop chain.** All three `approval/*`
    events come only from unmounted `dsh-user-approval`; `permission/preset` only from

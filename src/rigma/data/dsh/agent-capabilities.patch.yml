@@ -130,25 +130,48 @@
         toolName: subagent_fork
         backgroundMode: one-shot
 
-    # ---- plan mode ---------------------------------------------------------
-    # `section` has no schema default and is required, so the text is restated.
-    # Copied verbatim from packages/bundle/base/cordis.patch.yml so plan mode
-    # behaves exactly as it does in the shipped `sdk` and `web` profiles.
-    - id: plan-mode
-      name: '@deepseek-ai/dsh-plan-mode'
-      config:
-        section: |
-          You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
-
-          Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
-
-          The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed only to keep the request shape stable. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
-
-          Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
-
-          Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
-
-          When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+    # ---- plan mode: DELIBERATELY NOT MOUNTED (R5-PLANMODE) ---------------
+    # This row used to mount `@deepseek-ai/dsh-plan-mode`, copied verbatim from
+    # packages/bundle/base/cordis.patch.yml so plan mode "behaves exactly as it
+    # does in the shipped sdk and web profiles". It cannot behave that way here,
+    # and the row was worse than useless: it advertised a capability and handed
+    # the model a tool that could only ever fail.
+    #
+    # Plan mode is entered by the `/plan` command and left by the `exit_plan_mode`
+    # tool, and those are the ONLY two things the plugin registers
+    # (packages/plan/plan-mode/src/index.ts):
+    #
+    #   :225  ctx.inject(['commands'], (commandCtx) => { commandCtx.commands.register(...)
+    #   :273  ctx.tools.register(defineTool({ name: EXIT_PLAN_MODE, ...
+    #   :298  const interaction = ctx.get('userQuestions')
+    #   :300  throw new Error('no user-questions channel is available to review the
+    #                         plan; ask the user to switch the session mode instead')
+    #
+    # `/plan` exists only inside the `inject(['commands'])` block, so with
+    # `dsh-commands` unmounted there is NO way to enter plan mode — the command is
+    # not registered. (Checked: `dsh-commands` and `dsh-user-questions` are absent
+    # from sdk-minimal AND from this patch; the only `commands` hits in the profile
+    # are shell-prompt prose.) And `exit_plan_mode` is registered UNCONDITIONALLY,
+    # outside that inject — so mounting this row puts a tool in the catalog whose
+    # first act is `throw new Error('exit_plan_mode is only available in plan
+    # mode')`, while the only route into plan mode does not exist. The plugin's own
+    # section text even ends by telling the model to "ask the user to switch modes
+    # manually", which the user cannot do either.
+    #
+    # So the honest state is: unavailable. Saying that in `harness.py` is worth
+    # more than a row that makes the capability list look complete. If the two
+    # services are ever mounted, restore this row — the config below is correct and
+    # was verified against the upstream text:
+    #
+    #     - id: plan-mode
+    #       name: '@deepseek-ai/dsh-plan-mode'
+    #       config:
+    #         section: |
+    #           You are in plan mode. Stay in plan mode until exit_plan_mode
+    #           succeeds or the user switches the session mode. ...
+    #
+    # `section` is `z.<type>().required()` upstream with no schema default, so it
+    # must be restated in full rather than omitted.
 
     # ---- workflows ---------------------------------------------------------
     - id: ptc-runtime

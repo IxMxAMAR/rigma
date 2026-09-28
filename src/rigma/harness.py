@@ -303,6 +303,21 @@ BACKENDS: dict[str, Harness] = {
             "the sandbox: sdk-minimal pins danger-full-access with its "
             "workspace at the process cwd, so a confined profile does not "
             "survive the seam",
+            # R5-PLANMODE: plan mode was CLAIMED under `capabilities` below and is
+            # not available. It was also MOUNTED, which was worse than a wrong
+            # sentence — the plugin registers `exit_plan_mode` unconditionally
+            # while `/plan`, the only way in, lives inside `inject(['commands'])`,
+            # and `dsh-commands` is not mounted. So the model was handed a tool
+            # whose first act is to throw. The row is gone from the patch; the
+            # claim moves here.
+            "plan mode, so it can propose before it changes anything — the plugin "
+            "needs `dsh-commands` (the `/plan` command, the only way IN) and "
+            "`dsh-user-questions` (`exit_plan_mode`'s review channel, the only way "
+            "OUT), and neither is mounted in this build. Mounting it anyway gave "
+            "the model an `exit_plan_mode` tool that could only fail, so it is "
+            "not mounted at all",
+            "asking you a question mid-turn: `ask_user_question` needs the same "
+            "missing `dsh-user-questions` channel",
         ),
         # R3-HARN-1: `harness_dsh.run_turn` accepts `permission` and ignores it
         # by design — DSH's confinement is its own bundle's business. Declared so
@@ -318,7 +333,6 @@ BACKENDS: dict[str, Harness] = {
             "goals, with a round driver and a tool to set, read and revise one",
             "subagents, spawned in-process or forked from this conversation",
             "a todo list the model maintains and the transcript renders",
-            "plan mode, so it can propose before it changes anything",
             "skills, discoverable and loadable by the model itself "
             "(read from ~/.rigma/skills, the directory the Skills page writes)",
             "filesystem tools: read, write, edit, glob and grep",
