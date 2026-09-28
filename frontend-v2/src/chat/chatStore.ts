@@ -611,6 +611,11 @@ export const useChat = create<ChatState>((set, get) => ({
       pendingVariants: without(st.pendingVariants, id),
       // the draft was typed for a chat that is about to stop existing
       drafts: without(st.drafts, id),
+      // R5-PERSIST: and so was the agent state. Same reason as the draft — every
+      // other per-chat map is dropped here and this one was added without it. It
+      // is not only a leak: if an id were ever reused, the deleted chat's goal
+      // would appear in the fresh chat's panel with nothing to explain it.
+      savedAgent: without(st.savedAgent, id),
       ...(st.currentId === id ? { currentId: null, messages: [] } : {}),
     }));
     saveDrafts(get().drafts);

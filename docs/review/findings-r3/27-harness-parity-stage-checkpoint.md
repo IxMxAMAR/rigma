@@ -680,6 +680,88 @@ passed; ruff and tsc clean; bundle rebuilt (`index-Cly9FK1L.js`).
 
 ---
 
+## 8f. Round 5 audit: what is STILL unreachable, ranked
+
+Two DeepSeek-V4.1-Flash subagents re-audited both backends across all four hops
+(backend emits → adapter → `serve.py` → `chatStore.ts`), read-only. This section is
+the durable result, because the findings are the expensive part.
+
+**Both agents independently confirmed the negative that matters most: there is NO
+remaining name mismatch between hops.** Every SSE name `serve.py` emits has a
+`chatStore.ts` case, and every adapter state name has a `serve.py` branch. The bug
+class that R4 found twice is now exhausted. The remaining losses are of three other
+kinds: unmounted plugins, adapter-internal drops, and false comments.
+
+### Fixed in round 5
+
+- **mcode tool-call ids were never forwarded** (`harness_mcode.py:817-824`). `serve.py`
+  falls back to the tool NAME and says what that costs in its own comment; mcode runs
+  tools in PARALLEL, so two `read`s in a turn collapsed onto one chip and React got
+  duplicate keys. The sibling adapter always passed it. Fixed + 2 tests.
+- **Every DSH step's prose except the last was discarded** (`_dsh_runner.py:171-174`
+  kept only `usage`). The SDK's `final_response` walks events in REVERSE and returns
+  the FIRST `assistant/message` (`python/sdk/src/deepseek_harness/api.py:211-228`), so
+  a multi-step turn read as if the agent said nothing between tool calls. Fixed by
+  streaming each step's prose, with `_Streamed` suppressing the duplicate — and
+  `harness_dsh._Run.spoke`, because `done` is now legitimately EMPTY on a successful
+  turn and the old check would have reported a failed model call on every one.
+- **Two false comments removed** (`_ok_of`'s claim that the runtime normalises its
+  numeric enum; `subagents.ts`'s claim that `subagent/descriptor` carries the child id).
+
+### NOT fixed, and why — ranked
+
+1. **mcode's `ask_user` permanently bricks the chat (HIGH, dead end).** `mcode exec`
+   has no interaction host, so a questionnaire turn is rewritten to a failure AND the
+   pending questionnaire is never cleared, which makes **every later turn on that
+   session fail before it starts** — with no stream-json output at all, because the
+   guard throws before the projector exists. The user must abandon the chat. The same
+   path covers `--permission smart` raising a pending permission request. Feature-sized:
+   needs an interaction channel, which neither transport offers Rigma today.
+
+2. **`_ok_of` always returns None, so every mcode tool chip shows UNKNOWN.** The wire
+   value is numeric (the file's own note at `:169-172` and the fixture agree: 4, 5, 1,
+   3) while the function compares words. **Deliberately NOT mapped:** mcode's own
+   tracker maps "3"→failed, but the bundle contains no `status: 3` literal at all
+   while `status: 2/4/5` appear 342/300/69 times mostly as HTTP codes — and the
+   fixture pairs 3 with the output "Tool not found". Guessing could invert every tick
+   and cross in the transcript. Needs one observed mcode turn with a known success and
+   a known failure. The docstring now states this instead of asserting a mapping.
+
+3. **Plan mode is mounted, advertised, and impossible to enter or leave.** Entry needs
+   the `commands` service (`plan-mode/src/index.ts:225`) and exit needs `userQuestions`
+   (`:298`); neither `dsh-commands` nor `dsh-user-questions` is mounted. Rigma's whole
+   rendering chain for it is dead. **Same shape on mcode**, where `EnterPlanMode`/
+   `ExitPlanMode` require a local user decision. Either build the answerer or stop
+   advertising it — the patch mounts it and `harness.py` claims it.
+
+4. **The approval/governance panel is a dead four-hop chain.** All three `approval/*`
+   events come only from unmounted `dsh-user-approval`; `permission/preset` only from
+   unmounted `dsh-permission-presets`. `sandbox/mode` DOES work, so the panel looks
+   live while its audit trail can never fill.
+
+5. **Rigma's own memory/RAG MCP tools reach mcode but not DSH.** `harness_mcode.py`
+   writes an mcp.json; `harness_dsh.py` passes none, and `dsh-mcp-client` is installed
+   but unmounted. An asymmetry the menu does not disclose.
+
+6. **`subagent/model-selection-policy` is dropped by the runner's keyword filter**
+   though it fires from a plugin Rigma mounts; `subagent/descriptor` dies at the
+   fourth hop; workflow/PTC structure is reduced to an opaque identifier line.
+
+7. **Smaller, all verified:** `turn.completed`'s `usageIncomplete`/`durationMs`/`model`
+   dropped; image content blocks dropped by `_flatten`; `turn.failed`'s
+   `code`/`category` dropped (which is why #1 has no recovery path); background `bash`
+   tasks never become rows; `web_fetch` omitted for an API-key reason that applies only
+   to the search providers.
+
+### The honest summary
+
+The BRIDGE is now in good shape — nothing is silently dropped at a hop boundary, which
+is what four rounds of work bought. What remains is mostly **upstream**: capabilities
+whose plugins are not mounted, and a false advertising problem where `harness.py` and
+the capability patch claim plan mode and a governance audit trail that cannot fire.
+
+---
+
 ## 9. Gap 5, measured: mcode's ACP surface is real and blocked
 
 The earlier note said ACP "would additionally mean implementing the ACP *client*

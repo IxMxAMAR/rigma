@@ -1080,3 +1080,68 @@ describe("durableFromEvent", () => {
     }
   });
 });
+
+
+// --- R5-PERSIST: the durable state is per-chat and must be cleaned up ---------
+describe("savedAgent is dropped with the chat", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useChat.setState(PRISTINE, true);
+  });
+
+  it("does not outlive the session it describes", async () => {
+    // Every other per-chat map (streams, aborts, pendingVariants, drafts) is
+    // dropped on delete, and `savedAgent` was added without that — so a deleted
+    // chat's goal stayed in the store. If an id were ever reused, the fresh
+    // chat's panel would show the deleted one's goal with nothing to explain it.
+    h.api.deleteSession.mockResolvedValue({});
+    h.api.listSessions.mockResolvedValue([]);
+    useChat.setState({
+      savedAgent: { A: { goal: { objective: "ship it" }, plan_mode: true } },
+    });
+    await useChat.getState().deleteChat("A");
+    expect(useChat.getState().savedAgent.A).toBeUndefined();
+  });
+
+  it("keeps another chat's saved state while dropping only the deleted one", async () => {
+    // The cleanup is per id, not a wholesale reset — deleting one chat must not
+    // blank the panel of the chat still on screen.
+    h.api.deleteSession.mockResolvedValue({});
+    h.api.listSessions.mockResolvedValue([]);
+    useChat.setState({
+      savedAgent: { A: { plan_mode: true }, B: { plan_mode: true } },
+    });
+    await useChat.getState().deleteChat("A");
+    expect(useChat.getState().savedAgent.B).toEqual({ plan_mode: true });
+  });
+});
+
+describe("savedAgent is keyed by chat, so a reload cannot cross the wires", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useChat.setState(PRISTINE, true);
+  });
+
+  it("takes the stored state from the session it opens", async () => {
+    h.api.getSession.mockResolvedValue({
+      id: "A", title: "a", messages: [],
+      agent_state: { goal: { objective: "ship it" }, plan_mode: true },
+    });
+    await useChat.getState().open("A");
+    expect(useChat.getState().savedAgent.A).toEqual({
+      goal: { objective: "ship it" }, plan_mode: true,
+    });
+  });
+
+  it("gives a chat with no stored state an empty panel, not another's", async () => {
+    // `agent_state` is absent on a chat that predates the field, so this must read
+    // as "nothing to show" rather than throwing or inheriting.
+    h.api.getSession.mockResolvedValue(
+      { id: "B", title: "b", messages: [] });
+    useChat.setState({ savedAgent: { A: { plan_mode: true } } });
+    await useChat.getState().open("B");
+    expect(useChat.getState().savedAgent.B).toEqual({});
+    // A's state is untouched — switching chats must not discard it.
+    expect(useChat.getState().savedAgent.A).toEqual({ plan_mode: true });
+  });
+});

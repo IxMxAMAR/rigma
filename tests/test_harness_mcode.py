@@ -1655,3 +1655,57 @@ def test_a_fresh_session_starts_with_an_empty_agent_state(monkeypatch, tmp_path)
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     s = sessions.create(title="fresh")
     assert s["agent_state"] == {}
+
+
+# --- R5-TOOLID: the call id must reach serve.py ------------------------------
+#
+# serve.py falls back to the tool NAME when no id arrives, and says in its own
+# comment what that costs: "Falling back to the tool NAME collapses two calls to
+# the same tool in one turn onto a single chip, because the frontend matches a
+# result to the first still-running chip with that id." mcode runs its tools in
+# PARALLEL, so two `read`s in one turn is ordinary — and every result landed on
+# whichever chip came first. The frontend also keys chips by that id
+# (`Transcript.tsx` `key={c.id}`), so the fallback produced duplicate React keys.
+#
+# The sibling adapter always passed it; this one did not. Pinned so it cannot
+# regress, because nothing else in the suite would notice: the events are still
+# produced, they are just anonymous.
+
+
+def test_a_tool_call_and_its_result_carry_the_same_call_id():
+    got = fold(TOOL_TURN)
+    call = next(e for e in got if e.kind == "tool")
+    result = next(e for e in got if e.kind == "tool_result")
+    assert call.data and result.data, got
+    assert call.data["id"] == "call_probe_1"
+    assert result.data["id"] == call.data["id"]
+
+
+def test_two_parallel_calls_to_one_tool_stay_distinguishable():
+    """The case the id exists for. Without it serve.py names both events by the
+    tool, and the frontend folds them onto one chip."""
+    two = [
+        _item(1, "item.started",
+              {"id": "call_a", "type": "tool_call",
+               "toolCall": {"id": "call_a", "name": "read", "status": 4}}),
+        _item(2, "item.started",
+              {"id": "call_b", "type": "tool_call",
+               "toolCall": {"id": "call_b", "name": "read", "status": 4}}),
+        _item(3, "item.completed",
+              {"id": "call_a", "type": "tool_call",
+               "toolCall": {"id": "call_a", "name": "read", "status": 3,
+                            "input": {"path": "a"},
+                            "output": {"content": [{"type": "text", "text": "A"}]}}}),
+        _item(4, "item.completed",
+              {"id": "call_b", "type": "tool_call",
+               "toolCall": {"id": "call_b", "name": "read", "status": 3,
+                            "input": {"path": "b"},
+                            "output": {"content": [{"type": "text", "text": "B"}]}}}),
+    ]
+    got = fold(two)
+    ids = [e.data["id"] for e in got if e.kind in ("tool", "tool_result")]
+    # Each call's result follows its own call, in the order mcode finished them —
+    # NOT grouped by call. What matters is that the four events carry two distinct
+    # ids rather than collapsing onto the tool name.
+    assert ids == ["call_a", "call_a", "call_b", "call_b"], ids
+    assert len(set(ids)) == 2

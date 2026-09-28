@@ -32,10 +32,17 @@ export interface Subagent {
    * R4-MCODE-2. DSH's lifecycle pair carries no name — `subagent.started` is
    * `{parentSessionId, childSessionId}` and nothing else — so a row could only
    * ever say "subagent running", which is unreadable the moment there are two.
-   * The name does arrive, just on OTHER events: `subagent/descriptor` carries
-   * `label` and `subagent/catalog` carries `label` keyed by `childId`, which is
-   * the same child session id used here. mcode sends `agent_name` directly.
-   * Both were being forwarded by the server and then discarded by this fold.
+   * The name arrives on `subagent/catalog` as `label`, keyed by `childId`. mcode
+   * sends `agent_name` directly. Both were being forwarded by the server and then
+   * discarded by this fold.
+   *
+   * NOT from `subagent/descriptor`, which an earlier version of this comment
+   * claimed. That event carries no child id at all — its fields are `{mode,
+   * version, provider}` plus `{label, agentProvider, agentModel,
+   * agentReasoningEffort, persona, toolFilter}` and it describes the subagent
+   * PROVIDER, so its `label` is the provider's name rather than any child's.
+   * Folding it onto a row would be wrong rather than merely useless, and
+   * `subagents.test.ts` pins that it is ignored.
    */
   name?: string;
 }
