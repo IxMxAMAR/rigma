@@ -624,6 +624,78 @@ behaviour, and **neither collision is visible from the focused runs**.
 
 ---
 
+### R3-ORPHAN · an engine whose UI died, and the two commands that recover [high]
+
+Found by running the tool, not by reading it. `rigma up` printed:
+
+```
+port 11499 is already in use (held by pid 16908: llama-server.exe) — free it or
+pass a different --port
+```
+
+and `rigma stop` answered `not running`. Both were wrong about the same process.
+
+**What was actually there.** `rigma up`'s `finally` is what stops the engine it
+started, and a hard kill skips it — terminal closed, crash, power event. The
+llama-server keeps the **inference** port, and `state.json`, which that same
+process writes, can be gone. Measured on this machine: pid 16908, a
+`b9867/rocm` llama-server with `Ternary-Bonsai-2-27B-PQ2_0.gguf` loaded at 65536
+ctx, `/health` 200, `/props` answering, no state file. So a model was resident in
+VRAM, Rigma could not see it, `rigma stop` could not stop it, and the only way back
+was Task Manager. The refusal's advice — "free it" — was not actionable, because
+the process was Rigma's own.
+
+**The distinction that matters** is not "is the port free" but *whose* the listener
+is. `orphan.is_rigma_engine` requires the executable to be named
+`llama-server*`/`vllm*` **and** to sit under `<rigma home>/engines/` — a
+llama-server the user built themselves is not Rigma's to adopt, and a name check
+alone would claim it. `orphan.engine_props` then requires a real `/health` answer,
+so a wedged engine falls back to the refusal rather than producing a UI pointed at
+a dead one.
+
+**The way out.** `rigma up --reattach` adopts it: the record is reconstructed from
+what the engine itself reports — `/props.model_path`,
+`default_generation_settings.n_ctx`, the backend from the binary's own path, the
+start time from the process. Everything is read, not remembered. `quant` is left
+**empty** rather than guessed, because it is a derived label that moves as a repo
+gains siblings and a wrong one is worse than a blank one. `rigma stop` now looks
+for Rigma's own engine before believing the absent record, and refuses to guess
+when it finds two.
+
+**Adoption is opt-in**, and that is a decision rather than a default. Adopting a
+process we did not start is a different act from starting one, and `rigma up`
+refusing loudly is what tells the user their previous session ended abnormally. So
+the refusal stays — it now names what is there and the command that adopts it.
+
+**The cache fingerprint.** An adopted engine has no `kv_fp`, and the suite's own
+guard (`test_launch_records_fingerprint`) is what said so: it refuses any
+`write_state` recording a live engine without one, because omitting it silently
+disables the slot cache *and* restore-on-unload. Computing one is the wrong answer.
+`kv_fp` hashes **thirteen** launch fields — `ctx`, `cache_type_k/v`, `ngl`,
+`n_cpu_moe`, `spec_type`, `spec_n_max`, `flash_attn`, and the model identity — and
+the launch that computed it is gone; `/props` reports the window but not the rest.
+A value derived from a partial reconstruction is a *different* hash than the one
+the original launch recorded, and a cache restored under a mismatched fingerprint
+generates fluent text from a history that never happened. That is worse than no
+cache, so `kv_fp=""` is passed explicitly — the same choice the vLLM path already
+makes — and adoption now says `prompt caching is OFF for this session` out loud. A
+limitation the user is told about is a limitation; one they discover is a bug
+report.
+
+**Two bugs found while building this, both by driving the real listener:**
+
+1. The first version compared the held port to the **UI** port, so it never
+   recognised the inference-port holder — the only one that can be an engine — and
+   printed the old sentence. Caught by running `rigma up` against the real orphan
+   rather than trusting the unit tests.
+2. Those unit tests mocked the UI port too, so **they agreed with the bug**. Their
+   mocks now answer for the engine port and leave the UI port free.
+
+That second one is the round's lesson in miniature: a mock that shares the bug's
+assumption cannot fail on it.
+
+---
+
 ## 10. Deliberately not changed
 
 These are real findings that were left alone, with the reason.
@@ -758,8 +830,8 @@ added to one path can be wrong about another, and only the whole suite says so.
 ## 12. Result
 
 ```
-$ pytest tests -m "not hardware" -q     # junit-xml: 2566 tests
-2566 passed, 3 skipped
+$ pytest tests -m "not hardware" -q     # junit-xml: 2582 tests
+2582 passed, 3 skipped
 $ ruff check src tests tools
 All checks passed!
 $ node node_modules/vitest/vitest.mjs run     # frontend-v2
@@ -769,8 +841,20 @@ $ node node_modules/typescript/bin/tsc --noEmit
 (clean)
 ```
 
-`tests/test_r3_adversarial_fixes.py` carries 50 of those; every one was checked
-**red against HEAD** before being accepted as green, and the measurements behind
-each are quoted in the sections above rather than asserted from memory. Full-suite,
-frontend and lint results for the intermediate commits are recorded in their commit
-messages.
+`tests/test_r3_adversarial_fixes.py` carries 50 of those and
+`tests/test_r3_orphan_engine.py` 16; every one was checked **red against a
+baseline that lacks the fix** before being accepted as green, and the measurements
+behind each are quoted in the sections above rather than asserted from memory.
+Full-suite, frontend and lint results for the intermediate commits are recorded in
+their commit messages.
+
+### What this round did not verify
+
+`rigma up --reattach` was exercised against the real orphan (it adopted pid 16908
+and served the UI on :11500) but **not** carried through to a completed chat turn
+and a clean shutdown, because that would have stopped the owner's running engine.
+The record it writes is asserted by test, and `up`'s existing `finally` is what
+stops a reattached engine — the same code path as a normal launch — but the
+end-to-end stop is inferred, not observed. The one place that matters is `kv_fp`:
+adoption leaves it empty, so a reattached session has no prefix cache, and that is
+stated to the user rather than tested against a real restore.
