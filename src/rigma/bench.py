@@ -8,6 +8,7 @@ import httpx
 from pydantic import BaseModel
 
 from . import hwid
+from .atomicio import atomic_write_json, atomic_write_text
 from .models import ComboFlags, RunPlan
 from .runtime import launch_server, rigma_home
 
@@ -181,23 +182,43 @@ def calibration_entry(cal: dict, model: str, quant: str,
     return "", {}
 
 
-def prune_calibration(cal: dict, keep_per_identity: int = 1) -> dict:
-    """Keep only the newest `keep_per_identity` entries for each hardware identity.
+def _base_calibration_key(k: str) -> str:
+    """`model:quant:backend:<hardware digest>` -> `model:quant:backend`.
 
-    A single machine has 1-4 identities (iGPU + dGPU, plus a backend each), so this
-    is about not letting the file grow without bound across GPU swaps and driver
-    experiments. Entries with no recorded hardware are kept — they are from before
-    identity existed and cannot be attributed to an identity to prune.
+    The identity digest is appended to the key (R3-CAL-1), so pruning has to
+    strip it to know WHICH model an entry belongs to. A legacy key has no
+    trailing digest and is returned unchanged.
     """
-    by_ident: dict[str, list[tuple[str, str]]] = {}
+    return k.rsplit(":", 1)[0] if k.count(":") >= 3 else k
+
+
+def prune_calibration(cal: dict, keep_per_identity: int = 1) -> dict:
+    """Keep only the newest `keep_per_identity` entries per (model, identity).
+
+    R3-CAL-2. This grouped by HARDWARE IDENTITY ALONE, so `keep_per_identity=1`
+    kept exactly ONE entry per GPU — across every model on it. Calibrating a
+    second model therefore evicted the first model's row, and because
+    `save_calibration` prunes unconditionally on every save, two models on one
+    card oscillated: each save destroyed the other's measurement, so neither
+    ever stayed calibrated and the expensive first-load sweep re-ran forever.
+
+    The unit that may accumulate is "this model, measured on this hardware", so
+    that is the grouping key. The identity stays in it because the point of the
+    cap is still to bound growth across GPU swaps and driver experiments.
+
+    Entries with no recorded hardware are kept — they are from before identity
+    existed and cannot be attributed to an identity to prune.
+    """
+    by_group: dict[tuple[str, str], list[tuple[str, str]]] = {}
     keep: set[str] = set()
     for k, entry in cal.items():
         ident = (entry.get("hardware") or {}).get("id")
         if not ident:
             keep.add(k)
             continue
-        by_ident.setdefault(ident, []).append((entry.get("date") or "", k))
-    for rows in by_ident.values():
+        by_group.setdefault((_base_calibration_key(k), ident), []).append(
+            (entry.get("date") or "", k))
+    for rows in by_group.values():
         rows.sort(reverse=True)          # newest date first, then key
         keep.update(k for _, k in rows[:keep_per_identity])
     return {k: v for k, v in cal.items() if k in keep}
@@ -247,8 +268,10 @@ def save_calibration(key: str, measured: dict, flags: dict | None = None,
     entry["date"] = datetime.date.today().isoformat()
     cal[key] = entry
     cal = prune_calibration(cal)
-    calibration_path().parent.mkdir(parents=True, exist_ok=True)
-    calibration_path().write_text(json.dumps(cal, indent=2), encoding="utf-8")
+    # R3-STORE-1: atomic. A torn calibration.json used to load as `{}`, and the
+    # NEXT save wrote that `{}` back plus one entry — so one interrupted write
+    # destroyed every other measured model, permanently.
+    atomic_write_json(calibration_path(), cal)
 
 
 # How much the desktop's VRAM footprint may drift before a calibration stops
@@ -345,16 +368,14 @@ def clear_calibration(model: str, quant: str, backend: str) -> bool:
                        legacy_key(model, quant, backend)) if cal.pop(k, None) is not None]
     if not hit:
         return False
-    calibration_path().parent.mkdir(parents=True, exist_ok=True)
-    calibration_path().write_text(json.dumps(cal, indent=2), encoding="utf-8")
+    atomic_write_json(calibration_path(), cal)
     return True
 
 
 def reset_all_calibration() -> int:
     """Wipe every stored tune. Returns how many were cleared."""
     n = len(load_calibration())
-    calibration_path().parent.mkdir(parents=True, exist_ok=True)
-    calibration_path().write_text("{}", encoding="utf-8")
+    atomic_write_text(calibration_path(), "{}")
     return n
 
 

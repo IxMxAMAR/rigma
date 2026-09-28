@@ -6,6 +6,7 @@ from pathlib import Path
 
 import psutil
 
+from .atomicio import atomic_write_json
 from .runtime import rigma_home
 
 
@@ -28,6 +29,10 @@ _FIELD_DEFAULTS = {
     # or a pid that had already exited) and is treated as no evidence, not as a
     # mismatch — an old state.json keeps behaving exactly as it used to.
     "engine_started_at": 0.0, "ui_started_at": 0.0,
+    # R3-STORE-2: the engine RUNTIME (llamacpp/vllm). Named here so a record
+    # written before the field existed still merges to a usable value instead of
+    # raising KeyError out of `update_state` — see `_write_record`.
+    "engine": None,
 }
 
 _PID_STAMP = {"engine_pid": "engine_started_at", "ui_pid": "ui_started_at"}
@@ -97,10 +102,18 @@ def _write_record(rec: dict) -> dict:
         # list, so a field not named here is SILENTLY dropped from disk — the
         # first version of this fix added it to write_state's signature only and
         # `read_state()["engine"]` raised KeyError. Its own test caught it.
-        "engine": rec["engine"],
+        #
+        # R3-STORE-2: `.get`, not `[...]`. The same KeyError was still reachable
+        # from the other direction: a state.json written by a build BEFORE this
+        # field existed has no `engine`, and `update_state` merges the defaults
+        # into the stored record before rewriting it — so `perform_unload()` on
+        # such a file raised KeyError AFTER the engine had already been killed,
+        # leaving a record claiming a live engine. `_FIELD_DEFAULTS` names it too,
+        # so a caller who does not set it gets the documented default rather than
+        # a crash. A record that predates a field must degrade, not explode.
+        "engine": rec.get("engine"),
     }
-    state_path().parent.mkdir(parents=True, exist_ok=True)
-    state_path().write_text(json.dumps(out, indent=2), encoding="utf-8")
+    atomic_write_json(state_path(), out)
     return out
 
 
