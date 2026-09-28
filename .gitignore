@@ -31,3 +31,13 @@ docs/*
 # is for: those are the owner's working notes and were never published. Naming
 # the file means adding a note to `docs/design/` cannot publish it by accident.
 !docs/design/2026-09-25-vllm-engine-spec.md
+
+# Local cache of upstream files downloaded for research — llama.cpp's ggml.h,
+# ggml.c, server-context.cpp and so on, kept only so a finding can be re-checked
+# against the exact revision it cites. It is ~5.7 MB of OTHER PEOPLE'S source, so it
+# is never committed: it is not ours to redistribute, it bloats every clone, and it
+# is reproducible from the URLs the reports already carry.
+#
+# The reports themselves (`_research/reports/*.md`) ARE committed — they are the
+# deliverable. Only the raw downloads are excluded.
+_research/sources/
