@@ -2243,6 +2243,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         # DSH name carried alongside so the UI can tell an ASK
                         # from a DECISION from a POLICY SWITCH. `asked` and
                         # `decided` share an `id`; the UI pairs them.
+                        #
+                        # R6-ACP: mcode's ACP permission decisions arrive on this
+                        # same arm, because `drive_turn_acp` translates them into
+                        # this vocabulary rather than growing a second one. That is
+                        # why answering a permission prompt needed no new UI: the
+                        # governance trail already draws a question and its answer.
                         yield _sse({"event": _ev, "data": _data},
                                    event="approval")
                     elif _ev == "sandbox/mode":
