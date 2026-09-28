@@ -582,6 +582,66 @@ like a returning one.
 
 ---
 
+## 8e. NEXT STEP — the capability panel is turn-scoped (a real feature, not a fix)
+
+**This is the one substantive gap left from the round-4 audit, and it is scoped here so
+the next session does not have to re-derive it.**
+
+### The defect
+
+`AgentState` (goal, todos, plan mode, subagent rows) is mounted inside `LiveTurn`
+(`Transcript.tsx:504`) and `chatStore.ts:785` drops the turn's stream when the turn
+ends. So the whole panel vanishes on reload — and on a page refresh mid-conversation
+there is nothing to restore it from, because **nothing on the server persists or
+returns that state**: the four SSE emitters at `serve.py:2125-2151` are the only
+places a goal or a todo list is mentioned anywhere in `src/rigma`.
+
+Two comments asserted the opposite and were corrected in `2f486ea`:
+`chatStore.ts:66-69` ("outlives the turn that set it") and `AgentState.tsx:5-6`
+("they outlive the turn that produced them"). Both were false as rendered, and a
+comment that reads as a guarantee is how this survived several review rounds.
+
+### Why it is a feature and not a one-line fix
+
+It needs a persisted per-session field, a write path, and a rehydrate path. The
+pieces are all identified:
+
+1. **Field.** Add `agent_state` (a `dict`) to `sessions.MUTABLE_FIELDS` and to
+   `sessions._FIELD_TYPES` — `test_r3_http.py` asserts every MUTABLE_FIELD has a type,
+   so adding one without the other fails the suite by design.
+
+2. **Write path — mid-turn, and the pattern already exists.** `_external_turn` does
+   NOT save the session (verified: no `sessions.save` call between :1980 and :2260),
+   so the turn's own end-of-turn write is not what would clobber this. Use the
+   `unlocked_tools` pattern at `serve.py:2611-2625`: `sessions.load(id)` → set the one
+   field → `sessions.save(cur, base_rev=cur[sessions.REV_KEY])`, inside try/except.
+   Accumulate into one dict in the four `state` branches (`goal/change|goal`,
+   `todo/write|todos`, `plan/mode`, `subagent*`) and persist on each — these are rare
+   events, so a write per event is cheap.
+
+   **Do NOT persist on `usage`** (`serve.py:2152`): it arrives every step and would
+   turn a turn into a write storm.
+
+3. **Rehydrate path.** The session GET must return the field (it already serialises
+   the whole session record, so storing it is most of the work), and the frontend must
+   seed `chatStore` from it instead of starting every panel empty.
+
+### The decision to make first
+
+**The turn-scoped behaviour is arguably CORRECT for `subagent` rows** — a subagent
+belongs to the turn that spawned it, and a row surviving a reload would imply a child
+process that is long gone. Decide explicitly whether `subagent` is persisted at all,
+rather than persisting everything and calling it parity. Goal, todos and plan mode
+genuinely outlive a turn; a subagent row does not.
+
+### Not yet done, and deliberately not half-done
+
+Attempted at the end of round 4 and stopped: a session-schema change plus a frontend
+rehydrate is not something to land at the tail of a long session, where a regression
+would ship with the suite green but the panel silently wrong. Recorded instead.
+
+---
+
 ## 9. Gap 5, measured: mcode's ACP surface is real and blocked
 
 The earlier note said ACP "would additionally mean implementing the ACP *client*
