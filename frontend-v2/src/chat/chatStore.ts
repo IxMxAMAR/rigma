@@ -9,6 +9,7 @@
 // in one chapter finished into whichever chapter you happened to be reading.
 import { create } from "zustand";
 import { api, type ChatMessage, type SessionSummary } from "../lib/api";
+import { responseError } from "../lib/listFetch";
 import { runMacroStream } from "../lib/methods";
 import { streamChat, type SseEvent } from "../lib/sse";
 import { DRAFT_KEY, parseDrafts, saveDrafts } from "./drafts";
@@ -338,11 +339,24 @@ export const useChat = create<ChatState>((set, get) => ({
 
   search: async (q) => {
     if (!q.trim()) return get().loadSessions();
+    // R3-UI-2: a failed search used to leave the FULL list on screen, so the
+    // filter appeared to match everything — the reader concludes no chat
+    // matches, when in fact the search never ran. Say so instead.
+    //
+    // `r.ok` is checked BEFORE reading the body: a Response body can only be
+    // consumed once, so parsing first left `responseError` nothing to read and
+    // it fell back to "server replied 500" instead of the server's sentence.
     try {
       const r = await fetch(`/api/sessions/search?q=${encodeURIComponent(q)}`);
+      if (!r.ok) {
+        set({ lastError: await responseError(r) });
+        return;
+      }
       const d: unknown = await r.json();
-      if (r.ok && Array.isArray(d)) set({ sessions: d as SessionSummary[] });
-    } catch { /* keep list */ }
+      if (Array.isArray(d)) set({ sessions: d as SessionSummary[] });
+    } catch (e) {
+      set({ lastError: errText(e) });
+    }
   },
 
   deleteChat: async (id) => {
@@ -363,12 +377,23 @@ export const useChat = create<ChatState>((set, get) => ({
   },
 
   duplicateChat: async (id) => {
+    // R3-UI-2: this was a total silent no-op on EVERY failure path — no new
+    // chat, no error, no state change. `r.ok` was never checked, so even a 404
+    // resolved cleanly with `d.id` undefined, and the bare `catch {}` swallowed
+    // the rest. A duplicate button that does nothing is indistinguishable from
+    // one that worked and made a chat you cannot find.
     try {
       const r = await fetch(`/api/sessions/${id}/duplicate`, { method: "POST" });
+      if (!r.ok) {
+        set({ lastError: await responseError(r) });
+        return;
+      }
       const d = (await r.json()) as { id?: string };
       await get().loadSessions();
       if (d.id) await get().open(d.id);
-    } catch { /* nothing */ }
+    } catch (e) {
+      set({ lastError: errText(e) });
+    }
   },
 
   // AUDIT F1: docs/audit-2026-09-04-full.md — opening another chat no longer
@@ -615,23 +640,34 @@ export const useChat = create<ChatState>((set, get) => ({
       old = msgs.pop() ?? null;
     if (!msgs.length) return;
     const sid = currentId;
-    await api.updateSession(sid, { messages: msgs }).catch(() => {});
+
+    // R3-UI-2. The reply is set aside BEFORE the destructive write, not after.
+    //
+    // `msgs` has the last assistant message POPPED OFF, so the PUT below
+    // persists a transcript that no longer contains it. The set-aside take is
+    // the only copy left, and it used to be recorded only once the write had
+    // already returned AND the ownership guard had passed. So a user who
+    // switched chats during that round-trip lost the reply twice over: the
+    // server no longer had it, and the take that could have restored it was
+    // never recorded. Nothing in the UI could bring it back.
+    //
+    // Recording it first makes the write recoverable: whatever happens to the
+    // guard or the request, the previous reply is still in `pendingVariants`
+    // for its own chat. This is the only ordering that cannot lose it.
+    set((st) => ({
+      pendingVariants: old
+        ? { ...st.pendingVariants,
+            [sid]: { content: old.content, variants: old.variants ?? [] } }
+        : without(st.pendingVariants, sid),
+    }));
+
     // AUDIT F1: the rail is live during that PUT. Without this guard, clicking
     // another chat mid-round-trip paints THIS chat's transcript into that one's
     // pane, and the send below starts a generation in a chat that never asked
-    // for one — the same defect F1 describes, through a one-round-trip window
-    // instead of a whole generation. Bail rather than write: the user moved on.
+    // for one. Bail rather than write: the user moved on.
     if (get().currentId !== sid) return;
-    set((st) => ({
-      messages: msgs,
-      // AUDIT F1: the set-aside take belongs to THIS chat. As one global slot
-      // it was folded into whichever session's turn returned first.
-      pendingVariants: old
-        ? { ...st.pendingVariants,
-            [sid]: { content: old.content,
-                     variants: old.variants ?? [] } }
-        : without(st.pendingVariants, sid),
-    }));
+    await api.updateSession(sid, { messages: msgs }).catch(() => {});
+    set({ messages: msgs });
     await get().send(null);
   },
 
@@ -654,7 +690,15 @@ export const useChat = create<ChatState>((set, get) => ({
                   { ...last, content: next as ChatMessage["content"],
                     variants }];
     set({ messages: msgs });
-    await api.updateSession(currentId, { messages: msgs }).catch(() => {});
+    // R3-UI-2: an optimistic write with the failure discarded. The other take
+    // appeared immediately and looked saved; on reload it was back to the old
+    // one, with nothing anywhere saying the write had failed. Roll back so the
+    // screen matches the server, and say what happened.
+    try {
+      await api.updateSession(currentId, { messages: msgs });
+    } catch (e) {
+      set({ messages, lastError: errText(e) });
+    }
   },
 
   addImage: (dataUri) => set((st) => ({ images: [...st.images, dataUri] })),

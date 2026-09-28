@@ -4,6 +4,7 @@
 // for typing; sending is what needs a model.
 import { useEffect, useRef, useState } from "react";
 import { engineApi, type ModelCard } from "../lib/engineApi";
+import { errText } from "./chatStore";
 import { useApp } from "../store";
 
 export default function ModelPicker() {
@@ -12,6 +13,7 @@ export default function ModelPicker() {
   const [cards, setCards] = useState<ModelCard[] | null>(null);
   const [state, setState] = useState<"idle" | "loading" | "error">("idle");
   const [err, setErr] = useState("");
+  const [loadErr, setLoadErr] = useState("");
   const [dismissed, setDismissed] = useState(false);
   const pickedRef = useRef<string | null>(null);
 
@@ -23,7 +25,12 @@ export default function ModelPicker() {
     engineApi.models()
       .then((d) => setCards(d.models.filter(
         (m) => m.quants.some((q) => q.on_disk))))
-      .catch(() => setCards([]));
+      // R3-UI-2: an EMPTY list is a claim about the user's disk, so a failed
+      // fetch must not be collapsed into one. `.catch(() => setCards([]))` made
+      // a 500 (or an engine that is down, which is the usual reason this modal
+      // is open at all) read "No models on disk yet - install one from the
+      // Models page", inviting a re-download of models already present.
+      .catch((e) => setLoadErr(errText(e)));
   }, [show, cards]);
 
   // engine came up (poll in App noticed): close ourselves
@@ -74,9 +81,16 @@ export default function ModelPicker() {
             {cards === null && (
               <li className="px-4 py-3 font-mono text-[12px] text-muted">loading…</li>
             )}
-            {cards?.length === 0 && (
+            {cards?.length === 0 && !loadErr && (
               <li className="px-4 py-3 text-[12.5px] text-secondary">
                 No models on disk yet — install one from the Models page.
+              </li>
+            )}
+            {/* R3-UI-2: the list could not be read, which is not the same fact
+                as "there are none". */}
+            {loadErr && (
+              <li className="px-4 py-3 text-[12.5px] text-red">
+                Could not list the models on disk — {loadErr}
               </li>
             )}
             {cards?.map((m) => (

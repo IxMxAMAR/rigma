@@ -103,12 +103,23 @@ class Harness:
     # `verified == ""`, because empty means UNKNOWN for every other backend and
     # conflating the two would hide a real unknown.
     built_in: bool = False
+    # R3-HARN-1: whether this backend actually APPLIES the chat's `permission`
+    # setting. The field is part of the adapter contract, but a backend with no
+    # such notion ignores it — DSH's confinement is its own bundle's business and
+    # its sandbox is pinned. The value was accepted, stored, sent to the adapter
+    # and dropped, while the UI rendered the "off — no tools at all" selector for
+    # every non-native backend. So a user could arm a safety setting and have
+    # nothing happen, with nothing on screen saying so. Declared here rather than
+    # inferred, because "ignores it" and "honours it" are both legitimate
+    # adapter designs and only the adapter knows which it is.
+    honours_permission: bool = True
 
     def as_dict(self) -> dict:
         return {"name": self.name, "label": self.label, "drives": self.drives,
                 "runnable": self.runnable, "installed": installed(self),
                 "needs": self.needs, "wire": self.wire, "verified": self.verified,
                 "built_in": self.built_in,
+                "honours_permission": self.honours_permission,
                 "unsupported": list(self.unsupported), "pending": self.pending}
 
 
@@ -197,6 +208,10 @@ BACKENDS: dict[str, Harness] = {
             "workspace at the process cwd, so a confined profile does not "
             "survive the seam",
         ),
+        # R3-HARN-1: `harness_dsh.run_turn` accepts `permission` and ignores it
+        # by design — DSH's confinement is its own bundle's business. Declared so
+        # the UI can say that instead of rendering a selector that does nothing.
+        honours_permission=False,
     ),
     MCODE: Harness(
         name=MCODE,
