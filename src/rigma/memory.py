@@ -421,6 +421,12 @@ class MemoryStore:
                    "kind": kind, "text": text, "status": "draft",
                    "seen_count": 1, "outcome_score": 0,
                    "vec": embed_one(text, purpose="doc"),
+                   # R3-MEM-1: WHICH embedding space `vec` lives in. A row with no
+                   # tag predates this and is still compared (the length check
+                   # covers the case that actually breaks); a tagged row from a
+                   # different embedder is not, because a cosine across two
+                   # spaces is not a similarity.
+                   "embed": _embedder_name,
                    "born": time.time(), "last_seen": time.time(), **extra}
             rows.append(rec)
             # AUDIT 10-10: bounded for EVERY kind, with the same least-proven
@@ -503,6 +509,10 @@ class MemoryStore:
             hit.update(changes)
             if "text" in changes:
                 hit["vec"] = embed_one(hit["text"], purpose="doc")
+                # R3-MEM-1: a recomputed vector belongs to the LIVE space, so the
+                # tag has to move with it. Without this an edited row would keep
+                # the old tag and be refused against its own new vector.
+                hit["embed"] = _embedder_name
             hit["edited"] = time.time()
             # AUDIT R3-10-15: an edit that changes `kind` moves a row into
             # another kind's group, and nothing re-applied that kind's cap. The
@@ -565,10 +575,27 @@ class MemoryStore:
 _EMBED_MODELS = ["nomic-ai/nomic-embed-text-v1.5", "BAAI/bge-small-en-v1.5"]
 _embedder = None
 _embedder_tried = False
+# Which of `_EMBED_MODELS` actually loaded, or "" when none did.
+#
+# R3-MEM-1: a stored `vec` carried no record of the embedder that produced it,
+# and the preference list has TWO entries. So a machine that lost its cached
+# nomic (a cleared TEMP, an offline HF cache) silently fell back to bge — and
+# then every memory written by the first was compared against queries embedded by
+# the second. Different models put unrelated texts at different cosines, so the
+# `_DENSE_BASELINE = 0.40` anisotropy correction measured on nomic is simply the
+# wrong number for bge: unrelated pairs could clear the floor and be injected as
+# "relevant", or related pairs could fall under it and be lost. Nothing anywhere
+# said the space had changed.
+#
+# Vectors from a different embedder are now not compared at all. The lexical half
+# of the score still applies, so a stale row degrades to lexical-only rather than
+# to a meaningless cosine — which is the honest behaviour, since a cosine across
+# two embedding spaces is not a similarity.
+_embedder_name = ""
 
 
 def get_embedder():
-    global _embedder, _embedder_tried
+    global _embedder, _embedder_tried, _embedder_name
     if _embedder_tried:
         return _embedder
     _embedder_tried = True
@@ -581,6 +608,7 @@ def get_embedder():
         for name in _EMBED_MODELS:
             try:
                 _embedder = TextEmbedding(name, cache_dir=cache)
+                _embedder_name = name       # R3-MEM-1: remember WHICH space
                 log.info("memory: dense retrieval via %s", name)
                 break
             except Exception:
@@ -590,6 +618,15 @@ def get_embedder():
     if _embedder is None:
         log.info("memory: no cached embedding model — lexical retrieval only")
     return _embedder
+
+
+def embedder_name() -> str:
+    """Which embedding space is live, or "" for lexical-only.
+
+    R3-MEM-1. Stored vectors are tagged with this so a row written under one
+    embedder is never compared against a query embedded by another."""
+    get_embedder()
+    return _embedder_name
 
 
 def embed_one(text: str, purpose: str = "doc") -> list | None:
@@ -612,8 +649,26 @@ def embed_one(text: str, purpose: str = "doc") -> list | None:
         return None
 
 
-def _cos(a, b) -> float:
+def _cos(a, b, *, tag_a: str = "", tag_b: str = "") -> float:
+    """Cosine similarity, or 0.0 when the two vectors are not comparable.
+
+    R3-MEM-1: `zip` stops at the shorter input, so two vectors of DIFFERENT
+    lengths were silently compared element-wise over the overlap and the result
+    was treated as a real similarity. Combined with the untagged embedder that
+    meant a fallback from nomic (768-d) to bge (384-d) produced a cosine over the
+    first 384 dimensions of one against all of the other — a number with no
+    meaning that the retrieval floor then accepted or rejected on.
+
+    Two vectors are comparable only if they came from the same embedder. An
+    unknown tag on either side (a row written before this existed) is treated as
+    comparable, because refusing would silently switch every existing memory to
+    lexical-only; the length check still catches the case that actually breaks.
+    """
     try:
+        if tag_a and tag_b and tag_a != tag_b:
+            return 0.0
+        if len(a) != len(b):
+            return 0.0
         num = sum(x * y for x, y in zip(a, b))
         da = sum(x * x for x in a) ** 0.5
         db = sum(y * y for y in b) ** 0.5
@@ -700,7 +755,11 @@ def retrieve(rows: list[dict], query: str, kinds: tuple = ("pitfall",
             # the moment dense was available — injecting garbage that then got
             # falsely punished by outcome scoring. Subtract the ambient
             # baseline so zero means "unrelated", not "orthogonal".
-            s += 0.5 * max(0.0, (_cos(qv, r["vec"]) - _DENSE_BASELINE)
+            # R3-MEM-1: the row records the embedder that wrote it, and a row
+            # from a different space scores on the lexical half alone.
+            s += 0.5 * max(0.0, (_cos(qv, r["vec"], tag_a=_embedder_name,
+                                      tag_b=str(r.get("embed") or ""))
+                                 - _DENSE_BASELINE)
                            / (1.0 - _DENSE_BASELINE))
         scored.append((s, r))
     scored.sort(key=lambda t: t[0], reverse=True)
@@ -908,7 +967,8 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
             if r.get("kind") != kind or r.get("status") == "retired" \
                     or not r.get("vec"):
                 continue
-            c = _cos(nv, r["vec"])
+            c = _cos(nv, r["vec"], tag_a=_embedder_name,
+                     tag_b=str(r.get("embed") or ""))
             if c > best_cos:
                 best, best_cos = r, c
     if best is None or best_cos < _NOMINATE_COS or complete is None:

@@ -516,6 +516,59 @@ def test_a_transient_read_failure_is_retried_before_giving_up(tmp_path,
     assert calls["n"] == 2, calls
 
 
+# --- R3-MEM-1: vectors from different embedding spaces were compared ----------
+
+def test_a_vector_from_another_embedder_is_not_compared():
+    """A stored `vec` carried no record of the embedder that produced it, and the
+    preference list has TWO entries — so a machine that lost its cached nomic
+    silently fell back to bge and then compared every memory written by the first
+    against queries embedded by the second. The `_DENSE_BASELINE` anisotropy
+    correction was measured on nomic and is simply the wrong number for bge."""
+    from rigma import memory
+    assert memory._cos([1, 0], [1, 0], tag_a="nomic", tag_b="nomic") == 1.0
+    assert memory._cos([1, 0], [1, 0], tag_a="nomic", tag_b="bge") == 0.0
+
+
+def test_vectors_of_different_lengths_are_not_compared():
+    """`zip` stops at the shorter input, so a 768-d nomic vector against a 384-d
+    bge vector was scored over the first 384 dimensions of one against all of the
+    other and treated as a real similarity. Measured against HEAD, the pair below
+    scored 1.0 — a perfect match between two vectors that are not in the same
+    space at all."""
+    from rigma import memory
+    assert memory._cos([1, 0, 0, 0], [1, 0]) == 0.0
+    assert memory._cos([1, 0], [1, 0, 0, 0]) == 0.0
+
+
+def test_an_untagged_legacy_vector_is_still_compared():
+    """Rows written before the tag existed must not silently switch to
+    lexical-only — the length check covers the case that actually breaks."""
+    from rigma import memory
+    assert memory._cos([1, 0], [1, 0]) == 1.0
+    assert memory._cos([1, 0], [1, 0], tag_a="nomic") == 1.0
+    assert memory._cos([1, 0], [1, 0], tag_b="nomic") == 1.0
+
+
+def test_a_stored_memory_records_its_embedding_space(tmp_path, monkeypatch):
+    from rigma import memory
+    store = memory.MemoryStore(tmp_path / "m.jsonl")
+    rec = store.add(kind="rule", text="always sample before cropping")
+    assert "embed" in rec, rec
+    assert rec["embed"] == memory.embedder_name()
+
+
+def test_editing_a_memory_moves_its_tag_with_its_vector(tmp_path, monkeypatch):
+    """The vector is recomputed on edit, so the tag has to move with it —
+    otherwise the row would keep the old tag and be refused against its own new
+    vector."""
+    from rigma import memory
+    store = memory.MemoryStore(tmp_path / "m.jsonl")
+    rec = store.add(kind="rule", text="old text")
+    out = store.update(rec["id"], text="new text")
+    assert out is not None
+    assert out["embed"] == memory.embedder_name()
+
+
 # --- R3-TOOL-8: the outbound-data gate had two holes -------------------------
 
 def test_a_query_string_is_a_body_for_the_outbound_gate(monkeypatch):
