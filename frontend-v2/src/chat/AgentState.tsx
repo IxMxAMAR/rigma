@@ -175,14 +175,17 @@ export default function AgentState({
   todos: { content: string; status: string }[];
   planMode: boolean;
   subagents: Subagent[];
-  usage: Record<string, unknown> | null;
+  /** R5-PERSIST: optional because the DURABLE panel has no usage to show — a
+   *  token count describes a step, not the conversation, so it is not persisted.
+   *  Required-and-passed-null would work too, but making it optional says why. */
+  usage?: Record<string, unknown> | null;
   governance: Governance;
 }) {
   // Already normalised by the store, so this draws ONE shape whatever the
   // backend was: DSH's nested `goal/change` envelope and mcode's flat goal
   // object both arrive here as a NormalGoal.
   const hasGoal = goal !== null && goal.objective !== "";
-  const hasUsage = usage !== null && Object.keys(usage).length > 0;
+  const hasUsage = usage != null && Object.keys(usage).length > 0;
   const hasGov =
     governance.approvals.length > 0 || !!governance.sandbox || !!governance.preset;
   if (

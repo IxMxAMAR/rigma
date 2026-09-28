@@ -1505,3 +1505,153 @@ def test_an_unknown_state_event_is_still_dropped(monkeypatch, tmp_path):
         harness.TurnEvent("text", text="done"),
     ])
     assert "something/from-the-future" not in body, body
+
+
+# --- R5-PERSIST: the agent's durable state must survive the turn -------------
+#
+# Goals, todos and plan mode OUTLIVE the turn that reported them, and the UI drew
+# them from the live turn only — so the whole panel vanished on reload even though
+# the agent's state had not changed. The server now stores them on the session row.
+#
+# These drive a real turn through the real app and then read the session back, so
+# they cover the hop that had no coverage at all before R4: adapter -> server ->
+# stored row.
+
+
+def _turn_then_read_session(monkeypatch, tmp_path, events):
+    """Run one chat turn, then return (sse_body, stored_session)."""
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+    from rigma import state as st
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(harness_mcode, "available", lambda: True)
+
+    def _fake_drive(**kw):
+        for e in events:
+            yield e
+
+    monkeypatch.setattr(harness_mcode, "drive_turn", _fake_drive)
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    real_read = st.read_state
+    monkeypatch.setattr(st, "read_state",
+                        lambda: {**(real_read() or {}),
+                                 "public_port": 11500, "ctx": 32768})
+    s = sessions.create(title="t")
+    s["harness"] = "mcode"
+    sessions.save(s)
+    with TestClient(serve.build_app(upstream_port=11499)) as c:
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "go"})
+        assert r.status_code == 200, r.text
+        got = c.get(f"/api/sessions/{s['id']}").json()
+    return r.text, got
+
+
+def test_a_goal_is_stored_on_the_session_and_returned_by_get(monkeypatch, tmp_path):
+    """The reload path: what the panel needs must come back from the server."""
+    _body, got = _turn_then_read_session(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="goal",
+                          data={"goalId": "g1", "objective": "ship it",
+                                "status": "active"}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert got["agent_state"]["goal"]["objective"] == "ship it"
+
+
+def test_the_stored_goal_is_the_raw_payload_not_a_reshaped_one(monkeypatch, tmp_path):
+    """`chat/goal.ts` owns the two backends' field names. Reshaping here would mean
+    the server guessing at a schema it does not own, and the stored copy drifting
+    from the live one."""
+    _body, got = _turn_then_read_session(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="goal",
+                          data={"goalId": "g1", "objective": "ship it",
+                                "status": "active", "tokensUsed": 7}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    # mcode's own key names survive verbatim, including ones Rigma never reads.
+    assert got["agent_state"]["goal"]["goalId"] == "g1"
+    assert got["agent_state"]["goal"]["tokensUsed"] == 7
+
+
+def test_a_todo_list_is_stored_as_the_whole_list(monkeypatch, tmp_path):
+    """`todo_write` REPLACES the list every call, so the stored copy is an
+    assignment, never a merge."""
+    _body, got = _turn_then_read_session(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="todos",
+                          data={"todos": [{"content": "one", "status": "completed"},
+                                          {"content": "two", "status": "pending"}]}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    stored = got["agent_state"]["todos"]
+    assert [x["content"] for x in stored] == ["one", "two"]
+    assert stored[1]["status"] == "pending"
+
+
+def test_a_second_todo_write_replaces_rather_than_appends(monkeypatch, tmp_path):
+    _body, got = _turn_then_read_session(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="todos",
+                          data={"todos": [{"content": "old", "status": "pending"}]}),
+        harness.TurnEvent(kind="state", event="todos",
+                          data={"todos": [{"content": "new", "status": "pending"}]}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert [x["content"] for x in got["agent_state"]["todos"]] == ["new"]
+
+
+def test_plan_mode_is_stored(monkeypatch, tmp_path):
+    _body, got = _turn_then_read_session(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="plan/mode", data={"active": True}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert got["agent_state"]["plan_mode"] is True
+
+
+def test_a_goal_clear_does_not_resurrect_the_goal_on_reload(monkeypatch, tmp_path):
+    """The clear tombstone carries no objective. Storing it as-is would mean a
+    reload normalises it, finds no objective, and ... shows nothing — but only by
+    accident. Storing an explicit None is what the panel actually showed, and it
+    keeps the tombstone out of the durable copy."""
+    _body, got = _turn_then_read_session(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="goal",
+                          data={"goalId": "g1", "objective": "ship it"}),
+        harness.TurnEvent(kind="state", event="goal",
+                          data={"operation": "clear", "cleared": True}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert got["agent_state"]["goal"] is None
+
+
+def test_subagents_are_deliberately_not_persisted(monkeypatch, tmp_path):
+    """A subagent row names a child process belonging to the turn that spawned it.
+    Restoring one after a reload would draw "running" for a child that is long
+    gone, so it is turn-scoped ON PURPOSE — the same decision the frontend makes.
+    This test exists so that adding it later is a decision, not an accident."""
+    _body, got = _turn_then_read_session(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="subagent",
+                          data={"taskId": "bg_1", "subSessionId": "s1",
+                                "name": "explore", "status": "started"}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert "subagents" not in got["agent_state"]
+    assert "subagent" not in got["agent_state"]
+
+
+def test_usage_is_not_persisted(monkeypatch, tmp_path):
+    """A per-step number is not a fact about the conversation, and it arrives every
+    step — persisting it would turn one turn into a write storm."""
+    _body, got = _turn_then_read_session(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="usage", data={"promptTokens": 5}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert "usage" not in got["agent_state"]
+
+
+def test_a_fresh_session_starts_with_an_empty_agent_state(monkeypatch, tmp_path):
+    """Named in the defaults rather than left absent, so a reader that subscripts
+    it on a chat that predates the field does not KeyError."""
+    from rigma import sessions
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    s = sessions.create(title="fresh")
+    assert s["agent_state"] == {}

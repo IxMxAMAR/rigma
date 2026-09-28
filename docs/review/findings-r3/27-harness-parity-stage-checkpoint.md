@@ -582,7 +582,7 @@ like a returning one.
 
 ---
 
-## 8e. NEXT STEP — the capability panel is turn-scoped (a real feature, not a fix)
+## 8e. DONE (round 5) — the capability panel now survives a reload
 
 **This is the one substantive gap left from the round-4 audit, and it is scoped here so
 the next session does not have to re-derive it.**
@@ -634,11 +634,49 @@ process that is long gone. Decide explicitly whether `subagent` is persisted at 
 rather than persisting everything and calling it parity. Goal, todos and plan mode
 genuinely outlive a turn; a subagent row does not.
 
-### Not yet done, and deliberately not half-done
+### Implemented in round 5
 
-Attempted at the end of round 4 and stopped: a session-schema change plus a frontend
-rehydrate is not something to land at the tail of a long session, where a regression
-would ship with the suite green but the panel silently wrong. Recorded instead.
+All three pieces, as scoped:
+
+1. **Field.** `agent_state` (a `dict`) added to `sessions.MUTABLE_FIELDS`,
+   `sessions._FIELD_TYPES` and the create defaults. Named in the defaults rather than
+   left absent, so a reader that subscripts it on a chat predating the field does not
+   KeyError.
+
+2. **Write path.** `_external_turn` accumulates into `_agent_state` and persists via
+   `_persist_agent_state()`, using the `unlocked_tools` pattern (reload → set one
+   field → save against the revision just read, failures swallowed). Called from the
+   goal, todos and plan-mode branches only — **not** from `usage`, which arrives every
+   step.
+
+3. **Rehydrate path.** `Session.agent_state` on the API type, `chatStore.savedAgent`
+   keyed by session id, hydrated in `open()`, and a durable `AgentState` rendered by
+   `Transcript` when no turn is live.
+
+### The two deliberate omissions
+
+- **Subagents are NOT persisted.** A subagent row names a child process belonging to
+  the turn that spawned it; restoring one after a reload would draw "running" for a
+  child that is long gone. Pinned on BOTH sides (a Python test and a frontend test) so
+  that adding it later is a decision rather than an accident.
+- **`usage` is NOT persisted.** A per-step number is not a fact about the
+  conversation, and it arrives every step.
+
+### Two details that were easy to get wrong
+
+- **The goal payload is stored RAW and unreshaped.** `chat/goal.ts` owns the two
+  backends' field names; normalising server-side would mean guessing at a schema this
+  side does not own and letting the stored copy drift from the live one. A test pins
+  that mcode's own keys (including ones Rigma never reads) survive verbatim.
+- **A goal CLEAR stores an explicit `None`, not the tombstone.** The tombstone has no
+  objective, so storing it as-is would have a reload normalise it and show nothing —
+  but only by accident. `None` is what the panel actually showed.
+
+### Verified
+
+`tests/test_harness_mcode.py` +10 (drive a real turn through the real app, then read
+the session back) and `frontend-v2/src/chat/chatStore.test.ts` +8. Frontend 346
+passed; ruff and tsc clean; bundle rebuilt (`index-Cly9FK1L.js`).
 
 ---
 

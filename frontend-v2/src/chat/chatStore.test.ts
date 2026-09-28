@@ -8,7 +8,7 @@
 // the other chapter.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  alreadySaved, applyEvent, emptyTurn, errText, promptSurvived,
+  alreadySaved, applyEvent, durableFromEvent, emptyTurn, errText, promptSurvived,
   selectAnyStreaming, selectStreaming, STOPPED_SUFFIX, useChat,
   type StreamingTurn,
 } from "./chatStore";
@@ -1008,5 +1008,75 @@ describe("drafts are keyed to the chat they were typed in", () => {
     useChat.getState().setDraft("gone in a moment");
     useChat.getState().setDraft("");
     expect(useChat.getState().drafts).toEqual({});
+  });
+});
+
+
+// --- R5-PERSIST: which events outlive the turn -------------------------------
+//
+// Goals, todos and plan mode outlive the turn that reported them, and the panel
+// was drawn from the live turn only — so a reload lost a goal the agent was still
+// working toward, and the panel silently disagreed with the agent.
+//
+// `durableFromEvent` is what picks the durable half out of the stream. It is a
+// separate function from `applyEvent` because the two answer different questions:
+// `applyEvent` is what is on screen NOW, this is what must survive the turn
+// ending. The two deliberate omissions are the interesting part.
+describe("durableFromEvent", () => {
+  it("keeps a goal as the RAW payload", () => {
+    // Not normalised here: `chat/goal.ts` stays the single place the two
+    // backends' field names are reconciled, which is also what the server stores.
+    const d = durableFromEvent({ event: "goal",
+      data: { goalId: "g1", objective: "ship it", status: "active" } });
+    expect(d).toEqual({ goal: { goalId: "g1", objective: "ship it",
+                                status: "active" } });
+  });
+
+  it("stores a clear as null, so a reload cannot resurrect the goal", () => {
+    // The tombstone has no objective, so a reload would normalise it and show
+    // nothing — but only by accident. An explicit null is what the panel showed.
+    expect(durableFromEvent({ event: "goal",
+      data: { operation: "clear", cleared: true } })).toEqual({ goal: null });
+  });
+
+  it("keeps a todo list as the whole list, matching the wire", () => {
+    const d = durableFromEvent({ event: "todos",
+      data: { todos: [{ content: "one", status: "completed" }] } });
+    expect(d).toEqual({ todos: [{ content: "one", status: "completed" }] });
+  });
+
+  it("tolerates a todos payload that is not a list", () => {
+    expect(durableFromEvent({ event: "todos", data: { todos: "nope" } }))
+      .toEqual({ todos: [] });
+    expect(durableFromEvent({ event: "todos", data: {} })).toEqual({ todos: [] });
+  });
+
+  it("keeps plan mode as a boolean", () => {
+    expect(durableFromEvent({ event: "plan_mode", data: { active: true } }))
+      .toEqual({ plan_mode: true });
+    expect(durableFromEvent({ event: "plan_mode", data: {} }))
+      .toEqual({ plan_mode: false });
+  });
+
+  it("does NOT keep subagents, on purpose", () => {
+    // A subagent row names a child process belonging to the turn that spawned it.
+    // Restoring one after a reload would draw "running" for a child that is long
+    // gone. The server makes the same decision, and both are pinned by a test so
+    // that adding it later is a decision rather than an accident.
+    expect(durableFromEvent({ event: "subagent",
+      data: { event: "subagent.started", data: { childSessionId: "c1" } } }))
+      .toBeNull();
+  });
+
+  it("does NOT keep usage, which describes a step and arrives every step", () => {
+    expect(durableFromEvent({ event: "usage", data: { promptTokens: 5 } }))
+      .toBeNull();
+  });
+
+  it("ignores everything else in the stream", () => {
+    for (const ev of ["message", "tool", "notice", "meta", "housekeeping",
+                      "masked", "compacted", "governance"]) {
+      expect(durableFromEvent({ event: ev, data: {} })).toBeNull();
+    }
   });
 });
