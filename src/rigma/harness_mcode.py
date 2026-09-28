@@ -432,10 +432,13 @@ def ensure_mcp(cwd: str = "") -> None:
     if wanted:
         # An entry that is PRESENT BUT WRONG is the case that used to be
         # permanent. This only ever assigned when `wanted`, so a registration
-        # written by an older build — or one pointing at an interpreter that has
-        # since lost Rigma — was left exactly as it was, every turn, forever. The
-        # arm then silently had no `remember`, `recall` or `undo_last_change`,
-        # and nothing anywhere said so: the file looks configured.
+        # naming an interpreter that cannot import Rigma — because it moved, was
+        # rebuilt, or was hand-edited — was left exactly as it was, every turn,
+        # forever. The arm then silently had no `search_my_documents`, `remember`,
+        # `recall` or `undo_last_change`, and nothing anywhere said so: the file
+        # looks configured, and a missing MCP server is not an error mcode
+        # reports. A real one was found on this machine naming a python whose
+        # Rigma predates `mcp_server` entirely.
         #
         # The fix is to compare, not to assume. `ensure_mcp` already runs every
         # turn and already reads this file, so the drift check is free.
