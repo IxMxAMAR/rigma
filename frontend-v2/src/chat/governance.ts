@@ -6,12 +6,20 @@
 // conversation should not carry — so they are rendered beside the turn, not in
 // it.
 //
-// **These are display-only, and that is a property of the transport rather than a
-// limitation of this code.** DSH's SDK wire exposes exactly three methods —
+// **These are display-only on DSH, and that is a property of the transport rather
+// than a limitation of this code.** DSH's SDK wire exposes exactly three methods —
 // `initialize`, `session/prompt`, `shutdown` — so there is no way to answer an
 // approval over it. Approval is decided by the policy engine. A clickable
-// "Allow?" button here would misrepresent what the connection can do, so there
-// is none, and this comment is the reason.
+// "Allow?" button on a DSH approval would misrepresent what the connection can do,
+// so there is none.
+//
+// R6-ACP-APPROVE: that reasoning does NOT hold for mcode over ACP, which is why
+// `GovernanceEvent.awaiting` exists. There the server sends
+// `session/request_permission` and BLOCKS until it is answered, so a request marked
+// `awaiting` is one a click can actually resolve — and one that, left unanswered,
+// wedges the transport rather than failing a turn. The flag is what distinguishes
+// the two cases, so the button is rendered on the transport's ability rather than on
+// the reader's optimism.
 
 /** One entry in the audit trail, in arrival order. */
 export interface GovernanceEvent {
@@ -27,6 +35,13 @@ export interface GovernanceEvent {
   outcome: string;
   /** The policy in force, on a `policy`. */
   policy: string;
+  /** R6-ACP-APPROVE: this request is BLOCKING the turn and a click can answer it.
+   *
+   *  Set only for mcode over ACP, where the server sends
+   *  `session/request_permission` and waits. A DSH approval never sets it, because
+   *  there is no method on that wire to answer with — so this flag, not the presence
+   *  of an outcome, is what decides whether a button is drawn. */
+  awaiting?: boolean;
 }
 
 export interface Governance {
@@ -77,6 +92,9 @@ export function foldApproval(
     reason: str(d.reason),
     outcome: str(d.outcome),
     policy: str(d.policy),
+    // Only ever true from a transport that can be answered. `=== true` rather than
+    // truthiness so a string "false" from a hand-written payload cannot arm a button.
+    awaiting: d.awaiting === true,
   };
 
   // `decided` carries only an id and an outcome. Folding it onto the matching

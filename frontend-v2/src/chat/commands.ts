@@ -41,6 +41,15 @@ export const COMMANDS: SlashCommand[] = [
     takesArgs: true,
     argHint: "off | smart | full",
   },
+  {
+    // R6-EXPORT: the route has existed all along (`GET /api/sessions/{sid}/export`)
+    // and the per-session rail in ChatSurface already links it — but there was no way
+    // to reach it FROM THE COMPOSER, which is where someone finishing a conversation
+    // actually is. No backend work: this wraps a capability Rigma already had.
+    name: "export",
+    summary: "download this chat as markdown",
+    takesArgs: false,
+  },
   { name: "help", summary: "list these commands", takesArgs: false },
 ];
 

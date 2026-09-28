@@ -1,10 +1,10 @@
 // Transcript: persisted messages + the live streaming turn. Thinking blocks
 // collapse once the reply starts; chips expand to show their result.
-import { useEffect, useRef, useState } from "react";
-import type { ChatMessage } from "../lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, type ChatMessage } from "../lib/api";
 import Markdown from "./Markdown";
 import {
-  selectStreaming, useChat, type Chip, type Source, type StreamingTurn,
+  errText, selectStreaming, useChat, type Chip, type Source, type StreamingTurn,
 } from "./chatStore";
 import { formatArgs, previewArgs } from "./toolChip";
 import AgentState from "./AgentState";
@@ -276,6 +276,24 @@ function HarnessBadge({ name, label }: { name: string; label?: string }) {
 }
 
 function LiveTurn({ turn }: { turn: StreamingTurn }) {
+  // R6-ACP-APPROVE: the one place an approval can be ANSWERED. Read here rather than
+  // passed down, so the handler always names the chat actually on screen — a stale
+  // closure over a previous id would send the answer to the wrong turn.
+  //
+  // The server refuses a requestId it is not waiting on, so a race (the turn ended,
+  // or the request timed out) surfaces as a 409 rather than as a silent no-op. That
+  // refusal is deliberately NOT swallowed: a click that did nothing must not look
+  // like one that worked.
+  const answerApproval = useCallback(async (requestId: string, allow: boolean) => {
+    const sid = useChat.getState().currentId;
+    if (!sid) return;
+    try {
+      await api.answerApproval(sid, { allow, requestId });
+    } catch (e) {
+      useChat.setState({ lastError: errText(e) });
+    }
+  }, []);
+
   // The still-open compaction for THIS turn, if any. Computed here rather than
   // inline in the JSX so it is one lookup per render, not one per condition.
   const runningCompaction = running(turn.compactions);
@@ -306,6 +324,15 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
           by the model: its goal, its todo list, whether it is in plan mode,
           the subagents it started, and what the step cost. Rendered above the
           reply because it is the context the reply is happening in. */}
+      {/* R6-ACP-APPROVE: the one place an approval can be ANSWERED. Declared here,
+          where the panel that draws the buttons is rendered, and it reads the CURRENT
+          session at click time — a stale closure over a previous id would send the
+          answer to the wrong turn.
+
+          The server refuses a requestId it is not waiting on, so a race (the turn
+          ended, or the request timed out) surfaces as a 409 rather than as a silent
+          no-op. That refusal is deliberately NOT swallowed: a click that did nothing
+          must not look like one that worked. */}
       <AgentState
         goal={turn.goal}
         todos={turn.todos}
@@ -318,6 +345,7 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         acpConfig={turn.acpConfig}
         acpCommands={turn.acpCommands}
         acpPlan={turn.acpPlan}
+        onAnswerApproval={answerApproval}
       />
       {/* Compaction, observation-masking and the prompt queue. All three were
           emitted by the server and dropped by the store's default arm, so a

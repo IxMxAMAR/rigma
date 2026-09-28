@@ -2105,6 +2105,44 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             yield b"data: [DONE]\n\n"
             return
 
+        def _answer_permission(method: str, params: dict):
+            """Ask the USER, and block this thread until they answer.
+
+            R6-ACP-APPROVE. This runs on the ACP client's READER thread, which is
+            blocked for as long as it waits — so the wait is bounded, and on expiry the
+            request is DECLINED rather than left unanswered. mcode waits forever on
+            silence, so a timeout that returned nothing would wedge the transport
+            instead of the turn.
+
+            Returns None when nobody answers, which `drive_turn_acp` reports as
+            `cancelled` — the protocol's own word for "no answer", deliberately not the
+            same as a denial. A timeout is not a decision the user made.
+            """
+            tool_call = params.get("toolCall") or {}
+            request_id = str(tool_call.get("toolCallId") or "")
+            slot = {"requestId": request_id, "allow": None,
+                    "event": threading.Event()}
+            _approvals[sid] = slot
+            # The UI is told through the SAME `approval/asked` channel DSH uses, so
+            # the governance trail already has somewhere to draw it. The `requestId`
+            # is what the answer has to quote back.
+            loop.call_soon_threadsafe(q.put_nowait, _harness.TurnEvent(
+                "state", event="approval/asked", data={
+                    "id": request_id,
+                    "toolName": str(tool_call.get("title") or ""),
+                    "reason": "mcode is asking; this turn is waiting for your answer",
+                    "awaiting": True,
+                }))
+            try:
+                answered = slot["event"].wait(_APPROVAL_WAIT_SECS)
+            finally:
+                # Cleared even on the timeout path: a slot left behind would let a
+                # later click answer a question that no longer exists.
+                _approvals.pop(sid, None)
+            if not answered:
+                return None
+            return slot["allow"]
+
         def _pump() -> None:
             """Drain the adapter on a worker thread. It never raises: a driver
             failure comes back as an error event, so the turn still ends."""
@@ -2120,7 +2158,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         max_tokens=EXTERNAL_MAX_TOKENS,
                         context_window=int(state.get("ctx") or 0) or 32768,
                         state=hstate, cancel=cancel,
-                        permission=str(s.get("permission") or "full"))
+                        permission=str(s.get("permission") or "full"),
+                        on_permission=_answer_permission)
                 else:
                     _events = adapter.drive_turn(
                         base_url=_harness.endpoint_for(
@@ -4592,6 +4631,33 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # actually runs on, so the two have to meet on something both can touch.
     _cancels: dict[str, threading.Event] = {}
 
+    # R6-ACP-APPROVE: session id -> the ONE permission request that session is
+    # waiting on, if any.
+    #
+    # WHY THIS EXISTS AT ALL. `mcode exec` has no interaction host, so when `smart`
+    # decided to ask, nobody could answer and mcode's own guard then refused to start
+    # another session — the chat was blocked PERMANENTLY (R5-MCODE-DEADEND). Over ACP
+    # the server asks and WAITS, so the answer has to come from somewhere: from the
+    # user, through the UI.
+    #
+    # The two sides are on DIFFERENT THREADS — the ACP client's reader thread blocks
+    # inside the request handler, and the answer arrives on the event loop from an HTTP
+    # route — so the handshake is a `threading.Event` plus a slot, exactly like
+    # `_cancels` above and for the same reason.
+    #
+    # ONE slot per session, not a queue: mcode asks one question at a time and blocks
+    # until it is answered, so a second pending request for the same session cannot
+    # exist. Keying by session is what lets the route refuse an answer that belongs to
+    # a different chat, which a global slot would have silently accepted.
+    _approvals: dict[str, dict] = {}
+
+    # How long the reader thread waits for the user before giving up. Bounded because
+    # an unbounded wait is worse than a decline: the client's reader thread is blocked
+    # for the whole time, so a UI that never answers would wedge the transport rather
+    # than the one turn. On expiry the request is DECLINED, not left unanswered —
+    # mcode waits forever on silence.
+    _APPROVAL_WAIT_SECS = 120.0
+
     def _apply_skill(text: str) -> str:
         """`/name` (or `/skill:name`) pulls a global skill in front of the ask.
 
@@ -4847,6 +4913,44 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return {"ok": True, "stopped": False}
         ev.set()
         return {"ok": True, "stopped": True}
+
+    @app.post("/api/sessions/{sid}/approval")
+    async def answer_approval(sid: str, body: dict):
+        """Answer the permission request this chat is waiting on.
+
+        R6-ACP-APPROVE. The ACP server asks and WAITS, so an unanswered request does
+        not fail the turn — it wedges the transport, because the client's reader thread
+        is blocked inside the request handler. This is the other half of that
+        handshake: the reader thread waits on an Event, and this route sets it.
+
+        THE REQUEST ID IS REQUIRED AND CHECKED. A UI can hold a stale card — the turn
+        may have been stopped, or the request may have timed out — and answering by
+        session alone would apply a decision to a DIFFERENT question than the one the
+        user was looking at. So a mismatch is refused with 409 rather than accepted,
+        which is the difference between "your answer was applied" and "an answer was
+        applied to something".
+
+        `allow` is the decision. Anything that is not a true boolean is refused: a
+        string "false" is truthy in Python, and granting permission from a typo is the
+        one failure here that cannot be taken back.
+        """
+        allow = body.get("allow")
+        if not isinstance(allow, bool):
+            return JSONResponse(
+                {"error": "allow: must be true or false"}, status_code=400)
+        request_id = str(body.get("requestId") or "")
+        slot = _approvals.get(sid)
+        if slot is None:
+            return JSONResponse(
+                {"error": "this chat is not waiting on a permission request"},
+                status_code=409)
+        if request_id and request_id != slot.get("requestId"):
+            return JSONResponse(
+                {"error": "that request is no longer the one being waited on"},
+                status_code=409)
+        slot["allow"] = allow
+        slot["event"].set()
+        return {"ok": True, "requestId": slot.get("requestId"), "allow": allow}
 
     # ================= Autonomous Mode (Runs) =========================
     _run_tasks: dict = {}   # run_id -> asyncio.Task (for cancellation)
