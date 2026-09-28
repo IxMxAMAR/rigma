@@ -43,7 +43,7 @@ EXPECTED_ROWS = {
         "tool-subagent-control", "tool-subagent-list-agents", "tool-subagent",
         "tool-subagent-fork",
     ],
-    "plan": ["plan-mode"],
+    # "plan" is deliberately ABSENT — see `test_plan_mode_is_not_mounted_and_why`.
     "workflow": ["ptc-runtime", "workflow-ptc", "tool-workflow"],
     "context": ["token-meter", "compaction-basic"],
 }
@@ -94,7 +94,6 @@ def test_rows_whose_config_has_no_default_carry_it():
     by_id = {str(r.get("id")): r for r in _patch_rows()}
     assert by_id["tool-todo"]["config"]["allowParallelInProgress"] is True
     assert by_id["tool-fs-search"]["config"]["sampleOverCapGlobResults"] is False
-    assert by_id["plan-mode"]["config"]["section"].strip()
     for row in _patch_rows():
         if row.get("name") == "@deepseek-ai/dsh-tool-subagent":
             assert row["config"]["provider"]
@@ -812,3 +811,37 @@ def test_thinking_and_notices_do_not_count_as_speaking():
         state = harness_dsh._Run()
         harness_dsh._event_for(payload, state)
         assert state.spoke is False, payload
+
+
+def test_plan_mode_is_not_mounted_and_why():
+    """Plan mode is UNREACHABLE, so the patch must not mount it.
+
+    The row used to be here, copied from the shipped `sdk`/`web` profiles. In
+    those profiles `dsh-commands` and `dsh-user-questions` are mounted; in
+    sdk-minimal (and in this patch) neither is. Plan mode has exactly two
+    registrations (`packages/plan/plan-mode/src/index.ts`):
+
+      :225  ctx.inject(['commands'], ...)   -> the `/plan` command, the ONLY way IN
+      :273  ctx.tools.register(EXIT_PLAN_MODE)  -> the only way OUT, and it is
+             registered UNCONDITIONALLY, outside that inject
+
+    So with `commands` unmounted there is no way in, while `exit_plan_mode` is
+    still in the tool catalog and throws `is only available in plan mode` on its
+    first call. Mounting it therefore advertises a capability AND hands the model a
+    tool that can only fail — strictly worse than not mounting it.
+
+    This is a DRIFT GUARD, not a preference: if `dsh-commands` and
+    `dsh-user-questions` are ever mounted, delete this test and restore the row
+    (the config is preserved in a comment beside where it used to live). Until
+    then, re-adding the row silently is the regression this catches.
+    """
+    ids = {str(r.get("id")) for r in _patch_rows()}
+    assert "plan-mode" not in ids, (
+        "plan-mode is mounted again, but nothing can enter or leave plan mode: "
+        "`dsh-commands` (the /plan command) and `dsh-user-questions` "
+        "(exit_plan_mode's review channel) are both unmounted. Mount those first."
+    )
+    # The other two plan-mode-adjacent registrations the audit found, so the
+    # guard covers the capability rather than one row's id.
+    names = {str(r.get("name")) for r in _patch_rows()}
+    assert "@deepseek-ai/dsh-plan-mode" not in names
