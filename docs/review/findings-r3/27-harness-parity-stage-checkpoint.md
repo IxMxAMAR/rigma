@@ -159,7 +159,8 @@ Ranked by (user value × honesty of the fix), highest first.
    §7, "still open").
 4. ~~**Compaction visibility (DSH).**~~ **DONE** — see §8. Four events bridged,
    folded as a bracket, and rendered beside Rigma's own compaction lines.
-5. **mcode ACP client — MEASURED, and BLOCKED on authentication.** See §9. The
+5. **mcode ACP client — MEASURED, and BUILDABLE (an earlier "BLOCKED on
+   authentication" claim here was WRONG; see the correction in §9).** The
    surface is real and much larger than stream-json (14 methods plus a goal and a
    delegation control plane), but every session method refuses with
    `-32000 Authentication required`, and this machine has no credentials. Not
@@ -724,7 +725,8 @@ kinds: unmounted plugins, adapter-internal drops, and false comments.
    `harness.py` now discloses that `smart` is the mode which invites this.
 
    **Still open:** answering the question. That needs an interaction channel — the exec
-   path has none by design and mcode's ACP path needs `mcode login`.
+   path has none by design; mcode's ACP path DOES have one, which is why the plan-mode
+   capability is reachable there and not on DSH (see §9).
 
 2. **`_ok_of` always returns None, so every mcode tool chip shows UNKNOWN.** The wire
    value is numeric (the file's own note at `:169-172` and the fixture agree: 4, 5, 1,
@@ -819,9 +821,12 @@ is exhausted.
 
 ### Open, and why each is NOT a bridge defect
 
-1. **mcode ACP** — blocked on `mcode login` (browser sign-in). **Needs the user.** The
-   largest remaining piece; ACP is complementary to `exec` rather than a replacement
-   (§9).
+1. **mcode ACP** — NOT blocked. My earlier "needs `mcode login`" was a broken probe
+   (stdin from a file => EOF => exit before answering), corrected in §9. `initialize`,
+   `session/new`, `mcode/session/goal/get` and `session/set_mode` all work with NO
+   credentials. **This is buildable and is the largest remaining piece of parity work**;
+   it carries plan mode (which DSH cannot offer), a full goal control plane, delegation,
+   steering and queueing. ACP is complementary to `exec`, not a replacement.
 2. **An interaction channel** (`ask_user_question`, plan-mode review) — impossible on
    BOTH transports today. Rendering a question is a HOST UI capability: the `web` profile
    mounts the answerer, `acp` mounts a seam with none, and Rigma mounts neither. This is
@@ -882,23 +887,64 @@ ADVERTISED NOTIFICATIONS (4):
 — and `mcode/session/delegation/*`, which is subagent control. Rigma currently
 scrapes `exec --output-format stream-json`, which cannot reach any of it.
 
-**And it is blocked.** `session/fork` answered:
+### CORRECTION (round 5, late): it is NOT blocked, and the "authentication required" was MY BUG
 
-```json
-{"jsonrpc":"2.0","id":2,"error":{"code":-32000,
- "message":"Authentication required: Run `mcode login` and try again."}}
+The section above was written from a probe that could not work, and its conclusion was
+wrong. Corrected by re-probing properly:
+
+**`mcode acp` needs no login.** Measured on 0.5.4, this machine, **no credentials**:
+
+```
+initialize        -> OK. agentInfo {name: minimax-code, version: 0.5.4}
+session/new       -> OK. sessionId "mvs_d26d0c59339b44acb43da17c6c8960a8"
+mcode/session/goal/get -> {"goal": null}          <- a real answer, not a refusal
+session/set_mode {modeId: "plan"} -> {"_meta": {"minimax-code/transition": "next_prompt"}}
+session/prompt    -> error: "BYOK provider custom_provider:rigma upstream error:
+                     Connection error."
 ```
 
-Every session method needs it. `~/.minimax/auth/prod/cn/mcode-public/` contains
-**only `auth.lock` files and no credentials**, so this machine is not signed in, and
-`mcode login` opens a browser to sign in to a MiniMax account. `initialize` and the
-method *advertisement* work unauthenticated; nothing else does.
+The last line is the ONLY failure, and it is not authentication: **Rigma's own engine
+was not running on 11601**. `~/.minimax/config.yaml` already has Rigma registered as
+`custom_provider: rigma` with `api: openai-completions`, `baseURL
+http://127.0.0.1:11601/v1`, and `defaultModel: custom_provider:rigma/local-test` — the
+BYOK path the README documents as "does not require a MiniMax login".
 
-**Conclusion: do not build this yet.** It is the largest remaining piece of work, and
-it would be written against an API that cannot be exercised even once — which is
-precisely the "declared gap beats a fake green" rule. It becomes worth doing when the
-user signs in; the three probe scripts are committed so the work starts from measured
-facts rather than a guess.
+**WHY THE OLD PROBE LIED.** It drove `mcode acp` with **stdin attached to a FILE**. The
+process read the first request, hit EOF on the remaining ones, and **exited 0 before
+answering `session/new`**. An unanswered request was then read as a refusal. The
+`-32000 Authentication required` in the old transcript is a real string from the binary
+(`chunks/run-acp-command-JPZMIXGP.js`, `sr()` wrapping a `Qd` error), but nothing
+observed here ever produced it. This is the lesson worth keeping: **an unanswered probe
+is not a negative result.** A probe that cannot distinguish "refused" from "never asked"
+will manufacture a blocker, and this one did.
+
+**MORE CORRECTIONS FROM THE RE-PROBE.**
+
+- **mcode ACP HAS plan mode, and it is settable.** `session/new` returns
+  `modes.availableModes = [{id: "default"}, {id: "plan", name: "Plan", description:
+  "Research and prepare an implementation plan before making changes."}]`, and
+  `session/set_mode {modeId: "plan"}` returns a transition marker. So the plan-mode
+  capability that is UNREACHABLE on DSH is reachable here — §8f item 3 must not be read
+  as applying to mcode.
+- **The permission vocabulary is TRANSPORT-SPECIFIC, and they are not the same words.**
+  `exec --permission` takes `smart | full | off`. ACP's `configOptions` takes
+  `permissionMode` with options `default | auto | bypassPermissions`. Passing `full` to
+  ACP is rejected: `Invalid params: Unsupported permission mode: full`. Any ACP client
+  must translate between the two rather than forwarding one to the other.
+- **The model selector is an ACP configOption**, listing every configured model
+  including Rigma's BYOK entry (`m:custom_provider%3Arigma:local-test:v:thinking`), with
+  a `:thinking` variant per model. So model choice is a protocol operation here, not a
+  CLI flag.
+- The extension surface is unchanged and real: `mcode/session/goal/*` (create/get/patch/
+  clear) plus `goal_update`; `mcode/session/delegation/*` (get/stop) plus
+  `delegation_update`; `mcode/session/queue/*`; `session/steer`; `session/activate`;
+  and `sessionCapabilities {list, fork, resume, close}`.
+
+**Revised conclusion: this is BUILDABLE, and it is the largest remaining piece of
+parity work.** It is no longer blocked on the user. What it needs is a real ACP client
+in Rigma (JSON-RPC over the child's stdio, with the stdin left OPEN — see the probe bug
+above) and a running engine to exercise it against. The goal control plane alone is a
+capability Rigma cannot reach over `exec` at all.
 
 ---
 

@@ -279,19 +279,41 @@ mcpCapabilities: {http: true, sse: true}
   current_session_update, delegation_update, goal_update, queue_update
 ```
 
-That is a genuinely larger surface than stream-json. **And every session method
-refuses:**
+That is a genuinely larger surface than stream-json. **An earlier version of this
+section said every session method refuses with `-32000 Authentication required`, and
+that was WRONG — it came from a probe that could not work.** See the correction below.
 
-```json
-{"error":{"code":-32000,"message":"Authentication required: Run `mcode login` and try again."}}
+### CORRECTION (round 5, late): ACP needs no login
+
+Re-probed with a **live stdin pipe**. The old probe attached stdin to a FILE, so mcode
+read the first request, hit EOF on the rest, and **exited 0 before answering
+`session/new`** — and an unanswered request was read as a refusal. Measured properly,
+with no credentials on this machine:
+
+```
+initialize                      -> OK (minimax-code 0.5.4)
+session/new                     -> OK, sessionId mvs_d26d0c59339b44acb43da17c6c8960a8
+mcode/session/goal/get          -> {"goal": null}
+session/set_mode {plan}         -> {"_meta": {"minimax-code/transition": "next_prompt"}}
+session/prompt                  -> error: BYOK provider custom_provider:rigma
+                                   upstream error: Connection error.
 ```
 
-`~/.minimax/auth/prod/cn/mcode-public/` contains **only `auth.lock` files and no
-credentials** — re-checked at the start of this round, still not signed in.
-`initialize` and the method *advertisement* work unauthenticated; nothing else does.
+The only failure is that **Rigma's engine was not running on 11601**. `~/.minimax/config.yaml`
+already registers Rigma as `custom_provider: rigma` (openai-completions, `defaultModel:
+custom_provider:rigma/local-test`) — the README's BYOK path, which it explicitly says
+"does not require a MiniMax login". `~/.minimax/auth/` holding only lock files is
+consistent with that: BYOK does not write credentials.
 
-**Conclusion: not built.** It is the largest remaining piece of work and it would be
-written against an API that cannot be exercised even once.
+Two further facts from the re-probe that change the picture:
+
+- **mcode ACP HAS plan mode and it is settable.** `session/new` returns
+  `availableModes [{id: "default"}, {id: "plan"}]` and `session/set_mode {modeId: "plan"}`
+  succeeds. So plan mode is unreachable on DSH but REACHABLE here.
+- **The permission vocabulary is transport-specific.** `exec --permission` takes
+  `smart | full | off`; ACP's `permissionMode` configOption takes
+  `default | auto | bypassPermissions`. Passing `full` to ACP is rejected:
+  `Invalid params: Unsupported permission mode: full`. A client must translate.
 
 ---
 
@@ -299,7 +321,7 @@ written against an API that cannot be exercised even once.
 
 | item | blocked on | evidence |
 |---|---|---|
-| mcode ACP client (goals, delegation, queue, fork, resume) | **`mcode login`** — a browser sign-in to a MiniMax account | `-32000 Authentication required` on every session method |
+| mcode ACP client (goals, delegation, queue, fork, resume, **plan mode**) | **nothing technical** — verified working with no credentials; needs an ACP client (JSON-RPC over stdio, stdin kept OPEN) and a running engine | re-probe above; supersedes the old `-32000` claim |
 | DSH ACP client (answerable permission, model/effort selection, session list/resume) | **nothing technical** — verified working; it is a design decision, since it would add a second DSH transport and give up goals/todos/plans on that path | `tools/dsh_acp_probe.py` output |
 | interactive approvals on the SDK wire | **impossible** — `HarnessSdkNotificationMap` is notifications-only | §1 |
 | `ask_user_question` on **either** DSH transport | **impossible** — answering is a Host UI capability and Rigma is an SDK client; ACP omits elicitation | §2.3 |
