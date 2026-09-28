@@ -650,7 +650,21 @@ def ensure_provider(exe: str, base_url: str, model: str, context_window: int,
 
 
 def _flatten(out) -> str:
-    """A tool result as text. mcode wraps it as `{content:[{type,text}],details}`."""
+    """A tool result as text. mcode wraps it as `{content:[{type,text}],details}`.
+
+    R5-MCODE-CONTENT: a content block that is not text is now NAMED rather than
+    silently dropped. `content` is a block list — the same shape the SDK's own
+    `final_response` reads — and this kept only blocks carrying `text`, so an
+    `image` block (which carries its payload elsewhere) vanished with no trace
+    that anything had been omitted. A tool result that reads as empty when the
+    tool in fact returned a picture is worse than one that says so.
+
+    The payload is deliberately NOT inlined. mcode's image blocks carry base64,
+    which would put megabytes into an SSE text frame and into the transcript;
+    rendering them needs a tool-result content model in the seam and a
+    renderer in the UI, which is a feature rather than a fix. Naming the
+    omission is the part that is unambiguously correct today.
+    """
     if isinstance(out, str):
         return out
     if isinstance(out, dict):
@@ -658,6 +672,14 @@ def _flatten(out) -> str:
         if isinstance(parts, list):
             text = "\n".join(str(p.get("text", "")) for p in parts
                              if isinstance(p, dict) and p.get("text"))
+            # Only worth saying when there IS something else; a text-only result
+            # must not grow a note.
+            other = [str(p.get("type") or "unknown") for p in parts
+                     if isinstance(p, dict) and not p.get("text")]
+            if other:
+                kinds = ", ".join(dict.fromkeys(other))
+                note = f"[{len(other)} non-text content block(s) not shown: {kinds}]"
+                text = f"{text}\n{note}" if text else note
             if text:
                 return text
         return json.dumps(out)[:4000]
@@ -833,6 +855,24 @@ def map_event(obj: dict, seen: dict) -> list[TurnEvent]:
         err = obj.get("error")
         msg = str(err.get("message") or "the mcode turn failed") \
             if isinstance(err, dict) else "the mcode turn failed"
+        # R5-MCODE-ERR: the envelope carries more than a message and all of it was
+        # dropped. `code` is the important one: mcode rewrites an
+        # `awaiting-user-continuation` turn to
+        # `{category:"runtime", code:"INTERACTION_NOT_AVAILABLE", retryable:false}`
+        # (run-exec-command-EXGGKYPR.js, `bt`/`yr`), and that code is the only
+        # machine-readable way to tell a dead end apart from a transient fault.
+        # `category` separates a runtime refusal from an internal one, and
+        # `retryable` is mcode's own answer to "is trying again worth anything".
+        # The adapter reads the same code out of stderr for the guard path; this
+        # is the in-band half, so a failure is diagnosable without guessing from
+        # prose. Kept terse and appended in a fixed order so it stays scannable.
+        if isinstance(err, dict):
+            bits = [str(err[k]) for k in ("category", "code")
+                    if err.get(k)]
+            if err.get("retryable") is False:
+                bits.append("not retryable")
+            if bits:
+                msg = f"{msg} [{', '.join(bits)}]"
         return [TurnEvent("error", msg)]
     if kind not in ("item.started", "item.updated", "item.completed"):
         return []
@@ -1106,6 +1146,29 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
                 continue
             if kind == "turn.completed":
                 usage = obj.get("usage") or {}
+                # R5-MCODE-ERR: `turn.completed` also carries `durationMs`,
+                # `model` and `usageIncomplete` as SIBLINGS of `usage` — the
+                # projector spreads them in (`run-exec-command-EXGGKYPR.js`,
+                # the `turn.completed` arm). Only `usage` was read, so a turn's
+                # wall-clock and the model that actually served it were discarded
+                # while the token count survived.
+                #
+                # They are folded into the `usage` payload rather than sent as a
+                # second state event, because the UI already renders that one
+                # object and a second event would need a second code path for the
+                # same panel. `usageIncomplete` matters most of the three: it is
+                # mcode saying the token count is NOT the whole story, and a
+                # reader who cannot see it will trust a number that is low.
+                if isinstance(usage, dict) and usage:
+                    extra = {}
+                    if obj.get("durationMs") is not None:
+                        extra["durationMs"] = obj["durationMs"]
+                    if obj.get("model"):
+                        extra["model"] = obj["model"]
+                    if obj.get("usageIncomplete") is not None:
+                        extra["usageIncomplete"] = obj["usageIncomplete"]
+                    if extra:
+                        usage = {**usage, **extra}
                 if state is not None:
                     state["usage"] = usage
                 # Emitted as well as remembered. mcode has always reported
