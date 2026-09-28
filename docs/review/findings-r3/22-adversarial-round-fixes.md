@@ -715,5 +715,16 @@ fixture needed one added — the real probe correctly reports that **this machin
 Rigma holds port 11499, which is precisely the detection that was missing. A
 stub that silently absorbs a new return value is how a fix stops being tested.
 
+A fifth is the sharpest of them, because the test was **green in isolation and red
+in the full suite** and the code was never wrong. Two tests in
+`tests/test_r3_prompt_queue.py` asserted on `inspect.getsource(serve.build_app)` —
+source text, deliberately, because the difference between the two release paths
+*is* the fix and neither can be reached from outside. In a full-suite run that call
+returned the body of a **different function**, so the assertions failed against
+text that was never `build_app`'s. They now read `serve.__file__` directly, which
+is the same assertion with no line-number indirection. The lesson is the same one
+the whole round is about: an assertion that resolves its subject indirectly is
+testing the resolution as much as the subject.
+
 Full suite, frontend suite, `tsc --noEmit` and `ruff` results are recorded in the
 commit messages for this batch.
