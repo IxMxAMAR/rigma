@@ -27,6 +27,11 @@ including its real error result.
 """
 from __future__ import annotations
 
+import json
+import sys
+
+import pytest
+
 from rigma import harness_mcode as mc
 
 
@@ -217,3 +222,96 @@ def test_the_state_event_is_not_repeated_for_a_repeated_item():
     second = mc.map_event(item, seen)
     assert len([e for e in first if e.kind == "state"]) == 1
     assert second == []
+
+
+# --------------------------------------------------------------------------
+# the MCP registration, which mcode launches to reach Rigma's own tools
+#
+# `ensure_mcp` runs every turn and points mcode at `python -m rigma.mcp_server`.
+# It only ever ASSIGNED that entry when there was something to offer, so an entry
+# that was present but wrong was never corrected — the file looks configured, the
+# arm silently has no `remember`, `recall` or `undo_last_change`, and nothing
+# anywhere says so. A real stale entry naming a different interpreter was found
+# on this machine; these tests are that case, made permanent.
+
+
+@pytest.fixture
+def mcp_home(monkeypatch, tmp_path):
+    """A Rigma home with mcode's data dir, and a foreign MCP server in the file
+    so clobbering config Rigma does not own would be caught."""
+    home = tmp_path / "home"
+    (home / "mcode").mkdir(parents=True)
+    monkeypatch.setenv("RIGMA_HOME", str(home))
+    path = home / "mcode" / "mcp.json"
+    return path
+
+
+def _write(path, servers):
+    path.write_text(json.dumps({"mcpServers": servers}, indent=2), encoding="utf-8")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a_stale_interpreter_is_repaired_to_the_running_one(mcp_home):
+    """The measured case: an entry naming a python that cannot import Rigma."""
+    _write(mcp_home, {
+        "rigma": {
+            "command": r"C:\somewhere\else\Python312\python.exe",
+            "args": ["-m", "rigma.mcp_server"],
+            "env": {"RIGMA_HOME": str(mcp_home.parent), "RIGMA_MCP_ALLOW_CODE": "1"},
+        },
+        "someone-else": {"command": "other", "args": []},
+    })
+    mc.ensure_mcp("C:/chat")
+    after = json.loads(mcp_home.read_text(encoding="utf-8"))["mcpServers"]
+    assert after["rigma"]["command"] == sys.executable
+    assert after["rigma"]["env"]["RIGMA_MCP_WORKSPACE"] == "C:/chat"
+    # Rigma manages this file, it does not own it.
+    assert "someone-else" in after
+
+
+def test_a_correct_entry_is_left_exactly_as_it_is(mcp_home):
+    """Idempotent, and specifically not rewritten when the only difference is
+    the workspace — which moves legitimately from turn to turn."""
+    mc.ensure_mcp("C:/chat")
+    first = mcp_home.read_bytes()
+    stamp = mcp_home.stat().st_mtime_ns
+
+    mc.ensure_mcp("C:/chat")
+    assert mcp_home.read_bytes() == first
+
+    mc.ensure_mcp("C:/a/different/chat")
+    assert mcp_home.read_bytes() == first, "a moved workspace is not drift"
+    assert mcp_home.stat().st_mtime_ns == stamp
+
+
+def test_a_dropped_code_grant_is_repaired(mcp_home):
+    """`RIGMA_MCP_ALLOW_CODE` decides whether `undo_last_change` may be offered,
+    so an entry missing it is a real difference and not a formatting one."""
+    _write(mcp_home, {"rigma": {
+        "command": sys.executable, "args": ["-m", "rigma.mcp_server"],
+        "env": {"RIGMA_HOME": str(mcp_home.parent)},
+    }})
+    mc.ensure_mcp("C:/chat")
+    after = json.loads(mcp_home.read_text(encoding="utf-8"))["mcpServers"]
+    assert after["rigma"]["env"]["RIGMA_MCP_ALLOW_CODE"] == "1"
+
+
+def test_a_hand_written_entry_that_is_not_an_object_is_repaired(mcp_home):
+    """A user can edit this file. `"rigma": "python -m rigma.mcp_server"` is a
+    plausible mistake and must be replaced, not raise inside a turn."""
+    _write(mcp_home, {"rigma": "python -m rigma.mcp_server"})
+    mc.ensure_mcp("C:/chat")
+    after = json.loads(mcp_home.read_text(encoding="utf-8"))["mcpServers"]
+    assert isinstance(after["rigma"], dict)
+    assert after["rigma"]["command"] == sys.executable
+
+
+def test_same_registration_ignores_the_workspace_and_nothing_else():
+    spec = mc._mcp_spec("C:/chat")
+    moved = {**spec, "env": {**spec["env"], "RIGMA_MCP_WORKSPACE": "D:/elsewhere"}}
+    assert mc._same_registration(moved, spec) is True
+    assert mc._same_registration({**spec, "command": "python"}, spec) is False
+    assert mc._same_registration({**spec, "args": []}, spec) is False
+    assert mc._same_registration({}, spec) is False
+    assert mc._same_registration("nope", spec) is False
+    assert mc._same_registration(spec, spec) is True
