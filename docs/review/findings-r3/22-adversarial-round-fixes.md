@@ -313,7 +313,85 @@ which is the normal case. Now shown for the selected backend.
 
 ---
 
-## 5. Fixed — model acquisition
+## 5. Fixed — the chat turn and the environment
+
+### R3-CHAT-1 · a message-less turn bypassed the per-session guard  [high]
+
+The guard was `if message and sid in _streaming`, and the `message` half is what
+made it bypassable. `regenerate` and the queued-prompt replay both call the
+endpoint with **no** message — a continuation of an existing transcript — which
+is exactly the set of callers that must not start a second turn.
+
+Measured: two concurrent `{"message": null}` requests on one session both
+passed, both reached `_cancels[sid] = cancel`, and the second overwrote the
+first's cancel token. The first turn then became unstoppable by the Stop button
+(the UI cancels the token it last saw, which was the second's), and two agent
+loops shared one transcript — the interleaving AUDIT 03-5 closed for autonomous
+runs, reached through the other door.
+
+**Fix:** the queue branch is entered on `sid in _streaming` alone. A
+continuation cannot be *queued*, because it is not a new instruction — it is the
+same turn's next step — so it is refused 409 and the caller retries once the
+reply lands. A new prompt is still queued exactly as before.
+
+### R3-HARN-6 · the DSH adapter handed the agent the whole environment  [medium]
+
+AUDIT 13-6 found precisely this for mcode — `{**os.environ}` gave a third-party
+autonomous agent `HF_TOKEN`, `GEMINI_API_KEY`, `TAVILY_API_KEY` and every other
+secret the owner had exported, readable by `printenv` and by anything the agent
+spawns — and fixed it there. `harness_dsh` kept `os.environ.copy()`, so the
+identical leak survived in the sibling adapter: DSH's runner spawns a Node child
+that inherits it, and DSH's own shell tools read it.
+
+Verified against HEAD: `os.environ.copy()` is the line, in `drive_turn`.
+
+**Fix:** the allowlist moved to `harness.HARNESS_ENV_ALLOWLIST` and the filter to
+`harness.harness_env()`, which mcode now wraps. One list, one function, no second
+copy for the next adapter to forget. `harness_env(also=…)` names what a specific
+child cannot start without — DSH resolves its provider key through
+`apiKeyEnv: DEEPSEEK_API_KEY`, so filtering that out would leave the agent unable
+to reach the local server at all. This is the **third** instance in this review
+of the same bug fixed twice in two files, which is why the fix is deduplication
+rather than a second copy of the list.
+
+---
+
+## 6. Fixed — the session store and the home directory
+
+### R3-STORE-3 · an unguarded whole-row save clobbered a live turn  [high]
+
+The grants endpoint is used *while* a turn is running — that is what it is for:
+the model asks to run a command, the user arms `allow_code`, the turn continues.
+`sessions.load` → mutate → `sessions.save` writes the **whole row**, and the turn
+loop saves its own copy, so whichever wrote last won outright: arming a grant
+mid-turn could silently discard the messages the turn had just produced, and the
+next turn started from a transcript missing its own last exchange.
+
+The mechanism to prevent exactly this already existed and was simply not used:
+`sessions.save(s, base_rev=…)` writes only while the stored row is still at that
+revision, and raises `StaleWriteError` otherwise. **Fix:** the patch endpoint
+passes the revision it read and, on a collision, re-reads and re-applies — the
+concurrent writer's messages survive and only the named fields are ours.
+
+Worth noting as a pattern: this is the second finding in the review where the
+guard already existed and one call site skipped it (the other is R3-CLI-1, the
+drift check present in the human branch and absent in the JSON one).
+
+### R3-STORE-4 · `RIGMA_HOME=""` put the whole store in the CWD  [medium]
+
+`os.environ.get("RIGMA_HOME", default)` substitutes the default only when the
+variable is **absent**, so an empty value returned `Path("")` — the current
+working directory. `rigma up` in a git checkout wrote `models/`, `engines/`,
+`sessions.db` and `settings.json` into the project, and a run from elsewhere saw
+none of it. Verified against HEAD: empty → `'.'`.
+
+**Fix:** an empty (or whitespace) value is the same intent as no value, which is
+also how the shell idiom `RIGMA_HOME=$SOMETHING rigma up` behaves when `SOMETHING`
+is unset.
+
+---
+
+## 7. Fixed — model acquisition
 
 ### R3-HANG-1 · two specs sharing a filename destroyed each other's file  [high]
 
@@ -330,7 +408,7 @@ name is what the spec, the loader and the fit math all look up.
 
 ---
 
-## 6. Deliberately not changed
+## 8. Deliberately not changed
 
 These are real findings that were left alone, with the reason.
 
@@ -364,23 +442,39 @@ These are real findings that were left alone, with the reason.
 
 ---
 
-## 7. Verification
+## 9. Verification
 
 Every fix above is covered by a test that fails against the code before it.
 
-- `tests/test_r3_adversarial_fixes.py` — 22 new tests, one per fixed finding,
-  each written to fail on the old behaviour. The credential, write-grant and
-  spill tests were all confirmed red against the pre-fix code before being
-  accepted as green.
+- `tests/test_r3_adversarial_fixes.py` — 32 tests, one or more per fixed finding.
+  Each was checked **red against HEAD** before being accepted as green. Four in
+  the second batch were verified against the real HEAD source rather than
+  assumed: the DSH env leak (`os.environ.copy()` is the line, in `drive_turn`),
+  the chat guard (`if message and sid in _streaming` present, fixed form absent),
+  `RIGMA_HOME=""` → `'.'`, and the run-state readability split.
+- The chat-guard test drives the **real endpoint** with `_streaming` seeded to
+  the state a second request actually hits, rather than asserting on source text
+  — the source-text version was written first, matched its own explanatory
+  comment, and was replaced.
 - `tests/test_autonomous_run.py` — the completion-gate tests were rewritten
-  because the old ones **asserted the defect**; a new test pins that a run which
-  did nothing cannot report done.
+  because the old ones **asserted the defect**; new tests pin that a run with
+  outstanding steps, and a run that did nothing, cannot report done.
 - `tests/test_phase5_mcp.py` — the MCP grant tests were updated, and two new
   tests pin the `confirm_exec` requirement and the `no-delete` case.
 - `tests/test_audit_sec13.py`, `tests/test_audit_tools.py`,
   `tests/test_r3_image_credentials.py` — the tests that encoded the old
   behaviours were updated to assert the new boundary *and* to still exercise the
   capability through the grant, so nothing was silently dropped.
+
+Three tests were wrong for **test-side** reasons while writing this batch, and
+each is worth naming because the failure mode recurs:
+
+1. a `view_image` test that passed an absolute path with no workspace — there is
+   no boundary to escape, so the grant is not required, and the fix had to be
+   narrowed to the case that actually escapes;
+2. a source-text assertion that matched the comment explaining the fix;
+3. a `monkeypatch.undo()` that also reverted the `RIGMA_HOME` the test needed, so
+   the "success" case silently ran against the real home directory.
 
 Full suite, frontend suite, `tsc --noEmit` and `ruff` results are recorded in the
 commit messages for this batch.
