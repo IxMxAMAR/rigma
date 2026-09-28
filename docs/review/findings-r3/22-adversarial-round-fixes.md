@@ -479,7 +479,79 @@ memory to lexical-only — the length check still catches the case that breaks.
 
 ---
 
-## 9. Deliberately not changed
+## 9. Fixed — the fourth batch: stores, the engine fetch, and the CLI
+
+### R3-ENG-1 · an engine download could land anywhere the pinned host sent it [high]
+
+`_manifest_ok` checks that the pinned `url_base` is on `ENGINE_URL_ALLOWLIST`, but
+that is a statement about where the request **starts**. `_fetch` passed
+`follow_redirects=True` with nothing checking where it **ended** — and the
+artifact in question is the engine archive whose extracted binary Rigma then
+executes.
+
+The fix is not a single-host check, and measuring showed why: GitHub answers a
+`github.com/<org>/<repo>/releases/download/...` GET with a 302 to a signed
+`release-assets.githubusercontent.com` URL (measured 2026-09-28), so a strict
+one-host rule would refuse every legitimate engine download and the first user to
+hit it would be told the pin was broken. `ENGINE_REDIRECT_ALLOWLIST` names that
+hop explicitly, with the measurement recorded beside it, and
+`RIGMA_ENGINE_URL_ALLOW` is the named, opt-in extension for a self-hosted mirror —
+there is no "allow anything" value.
+
+### R3-STORE-10 · twelve fixed temp names that could collide [medium]
+
+`atomicio`'s own docstring states the rule — the temp name must be unique per
+write — and twelve call sites kept a fixed `<name>.tmp`. The documented failure is
+measured: two concurrent writers share the temp file, one replaces the other's
+half-written bytes, or the rename fails with `PermissionError [WinError 32]`. The
+run loop saves `run.json` every turn while a tool thread can save `live.json`, so
+this is the concurrency it actually meets. Every fixed name is gone, and a test
+asserts that over the **whole package** rather than a list of modules — a list has
+to be maintained, which is how twelve call sites were missed.
+
+Three of the twelve were not the same bug:
+
+- `registry.update_registry` shared a fixed staging **directory**. Two concurrent
+  `rigma update` runs — or a CLI update racing the server's — meant the second
+  `rmtree` deleted the first's extraction mid-flight and the swap-in failed on a
+  half-extracted tree.
+- `serve.py`'s usage-stats write happens per turn and several turns finish at
+  once, which is exactly when a shared `usage.tmp` collides.
+- `runtime.ensure_engine`'s lock write was already temp+replace (AUDIT F08-4) but
+  with a shared name.
+
+`atomicio.atomic_write_text` gained `create_only=True` for the one case
+`os.replace` cannot express: exclusive creation, where "already exists" is an
+answer rather than a race to be resolved. It is still atomic — the check and the
+write are one operation because `os.link` fails when the destination is there.
+
+### R3-CLI-3/4 · `recalibrate --all` wiped without asking, and not atomically [low]
+
+`--all` cleared every stored tune on the machine with no confirmation and no way
+back. A tune is the result of a sweep that takes minutes per model and is not
+reconstructible from anything else. It now confirms, and `--yes`/`-y` skips the
+prompt for a script. The `--model` branch wrote `calibration.json` with a bare
+`write_text` — the same store the atomic writer was added for, so a crash
+mid-write leaves a truncated file that loads as `{}` and destroys every **other**
+model's measurement on the next save. That call site was simply missed.
+
+### R3-HARN-7 · a test that passed alone and failed in a full run [low]
+
+`fake_cli` never set `FAKE_MCODE_VERSION`, so the fake CLI reported its default
+0.5.1 against a pin of 0.5.4. That only worked because the adapter used to copy
+the **whole** environment into the child and the variable happened to be set in
+the ambient one. With the allowlist in place the first turn emitted a drift
+notice and latched the process-global `_DRIFT_SAID`, so every later test asserting
+an exact notice list failed by test **order**. The fixture now sets the version it
+means, and the cancel test resets the latch it asserts about. The same class of
+problem — a test whose result depends on which other tests ran — is what made
+`tests/test_phase4_lifecycle.py`'s two restart tests fail: they did only
+`manage_plan` work before their first stop, which the R3-RUN-1 evidence gate now
+correctly refuses to call a finished run.
+
+---
+
+## 10. Deliberately not changed
 
 These are real findings that were left alone, with the reason.
 
@@ -522,7 +594,15 @@ These are real findings that were left alone, with the reason.
 - **The engine binary is fetched with no resume, and hashes via
   `read_bytes()`.** A multi-GB download that drops starts over, and the hash
   holds the whole file in memory. Real, but it is a throughput fix rather than a
-  correctness one, and the redirect allowlist above is the security half.
+  correctness one, and the redirect allowlist (R3-ENG-1) is the security half.
+- **The first install of an engine has no pinned checksum** — it records the
+  digest it saw and verifies re-downloads against it (trust on first use). Adding
+  a pin would not help on its own: a checksum published in the same GitHub release
+  as the artifact is fetched over the same channel from the same host, so an
+  attacker who can replace the archive can replace the checksum beside it. The pin
+  only adds security if it comes from a different channel, which is a release and
+  distribution decision rather than a code change. Recorded as a position instead
+  of left implied.
 - **`WORK_GET_ROUTES` covers three of at least eight process-spawning GET
   routes.** The list is a denylist of GETs that are not safe to auto-run, and a
   route added later is not on it. Inverting it to an allowlist is the right
@@ -538,17 +618,18 @@ These are real findings that were left alone, with the reason.
 
 ---
 
-## 10. Verification
+## 11. Verification
 
 Every fix above is covered by a test that fails against the code before it.
 
-- `tests/test_r3_adversarial_fixes.py` — 44 tests, one or more per fixed finding.
+- `tests/test_r3_adversarial_fixes.py` — 50 tests, one or more per fixed finding.
   Each was checked **red against HEAD** before being accepted as green. The later
   batches were verified against the real HEAD source rather than assumed, and the
   measurements are quoted in the sections above: `os.environ.copy()` in
   `drive_turn`; `if message and sid in _streaming`; `RIGMA_HOME=""` → `'.'`; three
   outbound shapes leaving the process with no grant; a held port returning `None`;
-  and a 768-d vs 384-d vector pair scoring `1.0`.
+  a 768-d vs 384-d vector pair scoring `1.0`; and the absence of both
+  `_redirect_allowed` and `ENGINE_REDIRECT_ALLOWLIST`.
 - The chat-guard test drives the **real endpoint** with `_streaming` seeded to
   the state a second request actually hits, rather than asserting on source text
   — the source-text version was written first, matched its own explanatory
