@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { goalTone, normaliseGoal, phaseLabel } from "./goal";
+import { goalTone, isGoalCleared, normaliseGoal, phaseLabel } from "./goal";
 
 // Two backends, two shapes, one panel. Every case below is a shape that was
 // actually observed: DSH's `goal/change` envelope and mcode's flat goal object
@@ -117,5 +117,48 @@ describe("phaseLabel", () => {
 
   it("says nothing for no phase", () => {
     expect(phaseLabel("")).toBe("");
+  });
+});
+
+// R4-GOAL-1: a CLEAR is an instruction, and used to be indistinguishable from
+// "this payload is not a goal".
+//
+// `goal/change` is a union. An ordinary change is `{operation, goal: {...}}`, but
+// a clear is `{operation: "clear", cleared: true, clearedAt}` with NO `goal` key.
+// Both folded to `null`, and the store's `null` case deliberately keeps whatever
+// the panel was showing - so clearing a goal left the old objective on screen
+// forever, with nothing saying it was stale.
+describe("isGoalCleared", () => {
+  it("recognises DSH's clear tombstone", () => {
+    expect(isGoalCleared({ operation: "clear", cleared: true, clearedAt: "t" })).toBe(true);
+  });
+
+  it("accepts either signal alone, since a backend may send one", () => {
+    expect(isGoalCleared({ operation: "clear" })).toBe(true);
+    expect(isGoalCleared({ cleared: true })).toBe(true);
+    expect(isGoalCleared({ operation: "CLEAR" })).toBe(true);
+  });
+
+  it("does NOT treat an ordinary change as a clear", () => {
+    expect(isGoalCleared({
+      operation: "update", goal: { objective: "ship it", phase: "active" },
+    })).toBe(false);
+  });
+
+  it("does NOT treat 'no goal' as a clear", () => {
+    // `get_goal` with no goal answers `{goal: null}`, and an error answers
+    // `{error}`. Neither means the goal was cleared, so neither may blank the
+    // panel - that is the whole distinction this function exists to draw.
+    expect(isGoalCleared({ goal: null })).toBe(false);
+    expect(isGoalCleared({ error: "nope" })).toBe(false);
+    expect(isGoalCleared({})).toBe(false);
+    expect(isGoalCleared(null)).toBe(false);
+    expect(isGoalCleared("clear")).toBe(false);
+  });
+
+  it("still normalises a clear to null, so the two agree", () => {
+    // The tombstone has no objective, so the normaliser refuses it; the store
+    // checks isGoalCleared FIRST and only then falls back to this.
+    expect(normaliseGoal({ operation: "clear", cleared: true })).toBeNull();
   });
 });

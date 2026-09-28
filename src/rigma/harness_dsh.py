@@ -43,6 +43,10 @@ from . import harness as _harness
 # checkout is a user's directory, not a fact about Rigma.
 _DEFAULT_HOME = r"C:\AI\deepseek-harness"
 _PATCH_NAME = "rigma-dsh-patch.yaml"
+# A SECOND patch, for the skill provider's roots. Kept separate from the one above
+# because that one is regenerated per TURN (it carries the window and token
+# budget) while this one is per RUNTIME (it carries a path that does not change).
+_SKILLS_PATCH_NAME = "rigma-dsh-skills.yaml"
 _SDK_REL = ("python", "sdk", "src")
 _CLI_REL = ("python", "sdk-runtime", "node_modules", ".bin", "dsh.CMD")
 
@@ -176,6 +180,59 @@ def capability_patch() -> str:
     except Exception:
         return ""
     return str(path) if path.is_file() else ""
+
+def skills_patch_file(tmpdir) -> str:
+    """Point DSH's skill provider at the skills Rigma's own UI writes.
+
+    WHY THIS IS NEEDED, and why the capability patch alone was not enough.
+
+    `agent-capabilities.patch.yml` mounts `dsh-skill-filesystem`, which makes the
+    `skill` tool exist. It does not make Rigma's skills REACHABLE, because that
+    provider scans roots of its own choosing and Rigma's are not among them:
+
+        <dshHome>/skills        rank 400   -> ~/.rigma/dsh/skills
+        <agentsHome>/skills     rank 500   -> ~/.agents/skills
+
+    Rigma writes to `~/.rigma/skills` (rigma.skills.skills_dir). So the Skills
+    page and the DSH agent were two disconnected stores: a skill authored in the
+    UI was invisible to every harness turn, and nothing anywhere said so — the
+    tool was present and simply never found anything.
+
+    `customSkillDirs` is the provider's documented field for extra roots and it
+    ranks 300, ABOVE both user roots, so Rigma's directory wins a name collision
+    against a skill the user put in ~/.rigma/dsh/skills by hand.
+
+    Generated rather than shipped, because the path is absolute and depends on
+    the user's home; the shipped capability patch cannot carry it. Returns "" when
+    the directory does not exist yet, which leaves DSH exactly as it was rather
+    than adding a root that cannot resolve.
+    """
+    try:
+        from .skills import skills_dir
+
+        d = Path(skills_dir())
+    except Exception:
+        return ""
+    if not d.is_dir():
+        return ""
+    path = Path(tmpdir) / _SKILLS_PATCH_NAME
+    # `config:` REPLACES the row's whole config, so `includeDefaultRoots` is
+    # restated: dropping it would turn off the project and user roots, and a
+    # repository's own .dsh/skills would stop being found. Only the added root is
+    # new; everything the provider did before must keep working.
+    path.write_text(
+        "# Generated per runtime: points DSH's skill provider at Rigma's skills.\n"
+        "# A patch row REPLACES the whole config, so `includeDefaultRoots` is\n"
+        "# restated rather than assumed.\n"
+        "- id: skill-filesystem\n"
+        "  config:\n"
+        "    includeDefaultRoots: true\n"
+        "    customSkillDirs:\n"
+        f"      - {d}\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
 
 def patch_file(context_window: int, max_tokens: int, tmpdir) -> Path:
     """Write the one-row YAML patch that makes DSH talk to Rigma's server.
@@ -637,6 +694,11 @@ def drive_turn(
             # PATH rather than regenerated in the child so there is exactly one
             # copy of it to keep correct.
             "capability_path": capability_patch(),
+            # NOTE: the skills patch is deliberately NOT sent from here. It is
+            # generated in the runner, which owns a scratch directory for exactly
+            # this kind of file. Passing the chat's `cwd` instead would drop
+            # `rigma-dsh-skills.yaml` into the user's own workspace — a file they
+            # never asked for, in the directory their project lives in.
         }
         # R3-HARN-6: `os.environ.copy()` handed the agent every secret the owner
         # had exported. AUDIT 13-6 fixed exactly this for mcode and left DSH

@@ -1415,3 +1415,93 @@ def test_a_completed_stream_is_not_reported_as_unfinished(monkeypatch):
          "result": {"status": "succeeded", "output": "hi"}}) + "\n")
     got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
     assert [e.kind for e in got] == ["text"], got
+
+
+# --- R4-MCODE-1: the SERVER hop, which had no test at all --------------------
+#
+# WHY THIS EXISTS. The adapter has emitted `event="goal"` and `event="todos"`
+# since it was written, and `serve.py`'s state chain matched DSH's slash names
+# only (`goal/change`, `todo/write`). Every mcode goal and todo list therefore
+# fell through to the "an event name from a newer DSH than this Rigma knows is
+# dropped" branch and reached the UI as NOTHING.
+#
+# The adapter tests could not catch it, because they stop at the adapter: they
+# assert the TurnEvent is produced, which was always true. A typo anywhere in
+# that elif chain would have left every Python test green, so these drive a real
+# request through the real app and read the SSE that comes back.
+
+
+def _drive_events(monkeypatch, tmp_path, events):
+    """Run one chat turn whose adapter yields exactly `events`."""
+    from fastapi.testclient import TestClient
+
+    from rigma import serve, sessions
+    from rigma import state as st
+
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(harness_mcode, "available", lambda: True)
+
+    def _fake_drive(**kw):
+        for e in events:
+            yield e
+
+    monkeypatch.setattr(harness_mcode, "drive_turn", _fake_drive)
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
+    real_read = st.read_state
+    monkeypatch.setattr(st, "read_state",
+                        lambda: {**(real_read() or {}),
+                                 "public_port": 11500, "ctx": 32768})
+    s = sessions.create(title="t")
+    s["harness"] = "mcode"
+    sessions.save(s)
+    with TestClient(serve.build_app(upstream_port=11499)) as c:
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "go"})
+    assert r.status_code == 200, r.text
+    return r.text
+
+
+def test_an_mcode_goal_reaches_the_ui_as_a_goal_event(monkeypatch, tmp_path):
+    """`event="goal"` must be forwarded, not dropped as an unknown name."""
+    body = _drive_events(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="goal",
+                          data={"goalId": "g1", "objective": "ship it",
+                                "status": "active", "tokensUsed": 5}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert "event: goal" in body, body
+    assert "ship it" in body
+
+
+def test_an_mcode_todo_list_reaches_the_ui_as_a_todos_event(monkeypatch, tmp_path):
+    """`event="todos"` must be forwarded, and the list preserved."""
+    body = _drive_events(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="todos",
+                          data={"todos": [{"content": "step one",
+                                           "status": "in_progress"}]}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert "event: todos" in body, body
+    assert "step one" in body
+
+
+def test_an_mcode_subagent_reaches_the_ui_with_its_ids(monkeypatch, tmp_path):
+    """The wrapped payload keeps the ids the fold needs to key a row by."""
+    body = _drive_events(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="subagent",
+                          data={"taskId": "bg_1", "subSessionId": "s1",
+                                "name": "explore", "status": "started"}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert "event: subagent" in body, body
+    assert "s1" in body and "explore" in body
+
+
+def test_an_unknown_state_event_is_still_dropped(monkeypatch, tmp_path):
+    """The other half of the contract: a name this build does not know is not
+    guessed at. A wrong rendering is worse than none."""
+    body = _drive_events(monkeypatch, tmp_path, [
+        harness.TurnEvent(kind="state", event="something/from-the-future",
+                          data={"x": 1}),
+        harness.TurnEvent("text", text="done"),
+    ])
+    assert "something/from-the-future" not in body, body

@@ -489,6 +489,80 @@ made on facts.
 
 ---
 
+## 8d. Round 4: three mcode capabilities that never rendered, and a skills bridge
+
+Found by auditing the WHOLE PATH (backend -> server -> frontend -> tests) instead of
+the adapter, which is where the previous rounds had stopped. Every one of these had
+passing tests.
+
+### 8d.1 mcode goals and todos were dropped at the server
+
+`harness_mcode.py` emits `event="goal"` and `event="todos"`. `serve.py`'s state
+chain matched DSH's slash names only (`goal/change`, `todo/write`), so both fell
+through to the unknown-name drop. The frontend was already built for them.
+
+**Why the tests missed it:** they stop at the adapter and assert the TurnEvent is
+produced — always true. There was NO test for `serve.py`'s event chain at all. Four
+now drive a real request through the real app.
+
+### 8d.2 mcode subagents were dropped twice, over an unreachable test
+
+`serve.py` wraps EVERY subagent payload as `{event, data}`, mcode's included. The
+frontend's mcode branch required `p.data` to be ABSENT, so it never matched; the
+wrapped branch then read `data.childSessionId`, which mcode does not send. Five
+tests exercised the flat shape directly — a payload the server never produces.
+
+### 8d.3 A subagent's name was discarded, though DSH sends one
+
+DSH's lifecycle pair has no name. `subagent/catalog` does, and its shape is
+`{version, childId, childCreatedAt, mode, label?}` (`catalog.ts:24-32`) — note
+`childId`, where the lifecycle pair says `childSessionId`. Reading only one of the
+two names is how it was lost. mcode sends `agent_name`.
+
+`subagent/descriptor` is deliberately NOT folded: it describes the subagent
+PROVIDER (`{mode, version, provider}` + `{label, agentProvider, agentModel,
+persona, toolFilter}`, `dispositions.ts:92-95`), carries no child id, and its
+`label` is the provider's name.
+
+### 8d.4 Clearing a goal left the old objective on screen
+
+`goal/change` is a union: a clear is `{operation: "clear", cleared: true}` with NO
+`goal` key, which folded to `null` — and the store's `null` case deliberately keeps
+what it was showing. Correct for `{goal: null}` and for an error; wrong for a
+tombstone. New `isGoalCleared` draws the distinction.
+
+### 8d.5 The Skills page now reaches the agent (two defects, either fatal)
+
+`agent-capabilities.patch.yml` mounts `dsh-skill-filesystem`, which makes the skill
+tool EXIST. It never made Rigma's skills REACHABLE: the provider scans
+`<dshHome>/skills` (= `~/.rigma/dsh/skills`) and `~/.agents/skills`, while Rigma
+writes `~/.rigma/skills`. Two disjoint stores.
+
+And even pointed at the right directory it would have found nothing usable: Rigma
+saved bare prose, while DSH's provider warns *"skill file ignored: missing YAML
+frontmatter"* and *"frontmatter requires name and description"*
+(`dsh-skill-filesystem/lib/index.js:676,682`) and SKIPS the file.
+
+Both fixed: a generated second patch layer sets `customSkillDirs` (rank 300, above
+both user roots), and `save_skill` emits derived `name`/`description`, idempotently
+and preserving a hand-written block. Verified against a real
+`dsh --profile sdk-minimal --dump-config`: exit 0, row resolves, `customSkillDirs`
+carries Rigma's directory.
+
+### 8d.6 Two hard limits confirmed this round, with the source that proves them
+
+- **DSH session resume is impossible, not merely missing.** The adapter says so
+  (`harness_dsh.py:643-647`): continuity comes from the pooled process outliving a
+  turn, and "the SDK has no way to open a session it did not create". So pool
+  eviction, a failed turn or a Rigma restart loses the agent's context SILENTLY —
+  the transcript still looks continuous. **The gap is the silence, not the loss.**
+- **DSH session enumeration does not exist** in the SDK surface
+  (`HarnessSdkRequestMap` is initialize / session-prompt / shutdown). Only the ACP
+  profile has `session/list` and `session/resume` — see §8c and the transport
+  matrix, where that transport is verified working but gives up goals and todos.
+
+---
+
 ## 9. Gap 5, measured: mcode's ACP surface is real and blocked
 
 The earlier note said ACP "would additionally mean implementing the ACP *client*

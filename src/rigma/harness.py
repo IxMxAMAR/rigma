@@ -319,7 +319,8 @@ BACKENDS: dict[str, Harness] = {
             "subagents, spawned in-process or forked from this conversation",
             "a todo list the model maintains and the transcript renders",
             "plan mode, so it can propose before it changes anything",
-            "skills, discoverable and loadable by the model itself",
+            "skills, discoverable and loadable by the model itself "
+            "(read from ~/.rigma/skills, the directory the Skills page writes)",
             "filesystem tools: read, write, edit, glob and grep",
             "agent instructions from AGENTS.md, and context compaction",
         ),

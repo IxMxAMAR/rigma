@@ -2122,9 +2122,20 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # harness_dsh.capability_patch().
                     _ev = ev.event or ""
                     _data = ev.data or {}
-                    if _ev == "goal/change":
+                    if _ev == "goal/change" or _ev == "goal":
+                        # R4-MCODE-1: `goal` is mcode's name for the same fact.
+                        # The adapter has emitted it since it was written
+                        # (harness_mcode.py:711, from the `details` of a
+                        # goal_create/get/update result) and NOTHING rendered it:
+                        # this chain matched DSH's slash names only, so every
+                        # mcode goal fell through to the drop below. The payload
+                        # is passed through whole either way — `chat/goal.ts`
+                        # normalises mcode's own field names, deliberately, so
+                        # reshaping it here would mean guessing at a schema this
+                        # side does not own.
                         yield _sse(_data, event="goal")
-                    elif _ev == "todo/write":
+                    elif _ev == "todo/write" or _ev == "todos":
+                        # R4-MCODE-1: same again — mcode's name for the todo list.
                         _todos = _data.get("todos")
                         yield _sse({"todos": _todos if isinstance(_todos, list)
                                     else []}, event="todos")
@@ -2132,6 +2143,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         yield _sse({"active": bool(_data.get("active"))},
                                    event="plan_mode")
                     elif _ev.startswith("subagent"):
+                        # R4-MCODE-1: mcode's payload is FLAT (taskId,
+                        # subSessionId, name, status) while DSH's is a lifecycle
+                        # pair carrying `childSessionId`. Both are passed as
+                        # `{event, data}` and the UI's fold reduces them; see
+                        # chat/subagents.ts, which is where the two shapes meet.
                         yield _sse({"event": _ev, "data": _data}, event="subagent")
                     elif _ev == "usage":
                         yield _sse(_data, event="usage")

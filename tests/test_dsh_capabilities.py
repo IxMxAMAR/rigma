@@ -539,3 +539,77 @@ def test_the_runner_no_longer_treats_a_retry_as_internal_chatter():
         assert evs, kind
         assert evs[0]["type"] == "state", kind
 
+
+
+# --- R4-SKILL-1: pointing DSH's skill provider at Rigma's skills -------------
+#
+# The capability patch mounts `skill`, `skill-filesystem` and `tool-skill`, which
+# makes the skill TOOL exist. It does not make Rigma's skills REACHABLE: the
+# provider scans `<dshHome>/skills` (= ~/.rigma/dsh/skills, because the runner
+# boots DSH with dsh_home=~/.rigma/dsh) and `~/.agents/skills`, while Rigma's
+# Skills page writes `~/.rigma/skills`. Two disjoint stores, so an authored skill
+# was invisible to every harness turn with nothing on screen saying so.
+
+
+def test_the_skills_patch_points_the_provider_at_rigmas_own_directory(tmp_path):
+    """The added root is Rigma's, and it is added rather than substituted.
+
+    `config:` REPLACES a row's whole config, so `includeDefaultRoots` has to be
+    restated: dropping it would silently stop a repository's own `.dsh/skills`
+    from being found, which is a capability the provider had before Rigma
+    touched it.
+    """
+    path = harness_dsh.skills_patch_file(tmp_path)
+    assert path, "the skills patch was not generated"
+    doc = yaml.safe_load(open(path, encoding="utf-8"))
+    row = next(r for r in doc if r.get("id") == "skill-filesystem")
+    cfg = row["config"]
+    assert cfg["includeDefaultRoots"] is True
+    from rigma.skills import skills_dir
+
+    dirs = [str(d) for d in cfg["customSkillDirs"]]
+    assert str(skills_dir()) in dirs
+
+
+def test_the_skills_patch_targets_the_row_the_capability_patch_inserts(tmp_path):
+    """A patch row naming an id that does not exist is SKIPPED WITH A WARNING,
+    not fatally — so a typo here would silently leave the provider unconfigured
+    and look exactly like the bug this fixes."""
+    path = harness_dsh.skills_patch_file(tmp_path)
+    doc = yaml.safe_load(open(path, encoding="utf-8"))
+    ids = {r.get("id") for r in doc}
+    inserted = {r["id"] for r in _patch_rows()}
+    assert ids <= inserted, ids - inserted
+
+
+def test_the_skills_patch_is_written_where_it_is_told(tmp_path):
+    """It is generated per runtime into the runner's own scratch directory.
+
+    Passing the chat's `cwd` instead would drop a generated YAML file into the
+    user's project directory — a file they never asked for, in the folder their
+    work lives in.
+    """
+    from pathlib import Path
+
+    path = harness_dsh.skills_patch_file(tmp_path)
+    assert Path(path).parent == Path(tmp_path)
+
+
+def test_a_missing_skills_directory_yields_no_patch_rather_than_a_bad_root(tmp_path, monkeypatch):
+    """An empty string means "leave DSH exactly as it was". A root that cannot
+    resolve is worse than no extra root."""
+    monkeypatch.setattr("rigma.skills.skills_dir",
+                        lambda: tmp_path / "does-not-exist")
+    assert harness_dsh.skills_patch_file(tmp_path) == ""
+
+
+def test_the_skills_patch_composes_over_the_capability_patch():
+    """The two patches must be independent: the capability patch INSERTS the row
+    and this one CONFIGURES it. If the insert and the config ever landed in one
+    layer, order would decide the result and one of them would win."""
+    caps = yaml.safe_load(open(harness_dsh.capability_patch(), encoding="utf-8"))
+    for entry in caps:
+        for row in entry.get("insert") or []:
+            assert "config" not in row or row["id"] != "skill-filesystem", (
+                "the capability patch now configures skill-filesystem; the "
+                "generated skills patch would silently override it")

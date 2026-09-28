@@ -79,14 +79,79 @@ def test_saving_the_same_name_replaces_rather_than_duplicates(client):
     client.post("/api/skills", json={"name": "s", "content": "one"})
     client.post("/api/skills", json={"name": "s", "content": "two"})
     listed = client.get("/api/skills").json()
-    assert len(listed) == 1 and listed[0]["content"] == "two"
+    assert len(listed) == 1
+    # R4-SKILL-2: the stored text now carries the frontmatter DeepSeek Harness's
+    # skill provider REQUIRES (it warns "missing YAML frontmatter" and skips a
+    # file without it). What this test is about is that the second save REPLACES
+    # the first, so the assertion is that the old body is gone and the new one is
+    # present — and that re-saving did not stack a second frontmatter block.
+    assert "two" in listed[0]["content"]
+    assert "one" not in listed[0]["content"]
+    assert listed[0]["content"].count("---") == 2
 
 
 def test_get_skill_is_case_insensitive():
     skills.save_skill("Wildcard", "body")
-    assert skills.get_skill("wildcard") == "body"
-    assert skills.get_skill("WILDCARD.md") == "body"
+    # The body survives verbatim, with the required frontmatter in front of it.
+    for name in ("wildcard", "WILDCARD.md"):
+        got = skills.get_skill(name)
+        assert got is not None and "body" in got, name
+        assert got.startswith("---\n"), name
     assert skills.get_skill("nope") is None
+
+
+# --- R4-SKILL-2: the frontmatter DeepSeek Harness requires -------------------
+
+def test_a_saved_skill_carries_the_frontmatter_dsh_requires():
+    """Both fields, or DSH's provider discards the file.
+
+    `parseSkillFile` warns "missing YAML frontmatter", then "frontmatter requires
+    name and description", then SKIPS the file. So this is not cosmetic: without
+    it the `skill` tool mounts, finds the file, and ignores it.
+    """
+    made = skills.save_skill("Wildcard Generator", "# Wildcards\nAlways vary the outfit.")
+    text = made["content"]
+    assert text.startswith("---\n")
+    assert 'name: "Wildcard Generator"' in text
+    # The description is derived from the first line of prose, not the heading.
+    assert 'description: "Always vary the outfit."' in text
+    assert text.count("---") == 2          # exactly one block, opened and closed
+
+
+def test_saving_is_idempotent_and_keeps_a_hand_written_frontmatter():
+    """A user's own frontmatter must win, and re-saving must not stack blocks.
+
+    `disable-model-invocation` and friends are honoured by the provider, so
+    overwriting an author's block with a generated one would silently re-enable a
+    skill they deliberately hid.
+    """
+    mine = '---\nname: mine\ndescription: hand written\ndisable-model-invocation: true\n---\n\nBody.'
+    made = skills.save_skill("mine", mine)
+    assert made["content"] == mine
+
+    once = skills.save_skill("twice", "Body.")["content"]
+    twice = skills.save_skill("twice", once)["content"]
+    assert once == twice
+
+
+def test_a_description_is_never_empty():
+    """An empty description is as unusable to the provider as a missing one, so
+    a skill with no prose still gets a real string."""
+    text = skills.save_skill("bare", "")["content"]
+    assert 'description: "bare skill"' in text
+    text2 = skills.save_skill("headed", "# Only A Heading\n")["content"]
+    assert 'description: "headed skill"' in text2
+
+
+def test_a_quote_in_the_content_cannot_break_the_frontmatter():
+    """The description is interpolated into a double-quoted YAML scalar, so a
+    quote or backslash in the prose has to be escaped or the file becomes
+    unparseable and DSH skips it."""
+    text = skills.save_skill("q", 'He said "hi" and used a \\ backslash.')["content"]
+    assert '\\"hi\\"' in text
+    assert "\\\\" in text
+    # The block is still exactly two delimiters, so it parses as one document.
+    assert text.count("---") == 2
 
 
 # --- /name injection ---------------------------------------------------------

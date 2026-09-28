@@ -26,10 +26,85 @@ export interface Subagent {
   status?: string;
   /** The child's last message, clipped. The reason to show a row at all. */
   last?: string;
+  /**
+   * A human name for the child, when the backend has one.
+   *
+   * R4-MCODE-2. DSH's lifecycle pair carries no name — `subagent.started` is
+   * `{parentSessionId, childSessionId}` and nothing else — so a row could only
+   * ever say "subagent running", which is unreadable the moment there are two.
+   * The name does arrive, just on OTHER events: `subagent/descriptor` carries
+   * `label` and `subagent/catalog` carries `label` keyed by `childId`, which is
+   * the same child session id used here. mcode sends `agent_name` directly.
+   * Both were being forwarded by the server and then discarded by this fold.
+   */
+  name?: string;
 }
 
 /** The most a subagent's closing message may add to a row. */
 const LAST_CLIP = 400;
+
+/**
+ * Reduce one subagent payload to `(event, data)`, whichever backend sent it.
+ *
+ * WHY THIS EXISTS. There are three shapes on the wire and only one of them used
+ * to be handled:
+ *
+ *   1. DSH lifecycle: `{event: "subagent.started"|"subagent.finished", data}`
+ *      where data carries `childSessionId`.
+ *   2. mcode, wrapped by the server: `{event: "subagent", data: {taskId,
+ *      subSessionId, name, status}}`. The server wraps EVERY subagent payload
+ *      (serve.py, the `_ev.startswith("subagent")` arm), so this is what mcode
+ *      actually arrives as.
+ *   3. mcode, flat: `{taskId, subSessionId, name, status}` with no `data`.
+ *
+ * Shape 3 was the only mcode branch written, and shape 2 is what the server
+ * produces — so mcode subagents rendered NOTHING, and the tests that covered the
+ * flat shape exercised a payload the real server never sends. Recognising
+ * mcode's fields INSIDE `data` is what makes shape 2 work.
+ */
+function normalise(p: Record<string, unknown>): { event: string; d: Record<string, unknown> } | null {
+  const inner = p.data && typeof p.data === "object"
+    ? (p.data as Record<string, unknown>)
+    : null;
+  // mcode's own field names, whether or not the server wrapped them.
+  const flat = inner && (inner.subSessionId || inner.taskId) ? inner : null;
+  const loose = !inner && (p.subSessionId || p.taskId) ? p : null;
+  const mcode = flat ?? loose;
+  if (mcode) {
+    // mcode's status IS the lifecycle step: `started`/`running`/`queued` mean
+    // live, anything else (completed, failed, cancelled) is an end.
+    const status = String(mcode.status ?? "").toLowerCase();
+    const event = status === "started" || status === "running" || status === "queued"
+      ? "subagent.started"
+      : "subagent.finished";
+    return {
+      event,
+      d: {
+        childSessionId: mcode.subSessionId ?? mcode.taskId,
+        provider: "mcode",
+        status: mcode.status,
+        name: mcode.name,
+      },
+    };
+  }
+  if (inner) return { event: String(p.event ?? ""), d: inner };
+  return null;
+}
+
+/**
+ * The child's id, whichever name the event uses.
+ *
+ * TWO NAMES FOR ONE THING. DSH's lifecycle pair says `childSessionId`
+ * (`subagent.started` is `{parentSessionId, childSessionId}`), while
+ * `subagent/catalog` says `childId` — verified against the source, not guessed:
+ * `SubagentCatalogEvent` is `{version, childId, childCreatedAt, mode, label?}`
+ * (packages/subagent/subagent/src/catalog.ts:24-32). Reading only the first name
+ * meant a catalog entry never matched a row, which is how the one human-readable
+ * name DSH sends for a subagent was thrown away.
+ */
+function childIdOf(d: Record<string, unknown>): string {
+  return String(d.childSessionId ?? d.childId ?? "");
+}
 
 /** One line of text out of the content-block shape a finish event carries. */
 function lastText(blocks: unknown): string {
@@ -56,39 +131,28 @@ function lastText(blocks: unknown): string {
  */
 export function foldSubagent(rows: Subagent[], payload: unknown): Subagent[] {
   if (!payload || typeof payload !== "object") return rows;
-  const p = payload as Record<string, unknown>;
+  const n = normalise(payload as Record<string, unknown>);
+  if (!n) return rows;
+  const { event, d } = n;
 
-  // TWO SHAPES AGAIN. DSH wraps its lifecycle in `{event, data}`; mcode reports a
-  // task's ids flat, from the `details` of a `task`/`task_output` result, and its
-  // status IS the lifecycle step. Rather than branch in the renderer, both are
-  // reduced to (event, data) here.
-  let event = String(p.event ?? "");
-  let d: Record<string, unknown>;
-  if (p.data && typeof p.data === "object") {
-    d = p.data as Record<string, unknown>;
-  } else if (p.taskId || p.subSessionId) {
-    // mcode: `started`/`running` mean live, anything else is an end.
-    const status = String(p.status ?? "").toLowerCase();
-    event = status === "started" || status === "running" || status === "queued"
-      ? "subagent.started"
-      : "subagent.finished";
-    d = {
-      childSessionId: p.subSessionId ?? p.taskId,
-      provider: "mcode",
-      status: p.status,
-    };
-  } else {
-    return rows;
-  }
-
-  const id = String(d.childSessionId ?? "");
+  const id = childIdOf(d);
   if (!id) return rows;
+
+  // The name travels on DSH's descriptor/catalog events, which are NOT lifecycle
+  // steps — they can arrive before the start or after the finish. So a name is
+  // applied to an existing row whenever one is present, on every shape, rather
+  // than only at the two lifecycle transitions below.
+  const label = d.name != null && String(d.name) ? String(d.name)
+    : (d.label != null && String(d.label) ? String(d.label) : undefined);
 
   if (event === "subagent.started") {
     // A repeat start for an id already running is ignored rather than
     // duplicated — the same child reported twice is still one child.
-    if (rows.some((r) => r.id === id)) return rows;
-    return [...rows, { id, state: "running" }];
+    const at = rows.findIndex((r) => r.id === id);
+    if (at >= 0) {
+      return label ? rows.map((r, i) => (i === at ? { ...r, name: label } : r)) : rows;
+    }
+    return [...rows, { id, state: "running", name: label }];
   }
 
   if (event === "subagent.finished") {
@@ -100,13 +164,21 @@ export function foldSubagent(rows: Subagent[], payload: unknown): Subagent[] {
       stopReason: d.stopReason != null ? String(d.stopReason) : undefined,
       status: d.status != null ? String(d.status) : undefined,
       last: last || undefined,
+      name: label,
     };
     // A finish with no start — a child spawned before this turn began, or a
     // dropped event — is ADDED rather than dropped. Showing a finished child is
     // strictly better than pretending it never ran.
-    if (!rows.some((r) => r.id === id)) return [...rows, patch];
-    return rows.map((r) => (r.id === id ? { ...r, ...patch } : r));
+    const at = rows.findIndex((r) => r.id === id);
+    if (at < 0) return [...rows, patch];
+    return rows.map((r, i) => (i === at ? { ...r, ...patch } : r));
   }
 
+  // Not a lifecycle step, but it may still be a name for a child already known
+  // (DSH's `subagent/descriptor` and `subagent/catalog`). Apply it and stop.
+  if (label) {
+    const at = rows.findIndex((r) => r.id === id);
+    if (at >= 0) return rows.map((r, i) => (i === at ? { ...r, name: label } : r));
+  }
   return rows;
 }

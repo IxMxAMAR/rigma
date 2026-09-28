@@ -312,7 +312,19 @@ def _run_turn(job: dict, live: _Live) -> int:
             # The capability patch goes FIRST and the per-turn llm patch LAST:
             # patch layers are applied in order and the last write wins per row.
             cap = str(job.get("capability_path") or "")
-            patches = tuple(p for p in (cap, patch) if p)
+            # R4-SKILL-1: the skill provider's roots. Generated HERE, into this
+            # runtime's own scratch directory, because it carries an absolute path
+            # that the shipped capability patch cannot — and because the parent
+            # has no scratch directory to write into. Writing it beside the chat's
+            # cwd would put a generated file in the user's project.
+            skills = ""
+            try:
+                from rigma.harness_dsh import skills_patch_file
+
+                skills = skills_patch_file(live.scratch)
+            except Exception:
+                skills = ""     # a missing skill root is a smaller loss than no turn
+            patches = tuple(p for p in (cap, skills, patch) if p)
             config = DeepSeekHarnessConfig(
                 profile="sdk-minimal",
                 dsh_bin=str(cli),
