@@ -163,6 +163,72 @@ function GovernanceBlock({ gov }: { gov: Governance }) {
   );
 }
 
+/**
+ * The token accounting as one readable line, or "" when there is nothing to say.
+ *
+ * WHY THIS IS NOT A GENERIC `key value` JOIN. It was one, and it filtered to
+ * numbers only — so `durationMs` rendered as a bare `durationMs 4200` with no
+ * unit, and `model` and `usageIncomplete` were dropped entirely. Both backends
+ * send more than token counts here:
+ *
+ *   DSH    inputTokens + outputTokens required; totalTokens, cacheReadTokens,
+ *          cacheWriteTokens, reasoningTokens optional
+ *          (packages/session/session-format-v0-to-v1/src/payload-validation.ts:415-421)
+ *   mcode  the same token keys, plus durationMs, model and usageIncomplete,
+ *          which its projector spreads in as siblings of `usage`
+ *
+ * So the known keys get labels and units, `model` is unwrapped from whatever
+ * shape the backend used, and anything unrecognised still shows up rather than
+ * being silently dropped — a future key must not vanish the way `model` did.
+ */
+export function usageLine(usage: Record<string, unknown>): string {
+  const LABELS: Record<string, string> = {
+    inputTokens: "in",
+    outputTokens: "out",
+    totalTokens: "total",
+    cacheReadTokens: "cache read",
+    cacheWriteTokens: "cache write",
+    reasoningTokens: "reasoning",
+  };
+  const bits: string[] = [];
+  for (const [k, label] of Object.entries(LABELS)) {
+    const v = usage[k];
+    if (typeof v === "number") bits.push(`${label} ${v}`);
+  }
+  // A duration without a unit is not information. Sub-second turns are common,
+  // so seconds is the readable unit; one decimal is enough to tell 0.4s from 0.9s.
+  const ms = usage.durationMs;
+  if (typeof ms === "number") bits.push(`${(ms / 1000).toFixed(1)}s`);
+
+  const model = modelName(usage.model);
+  if (model) bits.push(model);
+
+  // Anything the list above does not know about, so a new backend key is
+  // visible instead of being dropped. Booleans are skipped: `usageIncomplete`
+  // is rendered as its own sentence by the caller, where it can be explained.
+  const known = new Set([...Object.keys(LABELS), "durationMs", "model",
+                         "usageIncomplete"]);
+  for (const [k, v] of Object.entries(usage)) {
+    if (known.has(k) || typeof v !== "number") continue;
+    bits.push(`${k} ${v}`);
+  }
+  return bits.join(" · ");
+}
+
+/** The model's name, from whichever shape the backend used. */
+function modelName(model: unknown): string {
+  if (typeof model === "string") return model;
+  // mcode sends `{modelId: "..."}` (the projector's own fixture agrees), and the
+  // name is what a reader wants — not the object.
+  if (model && typeof model === "object") {
+    const m = model as Record<string, unknown>;
+    for (const k of ["modelId", "id", "name", "model"]) {
+      if (typeof m[k] === "string") return m[k] as string;
+    }
+  }
+  return "";
+}
+
 export default function AgentState({
   goal,
   todos,
@@ -273,12 +339,17 @@ export default function AgentState({
       )}
 
       {hasUsage && (
-        <p className="font-mono text-[10.5px] text-muted">
-          {Object.entries(usage!)
-            .filter(([, v]) => typeof v === "number")
-            .map(([k, v]) => `${k} ${v}`)
-            .join(" · ")}
-        </p>
+        <div className="font-mono text-[10.5px] text-muted">
+          <p>{usageLine(usage!)}</p>
+          {/* mcode says when its own token count is not the whole story. A reader
+              who cannot see this trusts a number that is low, so it is said
+              plainly rather than left in the payload. */}
+          {usage!.usageIncomplete === true && (
+            <p className="text-amber/80">
+              token count incomplete — the backend reported a partial figure
+            </p>
+          )}
+        </div>
       )}
 
       {/* Last, and separated by a rule: this is about the CONNECTION's
