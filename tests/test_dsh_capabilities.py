@@ -457,3 +457,85 @@ def test_the_runner_no_longer_treats_compaction_as_internal_chatter():
         assert evs, kind
         assert evs[0]["type"] == "state", kind
 
+# --------------------------------------------------------------------------
+# DSH's LLM retry. `dsh-llm-retry` is a dependency of `sdk-minimal` ITSELF, so it
+# is always loaded and always firing — this is not an opt-in capability. When a
+# request to the model fails and DSH schedules another attempt it writes these two
+# events and says nothing on any surface Rigma reads, so against a local
+# llama-server that stalls or returns a malformed tool call the visible effect was
+# a turn that sat there producing nothing.
+#
+# Shapes quoted from DSH's own declarations
+# (packages/llm/llm-retry/src/types.ts:16-42, LlmFailure at
+# packages/llm/llm/src/types.ts:40):
+#   llm/retry          {retryId, turn, step, provider, mode, policyKey, retry,
+#                       delayMs, failure: {message, code, status?}, maxRetries?}
+#   llm/retry-started  {retryId, turn, step, retry}
+#
+# `maxRetries` is ABSENT for `mode: "always"`, which is an unbounded policy. That
+# absence is the fact the UI needs, so it must survive the bridge as an absence
+# rather than being defaulted to a number.
+
+
+def test_a_scheduled_retry_carries_its_attempt_and_failure():
+    evs = _project(_session_event("llm/retry", {
+        "retryId": "r1", "turn": 1, "step": 1, "provider": "deepseek-official",
+        "mode": "normal", "policyKey": "default", "retry": 2, "maxRetries": 5,
+        "delayMs": 1500,
+        "failure": {"message": "connection reset", "code": "TRANSPORT_ERROR"},
+    }))
+    assert len(evs) == 1
+    assert evs[0]["type"] == "state"
+    assert evs[0]["event"] == "llm/retry"
+    d = evs[0]["data"]
+    assert d["retry"] == 2
+    assert d["maxRetries"] == 5
+    assert d["delayMs"] == 1500
+    # The failure is an OBJECT, not a flattened string: the code is the
+    # provider-neutral routing fact and the message is the human one.
+    assert d["failure"]["code"] == "TRANSPORT_ERROR"
+    assert d["failure"]["message"] == "connection reset"
+
+
+def test_an_unbounded_retry_keeps_maxretries_absent():
+    """`mode: "always"` has no cap. If the bridge invented one, the UI would claim
+    "attempt 3 of 0" for a policy that retries forever."""
+    evs = _project(_session_event("llm/retry", {
+        "retryId": "r2", "turn": 1, "step": 1, "provider": "p",
+        "mode": "always", "policyKey": "k", "retry": 3, "delayMs": 500,
+        "failure": {"message": "boom", "code": "TRANSPORT_ERROR"},
+    }))
+    assert "maxRetries" not in evs[0]["data"]
+
+
+def test_a_retry_started_marks_the_wait_over():
+    evs = _project(_session_event("llm/retry-started", {
+        "retryId": "r1", "turn": 1, "step": 1, "retry": 2,
+    }))
+    assert evs[0]["event"] == "llm/retry-started"
+    assert evs[0]["data"]["retryId"] == "r1"
+
+
+def test_a_retry_status_survives_when_the_provider_gave_one():
+    evs = _project(_session_event("llm/retry", {
+        "retryId": "r3", "turn": 1, "step": 1, "provider": "p", "mode": "normal",
+        "policyKey": "k", "retry": 1, "maxRetries": 3, "delayMs": 100,
+        "failure": {"message": "rate limited", "code": "HTTP_ERROR", "status": 429},
+    }))
+    assert evs[0]["data"]["failure"]["status"] == 429
+
+
+def test_both_retry_events_are_recognised_state_events():
+    """A guard against the list drifting: if either leaves `_STATE_EVENTS` the
+    runner drops it silently and a retrying turn goes back to looking frozen."""
+    from rigma import _dsh_runner as runner
+    for name in ("llm/retry", "llm/retry-started"):
+        assert name in runner._STATE_EVENTS, name
+
+
+def test_the_runner_no_longer_treats_a_retry_as_internal_chatter():
+    for kind in ("llm/retry", "llm/retry-started"):
+        evs = _project(_session_event(kind, {"retryId": "r1", "retry": 1}))
+        assert evs, kind
+        assert evs[0]["type"] == "state", kind
+

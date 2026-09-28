@@ -9,6 +9,7 @@ import {
 import { formatArgs, previewArgs } from "./toolChip";
 import AgentState from "./AgentState";
 import { compactionLine, running } from "./compaction";
+import { retryLine } from "./retry";
 import { argHint, delegateSentence, summariseDelegate } from "./delegate";
 import { chipOutcome } from "./toolChip";
 
@@ -276,6 +277,9 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
   // The still-open compaction for THIS turn, if any. Computed here rather than
   // inline in the JSX so it is one lookup per render, not one per condition.
   const runningCompaction = running(turn.compactions);
+  // DSH had to retry the model request. Silent in every other surface, and
+  // against a local engine a silent retry reads as a frozen turn.
+  const retry = turn.retry ? retryLine(turn.retry) : null;
   return (
     <div className="flex flex-col gap-2">
       {/* Named at the START of the turn, so this is on screen while an external
@@ -328,6 +332,9 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
           `housekeeping`/`masked`/`compacted` above; a DSH turn reported none of
           it, so a long turn busy summarising its own context looked hung. The
           running line is the point: it is what turns "frozen" into "working". */}
+      {retry && (
+        <p className="font-mono text-[11px] text-amber">{retry}</p>
+      )}
       {runningCompaction && (
         <p className="font-mono text-[11px] text-amber">
           compacting the context — this can take a while
