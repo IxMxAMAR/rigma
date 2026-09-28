@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 from fastapi.testclient import TestClient
 
+from rigma import serve
 from rigma import state as st
 from rigma import tools
 from rigma.serve import build_app
@@ -206,16 +207,26 @@ def test_runaway_tool_loop_keeps_tools_on_last_round(home, always_upstream):
     st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid())
     client = TestClient(build_app(upstream_port=always_upstream))
     sid = client.post("/api/sessions", json={}).json()["id"]
+    # R3-CHAT-2: `_AlwaysToolUpstream` asks for the SAME call with the SAME
+    # arguments every round, so the repeat breaker now stops this turn before the
+    # round limit — which is the breaker working, not a regression. What THIS test
+    # is about is that the last round still advertises tools (a withheld tool
+    # leaks the raw `<tool_call>` text into the chat). The limit is therefore set
+    # just past the breaker's threshold, so the turn ends for a known reason and
+    # the tool-advertisement assertion still covers a real last round.
     client.post(f"/api/sessions/{sid}",
-                json={"use_tools": True, "max_tool_rounds": 10})
+                json={"use_tools": True,
+                      "max_tool_rounds": serve._REPEAT_CALL_LIMIT + 1})
     r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
     assert r.status_code == 200
     assert "<tool_call>" not in r.text            # never leaks raw call text
     assert "<function=" not in r.text
     reqs = _AlwaysToolUpstream.reqs
-    assert len(reqs) == 10                        # bounded at max_tool_rounds
+    assert len(reqs) <= serve._REPEAT_CALL_LIMIT + 1, len(reqs)
+    assert len(reqs) > 1                          # it really did loop
     assert all(reqs)                              # EVERY round advertised tools
-    assert "keep going" in r.text                 # never finishes silently
+    # and it says why it stopped rather than finishing silently
+    assert "keep going" in r.text or "same" in r.text.lower(), r.text[:300]
 
 
 class _MultiToolUpstream(BaseHTTPRequestHandler):

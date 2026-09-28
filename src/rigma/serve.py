@@ -2196,12 +2196,23 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # from then on and the only way out is manual — which is exactly the state
         # a user cannot diagnose.
         #
-        # The estimate here is deliberately crude (chars / 2, where the measured
-        # range on this machine is roughly 1-4 chars per token) and is only used to
+        # NOT for a run. A run has its own answer to this — masking observations,
+        # which shrinks the environment's replies and leaves the model's own
+        # reasoning byte-identical — and the end-of-turn path already prefers it
+        # for exactly that reason: summarising is lossy in the worst direction for
+        # an agent, which navigates by exact strings (filenames, error text, the
+        # argument that worked). Summarising a run here would silently replace the
+        # better mechanism with the worse one and, measurably, lengthen
+        # trajectories. A run's durable state is on disk, so a wedged run is a
+        # restart rather than a lost conversation.
+        #
+        # The estimate is deliberately crude (chars / 2, where the measured range
+        # on this machine is roughly 1-4 chars per token) and is only used to
         # decide whether to compact EARLY. A false positive costs one summary; a
         # false negative leaves the wedged chat wedged, so the constant is chosen
         # on the pessimistic side of the measured range.
-        if s.get("auto_compact", True) and len(s.get("messages", [])) > AUTO_COMPACT_KEEP:
+        if (s.get("auto_compact", True) and not s.get("run_id")
+                and len(s.get("messages", [])) > AUTO_COMPACT_KEEP):
             _wctx = compact_budget(s, (st.read_state() or {}).get("ctx", 0))
             if _wctx:
                 _est = context.session_chars(msgs) // 2
