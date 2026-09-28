@@ -61,7 +61,8 @@ def _replace_retrying(tmp: Path, path: Path) -> None:
             time.sleep(0.005 * (attempt + 1))
 
 
-def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8",
+                      create_only: bool = False) -> bool:
     """Replace `path` with `text`, atomically and safely under concurrency.
 
     The temp file is created BESIDE the target, because `os.replace` is only
@@ -71,6 +72,14 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
     A unique suffix rather than a fixed `.tmp`: see the module docstring. The
     temp is removed on failure so a crash mid-write cannot leave litter that a
     later run mistakes for a store.
+
+    `create_only=True` writes the file ONLY if it does not already exist, and
+    returns False instead of writing when it does. That is for the one case
+    `os.replace` cannot express: a caller that wants exclusive creation, where
+    "already exists" is a real answer rather than a race to be resolved. It is
+    still atomic — the check and the write are one operation because `os.link`
+    fails if the destination is there, which is what makes it a lock and not a
+    test-then-set.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +92,26 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
             # persisted ahead of the data, which is the torn file we are here to
             # prevent. A power cut is the failure this exists for.
             os.fsync(f.fileno())
+        if create_only:
+            try:
+                os.link(tmp, path)      # atomic: fails if `path` exists
+            except FileExistsError:
+                return False
+            except OSError:
+                # A filesystem without hard links: fall back to the check, which
+                # is racy but is still better than not writing at all.
+                if path.exists():
+                    return False
+                os.replace(tmp, path)
+                return True
+            finally:
+                try:
+                    tmp.unlink()        # `path` is the second link now
+                except OSError:
+                    pass
+            return True
         _replace_retrying(tmp, path)
+        return True
     except BaseException:
         try:
             tmp.unlink()

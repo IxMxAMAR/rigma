@@ -38,6 +38,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .atomicio import atomic_write_json
+
 REGISTRY_NAME = "engines-custom.json"
 SCHEMA = 1
 
@@ -131,9 +133,8 @@ def save(engines: dict[str, CustomEngine], home: Path | None = None) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {"schema": SCHEMA,
                "engines": {n: e.as_dict() for n, e in sorted(engines.items())}}
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-    tmp.replace(p)
+    # R3-STORE-10: fixed temp name -> unique temp + retried replace.
+    atomic_write_json(p, payload, indent=1)
 
 
 def register(engine: CustomEngine, home: Path | None = None) -> None:

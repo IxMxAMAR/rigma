@@ -21,6 +21,7 @@ from starlette.background import BackgroundTask
 
 from . import context
 from . import harness as _harness
+from .atomicio import atomic_write_json
 from . import methods_api
 from . import mission as _mission_mod
 from . import presets
@@ -1447,9 +1448,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             turns = cur.setdefault("by_model_turns", {})
             turns[model] = int(turns.get(model, 0)) + 1
             cur.setdefault("last_used", {})[model] = _now()
-            tmp = f.with_suffix(".tmp")
-            tmp.write_text(json.dumps(cur), encoding="utf-8")
-            tmp.replace(f)
+            # R3-STORE-10: fixed temp name -> unique temp + retried replace.
+            # Usage stats are written per turn and several turns can finish at
+            # once, which is exactly when a shared `usage.tmp` collides.
+            atomic_write_json(f, cur)
         except Exception:
             pass   # stats are best-effort; never break a turn
 

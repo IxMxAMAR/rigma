@@ -198,7 +198,13 @@ def test_orphaned_run_marked_interrupted(engine, tmp_path):
 
 
 def test_restart_reattaches_and_finishes(engine, tmp_path):
+    # R3-RUN-1: the first life must do something the completion gate counts as
+    # work. It used to be `manage_plan add` and then nothing, which the evidence
+    # gate now correctly refuses to call a finished run — so the run reached
+    # `stalled` before the test stopped it, and the restart assertion below was
+    # checking a status the gate had already denied.
     _E4.script = [("manage_plan", {"action": "add", "task": "step one"}),
+                  ("sample_files", {"path": "."}),
                   None]
     c = _client(engine)
     rid = c.post("/api/runs", json={"mission": "small job",
@@ -210,6 +216,7 @@ def test_restart_reattaches_and_finishes(engine, tmp_path):
     # new life: finish the plan and complete (verify-once gates the first)
     _E4.idx = 0
     _E4.script = [("manage_plan", {"action": "complete", "id": 1}),
+                  ("sample_files", {"path": "."}),
                   ("task_complete", {"summary": "did the small job"}),
                   ("task_complete", {"summary": "did the small job"})]
     out = c.post(f"/api/runs/{rid}/restart").json()
@@ -226,7 +233,11 @@ def test_restart_grants_a_step_budget_grace(engine, tmp_path):
     forever, because nothing resets `iteration`. Every press also re-persisted
     plan reconciliation, appended another never-consumed RESUMED steer and
     re-ran the memory harvest over an unchanged action trace (AUDIT F45)."""
-    _E4.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
+    # R3-RUN-1: same reason as the restart test above — the first life needs a
+    # turn the completion gate counts as work, or the run stalls before the test
+    # has arranged the iteration cap it means to exercise.
+    _E4.script = [("manage_plan", {"action": "add", "task": "step one"}),
+                  ("sample_files", {"path": "."}), None]
     c = _client(engine)
     rid = c.post("/api/runs", json={"mission": "small job",
                                     "budget_hours": 1}).json()["id"]
@@ -240,6 +251,7 @@ def test_restart_grants_a_step_budget_grace(engine, tmp_path):
     assert "iteration cap" in runs.budget_exceeded(runs.load(rid))
     _E4.idx = 0
     _E4.script = [("manage_plan", {"action": "complete", "id": 1}),
+                  ("sample_files", {"path": "."}),
                   ("task_complete", {"summary": "finished after the grace"}),
                   ("task_complete", {"summary": "finished after the grace"})]
     out = c.post(f"/api/runs/{rid}/restart").json()

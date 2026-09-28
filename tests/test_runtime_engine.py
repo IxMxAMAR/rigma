@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -65,21 +66,33 @@ def test_a_non_dict_lock_json_is_rebuilt_too(tmp_path, monkeypatch,
 
 
 def test_the_lock_is_written_atomically(tmp_path, monkeypatch, fake_engine_zip):
-    """AUDIT F08-4: the lock must land via a .tmp + replace, so a crash cannot
-    leave a half-written lock.json behind."""
+    """AUDIT F08-4: the lock must land via a temp + replace, so a crash cannot
+    leave a half-written lock.json behind.
+
+    R3-STORE-10: the assertion used to name the temp `lock.tmp`, which pinned the
+    FIXED name the store was moved off — the temp is now unique per write, so the
+    test checks the SHAPE (a temp beside the target, renamed onto it) rather than
+    one spelling of it. `atomicio` replaces via `os.replace`, which `Path.replace`
+    does not intercept, so the spy is on `os.replace`.
+    """
     home = tmp_path / "home"
     monkeypatch.setenv("RIGMA_HOME", str(home))
     monkeypatch.setattr(runtime, "_fetch", lambda url, dest: dest.write_bytes(
         fake_engine_zip.read_bytes()))
     replaced = []
-    real_replace = Path.replace
+    real_replace = os.replace
 
-    def spy(self, target):
-        replaced.append((self.name, Path(target).name))
-        return real_replace(self, target)
+    def spy(src, dst):
+        replaced.append((Path(src).name, Path(dst).name))
+        return real_replace(src, dst)
 
-    monkeypatch.setattr(Path, "replace", spy)
+    monkeypatch.setattr(os, "replace", spy)
     runtime.ensure_engine("vulkan", "windows")
 
-    assert ("lock.tmp", "lock.json") in replaced
-    assert not (home / "engines" / "lock.tmp").exists()
+    lock_replaces = [t for t in replaced if t[1] == "lock.json"]
+    assert lock_replaces, replaced
+    tmp_name = lock_replaces[0][0]
+    assert tmp_name != "lock.json" and tmp_name.endswith(".tmp"), tmp_name
+    # the temp name must be unique per write, not a shared fixed one
+    assert any(ch.isdigit() for ch in tmp_name) or "." in tmp_name.strip(".tmp")
+    assert not (home / "engines" / tmp_name).exists()

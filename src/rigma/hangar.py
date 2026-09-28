@@ -13,6 +13,7 @@ import shutil
 import threading
 from pathlib import Path
 
+from .atomicio import atomic_write_json, atomic_write_text
 from .gguf_meta import GgufParseError, inspect_gguf
 from .models import GgufFile, ModelSpec, MoESpec
 from .runtime import rigma_home
@@ -367,9 +368,8 @@ def _write_spec(spec: ModelSpec) -> None:
     d = custom_dir()
     d.mkdir(parents=True, exist_ok=True)
     p = custom_spec_path(spec.slug)   # AUDIT F07-1: same confinement as the readers
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(spec.model_dump_json(indent=1), encoding="utf-8")
-    os.replace(tmp, p)
+    # R3-STORE-10: fixed temp name -> unique temp + retried replace.
+    atomic_write_text(p, spec.model_dump_json(indent=1))
 
 
 # Repetition control every model gets, on top of whatever sampling it declares.
@@ -717,9 +717,8 @@ def rename_model(slug: str, new_slug: str) -> ModelSpec:
                       if k.startswith(f"{slug}:") else k): v
                      for k, v in rows.items()}
             if moved != rows:
-                tmp = calib.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps(moved, indent=1), encoding="utf-8")
-                os.replace(tmp, calib)
+                # R3-STORE-10: fixed temp name -> unique temp + retried replace.
+                atomic_write_json(calib, moved, indent=1)
         except (OSError, ValueError):
             pass          # a lost calibration row costs one re-tune, not data
     custom_spec_path(slug).unlink(missing_ok=True)   # AUDIT F07-1: confined
@@ -1082,9 +1081,8 @@ def delete_model(slug: str, registry=None) -> None:
             kept = {k: v for k, v in rows.items()
                     if not k.startswith(f"{slug}:")}
             if kept != rows:
-                tmp = calib.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps(kept, indent=1), encoding="utf-8")
-                os.replace(tmp, calib)
+                # R3-STORE-10: fixed temp name -> unique temp + retried replace.
+                atomic_write_json(calib, kept, indent=1)
         except (OSError, ValueError):
             pass          # a lost calibration row costs one re-tune, not data
 

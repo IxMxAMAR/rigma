@@ -523,6 +523,14 @@ def fake_cli(tmp_path, monkeypatch):
     # wrapper that needs extra names declares them through the passthrough hook
     # (this is also the escape hatch a real owner would use).
     monkeypatch.setenv("RIGMA_MCODE_ENV_PASSTHROUGH", "FAKE_MCODE_*")
+    # R3-HARN-7: the fake CLI reports 0.5.1 when `FAKE_MCODE_VERSION` is unset —
+    # that was the pinned build when its event lines were captured. It used to
+    # inherit a real value from the ambient environment by accident, because the
+    # adapter copied the whole environment into the child. Now that the child's
+    # environment is an allowlist, the fixture has to say so itself: otherwise the
+    # first turn to run emits a drift notice and latches `_DRIFT_SAID`, and every
+    # later test that asserts on the exact notice list fails by test ORDER.
+    monkeypatch.setenv("FAKE_MCODE_VERSION", harness_mcode.VERIFIED)
     # module-level state, so it must not leak between tests
     monkeypatch.setattr(harness_mcode, "_VERIFIED", {})
     return log
@@ -800,6 +808,11 @@ def test_a_cancel_stops_a_silent_turn_without_losing_the_session(fake_cli,
     monkeypatch.setenv("FAKE_MCODE_HANG", "1")
     monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps([
         {"type": "session.started", "sessionId": "mvs_interrupted"}]))
+    # R3-HARN-7: this asserts the EXACT notice list, so it must not depend on
+    # whether an earlier test in the same process already latched the one-shot
+    # drift notice. `_DRIFT_SAID` is process-global; without this the test passes
+    # alone and fails in a full run.
+    monkeypatch.setattr(harness_mcode, "_DRIFT_SAID", False)
     cancel = threading.Event()
     state: dict = {}
     got: list = []

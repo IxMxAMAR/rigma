@@ -516,6 +516,70 @@ def test_a_transient_read_failure_is_retried_before_giving_up(tmp_path,
     assert calls["n"] == 2, calls
 
 
+# --- R3-STORE-10: fixed temp names collided under concurrency -----------------
+
+def test_every_whole_file_store_uses_a_unique_temp():
+    """A fixed `<name>.tmp` beside the target means two concurrent writers
+    collide: one replaces the other's temp mid-write, or the rename fails with
+    PermissionError [WinError 32]. The run loop saves run.json every turn while a
+    tool thread can save live.json, so this is the concurrency it meets.
+
+    Asserted over the WHOLE package rather than a list of the modules I happened
+    to remember — a list would have to be updated by the next person, which is how
+    the last twelve call sites were missed.
+    """
+    from pathlib import Path
+    src_dir = Path(__file__).resolve().parents[1] / "src" / "rigma"
+    offenders = []
+    for f in sorted(src_dir.glob("*.py")):
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if "with_suffix(" in line and "tmp" in line:
+                offenders.append(f"{f.name}:{n}: {line.strip()}")
+    assert offenders == [], offenders
+
+
+def test_concurrent_writes_to_one_store_all_land(tmp_path):
+    """The measured failure that drove the retry: four threads each writing 40
+    times to one path produced PermissionError(13, 'Access is denied') from the
+    rename, even with a unique temp name — the DESTINATION rename collides."""
+    import threading
+
+    from rigma.atomicio import atomic_write_text
+    target = tmp_path / "store.json"
+    errors = []
+
+    def worker(n):
+        try:
+            for i in range(40):
+                atomic_write_text(target, f'{{"w": {n}, "i": {i}}}')
+        except Exception as e:                       # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [], errors
+    # the file is a complete document, not an interleaving of four
+    assert json.loads(target.read_text(encoding="utf-8"))["w"] in range(4)
+    # and no temp litter is left behind
+    assert [p.name for p in tmp_path.iterdir()] == ["store.json"]
+
+
+def test_create_only_refuses_to_clobber(tmp_path):
+    """The one case `os.replace` cannot express: exclusive creation, where
+    "already exists" is a real answer rather than a race to be resolved."""
+    from rigma.atomicio import atomic_write_text
+    p = tmp_path / "active.json"
+    assert atomic_write_text(p, '{"id": "first"}', create_only=True) is True
+    assert atomic_write_text(p, '{"id": "second"}', create_only=True) is False
+    assert json.loads(p.read_text(encoding="utf-8"))["id"] == "first"
+    # a normal write still replaces
+    atomic_write_text(p, '{"id": "third"}')
+    assert json.loads(p.read_text(encoding="utf-8"))["id"] == "third"
+
+
 # --- R3-CLI-3/4: `recalibrate --all` wiped without asking, and not atomically -
 
 def test_recalibrate_all_asks_before_destroying_every_measurement(tmp_path,
