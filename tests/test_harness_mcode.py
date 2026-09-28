@@ -861,8 +861,42 @@ def test_no_cancel_means_the_turn_runs_to_the_end(fake_cli):
     finish normally, not be cut short by a stray default."""
     got = list(harness_mcode.drive_turn(
         base_url="http://127.0.0.1:11500/v1", model="local-test", prompt="hi"))
-    assert {e.kind for e in got} == {"text"}, got
+    # `text` and `state` only. The `state`/`usage` event is deliberate: mcode has
+    # always reported a turn's token cost, Rigma wrote it into the adapter state
+    # and then read only `session_id` back out, so the number was collected and
+    # discarded. This assertion used to be `== {"text"}`, which would have made
+    # that fix look like a regression.
+    assert {e.kind for e in got} == {"text", "state"}, got
     assert "".join(e.text for e in got) == "hello from dsh"
+    usage = [e for e in got if e.kind == "state"]
+    assert len(usage) == 1
+    assert usage[0].event == "usage"
+    assert usage[0].data == {"inputTokens": 8, "outputTokens": 3, "totalTokens": 11}
+
+
+def test_the_turns_usage_is_reported_rather_than_only_remembered(fake_cli):
+    """mcode reports `usage` on `turn.completed`. The adapter stored it in
+    `state` and nothing ever read it, so a long agent turn's token cost was
+    collected and thrown away — the one number a reader most wants."""
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="local-test", prompt="hi",
+        state={}))
+    usage = [e for e in got if e.kind == "state" and e.event == "usage"]
+    assert len(usage) == 1
+    assert usage[0].data["totalTokens"] == 11
+
+
+def test_a_turn_with_no_usage_reports_none(fake_cli, monkeypatch):
+    """An empty or absent usage block must not emit a blank event, which would
+    render as a row of zeros."""
+    monkeypatch.setenv("FAKE_MCODE_EVENTS", json.dumps([
+        _ev(1, "exec.started"), _ev(2, "session.started"), _ev(3, "turn.started"),
+        _ev(4, "turn.completed"),
+        _ev(5, "exec.completed", result={"status": "succeeded", "output": "ok"}),
+    ]))
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="m", prompt="hi"))
+    assert [e for e in got if e.kind == "state"] == []
 
 
 def test_a_missing_cli_is_reported_and_never_raised(monkeypatch, tmp_path):

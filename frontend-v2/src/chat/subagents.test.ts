@@ -22,6 +22,48 @@ const finished = (child: string, extra: Record<string, unknown> = {}) => ({
   },
 });
 
+// mcode reports a task's ids FLAT, from the `details` of a `task` result, and
+// its status IS the lifecycle step. Both shapes must fold into the same rows.
+describe("foldSubagent — mcode's flat task shape", () => {
+  it("starts a row from a task that is running", () => {
+    const rows = foldSubagent([], {
+      taskId: "bg_1", subSessionId: "s1", name: "explore", status: "started",
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: "s1", state: "running" });
+  });
+
+  it("closes the row when the task reports a terminal status", () => {
+    let rows = foldSubagent([], {
+      taskId: "bg_1", subSessionId: "s1", name: "explore", status: "started",
+    });
+    rows = foldSubagent(rows, {
+      taskId: "bg_1", subSessionId: "s1", name: "explore", status: "succeeded",
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].state).toBe("done");
+  });
+
+  it("treats mcode's queued and running as live, not as ends", () => {
+    for (const status of ["queued", "running"]) {
+      const rows = foldSubagent([], { taskId: "bg_1", subSessionId: "s", status });
+      expect(rows[0].state).toBe("running");
+    }
+  });
+
+  it("falls back to the task id when there is no sub-session id", () => {
+    const rows = foldSubagent([], { taskId: "bg_9", status: "started" });
+    expect(rows[0].id).toBe("bg_9");
+  });
+
+  // A bash call also reports a task_id, but it is not a subagent. The extractor
+  // filters that on the tool NAME, so anything reaching here has a sub-session
+  // id or was named as a task.
+  it("ignores a payload with neither id", () => {
+    expect(foldSubagent([], { status: "started" })).toEqual([]);
+  });
+});
+
 describe("foldSubagent", () => {
   it("adds a running row when a child starts", () => {
     const rows = foldSubagent([], started("child-a"));

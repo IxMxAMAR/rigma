@@ -56,9 +56,31 @@ function lastText(blocks: unknown): string {
  */
 export function foldSubagent(rows: Subagent[], payload: unknown): Subagent[] {
   if (!payload || typeof payload !== "object") return rows;
-  const p = payload as { event?: unknown; data?: unknown };
-  const event = String(p.event ?? "");
-  const d = (p.data ?? {}) as Record<string, unknown>;
+  const p = payload as Record<string, unknown>;
+
+  // TWO SHAPES AGAIN. DSH wraps its lifecycle in `{event, data}`; mcode reports a
+  // task's ids flat, from the `details` of a `task`/`task_output` result, and its
+  // status IS the lifecycle step. Rather than branch in the renderer, both are
+  // reduced to (event, data) here.
+  let event = String(p.event ?? "");
+  let d: Record<string, unknown>;
+  if (p.data && typeof p.data === "object") {
+    d = p.data as Record<string, unknown>;
+  } else if (p.taskId || p.subSessionId) {
+    // mcode: `started`/`running` mean live, anything else is an end.
+    const status = String(p.status ?? "").toLowerCase();
+    event = status === "started" || status === "running" || status === "queued"
+      ? "subagent.started"
+      : "subagent.finished";
+    d = {
+      childSessionId: p.subSessionId ?? p.taskId,
+      provider: "mcode",
+      status: p.status,
+    };
+  } else {
+    return rows;
+  }
+
   const id = String(d.childSessionId ?? "");
   if (!id) return rows;
 

@@ -9,22 +9,36 @@ import {
 import { formatArgs, previewArgs } from "./toolChip";
 import AgentState from "./AgentState";
 import { argHint, delegateSentence, summariseDelegate } from "./delegate";
+import { chipOutcome } from "./toolChip";
+
+// How each outcome is drawn. `unknown` is deliberately NOT moss — see
+// `chipOutcome` in toolChip.ts for why an unreported result is not a success.
+const OUTCOME_TONE: Record<string, string> = {
+  running: "text-amber animate-pulse",
+  failed: "text-red",
+  ok: "text-moss",
+  unknown: "text-muted",
+};
+
+const OUTCOME_GLYPH: Record<string, string> = {
+  running: "◌", failed: "✕", ok: "✓", unknown: "?",
+};
 
 function ChipRow({ chip }: { chip: Chip }) {
+  const outcome = chipOutcome(chip);
   return (
     <details className="rounded-md bg-surface/60 open:bg-surface">
       <summary className="flex items-center gap-2 px-3 py-1.5 cursor-pointer list-none font-mono text-[12px]">
         <span
-          className={
-            chip.state === "running"
-              ? "text-amber animate-pulse"
-              : chip.result?.startsWith("error")
-                ? "text-red"
-                : "text-moss"
+          className={OUTCOME_TONE[outcome]}
+          aria-label={outcome}
+          title={
+            outcome === "unknown"
+              ? "this backend did not report whether the call succeeded"
+              : undefined
           }
-          aria-label={chip.state}
         >
-          {chip.state === "running" ? "◌" : chip.result?.startsWith("error") ? "✕" : "✓"}
+          {OUTCOME_GLYPH[outcome]}
         </span>
         <span className="font-semibold text-primary">{chip.name}</span>
         <span className="text-muted truncate">{previewArgs(chip.args)}</span>
@@ -134,7 +148,7 @@ function Bubble({ m }: { m: ChatMessage }) {
               <ChipRow
                 key={i}
                 chip={{ id: `trace-${i}`, name: t.name, args: t.args,
-                        result: t.result, state: "done" }}
+                        result: t.result, state: "done", ok: t.ok }}
               />
             ))}
           </div>

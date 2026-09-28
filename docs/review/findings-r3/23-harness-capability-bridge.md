@@ -249,12 +249,155 @@ Stated plainly, because a declared gap is worth more than a fake green.
 - **DSH still cannot stream or cancel.** The SDK reports a turn's text when it
   ends and has no wire-level cancel; Stop kills the subprocess. Unchanged, and
   unfixable from Rigma's side.
-- **No live DSH turn was run with the patch applied.** The patch was verified to
-  *compose* (dump-config), and every translation layer is unit-tested against
-  recorded shapes, but a real end-to-end turn exercising a goal or a subagent was
-  not executed. The first live turn is the remaining unknown.
-- **Rigma's own autonomous `objective` is still not a first-class goal.** It
-  exists as a string in a run's compiled spec, pinned into the system prompt and
-  reachable only via `GET /api/runs/{rid}`. It has no id, no status, no mutator
-  and no route of its own. `AutonomousSurface` still renders the plan list but
-  not the objective above it.
+- **No live turn exercised a goal or a subagent END TO END.** The runtime was
+  booted and a real request was captured (§9), which proves the tools are
+  mounted and advertised — but no turn was driven far enough for the model to
+  actually call `todo_write` or spawn a subagent and for the resulting event to
+  travel the whole way to the UI. Every translation layer is unit-tested against
+  the shapes the recon recorded; the composition is now measured. What is still
+  untested is one full round trip.
+- **Rigma's own autonomous `objective` is still not a first-class goal.** It is
+  now *visible* (§11) but it remains a string field of a run's compiled spec: no
+  id, no status, no mutator, no route of its own, and a chat cannot have one.
+
+---
+
+## 9. The runtime was booted, and the tools were counted
+
+§1's verification proved the patch *composes*. Composing is not mounting, and
+mounting is not advertising: a bad plugin config fails at mount, and a tool
+plugin can mount and still contribute nothing to the request. Both were then
+measured rather than argued.
+
+**Does it mount?** The real runtime was started three ways, with everything else
+held constant, including the exact configuration Rigma uses:
+
+| case | patches | result |
+|---|---|---|
+| A | per-turn `llm-deepseek` only | STARTED |
+| B | capability patch only | STARTED |
+| C | **both, capability first** (what Rigma does) | **STARTED** |
+
+Case A is the control, and it earned its place: the first two attempts at this
+probe failed with `no adapter registered for provider "deepseek"` — a name that
+does not exist, because the SDK's default is `deepseek-official` and the
+generated `llm-deepseek` row configures that. **Without the control, that failure
+would have looked exactly like my patch breaking the provider.** It was the
+probe that was wrong.
+
+**Do the tools reach the model?** A local HTTP server was put in place of the
+model and the request body recorded. That body's `tools` array is ground truth:
+
+| configuration | tools advertised to the model |
+|---|---|
+| `sdk-minimal`, unpatched | **1** — `pwsh` |
+| `sdk-minimal` + capability patch | **19** |
+
+The 19, verbatim from the captured request:
+
+```
+create_goal  get_goal  update_goal  todo_write  exit_plan_mode
+subagent  subagent_fork  send_message  interrupt_agent  list_agents
+skill  workflow  read  write  edit  str_replace_editor  glob  grep  pwsh
+```
+
+Every capability §1 claims is present and named: goals (`create_goal`,
+`get_goal`, `update_goal`), subagents (`subagent`, `subagent_fork`,
+`send_message`, `interrupt_agent`, `list_agents`), todos (`todo_write`), skills
+(`skill`), plan mode (`exit_plan_mode`), workflows (`workflow`), and the
+filesystem tools (`read`, `write`, `edit`, `str_replace_editor`, `glob`,
+`grep`).
+
+**This is the measurement the round existed to make.** The unpatched profile
+offers the model exactly one tool. That is the concrete form of "the harnesses'
+functionalities have been limited".
+
+---
+
+## 10. mcode's own state was in the payload all along
+
+§8 declared mcode's goal and todo state unread, on the assumption that reaching
+it meant coupling to mcode's private SQLite or its undocumented session files.
+That assumption was wrong, and the reconnaissance that disproved it is worth
+recording because it inverts the risk.
+
+mcode wraps every tool result as `{tool_name, text, content, details}`. Rigma's
+`_flatten` kept `content` — the prose — and discarded `details`, which is where
+the structured state lives. **The goal object, the todo array and every task id
+were being thrown away one line before they were read.** No database, no session
+files, no new coupling: the data is in the stream the adapter already parses.
+
+What the census established, over all 43 session directories on this machine:
+
+| fact | shape |
+|---|---|
+| `todowrite` args | `todos[]`, items `{content, status, priority}` all required; `status` ∈ `pending\|in_progress\|completed\|cancelled`; the list **replaces** ("an empty list clears it") |
+| goal object | `{goalId, sessionId, objective, status, createdAt, updatedAt, tokensUsed, timeUsedSeconds, tokenBudget}`; `status` ∈ `active\|paused\|complete\|blocked\|budget_limited\|usage_limited` |
+| `get_goal` with no goal | `{goal: null}` |
+| task ids | `details` are **snake_case**: `task_id`, `sub_session_id`, `sub_turn_id`, `agent_name`, `status` |
+| the call's own status | normalised by mcode to `started` / `completed` / `failed` |
+
+Two corrections follow from this, and both were claims in the code:
+
+1. **"`ok` cannot be derived here" was false.** The adapter's comment said mcode
+   does not flag failure in the projected item. The status *is* on the item, and
+   the old behaviour recorded `ok: True` for **every** result including the
+   failures. It is now derived from the wire, with anything unrecognised
+   returning `None` — unknown, which is not the same as success.
+2. **mcode's `usage` was collected and discarded.** `turn.completed` reports it,
+   the adapter wrote it into `state`, and `serve.py` read only `session_id` back
+   out. Now emitted as the same `state`/`usage` event DSH uses, so one SSE event
+   and one render path serve both.
+
+**A caveat that matters.** `todowrite`, `get_goal` and all five `task_*` tools
+were **never invoked in any session on this machine** — zero occurrences across
+108 message lines. Their *schemas* are real (`llm-call.json` is authoritative)
+and the goal object's field list is real, but their *success payloads* come from
+mcode's shipped code rather than from observed data. Only `update_goal` was
+observed, and only on its error path. The tests say so at the top of the file
+rather than implying otherwise.
+
+### Two shapes, one panel
+
+DSH and mcode report a goal differently — DSH nests a snapshot under `goal` and
+calls the phase `phase` with a round count; mcode sends the goal flat and calls
+it `status` with tokens instead. Neither is wrong, and branching on the shape in
+a render path would put that knowledge in the wrong place and duplicate it for
+every new field. `chat/goal.ts` normalises once, so the panel has one shape to
+draw, and a payload this build does not recognise still shows its objective
+rather than nothing. Subagent folding got the same treatment, since mcode reports
+a task's ids flat where DSH wraps them in `{event, data}`.
+
+---
+
+## 11. Two things the surfaces were not showing
+
+Neither is a harness gap. Both were found while checking the harness work, and
+both are the same failure mode as the five dropped SSE events in §4: the data was
+already on the wire and nothing drew it.
+
+**The autonomous objective was invisible.** `runs.create` compiles a spec with
+`objective`, `deliverables` and `constraints`, pins it into the system prompt
+every turn, and saves it on the run — and `AutonomousSurface` rendered the plan
+list and not the objective above it. A user watching an unattended run could see
+every step and not the thing the steps served. It is now a panel above the plan,
+with the deliverables ("must exist when it finishes") and constraints behind
+disclosures, and a marker when the spec was never compiled and the mission was
+used as given.
+
+**A blocked plan step looked like a pending one.** `PlanStep.status` has three
+server values — `pending`, `done`, `blocked` — and the surface drew two glyphs, so
+`blocked` was identical to `pending`. A run stuck on a step therefore read as a
+run that had not reached it, which is the opposite diagnosis and the one that
+costs a user time. Three states, three glyphs, three tones.
+
+**A tool call's outcome was guessed rather than read.** The server records `ok`
+on every tool trace and the chip ignored it, inferring the outcome from
+`result.startsWith("error")`. That is wrong for any tool whose failure text does
+not begin with that word, and it cannot distinguish "failed" from "unknown". Now
+the backend's own word wins, `ok` is sent on the wire for both the native and
+external paths (computed once, so the live chip and the persisted one cannot
+disagree), and a fourth outcome exists: `unknown`, drawn as `?` in muted grey
+rather than as a tick. **An unreported result shown as a success is how a broken
+tool call reads as a working one** — and until this round that was the behaviour
+for every mcode tool result, because the adapter set `ok: True` unconditionally.
