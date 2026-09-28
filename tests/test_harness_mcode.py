@@ -1946,3 +1946,104 @@ def test_the_image_payload_is_not_inlined():
     out = {"content": [{"type": "image", "data": "A" * 5000}]}
     text = harness_mcode._flatten(out)
     assert "A" * 100 not in text, "the payload must not be inlined"
+
+
+# --- R6-OKOF: the tool-call status enum, resolved from its definition ---------
+#
+# WHY THIS IS SETTLED NOW AND WAS NOT BEFORE. `_ok_of` returned None for every
+# real call, so every mcode tool chip rendered UNKNOWN — never a tick, never a
+# cross. It refused to guess, and that refusal was right: the captured fixture
+# pairs status 3 with "Tool not found", but the projector contains no `status: 3`
+# literal, so mapping 3 to a cross could have inverted every chip in the
+# transcript if 3 had meant success.
+#
+# The enum's DEFINITION settles it. In the installed @minimax-ai/code 0.5.4,
+# `chunk-QWAB5G2D.js` byte 6132401:
+#
+#     zu = {Start: 1, Finished: 2, Failed: 3, Preparing: 4, Prepared: 5}
+#
+# is the value domain of the thrift field `tool_call_status`, and the same module
+# pins the polarity with `isError: e.tool_call_status === zu.Failed`. The projector
+# does not invent the number — it passes the runtime tool-call object through
+# verbatim — so this is the authoritative source.
+#
+# The gap that remains, stated rather than hidden: NO capture in this repo contains
+# status 2, so "2 means success" rests on the enum's names plus the runtime's own
+# `isError` predicate, not on an observed successful call.
+
+_ACCEPTED = {
+    1: None,        # Start      — in flight
+    2: True,        # Finished   — the non-error terminal
+    3: False,       # Failed     — the error terminal
+    4: None,        # Preparing  — in flight
+    5: None,        # Prepared   — in flight
+}
+
+
+def test_the_numeric_status_enum_maps_from_its_own_definition():
+    """Every value of `zu`, including the two that must NOT become a tick.
+
+    1/4/5 return None deliberately: they are in-flight states, and a tick on a call
+    that has not finished is a lie about the transcript.
+    """
+    for code, want in _ACCEPTED.items():
+        got = harness_mcode._ok_of({"status": code})
+        assert got is want, f"status {code}: expected {want}, got {got}"
+
+
+def test_status_three_is_a_failure_and_two_is_a_success():
+    """The polarity, stated separately because inverting it is the specific error
+    the earlier note was right to fear."""
+    assert harness_mcode._ok_of({"status": 3}) is False
+    assert harness_mcode._ok_of({"status": 2}) is True
+
+
+def test_the_string_form_of_the_same_enum_still_works():
+    """`Dwn` proves these strings are the SAME enum's other spelling:
+        e==="preparing"?Preparing : e==="prepared"?Prepared
+        : e==="completed"?Finished : e==="failed"?Failed : Start
+    so keeping both arms is not two vocabularies — it is one.
+    """
+    assert harness_mcode._ok_of({"status": "completed"}) is True
+    assert harness_mcode._ok_of({"status": "failed"}) is False
+    assert harness_mcode._ok_of({"status": "preparing"}) is None
+    assert harness_mcode._ok_of({"status": "prepared"}) is None
+    assert harness_mcode._ok_of({"status": "started"}) is None
+
+
+def test_an_unknown_status_stays_unknown_rather_than_becoming_a_tick():
+    """A future item kind must not become a wrong row. The safe half is UNKNOWN."""
+    for junk in (None, "", "nonsense", 0, 6, 99, -1, [], {}, "7"):
+        assert harness_mcode._ok_of({"status": junk}) is None, junk
+
+
+def test_a_boolean_status_is_not_read_as_the_enum():
+    """`True == 1` in Python, so a careless `int()` arm would map a JSON `true` to
+    Start. A bool is not one of this enum's values."""
+    assert harness_mcode._ok_of({"status": True}) is None
+    assert harness_mcode._ok_of({"status": False}) is None
+
+
+def test_a_stringified_number_is_still_read_as_the_enum():
+    """The runtime accepts string-or-number for this field, so "2" and 2 must not
+    disagree. It does not: `str` falls through to the string arms, and "2" is not
+    one of them — so this pins the CURRENT behaviour honestly rather than claiming
+    a coercion that is not there."""
+    assert harness_mcode._ok_of({"status": "2"}) is None, (
+        "a stringified code is NOT silently coerced; it is unknown, which is safe")
+    assert harness_mcode._ok_of({"status": 2}) is True
+
+
+def test_the_captured_fixture_pairs_status_three_with_a_failure():
+    """The repo's own capture, end to end: status 4 -> 5 -> 1 -> 3, where 3 carries
+    "Tool not found". Read from the real fixture rather than restated."""
+    import pathlib as _p
+    import re
+    src = _p.Path(__file__).with_name("test_harness_mcode.py").read_text(encoding="utf-8")
+    block = src[src.index("TOOL_TURN"):src.index("TOOL_TURN") + 3000]
+    codes = [int(m) for m in re.findall(r'"status":\s*(\d+)', block)]
+    assert codes[:4] == [4, 5, 1, 3], codes
+    assert "Tool not found" in block
+    assert harness_mcode._ok_of({"status": codes[3]}) is False
+    for code in codes[:3]:
+        assert harness_mcode._ok_of({"status": code}) is None
