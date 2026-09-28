@@ -221,8 +221,21 @@ def harness_env(base: dict | None = None, *, also: tuple = ()) -> dict:
 
 # The repair and verification machinery is the reason a strong local-model
 # agent works at all here, and no external harness inherits it.
+#
+# R6-MCP: the first entry used to read "Rigma's tools (image-by-reference, undo,
+# sample_files, RAG, methods)" and named RAG and undo as left behind. They are
+# not — both reach BOTH backends now, as MCP tools (`search_my_documents`,
+# `remember`, `recall`, `undo_last_change`) rather than as native ones. The
+# distinction that survives is BETWEEN the four tools that are exposed over MCP
+# and the rest of Rigma's roster, which is not exposed at all: image-by-reference,
+# sample_files and the methods/verification tools have no MCP equivalent, so a
+# harness turn still cannot reach them. Saying "RAG is left behind" would now be
+# a false negative, which is the same class of defect as the plan-mode claim.
 _LEAVES_BEHIND = (
-    "Rigma's tools (image-by-reference, undo, sample_files, RAG, methods)",
+    "Rigma's tools that have no MCP equivalent (image-by-reference, "
+    "sample_files, the methods/verification suite) — the four that DO have one "
+    "(search_my_documents, remember, recall, undo_last_change) reach the agent "
+    "through Rigma's own MCP server",
     "the weak-model repair layer (tool-call rescue, JSON repair, fuzzy paths)",
     "the run progress log, artifact verification and one-action-per-turn guard",
 )
@@ -337,6 +350,12 @@ BACKENDS: dict[str, Harness] = {
             "(read from ~/.rigma/skills, the directory the Skills page writes)",
             "filesystem tools: read, write, edit, glob and grep",
             "agent instructions from AGENTS.md, and context compaction",
+            # R6-MCP: mounted by a generated patch, so the row is not in the
+            # shipped capability file and this sentence is the only place the
+            # capability is declared. Named as the model sees them.
+            "Rigma's own tools, as an MCP server: `mcp__rigma__search_my_documents`, "
+            "`mcp__rigma__remember`, `mcp__rigma__recall` and "
+            "`mcp__rigma__undo_last_change`, mounted through `dsh-mcp-client`",
         ),
     ),
     MCODE: Harness(

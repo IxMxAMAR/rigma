@@ -415,7 +415,21 @@ def _run_turn(job: dict, live: _Live) -> int:
                 skills = skills_patch_file(live.scratch)
             except Exception:
                 skills = ""     # a missing skill root is a smaller loss than no turn
-            patches = tuple(p for p in (cap, skills, patch) if p)
+            # R6-MCP: Rigma's OWN tools, as an MCP server. mcode has received
+            # these since `harness_mcode.ensure_mcp`; DSH received nothing, so a
+            # DSH turn could not search the user's indexed documents or remember
+            # anything, and no line in the capability menu said so. Generated
+            # here for the same two reasons as the skills patch: it carries
+            # `sys.executable` and the chat's cwd, neither of which the shipped
+            # patch can hold. Registered only when the roster is non-empty.
+            mcp = ""
+            try:
+                from rigma.harness_dsh import mcp_patch_file
+
+                mcp = mcp_patch_file(live.scratch, cwd=cwd)
+            except Exception:
+                mcp = ""        # missing Rigma tools beat no harness turn
+            patches = tuple(p for p in (cap, skills, mcp, patch) if p)
             config = DeepSeekHarnessConfig(
                 profile="sdk-minimal",
                 dsh_bin=str(cli),
