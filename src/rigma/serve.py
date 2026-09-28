@@ -2004,6 +2004,38 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         function does not change.
         """
         adapter = _harness.adapter(backend.name)
+        # R5-PERSIST: the agent's DURABLE state, accumulated as the backend
+        # reports it. Goals, todos and plan mode outlive the turn that reported
+        # them, so the panel must not empty when the turn ends — which is exactly
+        # what it did, because the UI drew them from the live turn only.
+        #
+        # Seeded from the stored row so a backend that reports a goal once and
+        # never again does not erase it on the next turn.
+        #
+        # SUBAGENTS ARE DELIBERATELY ABSENT. A subagent row names a child process
+        # belonging to the turn that spawned it; restoring one would claim a child
+        # that is long gone. `usage` is absent for a different reason: it arrives
+        # every step, so persisting it would turn one turn into a write storm for
+        # a number that describes a step, not the conversation.
+        _agent_state: dict = dict(s.get("agent_state") or {})
+
+        def _persist_agent_state() -> None:
+            """Write the durable agent state onto the session row.
+
+            Mid-turn and GUARDED, the way `unlocked_tools` does it at :2611:
+            reload the row so this never writes a stale message list over another
+            writer's, set the one field, and save against the revision just read.
+            Failures are swallowed on purpose — a panel that did not persist still
+            works for the rest of THIS turn, and the next event tries again.
+            """
+            try:
+                cur = sessions.load(s["id"])
+                if cur:
+                    cur["agent_state"] = _agent_state
+                    sessions.save(cur, base_rev=cur[sessions.REV_KEY])
+            except Exception:
+                pass
+
         if adapter is None:
             # Unreachable while `runnable` and the table agree, and reported
             # rather than silently running the native loop if they ever don't.
@@ -2133,14 +2165,42 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         # normalises mcode's own field names, deliberately, so
                         # reshaping it here would mean guessing at a schema this
                         # side does not own.
+                        # R5-PERSIST: the payload is stored WHOLE and unreshaped,
+                        # exactly as it goes on the wire — `chat/goal.ts` owns the
+                        # two backends' field names, so normalising here would mean
+                        # this side guessing at a schema it does not own, and the
+                        # stored copy would then drift from the live one.
+                        #
+                        # EXCEPT the clear tombstone. `{operation: "clear",
+                        # cleared: true}` carries no `goal` key, and the frontend
+                        # reads it as "blank the panel" (chat/goal.ts
+                        # `isGoalCleared`, added in R4-GOAL-1). Storing the
+                        # tombstone as-is would mean a RELOAD resurrects the goal
+                        # that was just cleared, because the durable panel would
+                        # normalise the tombstone and find no objective. So a clear
+                        # stores nothing, which is what the panel showed.
+                        _cleared = (
+                            str(_data.get("operation") or "").lower() == "clear"
+                            or _data.get("cleared") is True
+                        )
+                        _agent_state["goal"] = None if _cleared else _data
+                        _persist_agent_state()
                         yield _sse(_data, event="goal")
                     elif _ev == "todo/write" or _ev == "todos":
                         # R4-MCODE-1: same again — mcode's name for the todo list.
                         _todos = _data.get("todos")
-                        yield _sse({"todos": _todos if isinstance(_todos, list)
-                                    else []}, event="todos")
+                        _todos = _todos if isinstance(_todos, list) else []
+                        # R5-PERSIST: the store already renders this as a whole-list
+                        # assignment (`todo_write` REPLACES, never merges), so the
+                        # durable copy is the same shape the wire carries.
+                        _agent_state["todos"] = _todos
+                        _persist_agent_state()
+                        yield _sse({"todos": _todos}, event="todos")
                     elif _ev == "plan/mode":
-                        yield _sse({"active": bool(_data.get("active"))},
+                        _active = bool(_data.get("active"))
+                        _agent_state["plan_mode"] = _active
+                        _persist_agent_state()
+                        yield _sse({"active": _active},
                                    event="plan_mode")
                     elif _ev.startswith("subagent"):
                         # R4-MCODE-1: mcode's payload is FLAT (taskId,

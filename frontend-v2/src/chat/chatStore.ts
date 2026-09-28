@@ -8,7 +8,7 @@
 // session that owns it. A single `streaming` slot meant the reply you started
 // in one chapter finished into whichever chapter you happened to be reading.
 import { create } from "zustand";
-import { api, type ChatMessage, type SessionSummary } from "../lib/api";
+import { api, type ChatMessage, type SavedAgentState, type SessionSummary } from "../lib/api";
 import { responseError } from "../lib/listFetch";
 import { runMacroStream } from "../lib/methods";
 import { streamChat, type SseEvent } from "../lib/sse";
@@ -377,9 +377,63 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
   }
 }
 
+/**
+ * R5-PERSIST: the part of an event that OUTLIVES the turn, or null.
+ *
+ * A separate function from `applyEvent` because the two answer different
+ * questions and must not be confused. `applyEvent` is a pure reducer for what is
+ * on screen RIGHT NOW; this picks out the facts the server also stored, which
+ * must survive the turn ending. Only three of the events are durable, and the
+ * two omissions are deliberate:
+ *
+ *   subagent — a row names a child process belonging to the turn that spawned
+ *              it. Restoring one after a reload would draw "running" for a child
+ *              that is long gone, so it is turn-scoped on purpose. The server
+ *              does not persist it either; this is the same decision, twice.
+ *   usage    — a per-step number, not a fact about the conversation, and it
+ *              arrives every step.
+ *
+ * The value stored is the RAW payload, so `chat/goal.ts` stays the single place
+ * the two backends' field names are reconciled.
+ */
+export function durableFromEvent(ev: SseEvent): SavedAgentState | null {
+  const d = (ev.data ?? {}) as Record<string, unknown>;
+  switch (ev.event) {
+    case "goal":
+      // A clear stores null, matching what the server does — otherwise a reload
+      // would resurrect the objective that was just cleared, since the tombstone
+      // has no objective to normalise.
+      return { goal: isGoalCleared(d) ? null : d };
+    case "todos": {
+      const raw = Array.isArray(d.todos) ? d.todos : [];
+      return {
+        todos: raw.map((t) => {
+          const o = (t ?? {}) as Record<string, unknown>;
+          return { content: String(o.content ?? ""),
+                   status: String(o.status ?? "pending") };
+        }),
+      };
+    }
+    case "plan_mode":
+      return { plan_mode: d.active === true };
+    default:
+      return null;
+  }
+}
+
+/** Fold a durable fragment onto the saved state for one chat. Keyed by session
+ *  so a reload of chat B cannot paint chat A's goal into B's panel. */
+function mergeSavedAgent(sid: string, add: SavedAgentState) {
+  return (st: ChatState) => ({
+    savedAgent: {
+      ...st.savedAgent,
+      [sid]: { ...(st.savedAgent[sid] ?? {}), ...add },
+    },
+  });
+}
+
 export interface ChatState {
-  sessions: SessionSummary[];
-  currentId: string | null;
+  sessions: SessionSummary[];  currentId: string | null;
   messages: ChatMessage[];
   // AUDIT F1: docs/audit-2026-09-04-full.md
   /** In-flight turns, keyed by the session that owns them. Written only under
@@ -416,6 +470,20 @@ export interface ChatState {
    *  that already knows which chat that is. */
   harness: string;
   permission: string;
+  /** R5-PERSIST: the agent's durable state for the chat on screen, keyed by
+   *  session id — the goal, the todo list, and plan mode, as the SERVER stored
+   *  them.
+   *
+   *  WHY THIS IS NOT ON THE TURN. These facts outlive the turn that reported
+   *  them, and the turn does not: `streams[sid]` is created when a turn starts
+   *  and dropped when it ends, so a panel drawn from it vanishes on reload even
+   *  though nothing about the agent's state changed. Keyed by session because a
+   *  reload of chat B must not paint chat A's goal.
+   *
+   *  Held as the RAW wire payloads rather than normalised ones so that
+   *  `chat/goal.ts` stays the single place the two backends' field names are
+   *  reconciled — the same reason the server stores them unreshaped. */
+  savedAgent: Record<string, SavedAgentState>;
 
   loadSessions: () => Promise<void>;
   search: (q: string) => Promise<void>;
@@ -500,6 +568,7 @@ export const useChat = create<ChatState>((set, get) => ({
   drafts: loadDrafts(),
   harness: "native",
   permission: "full",
+  savedAgent: {},
 
   loadSessions: async () => {
     try {
@@ -577,7 +646,12 @@ export const useChat = create<ChatState>((set, get) => ({
       set({ currentId: id, messages: s.messages,
             harness: s.harness ?? "native",
         permission: s.permission ?? "full", lastError: null,
-        notice: null });
+        notice: null,
+        // R5-PERSIST: the agent's durable state comes back with the chat, so the
+        // panel survives a reload. Replaced rather than merged — this is the
+        // server's authoritative copy for THIS chat, and a stale local fragment
+        // (a goal cleared in another tab) must not win over it.
+        savedAgent: { ...get().savedAgent, [id]: s.agent_state ?? {} } });
     } catch (e) {
       // AUDIT F50: a session click that failed used to do nothing at all
       set({ lastError: errText(e) });
@@ -670,6 +744,8 @@ export const useChat = create<ChatState>((set, get) => ({
             if (nid) spawned = nid;
           }
           set(patchTurn(sid, (t) => applyEvent(t, ev)));
+          const durable = durableFromEvent(ev);
+          if (durable) set(mergeSavedAgent(sid, durable));
         },
         ctl.signal,
       );
@@ -743,8 +819,13 @@ export const useChat = create<ChatState>((set, get) => ({
       await streamChat(
         sid,
         { message: content, ...(opts ?? {}) },
-        (ev) =>
-          set(patchTurn(sid, (t) => applyEvent(t, ev))),
+        (ev) => {
+          set(patchTurn(sid, (t) => applyEvent(t, ev)));
+          // R5-PERSIST: the same durable half, so the panel is already populated
+          // the moment the turn ends rather than waiting for a reload.
+          const durable = durableFromEvent(ev);
+          if (durable) set(mergeSavedAgent(sid, durable));
+        },
         ctl.signal,
       );
     } catch (e) {

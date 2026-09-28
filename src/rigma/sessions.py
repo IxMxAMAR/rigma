@@ -102,7 +102,20 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   # reusing `allow_absolute_reads`: reading a file and replacing
                   # one are different risks, and a user who granted one did not
                   # grant the other.
-                  "allow_absolute_writes")
+                  "allow_absolute_writes",
+                  # R5-PERSIST: the agent's own durable state — its goal, its todo
+                  # list, whether it is in plan mode. The backend reports these as
+                  # SSE events, and the UI drew them from the LIVE TURN only, so
+                  # the whole panel vanished on reload even though the agent's
+                  # state had not. A SESSION field because that is what it is: it
+                  # belongs to the conversation, not to the turn that happened to
+                  # report it.
+                  #
+                  # Deliberately does NOT include subagents. A subagent row names a
+                  # child process that belongs to the turn that spawned it; one
+                  # restored after a reload would claim a child that is long gone,
+                  # and a panel that lies is worse than a panel that is empty.
+                  "agent_state")
 # What each agent backend understands. `smart` classifies and asks when it
 # judges risk high; `full` does not ask; `off` disarms the agent's tools. `ask`
 # is refused headlessly by mcode itself ("requires an interactive host"), so it
@@ -133,6 +146,13 @@ _FIELD_TYPES: dict[str, type] = {
     "workspace": str, "method": str, "harness": str, "permission": str,
     "messages": list, "archive": list, "pending_nudges": list,
     "params": dict, "trigger_state": dict,
+    # R5-PERSIST: a dict like `params`/`trigger_state`, so a client cannot store a
+    # string where the reader subscripts. Nothing on the PATCH surface sets it
+    # today — the SERVER writes it mid-turn — but it is typed here because
+    # `test_r3_session_field_types.py` asserts every MUTABLE_FIELD has an entry,
+    # and that guard is what stops a future field inheriting the
+    # `bool("false") is True` hole.
+    "agent_state": dict,
     # AUDIT 13-3 regression: this is a GRANT, so it is type-checked where the
     # other booleans are not. `bool("false")` is True, and a client that sent
     # the string form of "no" would otherwise have been read as "yes" — the one
@@ -247,6 +267,12 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # trigger rules: one-line reminders queued for the next
                      # turn, and the loop-guard bookkeeping (see triggers.py)
                      "pending_nudges": [], "trigger_state": {},
+                     # R5-PERSIST: the agent's durable state, empty until a backend
+                     # reports one. Named here rather than left absent for the same
+                     # reason the grants above are: a reader that subscripts a chat
+                     # that predates the field would otherwise KeyError, and the UI
+                     # cannot offer to show what it cannot see.
+                     "agent_state": {},
                      # which agent backend runs this session's turns: the
                      # built-in loop, or an external one wired behind the seam.
                      # `harness.resolve` refuses an unknown or unusable backend

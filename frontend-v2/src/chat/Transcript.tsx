@@ -8,6 +8,8 @@ import {
 } from "./chatStore";
 import { formatArgs, previewArgs } from "./toolChip";
 import AgentState from "./AgentState";
+import { EMPTY_GOVERNANCE } from "./governance";
+import { normaliseGoal } from "./goal";
 import { compactionLine, running } from "./compaction";
 import { retryLine } from "./retry";
 import { argHint, delegateSentence, summariseDelegate } from "./delegate";
@@ -456,6 +458,20 @@ export default function Transcript() {
   const endRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
 
+  // R5-PERSIST: the stored durable state for the chat on screen. Read here rather
+  // than passed down so the panel and the transcript cannot disagree about which
+  // chat they are describing — the same reason `messages` is read here.
+  const saved = useChat((s) => (currentId ? s.savedAgent[currentId] : undefined));
+  // Normalised here, at the one place it is rendered, so the stored copy stays the
+  // raw wire payload and `chat/goal.ts` remains the only place the two backends'
+  // field names are reconciled. `undefined` for no goal, which AgentState treats
+  // the same as null.
+  const durableGoal = saved?.goal ? normaliseGoal(saved.goal) : null;
+  const durable = saved && (durableGoal || (saved.todos?.length ?? 0) > 0 ||
+                            saved.plan_mode === true)
+    ? { goal: durableGoal, todos: saved.todos ?? [], plan: saved.plan_mode === true }
+    : null;
+
   useEffect(() => {
     if (stick.current) endRef.current?.scrollIntoView({ block: "end" });
   }, [messages, streaming]);
@@ -502,6 +518,26 @@ export default function Transcript() {
           );
         })}
         {streaming && <LiveTurn turn={streaming} />}
+        {/* R5-PERSIST: the agent's DURABLE state, shown when no turn is live.
+            Goals, todos and plan mode outlive the turn that reported them, and the
+            panel above is drawn from the turn — so before this, reloading a chat
+            lost a goal the agent was still working toward, and the panel silently
+            disagreed with the agent.
+
+            Only when NOT streaming, because the live panel already draws these
+            from the turn and two copies of the same goal would be a bug, not a
+            feature. Nothing is rendered when the chat has no durable state, so a
+            chat that never used a backend with goals looks exactly as before. */}
+        {!streaming && durable && (
+          <AgentState
+            goal={durable.goal}
+            todos={durable.todos}
+            planMode={durable.plan}
+            subagents={[]}
+            usage={null}
+            governance={EMPTY_GOVERNANCE}
+          />
+        )}
         {lastError && <TurnError text={lastError} onClose={clearError} />}
         <div ref={endRef} />
       </div>

@@ -55,6 +55,23 @@ export interface Session {
   confirm_exec?: boolean;
   allow_absolute_reads?: boolean;
   allow_outbound_post?: boolean;
+  /** R5-PERSIST: the agent's durable state — its goal, its todo list, whether it
+   *  is in plan mode. Written by the SERVER mid-turn from the backend's own state
+   *  events, not by the PATCH surface, and the payloads are the raw wire shapes so
+   *  that `chat/goal.ts` stays the single place the two backends' field names are
+   *  reconciled.
+   *
+   *  Deliberately has no `subagents`: a subagent row names a child process that
+   *  belongs to the turn that spawned it, so restoring one would claim a child
+   *  that is long gone. */
+  agent_state?: SavedAgentState;
+}
+
+/** The durable half of the agent's state. See `Session.agent_state`. */
+export interface SavedAgentState {
+  goal?: Record<string, unknown> | null;
+  todos?: { content: string; status: string }[];
+  plan_mode?: boolean;
 }
 
 /** One agent backend, and what choosing it would cost.
