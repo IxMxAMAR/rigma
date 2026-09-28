@@ -1721,8 +1721,43 @@ def stop():
     from . import state as st
     s = st.read_state()
     if s is None:
-        typer.echo("not running")
-        raise typer.Exit(0)
+        # R3-ORPHAN: "not running" was not always true. When `rigma up` is
+        # killed hard its `finally` never runs, so the engine it started keeps
+        # the port while the record it would have been stopped by is gone. The
+        # user is then told "not running" while a model sits in VRAM, and the
+        # only way out is Task Manager. Look for Rigma's OWN engine before
+        # believing the absent record.
+        from . import orphan
+        # 11500 is the default UI port and therefore the default engine port
+        # (port - 1); a session started with --port elsewhere is not findable
+        # without a record, and saying so is better than guessing.
+        _found = orphan.find_engines(11499)
+        if len(_found) == 1:
+            _pid, _props = _found[0]
+            typer.echo("no state file, but " + orphan.describe(11499, _pid,
+                                                               _props))
+            _exe = ""
+            try:
+                import psutil
+                _exe = psutil.Process(_pid).exe() or ""
+            except Exception:
+                _exe = ""
+            _rec = orphan.record_from_props(_props, _pid, _exe, 11500)
+            st.write_state(_rec["model_slug"], _rec["quant"], 11500,
+                           engine_pid=_pid, ui_pid=-1,
+                           backend=_rec["backend"], ctx=_rec["ctx"],
+                           gguf=_rec["gguf"], engine=_rec["engine"])
+            s = st.read_state()
+        elif len(_found) > 1:
+            typer.echo("several Rigma engines are listening on 11499 — "
+                       "stopping none of them; use `rigma status` or stop the "
+                       "one you mean by pid")
+            for _pid, _props in _found:
+                typer.echo("        " + orphan.describe(11499, _pid, _props))
+            raise typer.Exit(1)
+        if s is None:
+            typer.echo("not running")
+            raise typer.Exit(0)
     killed = [key for key in ("engine_pid", "ui_pid") if st.kill_recorded(s, key)]
     from . import rag as _rag
     _rag.stop_sidecar()
@@ -1737,6 +1772,78 @@ def stop():
         # only reads the status could not tell a stop that happened from a stop
         # that found nothing to stop — `rigma stop && rigma up` walked past it.
         typer.echo("stale state — nothing was killed")
+        raise typer.Exit(1)
+
+
+def _adopt_or_refuse(port: int, reattach: bool, dry_run: bool) -> None:
+    """The port check, plus the one case the old sentence got wrong.
+
+    R3-ORPHAN: when `rigma up`'s `finally` is skipped — terminal closed, crash,
+    power event — the llama-server it started keeps the INFERENCE port (`port - 1`)
+    and `state.json`, which that same process writes, can be gone. The next
+    `rigma up` then sees a listener it does not recognise and says "free it or pass
+    a different --port" about a process that is Rigma's own, holding a loaded model
+    and the VRAM that goes with it. `rigma stop` meanwhile answers "not running",
+    because there is no record to read.
+
+    With `--reattach`, an engine that IS Rigma's own — its binary, out of Rigma's
+    engines directory, answering /health — is adopted: a state record is
+    reconstructed from what the engine itself reports, and the caller goes on to
+    serve the UI against the model that is already loaded. Without it the refusal
+    stands, but it now names what is actually there and the command that adopts it,
+    because "free the port" is not advice a user can act on when the port holds
+    their own model.
+
+    Never adopted: a listener whose binary is not under Rigma's engines directory,
+    or one that does not answer /health. Both fall through to the old refusal.
+
+    The UI port is checked FIRST, and the holder sentence names the port that is
+    actually held — the first version of this compared the held port to the UI port
+    and so never recognised the inference-port holder, which is the only one that
+    can be an engine. The test that drove the real listener caught it.
+    """
+    from . import orphan
+    from . import state as st
+
+    for needed in (port, port - 1):
+        holder = _port_holder(needed)
+        if not holder:
+            continue
+        pid = _listening_pid(needed)
+        mine = bool(pid) and needed == port - 1 and orphan.is_rigma_engine(pid)
+        if not mine:
+            typer.echo(f"port {needed} is already in use{holder} — "
+                       f"free it or pass a different --port")
+            raise typer.Exit(1)
+        if reattach:
+            props = orphan.engine_props(needed)
+            if not props:
+                typer.echo(f"port {needed} is already in use{holder} — that pid "
+                           f"runs Rigma's engine but is not answering /health, so "
+                           f"it is not safe to adopt")
+                raise typer.Exit(1)
+            exe = ""
+            try:
+                import psutil
+                exe = psutil.Process(pid).exe() or ""
+            except Exception:
+                exe = ""
+            rec = orphan.record_from_props(props, pid, exe, port)
+            st.write_state(rec["model_slug"], rec["quant"], port,
+                           engine_pid=pid, ui_pid=-1, backend=rec["backend"],
+                           ctx=rec["ctx"], gguf=rec["gguf"],
+                           engine=rec["engine"])
+            typer.echo(f"reattached to {orphan.describe(needed, pid, props)}")
+            typer.echo("        the UI will stop this engine when it exits, as if "
+                       "it had started it")
+            return
+        typer.echo(f"port {needed} is already in use{holder}")
+        typer.echo("        that is RIGMA'S OWN engine from an earlier session — "
+                   "its UI died before it could stop it")
+        typer.echo("        rigma up --reattach   brings the UI back to the model "
+                   "it already has loaded")
+        typer.echo("        rigma stop            stops it (it is Rigma's, and "
+                   "Rigma can identify it)")
         raise typer.Exit(1)
 
 
@@ -1877,6 +1984,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        detach: bool = typer.Option(False, "--detach", "-d",
                                    help="Run in the background; the terminal "
                                         "returns and Rigma keeps serving"),
+       reattach: bool = typer.Option(
+           False, "--reattach",
+           help="If Rigma's own engine from a previous session is still "
+                "serving on the port (its UI died before it could stop it), "
+                "adopt it and bring the UI back rather than refusing"),
        no_calibrate: bool = typer.Option(False, "--no-calibrate",
                                          help="Skip the one-time first-load "
                                               "hardware auto-tune"),
@@ -1947,12 +2059,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if dry_run:                              # dry-run never touches ports
             typer.echo(f"would start Rigma (no model) on :{port}")
             raise typer.Exit(0)
-        for needed in (port, port - 1):
-            holder = _port_holder(needed)
-            if holder:
-                typer.echo(f"port {needed} is already in use{holder} — "
-                           f"free it or pass a different --port")
-                raise typer.Exit(1)
+        _adopt_or_refuse(port, reattach, dry_run)
         # AUDIT F08-5: detaching used to happen ABOVE the port check, so the
         # parent claimed success (and exited 0) before the child could discover
         # the port was taken — and the child's error went to DEVNULL.
