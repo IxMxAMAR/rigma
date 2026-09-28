@@ -1740,6 +1740,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": "permission: must be one of "
                  + "/".join(sessions.PERMISSION_MODES)},
                 status_code=400)
+        # R6-ACP-TURN: refuse the VALUE for the same reason `permission` is checked.
+        # The adapter asks `== "acp"`, so an unknown name would silently mean `exec` —
+        # a chat that appears to have been switched to the transport that can answer a
+        # permission prompt and was not. A silent fallback to the OTHER wire is the
+        # failure this check exists to prevent.
+        if "mcode_transport" in body and \
+                body["mcode_transport"] not in sessions.MCODE_TRANSPORTS:
+            return JSONResponse(
+                {"error": "mcode_transport: must be one of "
+                 + "/".join(sessions.MCODE_TRANSPORTS)},
+                status_code=400)
         if "harness" in body:
             # Refuse the VALUE, not the turn. The seam's contract is that a
             # session never silently gets a backend other than the one it asked
@@ -2071,11 +2082,47 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             yield b"data: [DONE]\n\n"
             return
 
+        # R6-ACP-TURN: mcode has TWO wires and this session chooses between them.
+        #
+        # `exec` stays the default: it is the transport that has been exercised
+        # against a real engine. `acp` is offered because it is the only one of the
+        # two that can ANSWER a question — on `exec`, `smart` deciding to ask blocks
+        # the chat permanently, because there is no interaction host at all.
+        #
+        # Resolved ONCE here. The test is an explicit CAPABILITY on the adapter rather
+        # than the adapter's module name: a name check would keep answering True if the
+        # driver were renamed away, and then the ACP path would be reported as taken
+        # while `exec` silently ran — the kind of lie that survives a review. If the
+        # capability is ever missing while the field says "acp", the turn says so
+        # instead of quietly running the other wire.
+        _use_acp = str(s.get("mcode_transport") or "exec") == "acp"
+        _acp_driver = getattr(adapter, "drive_turn_acp", None) if _use_acp else None
+        if _use_acp and _acp_driver is None:
+            yield _sse({"message": "this chat is set to drive mcode over ACP, but "
+                                   "the adapter has no ACP driver — the turn was not "
+                                   "run, because running it over `exec` instead would "
+                                   "not be the transport you chose"}, event="error")
+            yield b"data: [DONE]\n\n"
+            return
+
         def _pump() -> None:
             """Drain the adapter on a worker thread. It never raises: a driver
             failure comes back as an error event, so the turn still ends."""
             try:
-                for ev in adapter.drive_turn(
+                if _use_acp:
+                    _events = _acp_driver(
+                        prompt,
+                        base_url=_harness.endpoint_for(
+                            _public_port(upstream_port)),
+                        model=str(state.get("model") or ""),
+                        system_prompt=sys_prompt,
+                        session_id=sid, cwd=str(s.get("workspace") or ""),
+                        max_tokens=EXTERNAL_MAX_TOKENS,
+                        context_window=int(state.get("ctx") or 0) or 32768,
+                        state=hstate, cancel=cancel,
+                        permission=str(s.get("permission") or "full"))
+                else:
+                    _events = adapter.drive_turn(
                         base_url=_harness.endpoint_for(
                             _public_port(upstream_port)),
                         model=str(state.get("model") or ""),
@@ -2084,7 +2131,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         max_tokens=EXTERNAL_MAX_TOKENS,
                         context_window=int(state.get("ctx") or 0) or 32768,
                         state=hstate, cancel=cancel,
-                        permission=str(s.get("permission") or "full")):
+                        permission=str(s.get("permission") or "full"))
+                for ev in _events:
                     loop.call_soon_threadsafe(q.put_nowait, ev)
             except Exception as e:              # pragma: no cover - defensive
                 loop.call_soon_threadsafe(

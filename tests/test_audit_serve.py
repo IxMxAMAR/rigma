@@ -796,7 +796,17 @@ def test_idle_unload_never_fires_while_a_turn_is_streaming(home, engine,
             during = list(unloads)
             # control: with nothing in flight the poller really does fire, so
             # `during` being empty is not just a loop that never ran
-            for _ in range(200):
+            #
+            # 1000 iterations at 20ms is a ~20s ceiling, raised from 200 (~4s)
+            # because 200 produced a FALSE RED once in five full-suite runs
+            # (2026-09-22): under load the poller did not get scheduled inside 4s, and
+            # the failure read as "the engine was unloaded under a running turn" —
+            # the exact defect this test guards — when nothing had been unloaded at
+            # all. A timing-sensitive control that can fail for load reasons makes a
+            # real regression indistinguishable from noise, which is worse than a
+            # slower test. The loop still exits the moment the poller fires, so the
+            # ceiling costs nothing when the machine is idle.
+            for _ in range(1000):
                 if unloads:
                     break
                 await asyncio.sleep(0.02)
@@ -804,7 +814,10 @@ def test_idle_unload_never_fires_while_a_turn_is_streaming(home, engine,
 
     during, after = asyncio.run(scenario())
     assert during == [], "the engine was unloaded under a running turn"
-    assert after, "the keepalive poller never ran; the test proves nothing"
+    assert after, ("the keepalive poller never ran, so this test proved nothing. "
+                   "That is a BROKEN TEST, not a broken keepalive — if this fires, "
+                   "check the poller is still started in the lifespan before "
+                   "suspecting the unload guard.")
 
 
 # --------------------------------------------------------------------------

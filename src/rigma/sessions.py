@@ -115,7 +115,25 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   # child process that belongs to the turn that spawned it; one
                   # restored after a reload would claim a child that is long gone,
                   # and a panel that lies is worse than a panel that is empty.
-                  "agent_state")
+                  "agent_state",
+                  # R6-ACP-TURN: WHICH of mcode's two wires drives this chat.
+                  #
+                  # mcode has two transports and they are not equivalent. `exec` is a
+                  # projection of one turn; ACP is a session, so it can report a queue,
+                  # a delegation tree, a plan review and the live model/permission
+                  # selects, and it can ASK a question and wait for the answer. The
+                  # permission prompt is the one that matters most: on `exec` nobody
+                  # can answer, so `smart` deciding to ask blocks the chat PERMANENTLY.
+                  #
+                  # A SESSION field because it is a property of the conversation, not
+                  # of a turn — and because switching mid-conversation would strand the
+                  # session id, which belongs to one wire.
+                  "mcode_transport")
+# Which wire mcode is driven over. `exec` is the DEFAULT and stays the default:
+# it is the transport that has been exercised against a real engine, and ACP's
+# `drive_turn_acp` has not. `acp` is offered because it is the only one of the two
+# that can answer a question at all.
+MCODE_TRANSPORTS = ("exec", "acp")
 # What each agent backend understands. `smart` classifies and asks when it
 # judges risk high; `full` does not ask; `off` disarms the agent's tools. `ask`
 # is refused headlessly by mcode itself ("requires an interactive host"), so it
@@ -144,6 +162,11 @@ _FIELD_TYPES: dict[str, type] = {
     "title": str, "system_prompt": str, "preset_id": str, "notes": str,
     "digest": str, "effort": str, "authors_note": str, "prefill": str,
     "workspace": str, "method": str, "harness": str, "permission": str,
+    # R6-ACP-TURN: a str, and validated against MCODE_TRANSPORTS at the write like
+    # `permission` is. Typing it here is not enough on its own — the type only stops
+    # a list reaching a reader; the VALUE check is what stops an unknown transport
+    # name reaching the adapter and being treated as "not acp".
+    "mcode_transport": str,
     "messages": list, "archive": list, "pending_nudges": list,
     "params": dict, "trigger_state": dict,
     # R5-PERSIST: a dict like `params`/`trigger_state`, so a client cannot store a
