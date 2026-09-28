@@ -791,6 +791,63 @@ the capability patch claim plan mode and a governance audit trail that cannot fi
 
 ---
 
+## 8g. Round 5, final: what is DONE and what is OPEN
+
+Seven commits this round. The bridge work is complete; what remains is upstream.
+
+### Done
+
+| Commit | What it fixed |
+|---|---|
+| `c033398` | R5-PERSIST — the agent's goal/todos/plan-mode survive a reload |
+| `e979ea2` | R5-AUDIT — mcode tool-call ids (parallel calls collapsed onto one chip); every DSH step's prose but the last was discarded |
+| `d480cfa` | R5-MCODE-DEADEND — a blocked mcode chat says so instead of `mcode exited 1` |
+| `78498cb` | R5-PLANMODE — stopped mounting AND advertising a plan mode nothing could enter or leave |
+| `fb3c6e5` | R5-TESTWAIT — four `_wait` helpers returned a wrong-state run on timeout, turning timing failures into misleading assertions |
+| `e29202c` | R5-MCODE-ERR — `turn.failed`'s `code`/`category`/`retryable`, `turn.completed`'s `durationMs`/`model`/`usageIncomplete`, and non-text content blocks |
+| `b896dff` | R5-USAGE-UI — render the token accounting both backends actually send |
+
+Final gates: **2715 Python tests, 0 failed, 0 errors, 3 skipped**; **363 frontend tests**
+(was 350); ruff and tsc clean; bundle `index-Fg5CMHEd.js` rebuilt and referenced.
+
+### The audit's central result, which is a NEGATIVE
+
+There is no remaining name mismatch at any of the four hops. Every SSE name `serve.py`
+emits has a `chatStore.ts` case, and every adapter state name has a `serve.py` branch.
+Both audit subagents confirmed this independently. The bug class that drove rounds 3 and 4
+is exhausted.
+
+### Open, and why each is NOT a bridge defect
+
+1. **mcode ACP** — blocked on `mcode login` (browser sign-in). **Needs the user.** The
+   largest remaining piece; ACP is complementary to `exec` rather than a replacement
+   (§9).
+2. **An interaction channel** (`ask_user_question`, plan-mode review) — impossible on
+   BOTH transports today. Rendering a question is a HOST UI capability: the `web` profile
+   mounts the answerer, `acp` mounts a seam with none, and Rigma mounts neither. This is
+   the root of the plan-mode and `ask_user` gaps and it is a feature, not a fix.
+3. **Governance/approval audit trail** — the three `approval/*` events come only from
+   unmounted `dsh-user-approval`, and `permission/preset` only from unmounted
+   `dsh-permission-presets`. `sandbox/mode` works, so the panel looks live while the
+   trail cannot fill. The SDK wire has NO approval-response method
+   (`HarnessSdkRequestMap` is exactly initialize/session/prompt/shutdown), so even
+   mounted it could only ever be display-only.
+4. **`_ok_of` numeric status mapping** — deliberately NOT guessed (§8f item 2). Needs one
+   observed mcode turn with a known success and a known failure.
+5. **Smaller verified gaps** — Rigma's MCP tools reach mcode but not DSH
+   (`dsh-mcp-client` installed, unmounted); `subagent/model-selection-policy` dropped by
+   the runner's keyword filter; workflow/PTC reduced to an opaque identifier;
+   background `bash` tasks never become rows; `/export` and `/feedback` slash commands.
+
+### The honest summary
+
+"Parity" for items 1-3 means BUILDING capabilities neither harness exposes to a client
+like Rigma, not repairing the bridge between them. Rigma now carries everything the two
+backends actually send over the transports available, it no longer claims anything it
+cannot do, and where a failure is a dead end it says so and names the way out.
+
+---
+
 ## 9. Gap 5, measured: mcode's ACP surface is real and blocked
 
 The earlier note said ACP "would additionally mean implementing the ACP *client*
