@@ -105,13 +105,26 @@ def _client(port):
 
 
 def _wait(client, rid, timeout=30):
+    # R5-TESTWAIT: this used to `return client.get(...)` on timeout, i.e. hand
+    # back whatever the run happened to be — usually still `running`. Every caller
+    # then asserted against a state the test had explicitly waited to leave, so a
+    # timing failure surfaced as a wrong-state assertion far from the cause. It is
+    # the same defect as test_phase4_lifecycle._wait, which produced an
+    # intermittent `assert None is True` in a restart test under full-suite load:
+    # the stale "running" snapshot was re-saved over a stopped run. `runs.save`
+    # guards terminal-is-sticky in the other direction and cannot help when the
+    # stale value is the one being written, so the wait itself must fail loudly.
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         r = client.get(f"/api/runs/{rid}").json()
         if r.get("status") in runs.TERMINAL:
             return r
         time.sleep(0.05)
-    return client.get(f"/api/runs/{rid}").json()
+    raise AssertionError(
+        f"run {rid} did not reach terminal within {timeout}s; "
+        f"last seen: status={r.get('status')!r} iteration={r.get('iteration')!r} "
+        f"halt_reason={r.get('halt_reason')!r}"
+    )
 
 
 def test_the_run_loop_does_not_erase_a_concurrent_session_write(engine, home):

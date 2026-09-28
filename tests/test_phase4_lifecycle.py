@@ -125,7 +125,24 @@ def _client(port):
 
 
 def _wait(client, rid, timeout=30, until=None):
+    """Poll until the run satisfies `until` (or is terminal), or FAIL LOUDLY.
+
+    It used to `return client.get(...)` on timeout, i.e. hand back whatever the
+    run happened to be — usually still `running`. That turned a timing failure
+    into a wrong-state assertion somewhere later: the restart tests then did
+    `r = runs.load(rid); r["iteration"] = MAX_ITERS; runs.save(r)`, which
+    re-persisted the stale `"running"` status, and `/restart` correctly refused
+    with "run is running". The reported failure was `assert None is True` in a
+    restart test — nothing pointed at the real cause, a stop that had not landed
+    within 30s under full-suite load.
+
+    `runs.save` guards the opposite direction (terminal is sticky, so a stale
+    "running" snapshot cannot un-halt a run that halted on disk); it cannot help
+    when the STALE value is the one being written. So the honest fix is here: a
+    wait that did not reach its condition must say so, with the last state seen.
+    """
     end = time.monotonic() + timeout
+    r: dict = {}
     while time.monotonic() < end:
         r = client.get(f"/api/runs/{rid}").json()
         if until and until(r):
@@ -133,7 +150,11 @@ def _wait(client, rid, timeout=30, until=None):
         if not until and r.get("status") in runs.TERMINAL:
             return r
         time.sleep(0.05)
-    return client.get(f"/api/runs/{rid}").json()
+    raise AssertionError(
+        f"run {rid} did not reach the expected state within {timeout}s; "
+        f"last seen: status={r.get('status')!r} iteration={r.get('iteration')!r} "
+        f"halt_reason={r.get('halt_reason')!r}"
+    )
 
 
 # --- units --------------------------------------------------------------------
