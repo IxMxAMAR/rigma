@@ -358,8 +358,12 @@ BACKENDS: dict[str, Harness] = {
         # this list is NOT about mounting capability — it is about the memory and
         # the workspace crossing the seam.
         capabilities=(
-            "Rigma's memory, as an MCP server: `remember`, `recall` and "
-            "`undo_last_change`, registered in mcode's own mcp.json",
+            # The roster is `mcp_server._ROSTER`, and it has FOUR entries.
+            # Naming three of them understated it and omitted the one an arm is
+            # most likely to want: searching the user's own indexed documents.
+            "Rigma's own tools, as an MCP server: `search_my_documents`, "
+            "`remember`, `recall` and `undo_last_change`, registered in "
+            "mcode's own mcp.json",
             "the chat's workspace and its AGENTS.md, written in before a turn",
             "a session that survives the process, so its plan, subagents and "
             "goals continue across turns instead of restarting each one",

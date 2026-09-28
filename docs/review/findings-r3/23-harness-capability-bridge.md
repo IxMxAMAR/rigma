@@ -401,3 +401,11 @@ disagree), and a fourth outcome exists: `unknown`, drawn as `?` in muted grey
 rather than as a tick. **An unreported result shown as a success is how a broken
 tool call reads as a working one** — and until this round that was the behaviour
 for every mcode tool result, because the adapter set `ok: True` unconditionally.
+
+**One more, found while checking a claim in this document.** §3 of the parity
+checkpoint asserted that mcode has Rigma's MCP server registered. It does — and
+the registration named an interpreter that cannot import it, because
+`ensure_mcp` only ever *assigned* that entry and never *corrected* one that had
+drifted. A present-but-wrong registration fell through both branches and was
+permanent. Fixed, verified end to end, and pinned by five tests; the full account
+is §8 of `24-harness-parity-checkpoint.md`.

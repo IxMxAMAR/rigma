@@ -355,6 +355,38 @@ def _mcp_spec(cwd: str) -> dict:
             "env": env}
 
 
+def _same_registration(have, spec) -> bool:
+    """Is a stored `rigma` entry the one we would write?
+
+    Compares the COMMAND and ARGS, which are the two things that identify which
+    Rigma is being launched, and treats the workspace as free: it is the chat's
+    directory and moves from turn to turn, so a mismatch there is normal rather
+    than drift.
+
+    `env` is compared on the keys that say WHICH rigma home and WHETHER code
+    tools were granted, ignoring the workspace for the same reason. Anything
+    else in the stored entry — a key a newer build adds — is left alone: this
+    decides whether to rewrite, not what the entry should contain.
+
+    Takes `object` on both sides on purpose. This reads a file a user can edit,
+    and `"rigma": "python -m rigma.mcp_server"` is a plausible hand-written
+    mistake; it must come back as "not the same" so the entry gets repaired,
+    not raise inside a turn.
+    """
+    if not isinstance(have, dict) or not isinstance(spec, dict):
+        return False
+    if list(have.get("args") or []) != list(spec.get("args") or []):
+        return False
+    if str(have.get("command") or "") != str(spec.get("command") or ""):
+        return False
+    h_env = have.get("env") if isinstance(have.get("env"), dict) else {}
+    s_env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
+    for key in ("RIGMA_HOME", "RIGMA_MCP_ALLOW_CODE"):
+        if str(h_env.get(key) or "") != str(s_env.get(key) or ""):
+            return False
+    return True
+
+
 def ensure_mcp(cwd: str = "") -> None:
     """Point the arm at Rigma's MCP server — or take the pointer away.
 
@@ -398,7 +430,24 @@ def ensure_mcp(cwd: str = "") -> None:
         wanted = False
 
     if wanted:
-        servers["rigma"] = _mcp_spec(cwd)
+        # An entry that is PRESENT BUT WRONG is the case that used to be
+        # permanent. This only ever assigned when `wanted`, so a registration
+        # written by an older build — or one pointing at an interpreter that has
+        # since lost Rigma — was left exactly as it was, every turn, forever. The
+        # arm then silently had no `remember`, `recall` or `undo_last_change`,
+        # and nothing anywhere said so: the file looks configured.
+        #
+        # The fix is to compare, not to assume. `ensure_mcp` already runs every
+        # turn and already reads this file, so the drift check is free.
+        #
+        # Compared WITHOUT `RIGMA_MCP_WORKSPACE`, which is the chat's workspace
+        # and changes legitimately from turn to turn. A repair must not be
+        # triggered by a value that is supposed to move.
+        spec = _mcp_spec(cwd)
+        have = servers.get("rigma")
+        if isinstance(have, dict) and _same_registration(have, spec):
+            spec = have          # keep the stored workspace; nothing to write
+        servers["rigma"] = spec
     else:
         servers.pop("rigma", None)
 
