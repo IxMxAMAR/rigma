@@ -827,16 +827,24 @@ is exhausted.
    credentials. **This is buildable and is the largest remaining piece of parity work**;
    it carries plan mode (which DSH cannot offer), a full goal control plane, delegation,
    steering and queueing. ACP is complementary to `exec`, not a replacement.
-2. **An interaction channel** (`ask_user_question`, plan-mode review) — impossible on
-   BOTH transports today. Rendering a question is a HOST UI capability: the `web` profile
-   mounts the answerer, `acp` mounts a seam with none, and Rigma mounts neither. This is
-   the root of the plan-mode and `ask_user` gaps and it is a feature, not a fix.
+2. **An interaction channel** — CORRECTED, see the matrix's §6a. "Impossible" was too
+   strong and named the wrong thing. Approvals ARE answerable over ACP on BOTH backends
+   (DSH maps `approval/request` onto `session/request_permission` with one-shot choices;
+   mcode maps `allow-once`/`allow-always`/`deny`). `ask_user_question` is
+   CLIENT-GATED on mcode — it is offered only if the client declares
+   `clientCapabilities().elicitation?.form`, and plan review only if it declares
+   `clientCapabilities.plan` — while DSH's ACP bridge has no elicitation handler at all.
+   So the gap is Rigma's: it has never been an *interactive* client, and the SDK wire it
+   chose cannot be one. Over ACP it can. Still a feature rather than a fix, but a
+   buildable one, and the same ACP client that unlocks mcode's goal plane unlocks this.
 3. **Governance/approval audit trail** — the three `approval/*` events come only from
    unmounted `dsh-user-approval`, and `permission/preset` only from unmounted
    `dsh-permission-presets`. `sandbox/mode` works, so the panel looks live while the
    trail cannot fill. The SDK wire has NO approval-response method
-   (`HarnessSdkRequestMap` is exactly initialize/session/prompt/shutdown), so even
-   mounted it could only ever be display-only.
+   (`HarnessSdkRequestMap` is exactly initialize/session/prompt/shutdown), so on THAT
+   transport it could only ever be display-only. **On ACP it need not be** — see item 2
+   and the matrix's §6a: DSH's ACP bridge answers approvals through
+   `session/request_permission`.
 4. **`_ok_of` numeric status mapping** — deliberately NOT guessed (§8f item 2). Needs one
    observed mcode turn with a known success and a known failure.
 5. **Smaller verified gaps** — Rigma's MCP tools reach mcode but not DSH

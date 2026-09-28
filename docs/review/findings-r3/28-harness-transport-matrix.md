@@ -323,8 +323,64 @@ Two further facts from the re-probe that change the picture:
 |---|---|---|
 | mcode ACP client (goals, delegation, queue, fork, resume, **plan mode**) | **nothing technical** — verified working with no credentials; needs an ACP client (JSON-RPC over stdio, stdin kept OPEN) and a running engine | re-probe above; supersedes the old `-32000` claim |
 | DSH ACP client (answerable permission, model/effort selection, session list/resume) | **nothing technical** — verified working; it is a design decision, since it would add a second DSH transport and give up goals/todos/plans on that path | `tools/dsh_acp_probe.py` output |
-| interactive approvals on the SDK wire | **impossible** — `HarnessSdkNotificationMap` is notifications-only | §1 |
-| `ask_user_question` on **either** DSH transport | **impossible** — answering is a Host UI capability and Rigma is an SDK client; ACP omits elicitation | §2.3 |
+| interactive approvals on the **SDK wire** | **impossible on that transport** — `HarnessSdkNotificationMap` is notifications-only | §1 |
+| interactive approvals via **either ACP** | **nothing technical** — both implement the channel; Rigma just does not drive ACP | §6a |
+| `ask_user_question` on the DSH **SDK wire** | **impossible on that transport** — notifications-only, no reply method | §1 |
+| `ask_user_question` via **mcode ACP** | **nothing technical** — gated only on the CLIENT declaring elicitation; Rigma does not | §6a |
+| `ask_user_question` via **DSH ACP** | **not implemented upstream** — DSH's ACP bridge has no elicitation handler at all | §6a |
+
+### 6a. CORRECTION (round 5, late): "impossible" was too strong, and it was the wrong noun
+
+Two rows above used to read "impossible" for interaction. Re-checked against both ACP
+implementations, and the accurate statement is narrower and more useful.
+
+**Approvals ARE reachable — on ACP, on both backends.** DSH's ACP bridge maps its own
+approval event straight onto ACP's permission request
+(`packages/acp/acp/src/index.ts:152-173`):
+
+```
+ctx.on('approval/request', (request, next) => {
+  ...
+  options: [
+    { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+    { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
+  ],
+  return conn.request(methods.client.session.requestPermission, params)
+```
+
+with the comment "Permission requests are a machine policy channel for ACP clients such
+as dsh-subagent-acp. The bridge offers one-shot choices only and never infers a durable
+grant from an unknown client response." mcode's ACP does the same
+(`session/request_permission`, mapping `allow-once`/`allow-always`/`deny`). So the
+governance panel's "display-only" limitation is a property of **the SDK wire Rigma chose**,
+not of the backends. An ACP client could answer.
+
+**`ask_user_question` is CLIENT-GATED on mcode, and absent upstream on DSH.**
+
+mcode's ACP implements the questionnaire channel and gates it on what the client
+declares (`chunks/run-acp-command-JPZMIXGP.js`, `Dx`):
+
+```js
+if (e.clientCapabilities().elicitation?.form != null) {
+  p = await e.connection.client.request(ee.client.elicitation.create, Cx(a, s), ...)
+  if (p && Sd.isAccept(p) && r.isCurrent()) d = await e.runtime.replyQuestionnaire(o, s.id, Mx(s, h))
+} else d = await ch(e, a, o, s, l, r.isCurrent())   // the non-interactive fallback
+```
+
+It also gates plan review on `e.clientCapabilities.plan` and emits a `plan_update`
+notification with the plan markdown. Rigma declares neither, so it gets the fallback and
+the questionnaire becomes the dead end R5-MCODE-DEADEND now reports.
+
+DSH is the opposite: its ACP bridge has **no elicitation handler at all** — the only
+client request it makes is `session/request_permission`. So on DSH, asking a question is
+genuinely unavailable on BOTH transports, for two different reasons (notifications-only
+wire; no ACP handler).
+
+**The revised sentence.** Interaction is not impossible; Rigma has never been an
+*interactive* client. On the SDK wire it cannot be, by protocol. Over ACP it can, and
+what is missing is on Rigma's side: an ACP client, and the `initialize` capability
+declarations (`elicitation.form`, `plan`) that make mcode offer the questionnaire and the
+plan review instead of silently degrading.
 
 ### The honest recommendation on DSH ACP
 
