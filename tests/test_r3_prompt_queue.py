@@ -24,7 +24,6 @@ buffers the whole response, so by the time a chunk is readable the turn is over.
   3. the safe default is asserted, because a default of "drop" is how this bug
      happened and any future caller would inherit it silently.
 """
-import inspect
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -174,13 +173,28 @@ def test_a_finished_turn_delivers_the_queued_prompt(client):
     assert not queued.get(sid)
 
 
+def _serve_source() -> str:
+    """The whole of `serve.py`, read from disk.
+
+    These two tests assert on SOURCE, because the difference between the two
+    release paths is the fix and neither can be reached from outside. They used
+    `inspect.getsource(serve.build_app)`, which resolves a function's start line
+    through `linecache` — and in a full-suite run that returned the body of a
+    DIFFERENT function, so both tests passed alone and failed together. Reading
+    the file the module came from has no such indirection and is the same
+    assertion.
+    """
+    with open(serve.__file__, encoding="utf-8") as f:
+        return f.read()
+
+
 def test_the_drop_decision_is_the_readers_cancel_and_not_any_unwind():
     """The two release paths, asserted at the source that defines them, because
     the difference BETWEEN them is the fix. `_drain`'s finally passes the
     `_cancelled` flag (set only by a stop); the disconnect safety net passes True
     (the reader is gone and the body was never read). Neither may drop
     unconditionally, which is what the old code did."""
-    src = inspect.getsource(serve.build_app)
+    src = _serve_source()
     assert "_release_claim(dropped=_cancelled)" in src, (
         "the drain must drop the queue only when the reader cancelled")
     assert "BackgroundTask(_release_claim, True)" in src, (
@@ -194,6 +208,6 @@ def test_the_release_helper_defaults_to_keeping_the_queue():
     """A default of "drop" is how this bug happened: any new caller would
     silently inherit the destructive behaviour. The default must be the safe
     one."""
-    src = inspect.getsource(serve.build_app)
+    src = _serve_source()
     assert "def _release_claim(dropped: bool = False)" in src, (
         "the safe default is what stops a future caller reintroducing R3-5")
