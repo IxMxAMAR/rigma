@@ -48,6 +48,38 @@ def emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
+def _load_state(path: str) -> dict:
+    """The persisted session, or {} when there is none.
+
+    WHY THE FAKE NEEDS THIS. The real mcode keeps a session across processes — that is
+    what makes `session/resume` mean anything, and it is why a goal created in one turn
+    is still there in the next. An in-memory-only fake answers `session/resume` and then
+    behaves as if the session were brand new, so a test that drove a control operation
+    and read it back would pass while the thing it was testing could not work at all.
+
+    A control route opens its OWN process per operation, so without this the fake makes
+    every operation look isolated — which is precisely the failure mode this models.
+    """
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            got = json.load(fh)
+        return got if isinstance(got, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(path: str, state: dict) -> None:
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+    except Exception:
+        pass
+
+
 def main(argv: list[str]) -> int:
     modes = list(MODES)
     no_extensions = False
@@ -58,6 +90,7 @@ def main(argv: list[str]) -> int:
     resume_renames = False
     resume_unknown = False
     record_path = ""
+    state_path = ""
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -81,6 +114,10 @@ def main(argv: list[str]) -> int:
             record_path = argv[i + 1]
             i += 2
             continue
+        elif a == "--state-file" and i + 1 < len(argv):
+            state_path = argv[i + 1]
+            i += 2
+            continue
         elif a == "--resume-renames":
             resume_renames = True
         elif a == "--resume-unknown":
@@ -93,7 +130,7 @@ def main(argv: list[str]) -> int:
 
     state = {"sessionId": "", "mode": modes[0] if modes else "default",
              "permission": "auto", "model": "m:custom_provider%3Arigma:local-test:v:thinking",
-             "goal": None, "asked": 0, "queue": [],
+             "goal": None, "asked": 0, "queue": [], "members": [],
              # THE GATE. mcode gates ALL FOUR extension notifications on the client
              # declaring this; it is not symmetric with the extension list it
              # advertises in the initialize RESPONSE. Reproduced here so the client's
@@ -133,6 +170,11 @@ def main(argv: list[str]) -> int:
             json.dumps(state.get("rejected_config", [])), encoding="utf-8")
 
     atexit.register(_dump_rejections)
+    # The session, persisted once at exit — where a real store would flush it. Registered
+    # AFTER the rejections so both survive an interpreter shutdown, and sited here rather
+    # than inside the request loop because a per-request save at the top of the body
+    # records the state as of BEFORE the request, silently dropping the last change.
+    atexit.register(lambda: _save_state(state_path, state))
 
     def ask(method: str, params: dict):
         """Send a SERVER-INITIATED request and block for its reply."""
@@ -159,6 +201,7 @@ def main(argv: list[str]) -> int:
         line = line.strip()
         if not line:
             continue
+
         try:
             req = json.loads(line)
         except ValueError:
@@ -236,6 +279,15 @@ def main(argv: list[str]) -> int:
             state["sessionId"] = (state["renamed_session"]
                                   if state.get("resume_renames") else asked)
             state["resumed"] = asked
+            # THE PERSISTED SESSION, read where a real store would be read. Without
+            # this, a resumed session looks brand new — so a control operation driven in
+            # its own process would appear to have worked and left nothing behind, and
+            # the test would be measuring the fake rather than the route.
+            saved = _load_state(state_path)
+            if saved:
+                for key in ("goal", "queue", "members", "mode", "permission", "model"):
+                    if key in saved:
+                        state[key] = saved[key]
             emit({"jsonrpc": "2.0", "id": rid, "result": {
                 "sessionId": state["sessionId"],
                 "modes": {"currentModeId": state["mode"],
@@ -303,6 +355,25 @@ def main(argv: list[str]) -> int:
                 emit({"jsonrpc": "2.0", "method": "mcode/session/goal_update",
                       "params": {"sessionId": state["sessionId"], "goal": state["goal"]}})
             continue
+        if method == "mcode/session/goal/patch":
+            # ADVERTISED AND PREVIOUSLY UNHANDLED. Patch merges onto the existing goal
+            # and REFUSES when there is none, because the real server has nothing to
+            # patch — an empty success here would let a caller believe it set a status
+            # on a goal that does not exist.
+            if state["goal"] is None:
+                emit({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32602, "message": "No active goal"}})
+                continue
+            for key in ("objective", "status", "statusReason", "tokenBudget"):
+                if key in params:
+                    state["goal"][key] = params[key]
+            emit({"jsonrpc": "2.0", "id": rid, "result": {"goal": state["goal"]}})
+            # GATED like every other extension notification: a client that did not
+            # declare `_meta` gets a correct answer and no update.
+            if state["extensions_enabled"]:
+                emit({"jsonrpc": "2.0", "method": "mcode/session/goal_update",
+                      "params": {"sessionId": state["sessionId"], "goal": state["goal"]}})
+            continue
         if method == "mcode/session/goal/clear":
             state["goal"] = None
             emit({"jsonrpc": "2.0", "id": rid, "result": {}})
@@ -351,7 +422,36 @@ def main(argv: list[str]) -> int:
             emit({"jsonrpc": "2.0", "id": rid, "result": {"turnId": "turn_1", "mode": "steered"}})
             continue
         if method == "mcode/session/delegation/get":
-            emit({"jsonrpc": "2.0", "id": rid, "result": {"delegations": []}})
+            # THE REAL SHAPE. It is a `snapshot` with `members`, not a `delegations`
+            # list, and `AcpDelegation` in the UI is built from those member fields —
+            # so the old shape was one no client could have been reading correctly.
+            emit({"jsonrpc": "2.0", "id": rid, "result": {"snapshot": {
+                "schemaVersion": 1,
+                "rootSessionId": state["sessionId"],
+                "members": list(state["members"])}}})
+            continue
+        if method == "mcode/session/delegation/stop":
+            # ADVERTISED AND PREVIOUSLY UNHANDLED. Stops the named member and reports
+            # its terminal status, which is what the caller needs to know the stop
+            # landed rather than merely being requested.
+            target = str(params.get("sessionId") or "")
+            found = None
+            for member in state["members"]:
+                if member["sessionId"] == target:
+                    member["status"] = "stopped"
+                    found = member
+            if found is None:
+                emit({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32602, "message": f"No such member: {target}"}})
+                continue
+            emit({"jsonrpc": "2.0", "id": rid, "result": {"member": found}})
+            if state["extensions_enabled"]:
+                emit({"jsonrpc": "2.0",
+                      "method": "mcode/session/delegation_update",
+                      "params": {"sessionId": state["sessionId"],
+                                 "snapshot": {"schemaVersion": 1,
+                                              "rootSessionId": state["sessionId"],
+                                              "members": list(state["members"])}}})
             continue
 
         if method == "session/cancel":

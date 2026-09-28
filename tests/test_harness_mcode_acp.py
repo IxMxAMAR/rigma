@@ -421,7 +421,11 @@ def test_queue_and_delegation_are_reachable(events):
         c.initialize()
         c.session_new("/tmp")
         assert c.queue_list() == {"items": []}
-        assert c.delegation_get() == {"delegations": []}
+        # The REAL shape: a `snapshot` carrying `members`, not a `delegations` list.
+        snap = c.delegation_get()["snapshot"]
+        assert snap["members"] == []
+        assert snap["rootSessionId"] == "mvs_fake_session"
+        assert snap["schemaVersion"] == 1
 
 
 def test_the_three_queue_operations_are_distinct_and_all_reachable(events):

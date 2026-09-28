@@ -1058,6 +1058,173 @@ def acp_permission_mode(permission: str) -> str:
     return _EXEC_TO_ACP_PERMISSION.get(str(permission or "").strip().lower(), "auto")
 
 
+
+# --- driving the control plane OUTSIDE a turn ---------------------------------
+#
+# WHY THIS EXISTS. Every method below was defined in `AcpClient` and NONE of them was
+# called by anything: the control plane was readable and not invocable. The queue, the
+# goal, steering and the delegation tree all arrived as NOTIFICATIONS, so the UI could
+# draw them and a user could not touch them. A control plane you can only watch is not a
+# control plane, and "carry the goal control plane" was not done until a caller existed.
+#
+# WHAT IT IS. A short-lived client that RESUMES an existing session, performs ONE
+# operation and stops. Verified against `tests/fake_acp_server.py`, which is a real
+# subprocess over real pipes: `session/resume` answers the same sessionId, and the goal
+# operations mutate state that a later `goal/get` reads back.
+#
+# WHY NOT DO IT ON THE TURN'S CONNECTION. That would be better — no second process, no
+# question about who owns the session — but the turn's connection lives inside
+# `drive_turn_acp`'s worker thread, and reaching into it from an HTTP route would need a
+# new cross-thread control channel. That is a larger change than this, and it is the
+# reason this path opens its own client. The cost is honest and bounded: one extra mcode
+# process per control action, which is what `probe_surface` already does for the
+# capability menu.
+#
+# THE OPERATION NAMES ARE AN ALLOWLIST, and that is the point. An HTTP body supplies the
+# name, so mapping it through a dict of literals is what stops a request from naming any
+# method it likes on the protocol — including `session/prompt`, which would be a model
+# turn smuggled in through a control route.
+_CONTROL_OPS: dict[str, tuple[str, tuple[str, ...]]] = {
+    # name: (what it does, the params it requires)
+    "goal_get":       ("read the goal", ()),
+    "goal_create":    ("create a goal", ("objective",)),
+    "goal_patch":     ("change a goal", ()),
+    "goal_clear":     ("clear the goal", ()),
+    "queue_list":     ("read the queue", ()),
+    "queue_enqueue":  ("add to the queue", ("text",)),
+    "queue_update":   ("edit a queued message", ("itemId", "text")),
+    "queue_delete":   ("drop a queued message", ("itemId",)),
+    "queue_steer":    ("promote a queued message into the running turn", ("itemId",)),
+    "steer":          ("inject text into the running turn", ("text",)),
+    "activate":       ("make this the active session", ()),
+    "delegation_get": ("read the delegation tree", ()),
+    "delegation_stop": ("stop a delegated child", ("sessionId",)),
+    "mode_set":       ("change the mode (plan/default)", ("modeId",)),
+    "config_set":     ("change a configOption (model, permissionMode)",
+                       ("optionId", "value")),
+}
+
+# The names the UI may offer, in the order it should offer them. A separate tuple rather
+# than `list(_CONTROL_OPS)`, because dict order is an implementation detail of how the
+# table happens to be written and this is a presentation order.
+CONTROL_OPS = tuple(_CONTROL_OPS)
+
+
+def control_op_error(op: str, params: dict | None) -> str:
+    """Why this operation cannot be attempted, or "" if it can.
+
+    Separate from `drive_control` so the ROUTE can refuse a bad request with a 400
+    BEFORE opening a process — an unknown operation or a missing parameter is a client
+    mistake, not a transport failure, and paying for an mcode launch to discover it
+    would also report it as the wrong kind of error.
+    """
+    if op not in _CONTROL_OPS:
+        return (f"unknown operation {op!r}; known: "
+                + ", ".join(sorted(_CONTROL_OPS)))
+    missing = [k for k in _CONTROL_OPS[op][1] if not (params or {}).get(k)]
+    if missing:
+        return f"{op} requires {', '.join(missing)}"
+    return ""
+
+
+def drive_control(op: str, params: dict | None = None, *, exe: str = "",
+                  session_id: str, cwd: str = "", timeout: float = 60.0) -> dict:
+    """Perform ONE control-plane operation on an existing session.
+
+    Returns `{"ok": bool, "op": str, "result": Any, "error": str}` and never raises,
+    for the same reason `probe_surface` never raises: this is called from a route that
+    is drawing a panel, and an exception would take down the panel rather than report
+    one failure.
+
+    A SESSION IS REQUIRED. Without one there is nothing to control, and creating a
+    session to control would produce a goal on a session the chat is not using — a
+    success that changed nothing the user can see.
+    """
+    out: dict = {"ok": False, "op": op, "result": None, "error": ""}
+    why = control_op_error(op, params)
+    if why:
+        out["error"] = why
+        return out
+    if not session_id:
+        out["error"] = ("this chat has no mcode session yet; the control plane needs "
+                        "one, so it becomes available after the first turn")
+        return out
+    exe = exe or _default_exe()
+    if not exe:
+        out["error"] = "mcode is not on PATH"
+        return out
+
+    body = dict(params or {})
+    # `exe` is a COMMAND LINE, not necessarily a single token: the turn paths build
+    # `[exe, "acp"]`, which is right for a real binary and wrong for a test double, which
+    # needs an interpreter too. Splitting here makes one string serve both, and the
+    # `shlex` failure falls back to the whole string rather than losing the executable.
+    #
+    # The `acp` subcommand is appended only when it is not already there, so a caller
+    # that passed a complete command line is not given it twice.
+    try:
+        import shlex as _shlex
+
+        argv = _shlex.split(exe, posix=(os.name != "nt"))
+    except Exception:
+        argv = [exe]
+    argv = [a.strip('"') for a in argv] or [exe]
+    if not any(a == "acp" for a in argv):
+        argv.append("acp")
+    client = AcpClient(argv, cwd=cwd or None, default_timeout=timeout)
+    try:
+        client.start()
+        # `declare_extensions` matters even here: without it the server still ANSWERS
+        # every call correctly and sends no `goal_update`, so the panel would not
+        # refresh after the user changed something. The answer and the notification are
+        # separately gated, which is the asymmetry this module documents.
+        client.initialize(timeout=timeout)
+        client.session_resume(session_id, timeout=timeout)
+        if op == "goal_get":
+            res = client.goal_get(timeout=timeout)
+        elif op == "goal_create":
+            res = client.goal_create(body, timeout=timeout)
+        elif op == "goal_patch":
+            res = client.goal_patch(body, timeout=timeout)
+        elif op == "goal_clear":
+            res = client.goal_clear(timeout=timeout)
+        elif op == "queue_list":
+            res = client.queue_list(timeout=timeout)
+        elif op == "queue_enqueue":
+            res = client.queue_enqueue(body, timeout=timeout)
+        elif op == "queue_update":
+            res = client.queue_update(body, timeout=timeout)
+        elif op == "queue_delete":
+            res = client.queue_delete(body, timeout=timeout)
+        elif op == "queue_steer":
+            res = client.queue_steer(body, timeout=timeout)
+        elif op == "steer":
+            res = client.steer(body, timeout=timeout)
+        elif op == "activate":
+            res = client.activate(timeout=timeout)
+        elif op == "delegation_get":
+            res = client.delegation_get(timeout=timeout)
+        elif op == "delegation_stop":
+            res = client.delegation_stop(body, timeout=timeout)
+        elif op == "mode_set":
+            res = client.set_mode(str(body["modeId"]), timeout=timeout)
+        elif op == "config_set":
+            res = client.set_config_option(str(body["optionId"]), body["value"],
+                                          timeout=timeout)
+        else:  # pragma: no cover - `control_op_error` already refused these
+            raise AcpError(f"unhandled operation {op!r}")
+        out["result"] = res
+        out["ok"] = True
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            client.stop()
+        except Exception:
+            pass
+    return out
+
+
 def drive_turn_acp(prompt: str, *, exe: str = "", base_url: str = "",
                    model: str = "", system_prompt: str = "", session_id: str = "",
                    cwd: str = "", max_tokens: int = 4096,

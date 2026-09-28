@@ -217,6 +217,19 @@ export const api = {
   answerApproval: (id: string, answer: ApprovalAnswer) =>
     j<{ ok: boolean; requestId?: string; allow?: boolean }>(
       "POST", `/api/sessions/${id}/approval`, answer),
+  /** Perform ONE operation on this chat's mcode control plane.
+   *
+   *  R6-ACP-CONTROL. Until this existed the control plane was READ-ONLY in the product:
+   *  the queue, the goal, the delegation tree and the mode/model selects all arrived as
+   *  notifications, so a panel could draw them and a user could not touch any of them.
+   *
+   *  The server refuses this on the `exec` transport, because `exec` projects a single
+   *  turn and holds no session — there is nothing to steer and no queue to add to. That
+   *  refusal is a 409 carrying the transport, so the UI can tell the user what to change
+   *  rather than showing a control that silently does nothing. */
+  control: (id: string, op: string, params: Record<string, unknown> = {}) =>
+    j<{ ok: boolean; op: string; result: unknown }>(
+      "POST", `/api/sessions/${id}/control`, { op, params }),
   deleteSession: (id: string) => j<unknown>("DELETE", `/api/sessions/${id}`),
   /** Stop the turn running in this chat. Distinct from aborting the fetch that
    *  is reading it: that only drops this browser's end, and the backend keeps

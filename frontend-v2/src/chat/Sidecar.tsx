@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import InlineError from "../InlineError";
 import { api, type HarnessInfo } from "../lib/api";
+import { permissionTrap } from "./commands";
+import ControlPanel from "./ControlPanel";
 import {
   createDraft,
   exportUrl,
@@ -618,6 +620,10 @@ function SamplingCard() {
   // is already fetched below for the sampling fields.
   const [grants, setGrants] = useState<Grants>(NO_GRANTS);
   const [grantErr, setGrantErr] = useState<string | null>(null);
+  // R6-ACP-CONTROL: the id MCODE knows this chat by, which is not the chat's own id.
+  // Read from the fetch below rather than fetched again — the control plane acts on an
+  // mcode SESSION, and there is none until the first turn has run.
+  const [mcodeSession, setMcpSession] = useState("");
   const [menu, setMenu] = useState<HarnessInfo[]>([]);
   // The one backend that moved, if any. Only INSTALLED ones count: a backend
   // that is not here cannot have drifted, and reporting it would be noise.
@@ -664,6 +670,9 @@ function SamplingCard() {
       setPresetId(raw.preset_id ?? "");
       setEffort(String((s as unknown as { effort?: string }).effort ?? ""));
       setGrants(readGrants(s));
+      const hs = (s as unknown as { harness_sessions?: Record<string, string> })
+        .harness_sessions;
+      setMcpSession(String(hs?.mcode ?? ""));
       setDirty(false);
     }).catch(() => {});
   }, [currentId]);
@@ -981,6 +990,29 @@ function SamplingCard() {
             <option value="acp">acp — a session, so a question can be answered</option>
           </select>
         </label>
+      )}
+      {/* R6-ACP-CONTROL: the operations, under the selector that decides whether they
+          are available. The panel renders its own reason when they are not, because
+          `exec` is the DEFAULT and a panel that vanished would leave a user with no idea
+          the control plane exists. */}
+      {currentId && (
+        <ControlPanel sessionId={currentId} harness={harness}
+                      transport={mcodeTransport} hasSession={mcodeSession !== ""} />
+      )}
+      {/* R6-ACP-REACH: the two selectors above have to AGREE, and until now nothing
+          said so at the point of choice. `smart` means "ask", and on `exec` there is
+          nobody to ask — so mcode raises a permission request, the turn fails, and its
+          guard then refuses to start ANY later session in this chat. The chat is
+          permanently dead, and the only fix is to switch the transport or start a new
+          chat. That is not a risk warning; it is a broken combination, and it was
+          documented in a tooltip rather than shown.
+
+          Rendered only for mcode, because `exec`/`acp` are mcode's wires and the same
+          pairing on another backend would be a warning about nothing. */}
+      {permissionTrap(harness, permission, mcodeTransport) !== "" && (
+        <p className="rounded-md bg-surface px-2.5 py-1.5 text-[11.5px] text-amber">
+          {permissionTrap(harness, permission, mcodeTransport)}
+        </p>
       )}
       {/* IMP-4 / AUDIT 13-3: the server gates run_shell / start_job /
           run_python behind the session field `confirm_exec`, and 13-2 gates
