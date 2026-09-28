@@ -683,3 +683,132 @@ def test_the_mcode_names_are_bridged_by_the_server_not_the_runner():
     # serve.py is dead code and the mcode path is unreachable again.
     for dsh_name in ('event="goal/change"', 'event="todo/write"'):
         assert dsh_name not in src, dsh_name
+
+
+# --- R5-STEPTEXT: a multi-step turn must not lose its earlier prose ----------
+#
+# `assistant/message` carries the step's text AND its token accounting. The runner
+# kept only `usage` and dropped `data.message` on the floor. That was a real loss,
+# because the SDK's `final_response` walks the events in REVERSE and returns the
+# FIRST `assistant/message` it finds (python/sdk/src/deepseek_harness/api.py:211-228)
+# — so it returns only the LAST step's text. Every earlier step's prose reached
+# nobody, and a turn with tool calls read as if the agent had said nothing between
+# them.
+#
+# The fix streams each step's prose as it arrives, which means the final answer
+# would arrive twice unless something subtracts it. `_Streamed` is that something,
+# and `harness_dsh._Run.spoke` is what stops an empty `done` being misread as a
+# failed model call.
+
+
+def _assistant_message(text: str, usage: dict | None = None):
+    return _session_event("assistant/message", {
+        "turn": 1, "step": 1,
+        "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": text}]},
+        **({"usage": usage} if usage else {}),
+    })
+
+
+def test_a_steps_prose_is_emitted_and_not_only_its_usage():
+    out = runner._project(_assistant_message("thinking out loud", {"input": 5}))
+    kinds = [e["type"] for e in out]
+    assert "text" in kinds, out
+    assert any(e["type"] == "state" and e["event"] == "usage" for e in out), out
+    # Prose FIRST, so the transcript reads in order.
+    assert kinds[0] == "text"
+    assert out[0]["text"] == "thinking out loud"
+
+
+def test_a_message_with_no_text_still_reports_its_usage():
+    """A step that only called tools has no prose but does have a token count."""
+    out = runner._project(_session_event("assistant/message", {
+        "turn": 1, "step": 1,
+        "message": {"role": "assistant",
+                    "content": [{"type": "tool_call", "name": "x"}]},
+        "usage": {"input": 3},
+    }))
+    assert [e["type"] for e in out] == ["state"], out
+
+
+def test_the_text_comes_from_the_message_not_the_envelope():
+    """The block list is `data.message.content`, the same shape the SDK's own
+    `final_response` reads — so the two cannot drift apart."""
+    out = runner._project(_assistant_message("from the message"))
+    assert out[0]["text"] == "from the message"
+
+
+def test_every_step_of_a_multi_step_turn_is_emitted():
+    """The bug: only the LAST step's text survived."""
+    streamed = runner._Streamed()
+    got = []
+    for step, text in enumerate(["first", "second", "third"], start=1):
+        for e in runner._project(_session_event("assistant/message", {
+            "turn": 1, "step": step,
+            "message": {"content": [{"type": "text", "text": text}]},
+        }), streamed):
+            if e["type"] == "text":
+                got.append(e["text"])
+    assert got == ["first", "second", "third"], got
+
+
+def test_the_final_answer_is_not_emitted_twice():
+    """The cost of streaming: `done` would repeat the last message."""
+    streamed = runner._Streamed()
+    for text in ("first", "the answer"):
+        runner._project(_assistant_message(text), streamed)
+    # final_response returns the LAST assistant/message, which was already sent.
+    assert streamed.remaining("the answer") == ""
+
+
+def test_only_the_unstreamed_tail_is_emitted():
+    """If final_response says more than the streamed copy, the difference goes
+    out rather than being dropped.
+
+    The two must share a genuine PREFIX for this to apply — a streamed snapshot of
+    a message that then finished streaming. ("the ans" and "the answer" look like
+    that pair and are NOT: the fifth character is `e` against `a`. That is a
+    DIVERGENCE, covered by `test_a_divergent_final_answer_is_emitted_whole`.)
+    """
+    streamed = runner._Streamed()
+    runner._project(_assistant_message("the answ"), streamed)
+    assert streamed.remaining("the answer") == "er"
+
+
+def test_a_divergent_final_answer_is_emitted_whole():
+    """A guess here would either duplicate a reply or silently drop one, so an
+    unmatched final is returned whole."""
+    streamed = runner._Streamed()
+    runner._project(_assistant_message("something else"), streamed)
+    assert streamed.remaining("the answer") == "the answer"
+
+
+def test_an_empty_final_emits_nothing():
+    streamed = runner._Streamed()
+    runner._project(_assistant_message("a reply"), streamed)
+    assert streamed.remaining("") == ""
+
+
+def test_a_streamed_turn_records_that_it_spoke():
+    """`_Run.spoke` is what tells an empty `done` apart from a dead model call.
+    Without it, EVERY successful multi-step turn would be reported as a failure,
+    because `done` is now legitimately empty."""
+    from rigma import harness_dsh
+
+    state = harness_dsh._Run()
+    assert state.spoke is False
+    ev = harness_dsh._event_for({"type": "text", "text": "hello"}, state)
+    assert ev is not None and ev.kind == "text"
+    assert state.spoke is True
+
+
+def test_thinking_and_notices_do_not_count_as_speaking():
+    """Only real prose makes an empty `done` legitimate: `thinking` is private
+    reasoning and `notice` is backend chatter."""
+    from rigma import harness_dsh
+
+    for payload in ({"type": "thinking", "text": "hmm"},
+                    {"type": "notice", "text": "working"}):
+        state = harness_dsh._Run()
+        harness_dsh._event_for(payload, state)
+        assert state.spoke is False, payload

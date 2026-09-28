@@ -281,6 +281,16 @@ class _Run:
     # either way, so without this the timeout message asserts a kill that may
     # not have happened while the agent keeps holding VRAM.
     tree_killed: bool | None = None
+    # R5-STEPTEXT: whether this turn has already put any prose on screen.
+    #
+    # The `done` handler below treats an empty `done` as "the model call failed",
+    # which was sound while `done` was the ONLY carrier of the reply. It is not any
+    # more: the runner streams each step's `assistant/message` prose and then sends
+    # `done` carrying only the part that was not already streamed — so on a normal
+    # turn `done` is legitimately EMPTY and the old check would have reported a
+    # failed model call on every successful turn. This flag is what tells the two
+    # apart.
+    spoke: bool = False
     stderr: deque = field(default_factory=lambda: deque(maxlen=400))
     lines: queue.Queue = field(default_factory=queue.Queue)
     cancel: threading.Event | None = None
@@ -291,7 +301,7 @@ def _tail(state: _Run) -> str:
     return "".join(state.stderr).strip()[-2000:]
 
 
-def _event_for(payload: dict) -> TurnEvent | None:
+def _event_for(payload: dict, state: _Run | None = None) -> TurnEvent | None:
     """Translate one runner event, or None when there is nothing to show.
 
     The runner is the only thing that understands DSH's wire format; this maps
@@ -299,12 +309,19 @@ def _event_for(payload: dict) -> TurnEvent | None:
     that carries a STRUCTURED fact — a goal, a todo list, a plan-mode switch, a
     subagent's lifecycle, a token count — so it keeps the backend's own event
     name and payload instead of being flattened into a sentence.
+
+    `state` (the run) is passed so this can RECORD that the turn has spoken. Only
+    real prose counts: `thinking` is the model's private reasoning and `notice` is
+    the backend's chatter, and neither is a reply that would make an empty `done`
+    legitimate.
     """
     kind = str(payload.get("type") or "").strip().lower()
     if kind in ("text", "thinking", "notice"):
         text = str(payload.get("text") or "")
         if not text and kind != "notice":
             return None  # an empty text event is noise, not progress
+        if kind == "text" and state is not None:
+            state.spoke = True
         return TurnEvent(kind=kind, text=text)
     if kind == "tool":
         args = payload.get("args")
@@ -421,7 +438,13 @@ def _read_events(state: _Run, timeout: float) -> Iterator[TurnEvent]:
             text = str(payload.get("text") or "")
             reason = str(payload.get("finish_reason") or "")
             if text:
+                state.spoke = True
                 yield TurnEvent(kind="text", text=text)  # the turn's final answer
+            elif state.spoke:
+                # The reply was already streamed as its own `assistant/message`,
+                # and `done` carries only what was left over — nothing. Silence
+                # here is the normal case, not a failure.
+                pass
             elif reason == "error":
                 # DSH reports a failed model call as an empty done, not as an
                 # exception. Passing that through as silence would make a dead
@@ -441,7 +464,7 @@ def _read_events(state: _Run, timeout: float) -> Iterator[TurnEvent]:
             # the deadline and report a timeout on a turn that had already
             # answered — which is exactly what a pooled runner did before this.
             return
-        event = _event_for(payload)
+        event = _event_for(payload, state)
         if event is not None:
             yield event
 

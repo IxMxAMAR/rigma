@@ -742,14 +742,28 @@ def _state_events(name: str, out) -> list[TurnEvent]:
 def _ok_of(call: dict) -> bool | None:
     """Whether the call succeeded, from the wire's own status.
 
-    The adapter used to say this could not be derived: "mcode does not flag
-    failure in the projected item — a tool that does not exist comes back as
-    status 3 with the reason as TEXT — so `ok` cannot be derived here". The
-    status IS on the item: the runtime normalises its numeric enum to
-    `started` / `completed` / `failed`. Only `failed` is a failure, and
-    anything unrecognised returns None, which the seam renders as UNKNOWN
-    rather than as success — the old behaviour claimed success for every
-    result including the failures.
+    THIS CURRENTLY ALWAYS RETURNS None, and that is stated rather than papered
+    over. The docstring here used to claim "the runtime normalises its numeric
+    enum to `started` / `completed` / `failed`". It does not. The wire value is
+    NUMERIC — this file's own note 570 lines above says so ("Tool-call item status
+    codes seen: 4 on first sight, then 5, then 1 while the arguments stream in,
+    then 3 with the result", :169-172) and the repo's own captured fixture agrees
+    (tests/test_harness_mcode.py:105,109,113,117 use 4, 5, 1, 3). So both word
+    comparisons below miss every real call, `ok` is None, and every mcode tool
+    chip renders UNKNOWN — never a tick, never a cross.
+
+    WHY THE MAPPING IS NOT GUESSED AT. mcode's own activity tracker maps
+    "1"/started/running/in_progress -> started, "2"/completed/succeeded/success ->
+    finished, "3"/failed/error -> failed (run-exec-command-EXGGKYPR.js, the
+    `toolStates` assignment). But that same file contains no `status: 3` literal
+    at all, while `status: 2`/`4`/`5` appear 342/300/69 times mostly as HTTP codes
+    in unrelated code — and the fixture pairs status 3 with the output "Tool not
+    found". Mapping 3 to a cross would therefore be right for the fixture and
+    quite possibly WRONG for a successful call, which would invert the meaning of
+    every chip in the transcript. A confidently wrong tick is worse than an
+    honest UNKNOWN, so this stays None until a real mcode turn is observed with
+    both a known-success and a known-failure result. The seam already renders
+    None as UNKNOWN rather than as success, which is the safe half.
     """
     status = str(call.get("status") or "").strip().lower()
     if status == "failed":
@@ -814,14 +828,30 @@ def map_event(obj: dict, seen: dict) -> list[TurnEvent]:
         # is HELD until its arguments exist — or until a result arrives without
         # them, in which case it is emitted just before the result rather than
         # dropped.
+        # The CALL ID goes with both events, and it is not cosmetic. serve.py
+        # falls back to the tool NAME when no id arrives — and says so in its own
+        # comment: "Falling back to the tool NAME collapses two calls to the same
+        # tool in one turn onto a single chip, because the frontend matches a
+        # result to the first still-running chip with that id." mcode runs its
+        # tools in PARALLEL (`executionMode: "parallel"`), so two `read`s or two
+        # `task`s in one turn is ordinary, and every result landed on whichever
+        # chip came first. The frontend also keys chips by this id
+        # (Transcript.tsx `key={c.id}`), so the fallback gave duplicate React keys
+        # as well.
+        #
+        # `iid` is the projector's `item.id`, which it sets from the tool call's
+        # own id (`toolCall.id`). The sibling adapter has always done this —
+        # harness_dsh.py passes `data={"id": ...}` on both events with the comment
+        # "The call id, so two calls to one tool in a turn stay two chips."
         if not seen.get(f"{iid}:call") and (args is not None or out is not None):
             seen[f"{iid}:call"] = True
-            events.append(TurnEvent("tool", name=name,
-                                    args=args if isinstance(args, dict) else {}))
+            events.append(TurnEvent("tool", name=name, args=args if isinstance(args, dict) else {},
+                                    data={"id": iid}))
         if out is not None and not seen.get(f"{iid}:result"):
             seen[f"{iid}:result"] = True
             events.append(TurnEvent("tool_result", text=_flatten(out),
-                                    name=name, ok=_ok_of(call)))
+                                    name=name, ok=_ok_of(call),
+                                    data={"id": iid}))
             # What the call DID, in structured form, for the tools whose
             # result carries state rather than prose. Emitted after the result
             # so the transcript reads call-then-outcome-then-state.

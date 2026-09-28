@@ -101,6 +101,77 @@ _STATE_EVENTS = (
 _USAGE_EVENT = "assistant/message"
 
 
+def _message_text(data: dict) -> str:
+    """The prose in one `assistant/message`, or "" when it carries none.
+
+    The payload is `{turn, step, message, usage?, interrupted?}`, where `message`
+    is an assistant message whose `content` is a list of blocks
+    (`packages/session/session-format-v0-to-v1/src/dispositions.ts:47-50`, and the
+    appender at `packages/core/agent-loop/src/agent.ts:406`). This is the same
+    shape the SDK's own `final_response` reads
+    (`python/sdk/src/deepseek_harness/api.py:218-227`), so the two cannot drift.
+    """
+    message = data.get("message")
+    owner = message if isinstance(message, dict) else data
+    content = owner.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        str(b.get("text") or "")
+        for b in content
+        if isinstance(b, dict) and b.get("type") == "text"
+    )
+
+
+class _Streamed:
+    """Text already sent for the current turn, so the final answer is not doubled.
+
+    WHY THIS EXISTS. Every `assistant/message` is streamed as it arrives, because
+    the alternative loses content: the SDK's `final_response` walks the events in
+    REVERSE and returns the FIRST `assistant/message` it finds
+    (`api.py:211-228`), so it returns only the LAST step's text. In a multi-step
+    turn — the normal shape once tools are involved — every earlier step's prose
+    reached nobody, and the transcript read as if the agent had said nothing
+    between tool calls.
+
+    The cost of streaming them is that the final answer would then arrive twice:
+    once as its own `assistant/message` and again in `done`. `remaining()` subtracts
+    what was already sent, so a caller can emit only the unmatched tail.
+    """
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+
+    def add(self, text: str) -> None:
+        if text:
+            self._parts.append(text)
+
+    def remaining(self, final: str) -> str:
+        """The part of `final` not already streamed.
+
+        Compares against the LAST streamed message, NOT against all of them
+        concatenated — `final_response` returns the last `assistant/message`, so a
+        turn whose steps said "first" then "the answer" has a final of exactly
+        "the answer", and joining the two would never match it. (That was the first
+        version of this method, and it silently failed to suppress the duplicate.)
+
+        An exact match means everything was streamed, so there is nothing left —
+        the common case. A `final` that STARTS WITH the last streamed message means
+        the streamed copy was an earlier snapshot of that same message and has since
+        been completed, so only the tail is new. (Prefix, not suffix: the streamed
+        text is the beginning of the final text, not its end.) Anything else — an
+        empty final, or one that diverges — is returned whole rather than guessed
+        at: showing a reply twice is a visible bug, and dropping it would be a
+        silent one.
+        """
+        last = self._parts[-1] if self._parts else ""
+        if not final or final == last:
+            return ""
+        if last and final.startswith(last):
+            return final[len(last):]
+        return final
+
+
 def _event_and_data(notification) -> tuple[str, dict]:
     """The inner session event and its payload, or ("", {}) when there is none.
 
@@ -120,7 +191,7 @@ def _event_and_data(notification) -> tuple[str, dict]:
     return kind, data if isinstance(data, dict) else {}
 
 
-def _project(notification) -> list[dict]:
+def _project(notification, streamed: "_Streamed | None" = None) -> list[dict]:
     """Every event this one notification should produce, in Rigma's vocabulary.
 
     Returns a LIST because one notification can carry more than one fact, and
@@ -129,7 +200,13 @@ def _project(notification) -> list[dict]:
     name and arguments — before this, the parent was told the literal string
     "session.event tool/call", so every DSH turn rendered zero tool chips and
     the tool name was unrecoverable downstream.
+
+    `streamed` carries the text already sent for this turn, so the final answer is
+    not emitted twice; see `_Streamed`. It is optional so a caller with no turn in
+    flight (a test, a probe) can project one notification on its own.
     """
+    if streamed is None:
+        streamed = _Streamed()
     method = str(getattr(notification, "method", "") or "notification")
     payload = getattr(notification, "payload", None)
     if not isinstance(payload, dict):
@@ -169,9 +246,23 @@ def _project(notification) -> list[dict]:
         return [{"type": "state", "event": kind, "data": data}]
 
     if kind == _USAGE_EVENT:
+        # R5-STEPTEXT: the step's PROSE goes out as well as its token count.
+        #
+        # This branch used to return only `usage` and drop `data.message` on the
+        # floor. Because the SDK's `final_response` returns only the LAST
+        # `assistant/message` (api.py:211-228), every earlier step's text reached
+        # nobody — a multi-step turn read as if the agent said nothing between
+        # tool calls. Both are emitted now, prose first so the transcript reads in
+        # order; `_Streamed` keeps the final answer from arriving twice.
+        out: list[dict] = []
+        prose = _message_text(data)
+        if prose:
+            streamed.add(prose)
+            out.append({"type": "text", "text": prose})
         usage = data.get("usage")
         if isinstance(usage, dict):
-            return [{"type": "state", "event": "usage", "data": usage}]
+            out.append({"type": "state", "event": "usage", "data": usage})
+        return out
 
     # Everything else keeps the old behaviour: a short progress line, and only
     # when it is one a person watching would want.
@@ -341,9 +432,13 @@ def _run_turn(job: dict, live: _Live) -> int:
             live.harness.start()
             live.key = key
 
+        # R5-STEPTEXT: per-turn, so one turn's text can never suppress the next
+        # turn's. `done` emits only what this has not already sent.
+        streamed = _Streamed()
+
         def on_notification(notification) -> None:
             try:
-                for ev in _project(notification):
+                for ev in _project(notification, streamed):
                     _emit(ev)
             except Exception:
                 pass  # a progress line must never break the turn
@@ -356,10 +451,17 @@ def _run_turn(job: dict, live: _Live) -> int:
             on_notification=on_notification,
         )
         live.session_id = str(getattr(result, "session_id", "") or "") or live.session_id
+        # R5-STEPTEXT: the final answer, MINUS whatever was already streamed as
+        # this message's own `assistant/message`. Usually that is all of it, so
+        # this emits nothing and `done` carries no duplicate text. When the SDK's
+        # final_response says more than the last step's event did, the difference
+        # goes out here rather than being lost.
+        final = str(getattr(result, "final_response", "") or "")
+        tail = streamed.remaining(final)
         _emit(
             {
                 "type": "done",
-                "text": str(getattr(result, "final_response", "") or ""),
+                "text": tail,
                 "finish_reason": str(getattr(result, "finish_reason", "") or ""),
                 # Reported for the record and for the cross-process case, where
                 # it is what the NEXT process would need if the SDK ever learns
