@@ -2032,10 +2032,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # empty stderr tail. Both are true and neither names the cause, which is
         # two screens away: there is no model loaded. Say so here instead.
         if not str(state.get("model") or "").strip():
-            yield _sse({"error": "no model is loaded, so there is nothing for "
-                                 "this harness to run against — load a model "
-                                 "from the Models tab, or start one with "
-                                 "`rigma up --model <slug>`"}, event="error")
+            yield _sse({"message": "no model is loaded, so there is nothing for "
+                                   "this harness to run against — load a model "
+                                   "from the Models tab, or start one with "
+                                   "`rigma up --model <slug>`"}, event="error")
             yield b"data: [DONE]\n\n"
             return
 
