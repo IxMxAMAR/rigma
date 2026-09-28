@@ -15,6 +15,7 @@ import { streamChat, type SseEvent } from "../lib/sse";
 import { DRAFT_KEY, parseDrafts, saveDrafts } from "./drafts";
 import { foldSubagent, type Subagent } from "./subagents";
 import { normaliseGoal, type NormalGoal } from "./goal";
+import { EMPTY_GOVERNANCE, foldApproval, type Governance } from "./governance";
 
 export interface Chip {
   id: string;
@@ -74,6 +75,14 @@ export interface StreamingTurn {
   subagents: Subagent[];
   /** The step's token accounting, when the backend reported any. */
   usage: Record<string, unknown> | null;
+  /** What the harness was allowed to do, and what it asked for. DSH records
+   *  its governance as `log-only` events — durable, never in the model
+   *  transcript — so this belongs beside the turn rather than inside it.
+   *
+   *  DISPLAY-ONLY, and that is the transport's property, not a shortcut: DSH's
+   *  SDK wire has no approval-response method, so approval is decided by the
+   *  policy engine. See chat/governance.ts. */
+  governance: Governance;
   /** These five names were emitted by the server and dropped here by the
    *  default arm, so a compaction, an observation-masking pass, a queued
    *  prompt and the server's own retitling were all silent. */
@@ -162,6 +171,7 @@ export const emptyTurn = (): StreamingTurn => ({
   notices: [],
   sources: [],
   goal: null,
+  governance: EMPTY_GOVERNANCE,
   todos: [],
   planMode: false,
   subagents: [],
@@ -268,6 +278,23 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
     }
     // The backend's structured state. Each is a fact with its own shape, so
     // none of them is folded into `text`.
+    case "approval":
+      return { ...turn, governance: foldApproval(turn.governance, d) };
+    case "sandbox":
+      return {
+        ...turn,
+        governance: { ...turn.governance, sandbox: String(d.mode ?? "") },
+      };
+    case "permission_preset":
+      return {
+        ...turn,
+        governance: { ...turn.governance, preset: String(d.preset ?? "") },
+      };
+    case "session_title":
+      // The SERVER's title, which is authoritative. Rigma's own auto-title is a
+      // guess made without it, so adopting this is a correction rather than a
+      // second opinion.
+      return { ...turn, title: String(d.title ?? "") || turn.title };
     case "goal": {
       // A payload with no objective is not a goal — `get_goal` answers
       // `{goal: null}` and an error answers `{error}`. Returning the turn
@@ -334,6 +361,16 @@ export interface ChatState {
   /** The last failure worth a sentence on screen. Held here because the turn
    *  that produced it is thrown away one round-trip after it appears. */
   lastError: string | null;
+  /** What a command just did, or refused to do.
+   *
+   *  A separate channel from `lastError` on purpose: "compacted" and "unknown
+   *  permission" are not failures, and routing them through the error banner
+   *  would train the user to read red as noise. It is also separate from a
+   *  turn's `notices`, which are the SERVER's status lines for a turn — a
+   *  command can be run with no turn in flight at all, and a turn's stream is
+   *  replaced when the next one starts, which would erase the message before it
+   *  could be read. */
+  notice: string | null;
   images: string[];               // data URIs staged in the composer
   /** Unsent composer text, keyed by the chat it was typed in. The draft is the
    *  one piece of user input that must NOT outlive its chat: a paragraph typed
@@ -377,7 +414,16 @@ export interface ChatState {
    *  back where it came from even if the user has switched chats since. */
   setDraft: (text: string, sid?: string) => void;
   stop: () => void;
+  /** Fold this chat's older turns into a digest. Returns the server's own
+   *  refusal message when it refuses, so the caller can SHOW it: the two
+   *  refusals (mid-reply, nothing to compact) are informative, and a silent
+   *  no-op would read as the command being broken. */
+  compactChat: () => Promise<string>;
   clearError: () => void;
+  /** Show what a command did. One message at a time: a queue would need
+   *  dismissals the user did not ask for. */
+  pushNotice: (text: string) => void;
+  clearNotice: () => void;
   /** Hand the current chat's turns to another backend. Unlike the other
    *  session patches this one is NOT fire-and-forget: the server refuses a
    *  backend it cannot run and says why, and that reason is the whole value of
@@ -415,6 +461,7 @@ export const useChat = create<ChatState>((set, get) => ({
   aborts: {},
   pendingVariants: {},
   lastError: null,
+  notice: null,
   images: [],
   drafts: loadDrafts(),
   harness: "native",
@@ -495,7 +542,8 @@ export const useChat = create<ChatState>((set, get) => ({
       const s = await api.getSession(id);
       set({ currentId: id, messages: s.messages,
             harness: s.harness ?? "native",
-        permission: s.permission ?? "full", lastError: null });
+        permission: s.permission ?? "full", lastError: null,
+        notice: null });
     } catch (e) {
       // AUDIT F50: a session click that failed used to do nothing at all
       set({ lastError: errText(e) });
@@ -507,7 +555,7 @@ export const useChat = create<ChatState>((set, get) => ({
       const s = await api.createSession();
       set({ currentId: s.id, messages: [], harness: s.harness ?? "native",
         permission: s.permission ?? "full",
-            lastError: null });
+            lastError: null, notice: null });
       await get().loadSessions();
     } catch (e) {
       set({ lastError: errText(e) });
@@ -525,7 +573,8 @@ export const useChat = create<ChatState>((set, get) => ({
       const s = await api.createSession();
       set({ currentId: s.id, messages: [],
             harness: s.harness ?? "native",
-            permission: s.permission ?? "full", lastError: null });
+            permission: s.permission ?? "full", lastError: null,
+            notice: null });
       await get().loadSessions();
       return s.id;
     } catch (e) {
@@ -833,5 +882,34 @@ export const useChat = create<ChatState>((set, get) => ({
       .then(() => get().aborts[currentId]?.abort());
   },
 
+  compactChat: async () => {
+    const { currentId } = get();
+    if (!currentId) return "there is no chat to compact";
+    // Refused locally as well as by the server, for the same reason the server
+    // refuses: the fold and the turn's save would race, and one of them would
+    // erase the other. Catching it here means no request is made at all. The
+    // per-session stream entry is the same signal `selectStreaming` reads.
+    if (get().streams[currentId]) {
+      return "this chat is still replying — compact it after";
+    }
+    try {
+      const out = await api.compactSession(currentId);
+      // Reload rather than patching in place: compaction REPLACES the visible
+      // transcript with a digest, so a client-side splice would have to
+      // reproduce the server's own choice of what survived.
+      const fresh = await api.getSession(currentId);
+      set({ messages: fresh.messages ?? [] });
+      return out.archived > 0
+        ? `compacted — ${String(out.archived)} earlier messages folded into a digest`
+        : "compacted";
+    } catch (e) {
+      return errText(e);
+    }
+  },
+
   clearError: () => set({ lastError: null }),
+
+  pushNotice: (text) => set({ notice: text }),
+
+  clearNotice: () => set({ notice: null }),
 }));

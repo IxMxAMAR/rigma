@@ -27,6 +27,7 @@ import yaml
 
 from rigma import _dsh_runner as runner
 from rigma import harness_dsh
+from rigma._dsh_runner import _project
 
 
 # The rows the bridge is expected to carry, grouped by the capability they buy.
@@ -189,9 +190,14 @@ def test_subagent_lifecycle_is_top_level_and_no_longer_filtered_out():
 
 def test_internal_chatter_is_still_dropped():
     """The filter existed for a reason: a one-line turn produced fifteen
-    notifications, and forwarding them all buries the reply."""
+    notifications, and forwarding them all buries the reply.
+
+    `session/title` was in this list and is deliberately NOT any more: it is the
+    server's own authoritative title for the chat, Rigma invents its own without
+    ever learning it, and the two can disagree. That is worth a line; the others
+    here are genuinely bookkeeping."""
     for kind in ("agent/inbox/spliced", "step/start", "request/header",
-                 "session/title", "delivery-accepted"):
+                 "delivery-accepted"):
         assert runner._project(_session_event(kind, {})) == [], kind
 
 
@@ -245,3 +251,101 @@ def test_the_capability_patch_is_handed_to_the_runner(tmp_path, window, tokens):
     from pathlib import Path
 
     assert Path(job_path).is_file()
+
+# --------------------------------------------------------------------------
+# DSH's governance events. These are the ones a reader most needs and could not
+# see at all: DSH records when it ASKED for permission, what it was told, and
+# which confinement was in force. All of them are `log-only` in DSH's own words —
+# durable and replayable, never part of the model transcript — which is exactly
+# why they belong beside the turn rather than inside it.
+#
+# The payload shapes are quoted from DSH's own declarations:
+#   approval/asked    {id, toolName, callId?, reason?}
+#                     packages/interaction/user-approval/src/types.ts:44
+#   approval/decided  {id, outcome}   outcome in allowed-once|rejected|cancelled|unavailable
+#                     packages/interaction/user-approval/src/types.ts:55
+#   approval/policy   {policy, source?}
+#                     packages/interaction/user-approval/src/index.ts:33
+#   sandbox/mode      {mode, source?}  mode in read-only|workspace-write|danger-full-access
+#                     packages/sandbox/sandbox-policy/src/session-mode.ts:33
+#   permission/preset {preset}
+#                     packages/interaction/permission-presets/src/index.ts:57
+#   session/title     {title, messageSeqs, source}
+#                     packages/session/session-format-v0-to-v1/src/dispositions.ts:86
+
+
+def test_an_approval_ask_carries_the_tool_and_the_reason():
+    evs = _project(_session_event("approval/asked", {
+        "id": "ap_1", "toolName": "write", "callId": "c1",
+        "reason": "outside the workspace",
+    }))
+    assert len(evs) == 1
+    assert evs[0]["type"] == "state"
+    assert evs[0]["event"] == "approval/asked"
+    # The WHOLE payload, not a summary: `id` is what pairs the ask with its
+    # decision, and dropping it would make the trail unpairable.
+    assert evs[0]["data"]["id"] == "ap_1"
+    assert evs[0]["data"]["toolName"] == "write"
+    assert evs[0]["data"]["reason"] == "outside the workspace"
+
+
+def test_an_approval_decision_carries_its_outcome_and_id():
+    evs = _project(_session_event("approval/decided",
+                                  {"id": "ap_1", "outcome": "allowed-once"}))
+    assert evs[0]["event"] == "approval/decided"
+    assert evs[0]["data"] == {"id": "ap_1", "outcome": "allowed-once"}
+
+
+def test_the_fail_closed_outcome_is_preserved_verbatim():
+    """`unavailable` means nobody could answer, so the tool was NOT permitted.
+    It must survive the bridge unmangled — it is the one outcome a reader could
+    mistake for a network problem."""
+    evs = _project(_session_event("approval/decided",
+                                  {"id": "ap_2", "outcome": "unavailable"}))
+    assert evs[0]["data"]["outcome"] == "unavailable"
+
+
+def test_the_sandbox_mode_and_permission_preset_are_carried():
+    sandbox = _project(_session_event("sandbox/mode",
+                                      {"mode": "danger-full-access"}))
+    assert sandbox[0]["event"] == "sandbox/mode"
+    assert sandbox[0]["data"]["mode"] == "danger-full-access"
+
+    preset = _project(_session_event("permission/preset", {"preset": "ask"}))
+    assert preset[0]["event"] == "permission/preset"
+    assert preset[0]["data"]["preset"] == "ask"
+
+    policy = _project(_session_event("approval/policy",
+                                     {"policy": "ask", "source": "delegation"}))
+    assert policy[0]["event"] == "approval/policy"
+    assert policy[0]["data"]["policy"] == "ask"
+
+
+def test_the_servers_own_title_is_carried():
+    """Rigma invents its own chat title without ever learning DSH's, so the two
+    can disagree. This is the authoritative one."""
+    evs = _project(_session_event("session/title",
+                                  {"title": "Fix the flaky test", "messageSeqs": [1, 2],
+                                   "source": "llm"}))
+    assert evs[0]["event"] == "session/title"
+    assert evs[0]["data"]["title"] == "Fix the flaky test"
+
+
+def test_every_governance_event_is_a_recognised_state_event():
+    """A guard against the list drifting: each of these must be in
+    `_STATE_EVENTS`, or the runner silently drops it and the UI shows nothing
+    while every test above still passes on a hand-built payload."""
+    from rigma import _dsh_runner as runner
+    for name in ("approval/asked", "approval/decided", "approval/policy",
+                 "sandbox/mode", "permission/preset", "session/title"):
+        assert name in runner._STATE_EVENTS, name
+
+
+def test_the_runner_no_longer_drops_governance_as_internal_chatter():
+    """`_notice_text` matched six keywords and truncated to 200 characters, so
+    these fell through it. They must now be structured events."""
+    for kind in ("approval/asked", "sandbox/mode", "session/title"):
+        evs = _project(_session_event(kind, {"id": "x", "mode": "read-only",
+                                             "title": "t", "toolName": "bash"}))
+        assert evs, kind
+        assert evs[0]["type"] == "state", kind

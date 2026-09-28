@@ -2135,6 +2135,28 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         yield _sse({"event": _ev, "data": _data}, event="subagent")
                     elif _ev == "usage":
                         yield _sse(_data, event="usage")
+                    elif _ev.startswith("approval/"):
+                        # One SSE name for the three approval events, with the
+                        # DSH name carried alongside so the UI can tell an ASK
+                        # from a DECISION from a POLICY SWITCH. `asked` and
+                        # `decided` share an `id`; the UI pairs them.
+                        yield _sse({"event": _ev, "data": _data},
+                                   event="approval")
+                    elif _ev == "sandbox/mode":
+                        yield _sse({"mode": str(_data.get("mode") or ""),
+                                    "source": str(_data.get("source") or "")},
+                                   event="sandbox")
+                    elif _ev == "permission/preset":
+                        yield _sse({"preset": str(_data.get("preset") or "")},
+                                   event="permission_preset")
+                    elif _ev == "session/title":
+                        # The SERVER's title, which is authoritative — Rigma's own
+                        # auto-title is a guess made without it. Sent separately
+                        # from `meta` so the rail can adopt it without waiting for
+                        # a turn to end.
+                        _title = str(_data.get("title") or "").strip()
+                        if _title:
+                            yield _sse({"title": _title}, event="session_title")
                     # An event name from a NEWER DSH than this Rigma knows is
                     # dropped rather than guessed at, the same way an unknown
                     # TurnEvent kind is: a wrong rendering is worse than none.

@@ -17,6 +17,13 @@
 
 import type { Subagent } from "./subagents";
 import { goalTone, phaseLabel, type NormalGoal } from "./goal";
+import {
+  outcomeLabel,
+  outcomeTone,
+  sandboxLabel,
+  sandboxTone,
+  type Governance,
+} from "./governance";
 
 /** Amber = in flight, moss = settled well, muted = not started, red = failed. */
 function todoTone(status: string): string {
@@ -66,25 +73,109 @@ function SubagentRow({ row }: { row: Subagent }) {
   );
 }
 
+/** What the harness was allowed to do, and what it asked for.
+ *
+ *  DISPLAY-ONLY, and that is the transport's property rather than a shortcut
+ *  taken here: DSH's SDK wire exposes exactly initialize / session/prompt /
+ *  shutdown, so there is no way to ANSWER an approval over it — approval is
+ *  decided by the policy engine. A clickable "Allow?" would therefore be a lie
+ *  about what this connection can do, so there is none.
+ *
+ *  What it is instead is the one thing a reader currently cannot see: that an
+ *  agent asked for permission, what it was told, and how confined it was. DSH
+ *  marks all of these `log-only` — durable, replayable, never in the model
+ *  transcript — which is exactly why they belong beside the turn, not in it.
+ */
+function GovernanceBlock({ gov }: { gov: Governance }) {
+  const hasTrail = gov.approvals.length > 0;
+  if (!hasTrail && !gov.sandbox && !gov.preset) return null;
+  return (
+    <div className="border-t border-line pt-1.5 flex flex-col gap-1">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em]">
+          permitted
+        </span>
+        {gov.sandbox && (
+          <span
+            className={`font-mono text-[10.5px] ${sandboxTone(gov.sandbox)}`}
+            title="DSH sandbox/mode — the confinement actually in force"
+          >
+            {sandboxLabel(gov.sandbox)}
+          </span>
+        )}
+        {gov.preset && (
+          <span className="font-mono text-[10.5px] text-muted">
+            preset {gov.preset}
+          </span>
+        )}
+      </div>
+      {hasTrail && (
+        <ul className="flex flex-col gap-0.5">
+          {gov.approvals.map((a, i) => (
+            <li key={`${a.id}-${String(i)}`} className="text-[11.5px] flex items-start gap-1.5">
+              <span
+                className={`font-mono mt-px ${
+                  a.outcome ? outcomeTone(a.outcome) : "text-amber"
+                }`}
+                aria-hidden="true"
+              >
+                {a.outcome ? (a.outcome === "allowed-once" ? "✓" : "✕") : "?"}
+              </span>
+              <span className="flex-1 min-w-0">
+                <span className="font-mono text-secondary">{a.toolName || a.kind}</span>
+                {a.outcome ? (
+                  <span className={`font-mono ${outcomeTone(a.outcome)}`}>
+                    {" "}— {outcomeLabel(a.outcome)}
+                  </span>
+                ) : (
+                  // An ASK with no decision yet. DSH appends exactly one
+                  // `decided` per `asked`, so this is genuinely pending — it is
+                  // not a lost answer.
+                  <span className="font-mono text-amber"> — asked, not yet decided</span>
+                )}
+                {a.reason && (
+                  <span className="block text-muted break-words">{a.reason}</span>
+                )}
+                {a.policy && (
+                  <span className="block text-muted">
+                    policy in force: <span className="font-mono">{a.policy}</span>
+                  </span>
+                )}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export default function AgentState({
   goal,
   todos,
   planMode,
   subagents,
   usage,
+  governance,
 }: {
   goal: NormalGoal | null;
   todos: { content: string; status: string }[];
   planMode: boolean;
   subagents: Subagent[];
   usage: Record<string, unknown> | null;
+  governance: Governance;
 }) {
   // Already normalised by the store, so this draws ONE shape whatever the
   // backend was: DSH's nested `goal/change` envelope and mcode's flat goal
   // object both arrive here as a NormalGoal.
   const hasGoal = goal !== null && goal.objective !== "";
   const hasUsage = usage !== null && Object.keys(usage).length > 0;
-  if (!hasGoal && todos.length === 0 && !planMode && subagents.length === 0 && !hasUsage) {
+  const hasGov =
+    governance.approvals.length > 0 || !!governance.sandbox || !!governance.preset;
+  if (
+    !hasGoal && todos.length === 0 && !planMode && subagents.length === 0 &&
+    !hasUsage && !hasGov
+  ) {
     return null;
   }
 
@@ -173,6 +264,11 @@ export default function AgentState({
             .join(" · ")}
         </p>
       )}
+
+      {/* Last, and separated by a rule: this is about the CONNECTION's
+          permissions rather than about the work, and putting it above the goal
+          would make confinement read as the turn's subject. */}
+      <GovernanceBlock gov={governance} />
     </div>
   );
 }

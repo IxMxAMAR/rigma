@@ -59,6 +59,26 @@ _STATE_EVENTS = (
     "plan/mode",
     "subagent/descriptor",
     "subagent/catalog",
+    # The governance events. These are the ones a user most needs and could not
+    # see at all: DSH records when it ASKED for permission, what it was allowed
+    # to do, and which confinement was in force — and every one of them is
+    # `log-only` in DSH's own words, meaning they are durable and replayable but
+    # never enter the model transcript. That is exactly the shape of fact a UI
+    # should show and the conversation should not carry.
+    #
+    # Worth stating plainly, because it bounds what the UI may do with them: the
+    # SDK wire has NO approval-response method (HarnessSdkRequestMap is exactly
+    # initialize / session/prompt / shutdown). Approval is decided by the policy
+    # engine, not by the client. So these are DISPLAY-ONLY — an audit trail — and
+    # a clickable "Allow?" button would misrepresent the transport.
+    "approval/asked",
+    "approval/decided",
+    "approval/policy",
+    "sandbox/mode",
+    "permission/preset",
+    # The server's own title for the session, which Rigma otherwise never learns:
+    # it invents its own title and the two can disagree.
+    "session/title",
 )
 
 # `assistant/message` carries the step's token accounting. It is the ONLY

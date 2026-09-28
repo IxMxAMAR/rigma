@@ -149,4 +149,11 @@ export const api = {
    *  menu. */
   listHarnesses: (check = false) =>
     j<HarnessMenu>("GET", `/api/harnesses${check ? "?check=1" : ""}`),
+  /** Fold this chat's older turns into a digest. The server refuses while the
+   *  chat is mid-reply (409) and when there is nothing to fold (400), and both
+   *  refusals are worth surfacing verbatim: a silent no-op would read as the
+   *  command not working. */
+  compactSession: (id: string, keep = 6) =>
+    j<{ session: Session; archived: number }>(
+      "POST", `/api/sessions/${id}/compact`, { keep }),
 };

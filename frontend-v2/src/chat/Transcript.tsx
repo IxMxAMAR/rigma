@@ -302,6 +302,7 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         planMode={turn.planMode}
         subagents={turn.subagents}
         usage={turn.usage}
+        governance={turn.governance}
       />
       {/* Compaction, observation-masking and the prompt queue. All three were
           emitted by the server and dropped by the store's default arm, so a
