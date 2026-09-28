@@ -602,6 +602,26 @@ call being down. The test asserts the summariser request comes **first**, by ord
 rather than presence, because "a compaction happened somewhere in this turn" would
 also pass if it fired after the reply that was supposed to fail.
 
+**Not for a run**, and the full suite is what said so. A run has its own answer to
+a filling window — masking observations, which shrinks the environment's replies
+and leaves the model's own reasoning byte-identical — and the end-of-turn path
+already prefers it for exactly that reason: summarising is lossy in the worst
+direction for an agent, which navigates by exact strings (filenames, error text,
+the argument that worked). The first version of this fix summarised runs too,
+which would have silently replaced the better mechanism with the worse one; two
+`test_auto_compact` tests caught it, one asserting `event: masked` and getting the
+compaction notice, the other finding the model's own turns had been folded away. A
+run's durable state is on disk, so a wedged run is a restart rather than a lost
+conversation.
+
+The same full run caught the second collision: the R3-CHAT-2 breaker stops
+`test_runaway_tool_loop_keeps_tools_on_last_round`, whose upstream asks for the
+same call every round. That is the breaker working, but the test is about
+something else — that the last round still advertises tools, because a withheld
+tool leaks the raw `<tool_call>` text into the chat — so it is retargeted onto the
+breaker's boundary. Two new guards, two existing tests asserting defect-adjacent
+behaviour, and **neither collision is visible from the focused runs**.
+
 ---
 
 ## 10. Deliberately not changed
