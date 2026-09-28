@@ -49,6 +49,10 @@ export interface Session {
   use_tools?: boolean;
   harness?: string;
   permission?: string;
+  /** R6-ACP-TURN: which of mcode's two wires drives this chat — `exec` (default) or
+   *  `acp`. Only meaningful for mcode, and a SESSION field rather than a turn's,
+   *  because the mcode session id belongs to one wire. */
+  mcode_transport?: string;
   /** AUDIT 13-2/13-3 per-chat tool grants. None has a server default, so a
    *  chat that has never been toggled reports all three absent — which the UI
    *  must read as OFF, never as granted (see chat/grants.ts). */

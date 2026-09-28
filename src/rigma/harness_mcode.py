@@ -117,6 +117,17 @@ VERIFIED = "0.5.4"
 from .harness import TurnEvent          # noqa: E402
 from . import harness as _harness       # noqa: E402
 
+# R6-ACP-TURN: the SECOND transport, re-exported so it is reachable as
+# `adapter.drive_turn_acp`. The seam in `serve.py` looks for this attribute rather
+# than testing the module's name, because a name test keeps answering True after a
+# rename and would report the ACP path as taken while `exec` silently ran.
+#
+# Imported HERE rather than inside the caller so a missing module is an ImportError at
+# load, not a silent `None` at turn time. `harness_mcode_acp` imports nothing from this
+# module at module level (it resolves `bin_path` lazily), so there is no cycle.
+from .harness_mcode_acp import drive_turn_acp    # noqa: E402,F401
+
+
 # mcode's own id for a provider Rigma adds. The `custom_provider:` prefix is
 # part of the id it prints, and the model reference has to spell it out.
 PROVIDER = "rigma"

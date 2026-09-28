@@ -607,6 +607,9 @@ function SamplingCard() {
   const setHarness = useChat((s) => s.setHarness);
   const permission = useChat((s) => s.permission);
   const setPermission = useChat((s) => s.setPermission);
+  // R6-ACP-TURN: which of mcode's two wires drives this chat.
+  const mcodeTransport = useChat((s) => s.mcodeTransport);
+  const setMcodeTransport = useChat((s) => s.setMcodeTransport);
   // R3-UI-1: creates the chat a per-chat setting belongs to, rather than
   // dropping the write when none is open yet.
   const ensureSession = useChat((s) => s.ensureSession);
@@ -944,6 +947,38 @@ function SamplingCard() {
             <option value="full">full — never asks</option>
             <option value="smart">smart — asks, so a turn can fail</option>
             <option value="off">off — no tools at all</option>
+          </select>
+        </label>
+      )}
+      {/* R6-ACP-TURN: mcode is driven over ONE of two wires, and they are not
+          equivalent. `exec` projects a single turn; ACP holds a session, so it can
+          report the queue, the delegation tree, the plan review and the live
+          model/permission selects — and, the reason this control exists at all, it can
+          ASK a question and wait for the answer.
+
+          On `exec` nobody can answer, so `smart` deciding to ask blocks the chat
+          PERMANENTLY rather than for one turn. That is stated in the option label
+          rather than left in a tooltip, because it is the whole reason to switch.
+
+          Gated on mcode: the field is mcode's, and showing it on DSH or Rigma's own
+          loop would offer a knob that changes nothing. `exec` stays the default — it
+          is the wire that has been exercised against a real engine. */}
+      {harness === "mcode" && (
+        <label className="flex items-center gap-2 text-[12.5px]"
+               title={"Which of mcode's two wires drives this chat. exec: one turn, "
+                      + "projected — the queue, the delegation tree and the live "
+                      + "selects are not reported at all. acp: a real session, so all "
+                      + "of those arrive AND a question can be answered. Applies to "
+                      + "THIS chat, from its next turn."}>
+          <span className="w-24 text-secondary">transport</span>
+          <select
+            value={mcodeTransport}
+            aria-label="mcode transport"
+            onChange={(e) => void setMcodeTransport(e.target.value)}
+            className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"
+          >
+            <option value="exec">exec — one turn, nothing can be answered</option>
+            <option value="acp">acp — a session, so a question can be answered</option>
           </select>
         </label>
       )}

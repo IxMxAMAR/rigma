@@ -571,6 +571,16 @@ export interface ChatState {
    *  that already knows which chat that is. */
   harness: string;
   permission: string;
+  /** R6-ACP-TURN: WHICH of mcode's two wires drives this chat.
+   *
+   *  `exec` is a projection of one turn; `acp` is a session, so it can report a
+   *  queue, a delegation tree, a plan review and the live selects — and it can ASK a
+   *  question and wait for the answer. That last one is why this exists: on `exec`
+   *  there is no interaction host, so `smart` deciding to ask blocks the chat
+   *  PERMANENTLY rather than for one turn.
+   *
+   *  A session field, and only meaningful for mcode. `exec` stays the default. */
+  mcodeTransport: string;
   /** R5-PERSIST: the agent's durable state for the chat on screen, keyed by
    *  session id — the goal, the todo list, and plan mode, as the SERVER stored
    *  them.
@@ -635,6 +645,7 @@ export interface ChatState {
   /** How much the agent may do without asking. A trade, not a fact: the
    *  mode that asks fails the run headlessly, so the default is `full`. */
   setPermission: (mode: string) => Promise<void>;
+  setMcodeTransport: (wire: string) => Promise<void>;
 }
 
 /** The live turn for the chat on screen — nothing else may render. */
@@ -669,6 +680,7 @@ export const useChat = create<ChatState>((set, get) => ({
   drafts: loadDrafts(),
   harness: "native",
   permission: "full",
+  mcodeTransport: "exec",
   savedAgent: {},
 
   loadSessions: async () => {
@@ -751,7 +763,7 @@ export const useChat = create<ChatState>((set, get) => ({
       const s = await api.getSession(id);
       set({ currentId: id, messages: s.messages,
             harness: s.harness ?? "native",
-        permission: s.permission ?? "full", lastError: null,
+        permission: s.permission ?? "full", mcodeTransport: s.mcode_transport ?? "exec", lastError: null,
         notice: null,
         // R5-PERSIST: the agent's durable state comes back with the chat, so the
         // panel survives a reload. Replaced rather than merged — this is the
@@ -769,6 +781,7 @@ export const useChat = create<ChatState>((set, get) => ({
       const s = await api.createSession();
       set({ currentId: s.id, messages: [], harness: s.harness ?? "native",
         permission: s.permission ?? "full",
+      mcodeTransport: s.mcode_transport ?? "exec",
             lastError: null, notice: null });
       await get().loadSessions();
     } catch (e) {
@@ -787,7 +800,7 @@ export const useChat = create<ChatState>((set, get) => ({
       const s = await api.createSession();
       set({ currentId: s.id, messages: [],
             harness: s.harness ?? "native",
-            permission: s.permission ?? "full", lastError: null,
+            permission: s.permission ?? "full", mcodeTransport: s.mcode_transport ?? "exec", lastError: null,
             notice: null });
       await get().loadSessions();
       return s.id;
@@ -826,6 +839,23 @@ export const useChat = create<ChatState>((set, get) => ({
       // Same reasoning as the backend picker: a rejected value that stays on
       // screen makes the NEXT turn's failure look like something else.
       set({ permission: prev, lastError: errText(e) });
+    }
+  },
+
+  setMcodeTransport: async (wire) => {
+    if (wire === get().mcodeTransport) return;
+    const sid = await get().ensureSession();
+    if (!sid) return;
+    const prev = get().mcodeTransport;
+    set({ mcodeTransport: wire, lastError: null });
+    try {
+      await api.updateSession(sid, { mcode_transport: wire });
+    } catch (e) {
+      // Same reasoning as `setPermission`: a rejected value left on screen makes the
+      // next turn's behaviour look like something else entirely — and here the
+      // difference is which WIRE ran, so the lie would be about whether a permission
+      // prompt could have been answered.
+      set({ mcodeTransport: prev, lastError: errText(e) });
     }
   },
 
