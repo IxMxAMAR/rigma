@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import uuid
 import zipfile
 from importlib import resources
 from pathlib import Path
@@ -49,9 +50,14 @@ def _custom_dir() -> Path:
 
 def update_registry(url: str = DEFAULT_REGISTRY_ZIP) -> Path:
     dest = _registry_cache_dir()
-    tmp = dest.with_suffix(".tmp")
+    # R3-STORE-10: this used a FIXED `<dest>.tmp`. Two concurrent `rigma update`
+    # runs — or a CLI update racing the server's own — then shared one staging
+    # directory: the second `rmtree` deleted the first's extraction mid-flight and
+    # the rename below failed on a half-extracted tree. A unique staging name per
+    # call, removed on every exit path.
+    tmp = dest.with_name(f"{dest.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     if tmp.exists():
-        shutil.rmtree(tmp)
+        shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(io.BytesIO(_fetch_bytes(url))) as z:
         z.extractall(tmp)
     # AUDIT 06R3-5: a registry re-packaged flat — no `rigma-registry-master/`

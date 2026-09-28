@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 
+from .atomicio import atomic_write_json
 from .runtime import rigma_home
 
 # Every setting, and the value a caller who does not name it gets.
@@ -99,10 +100,10 @@ def save(patch: dict) -> dict:
     cur = load()
     cur.update(clean)
     p = settings_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    # R3-STORE-10: a fixed `<name>.tmp` beside the target collides under
+    # concurrency, and this is the store the settings UI writes while the server
+    # may be reading it. Shared writer: unique temp + retried replace.
+    atomic_write_json(p, cur, indent=2)
     return cur
 
 

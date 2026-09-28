@@ -6,6 +6,7 @@ import platform
 
 import psutil
 
+from .atomicio import atomic_write_json
 from .models import CACHE_BYTES
 from .runtime import rigma_home
 
@@ -186,10 +187,8 @@ def read_calib_marker() -> dict | None:
 
 def _write_calib_marker(model: str, step: str) -> None:
     p = _calib_marker_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"model": model, "step": step}), encoding="utf-8")
-    tmp.replace(p)
+    # R3-STORE-10: fixed temp name -> unique temp + retried replace.
+    atomic_write_json(p, {"model": model, "step": step})
 
 
 def _clear_calib_marker() -> None:

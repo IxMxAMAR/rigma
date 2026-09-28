@@ -6,6 +6,7 @@ import secrets
 import time
 from pathlib import Path
 
+from .atomicio import atomic_write_json
 from .runtime import rigma_home
 
 MUTABLE_FIELDS = ("name", "system_prompt", "greeting", "params")
@@ -66,9 +67,8 @@ def save(preset: dict) -> None:
         raise ValueError("builtin presets are read-only")
     preset["updated_at"] = time.time()
     p = _path(preset["id"])
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(preset, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    # R3-STORE-10: fixed temp name -> unique temp + retried replace.
+    atomic_write_json(p, preset, indent=2)
 
 
 def load(preset_id: str) -> dict | None:

@@ -14,6 +14,7 @@ import secrets
 import time
 from pathlib import Path
 
+from .atomicio import atomic_write_text
 from .runtime import rigma_home
 
 # terminal statuses release the active-run pointer
@@ -79,9 +80,14 @@ def new_id() -> str:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    """R3-STORE-10: this used a FIXED `<name>.tmp` beside the target, so two
+    concurrent writers collided — one replaced the other's temp mid-write, or the
+    rename failed with `PermissionError [WinError 32]`. The run loop saves
+    `run.json` every turn and a tool thread can save `live.json` at the same
+    instant, so this is the concurrency it was most likely to meet. Delegates to
+    the one correct implementation rather than repeating the pattern.
+    """
+    atomic_write_text(path, text)
 
 
 # --- lifecycle ---------------------------------------------------------------

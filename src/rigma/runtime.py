@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 from huggingface_hub import hf_hub_download
 
+from .atomicio import atomic_write_json
 from .models import GgufFile, RunPlan
 
 
@@ -111,9 +112,8 @@ def update_engines_manifest(url: str = ENGINES_MANIFEST_URL) -> bool:
         if not _manifest_ok(cand):
             return False
         p = rigma_home() / "engines.json"
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cand, indent=1), encoding="utf-8")
-        tmp.replace(p)
+        # R3-STORE-10: fixed temp name -> unique temp + retried replace.
+        atomic_write_json(p, cand, indent=1)
         return True
     except Exception:
         return False
@@ -260,9 +260,10 @@ def ensure_engine(backend: str, os_name: str) -> Path:
         archive.unlink()
     # AUDIT F08-4: temp-file + replace, like update_engines_manifest — a plain
     # write_text leaves a torn lock.json behind if the process dies mid-write.
-    lock_tmp = lock_path.with_suffix(".tmp")
-    lock_tmp.write_text(json.dumps(lock, indent=2), encoding="utf-8")
-    lock_tmp.replace(lock_path)
+    # R3-STORE-10: and the temp name must be unique, or two processes installing
+    # engines at once collide on `lock.tmp` and one replaces the other's
+    # half-written file.
+    atomic_write_json(lock_path, lock, indent=2)
     result = exe if exe.exists() else next(root.rglob(exe.name), None)
     if not result:   # some archives nest under build/bin/
         raise RuntimeError(f"{exe.name} not found in downloaded engine assets")
