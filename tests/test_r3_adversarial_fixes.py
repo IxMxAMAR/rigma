@@ -516,6 +516,51 @@ def test_a_transient_read_failure_is_retried_before_giving_up(tmp_path,
     assert calls["n"] == 2, calls
 
 
+# --- R3-CLI-3/4: `recalibrate --all` wiped without asking, and not atomically -
+
+def test_recalibrate_all_asks_before_destroying_every_measurement(tmp_path,
+                                                                 monkeypatch):
+    """R3-CLI-3: `--all` cleared every stored tune on the machine with no
+    confirmation and no way back. A tune is the result of a sweep that takes
+    minutes per model and is not reconstructible from anything else."""
+    from typer.testing import CliRunner
+
+    from rigma import bench, cli
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    for i in (1, 2):
+        bench.save_calibration(f"modelA:Q4:vulkan:ident{i}:2026-09-0{i}",
+                               {"tg_tps": 40.0 + i})
+    before = bench.load_calibration()
+    assert len(before) == 2, before
+
+    runner = CliRunner()
+    # answering "no" must abort AND leave the store untouched
+    res = runner.invoke(cli.app, ["recalibrate", "--all"], input="n\n")
+    assert res.exit_code != 0, res.output
+    assert bench.load_calibration() == before, "nothing may be cleared"
+
+    # `--yes` is the scriptable path and must still work
+    res = runner.invoke(cli.app, ["recalibrate", "--all", "--yes"])
+    assert res.exit_code == 0, res.output
+    assert bench.load_calibration() == {}
+
+
+def test_recalibrate_one_model_writes_atomically(tmp_path, monkeypatch):
+    """R3-CLI-4: this call site was missed by the atomic-writer pass. A bare
+    `write_text` that crashes mid-write leaves a truncated calibration.json, which
+    loads as {} and destroys every OTHER model's measurement on the next save."""
+    from typer.testing import CliRunner
+
+    from rigma import bench, cli
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    bench.save_calibration("modelA:Q4:vulkan:ident1:2026-09-01", {"tg_tps": 41.0})
+    bench.save_calibration("modelB:Q4:vulkan:ident1:2026-09-01", {"tg_tps": 42.0})
+    res = CliRunner().invoke(cli.app, ["recalibrate", "--model", "modelA"])
+    assert res.exit_code == 0, res.output
+    left = bench.load_calibration()
+    assert list(left) == ["modelB:Q4:vulkan:ident1:2026-09-01"], left
+
+
 # --- R3-MEM-1: vectors from different embedding spaces were compared ----------
 
 def test_a_vector_from_another_embedder_is_not_compared():

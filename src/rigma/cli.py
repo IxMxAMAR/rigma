@@ -1662,14 +1662,27 @@ def recalibrate(model: str = typer.Option(None, "--model",
                                           help="Forget one model's tune so it "
                                                "re-optimizes on next load"),
                 all: bool = typer.Option(False, "--all",
-                                         help="Wipe every stored tune")):
+                                         help="Wipe every stored tune"),
+                yes: bool = typer.Option(False, "--yes", "-y",
+                                         help="Skip the confirmation for --all")):
     """Reset or redo hardware tuning. No args re-optimizes the RUNNING model now
     (unload -> quick sweep -> relaunch the fresh winner). The sweep always
     includes baseline, so a re-tune can only match or beat plain defaults."""
-    import json as _json
-
+    from .atomicio import atomic_write_json
     from .bench import calibration_path, load_calibration, reset_all_calibration
     if all:
+        # R3-CLI-3: `--all` destroyed every measurement on the machine with no
+        # confirmation and no way back. The tunes are not reconstructible from
+        # anything else — each one is the result of a sweep that takes minutes per
+        # model — and `--all` is the same shape of command that wipes a store, so
+        # it asks first, like the rest of the destructive verbs here. `--yes`
+        # skips it for a script, which is the existing convention.
+        cal = load_calibration()
+        if not yes and cal:
+            typer.echo(f"this clears {len(cal)} stored tune(s) for EVERY model on "
+                       f"this machine. They are re-measured only by running the "
+                       f"sweep again.")
+            typer.confirm("clear them all?", abort=True)
         n = reset_all_calibration()
         typer.echo(f"cleared {n} tune(s) — each model re-optimizes on next load")
         return
@@ -1678,7 +1691,11 @@ def recalibrate(model: str = typer.Option(None, "--model",
         gone = [k for k in list(cal) if k.startswith(model + ":")]
         for k in gone:
             del cal[k]
-        calibration_path().write_text(_json.dumps(cal, indent=2), encoding="utf-8")
+        # R3-CLI-4: this was a bare `write_text`, so a crash mid-write left a
+        # truncated calibration.json — which loads as {} and destroys every other
+        # model's measurement on the next save. Same store the atomic writer was
+        # added for; this call site was missed.
+        atomic_write_json(calibration_path(), cal, indent=2)
         typer.echo(f"cleared {len(gone)} tune(s) for {model} — "
                    f"re-optimizes on next load")
         return
