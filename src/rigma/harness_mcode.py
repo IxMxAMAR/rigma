@@ -881,8 +881,19 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
                         "notice",
                         text="continuing this chat's MiniMax Code session")
                 continue
-            if kind == "turn.completed" and state is not None:
-                state["usage"] = obj.get("usage") or {}
+            if kind == "turn.completed":
+                usage = obj.get("usage") or {}
+                if state is not None:
+                    state["usage"] = usage
+                # Emitted as well as remembered. mcode has always reported
+                # this and Rigma has always written it into the adapter state
+                # and then read only `session_id` back out, so the turn's
+                # token cost was collected and discarded — the one number a
+                # reader of a long agent turn most wants. Same `state`/`usage`
+                # vocabulary the DSH adapter uses, so one SSE event serves
+                # both and the UI needs no second code path.
+                if isinstance(usage, dict) and usage:
+                    yield TurnEvent(kind="state", event="usage", data=usage)
                 continue
             if kind == "exec.completed":
                 saw_end = True

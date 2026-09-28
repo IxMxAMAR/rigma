@@ -11,6 +11,17 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string | { type: string; [k: string]: unknown }[];
   tool_trace?: { name: string; args?: unknown; result?: string }[];
+  /** What a `delegate` research helper did behind the context firewall. The
+   *  server has always recorded this; nothing rendered it, so the exploration
+   *  was invisible — one chip, then an answer. UI-only: it never re-enters
+   *  context, which is the whole point of the firewall. */
+  delegate_trace?: {
+    name: string;
+    args?: unknown;
+    ok?: boolean;
+    blocked?: boolean;
+    ts?: number;
+  }[];
   variants?: unknown[];
   kind?: string;          // "tool_result" = model-context carrier, not UI
   notice?: string;        // server-authored status line — shown, never fed
@@ -76,6 +87,14 @@ export interface HarnessInfo {
    *  silently removing a control. */
   honours_permission?: boolean;
   unsupported: string[];
+  /** What RIGMA ADDS to this backend, when it would otherwise be missing it.
+   *  The other half of `unsupported`: that says what the backend does not get
+   *  from Rigma, this says what Rigma mounts into it. Both are needed to answer
+   *  "what can this actually do for me". DSH's minimal profile ships almost no
+   *  model-facing tools, so without this line the goals, subagents and todos
+   *  Rigma patches in appear with nothing saying where they came from.
+   *  Optional: an older server does not send it. */
+  capabilities?: string[];
   pending: string;
 }
 

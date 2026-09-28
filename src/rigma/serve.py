@@ -2094,13 +2094,44 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     thought.append(ev.text)
                     yield _sse({"delta": ev.text}, event="think")
                 elif ev.kind == "tool":
-                    yield _sse({"id": ev.name, "name": ev.name,
+                    # The backend's own call id when it has one. Falling back to
+                    # the tool NAME collapses two calls to the same tool in one
+                    # turn onto a single chip, because the frontend matches a
+                    # result to the first still-running chip with that id.
+                    _tid = str((ev.data or {}).get("id") or "") or ev.name
+                    yield _sse({"id": _tid, "name": ev.name,
                                 "args": ev.args or {}}, event="tool")
                 elif ev.kind == "tool_result":
-                    yield _sse({"id": ev.name, "name": ev.name,
+                    _tid = str((ev.data or {}).get("id") or "") or ev.name
+                    yield _sse({"id": _tid, "name": ev.name,
                                 "result": ev.text}, event="tool_result")
                     trace.append({"name": ev.name, "result": ev.text, "ok": ev.ok,
                                   "ts": _now()})
+                elif ev.kind == "state":
+                    # A STRUCTURED fact from the backend: a goal, a todo list, a
+                    # plan-mode switch, a subagent's lifecycle, a token count.
+                    # Each gets its own SSE name so the UI can render it as the
+                    # thing it is. These capabilities only exist at all because
+                    # the capability patch mounts them; see
+                    # harness_dsh.capability_patch().
+                    _ev = ev.event or ""
+                    _data = ev.data or {}
+                    if _ev == "goal/change":
+                        yield _sse(_data, event="goal")
+                    elif _ev == "todo/write":
+                        _todos = _data.get("todos")
+                        yield _sse({"todos": _todos if isinstance(_todos, list)
+                                    else []}, event="todos")
+                    elif _ev == "plan/mode":
+                        yield _sse({"active": bool(_data.get("active"))},
+                                   event="plan_mode")
+                    elif _ev.startswith("subagent"):
+                        yield _sse({"event": _ev, "data": _data}, event="subagent")
+                    elif _ev == "usage":
+                        yield _sse(_data, event="usage")
+                    # An event name from a NEWER DSH than this Rigma knows is
+                    # dropped rather than guessed at, the same way an unknown
+                    # TurnEvent kind is: a wrong rendering is worse than none.
                 elif ev.kind == "notice":
                     yield _sse({"note": ev.text}, event="notice")
                 elif ev.kind == "error":
