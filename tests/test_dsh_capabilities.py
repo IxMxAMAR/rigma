@@ -27,7 +27,7 @@ import pytest
 import yaml
 
 from rigma import _dsh_runner as runner
-from rigma import harness_dsh
+from rigma import harness, harness_dsh
 from rigma._dsh_runner import _project
 
 
@@ -85,9 +85,74 @@ def test_the_two_subagent_tools_are_the_same_plugin_under_two_names():
     assert len(rows) == 2, rows
     names = {r["config"]["toolName"] for r in rows}
     assert names == {"subagent", "subagent_fork"}
-    # `provider` is required by the plugin's schema; omitting it is fatal at
-    # mount rather than a silent degradation.
-    assert all(r["config"].get("provider") for r in rows)
+
+
+def test_each_subagent_tool_is_paired_with_the_right_provider():
+    """F9: the PAIRING is load-bearing, and this used to assert only that each
+    `provider` was truthy.
+
+    That is a real gap rather than a stylistic one. `provider` is required by the
+    plugin's schema, so the old assertion caught its ABSENCE — but swapping the two
+    values passed it while inverting the tools' meaning: `spawn` starts a fresh child
+    and `fork` continues from the parent's context, so a swap would make
+    `subagent_fork` silently start a child with no memory of the conversation. The
+    patch's own comments make the assignment load-bearing; this pins it.
+    """
+    rows = [r for r in _patch_rows() if r.get("name") == "@deepseek-ai/dsh-tool-subagent"]
+    pairs = {(r["config"]["toolName"], r["config"]["provider"]) for r in rows}
+    assert pairs == {("subagent", "spawn"), ("subagent_fork", "fork")}, (
+        f"the tool/provider pairing was changed or swapped: {pairs}")
+
+
+# ---------------------------------------------------------------------------
+# R6-WEBFETCH: `web_fetch` is mounted, `web_search` is not.
+#
+# The split is the point. The old single comment omitted both for an API-key reason
+# that only covers SEARCH — `dsh-web-fetch-http` has no credentials to check
+# (`web-fetch-http/src/provider.ts:51`) — so `web_fetch` was absent for a constraint
+# that does not apply to it. These guard the split in both directions, because either
+# half can rot silently: mounting search without a provider gives the model a tool that
+# fails on every call, and dropping the `search: false` is exactly how that happens.
+# ---------------------------------------------------------------------------
+
+def test_web_fetch_is_mounted_keylessly():
+    by_id = {str(r.get("id")): r for r in _patch_rows()}
+    assert by_id["web"]["name"] == "@deepseek-ai/dsh-web"
+    assert by_id["web-fetch-http"]["name"] == "@deepseek-ai/dsh-web-fetch-http"
+    assert by_id["tool-web"]["name"] == "@deepseek-ai/dsh-tool-web"
+
+
+def test_web_search_is_not_mounted():
+    """No search provider, and no key is configured anywhere in this build."""
+    names = {str(r.get("name")) for r in _patch_rows()}
+    assert "@deepseek-ai/dsh-web-search-deepseek" not in names, (
+        "a search provider needs DEEPSEEK_API_KEY and would fail on every call")
+
+
+def test_tool_web_registers_fetch_only():
+    """`search: false` is what makes the mount fetch-only.
+
+    Without it `dsh-tool-web` registers `web_search` too (`src/index.ts`: `search`
+    defaults true), and with no search provider registered the tool stays visible and
+    returns a structured error on every call — the outcome the original comment was
+    right to want to avoid. So the config is load-bearing, not decoration.
+    """
+    by_id = {str(r.get("id")): r for r in _patch_rows()}
+    assert by_id["tool-web"]["config"]["search"] is False
+    # `fetch` is deliberately NOT set: it defaults true, and restating a default is
+    # how a default quietly becomes a decision someone has to maintain.
+    assert "fetch" not in by_id["tool-web"]["config"]
+
+
+def test_the_capability_menu_declares_both_halves_of_the_web_decision():
+    """F8's other half: the menu said nothing about web either way, so a user could not
+    tell an absence from an oversight. Both halves must be named."""
+    dsh = next(h for h in harness.list_harnesses() if h["name"] == harness.DSH)
+    caps = " ".join(dsh["capabilities"])
+    unsup = " ".join(dsh["unsupported"])
+    assert "web_fetch" in caps, "the mounted capability is undeclared"
+    assert "web search" in unsup, (
+        "`web_search` is absent, and an undeclared absence reads as an oversight")
 
 
 def test_rows_whose_config_has_no_default_carry_it():

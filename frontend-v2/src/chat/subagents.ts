@@ -36,13 +36,31 @@ export interface Subagent {
    * sends `agent_name` directly. Both were being forwarded by the server and then
    * discarded by this fold.
    *
-   * NOT from `subagent/descriptor`, which an earlier version of this comment
-   * claimed. That event carries no child id at all — its fields are `{mode,
-   * version, provider}` plus `{label, agentProvider, agentModel,
-   * agentReasoningEffort, persona, toolFilter}` and it describes the subagent
-   * PROVIDER, so its `label` is the provider's name rather than any child's.
-   * Folding it onto a row would be wrong rather than merely useless, and
-   * `subagents.test.ts` pins that it is ignored.
+   * NOT from `subagent/descriptor` — and the reason is narrower than an earlier
+   * version of this comment gave, which is worth stating because that version was
+   * WRONG in a way that invited a bad change.
+   *
+   * It claimed the descriptor "describes the subagent PROVIDER, so its `label` is the
+   * provider's name". DSH says otherwise: `descriptor.ts:63-68` calls `label` "the
+   * child's durable creation label" — the initial delegation's short description. So
+   * the label IS a child's name, and folding it onto a row would be USEFUL rather
+   * than wrong.
+   *
+   * What actually blocks it is that the descriptor carries NO CHILD ID. Its fields are
+   * `{version, mode, provider}` plus optional `{label, agentProvider, agentModel,
+   * agentReasoningEffort, persona, toolFilter}` — there is no `childId` and no
+   * `childSessionId` in any variant, because DSH appends it INSIDE the child's own
+   * session (`descriptor.ts:32-38`) rather than to the parent's. So `childIdOf` finds
+   * nothing and the fold has no row to attach the name to.
+   *
+   * The child id IS available one hop earlier — `client.py:236-238` subscribes to a
+   * session "and descendants", and `_dsh_runner._event_and_data` discards
+   * `payload["sessionId"]` — so carrying that one field would make this fold work with
+   * no frontend change. That is a deliberate non-change, not an oversight: the same
+   * label arrives on `subagent/catalog` WITH a `childId` (`catalog.ts:23-32`), which
+   * Rigma already handles, so nothing is lost today.
+   *
+   * `subagents.test.ts` pins that the descriptor is ignored.
    */
   name?: string;
 }
@@ -78,12 +96,23 @@ function normalise(p: Record<string, unknown>): { event: string; d: Record<strin
   const loose = !inner && (p.subSessionId || p.taskId) ? p : null;
   const mcode = flat ?? loose;
   if (mcode) {
-    // mcode's status IS the lifecycle step: `started`/`running`/`queued` mean
-    // live, anything else (completed, failed, cancelled) is an end.
+    // mcode's status IS the lifecycle step, and the LIVE set is named rather than
+    // inferred, because an unknown status falls to "finished" — which is the safe
+    // default for a row that will otherwise never be resolved, and the WRONG one for a
+    // status we simply had not seen.
+    //
+    // `auto_promoted` is in the live set for exactly that reason. mcode yields a
+    // command that outran its timeout to a managed background task WITHOUT restarting
+    // it, and says "The command is still running and was yielded to a managed
+    // background task" — so it is running, and treating it as finished drew a row that
+    // claimed work was over while it was still going.
+    //
+    // `direct_foreground` is deliberately NOT here: it names a command that ran to
+    // completion in the foreground, so it is an end. Neither is `completed`/`failed`/
+    // `canceled`/`succeeded`.
     const status = String(mcode.status ?? "").toLowerCase();
-    const event = status === "started" || status === "running" || status === "queued"
-      ? "subagent.started"
-      : "subagent.finished";
+    const LIVE = new Set(["started", "running", "queued", "auto_promoted"]);
+    const event = LIVE.has(status) ? "subagent.started" : "subagent.finished";
     return {
       event,
       d: {

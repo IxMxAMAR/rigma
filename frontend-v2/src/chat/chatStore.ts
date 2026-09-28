@@ -8,7 +8,10 @@
 // session that owns it. A single `streaming` slot meant the reply you started
 // in one chapter finished into whichever chapter you happened to be reading.
 import { create } from "zustand";
-import { api, type ChatMessage, type SavedAgentState, type SessionSummary } from "../lib/api";
+import {
+  api, type ChatMessage, type SavedAgentState, type SessionSummary,
+  type WorkflowAgent, type WorkflowRun,
+} from "../lib/api";
 import { responseError } from "../lib/listFetch";
 import { runMacroStream } from "../lib/methods";
 import { streamChat, type SseEvent } from "../lib/sse";
@@ -130,6 +133,9 @@ export interface StreamingTurn {
    *  `todos`, which is the model's checklist, and from `planMode`, which is
    *  whether the agent is proposing rather than doing. */
   acpPlan: Record<string, unknown> | null;
+  /** R6-WORKFLOW: programmatic-tool-calling runs, newest first. Folded from four DSH
+   *  events by `foldWorkflow`, which is where the joining rules live. */
+  workflow: WorkflowRun[];
 }
 
 /** One prompt mcode is holding for a later turn.
@@ -275,6 +281,7 @@ export const emptyTurn = (): StreamingTurn => ({
   acpConfig: [],
   acpCommands: [],
   acpPlan: null,
+  workflow: [],
   housekeeping: "",
   masked: 0,
   compacted: 0,
@@ -284,6 +291,94 @@ export const emptyTurn = (): StreamingTurn => ({
 
 /** Pure: fold one SSE event into the streaming turn. Returns a NEW object —
  *  functional updates only, so React sees every change and nothing aliases. */
+/** Fold one `tool-workflow/*` event into the run it describes.
+ *
+ *  R6-WORKFLOW. DSH sends four events joined only by `runId`, and joins an agent's
+ *  start to its own end by `seq`. This is where that structure is rebuilt, so the
+ *  panel can draw a run rather than four lines the reader has to assemble.
+ *
+ *  THREE DECISIONS WORTH NAMING:
+ *
+ *  1. **An unknown `runId` OPENS a run.** `agent-start` can arrive without a
+ *     `run-start` ever being seen — the runner only began forwarding these in
+ *     R6-WORKFLOW, and a resumed session can carry a run's later events without its
+ *     first. Treating an unseen id as "ignore" would drop real activity to avoid
+ *     drawing a header, so it opens a run with a blank name instead. The `name` is
+ *     filled in by `run-start` if it ever arrives.
+ *
+ *  2. **An `agent-end` for an unseen `seq` still records the agent.** Same reasoning:
+ *     an outcome with no start is still a fact, and dropping it would make a run look
+ *     shorter than it was.
+ *
+ *  3. **`run-end` MARKS done rather than deleting.** A finished run is the thing worth
+ *     reading; deleting it would make the panel flash and vanish. This is also what
+ *     the durable path keys on, so `done` is load-bearing rather than cosmetic.
+ *
+ *  A new run is PREPENDED, so the newest is at the top — a run is usually read while
+ *  it is happening, and the newest is the one happening. */
+export function foldWorkflow(
+  runs: WorkflowRun[], d: Record<string, unknown>,
+): WorkflowRun[] {
+  const kind = String(d.event ?? "");
+  const data = (d.data ?? {}) as Record<string, unknown>;
+  const runId = String(data.runId ?? "");
+  // An event with no runId cannot be placed. Refusing it is not a drop: nothing can
+  // join it to anything, so a run would have to be invented for it.
+  if (!runId) return runs;
+
+  const idx = runs.findIndex((r) => r.runId === runId);
+  // Copy-on-write: the reducer must never mutate the array it was handed.
+  const next = runs.map((r) => ({ ...r, agents: [...r.agents] }));
+  let run = idx >= 0 ? next[idx] : null;
+  if (run === null) {
+    run = { runId, name: "", stopReason: "", done: false, agents: [] };
+    next.unshift(run);
+  }
+
+  switch (kind) {
+    case "tool-workflow/run-start":
+      run.name = String(data.name ?? "");
+      break;
+    case "tool-workflow/run-end":
+      run.done = true;
+      run.stopReason = String(data.stopReason ?? "");
+      break;
+    case "tool-workflow/agent-start": {
+      const seq = Number(data.seq ?? -1);
+      run.agents.push({
+        seq,
+        label: String(data.label ?? ""),
+        childId: String(data.childId ?? ""),
+        phase: String(data.phase ?? ""),
+        outcome: "",
+      });
+      break;
+    }
+    case "tool-workflow/agent-end": {
+      const seq = Number(data.seq ?? -1);
+      const agent = run.agents.find((a: WorkflowAgent) => a.seq === seq);
+      if (agent) {
+        agent.outcome = String(data.outcome ?? "");
+      } else {
+        // Decision 2: the outcome is still a fact even with no start to attach it to.
+        run.agents.push({
+          seq,
+          label: "",
+          childId: "",
+          phase: "",
+          outcome: String(data.outcome ?? ""),
+        });
+      }
+      break;
+    }
+    default:
+      // An unrecognised `tool-workflow/*` subtype: the run is opened or found, which
+      // is the honest outcome — something ran, and this build cannot name what.
+      break;
+  }
+  return next;
+}
+
 export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
   const d = (ev.data ?? {}) as Record<string, unknown>;
   switch (ev.event) {
@@ -425,6 +520,9 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
     }
     case "plan_mode":
       return { ...turn, planMode: d.active === true };
+    // R6-WORKFLOW: four DSH events, one run. See `WorkflowRun`.
+    case "workflow":
+      return { ...turn, workflow: foldWorkflow(turn.workflow, d) };
     case "subagent":
       return { ...turn, subagents: foldSubagent(turn.subagents, d) };
     // R6-ACP: mcode's control plane over the Agent Client Protocol transport.
@@ -517,6 +615,18 @@ export function durableFromEvent(ev: SseEvent): SavedAgentState | null {
     }
     case "plan_mode":
       return { plan_mode: d.active === true };
+    // R6-WORKFLOW: only a FINISHED run is durable. Persisting a run mid-flight would
+    // write on every agent start, and a run restored from a reload could never
+    // finish — the turn that would have ended it is gone.
+    //
+    // Keyed on the EVENT rather than on a `done` field, because `serve.py` sends the
+    // four lifecycle events with their own name alongside the payload
+    // (`{event, data}`), so there is no `done` on the envelope to read — only the
+    // event name says which of the four this is.
+    case "workflow":
+      return d.event === "tool-workflow/run-end"
+        ? { workflow: foldWorkflow([], d) }
+        : null;
     default:
       return null;
   }

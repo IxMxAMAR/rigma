@@ -86,10 +86,52 @@ export interface ApprovalAnswer {
 }
 
 /** The durable half of the agent's state. See `Session.agent_state`. */
+/** R6-WORKFLOW: one programmatic-tool-calling run, folded from four DSH events.
+ *
+ *  WHY IT IS FOLDED RATHER THAN APPENDED. DSH reports a run as four separate session
+ *  events — `run-start`, `agent-start`, `agent-end`, `run-end` — joined only by a
+ *  `runId`, and an agent's start is joined to its own end by `seq`. A list of four
+ *  lines would make the reader reconstruct the run themselves, which is exactly what
+ *  the UI is for.
+ *
+ *  Until R6-WORKFLOW all four reached the UI as the literal string
+ *  "session.event tool-workflow/agent-start", and that was an ACCIDENT: the runner's
+ *  notice filter matches on the substring "tool", which "tool-workflow" contains. */
+export interface WorkflowAgent {
+  /** `agent-start`'s `seq`, which pairs the start with its own end. */
+  seq: number;
+  /** The agent's name, from `agent-start`. */
+  label: string;
+  /** The child session that ran it, when DSH named one. */
+  childId: string;
+  /** `agent-start`'s optional phase. */
+  phase: string;
+  /** `agent-end`'s verdict — empty while the agent is still running. */
+  outcome: string;
+}
+
+export interface WorkflowRun {
+  runId: string;
+  /** `run-start`'s name for the run. */
+  name: string;
+  /** `run-end`'s reason, empty while the run is still going. */
+  stopReason: string;
+  /** Finished, from the presence of `run-end`. */
+  done: boolean;
+  agents: WorkflowAgent[];
+}
+
 export interface SavedAgentState {
   goal?: Record<string, unknown> | null;
   todos?: { content: string; status: string }[];
   plan_mode?: boolean;
+  /** R6-WORKFLOW: programmatic tool calling, which Rigma mounts and therefore fires.
+   *
+   *  Persisted for the same reason `todos` is: a run is a record of what this
+   *  conversation DID, and a reload that dropped it would show a chat whose agents had
+   *  never run. Keyed by `runId` in the live turn and a list here, because the durable
+   *  copy is written once at the end of a run rather than folded event by event. */
+  workflow?: WorkflowRun[];
 }
 
 /** One agent backend, and what choosing it would cost.
