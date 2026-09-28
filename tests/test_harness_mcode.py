@@ -871,7 +871,16 @@ def test_no_cancel_means_the_turn_runs_to_the_end(fake_cli):
     usage = [e for e in got if e.kind == "state"]
     assert len(usage) == 1
     assert usage[0].event == "usage"
-    assert usage[0].data == {"inputTokens": 8, "outputTokens": 3, "totalTokens": 11}
+    # R5-MCODE-ERR: the envelope also carries `durationMs`/`model`/
+    # `usageIncomplete` as SIBLINGS of `usage`, and all three were discarded while
+    # the token count survived. So this asserts the token keys rather than an exact
+    # dict — an exact match would now fail for the right reason and make a real
+    # improvement look like a regression.
+    for k, v in {"inputTokens": 8, "outputTokens": 3, "totalTokens": 11}.items():
+        assert usage[0].data.get(k) == v, (k, usage[0].data)
+    # And the extras must actually be there, or the fix did nothing.
+    assert usage[0].data.get("durationMs") is not None, usage[0].data
+    assert usage[0].data.get("model"), usage[0].data
 
 
 def test_the_turns_usage_is_reported_rather_than_only_remembered(fake_cli):
@@ -1794,3 +1803,146 @@ def test_the_detector_does_not_fire_on_ordinary_prose():
                   "interactive host is fine",
                   "no pending questionnaire"):
         assert harness_mcode._interaction_dead_end(prose) == "", prose
+
+
+# --- R5-MCODE-ERR / CONTENT: fields the projector sends and the adapter dropped
+#
+# The projector's own event construction (run-exec-command-EXGGKYPR.js) spreads
+# more into each envelope than the adapter read back. None of these change what a
+# turn DOES; all of them change what a reader can tell about it.
+
+
+def _turn_failed(**err):
+    return {"type": "turn.failed", "status": "failed", "error": err,
+            "durationMs": 1234}
+
+
+def test_a_failed_turn_keeps_the_error_code_and_category():
+    """`code` is the only machine-readable way to tell a dead end from a
+    transient fault. mcode rewrites an awaiting-user-continuation turn to
+    code INTERACTION_NOT_AVAILABLE, retryable false — and the adapter reported
+    just the message, so nothing downstream could branch on it."""
+    ev = harness_mcode.map_event(_turn_failed(
+        category="runtime", code="INTERACTION_NOT_AVAILABLE",
+        message="The Runtime requested interaction from a non-interactive Exec host.",
+        retryable=False), {})
+    assert ev[0].kind == "error"
+    assert "INTERACTION_NOT_AVAILABLE" in ev[0].text, ev[0].text
+    assert "runtime" in ev[0].text, ev[0].text
+
+
+def test_a_failed_turn_says_when_mcode_calls_it_not_retryable():
+    """mcode's own answer to "is trying again worth anything"."""
+    ev = harness_mcode.map_event(_turn_failed(
+        category="runtime", code="X", message="boom", retryable=False), {})
+    assert "not retryable" in ev[0].text, ev[0].text
+
+
+def test_a_retryable_failure_does_not_claim_otherwise():
+    ev = harness_mcode.map_event(_turn_failed(
+        category="internal", code="Y", message="boom", retryable=True), {})
+    assert "not retryable" not in ev[0].text, ev[0].text
+
+
+def test_a_bare_failure_stays_a_bare_message():
+    """No code, no category, no noise — the message must not grow brackets."""
+    ev = harness_mcode.map_event({"type": "turn.failed", "status": "failed"}, {})
+    assert ev[0].kind == "error"
+    assert ev[0].text == "the mcode turn failed", ev[0].text
+    assert "[" not in ev[0].text, ev[0].text
+
+
+def test_a_non_dict_error_is_still_survived():
+    """09-R3-1: `.get` on a string raised straight out of the read loop."""
+    ev = harness_mcode.map_event({"type": "turn.failed", "error": "plain"}, {})
+    assert ev[0].kind == "error"
+    assert ev[0].text == "the mcode turn failed", ev[0].text
+
+
+def _stream(*objs):
+    """mcode's stream-json: one JSON object per line."""
+    return "".join(json.dumps(o) + "\n" for o in objs)
+
+
+def test_the_turn_duration_and_model_reach_the_usage_state(monkeypatch):
+    """`durationMs` and `model` are SIBLINGS of `usage` in the envelope (the
+    projector spreads them in), and both were discarded while the token count
+    survived."""
+    _fake_exec(monkeypatch, stdout=_stream(
+        {"type": "turn.completed", "usage": {"inputTokens": 5},
+         "durationMs": 4200, "model": {"modelId": "MiniMax-M2"}},
+        {"type": "exec.completed", "result": {"status": "succeeded",
+                                              "output": "done"}}))
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    usage = [e for e in got if e.kind == "state" and e.event == "usage"][0]
+    assert usage.data["durationMs"] == 4200, usage.data
+    assert usage.data["model"] == {"modelId": "MiniMax-M2"}, usage.data
+    assert usage.data["inputTokens"] == 5, usage.data
+
+
+def test_an_incomplete_usage_count_is_flagged_rather_than_trusted(monkeypatch):
+    """`usageIncomplete` is mcode saying the token count is not the whole story.
+    A reader who cannot see it trusts a number that is low."""
+    _fake_exec(monkeypatch, stdout=_stream(
+        {"type": "turn.completed", "usage": {"inputTokens": 5},
+         "usageIncomplete": True},
+        {"type": "exec.completed", "result": {"status": "succeeded",
+                                              "output": "done"}}))
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    usage = [e for e in got if e.kind == "state" and e.event == "usage"][0]
+    assert usage.data["usageIncomplete"] is True, usage.data
+
+
+def test_a_usage_state_without_the_extras_is_unchanged(monkeypatch):
+    """The common case must not grow keys."""
+    _fake_exec(monkeypatch, stdout=_stream(
+        {"type": "turn.completed", "usage": {"inputTokens": 5}},
+        {"type": "exec.completed", "result": {"status": "succeeded",
+                                              "output": "done"}}))
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    usage = [e for e in got if e.kind == "state" and e.event == "usage"][0]
+    assert set(usage.data) == {"inputTokens"}, usage.data
+
+
+def test_a_failed_turn_reports_its_code_through_a_real_turn(monkeypatch):
+    """End to end, not just `map_event`: the code has to survive the read loop."""
+    _fake_exec(monkeypatch, stdout=_stream(
+        {"type": "turn.failed", "status": "failed",
+         "error": {"category": "runtime", "code": "INTERACTION_NOT_AVAILABLE",
+                   "message": "The Runtime requested interaction from a "
+                              "non-interactive Exec host.",
+                   "retryable": False}}))
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    errs = [e for e in got if e.kind == "error"]
+    assert errs, [e.kind for e in got]
+    assert "INTERACTION_NOT_AVAILABLE" in errs[0].text, errs[0].text
+    assert "not retryable" in errs[0].text, errs[0].text
+
+
+def test_a_non_text_content_block_is_named_not_dropped():
+    """`content` is a block list and only text blocks survived, so a tool that
+    returned a picture read as if it had returned nothing."""
+    out = {"content": [{"type": "text", "text": "here it is"},
+                       {"type": "image", "data": "AAAA"}]}
+    text = harness_mcode._flatten(out)
+    assert "here it is" in text, text
+    assert "image" in text, text
+
+
+def test_an_image_only_result_does_not_read_as_empty():
+    out = {"content": [{"type": "image", "data": "AAAA"}]}
+    text = harness_mcode._flatten(out)
+    assert text.strip(), "an image-only result must not flatten to nothing"
+    assert "image" in text, text
+
+
+def test_a_text_only_result_does_not_grow_a_note():
+    out = {"content": [{"type": "text", "text": "plain"}]}
+    assert harness_mcode._flatten(out) == "plain"
+
+
+def test_the_image_payload_is_not_inlined():
+    """Base64 in an SSE text frame would put megabytes into the transcript."""
+    out = {"content": [{"type": "image", "data": "A" * 5000}]}
+    text = harness_mcode._flatten(out)
+    assert "A" * 100 not in text, "the payload must not be inlined"
