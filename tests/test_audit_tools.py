@@ -302,7 +302,9 @@ def test_move_files_reports_the_fuzzy_correction(tmp_path):
     out = tools.run_tool("move_files",
                          {"paths": [str(ws / "IMG_13.png")],
                           "dest": str(dest)},
-                         {"workspace": str(ws), "allow_code": True})
+                         {"workspace": str(ws), "allow_code": True,
+                          # R3-TOOL-4: an absolute destination is its own grant
+                          "allow_absolute_writes": True})
     assert out.startswith("moved 1 file(s)"), out
     assert "IMG_13.png" in out and "IMG_0013.png" in out, out
     assert (dest / "IMG_0013.png").is_file()

@@ -175,6 +175,17 @@ def allow_outbound_post() -> bool:
     return os.environ.get("RIGMA_MCP_ALLOW_OUTBOUND_POST") == "1"
 
 
+def allow_absolute_writes() -> bool:
+    """Whether a move/copy destination may be OUTSIDE the workspace.
+
+    R3-TOOL-4. Same shape as the absolute-reads grant beside it, and separate
+    from it on purpose: reading a file and replacing one are different risks.
+    Failing closed here is what keeps this MCP surface no broader than the
+    native loop, where the grant defaults off.
+    """
+    return os.environ.get("RIGMA_MCP_ALLOW_ABSOLUTE_WRITES") == "1"
+
+
 def ctx() -> dict:
     """The context dict `run_tool` expects.
 
@@ -200,6 +211,8 @@ def ctx() -> dict:
         "allow_absolute_reads": allow_absolute_reads(),
         # R3-MCP-1: and neither does this one. See `allow_outbound_post`.
         "allow_outbound_post": allow_outbound_post(),
+        # R3-TOOL-4: a write outside the workspace is its own capability.
+        "allow_absolute_writes": allow_absolute_writes(),
         "run_id": "",
     }
 

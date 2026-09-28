@@ -91,7 +91,18 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   # AUDIT 13-2: reads default to the workspace and outbound
                   # POSTs carrying a body are refused. These two grants restore
                   # the pre-fix behaviour explicitly rather than by default.
-                  "allow_absolute_reads", "allow_outbound_post")
+                  "allow_absolute_reads", "allow_outbound_post",
+                  # R3-TOOL-4: writing OUTSIDE the workspace is its own grant.
+                  # `write_file`/`edit_file` have always been confined to the
+                  # workspace, but `move_files`/`copy_files` reached any absolute
+                  # destination on disk with only the default-on `allow_code` —
+                  # so the WEAKER tool (write_file) was strictly more confined
+                  # than its sibling, and a planted file in the Startup folder or
+                  # an extension directory was one move away. Deliberately NOT
+                  # reusing `allow_absolute_reads`: reading a file and replacing
+                  # one are different risks, and a user who granted one did not
+                  # grant the other.
+                  "allow_absolute_writes")
 # What each agent backend understands. `smart` classifies and asks when it
 # judges risk high; `full` does not ask; `off` disarms the agent's tools. `ask`
 # is refused headlessly by mcode itself ("requires an interactive host"), so it
@@ -139,6 +150,8 @@ _FIELD_TYPES: dict[str, type] = {
     "use_tools": bool, "use_rag": bool, "allow_code": bool,
     "auto_compact": bool, "one_action": bool, "carry_reasoning": bool,
     "allow_absolute_reads": bool, "allow_outbound_post": bool,
+    # R3-TOOL-4: bool like its siblings, so the quoted "false" cannot grant it.
+    "allow_absolute_writes": bool,
     # int, not bool: `build_messages` does int(...) on the depth and
     # `_round_cap` does int(...) on the cap, so a string that reached either
     # raised. True is deliberately NOT accepted (isinstance(True, int) is True,
@@ -254,6 +267,10 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # surface cannot SEE is one it cannot offer to change.
                      "allow_absolute_reads": False,
                      "allow_outbound_post": False,
+                     # R3-TOOL-4: named here for the same reason as the two
+                     # above — a grant a surface cannot see is one it cannot
+                     # offer to change.
+                     "allow_absolute_writes": False,
                      # AUDIT 10-9: the schema version this document was written
                      # at. Stamped by save(); a body that predates the key is
                      # what the max_tool_rounds migration below keys on.

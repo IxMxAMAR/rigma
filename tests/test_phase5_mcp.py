@@ -99,6 +99,13 @@ def _fake_server_config(tmp_path, name="fake"):
                    "args": ["-u", str(script)]}}
 
 
+# R3-TOOL-2: an MCP server is a process, so it is gated like run_shell, not like
+# a read-only code tool. allow_code alone is the product DEFAULT (on), while
+# confirm_exec is the grant that is off by default - reaching a server needs
+# both, exactly as run_shell does.
+MCP_CTX = {"allow_code": True, "confirm_exec": True}
+
+
 def test_discovers_and_calls_a_real_stdio_server(tmp_path):
     _write_config(tmp_path, _fake_server_config(tmp_path))
     specs = tools.tool_specs(allow_code=True)
@@ -108,14 +115,14 @@ def test_discovers_and_calls_a_real_stdio_server(tmp_path):
                 if s["function"]["name"] == "mcp__fake__shout")
     assert "[fake]" in spec["function"]["description"]
     out = tools.run_tool("mcp__fake__shout", {"text": "hello rigma"},
-                         {"allow_code": True})
+                         MCP_CTX)
     assert out == "HELLO RIGMA"
 
 
 def test_mcp_error_results_are_prefixed(tmp_path):
     _write_config(tmp_path, _fake_server_config(tmp_path))
     out = tools.run_tool("mcp__fake__nonexistent", {},
-                         {"allow_code": True})
+                         MCP_CTX)
     assert out.startswith("error")
 
 
@@ -137,8 +144,42 @@ def test_mcp_gated_like_code_and_profiles(tmp_path):
                    for s in tools.tool_specs(allow_code=True, profile=prof)}
         assert not any(n.startswith("mcp__") for n in offered), prof
         out = tools.run_tool("mcp__fake__shout", {"text": "x"},
-                             {"allow_code": True, "profile": prof})
+                             {**MCP_CTX, "profile": prof})
         assert "disabled" in out
+
+
+def test_mcp_needs_confirm_exec_not_just_allow_code(tmp_path):
+    """R3-TOOL-2: an MCP server must not be easier to reach than `run_shell`.
+
+    `allow_code` is ON by default in this product and `confirm_exec` is OFF, so
+    gating the `mcp__` branch on `allow_code` alone made a configured MCP shell
+    or filesystem server reachable from a default chat while `run_shell` — the
+    weaker capability — was refused. This pins that the server is never called
+    without the same grant the other exec tools require.
+    """
+    _write_config(tmp_path, _fake_server_config(tmp_path))
+    # allow_code on, confirm_exec OFF: the product default. Must refuse.
+    out = tools.run_tool("mcp__fake__shout", {"text": "hello rigma"},
+                         {"allow_code": True, "confirm_exec": False})
+    assert out.startswith("error"), out
+    assert "confirm" in out
+    # and it must not have run: the server would have answered "HELLO RIGMA"
+    assert "HELLO" not in out
+    # with the grant, it runs
+    assert tools.run_tool("mcp__fake__shout", {"text": "hello rigma"},
+                          MCP_CTX) == "HELLO RIGMA"
+
+
+def test_mcp_honours_no_delete(tmp_path):
+    """A `no-delete` run must not reach a shell through MCP either.
+
+    `_text_refusal` is applied to the call's arguments, so the profile that
+    promises deletion is disabled is not bypassable by configuring a server.
+    """
+    _write_config(tmp_path, _fake_server_config(tmp_path))
+    out = tools.run_tool("mcp__fake__shout", {"text": "rm -rf /"},
+                         {**MCP_CTX, "profile": "no-delete"})
+    assert out.startswith("error"), out
 
 
 def test_dead_server_reports_not_crashes(tmp_path):
@@ -148,7 +189,7 @@ def test_dead_server_reports_not_crashes(tmp_path):
     # discovery survives the corpse; the failure is remembered and reported
     specs = tools.tool_specs(allow_code=True)
     assert isinstance(specs, list)
-    out = tools.run_tool("mcp__broken__anything", {}, {"allow_code": True})
+    out = tools.run_tool("mcp__broken__anything", {}, MCP_CTX)
     assert out.startswith("error") and "unavailable" in out
     status = mcp_client.manager().status()
     assert "broken" in status["failed"]
@@ -157,7 +198,7 @@ def test_dead_server_reports_not_crashes(tmp_path):
 def test_malformed_name_and_missing_server(tmp_path):
     _write_config(tmp_path, _fake_server_config(tmp_path))
     assert tools.run_tool("mcp__nosuchserver__t", {},
-                          {"allow_code": True}).startswith("error")
+                          MCP_CTX).startswith("error")
 
 
 # --- 09-2/09-3/09-8: a JSON value that is not an object is not a mapping ------
@@ -473,14 +514,14 @@ def test_an_oversize_frame_is_dropped_and_the_caller_told(tmp_path, monkeypatch)
     mgr._ensure()
     srv = mgr._servers["fake"]
     started = time.monotonic()
-    out = tools.run_tool("mcp__fake__huge", {"n": 4000}, {"allow_code": True})
+    out = tools.run_tool("mcp__fake__huge", {"n": 4000}, MCP_CTX)
     elapsed = time.monotonic() - started
     assert elapsed < 30, f"the caller waited {elapsed:.1f}s for a dropped frame"
     assert out.startswith("error") and "exceeded" in out, out
     assert srv.oversize_frames == 1
     # framing stays in sync: the very next call is served normally
     assert tools.run_tool("mcp__fake__shout", {"text": "still here"},
-                          {"allow_code": True}) == "STILL HERE"
+                          MCP_CTX) == "STILL HERE"
 
 
 def test_a_server_that_streams_one_endless_line_is_reported_dead(
@@ -494,7 +535,7 @@ def test_a_server_that_streams_one_endless_line_is_reported_dead(
     mgr = mcp_client.manager()
     mgr._ensure()
     srv = mgr._servers["fake"]
-    out = tools.run_tool("mcp__fake__flood", {}, {"allow_code": True})
+    out = tools.run_tool("mcp__fake__flood", {}, MCP_CTX)
     assert out.startswith("error"), out
     # The caller is woken by the oversize frame; the READER sets reader_error a
     # moment later, after it has given up on the rest of the line. Poll for it
@@ -506,6 +547,6 @@ def test_a_server_that_streams_one_endless_line_is_reported_dead(
     assert srv.reader_error and "exceeded" in srv.reader_error, srv.reader_error
     # and the next call reports it instead of blocking for a minute
     second = tools.run_tool("mcp__fake__shout", {"text": "x"},
-                            {"allow_code": True})
+                            MCP_CTX)
     assert second.startswith("error") and "exceeded" in second, second
     assert "fake" in mgr.status()["failed"]

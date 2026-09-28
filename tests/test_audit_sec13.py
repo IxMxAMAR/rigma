@@ -85,15 +85,36 @@ def test_a_workspace_inside_the_state_dir_is_not_off_limits(home):
 
 
 def test_move_files_to_an_absolute_destination_is_still_a_write(home):
-    # AUDIT 13-2 confines reads; a destination is a write and keeps its old
-    # behaviour, so it does NOT need the reads grant.
+    # AUDIT 13-2 confined reads; a destination is a write and kept its old
+    # behaviour — no reads grant needed.
+    #
+    # R3-TOOL-4 changed what "old behaviour" may be: an absolute destination is
+    # now its own explicit grant, because needing only the default-on
+    # `allow_code` made this tool LESS confined than `write_file`, which has
+    # always been pinned to the workspace. Both halves are asserted, so the
+    # grant cannot quietly become a no-op.
     ws = home / "ws"
     ws.mkdir()
     (ws / "a.txt").write_text("x", encoding="utf-8")
     dest = home / "sorted"
+    base = {"workspace": str(ws), "allow_code": True}
     out = tools.run_tool("move_files",
                          {"paths": [str(ws / "a.txt")], "dest": str(dest)},
-                         {"workspace": str(ws), "allow_code": True})
+                         base)
+    assert out.startswith("error"), out
+    assert "outside the workspace" in out
+    assert not dest.exists()          # nothing was created
+
+    # the reads grant is NOT the writes grant — the two are separate risks
+    out = tools.run_tool("move_files",
+                         {"paths": [str(ws / "a.txt")], "dest": str(dest)},
+                         {**base, "allow_absolute_reads": True})
+    assert out.startswith("error"), out
+
+    # with the explicit write grant it works
+    out = tools.run_tool("move_files",
+                         {"paths": [str(ws / "a.txt")], "dest": str(dest)},
+                         {**base, "allow_absolute_writes": True})
     assert out.startswith("moved 1 file(s)"), out
     assert (dest / "a.txt").is_file()
 

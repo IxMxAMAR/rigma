@@ -3,10 +3,14 @@
 `read_file`, `list_directory`, `find_files` and `sample_files` all resolve
 through `_read_path`, which refuses a credential path even when absolute reads
 are granted. The image tools take the other branch (`_resolve_image`), which
-applies neither the denylist nor the grant, so an image inside a credential
-directory is the one read the 13-2 fix does not cover. Reported separately and
-left OPEN: an absolute image outside the workspace is allowed with no grant at
-all, which the pinned tests in test_run_tools.py assert deliberately.
+applied neither the denylist nor the grant.
+
+R3-7 closed the denylist half. R3-TOOL-5 closed the grant half: an absolute
+image outside the workspace is no longer readable without `allow_absolute_reads`,
+which is what `view_images(folder=…)`, `list_directory` and `read_file` always
+required. The pinned tests in `test_run_tools.py` that asserted the ungated
+behaviour now supply the grant, so the capability is still covered — it is just
+no longer automatic.
 """
 import pytest
 
@@ -61,7 +65,18 @@ def test_an_ordinary_image_still_works(ws, tmp_path):
     rel = tools.run_tool("view_image", {"path": "pic.png"},
                          {"workspace": str(ws), "has_vision": True})
     assert rel.startswith(tools.IMAGE_SENTINEL)
+    # R3-TOOL-5: an image OUTSIDE the workspace now needs the reads grant. It was
+    # the one read path that skipped it — `view_images(folder=…)`,
+    # `list_directory` and `read_file` all enforced it, and `view_image` was how a
+    # prompt-injected model pulled any image off the disk into the conversation,
+    # from where `fetch_url` could carry it out. Images outside the workspace are
+    # a real need, which is exactly why the grant exists.
     other = _png(tmp_path / "elsewhere.png")
+    base = {"workspace": str(ws), "has_vision": True}
+    refused = tools.run_tool("view_image", {"path": str(other)}, base)
+    assert "outside the workspace" in refused, refused
+    assert tools.IMAGE_SENTINEL not in refused
+
     absolute = tools.run_tool("view_image", {"path": str(other)},
-                              {"workspace": str(ws), "has_vision": True})
+                              {**base, "allow_absolute_reads": True})
     assert absolute.startswith(tools.IMAGE_SENTINEL)
