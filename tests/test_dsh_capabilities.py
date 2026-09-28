@@ -613,3 +613,73 @@ def test_the_skills_patch_composes_over_the_capability_patch():
             assert "config" not in row or row["id"] != "skill-filesystem", (
                 "the capability patch now configures skill-filesystem; the "
                 "generated skills patch would silently override it")
+
+
+# --- R4-DRIFT: the four capabilities the UI draws, guarded the same way ------
+#
+# WHY. Governance, compaction and retry each already had a drift guard — a test
+# that fails if the event name leaves `_STATE_EVENTS`, because the runner then
+# drops it SILENTLY and the UI shows nothing with no error anywhere. The four
+# capabilities the AgentState panel draws had no such guard, so the same silent
+# loss was possible for a goal, a todo list, a plan-mode switch or a subagent.
+#
+# `serve.py` maps each of these to an SSE name, and the frontend reducer keys off
+# that name; if a name here stops being a state event, the panel simply goes
+# quiet. Nothing else in the suite would notice.
+
+# backend event name -> the SSE name serve.py must emit for it
+_PANEL_EVENTS = {
+    "goal/change": "goal",
+    "todo/write": "todos",
+    "plan/mode": "plan_mode",
+}
+
+
+def test_every_panel_capability_is_still_a_state_event():
+    """A guard against the list drifting: if one of these leaves `_STATE_EVENTS`,
+    the runner drops it and the panel renders nothing."""
+    for name in _PANEL_EVENTS:
+        assert name in runner._STATE_EVENTS, name
+
+
+def test_the_panel_capabilities_are_not_treated_as_internal_chatter():
+    """Being IN the list is not enough — the projection has to yield them."""
+    for name in _PANEL_EVENTS:
+        evs = _project(_session_event(name, {}))
+        assert evs, name
+        assert evs[0]["type"] == "state", name
+
+
+def test_the_subagent_lifecycle_is_still_recognised():
+    """The subagent rows come from the top-level lifecycle pair, not from
+    `_STATE_EVENTS` alone, so they need their own guard."""
+    for name, payload in (
+        ("subagent.started", {"parentSessionId": "p", "childSessionId": "c"}),
+        ("subagent.finished", {"childSessionId": "c", "status": "ok"}),
+    ):
+        evs = _project(_notif(name, payload))
+        assert evs, name
+        assert evs[0]["type"] == "state", name
+        assert evs[0]["event"] == name, name
+
+
+def test_the_mcode_names_are_bridged_by_the_server_not_the_runner():
+    """R4-MCODE-1, pinned so the two naming schemes cannot silently diverge again.
+
+    The RUNNER normalises DSH's names; mcode's adapter emits its OWN names
+    (`goal`, `todos`, `subagent`) and they are bridged in `serve.py`. This test
+    records that split, because the bug it fixes was exactly a name that no layer
+    claimed: the adapter emitted it, `_STATE_EVENTS` did not know it, and
+    `serve.py`'s elif chain did not match it.
+    """
+    from rigma import harness_mcode
+
+    import inspect
+
+    src = inspect.getsource(harness_mcode)
+    for name in ('event="goal"', 'event="todos"', 'event="subagent"'):
+        assert name in src, name
+    # And the DSH spelling must NOT be what mcode emits, or the bridge in
+    # serve.py is dead code and the mcode path is unreachable again.
+    for dsh_name in ('event="goal/change"', 'event="todo/write"'):
+        assert dsh_name not in src, dsh_name

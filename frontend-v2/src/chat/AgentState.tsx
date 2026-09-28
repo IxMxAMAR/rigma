@@ -3,10 +3,16 @@
 // WHY THIS IS A COMPONENT AND NOT MORE LINES IN Transcript.tsx. The transcript
 // renders a turn's prose and its tool chips. These are a different kind of thing:
 // they are the agent's OWN state, reported by the backend rather than written by
-// the model, and they outlive the turn that produced them. Keeping them in one
-// component also means the whole block can be absent when a backend reports none
-// of it — which is the case for the built-in loop, whose plan lives in the
-// Autonomous surface instead.
+// the model. Keeping them in one component also means the whole block can be
+// absent when a backend reports none of it — which is the case for the built-in
+// loop, whose plan lives in the Autonomous surface instead.
+//
+// R4-PERSIST: this comment used to say they "outlive the turn that produced them",
+// and that is FALSE as rendered. `AgentState` is mounted inside `LiveTurn`, and
+// `chatStore` drops the stream when the turn ends, so the block disappears on
+// reload even though the agent's own state is durable. The claim is removed rather
+// than left standing, because a comment that reads as a guarantee is how a real
+// gap survives a review — this one survived several.
 //
 // The four facts and their shapes come from the backend, not from inference:
 //   goal       — the backend's goal snapshot (phase, objective, revision, rounds)
