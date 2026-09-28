@@ -8,6 +8,7 @@ summarizer, the titler, the delegate helper) answers with.
 """
 import json
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1176,3 +1177,75 @@ def test_a_disconnect_stops_an_external_agent_and_keeps_the_partial_reply(
     assert stored["messages"][-1]["role"] == "assistant", stored["messages"]
     assert "half " in stored["messages"][-1]["content"], (
         "the partial reply was thrown away with the disconnect")
+
+
+# --------------------------------------------------------------------------
+# R3-CHAT-2 — nothing watched for a model repeating itself
+
+
+def test_a_repeated_identical_call_stops_the_turn(home, engine):
+    """The round cap is a runaway BACKSTOP (1000), not a detector.
+
+    Nothing watched for a loop, so a model that kept issuing the same call with
+    the same arguments ran to the ceiling — a thousand round trips, each one
+    re-prefilling the whole transcript, which on a local card is minutes of GPU
+    time and a context full of identical tool results. The chat looks busy the
+    whole time.
+    """
+    _running()
+    # the SAME call every round: the fake engine repeats its last script entry
+    Engine.script = [_call("sample_files", {"path": "."})]
+    c = _client(engine.port)
+    sid = _seed(c, 2)
+    r = c.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200, r.text
+    rounds = len([b for b in Engine.seen if b.get("stream")])
+    assert rounds <= serve._REPEAT_CALL_LIMIT + 1, (
+        f"the turn ran {rounds} rounds on one repeated call")
+    assert "same" in r.text.lower() or "repeat" in r.text.lower(), r.text[:400]
+
+
+def test_two_different_calls_alternating_also_stop_the_turn(home, engine):
+    """Two DIFFERENT calls alternating is the same defect wearing a hat — the
+    signature is the SET of (name, args) in the round, not one call."""
+    _running()
+    Engine.script = [_call("sample_files", {"path": "."}),
+                     _call("list_files", {"path": "."})]
+    c = _client(engine.port)
+    sid = _seed(c, 2)
+    r = c.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200, r.text
+    rounds = len([b for b in Engine.seen if b.get("stream")])
+    assert rounds <= 2 * (serve._REPEAT_CALL_LIMIT + 1), (
+        f"an alternating pair ran {rounds} rounds")
+
+
+def test_a_turn_that_makes_progress_is_never_cut_off(home, engine):
+    """The breaker must not touch a long turn that keeps doing something new —
+    the counter resets on any round whose call set differs.
+
+    Eight rounds, which is past the repeat limit: if the counter did not reset,
+    this turn would be stopped with the loop notice instead of finishing. The
+    paths differ per round so each call genuinely differs.
+    """
+    _running()
+    # The fake engine repeats its LAST script entry once one remains, so the
+    # final `_say` needs a sentinel after it to actually be reached. The paths
+    # differ per round, so every round is genuinely a different call and the
+    # breaker's counter has to reset each time.
+    Engine.script = [_call("sample_files", {"path": "./" + "a" * (i + 1)})
+                     for i in range(8)] + [_say("all eight are done"), _say("x")]
+    c = _client(engine.port)
+    sid = _seed(c, 2)
+    r = c.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200, r.text
+    rounds = len([b for b in Engine.seen if b.get("stream")])
+    assert rounds == 9, f"expected 8 tool rounds + the final one, saw {rounds}"
+    # The reply itself, not the stored row: this chat has a tool-result summary
+    # as its last stored entry, and the point here is that the turn was allowed
+    # to finish with its answer rather than stopped by the breaker. `_say` emits
+    # ONE SSE EVENT PER CHARACTER, so the reply has to be reassembled from the
+    # deltas before it can be searched for a phrase.
+    reply = "".join(re.findall(r'data: \{"delta": "(.*?)"\}', r.text))
+    assert "all eight are done" in reply, reply[:200]
+    assert "same tool call" not in r.text, "the breaker fired on a progressing turn"
