@@ -37,11 +37,29 @@ def test_await_port_free_returns_when_free(home):
     from rigma.server_ops import _await_port_free
     import time as _t
     t0 = _t.monotonic()
-    _await_port_free(0, tries=1, delay=5.0)   # port 0 is always bindable
+    assert _await_port_free(0, tries=1, delay=5.0) is True  # port 0 is bindable
     # it must return on the FIRST try, not sleep through its retries: the
-    # assertion is the elapsed time, since the function returns None either
-    # way and a silent 5s stall per launch is exactly the bug (AUDIT F60)
+    # assertion is the elapsed time, since a silent 5s stall per launch is
+    # exactly the bug (AUDIT F60)
     assert _t.monotonic() - t0 < 1.0
+
+
+def test_await_port_free_reports_a_port_someone_else_holds(home):
+    """R3-SRV-1: the probe set SO_REUSEADDR, which on Windows means "allow binding
+    a port another socket is already bound to" — so the bind SUCCEEDED while the
+    port was held and the wait returned immediately, defeating the wait it exists
+    for. Measured against HEAD: a held port returned None (no signal at all)."""
+    import socket
+    from rigma.server_ops import _await_port_free
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        assert _await_port_free(port, tries=2, delay=0.01) is False
+    finally:
+        srv.close()
+    assert _await_port_free(port, tries=2, delay=0.01) is True
 
 
 def _tiny_gguf(path):

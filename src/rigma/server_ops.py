@@ -638,7 +638,15 @@ def perform_switch(model: str, registry=None, profile=None,
     model_path = rigma_home() / "models" / rp.gguf.file
     port = int(s["public_port"]) - 1
     st.kill_recorded(s, "engine_pid")   # AUDIT F08-1: identity-checked
-    _await_port_free(port)   # Windows TIME_WAIT grace
+    if not _await_port_free(port):      # Windows TIME_WAIT grace
+        # R3-SRV-1: this used to be a no-op on Windows (see the docstring), so a
+        # port held by something we did not kill was never noticed here. The
+        # auto-calibration below spends minutes; failing now is better than
+        # failing after it.
+        raise RuntimeError(
+            f"port {port + 1} is still in use after waiting — something other "
+            f"than the engine Rigma stopped is holding it. Close whatever is "
+            f"using that port, or launch on another one.")
     # First load of a never-seen model+quant: with the old engine already dead,
     # VRAM is free — auto-tune the hardware-specific toggles ONCE, then launch
     # the winner. Cached forever after. Skipped for ctx-relaunches (a deliberate
@@ -657,7 +665,14 @@ def perform_switch(model: str, registry=None, profile=None,
             pass   # tuning is best-effort; fall through to a normal launch
         finally:
             _clear_calib_marker()
-        _await_port_free(port)   # last trial engine just released the port
+        if not _await_port_free(port):   # last trial engine released the port
+            # R3-SRV-1: say WHICH port and why, here, rather than letting the
+            # launch fail below with a message about the engine. The old code
+            # returned silently whether or not the port came free.
+            raise RuntimeError(
+                f"port {port + 1} is still in use after waiting — something other "
+                f"than the engine Rigma stopped is holding it. Close whatever is "
+                f"using that port, or launch on another one.")
     try:
         sp = runtime.launch_server(exe, rp, model_path,
                                    port=int(s["public_port"]) - 1,
@@ -692,18 +707,36 @@ def perform_switch(model: str, registry=None, profile=None,
 
 
 def _await_port_free(port: int, tries: int = 10, delay: float = 0.3) -> None:
-    """After killing the old engine, its port lingers in TIME_WAIT briefly on
-    Windows; wait for it to free before relaunching to avoid a bind crash."""
+    """After killing the old engine, its port lingers briefly on Windows; wait
+    for it to free before relaunching to avoid a bind crash.
+
+    R3-SRV-1: this set SO_REUSEADDR on the probe socket, which defeats the probe
+    it is used for on Windows. There the flag means "allow binding a port another
+    socket is already bound to" (the BSD meaning is the narrower "skip TIME_WAIT"),
+    so the bind SUCCEEDED while the old engine still held the port and the wait
+    returned immediately — exactly the case it exists to catch. The flag is for a
+    listener that wants to rebind quickly, not for a test of whether a port is
+    free; without it the bind fails while the port is held and succeeds once it is
+    released, which is the question being asked.
+
+    It also used to return silently after the last attempt, so a port still held
+    by something Rigma did not kill produced a launch that failed later with a
+    message about the engine rather than about the port. It still does not raise
+    — the wait is a courtesy, not a promise — but it now returns whether the port
+    came free, so the caller can say so instead of letting the next failure be
+    misattributed.
+    """
     import socket
     import time
-    for _ in range(tries):
+    for attempt in range(tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
-            sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sk.bind(("127.0.0.1", port))
-                return
+                return True
             except OSError:
-                time.sleep(delay)
+                if attempt < tries - 1:
+                    time.sleep(delay)
+    return False
 
 
 def perform_unload() -> dict:
