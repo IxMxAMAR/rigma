@@ -211,3 +211,54 @@ describe("R6-ACP: mcode's permission decision on the shared trail", () => {
     expect(g.approvals[0].id).toBe("call_2");
   });
 });
+
+// R6-ACP-APPROVE: the flag that decides whether a button is DRAWN.
+//
+// `awaiting` is set only by mcode over ACP, where the server sends
+// `session/request_permission` and blocks until answered. A DSH ask with no decision
+// is pending in the audit trail but can never be answered over that wire, so the
+// button must key on this flag and NOT on "no outcome yet" — otherwise Rigma promises
+// something the connection cannot do.
+describe("R6-ACP-APPROVE: awaiting is what arms the answer buttons", () => {
+  it("keeps the flag on an ask that a transport is waiting on", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, {
+      event: "approval/asked",
+      data: { id: "call_1", toolName: "write file", awaiting: true },
+    });
+    expect(g.approvals[0].awaiting).toBe(true);
+  });
+
+  it("leaves it false for a DSH ask, which cannot be answered", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, {
+      event: "approval/asked",
+      data: { id: "call_1", toolName: "bash" },
+    });
+    expect(g.approvals[0].awaiting).toBe(false);
+  });
+
+  it("refuses to arm a button from a truthy non-boolean", () => {
+    // A string "false" is truthy in JavaScript, so a hand-written or older payload
+    // carrying one would otherwise render a live "allow" button.
+    const g = foldApproval(EMPTY_GOVERNANCE, {
+      event: "approval/asked",
+      data: { id: "call_1", awaiting: "false" },
+    });
+    expect(g.approvals[0].awaiting).toBe(false);
+  });
+
+  it("clears the flag once the decision lands", () => {
+    // The pair shares an id, so the decision folds onto the ask. `awaiting` stays on
+    // the row — the BUTTON is gated on `awaiting && !outcome`, so a resolved request
+    // stops being answerable without losing the record that it once was.
+    let g = foldApproval(EMPTY_GOVERNANCE, {
+      event: "approval/asked",
+      data: { id: "call_1", toolName: "write file", awaiting: true },
+    });
+    g = foldApproval(g, {
+      event: "approval/decided",
+      data: { id: "call_1", outcome: "allowed-once" },
+    });
+    expect(g.approvals).toHaveLength(1);
+    expect(g.approvals[0].outcome).toBe("allowed-once");
+  });
+});

@@ -105,7 +105,13 @@ function SubagentRow({ row }: { row: Subagent }) {
  *  marks all of these `log-only` — durable, replayable, never in the model
  *  transcript — which is exactly why they belong beside the turn, not in it.
  */
-function GovernanceBlock({ gov }: { gov: Governance }) {
+function GovernanceBlock({ gov, onAnswer }: {
+  gov: Governance;
+  /** R6-ACP-APPROVE: answer a request that is BLOCKING a turn, or absent when there
+   *  is nothing that can be answered — the durable panel passes none, because a
+   *  permission request does not outlive the turn that is waiting on it. */
+  onAnswer?: (requestId: string, allow: boolean) => void;
+}) {
   const hasTrail = gov.approvals.length > 0;
   if (!hasTrail && !gov.sandbox && !gov.preset) return null;
   return (
@@ -158,6 +164,41 @@ function GovernanceBlock({ gov }: { gov: Governance }) {
                 {a.policy && (
                   <span className="block text-muted">
                     policy in force: <span className="font-mono">{a.policy}</span>
+                  </span>
+                )}
+                {/* R6-ACP-APPROVE: the one place in Rigma where an approval can be
+                    ANSWERED rather than only read.
+
+                    Drawn on `awaiting` and NOT on "no outcome yet", because those are
+                    different facts: a DSH ask with no decision is pending in the audit
+                    trail but can never be answered over that wire, and a button there
+                    would promise something the connection cannot do. `awaiting` is set
+                    only by mcode over ACP, where the server is blocked on the reply.
+
+                    Both buttons are always shown rather than a single toggle: the
+                    default is neither, so a click is an explicit decision in one
+                    direction, and a stray click cannot grant. */}
+                {a.awaiting && !a.outcome && onAnswer && (
+                  <span className="flex items-center gap-1.5 mt-1">
+                    <button
+                      type="button"
+                      onClick={() => onAnswer(a.id, true)}
+                      className="rounded bg-surface px-2 py-0.5 font-mono text-[10.5px]
+                                 text-moss hover:bg-panel"
+                    >
+                      allow once
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onAnswer(a.id, false)}
+                      className="rounded bg-surface px-2 py-0.5 font-mono text-[10.5px]
+                                 text-red hover:bg-panel"
+                    >
+                      refuse
+                    </button>
+                    <span className="text-muted">
+                      — the turn is waiting on this
+                    </span>
                   </span>
                 )}
               </span>
@@ -443,6 +484,7 @@ export default function AgentState({
   acpConfig = [],
   acpCommands = [],
   acpPlan = null,
+  onAnswerApproval,
 }: {
   goal: NormalGoal | null;
   todos: { content: string; status: string }[];
@@ -460,6 +502,9 @@ export default function AgentState({
   acpConfig?: AcpConfigOption[];
   acpCommands?: AcpCommand[];
   acpPlan?: Record<string, unknown> | null;
+  /** R6-ACP-APPROVE: answers a permission request that is BLOCKING the turn. Absent
+   *  on the DURABLE panel, which has no live turn to unblock. */
+  onAnswerApproval?: (requestId: string, allow: boolean) => void;
 }) {
   // Already normalised by the store, so this draws ONE shape whatever the
   // backend was: DSH's nested `goal/change` envelope and mcode's flat goal
@@ -578,7 +623,7 @@ export default function AgentState({
       {/* Last, and separated by a rule: this is about the CONNECTION's
           permissions rather than about the work, and putting it above the goal
           would make confinement read as the turn's subject. */}
-      <GovernanceBlock gov={governance} />
+      <GovernanceBlock gov={governance} onAnswer={onAnswerApproval} />
     </div>
   );
 }

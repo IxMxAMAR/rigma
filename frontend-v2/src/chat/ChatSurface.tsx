@@ -282,6 +282,32 @@ function Composer() {
       case "skills":
         useApp.getState().setSurface("skills");
         break;
+      // R6-EXPORT: the route has existed all along
+      // (`GET /api/sessions/{sid}/export`) and the per-session rail already links it;
+      // what was missing was a way to reach it FROM THE COMPOSER, which is where
+      // someone finishing a conversation actually is. No backend work.
+      //
+      // An <a> rather than a fetch: the route answers with
+      // `Content-Disposition: attachment`, so the BROWSER owns the download and the
+      // filename. Fetching would mean buffering the whole transcript and inventing a
+      // filename the server had already chosen.
+      //
+      // `fmt=md` because that is what the rail offers and what a reader wants;
+      // `fmt=json` stays reachable by URL for anyone who needs the raw session.
+      case "export": {
+        const sid = useChat.getState().currentId;
+        if (!sid) {
+          // Not silent: a command that does nothing looks like a broken app, and
+          // this one has an obvious reason.
+          useChat.getState().pushNotice("there is no chat to export yet");
+          return;
+        }
+        const a = document.createElement("a");
+        a.href = `/api/sessions/${sid}/export?fmt=md`;
+        a.download = "";
+        a.click();
+        break;
+      }
       case "compact":
         void useChat.getState().compactChat().then((msg) => {
           useChat.getState().pushNotice(msg);

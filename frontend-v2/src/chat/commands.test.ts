@@ -163,3 +163,34 @@ describe("the roster itself", () => {
     expect(new Set(names).size).toBe(names.length);
   });
 });
+
+// R6-EXPORT: `/export` wraps a route Rigma has had all along.
+//
+// The invariant this file states at the top is that "every command must be backed by
+// something Rigma can do" — and this one is, which is why it was worth adding: the
+// capability existed and only the composer could not reach it.
+describe("R6-EXPORT: /export", () => {
+  it("parses, and is in the roster", () => {
+    expect(parseSlash("/export")).toEqual({ name: "export", args: "" });
+    expect(COMMANDS.some((c) => c.name === "export")).toBe(true);
+  });
+
+  it("takes no args, because there is one sensible format", () => {
+    // The route also serves `fmt=json`, but that is reachable by URL. A command that
+    // took a format argument would be a second way to say what the rail already says.
+    const cmd = COMMANDS.find((c) => c.name === "export");
+    expect(cmd?.takesArgs).toBe(false);
+  });
+
+  it("is offered by /help, so it is discoverable", () => {
+    // A command nobody can find is not a feature. `/help` is generated from the
+    // roster, so this checks the roster rather than a hand-written list.
+    expect(helpText()).toContain("/export");
+  });
+
+  it("does NOT swallow a path that merely starts with the same letters", () => {
+    // The parser's strictness is the feature: `/exports/2026/report.md` is a path, and
+    // eating it would be indistinguishable from the app being broken.
+    expect(parseSlash("/exports/2026/report.md")).toBeNull();
+  });
+});

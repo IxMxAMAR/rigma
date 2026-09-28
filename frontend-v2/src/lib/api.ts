@@ -71,6 +71,20 @@ export interface Session {
   agent_state?: SavedAgentState;
 }
 
+/** R6-ACP-APPROVE: the answer to a permission request a turn is BLOCKED on.
+ *
+ *  Only mcode over ACP produces one. DSH's SDK wire exposes exactly three methods —
+ *  `initialize`, `session/prompt`, `shutdown` — so a DSH approval is display-only and
+ *  this call never applies to it. The server refuses with 409 when the chat is not
+ *  waiting, or when `requestId` names a request that is no longer the one in flight,
+ *  so a caller must surface that rather than assume the decision was applied. */
+export interface ApprovalAnswer {
+  allow: boolean;
+  /** Quotes the request being answered, so a stale card cannot decide a different
+   *  question than the one on screen. */
+  requestId?: string;
+}
+
 /** The durable half of the agent's state. See `Session.agent_state`. */
 export interface SavedAgentState {
   goal?: Record<string, unknown> | null;
@@ -152,6 +166,15 @@ export const api = {
   createSession: () => j<Session>("POST", "/api/sessions", {}),
   updateSession: (id: string, patch: Record<string, unknown>) =>
     j<Session>("POST", `/api/sessions/${id}`, patch),
+  /** Answer the permission request this chat is waiting on.
+   *
+   *  R6-ACP-APPROVE. This is the other half of the ACP handshake: the client's reader
+   *  thread blocks on an Event and this call sets it. Left unanswered, mcode waits
+   *  forever and the TRANSPORT wedges — which is why the turn says it is waiting
+   *  rather than silently proceeding. */
+  answerApproval: (id: string, answer: ApprovalAnswer) =>
+    j<{ ok: boolean; requestId?: string; allow?: boolean }>(
+      "POST", `/api/sessions/${id}/approval`, answer),
   deleteSession: (id: string) => j<unknown>("DELETE", `/api/sessions/${id}`),
   /** Stop the turn running in this chat. Distinct from aborting the fetch that
    *  is reading it: that only drops this browser's end, and the backend keeps
