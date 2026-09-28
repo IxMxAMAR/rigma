@@ -739,6 +739,51 @@ def _state_events(name: str, out) -> list[TurnEvent]:
     return []
 
 
+def _interaction_dead_end(stderr_tail: str) -> str:
+    """A recovery sentence when mcode is blocked on user interaction, else "".
+
+    WHY THIS EXISTS. `mcode exec` has no interaction host, so a turn that asks the
+    user something cannot be answered. That much is a limitation. The part that
+    makes it a DEAD END is that the question is never cleared: mcode's guard
+    (`run-exec-command-EXGGKYPR.js`, `hr`) runs BEFORE the stream projector is
+    constructed and refuses to start a session that has a pending questionnaire OR
+    a pending permission request —
+
+        let[n,s]=await Promise.all([e.getPendingQuestionnaire(r,t.sessionId),
+                                    e.listPendingPermissions()]),i=s.some(...)
+        if(!n&&!i)return;
+        throw new h("runtime",`Session ${t.sessionId} has ${o} and requires an
+                    interactive host. Continue it in the TUI or ACP.`)
+
+    — so every LATER turn on that session fails the same way, in seconds, before a
+    single stream-json line is written. Rigma's chat becomes unusable and nothing
+    in the product said why or what to do. (The same guard fires for
+    `--permission smart` when it raises a permission request.)
+
+    Both the guard's message and the in-band failure carry the same distinctive
+    phrases, so this keys on those rather than on an exit code, which is generic.
+
+    NOT fixable here: answering the question needs an interaction channel that
+    neither the exec path nor mcode's ACP path offers Rigma (ACP needs
+    `mcode login`). What IS fixable is saying so, and saying the one thing that
+    works — a NEW chat, because retrying this one cannot succeed.
+    """
+    low = stderr_tail.lower()
+    if "requires an interactive host" not in low and \
+       "non-interactive exec host" not in low and \
+       "interaction_not_available" not in low:
+        return ""
+    return (
+        "This mcode chat is blocked and cannot continue. The agent asked a question "
+        "(or requested permission) that only an interactive host can answer, and "
+        "mcode will not start a session that still has one pending — so every later "
+        "turn in THIS chat fails the same way, immediately. Answering it needs "
+        "mcode's own TUI or ACP client, which Rigma cannot drive. Start a NEW chat "
+        "to carry on; retrying this one cannot succeed. (Choosing the `full` "
+        "permission mode avoids the permission-request half of this.)"
+    )
+
+
 def _ok_of(call: dict) -> bool | None:
     """Whether the call succeeded, from the wire's own status.
 
@@ -1121,6 +1166,12 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
         return
     if proc.returncode not in (0, None) and not failed:
         tail = " / ".join(list(err_lines)[-4:])[:400]
+        # R5-MCODE-DEADEND: a blocked-on-interaction failure is not a generic exit.
+        # Said first, because it is the one failure a retry cannot clear.
+        dead_end = _interaction_dead_end(" ".join(err_lines))
+        if dead_end:
+            yield TurnEvent("error", text=dead_end)
+            return
         why = _EXIT_MEANING.get(proc.returncode, "")
         yield TurnEvent("error",
                         f"mcode exited {proc.returncode}"
@@ -1138,6 +1189,15 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     # success — the DSH adapter has the equivalent `done` check (09-7).
     if not saw_end and not failed:
         tail = " / ".join(list(err_lines)[-4:])[:400]
+        # R5-MCODE-DEADEND: the guard throws before the projector exists, so the
+        # blocked-on-interaction case usually lands HERE — exit 0 with no
+        # `exec.completed` and the reason on stderr — not in the non-zero branch
+        # above. Both are checked, because which one it is depends on how the CLI
+        # chose to surface the throw.
+        dead_end = _interaction_dead_end(" ".join(err_lines))
+        if dead_end:
+            yield TurnEvent("error", text=dead_end)
+            return
         code = proc.returncode
         yield TurnEvent("error", text=(
             f"mcode exited {code if code is not None else '?'} without "

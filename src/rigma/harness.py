@@ -353,6 +353,16 @@ BACKENDS: dict[str, Harness] = {
             "its own system prompt: Rigma's is not passed through",
             "the sandbox: a headless turn needs `--permission full`, so a "
             "confined profile does not survive the seam",
+            # R5-MCODE-DEADEND: the cost of `smart`, which is otherwise the
+            # reasonable middle. `mcode exec` has no interaction host, so when
+            # `smart` decides to ask, nobody can answer — and mcode's guard refuses
+            # to start a session that still has a pending question, so the chat is
+            # blocked PERMANENTLY rather than for one turn. The adapter now
+            # detects that and says so in the chat, but the choice is what invites
+            # it, so it is disclosed where the choice is made.
+            "an answered question: if you pick `smart` and it decides to ask, "
+            "nobody can answer on this transport and that chat cannot continue "
+            "— `full` is the mode that does not invite this",
         ),
         # The other direction: what Rigma hands it that it did not arrive with.
         # mcode owns its own goals, todos, subagents and skills, so unlike DSH
