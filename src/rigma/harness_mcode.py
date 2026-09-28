@@ -809,33 +809,60 @@ def _interaction_dead_end(stderr_tail: str) -> str:
 def _ok_of(call: dict) -> bool | None:
     """Whether the call succeeded, from the wire's own status.
 
-    THIS CURRENTLY ALWAYS RETURNS None, and that is stated rather than papered
-    over. The docstring here used to claim "the runtime normalises its numeric
-    enum to `started` / `completed` / `failed`". It does not. The wire value is
-    NUMERIC — this file's own note 570 lines above says so ("Tool-call item status
-    codes seen: 4 on first sight, then 5, then 1 while the arguments stream in,
-    then 3 with the result", :169-172) and the repo's own captured fixture agrees
-    (tests/test_harness_mcode.py:105,109,113,117 use 4, 5, 1, 3). So both word
-    comparisons below miss every real call, `ok` is None, and every mcode tool
-    chip renders UNKNOWN — never a tick, never a cross.
+    RESOLVED (R6-OKOF), from the enum's DEFINITION rather than from a sample. The
+    value is a thrift enum, found at `chunk-QWAB5G2D.js` byte 6132401 in the
+    installed @minimax-ai/code 0.5.4:
 
-    WHY THE MAPPING IS NOT GUESSED AT. mcode's own activity tracker maps
-    "1"/started/running/in_progress -> started, "2"/completed/succeeded/success ->
-    finished, "3"/failed/error -> failed (run-exec-command-EXGGKYPR.js, the
-    `toolStates` assignment). But that same file contains no `status: 3` literal
-    at all, while `status: 2`/`4`/`5` appear 342/300/69 times mostly as HTTP codes
-    in unrelated code — and the fixture pairs status 3 with the output "Tool not
-    found". Mapping 3 to a cross would therefore be right for the fixture and
-    quite possibly WRONG for a successful call, which would invert the meaning of
-    every chip in the transcript. A confidently wrong tick is worse than an
-    honest UNKNOWN, so this stays None until a real mcode turn is observed with
-    both a known-success and a known-failure result. The seam already renders
-    None as UNKNOWN rather than as success, which is the safe half.
+        zu = {Start: 1, Finished: 2, Failed: 3, Preparing: 4, Prepared: 5}
+
+    It is the value domain of the field `tool_call_status` on `SessionToolCallView`
+    (declared `{thriftName:"tool_call_status", ..., value:{kind:"scalar"}}` in
+    chunk-E2AN54L4.js), and two other sites in the SAME module pin the polarity:
+
+        function Dwn(e){return e==="preparing"?zu.Preparing:e==="prepared"?zu.Prepared
+          :e==="completed"?zu.Finished:e==="failed"?zu.Failed:zu.Start}
+        isError: e.tool_call_status === zu.Failed
+
+    So Failed is the error, Finished is the non-error terminal, and
+    Preparing/Prepared/Start are in-flight. `Dwn` also proves the STRING arms below
+    are the same enum's string form, not a different vocabulary — which is why they
+    stay.
+
+    WHY THIS IS NO LONGER A GUESS, when an earlier note refused to guess. The earlier
+    reasoning was: the captured fixture pairs 3 with "Tool not found", but the
+    projector contains no `status: 3` literal, so 3 might mean success and mapping it
+    to a cross could invert every chip. That reasoning was sound about the evidence
+    it had and wrong about where to look — the projector passes the runtime tool-call
+    object through VERBATIM (`function mt(e,t,r){return {id, type:"tool_call",
+    toolCall:e}}`), so the number comes from the runtime's own `status`, and the
+    enum's definition is what settles it. `isError: ...===zu.Failed` is the decisive
+    line: it is the runtime's own success/failure predicate.
+
+    The one honest gap, stated rather than hidden: NO capture in this repo contains
+    status 2, so "2 means success" rests on the enum's names plus that predicate
+    rather than on an observed successful call. That is strong evidence and it is
+    still not an observation. It is recorded in the round-6 checkpoint as such.
+
+    1/4/5 return None deliberately: they are in-flight, and an in-flight call is not
+    a success. Returning True there would put a tick on a call that has not finished.
     """
-    status = str(call.get("status") or "").strip().lower()
-    if status == "failed":
+    raw = call.get("status")
+    if isinstance(raw, bool):
+        return None                     # a bool is not one of this enum's values
+    if isinstance(raw, (int, float)):
+        code = int(raw)
+        if code == 2:                   # Finished
+            return True
+        if code == 3:                   # Failed
+            return False
+        return None                     # 1 Start / 4 Preparing / 5 Prepared, or unknown
+    status = str(raw or "").strip().lower()
+    # The string form of the SAME enum, per `Dwn` above. "started"/"preparing"/
+    # "prepared" are in flight and stay None; "succeeded"/"success" are accepted
+    # because the activity tracker lists them for the same terminal state.
+    if status in ("failed", "error"):
         return False
-    if status == "completed":
+    if status in ("completed", "finished", "succeeded", "success"):
         return True
     return None
 
