@@ -861,6 +861,51 @@ cannot do, and where a failure is a dead end it says so and names the way out.
 
 ---
 
+## 8h. STANDING ORDER from the user (2026-09-22): no model loads, no live turns
+
+Verbatim: **"Don't load a Model or do a Live test until I explicitly say so."**
+
+This is a standing prohibition, not a per-task note. It exists so a later session does
+not have to rediscover it, and so no future round mistakes "it would be useful to see
+this for real" for permission. It binds every round until the user lifts it explicitly.
+
+**Forbidden without an explicit, direct instruction from the user:**
+
+- Starting Rigma's engine (`rigma up`, or anything that launches `llama-server` / vLLM),
+  and therefore loading any model into VRAM.
+- Any live harness turn: `dsh` or `mcode` actually calling a model. That includes
+  `mcode exec`, `mcode acp` + `session/prompt`, `dsh` + `session/prompt`, and Rigma's
+  own `/api/sessions/{id}/chat` against a real backend.
+- Any probe that needs a model to answer. `tools/mcode_acp_probe.py --prompt` is in this
+  category and must be run WITHOUT `--prompt`.
+
+**Still allowed, and how the work continues without a model:**
+
+- Everything that reads source, bundles, configs or artifacts: the whole of rounds 1-5
+  was built this way.
+- ACP/CLI *handshakes* that do not reach a model — `initialize`, `session/new`,
+  `mcode/session/goal/get`, `session/set_mode`, `--help`, `provider list`. These were
+  measured and they are how the corrections in §9 and the matrix's §6a were established.
+  They start a process but load no model and make no completion request.
+- The full test suite. Its fakes (`tests/fake_oai_server.py`, `_fake_exec`,
+  `_drive_events`, the `fake_cli` fixture) are exactly the mechanism that makes a real
+  model unnecessary, and they are why 2715 tests pass without one.
+
+**Consequences to remember, because they bound what may be claimed:**
+
+- `_ok_of`'s numeric tool status stays unmapped. It was already deliberately unguessed
+  (§8f item 2), and the observation that would settle it — one mcode turn with a known
+  success and a known failure — is now forbidden. It stays UNKNOWN, and that is the
+  correct state rather than a deferral.
+- `session/prompt` over mcode ACP was measured ONCE, before this order, and it failed on
+  an engine that was down. It must not be re-run to "confirm", and the failure must not be
+  reported as an auth or protocol problem.
+- Any future claim of the form "this works end to end" is unavailable. The honest ceiling
+  is: it typechecks, it lints, it passes its tests against fakes, and its protocol
+  handshake answers. Say that, and do not upgrade it.
+
+---
+
 ## 9. Gap 5, measured: mcode's ACP surface is real and blocked
 
 The earlier note said ACP "would additionally mean implementing the ACP *client*
