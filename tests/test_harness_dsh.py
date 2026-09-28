@@ -21,6 +21,25 @@ import pytest
 from rigma import harness_dsh
 
 
+@pytest.fixture(autouse=True)
+def _fresh_runtime_state():
+    """Reset the adapter's per-chat history around every test in this file.
+
+    `_spoke` (R4-SESS-1) is MODULE state, by design: it has to remember, for the
+    life of the server process, that a chat has already spoken, because that is
+    what makes a lost runtime detectable at all. In a test session that leaks
+    across tests — the second test's "first" turn on the same chat id looks like a
+    returning one and gains a context-lost notice that has nothing to do with what
+    that test is checking.
+
+    Reset on BOTH sides: before, so a test never inherits another's history; after,
+    so nothing this file does leaks into the rest of the suite.
+    """
+    harness_dsh._spoke.clear()
+    yield
+    harness_dsh._spoke.clear()
+
+
 def _fake_home(tmp_path):
     """A directory that looks enough like a checkout for the path checks."""
     home = tmp_path / "dsh"
@@ -564,3 +583,94 @@ def test_a_tree_kill_that_worked_says_nothing_extra(monkeypatch):
     assert "and was killed" in events[-1].text
     assert "STILL BE RUNNING" not in events[-1].text
 
+
+# --- R4-SESS-1: a lost agent context must not be silent ----------------------
+#
+# DSH keeps a conversation inside the PROCESS that created it; the SDK has no way
+# to reopen a session it did not create. So a fresh runtime for a chat that has
+# already spoken means the agent has lost everything it knew — the pool evicted
+# it, an earlier turn failed, or Rigma restarted. Nothing said so, and the
+# transcript still looked continuous, which is the part that is actually wrong:
+# the user reads a reply as a continuation of a conversation the model can no
+# longer see.
+
+_RUNNER_BODY = """
+import json, sys
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    print(json.dumps({"type": "text", "text": "ok"}), flush=True)
+    print(json.dumps({"type": "done", "text": "ok"}), flush=True)
+"""
+
+
+def _cleanup() -> None:
+    """Kill every pooled runner and forget the per-chat history.
+
+    Both, because the notice is driven by `_spoke` as well as the pool: leaving
+    `_spoke` populated across tests would make a later test's FIRST turn look
+    like a returning one.
+    """
+    harness_dsh._reap_all()
+    harness_dsh._spoke.clear()
+
+
+def _first_turn(monkeypatch, tmp_path):
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(tmp_path, _RUNNER_BODY)
+    first = _drive(monkeypatch, argv, home, session_id="chat-1")
+    return home, argv, first
+
+
+def test_the_first_turn_does_not_claim_context_was_lost(monkeypatch, tmp_path):
+    """A chat's FIRST turn also spawns a fresh runtime. Warning there would be a
+    false alarm, which is worse than the silence this replaces."""
+    _cleanup()
+    try:
+        _home, _argv, first = _first_turn(monkeypatch, tmp_path)
+        assert [e for e in first if e.kind == "notice" and "lost" in e.text] == []
+    finally:
+        _cleanup()
+
+
+def test_a_second_turn_on_a_live_runtime_does_not_claim_loss(monkeypatch, tmp_path):
+    """The normal case — the pool still holds the process — must stay quiet."""
+    _cleanup()
+    try:
+        home, argv, _first = _first_turn(monkeypatch, tmp_path)
+        second = _drive(monkeypatch, argv, home, session_id="chat-1")
+        assert [e for e in second if e.kind == "notice" and "lost" in e.text] == []
+    finally:
+        _cleanup()
+
+
+def test_a_lost_runtime_is_reported_on_the_next_turn(monkeypatch, tmp_path):
+    """The case the whole thing exists for: the process is gone, so the agent's
+    context is gone, and the turn says so."""
+    _cleanup()
+    try:
+        home, argv, _first = _first_turn(monkeypatch, tmp_path)
+        # Evict the runtime, the way the pool, a failed turn or a restart would.
+        harness_dsh._drop("chat-1")
+        second = _drive(monkeypatch, argv, home, session_id="chat-1")
+        notices = [e for e in second if e.kind == "notice" and "lost" in e.text]
+        assert len(notices) == 1, [e.kind for e in second]
+        # It must say what was lost AND that Rigma's own transcript is intact,
+        # because the second half is what stops it reading as data loss.
+        assert "DSH" in notices[0].text
+        assert "transcript" in notices[0].text
+    finally:
+        _cleanup()
+
+
+def test_a_different_chat_is_not_told_it_lost_context(monkeypatch, tmp_path):
+    """Tracking is PER CHAT. A second chat's first turn has lost nothing, and
+    telling it otherwise would train the user to ignore the notice."""
+    _cleanup()
+    try:
+        home, argv, _first = _first_turn(monkeypatch, tmp_path)
+        harness_dsh._drop("chat-1")
+        other = _drive(monkeypatch, argv, home, session_id="chat-2")
+        assert [e for e in other if e.kind == "notice" and "lost" in e.text] == []
+    finally:
+        _cleanup()

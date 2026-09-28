@@ -549,7 +549,26 @@ and preserving a hand-written block. Verified against a real
 `dsh --profile sdk-minimal --dump-config`: exit 0, row resolves, `customSkillDirs`
 carries Rigma's directory.
 
-### 8d.6 Two hard limits confirmed this round, with the source that proves them
+### 8d.6 A lost agent context is no longer silent
+
+DSH keeps a conversation inside the PROCESS that created it, so continuity dies
+with the process: pool eviction, an earlier turn that failed, or a Rigma restart.
+The SDK cannot reopen a session it did not create, so this cannot be FIXED — but it
+was SILENT, and that part was wrong: the transcript still looked continuous, so a
+reply read as a continuation of a conversation the model could no longer see.
+
+The adapter now tracks which chats have already spoken (`harness_dsh._spoke`) and
+emits a `notice` when a FRESH runtime appears for one of them. It is emitted only
+in that case — a chat's first turn also spawns a fresh runtime, and warning there
+would be a false alarm, which trains a user to ignore the real one. The notice
+renders through the existing notice channel (`Transcript.tsx:300`).
+
+Four tests pin it, including the two quiet cases (first turn, live runtime) and the
+per-chat scoping. One of them needed an autouse fixture: `_spoke` is module state
+by design, and it leaked across tests, making an unrelated test's first turn look
+like a returning one.
+
+### 8d.7 Two hard limits confirmed this round, with the source that proves them
 
 - **DSH session resume is impossible, not merely missing.** The adapter says so
   (`harness_dsh.py:643-647`): continuity comes from the pooled process outliving a

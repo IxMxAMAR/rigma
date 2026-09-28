@@ -525,6 +525,22 @@ _POOL_MAX = 4
 _pool: dict[str, "_Live"] = {}
 _pool_lock = threading.Lock()
 
+# R4-SESS-1: which Rigma chats have already had a turn on this server process.
+#
+# WHY THIS EXISTS. DSH's conversation lives in the runner PROCESS, not in an id
+# this side can reopen (`harness_dsh.py` docstring on `state`, and the note
+# above). So a fresh runtime for a chat that has already spoken means the agent
+# has lost everything it knew — the pool evicted it, the turn before failed, or
+# Rigma restarted. Nothing said so, and the transcript still looked continuous,
+# which is the part that is actually wrong: the user reads a reply as a
+# continuation of a conversation the model can no longer see.
+#
+# A `notice` is emitted in exactly that case, and ONLY then: a chat's FIRST turn
+# also spawns a fresh runtime, and warning about lost context there would be
+# false. Bounded like the pool, and never cleared on turn failure — the whole
+# point is to remember that this chat had spoken before.
+_spoke: set[str] = set()
+
 
 class _Live:
     """A runner process, its reader threads, and the config it was built for."""
@@ -716,7 +732,23 @@ def drive_turn(
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(src) + (os.pathsep + existing if existing else "")
 
-        live = _take(pkey, key) or _spawn(pkey, key, env)
+        live = _take(pkey, key)
+        # R4-SESS-1: a FRESH runtime for a chat that has already spoken means the
+        # agent's context is gone. Said out loud, because the transcript still
+        # looks continuous and nothing else in the turn would reveal it.
+        resumed = live is not None
+        if live is None:
+            live = _spawn(pkey, key, env)
+        if not resumed and pkey in _spoke:
+            yield TurnEvent(
+                kind="notice",
+                text=("this agent's earlier context was lost — DSH keeps a "
+                      "conversation inside the process that created it, and that "
+                      "process is gone (restart, or an earlier turn that did not "
+                      "finish). This turn starts a new agent session; Rigma's own "
+                      "transcript above is unaffected."),
+            )
+        _spoke.add(pkey)
         run = live.run
         run.done = False            # per-turn: the reader stops at this turn's
         run.hard = False            # `done`, not at the runtime's first one
