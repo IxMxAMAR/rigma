@@ -165,16 +165,117 @@ The mapper was emitting `session_title`, the SSE name, one hop too early; `serve
 routes the BACKEND name `session/title`. Every ACP session retitle would have been
 dropped with no error anywhere. Fixed, and the pair is now pinned.
 
+## 5. R6-ACP-TURN — a chat turn can run over ACP, so the control plane is LIVE
+
+A control plane nobody can reach DURING a turn is still unreachable, so
+`drive_turn_acp` is the path that makes the rest of this round matter. It is a PARALLEL
+path: `exec` stays the default, because swapping the live transport is a separate
+decision with its own risk and this has never run against a real engine.
+
+**Continuity, measured rather than guessed.** `session/resume` and `session/load` both
+take `{sessionId}` and answer `{sessionId}`, read from mcode's own handlers. The id the
+SERVER names is recorded, not the one requested — the same rule `exec`'s `--model`
+follows — and the fake proves the difference by renaming on request. A session mcode no
+longer has is not a failed turn: a new one starts and the chat SAYS SO.
+
+**The permission translation is not a rename.** `exec` takes smart|full|off; ACP takes
+default|auto|bypassPermissions, and the two sets share NO member — passing one to the
+other is refused outright (`Unsupported permission mode: full`). The fallback for an
+unrecognised mode is `auto`, never `bypassPermissions`: a fallback landing on the most
+permissive mode would turn a typo into a grant.
+
+**And every decision is ANSWERED**, which is the point of the whole module. `exec` has
+no interaction host, so when `smart` decided to ask, nobody could answer and mcode's
+guard blocked the chat permanently (R5-MCODE-DEADEND). Here the server asks and WAITS,
+so an unanswered request would hang the turn. No policy means "no" — but it still means
+an ANSWER, and `auto` does not silently grant.
+
+**The approval travels on the channel that already exists.** DSH reports approvals as
+`approval/asked` + `approval/decided`, and `chat/governance.ts` folds that pair into a
+trail already on screen. A second vocabulary would mean a second panel for one concept,
+so the ACP decision is translated into DSH's — which is why answering a permission
+prompt needed NO new UI at all. The translation is copied from DSH's own bridge
+(`packages/acp/acp/src/index.ts:171`): `cancelled` stays `cancelled`, `allow-once`
+becomes `allowed-once`, everything else `rejected`. An earlier version of this function
+returned "allowed"/"denied" — a THIRD vocabulary, under which `outcomeTone` would have
+coloured a grant grey and `outcomeLabel` would have shown a raw identifier, so a
+granted permission would have looked like an unexplained neutral event. Only
+`allow-once` is a grant; `allow-always` is not, matching DSH.
+
+### The drift guard caught the approval itself
+
+    the ACP mapper emits these and serve.py drops them: ['acp_permission']
+
+— the one event the whole module exists to deliver, dropped by the reducer's default
+arm. Nothing else in the suite would have noticed. The guard also needed teaching:
+`serve.py` matches a FAMILY by prefix (`_ev.startswith("approval/")`), and a guard that
+only understood `==` reported three correctly-routed events as dropped.
+
+### Three of my own tests were wrong
+
+Recorded because each was the same class of mistake:
+
+- Two asserted a decision on `outcome`, but `outcome: "selected"` means "the server
+  offered options and one was chosen" — a deny is also `selected`. Asserting on it
+  would have PASSED A DENY AS A GRANT. They now assert the optionId.
+- One was `assert ... or kinds`, which is TRUE when `kinds` is empty — it asserted
+  nothing at all. Replaced with an end-to-end check that the translated mode reaches
+  the server.
+- The fake's recorder wrote `[]` for exactly the case it existed to capture, because it
+  sat after the rejection path's `continue`, and it swallowed its own `KeyError`. A
+  recorder that fails silently makes a test read "nothing was refused" from "nothing was
+  recorded".
+
+## 6. R6-ACP-SEAM — the wire is selectable, and cannot silently fall back
+
+`drive_turn_acp` was reachable-but-unused: no chat could choose it, so the queue,
+steering, plan mode and the answerable permission prompt were still invisible in
+practice. This wires the choice end to end — a session field, a value check, the seam,
+and a selector in the sidecar.
+
+**The failure mode it is built around.** If the field says `acp` and `exec` runs instead,
+the user believes a permission prompt could have been answered when it could not — the
+exact class of defect this round exists to remove. Three places enforce otherwise:
+
+- `sessions.MCODE_TRANSPORTS` validates the VALUE at the write, as `permission` already
+  does. The type check alone only stops a list reaching a reader; the value check stops
+  an unknown name reaching the adapter, where `== "acp"` would read it as `exec`.
+- The seam asks the adapter for a `drive_turn_acp` CAPABILITY rather than testing its
+  module name. A name check keeps answering True after a rename, and then the ACP path
+  is reported as taken while `exec` silently runs.
+- If the field says `acp` and the capability is missing, the turn ERRORS and does not
+  run. Running it over `exec` anyway would be a turn the user did not ask for.
+
+`exec` stays the default, and the selector is gated on mcode — the field is mcode's, and
+offering it on DSH or Rigma's own loop would be a knob that changes nothing. The option
+label states the cost rather than hiding it in a tooltip, because it is the reason to
+switch:
+
+    exec — one turn, nothing can be answered
+    acp  — a session, so a question can be answered
+
+### A flaky test was fixed rather than tolerated
+
+The first full-suite run after this change reported ONE failure,
+`test_idle_unload_never_fires_while_a_turn_is_streaming`. It passed in isolation and the
+suite was green on re-run, so it was a timing flake and not a regression — but it was
+worth fixing rather than re-running past, because its failure message
+("the engine was unloaded under a running turn") is the exact defect the test guards, so
+a load-induced false red is indistinguishable from a real one. Its control loop waited
+~4s for the keepalive poller to be scheduled; that is now ~20s, and the message says a
+broken TEST rather than a broken keepalive.
+
 ## What is deliberately NOT done, and why
 
-- **The chat turn still runs over `exec`.** The ACP client exists and works; swapping
-  the live transport is a separate, riskier change than building the client. The
-  `drives` line says so rather than implying the turn uses ACP.
-- **The approval channel is built but not wired to a chat turn**, for the same reason:
-  it is only reachable if the turn runs over ACP. What exists is the mechanism
-  (`answer_permission`, tested) and the disclosure that mcode offers it.
-- **`ask_user` over mcode ACP is not wired either.** The client declares
-  `elicitation.form` and can answer; nothing in a chat turn asks yet.
+- **The chat turn still DEFAULTS to `exec`.** `drive_turn_acp` exists, is tested against
+  a real subprocess, and is selectable; it is not the default. The `drives` line says so.
+- **Nothing yet lets the UI ANSWER a permission prompt interactively.** The mechanism
+  exists and is tested (`answer_permission`, `on_permission`), and the decision reaches
+  the governance trail — but with no policy attached the request is auto-declined. That
+  is already better than `exec`, where the request hangs the chat forever. A round-trip
+  that waits for a click is the next step.
+- **`ask_user` over mcode ACP is not wired.** The client declares `elicitation.form` and
+  `drive_turn_acp` can answer, but nothing in a chat turn asks yet.
 
 ## What was NOT verified, and must not be claimed
 
@@ -189,20 +290,25 @@ dropped with no error anywhere. Fixed, and the pair is now pinned.
 
 ## Gates at this checkpoint
 
-- Python: full suite, counts in the round-6 commit messages.
-- Frontend: 375 tests across 27 files; tsc clean.
-- Bundle: `index-vrblvNIh.js` + `index-B3TPff.css`, referenced from `index.html`.
-- ruff clean.
+- Python: **2815 tests, 0 failures, 0 errors, 3 skipped** (`.scratch/full30.xml`). Run
+  twice; the first run's single failure was the timing flake described in §6, which is
+  now fixed rather than tolerated.
+- Frontend: **380 tests across 27 files**; tsc clean.
+- Bundle: `index-BtPeDMQR.js` + `index-B3TPff.css`, referenced from `index.html`, with
+  the superseded assets removed.
+- ruff clean across `src`, `tests`, `tools`.
 
 ## Next, in the order I would take it
 
-1. **Wire the ACP turn** — make mcode's chat turn run over ACP instead of `exec`, which
-   is what makes the approval channel, the queue and steering live rather than
-   reachable. The client is the hard part and it is done.
+1. **Let the UI ANSWER a permission prompt.** The one interaction channel mcode offers
+   that DSH does not is built and tested but auto-declines, because answering needs a
+   round-trip from the client's reader thread to the event loop and back. That round-trip
+   is the last piece of the ACP story.
 2. **`/export` and `/feedback`** — `/export` has a route already
    (`GET /api/sessions/{sid}/export`); `/feedback` has no Rigma equivalent.
 3. The unactioned DSH findings from round 5's audits: F5
    (`subagent/descriptor` dies at `subagents.ts:139`), F6
    (`subagent/model-selection-policy` dropped by `_notice_text`), F7 (workflow/PTC
    reduced to an opaque string), F8 (`web_fetch` omitted for a reason that applies only
-   to search providers).
+   to search providers), F9 (grouped unmounted providers), and mcode #8 (background
+   `bash` tasks never become rows).
