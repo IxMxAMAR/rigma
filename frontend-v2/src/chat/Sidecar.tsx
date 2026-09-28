@@ -15,7 +15,7 @@ import { responseError } from "../lib/listFetch";
 import { clampParam, rangeFor } from "../lib/paramLimits";
 import { useApp } from "../store";
 import MethodBuilder from "./MethodBuilder";
-import { selectAnyStreaming, useChat } from "./chatStore";
+import { errText, selectAnyStreaming, useChat } from "./chatStore";
 import { GRANTS, NO_GRANTS, readGrants,
          type GrantKey, type Grants } from "./grants";
 
@@ -325,6 +325,7 @@ function GroundingCard() {
   const [suggestions, setSuggestions] = useState<RagCandidate[]>([]);
   const [adding, setAdding] = useState<string | null>(null);
   const [removeErr, setRemoveErr] = useState<string | null>(null);
+  const [addErr, setAddErr] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -352,14 +353,23 @@ function GroundingCard() {
 
   const addFolder = useCallback(async (folder: string) => {
     setAdding(folder);
+    setAddErr(null);
     try {
-      await fetch("/api/rag/sources", {
+      const r = await fetch("/api/rag/sources", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ path: folder }),
       });
-    } catch {
-      /* status line below reports what did and did not land */
+      // R3-UI-2: `r.ok` was never examined. The server answers 400 with
+      // `path does not exist: X` for a typo'd or missing folder, and that
+      // sentence was thrown away — the card then re-rendered from
+      // /api/rag/status, whose `error` is the INGEST error (empty here), so a
+      // refused path still read "no folders indexed" and looked like a dead
+      // button. The comment claimed the status line reported this; it does not,
+      // because a rejected add never becomes an ingest error.
+      if (!r.ok) setAddErr(await responseError(r));
+    } catch (e) {
+      setAddErr((e as Error).message || "could not add that folder");
     } finally {
       setAdding(null);
     }
@@ -461,6 +471,13 @@ function GroundingCard() {
       {removeErr && (
         <p role="alert" className="font-mono text-[11px] text-red mt-1">
           {removeErr}
+        </p>
+      )}
+      {/* R3-UI-2: a refused add, said out loud. Without this the server's
+          "path does not exist: X" never reached the screen. */}
+      {addErr && (
+        <p role="alert" className="font-mono text-[11px] text-red mt-1">
+          {addErr}
         </p>
       )}
       {/* Folders raggity found, offered as one click each. The text box below
@@ -602,6 +619,11 @@ function SamplingCard() {
   // The one backend that moved, if any. Only INSTALLED ones count: a backend
   // that is not here cannot have drifted, and reporting it would be noise.
   const drifted = menu.find((h) => h.installed && h.drift === true);
+  // R3-HARN-1: the backend this chat is actually on, so the disclosure under
+  // the picker can describe the SELECTED one rather than only the unusable ones.
+  // The stored name may not be on the menu (a moved checkout), so the fallback
+  // is the name itself with nothing known about it.
+  const selectedHarness = menu.find((h) => h.name === harness);
 
   useEffect(() => {
     api.listHarnesses().then((d) => setMenu(d.harnesses)).catch(() => {});
@@ -654,13 +676,16 @@ function SamplingCard() {
   const setGrant = async (key: GrantKey, on: boolean) => {
     const sid = await ensureSession();
     if (!sid) return;
-    const prev = grants;
     setGrants((g) => ({ ...g, [key]: on }));
     setGrantErr(null);
     try {
       await api.updateSession(sid, { [key]: on });
     } catch (e) {
-      setGrants(prev);
+      // R3-UI-2: undo THIS key, not a whole-object snapshot. prev = grants
+      // was captured by this render, so ticking a second box during the first
+      // write and then failing rolled the second box back too — the screen
+      // stopped matching a grant whose own write had succeeded.
+      setGrants((g) => ({ ...g, [key]: !on }));
       setGrantErr((e as Error).message || "could not save");
     }
   };
@@ -758,13 +783,24 @@ function SamplingCard() {
           aria-label="Thinking effort"
           onChange={async (e) => {
             const v = e.target.value;
+            // R3-UI-2: create the chat rather than drop the write, like the
+            // harness and permission pickers above.
+            const sid = await ensureSession();
+            if (!sid) return;
+            const prev = effort;
             setEffort(v);
-            if (currentId)
-              await api.updateSession(currentId, { effort: v }).catch(() => {});
+            try {
+              await api.updateSession(sid, { effort: v });
+            } catch (err) {
+              setEffort(prev);
+              setErr(errText(err));
+            }
           }}
           className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"
         >
           <option value="">model default</option>
+          <option value="auto">auto - the model decides</option>
+          <option value="on">on - think, model's own budget</option>
           <option value="off">off — no thinking</option>
           <option value="low">low</option>
           <option value="medium">medium</option>
@@ -818,6 +854,28 @@ function SamplingCard() {
           ))}
         </ul>
       )}
+      {/* R3-HARN-2: the cost of the backend you are ACTUALLY on.
+          The same `title`-on-an-`<option>` mistake as above, one level worse:
+          the list of what a backend does not get from Rigma was rendered only
+          for backends that are unusable, so choosing a WORKING external agent
+          hid the entire disclosure — including "the sandbox is pinned
+          danger-full-access, so a confined profile does not survive the seam",
+          which is the sentence that explains the permission selector above.
+          `unsupported` is non-empty for every external backend, so this is the
+          normal case, not an edge one. */}
+      {selectedHarness && selectedHarness.runnable && selectedHarness.installed
+        && selectedHarness.unsupported.length > 0 && (
+        <details className="rounded-md bg-surface px-2.5 py-1.5 text-[11.5px]">
+          <summary className="cursor-pointer text-secondary">
+            what {selectedHarness.label} does not get from Rigma
+          </summary>
+          <ul className="mt-1 flex flex-col gap-0.5 pl-3 text-muted leading-snug">
+            {selectedHarness.unsupported.map((u) => (
+              <li key={u}>— {u}</li>
+            ))}
+          </ul>
+        </details>
+      )}
       {/* Said out loud, and only when it is TRUE. A backend that moved under us
           is the one thing about this seam the owner cannot see any other way:
           the turn keeps working right up until it quietly does not, and the
@@ -831,12 +889,25 @@ function SamplingCard() {
           may still work; if one misbehaves, that is the first thing to check.
         </div>
       )}
-      {/* Only for a chat an external agent drives: the setting is that agent's
-          vocabulary, and showing it on Rigma's own loop would offer a knob that
-          does nothing. Shown rather than hidden because the trade is real —
-          headless has nobody to ask, so the mode that asks FAILS THE RUN, which
-          is exactly the kind of thing an owner should be told once. */}
-      {harness !== "native" && (
+      {/* R3-HARN-1: the setting is that agent's vocabulary, and showing it on
+          Rigma's own loop would offer a knob that does nothing. But that is
+          exactly what it was ALSO doing for a backend whose adapter ignores the
+          field — DSH's `run_turn` accepts `permission` and drops it, because
+          DSH's confinement is its own bundle's business. So the selector is now
+          gated on the backend actually applying it, and the case where it does
+          not gets a sentence instead of a control that lies.
+
+          A backend that does not send the field at all reads as honouring it,
+          which keeps the control rather than silently removing it. */}
+      {harness !== "native" && selectedHarness?.honours_permission === false && (
+        <div className="rounded-md bg-surface px-2 py-1 text-[11.5px] text-muted">
+          <span className="text-secondary">{selectedHarness.label}</span> sets
+          its own permission policy, so this chat&apos;s permission setting does
+          not apply to it. Pick a different agent to control how much it may do
+          without asking.
+        </div>
+      )}
+      {harness !== "native" && selectedHarness?.honours_permission !== false && (
         <label className="flex items-center gap-2 text-[12.5px]"
                title={"How much the agent may do without asking. full: it does "
                       + "not ask. smart: it classifies each action and asks when "
@@ -902,10 +973,17 @@ function SamplingCard() {
           value={presetId}
           onChange={async (e) => {
             const v = e.target.value;
+            // R3-UI-2: create the chat rather than drop the write.
+            const sid = await ensureSession();
+            if (!sid) return;
+            const prev = presetId;
             setPresetId(v);
-            if (currentId)
-              await api.updateSession(currentId, { preset_id: v })
-                .catch(() => {});
+            try {
+              await api.updateSession(sid, { preset_id: v });
+            } catch (err) {
+              setPresetId(prev);
+              setErr(errText(err));
+            }
           }}
           aria-label="Preset"
           className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none"

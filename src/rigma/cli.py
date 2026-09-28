@@ -63,6 +63,14 @@ def _port_holder(port: int) -> str:
             free = True
         except OSError:
             pass
+        except OverflowError:
+            # R3-CLI-2: `bind` raises OverflowError — NOT OSError — for a port
+            # outside 0..65535. Every call site iterates `(port, port - 1)`, so
+            # `--port 0` asked about port -1 and `--port 70000` about 69999, and
+            # both escaped as an uncaught traceback instead of this function's
+            # own "port N is already in use" sentence. Treated as "not free":
+            # an unusable number must not read as an available one.
+            pass
     # Consult the OS regardless of how the bind went: a wildcard listener on
     # this port is a conflict even when our specific-address bind succeeded.
     pid = _listening_pid(port)
@@ -875,6 +883,13 @@ def harness(backend: str = typer.Option(None, "--backend", "-b",
         raise typer.Exit(1)
     if as_json:
         typer.echo(json.dumps(rows, indent=2))
+        # R3-CLI-1: the drift exit code applies to the JSON branch too. The
+        # comment below records that this command "used to exit 0 either way —
+        # so `rigma harness && ...` was a green light"; the fix landed only in
+        # the human branch, because this `return` sits above it. A script that
+        # parses the JSON is exactly the caller that cannot see the printed
+        # word DRIFTED, so it is the one that most needs the status.
+        _exit_on_drift(rows)
         return
     for r in rows:
         if not r["installed"]:
@@ -896,6 +911,16 @@ def harness(backend: str = typer.Option(None, "--backend", "-b",
     # exit 0 either way — so `rigma harness && ...` was a green light on a
     # backend whose event schema nobody has checked. `unverified` (drift is
     # None) stays a success on purpose: nobody can say anything changed.
+    _exit_on_drift(rows)
+
+
+def _exit_on_drift(rows) -> None:
+    """Exit 1 when any backend drifted, for BOTH output shapes.
+
+    R3-CLI-1: shared rather than duplicated, because the JSON branch returning
+    above the human branch's check is exactly how this went wrong the first
+    time. `drift is True` only — an unverified backend (`None`) stays a success,
+    since "nobody has checked" is not "something changed"."""
     if any(r.get("drift") is True for r in rows):
         raise typer.Exit(1)
 
@@ -1851,6 +1876,14 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     from . import engines as _engines
     from . import runtime
     from . import state as st
+
+    # R3-CLI-2: refuse an unusable port up front, with a sentence that names the
+    # range. The conflict check below iterates `(port, port - 1)`, so 0 and
+    # >65535 asked about port -1 / 69999 and died on an uncaught OverflowError
+    # from `bind` — a traceback where every neighbouring option gets a message.
+    if not 1 <= port <= 65535:
+        typer.echo(f"--port {port} is not a usable port number (1-65535).")
+        raise typer.Exit(2)
 
     # R3-VLLM-4: THE ENGINE RUNTIME IS CHOSEN HERE, and refused rather than
     # fallen back from.

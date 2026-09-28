@@ -471,6 +471,130 @@ describe("store: choosing an agent backend", () => {
   });
 });
 
+// R3-UI-2. Failures that were invisible: a write that was dropped, a failure
+// reported as an empty list, and one destructive write ordered before the guard
+// that was supposed to prevent it.
+describe("store: a failed write is never silent", () => {
+  beforeEach(() => {
+    // resetAllMocks, not clearAllMocks: `clear` keeps the mock IMPLEMENTATION
+    // from a previous test, so the regenerate test below inherited an
+    // implementation that switched chats and its guard fired for the wrong
+    // reason. It passed the fix and failed the test — the worst kind of green.
+    vi.resetAllMocks();
+    useChat.setState(PRISTINE, true);
+  });
+
+  it("regenerate sets the reply aside BEFORE the destructive write", async () => {
+    // R3-UI-2, and the reason the obvious fix was wrong. msgs has the last
+    // assistant reply POPPED OFF, so the PUT persists a transcript that no
+    // longer contains it; the set-aside take is then the only copy left.
+    //
+    // That take used to be recorded AFTER the write and AFTER the ownership
+    // guard. So switching chats during the round-trip lost the reply twice: the
+    // server no longer had it, and the take that could restore it was never
+    // recorded. Moving the guard earlier does NOT close this — the guard reads
+    // currentId and proceeds, because the switch happens while the write is
+    // in flight, which is exactly the reported race.
+    //
+    // The only ordering that cannot lose it is to record the take first, which
+    // is what this asserts: the take is present even though the write was
+    // abandoned, so the reply is recoverable.
+    h.api.getSession.mockResolvedValue({
+      id: "A", title: "a",
+      messages: [asUser("hi"), asAsst("the reply")],
+    });
+    await useChat.getState().open("A");
+
+    // the user clicks another chat in the rail while the PUT is in flight
+    h.api.updateSession.mockImplementation(async () => {
+      useChat.setState({ currentId: "B" });
+      return {};
+    });
+    await useChat.getState().regenerate();
+
+    // the take survives, keyed to the chat it came from
+    expect(useChat.getState().pendingVariants.A).toEqual({
+      content: "the reply", variants: [] });
+    // and the regenerated turn was NOT started in the chat the user left
+    expect(h.api.updateSession.mock.calls.map(
+      (c) => (c as unknown[])[0])).not.toContain("B");
+  });
+
+  it("regenerate does write, and keeps the take, when you stay put", async () => {
+    // The other half, so the fix cannot be "make regenerate do nothing". A test
+    // that only asserted "no write" would pass against code that never writes.
+    h.api.getSession.mockResolvedValue({
+      id: "A", title: "a",
+      messages: [asUser("hi"), asAsst("the reply")],
+    });
+    await useChat.getState().open("A");
+    h.api.updateSession.mockResolvedValue({});
+    // the regenerated turn is held open, so the end-of-turn cleanup that clears
+    // pendingVariants does not run and we can observe what was set aside
+    let release!: () => void;
+    h.streamChat.mockImplementation(async () => {
+      await new Promise<void>((r) => { release = r; });
+    });
+
+    const done = useChat.getState().regenerate();
+    await tick();
+    await tick();
+
+    expect(h.api.updateSession).toHaveBeenCalledWith("A",
+      { messages: [asUser("hi")] });
+    expect(useChat.getState().pendingVariants.A).toEqual({
+      content: "the reply", variants: [] });
+
+    release();
+    await done;
+  });
+
+  it("duplicateChat reports a refused duplicate instead of doing nothing", async () => {
+    // `r.ok` was never checked and a bare `catch {}` swallowed the rest, so a
+    // 404 resolved cleanly with `d.id` undefined: no chat, no error, no state
+    // change — indistinguishable from a duplicate that worked.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ error: "no such session" }),
+      { status: 404, headers: { "content-type": "application/json" } })));
+    try {
+      await useChat.getState().duplicateChat("gone");
+      expect(useChat.getState().lastError).toMatch(/no such session/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("search reports a failure rather than leaving the full list on screen", async () => {
+    // Leaving every chat visible makes the filter look like it matched
+    // everything, so the reader concludes no chat matches — the search never
+    // ran, and nothing said so.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ error: "search is down" }),
+      { status: 500, headers: { "content-type": "application/json" } })));
+    try {
+      await useChat.getState().search("anything");
+      expect(useChat.getState().lastError).toMatch(/search is down/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("flipVariant rolls back and reports a failed write", async () => {
+    // The other take appeared instantly and looked saved; on reload it was back
+    // to the old one with nothing anywhere saying the write had failed.
+    const last = { ...asAsst("take two"), variants: ["take one"] };
+    useChat.setState({ currentId: "A", messages: [asUser("hi"), last] });
+    h.api.updateSession.mockRejectedValue(new Error("write refused"));
+
+    await useChat.getState().flipVariant(1);
+
+    expect(useChat.getState().lastError).toMatch(/write refused/);
+    // rolled back: the live content is the take that was on screen before
+    const after = useChat.getState().messages[1];
+    expect(after.content).toBe("take two");
+  });
+});
+
 describe("store: one chat's turn never lands in another chat", () => {
   let server: Record<string, FakeSession>;
   /** resolve the turn the fake engine is holding open, per session */

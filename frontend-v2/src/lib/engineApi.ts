@@ -330,8 +330,20 @@ export const engineApi = {
   /** Lifetime tokens/turns and the per-model split (IMP-7). */
   stats: () => j<UsageStats>("GET", "/api/server/stats"),
   log: async (lines = 120): Promise<string> => {
+    // R3-UI-2: this resolved to "" on a non-ok response, and "" is exactly what
+    // an EMPTY log looks like. The caller then rendered "(empty)" with no
+    // explanation, contradicting its own comment ("a read failure leaves the
+    // previous text rather than blanking the panel"). A read that failed is not
+    // a log that is empty — and this is the panel where a failed model load
+    // explains itself, so it is the worst place to answer "nothing to report"
+    // to a question that was never asked.
+    //
+    // NOT through `j`: the route answers `Response(text, media_type="text/plain")`
+    // (serve.py:3519), so `r.json()` would throw on every successful read and
+    // break the panel this is meant to fix. Reject explicitly instead.
     const r = await fetch(`/api/server/log?lines=${lines}`);
-    return r.ok ? r.text() : "";
+    if (!r.ok) throw new Error(`server replied ${r.status}`);
+    return r.text();
   },
 
   models: (cfg?: FitConfig) =>

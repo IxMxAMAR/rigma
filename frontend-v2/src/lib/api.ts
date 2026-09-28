@@ -66,6 +66,15 @@ export interface HarnessInfo {
    *  `null` is not `false` — "I could not tell" is a different sentence to the
    *  owner than "it agrees". Absent when no check was run. */
   drift?: boolean | null;
+  /** R3-HARN-1: whether this backend APPLIES the chat's `permission` setting.
+   *  `permission` is part of the adapter contract, but a backend with no such
+   *  notion ignores it — DSH's confinement is its own bundle's business. The
+   *  UI used to render the "off — no tools at all" selector for every
+   *  non-native backend, so a user could arm a safety setting and have nothing
+   *  happen. Optional: an older server that does not send it is treated as
+   *  `true`, which keeps the selector (the pre-fix behaviour) rather than
+   *  silently removing a control. */
+  honours_permission?: boolean;
   unsupported: string[];
   pending: string;
 }

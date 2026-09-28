@@ -752,6 +752,46 @@ def _load_custom(slug: str) -> ModelSpec | None:
     return ModelSpec.model_validate_json(f.read_text(encoding="utf-8"))
 
 
+def _file_owner_slug(file: str, *, exclude: str = "") -> str | None:
+    """Which model spec claims the on-disk file `file`, if any.
+
+    R3-HANG-1. A model file's identity on disk is its FILENAME — `model_file_path`
+    joins it to `models_dir()` and nothing else — while a spec names a repo to
+    fetch it from. Two specs whose repos both ship the same name therefore point
+    at ONE file, and until this existed a pull for the second silently replaced
+    the first's bytes (see `start_pull`).
+
+    Custom specs are read first because they are the ones a user creates and the
+    likeliest to collide; a corrupt one is skipped rather than allowed to break a
+    pull, matching how `Registry.load` treats custom specs.
+
+    Callers may hold `_PULL_LOCK`; this takes no lock of its own.
+    """
+    def _claims(spec: ModelSpec | None) -> bool:
+        if spec is None or spec.slug == exclude:
+            return False
+        return any(g.file == file for g in spec.ggufs)
+
+    try:
+        for f in sorted(custom_dir().glob("*.json")):
+            try:
+                spec = ModelSpec.model_validate_json(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue          # a broken custom spec must not break a pull
+            if _claims(spec):
+                return spec.slug
+    except OSError:
+        pass
+    try:
+        from .registry import Registry
+        for slug, spec in Registry.load().models.items():
+            if _claims(spec):
+                return slug
+    except Exception:
+        pass
+    return None
+
+
 def _move(src: Path, dest: Path) -> None:
     try:
         os.replace(src, dest)          # same-drive: instant rename
@@ -1119,10 +1159,37 @@ def start_pull(slug: str, file: str, registry=None) -> dict:
     with _PULL_LOCK:
         if key in _PULLS and _PULLS[key]["status"] == "downloading":
             return _PULLS[key]
+        # R3-HANG-1: a model file's identity on disk is its FILENAME, but a pull
+        # is keyed on (slug, file). Two specs whose repos both ship the same name
+        # — `mmproj-F16.gguf` is in the registry twice and quantiser filenames
+        # collide routinely — therefore shared one `models/<file>` and one
+        # `models/<file>.part`, and two live threads interleaved into that single
+        # part file. Observed both ways: one model's multi-GB file silently
+        # replaced by the other's while BOTH pulls reported success (and the fit
+        # math then planned against the registry's byte count for a file that was
+        # no longer that model), or a bogus `WinError 32: could not write
+        # .part` reported as a transport failure.
+        #
+        # `install_model` already refuses when its destination exists; the pull
+        # path had no equivalent, because the guard it does have is keyed on the
+        # destination NAME and so cannot separate two live writers.
+        #
+        # Refused rather than renamed: the destination name is what the spec, the
+        # loader and the fit math all look up, so writing this file under a
+        # different name would leave the spec pointing at a file that is not
+        # there. Saying so is the only honest outcome.
+        target = model_file_path(file)
+        if target.exists():
+            owner = _file_owner_slug(file, exclude=slug)
+            if owner is not None and owner != slug:
+                raise HangarError(
+                    f"{file} is already on disk as part of {owner}. A model "
+                    f"file is identified by its filename, so pulling it here "
+                    f"would overwrite that model's file. Remove {owner} first, "
+                    f"or keep the two apart by renaming.")
         # AUDIT 07-5: refuse BEFORE spawning the thread. A file already on disk
         # downloads nothing, so it needs no room; a file whose size the repo did
         # not state cannot be judged and is left to the write's own OSError.
-        target = model_file_path(file)
         if want and not target.exists():
             try:
                 free = shutil.disk_usage(models_dir()).free
