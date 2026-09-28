@@ -16,6 +16,7 @@
 //   usage      — the step's token accounting, when the backend reported any
 
 import type { Subagent } from "./subagents";
+import { goalTone, phaseLabel, type NormalGoal } from "./goal";
 
 /** Amber = in flight, moss = settled well, muted = not started, red = failed. */
 function todoTone(status: string): string {
@@ -32,13 +33,6 @@ function todoGlyph(status: string): string {
   return "○";
 }
 
-/** A goal's phase drives its colour, and every phase has its own word. */
-function goalTone(phase: string): string {
-  if (phase === "complete") return "text-moss";
-  if (phase === "active") return "text-amber";
-  if (phase === "blocked") return "text-red";
-  return "text-secondary";
-}
 
 function SubagentRow({ row }: { row: Subagent }) {
   const tone =
@@ -79,27 +73,25 @@ export default function AgentState({
   subagents,
   usage,
 }: {
-  goal: Record<string, unknown> | null;
+  goal: NormalGoal | null;
   todos: { content: string; status: string }[];
   planMode: boolean;
   subagents: Subagent[];
   usage: Record<string, unknown> | null;
 }) {
-  // The `goal/change` envelope is {operation, goal: <snapshot>, roundsStarted}.
-  // Read through the envelope rather than assuming a bare snapshot, so a backend
-  // that adds a field does not silently blank the panel.
-  const snap = (goal?.goal ?? null) as Record<string, unknown> | null;
-  const hasGoal =
-    snap !== null && typeof snap.objective === "string" && snap.objective !== "";
+  // Already normalised by the store, so this draws ONE shape whatever the
+  // backend was: DSH's nested `goal/change` envelope and mcode's flat goal
+  // object both arrive here as a NormalGoal.
+  const hasGoal = goal !== null && goal.objective !== "";
   const hasUsage = usage !== null && Object.keys(usage).length > 0;
   if (!hasGoal && todos.length === 0 && !planMode && subagents.length === 0 && !hasUsage) {
     return null;
   }
 
-  const phase = String((snap?.phase as string) ?? "");
-  const rounds = goal?.roundsStarted;
-  const maxRounds = snap?.maxGoalRounds;
-  const blocked = snap?.blockedReason as { message?: unknown } | undefined;
+  const phase = goal?.phase ?? "";
+  const rounds = goal?.rounds ?? null;
+  const maxRounds = goal?.maxRounds ?? null;
+  const blocked = goal?.blocked ?? "";
 
   return (
     <div className="rounded-md bg-panel px-3 py-2 flex flex-col gap-2">
@@ -110,7 +102,9 @@ export default function AgentState({
               goal
             </span>
             {phase && (
-              <span className={`font-mono text-[10.5px] ${goalTone(phase)}`}>{phase}</span>
+              <span className={`font-mono text-[10.5px] ${goalTone(phase)}`}>
+                {phaseLabel(phase)}
+              </span>
             )}
             {rounds != null && (
               <span className="font-mono text-[10.5px] text-muted">
@@ -118,11 +112,17 @@ export default function AgentState({
                 {maxRounds != null ? ` of ${String(maxRounds)}` : ""}
               </span>
             )}
+            {/* mcode reports tokens where DSH reports rounds. Shown only when
+                a budget exists, because a bare count with nothing to compare it
+                to is not information. */}
+            {goal?.tokenBudget != null && (
+              <span className="font-mono text-[10.5px] text-muted">
+                {goal.tokensUsed ?? 0} of {goal.tokenBudget} tokens
+              </span>
+            )}
           </div>
-          <p className="text-[13px] text-primary">{String(snap?.objective ?? "")}</p>
-          {blocked?.message != null && (
-            <p className="text-[12px] text-red mt-0.5">{String(blocked.message)}</p>
-          )}
+          <p className="text-[13px] text-primary">{goal?.objective ?? ""}</p>
+          {blocked && <p className="text-[12px] text-red mt-0.5">{blocked}</p>}
         </div>
       )}
 

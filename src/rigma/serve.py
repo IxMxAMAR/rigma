@@ -2103,8 +2103,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                                 "args": ev.args or {}}, event="tool")
                 elif ev.kind == "tool_result":
                     _tid = str((ev.data or {}).get("id") or "") or ev.name
+                    # `ok` goes on the wire. The trace below has always
+                    # recorded it and the live chip never received it, so the
+                    # UI guessed the outcome from the result text. `None`
+                    # means the backend did not say, which the chip draws as
+                    # unknown rather than as a tick.
                     yield _sse({"id": _tid, "name": ev.name,
-                                "result": ev.text}, event="tool_result")
+                                "result": ev.text, "ok": ev.ok},
+                               event="tool_result")
                     trace.append({"name": ev.name, "result": ev.text, "ok": ev.ok,
                                   "ts": _now()})
                 elif ev.kind == "state":
@@ -3135,10 +3141,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _shown = str(result)
                         if len(_shown) > 900:      # display only; the model gets it all
                             _shown = _shown[:900] + " …(display clipped — the model sees the full text)"
+                        # `ok` is sent, and computed the same way the trace
+                        # below computes it, so the LIVE chip and the PERSISTED
+                        # one cannot disagree. Without it on the wire the chip
+                        # falls back to reading the text, which happens to agree
+                        # here — but only by coincidence, and the two paths would
+                        # drift the moment either heuristic changed.
+                        _ok = not str(result).startswith("error")
                         yield _sse({"id": c["id"] or f"call-{idx}", "name": name,
-                                    "result": _shown}, event="tool_result")
+                                    "result": _shown, "ok": _ok},
+                                   event="tool_result")
                         trace.append({"name": name, "args": cargs, "result": result,
-                                      "ok": not str(result).startswith("error"),
+                                      "ok": _ok,
                                       "ts": _now()})
                         # AUDIT F7: a completed action is exactly what must not be
                         # lost to a refresh — the file it wrote is already on disk,

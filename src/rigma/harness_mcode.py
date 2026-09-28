@@ -612,6 +612,100 @@ def _flatten(out) -> str:
     return str(out)[:4000]
 
 
+# mcode's own vocabulary for the state Rigma could not previously see. These
+# are the tool names it uses for goals, todos and subagents; everything below
+# reads the STRUCTURED payload of a call rather than flattening it to text.
+_GOAL_TOOLS = ("update_goal", "get_goal", "create_goal")
+_TODO_TOOLS = ("todowrite",)
+_TASK_TOOLS = ("task", "task_append", "task_query", "task_output",
+                "task_stop")
+
+
+def _details(out) -> dict:
+    """The structured `details` of a tool result, or {}.
+
+    mcode wraps every tool result as `{tool_name, text, content, details}` and
+    `_flatten` keeps only `content` — which is why the goal object, the todo
+    array and every task id were being thrown away one line before they were
+    read. They are all in `details`.
+    """
+    if not isinstance(out, dict):
+        return {}
+    d = out.get("details")
+    return d if isinstance(d, dict) else {}
+
+
+def _state_events(name: str, out) -> list[TurnEvent]:
+    """The structured state a tool result carries, in the seam's vocabulary.
+
+    Field names are mcode's own, deliberately NOT renamed. Rigma normalises
+    them once, in the UI, where a shape it does not recognise can be shown
+    rather than silently dropped — see `chat/goal.ts`. Renaming here would mean
+    guessing at a schema this side does not own.
+    """
+    d = _details(out)
+    if not d:
+        return []
+
+    if name in _GOAL_TOOLS:
+        # `get_goal` with no goal answers `{"goal": null}`, and an error
+        # answers `{"error": ...}`. Neither is a goal, and emitting an empty
+        # one would blank a panel that was showing something real.
+        goal = d.get("goal")
+        if not isinstance(goal, dict):
+            return []
+        # `update_goal` wraps it as {proposal, goal, goalSnapshotPhase}; the
+        # goal itself is the part that describes the work.
+        return [TurnEvent(kind="state", event="goal", data=goal)]
+
+    if name in _TODO_TOOLS:
+        # The argument is the whole list and replaces the previous one; the
+        # result echoes it under `details.todos`.
+        todos = d.get("todos")
+        if not isinstance(todos, list):
+            return []
+        return [TurnEvent(kind="state", event="todos", data={"todos": todos})]
+
+    if name in _TASK_TOOLS:
+        # mcode emits snake_case (`task_id`, `sub_session_id`, `sub_turn_id`);
+        # the seam uses camelCase, which is also what the runtime's own
+        # normaliser produces. Renaming here is safe because these three names
+        # are read by mcode's own parser both ways.
+        ids = {
+            "taskId": d.get("task_id"),
+            "subSessionId": d.get("sub_session_id"),
+            "subTurnId": d.get("sub_turn_id"),
+        }
+        if not any(v for v in ids.values()):
+            return []
+        return [TurnEvent(kind="state", event="subagent", data={
+            **{k: v for k, v in ids.items() if v},
+            "name": d.get("agent_name") or d.get("resolved_agent_name"),
+            "status": d.get("status"),
+        })]
+
+    return []
+
+
+def _ok_of(call: dict) -> bool | None:
+    """Whether the call succeeded, from the wire's own status.
+
+    The adapter used to say this could not be derived: "mcode does not flag
+    failure in the projected item — a tool that does not exist comes back as
+    status 3 with the reason as TEXT — so `ok` cannot be derived here". The
+    status IS on the item: the runtime normalises its numeric enum to
+    `started` / `completed` / `failed`. Only `failed` is a failure, and
+    anything unrecognised returns None, which the seam renders as UNKNOWN
+    rather than as success — the old behaviour claimed success for every
+    result including the failures.
+    """
+    status = str(call.get("status") or "").strip().lower()
+    if status == "failed":
+        return False
+    if status == "completed":
+        return True
+    return None
+
 def map_event(obj: dict, seen: dict) -> list[TurnEvent]:
     """Translate one mcode stream-json object into Rigma's events.
 
@@ -674,10 +768,12 @@ def map_event(obj: dict, seen: dict) -> list[TurnEvent]:
                                     args=args if isinstance(args, dict) else {}))
         if out is not None and not seen.get(f"{iid}:result"):
             seen[f"{iid}:result"] = True
-            # mcode does not flag failure in the projected item — a tool that
-            # does not exist comes back as status 3 with the reason as TEXT —
-            # so `ok` cannot be derived here and the text is what says it.
-            events.append(TurnEvent("tool_result", text=_flatten(out), name=name))
+            events.append(TurnEvent("tool_result", text=_flatten(out),
+                                    name=name, ok=_ok_of(call)))
+            # What the call DID, in structured form, for the tools whose
+            # result carries state rather than prose. Emitted after the result
+            # so the transcript reads call-then-outcome-then-state.
+            events.extend(_state_events(name, out))
         return events
     return []
 

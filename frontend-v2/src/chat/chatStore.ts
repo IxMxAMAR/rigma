@@ -14,6 +14,7 @@ import { runMacroStream } from "../lib/methods";
 import { streamChat, type SseEvent } from "../lib/sse";
 import { DRAFT_KEY, parseDrafts, saveDrafts } from "./drafts";
 import { foldSubagent, type Subagent } from "./subagents";
+import { normaliseGoal, type NormalGoal } from "./goal";
 
 export interface Chip {
   id: string;
@@ -21,6 +22,14 @@ export interface Chip {
   args?: unknown;
   result?: string;
   state: "running" | "done";
+  /** Whether the call succeeded, when the backend actually said.
+   *
+   *  `undefined` means UNKNOWN, and it is the honest default rather than `true`:
+   *  a backend that does not report an outcome (mcode's adapter used to claim
+   *  success for every result, including failures) must not be drawn as a tick.
+   *  The chip falls back to reading the result text, which is what it always
+   *  did, only now it can do better when it knows better. */
+  ok?: boolean | null;
 }
 
 /** One grounded passage's origin. `snippet` is a display excerpt, clipped
@@ -51,11 +60,11 @@ export interface StreamingTurn {
    *  the MODEL's text, so the sources reached the model and never the reader —
    *  backwards for the one feature whose value is "which file said this". */
   sources: Source[];
-  /** What the agent is working TOWARD, from the backend's own goal state.
-   *  A goal is not a message and not a todo: it has a phase, a revision and a
-   *  round count, and it outlives the turn that set it. Kept whole rather than
-   *  flattened because the phase is the point. */
-  goal: Record<string, unknown> | null;
+  /** What the agent is working TOWARD, normalised from whichever backend
+   *  reported it. A goal is not a message and not a todo: it outlives the turn
+   *  that set it. Both harnesses report one and they disagree on the shape, so
+   *  `chat/goal.ts` folds them into this. */
+  goal: NormalGoal | null;
   /** The backend's latest whole-list todo snapshot. `todo_write` REPLACES the
    *  list every call, so this is an assignment, never a merge. */
   todos: { content: string; status: string }[];
@@ -190,7 +199,14 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
                                : c.state === "running"; // legacy: first open
         if (!hit) return c;
         matched = true;
-        return { ...c, result: String(d.result ?? ""), state: "done" as const };
+        return {
+          ...c,
+          result: String(d.result ?? ""),
+          state: "done" as const,
+          // Absent on the wire means UNKNOWN, which is not `true`. The native
+          // loop sends it; the external path does not always.
+          ok: typeof d.ok === "boolean" ? d.ok : null,
+        };
       });
       return { ...turn, chips };
     }
@@ -252,8 +268,13 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
     }
     // The backend's structured state. Each is a fact with its own shape, so
     // none of them is folded into `text`.
-    case "goal":
-      return { ...turn, goal: d };
+    case "goal": {
+      // A payload with no objective is not a goal — `get_goal` answers
+      // `{goal: null}` and an error answers `{error}`. Returning the turn
+      // unchanged keeps whatever the panel was already showing.
+      const g = normaliseGoal(d);
+      return g ? { ...turn, goal: g } : turn;
+    }
     case "todos": {
       const raw = Array.isArray(d.todos) ? d.todos : [];
       return {

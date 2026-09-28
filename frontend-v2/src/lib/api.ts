@@ -10,7 +10,15 @@ export interface SessionSummary {
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string | { type: string; [k: string]: unknown }[];
-  tool_trace?: { name: string; args?: unknown; result?: string }[];
+  /** `ok` is the server's own record of whether the call succeeded. It was
+   *  always persisted and never read: the chip inferred success from the result
+   *  text starting with "error", which is a guess. `null` means unknown. */
+  tool_trace?: {
+    name: string;
+    args?: unknown;
+    result?: string;
+    ok?: boolean | null;
+  }[];
   /** What a `delegate` research helper did behind the context firewall. The
    *  server has always recorded this; nothing rendered it, so the exploration
    *  was invisible — one chip, then an answer. UI-only: it never re-enters

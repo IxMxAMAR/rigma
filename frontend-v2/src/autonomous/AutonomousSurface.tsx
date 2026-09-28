@@ -23,7 +23,24 @@ interface RunSummary {
   iteration: number;
 }
 
+interface Deliverable {
+  path: string;
+  description?: string;
+}
+
+/** The compiled mission, pinned into the system prompt every turn. It was
+ *  always in the payload and never drawn, so a run's OBJECTIVE — the one
+ *  thing that says what the run is for — was invisible in the surface named
+ *  after it. Only the plan list was shown, which is the how, not the what. */
+interface Spec {
+  objective: string;
+  deliverables?: Deliverable[];
+  constraints?: string[];
+  compiled?: boolean;
+}
+
 interface Run extends RunSummary {
+  spec?: Spec | null;
   plan?: PlanStep[];
   halt_reason?: string;
   summary?: string;
@@ -34,6 +51,22 @@ interface Run extends RunSummary {
    *  only on a restarted run; `deadline` is an absolute epoch (runs.create). */
   iter_ceiling?: number;
   deadline?: number;
+}
+
+// A plan step has THREE states on the server (`pending`, `done`, `blocked`)
+// and the surface drew two glyphs, so `blocked` was indistinguishable from
+// `pending` — a run stuck on a step read as a run that had not reached it,
+// which is the opposite diagnosis and the one that wastes a user's time.
+function planGlyph(status: string): string {
+  if (status === "done") return "✓";
+  if (status === "blocked") return "✕";
+  return "○";
+}
+
+function planTone(status: string): string {
+  if (status === "done") return "text-moss";
+  if (status === "blocked") return "text-red";
+  return "text-muted";
 }
 
 const ACTIVE = new Set(["running", "paused"]);
@@ -258,15 +291,68 @@ function ActiveRun({ run, onAction }: { run: Run; onAction: () => void }) {
           </p>
         </div>
       )}
+      {/* What the run is FOR. The plan below says how; this says what, and it
+          was the missing half — a user watching an unattended run could see
+          every step and not the objective they served. */}
+      {run.spec?.objective && (
+        <div className="rounded-md bg-panel px-3 py-2 mb-3">
+          <div className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em] mb-0.5">
+            objective
+            {run.spec.compiled === false && (
+              <span className="text-amber normal-case tracking-normal">
+                {" "}— compiled from the mission as given
+              </span>
+            )}
+          </div>
+          <p className="text-[13px] text-primary">{run.spec.objective}</p>
+          {(run.spec.deliverables?.length ?? 0) > 0 && (
+            <details className="mt-1">
+              <summary className="cursor-pointer font-mono text-[11px] text-secondary">
+                must exist when it finishes: {run.spec.deliverables!.length} file
+                {run.spec.deliverables!.length === 1 ? "" : "s"}
+              </summary>
+              <ul className="mt-1 flex flex-col gap-0.5 pl-3 text-[11.5px] text-muted">
+                {run.spec.deliverables!.map((d) => (
+                  <li key={d.path} className="font-mono break-all">
+                    — {d.path}
+                    {d.description && (
+                      <span className="font-sans text-muted"> {d.description}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+          {(run.spec.constraints?.length ?? 0) > 0 && (
+            <details className="mt-1">
+              <summary className="cursor-pointer font-mono text-[11px] text-secondary">
+                {run.spec.constraints!.length} constraint
+                {run.spec.constraints!.length === 1 ? "" : "s"}
+              </summary>
+              <ul className="mt-1 flex flex-col gap-0.5 pl-3 text-[11.5px] text-muted">
+                {run.spec.constraints!.map((c, i) => (
+                  <li key={i}>— {c}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
       {plan.length > 0 && (
         <ul className="flex flex-col gap-1 mb-3">
           {plan.map((s) => (
             <li key={s.id} className="flex items-start gap-2 text-[12.5px]">
-              <span className={`font-mono mt-px ${s.status === "done" ? "text-moss" : "text-muted"}`}>
-                {s.status === "done" ? "✓" : "○"}
+              {/* Three states, three glyphs. `blocked` used to render as the
+                  same ○ as `pending`, so a run stuck on a step looked like a
+                  run that had not reached it — the opposite diagnosis. */}
+              <span className={`font-mono mt-px ${planTone(s.status)}`}>
+                {planGlyph(s.status)}
               </span>
               <span className={s.status === "done" ? "text-muted" : "text-primary"}>
                 {s.text}
+                {s.status === "blocked" && (
+                  <span className="text-red"> — blocked</span>
+                )}
               </span>
             </li>
           ))}

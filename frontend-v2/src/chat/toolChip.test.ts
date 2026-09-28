@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatArgs, previewArgs } from "./toolChip";
+import { chipOutcome, formatArgs, previewArgs } from "./toolChip";
 
 // A chip is how a reader judges a tool call they did not write. These are the
 // calls an EXTERNAL agent makes, with that agent's vocabulary — which is not
@@ -104,5 +104,47 @@ describe("a subagent call is identified by its agent, not its prose", () => {
   it("still falls back to description when there is no agent", () => {
     // A tool with a description and no agent_name must not regress.
     expect(previewArgs({ description: "do the thing" })).toBe("do the thing");
+  });
+});
+
+
+// The outcome of a tool call. The server records it (`ok`) and the chip used to
+// ignore that and guess from the result text — wrong for any tool whose failure
+// text does not begin with "error", and unable to tell "failed" from "unknown".
+describe("chipOutcome", () => {
+  it("trusts the server's own record over the result text", () => {
+    // A result that READS like a failure but was reported as fine.
+    expect(chipOutcome({ state: "done", ok: true, result: "error: none found" }))
+      .toBe("ok");
+    // A result that reads fine but was reported as a failure.
+    expect(chipOutcome({ state: "done", ok: false, result: "all good" }))
+      .toBe("failed");
+  });
+
+  it("falls back to the text only when the backend did not say", () => {
+    expect(chipOutcome({ state: "done", result: "error: no such file" }))
+      .toBe("failed");
+    expect(chipOutcome({ state: "done", result: "wrote 3 files" }))
+      .toBe("unknown");
+    expect(chipOutcome({ state: "done", ok: null, result: "wrote 3 files" }))
+      .toBe("unknown");
+  });
+
+  // The whole reason `unknown` exists: a backend that reports nothing must not
+  // be drawn as a success, because a failed call shown as a tick is worse than
+  // no glyph at all.
+  it("never calls an unreported outcome a success", () => {
+    expect(chipOutcome({ state: "done", result: "" })).toBe("unknown");
+    expect(chipOutcome({ state: "done" })).toBe("unknown");
+  });
+
+  it("is running until the turn says otherwise, whatever ok says", () => {
+    expect(chipOutcome({ state: "running", ok: true, result: "x" })).toBe("running");
+    expect(chipOutcome({ state: "running", ok: false })).toBe("running");
+  });
+
+  it("treats a missing result and a missing ok as unknown, not as failure", () => {
+    expect(chipOutcome({ state: "done", ok: undefined, result: undefined }))
+      .toBe("unknown");
   });
 });

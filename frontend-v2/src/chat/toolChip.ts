@@ -68,3 +68,31 @@ export function formatArgs(args: unknown): string {
   const tail = Object.keys(rest).length ? JSON.stringify(rest, null, 2) : "";
   return [String(a[key]), tail].filter(Boolean).join("\n");
 }
+
+/** What a tool call's outcome is, and how it is decided.
+ *
+ *  ORDER MATTERS, and it is the point of this function. The server records
+ *  whether a call succeeded (`ok`) and the chip used to IGNORE it, inferring the
+ *  outcome from `result.startsWith("error")` — a heuristic that is wrong for any
+ *  tool whose failure text does not begin with that word, and that cannot tell
+ *  "failed" from "unknown".
+ *
+ *  The backend's own word wins. `ok === true` is a success, `ok === false` is a
+ *  failure, and `null`/`undefined` means the backend did not say — which falls
+ *  back to the old text guess rather than claiming either. `unknown` is a real
+ *  outcome and is drawn as neither a tick nor a cross: an unreported result
+ *  shown as a success is how a broken tool call reads as a working one.
+ */
+export type ChipOutcome = "running" | "failed" | "ok" | "unknown";
+
+export function chipOutcome(chip: {
+  state: "running" | "done";
+  ok?: boolean | null;
+  result?: string;
+}): ChipOutcome {
+  if (chip.state === "running") return "running";
+  if (chip.ok === false) return "failed";
+  if (chip.ok === true) return "ok";
+  if (chip.result?.startsWith("error")) return "failed";
+  return "unknown";
+}

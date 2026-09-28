@@ -21,31 +21,66 @@ describe("the backend's structured agent state reaches the turn", () => {
       },
       roundsStarted: 4,
     }));
-    // The `goal/change` envelope is {operation, goal: <snapshot>, roundsStarted}.
-    // The snapshot is where the phase and objective live.
-    expect(t.goal).toMatchObject({ operation: "create" });
-    expect(t.goal?.goal).toMatchObject({
+    // The store NORMALISES both backends' shapes, so this is a NormalGoal and
+    // not the raw envelope. The round count rides the envelope, not the
+    // snapshot, and losing it would make "round 4 of 60" impossible.
+    expect(t.goal).toMatchObject({
       objective: "make the suite green",
       phase: "active",
+      rounds: 4,
+      maxRounds: 60,
     });
-    // The round count rides the ENVELOPE, not the snapshot. Losing it would
-    // make "round 4 of 60" impossible to render.
-    expect(t.goal?.roundsStarted).toBe(4);
   });
 
-  // The snapshot is nested under `goal` in the change envelope. A reducer that
-  // assumed a bare snapshot would set `goal` to the envelope and the panel would
-  // render nothing — which is exactly the bug this pins.
-  it("keeps the goal envelope and its nested snapshot together", () => {
+  // The snapshot is nested under `goal` in DSH's envelope. A reducer that
+  // assumed a bare snapshot would blank the panel — which is the bug this pins.
+  it("reads DSH's nested envelope", () => {
     const t = applyEvent(emptyTurn(), ev("goal", {
       operation: "pause",
       goal: { objective: "x", phase: "paused", maxGoalRounds: 10 },
       roundsStarted: 1,
     }));
-    expect(t.goal).toHaveProperty("operation", "pause");
-    expect(t.goal).toHaveProperty("goal");
-    expect((t.goal?.goal as Record<string, unknown>).maxGoalRounds).toBe(10);
+    expect(t.goal).toMatchObject({
+      objective: "x",
+      phase: "paused",
+      rounds: 1,
+      maxRounds: 10,
+    });
   });
+
+  // mcode reports the goal object FLAT, with `status` where DSH says `phase`,
+  // and tokens where DSH says rounds. Both must reach the same panel.
+  it("reads mcode's flat goal object", () => {
+    const t = applyEvent(emptyTurn(), ev("goal", {
+      goalId: "g1",
+      sessionId: "s1",
+      objective: "make the suite green",
+      status: "active",
+      tokensUsed: 120,
+      tokenBudget: 5000,
+    }));
+    expect(t.goal).toMatchObject({
+      objective: "make the suite green",
+      phase: "active",
+      tokensUsed: 120,
+      tokenBudget: 5000,
+    });
+    expect(t.goal?.rounds).toBeNull();
+  });
+
+  // `get_goal` with no goal answers {goal: null}; an error answers {error}.
+  // Neither is a goal, and rendering one would blank a panel showing something.
+  it("ignores a goal payload that is not a goal", () => {
+    const before = applyEvent(emptyTurn(), ev("goal", { objective: "keep me" }));
+    expect(applyEvent(before, ev("goal", { goal: null })).goal).toMatchObject({
+      objective: "keep me",
+    });
+    expect(applyEvent(before, ev("goal", { error: "nope" })).goal).toMatchObject({
+      objective: "keep me",
+    });
+    expect(applyEvent(emptyTurn(), ev("goal", {})).goal).toBeNull();
+  });
+
 
   it("replaces the todo list rather than merging it", () => {
     let t = applyEvent(emptyTurn(), ev("todos", {
