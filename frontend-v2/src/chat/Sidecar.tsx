@@ -584,6 +584,9 @@ function SamplingCard() {
   const setHarness = useChat((s) => s.setHarness);
   const permission = useChat((s) => s.permission);
   const setPermission = useChat((s) => s.setPermission);
+  // R3-UI-1: creates the chat a per-chat setting belongs to, rather than
+  // dropping the write when none is open yet.
+  const ensureSession = useChat((s) => s.ensureSession);
   // IMP-4 / AUDIT 13-3: the per-chat tool grants. Held LOCALLY rather than in
   // the chat store because only this card renders them, and the session body
   // is already fetched below for the sampling fields.
@@ -637,13 +640,19 @@ function SamplingCard() {
   // A grant is a real write, so it is NOT fire-and-forget: the server refuses
   // a bad value and the checkbox must not keep showing a permission the chat
   // does not have. Optimistic, then rolled back with the server's sentence.
+  //
+  // R3-UI-1: `ensureSession`, not `if (!currentId) return`. There is no chat
+  // until one is opened or a first message is sent, and this fieldset renders
+  // anyway — so the old guard made every box silently un-tickable on a fresh
+  // page, which reads as a broken UI rather than a missing chat.
   const setGrant = async (key: GrantKey, on: boolean) => {
-    if (!currentId) return;
+    const sid = await ensureSession();
+    if (!sid) return;
     const prev = grants;
     setGrants((g) => ({ ...g, [key]: on }));
     setGrantErr(null);
     try {
-      await api.updateSession(currentId, { [key]: on });
+      await api.updateSession(sid, { [key]: on });
     } catch (e) {
       setGrants(prev);
       setGrantErr((e as Error).message || "could not save");

@@ -258,6 +258,16 @@ export interface ChatState {
   search: (q: string) => Promise<void>;
   open: (id: string) => Promise<void>;
   newChat: () => Promise<void>;
+  /** The chat to write a per-chat setting to, creating one if none is open.
+   *
+   *  R3-UI-1. `currentId` is null until a chat is opened OR the first message is
+   *  sent, because `send` creates one on demand. Every other per-chat write used
+   *  to `if (!currentId) return` instead, so on a fresh page the Sidecar's
+   *  controls rendered as live and did nothing at all: the harness dropdown
+   *  snapped back and the three grant checkboxes could not be ticked, with no
+   *  message saying why. Returning the id (or null on failure) lets a caller do
+   *  what `send` already does — make the chat the setting belongs to. */
+  ensureSession: () => Promise<string | null>;
   deleteChat: (id: string) => Promise<void>;
   duplicateChat: (id: string) => Promise<void>;
   /** false = the turn never started; the composer keeps what you typed. */
@@ -388,9 +398,32 @@ export const useChat = create<ChatState>((set, get) => ({
     }
   },
 
-  setHarness: async (name) => {
+  // R3-UI-1. One place that answers "which chat does this setting belong to",
+  // creating it when there is none. `send` has always done this inline; every
+  // other per-chat write silently gave up instead, which is why the Sidecar
+  // looked broken on a fresh page.
+  ensureSession: async () => {
     const sid = get().currentId;
-    if (!sid || name === get().harness) return;
+    if (sid) return sid;
+    try {
+      const s = await api.createSession();
+      set({ currentId: s.id, messages: [],
+            harness: s.harness ?? "native",
+            permission: s.permission ?? "full", lastError: null });
+      await get().loadSessions();
+      return s.id;
+    } catch (e) {
+      set({ lastError: errText(e) });
+      return null;
+    }
+  },
+
+  setHarness: async (name) => {
+    if (name === get().harness) return;
+    // Create the chat rather than refusing: the picker is on screen and looks
+    // live, so a click that does nothing is the bug this fixes.
+    const sid = await get().ensureSession();
+    if (!sid) return;
     const prev = get().harness;
     set({ harness: name, lastError: null });
     try {
@@ -403,8 +436,9 @@ export const useChat = create<ChatState>((set, get) => ({
   },
 
   setPermission: async (mode) => {
-    const sid = get().currentId;
-    if (!sid || mode === get().permission) return;
+    if (mode === get().permission) return;
+    const sid = await get().ensureSession();
+    if (!sid) return;
     const prev = get().permission;
     set({ permission: mode, lastError: null });
     try {

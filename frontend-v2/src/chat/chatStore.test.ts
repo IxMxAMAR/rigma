@@ -407,6 +407,68 @@ describe("store: choosing an agent backend", () => {
     expect(useChat.getState().harness).toBe("native");
     expect(useChat.getState().lastError).toMatch(/cannot run a turn yet/);
   });
+
+  // R3-UI-1. On a fresh page `currentId` is null — a chat exists only once one
+  // is opened or a first message is sent — but the Sidecar renders its harness
+  // picker and grant checkboxes anyway. Every one of those writes used to
+  // `if (!currentId) return`, so the controls looked live and did nothing: the
+  // dropdown snapped back and the boxes could not be ticked, with no message.
+  describe("a per-chat setting with no chat open", () => {
+    it("creates the chat instead of dropping the change", async () => {
+      expect(useChat.getState().currentId).toBeNull();
+      h.api.createSession.mockResolvedValue({ id: "NEW", messages: [] });
+      h.api.updateSession.mockResolvedValue({ id: "NEW" });
+
+      await useChat.getState().setHarness("dsh");
+
+      expect(h.api.createSession).toHaveBeenCalled();
+      expect(h.api.updateSession).toHaveBeenCalledWith("NEW", { harness: "dsh" });
+      expect(useChat.getState().harness).toBe("dsh");
+      expect(useChat.getState().currentId).toBe("NEW");
+    });
+
+    it("creates the chat for a permission change too", async () => {
+      h.api.createSession.mockResolvedValue({ id: "NEW", messages: [] });
+      h.api.updateSession.mockResolvedValue({ id: "NEW" });
+
+      await useChat.getState().setPermission("smart");
+
+      expect(h.api.updateSession).toHaveBeenCalledWith("NEW",
+                                                      { permission: "smart" });
+      expect(useChat.getState().permission).toBe("smart");
+    });
+
+    it("reuses the chat already open rather than making another", async () => {
+      h.api.getSession.mockResolvedValue({ id: "A", title: "a", messages: [] });
+      h.api.updateSession.mockResolvedValue({ id: "A" });
+      await useChat.getState().open("A");
+      h.api.createSession.mockClear();
+
+      await useChat.getState().setHarness("dsh");
+
+      expect(h.api.createSession).not.toHaveBeenCalled();
+      expect(h.api.updateSession).toHaveBeenCalledWith("A", { harness: "dsh" });
+    });
+
+    it("still reports the failure when the chat cannot be created", async () => {
+      // The change is not silently lost: the picker must not show a backend
+      // that was never saved.
+      h.api.createSession.mockRejectedValue(new Error("server down"));
+
+      await useChat.getState().setHarness("dsh");
+
+      expect(useChat.getState().harness).toBe("native");
+      expect(useChat.getState().lastError).toMatch(/server down/);
+    });
+
+    it("does not create a chat for a value that did not change", async () => {
+      // Opening a chat on every stray click of an unchanged select would litter
+      // the rail with empty chats.
+      h.api.createSession.mockClear();
+      await useChat.getState().setHarness("native");
+      expect(h.api.createSession).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("store: one chat's turn never lands in another chat", () => {
