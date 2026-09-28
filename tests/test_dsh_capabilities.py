@@ -700,7 +700,20 @@ _MCP_PLUGIN = "@deepseek-ai/dsh-mcp-client"
 
 
 def _mcp_rows(tmp_path, monkeypatch, *, offered=True, cwd=None):
-    """The generated MCP patch's rows, with the roster gate stubbed."""
+    """The generated MCP patch's ROWS, with the roster gate stubbed.
+
+    R6-MCP-INSERT: this used to return the loaded document, and the document is a list
+    of patch OPERATIONS — so the tests indexed `doc[0]` and got the operation rather than
+    the row. They passed only because the file used to be a bare row, which is the very
+    thing that was wrong: a bare row is read as a REPLACE, so DSH answered
+    `patch: entry "mcp-rigma" not found`, dropped the overlay, and exited 0. Rigma's own
+    tools therefore never reached a DSH turn while the capability menu said they were
+    mounted.
+
+    The helper now unwraps the operation, which means every test below is asserting on
+    the row DSH would actually insert — and `test_the_mcp_patch_is_an_insert_operation`
+    pins the wrapper itself, so the two cannot drift apart again.
+    """
     from rigma import mcp_server
 
     monkeypatch.setattr(mcp_server, "offered",
@@ -708,7 +721,31 @@ def _mcp_rows(tmp_path, monkeypatch, *, offered=True, cwd=None):
     path = harness_dsh.mcp_patch_file(tmp_path, cwd=cwd)
     if not path:
         return None
-    return yaml.safe_load(open(path, encoding="utf-8"))
+    doc = yaml.safe_load(open(path, encoding="utf-8"))
+    # Every operation, flattened to its rows. A `replace`/`remove` would contribute
+    # nothing, and the assert below is what catches a patch that has stopped inserting.
+    rows = [row for entry in doc if isinstance(entry, dict)
+            for row in (entry.get("insert") or [])]
+    assert rows, f"the MCP patch inserts no rows: {doc}"
+    return rows
+
+
+def test_the_mcp_patch_is_an_insert_operation(tmp_path, monkeypatch):
+    """R6-MCP-INSERT. The wrapper is load-bearing, and its absence was SILENT.
+
+    A patch list is a list of operations. A bare row is a REPLACE, and a replace of a row
+    that does not exist is not an error DSH stops for — it warns on stderr, drops the
+    whole overlay, and exits 0. So this is the difference between "DSH has Rigma's four
+    tools" and "nothing happened", with no failure to notice.
+    """
+    from rigma import mcp_server
+
+    monkeypatch.setattr(mcp_server, "offered", lambda **kw: ["remember"])
+    path = harness_dsh.mcp_patch_file(tmp_path, cwd=None)
+    doc = yaml.safe_load(open(path, encoding="utf-8"))
+    assert isinstance(doc, list) and len(doc) == 1, doc
+    assert list(doc[0]) == ["insert"], (
+        f"a bare row is read as a REPLACE and DSH silently drops it: {doc}")
 
 
 def test_the_mcp_patch_mounts_the_plugin_the_runtime_actually_ships(tmp_path, monkeypatch):
@@ -718,10 +755,10 @@ def test_the_mcp_patch_mounts_the_plugin_the_runtime_actually_ships(tmp_path, mo
     `apply` and deliberately no default export, so the row's `name` must be the
     package name and the id must be ours.
     """
-    doc = _mcp_rows(tmp_path, monkeypatch)
-    assert doc, "the MCP patch was not generated"
-    assert len(doc) == 1, doc
-    row = doc[0]
+    rows = _mcp_rows(tmp_path, monkeypatch)
+    assert rows, "the MCP patch was not generated"
+    assert len(rows) == 1, rows
+    row = rows[0]
     assert row["id"] == _MCP_ROW_ID
     assert row["name"] == _MCP_PLUGIN
 

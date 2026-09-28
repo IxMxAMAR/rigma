@@ -294,14 +294,24 @@ def mcp_patch_file(tmpdir, cwd=None) -> str:
         "# Generated per runtime: mounts Rigma's own MCP server into DSH.\n"
         "# `serverName` becomes the tool prefix, so these arrive as\n"
         "# mcp__rigma__search_my_documents and so on.\n"
-        "- id: mcp-rigma\n"
-        "  name: '@deepseek-ai/dsh-mcp-client'\n"
-        "  config:\n"
-        "    transport: stdio\n"
-        "    serverName: rigma\n"
-        f"    command: {json.dumps(str(spec.get('command') or ''))}\n"
-        f"    args: {args}\n"
-        f"    env: {env}\n",
+        "#\n"
+        "# THE `insert:` KEY IS LOAD-BEARING. A patch list is a list of OPERATIONS,\n"
+        "# and a bare row is read as a REPLACE — which DSH answers with\n"
+        "# `patch: entry \"mcp-rigma\" not found`, then drops the whole overlay and\n"
+        "# still exits 0. Written that way, this file silently gave DSH none of\n"
+        "# Rigma's tools while the capability menu said it had them. Verified by\n"
+        "# `dsh --profile sdk-minimal --dump-config --patch <this file>`, which needs\n"
+        "# no model: with `insert:` the row appears in the composed tree, without it\n"
+        "# the command warns and the row is absent.\n"
+        "- insert:\n"
+        "  - id: mcp-rigma\n"
+        "    name: '@deepseek-ai/dsh-mcp-client'\n"
+        "    config:\n"
+        "      transport: stdio\n"
+        "      serverName: rigma\n"
+        f"      command: {json.dumps(str(spec.get('command') or ''))}\n"
+        f"      args: {args}\n"
+        f"      env: {env}\n",
         encoding="utf-8",
     )
     return str(path)
