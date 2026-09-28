@@ -1709,3 +1709,88 @@ def test_two_parallel_calls_to_one_tool_stay_distinguishable():
     # ids rather than collapsing onto the tool name.
     assert ids == ["call_a", "call_a", "call_b", "call_b"], ids
     assert len(set(ids)) == 2
+
+
+# --- R5-MCODE-DEADEND: a blocked chat must say so, and say what works --------
+#
+# `mcode exec` has no interaction host, so a turn that asks the user something
+# cannot be answered — a limitation. The DEAD END is that the question is never
+# cleared: mcode's guard (`run-exec-command-EXGGKYPR.js`, `hr`) refuses to start a
+# session that still has a pending questionnaire OR pending permission request, and
+# it runs BEFORE the stream projector is constructed. So every LATER turn in that
+# chat fails the same way, in seconds, with no stream-json output at all.
+#
+# Verified in the 0.5.4 bundle:
+#   let[n,s]=await Promise.all([e.getPendingQuestionnaire(r,t.sessionId),
+#                               e.listPendingPermissions()]),i=s.some(...)
+#   if(!n&&!i)return;
+#   throw new h("runtime",`Session ${t.sessionId} has ${o} and requires an
+#               interactive host. Continue it in the TUI or ACP.`)
+#
+# Rigma cannot answer the question (that needs mcode's TUI or ACP, and ACP needs
+# `mcode login`). What it CAN do is stop reporting a cryptic exit code and say the
+# one thing that works: start a new chat.
+
+_DEAD_END_STDERR = ("mcode exec failed: Session sess_1 has a pending questionnaire "
+                    "and requires an interactive host. Continue it in the TUI or ACP.")
+
+
+def test_a_blocked_chat_is_told_it_cannot_continue(monkeypatch):
+    _fake_exec(monkeypatch, stdout="", stderr=_DEAD_END_STDERR, code=1)
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    errs = [e for e in got if e.kind == "error"]
+    assert errs, [e.kind for e in got]
+    text = errs[0].text
+    # It must name the recovery, and be explicit that a retry cannot work —
+    # otherwise the obvious response is to send the message again, which fails
+    # identically and looks like a broken product.
+    assert "NEW chat" in text or "new chat" in text, text
+    assert "cannot" in text.lower(), text
+
+
+def test_the_dead_end_is_not_reported_as_a_bare_exit_code(monkeypatch):
+    """The whole point: `mcode exited 1` is what the user used to get."""
+    _fake_exec(monkeypatch, stdout="", stderr=_DEAD_END_STDERR, code=1)
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    text = next(e.text for e in got if e.kind == "error")
+    assert "mcode exited" not in text, text
+
+
+def test_a_pending_permission_request_is_the_same_dead_end(monkeypatch):
+    """The same guard covers `--permission smart` raising a permission request,
+    so the message names the mode that avoids that half."""
+    _fake_exec(monkeypatch, stdout="",
+               stderr=("mcode exec failed: Session s has a pending permission "
+                       "request and requires an interactive host."), code=1)
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    text = next(e.text for e in got if e.kind == "error")
+    assert "full" in text, text
+
+
+def test_the_dead_end_is_detected_on_the_exit_zero_path_too(monkeypatch):
+    """The guard throws before the projector exists, so this usually lands as
+    exit 0 with no `exec.completed` and the reason on stderr — not as a non-zero
+    exit. Both paths are checked because which one it is depends on how the CLI
+    surfaced the throw."""
+    _fake_exec(monkeypatch, stdout="", stderr=_DEAD_END_STDERR, code=0)
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    text = next(e.text for e in got if e.kind == "error")
+    assert "new chat" in text.lower(), text
+
+
+def test_an_ordinary_failure_is_still_a_plain_exit_message(monkeypatch):
+    """The detection must not swallow unrelated failures — a real crash has to
+    keep reporting its exit code and stderr, or diagnosis gets worse."""
+    _fake_exec(monkeypatch, stdout="", stderr="something else went wrong", code=1)
+    got = list(harness_mcode.drive_turn(base_url=BASE, model="m", prompt="hi"))
+    text = next(e.text for e in got if e.kind == "error")
+    assert "mcode exited 1" in text, text
+
+
+def test_the_detector_does_not_fire_on_ordinary_prose():
+    """A false positive would replace a real error with recovery advice for a
+    problem the user does not have."""
+    for prose in ("the tool asked for input and continued",
+                  "interactive host is fine",
+                  "no pending questionnaire"):
+        assert harness_mcode._interaction_dead_end(prose) == "", prose

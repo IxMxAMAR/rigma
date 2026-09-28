@@ -710,13 +710,21 @@ kinds: unmounted plugins, adapter-internal drops, and false comments.
 
 ### NOT fixed, and why — ranked
 
-1. **mcode's `ask_user` permanently bricks the chat (HIGH, dead end).** `mcode exec`
-   has no interaction host, so a questionnaire turn is rewritten to a failure AND the
-   pending questionnaire is never cleared, which makes **every later turn on that
-   session fail before it starts** — with no stream-json output at all, because the
-   guard throws before the projector exists. The user must abandon the chat. The same
-   path covers `--permission smart` raising a pending permission request. Feature-sized:
-   needs an interaction channel, which neither transport offers Rigma today.
+1. **mcode's `ask_user` permanently bricks the chat (HIGH) — the SILENT half is FIXED,
+   the capability is not.** `mcode exec` has no interaction host, so a questionnaire
+   turn is rewritten to a failure AND the pending questionnaire is never cleared, which
+   makes **every later turn on that session fail before it starts** — with no stream-json
+   output at all, because the guard throws before the projector exists. The same path
+   covers `--permission smart` raising a pending permission request.
+
+   The adapter now detects the guard from its own wording and reports a recovery
+   sentence instead of `mcode exited 1: <stderr>`, on both terminal paths (the guard
+   usually lands as exit 0 with no `exec.completed`, not as a non-zero exit). It says the
+   chat is blocked, that a retry cannot succeed, and that a NEW chat is the way on.
+   `harness.py` now discloses that `smart` is the mode which invites this.
+
+   **Still open:** answering the question. That needs an interaction channel — the exec
+   path has none by design and mcode's ACP path needs `mcode login`.
 
 2. **`_ok_of` always returns None, so every mcode tool chip shows UNKNOWN.** The wire
    value is numeric (the file's own note at `:169-172` and the fixture agree: 4, 5, 1,
