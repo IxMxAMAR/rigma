@@ -1157,6 +1157,15 @@ async def _warm_memory_embedder() -> None:
         _log.exception("memory: embedder warm-up failed")
 
 
+# R3-CHAT-2: how many consecutive rounds may request the SAME tool calls with the
+# SAME arguments before the turn is stopped. The round cap is a runaway BACKSTOP
+# (1000), not a detector, so a model stuck in a loop used to run to it — a thousand
+# round trips, each re-prefilling the whole transcript. Four is past any legitimate
+# retry: a tool that genuinely needs calling again after its result usually gets
+# different arguments, and a retry after a transient failure is normally one or two.
+_REPEAT_CALL_LIMIT = 4
+
+
 def _round_cap(session: dict) -> int:
     """Per-turn tool-round budget. The session default became 1000 (a
     runaway backstop, not a leash) but the old inline clamp still cut it to
@@ -2628,6 +2637,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         force_last = False       # one-action: allow a final look-at-images round
         max_rounds = _round_cap(s) if use_tools else 1
         hit_ceiling = False      # distinguishes "ran out of rounds" from
+        hit_repeat = False       # R3-CHAT-2: stopped because the model looped
         # bound before the loop so the cancellation handler below can always
         # reach the eager tool tasks, even if a round dies before it starts any
         started: dict = {}
@@ -2646,6 +2656,23 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # UIUX-22: how many grounded sources have already been sent to the UI
             # this turn, so each round emits only what it added.
             _cites_sent = 0
+            # R3-CHAT-2: a breaker for a model that repeats itself.
+            #
+            # `max_rounds` defaults to 1000 and there was nothing watching for a
+            # loop, so a model that kept issuing the SAME call with the SAME
+            # arguments ran until the ceiling — a thousand round trips, each one
+            # re-prefilling the whole transcript, which on a local card is minutes
+            # of GPU time and a context full of identical tool results. The chat
+            # looks busy the entire time, which is why this is worth stopping
+            # rather than reporting after the fact.
+            #
+            # The signature is the set of (name, args) pairs in the round, so two
+            # DIFFERENT calls alternating count as one repeating signature — that
+            # is the same defect wearing a hat. `_repeat` resets on any round that
+            # differs, so a genuinely progressing turn is untouched no matter how
+            # long it is.
+            _last_sig = None
+            _repeat = 0
             for _round in range(max_rounds):
                 # WHERE A NATIVE TURN STOPS. An external backend's stop kills its
                 # process and lands immediately; here the only safe boundary is
@@ -3057,6 +3084,37 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             continue
                         text = rtext               # keep any narration with the action
                         break                      # ONE action: end the turn here
+                    # R3-CHAT-2: did this round ask for exactly what the previous
+                    # round asked for? Compared on the RESOLVED arguments, not the
+                    # raw string, so reformatting the same JSON does not read as
+                    # progress. `calls` is keyed by index and holds the parsed args
+                    # by the time the tool block above has run.
+                    try:
+                        _sig = tuple(sorted(
+                            (str(c.get("name") or ""), str(c.get("args") or ""))
+                            for c in calls.values()))
+                    except Exception:
+                        _sig = None
+                    if _sig and _sig == _last_sig:
+                        _repeat += 1
+                    else:
+                        _repeat = 0
+                        _last_sig = _sig
+                    if _repeat >= _REPEAT_CALL_LIMIT:
+                        # A notice, never persisted as the assistant's own words —
+                        # a server-authored message written into the transcript
+                        # poisoned the chat once already (live corruption
+                        # 2026-07-21, see the notice comment below).
+                        yield _sse({"delta": (
+                            f"_(Stopped: the same {len(calls)} tool call(s) with "
+                            f"the same arguments were requested "
+                            f"{_repeat + 1} rounds in a row without anything "
+                            f"changing, so this was going to repeat until the "
+                            f"round limit. The results above are real. Ask for "
+                            f"something different, or point at what is wrong with "
+                            f"the call.)_")})
+                        hit_repeat = True
+                        break
                     continue                       # stream the next round
                 text = rtext                       # no tool calls -> this is final
                 break
@@ -3085,6 +3143,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                               else
                               "_(You stopped without a reply. Your tool results "
                               "are above — continue the SAME step next turn.)_")
+                elif hit_repeat:
+                    # R3-CHAT-2: the loop notice already told the user WHY, and it
+                    # is not a round-limit problem, so "raise the limit" would be
+                    # the wrong advice.
+                    notice = ("_(The same call was repeated until it was stopped. "
+                              "The results above are real — the call itself is "
+                              "what needs to change.)_")
                 elif hit_ceiling:
                     notice = ("_(Reached this turn's tool-call limit while "
                               "still working — send **keep going** and I'll "
