@@ -175,11 +175,13 @@ def test_start_run_bad_budget_hours_is_400_and_creates_no_session(engine):
 
 
 def test_run_reaches_done_with_verify_once(engine):
-    # plan, plan, complete, task_complete (rejected -> verify), task_complete
+    # plan, plan, complete, real work, task_complete (rejected -> verify),
+    # task_complete
     _Engine.script = [
         ("manage_plan", {"action": "add", "task": "read the folder"}),
         ("manage_plan", {"action": "add", "task": "write the prompts"}),
         ("manage_plan", {"action": "complete", "id": 1}),
+        ("sample_files", {"path": "."}),
         ("task_complete", {"summary": "all prompts written"}),
         ("task_complete", {"summary": "all prompts written"}),
     ]
@@ -192,6 +194,66 @@ def test_run_reaches_done_with_verify_once(engine):
     assert "prompts" in r["summary"]
     assert any(t["status"] == "pending" or t["status"] == "done"
                for t in r["plan"])               # the plan was built
+
+
+def test_a_run_with_outstanding_steps_never_reports_done(engine):
+    """R3-RUN-2: the completion gate accepted the claim once the CHALLENGE
+    budget was spent, whatever was still outstanding.
+
+    This script completes only step 1 of a two-step plan and then calls
+    `task_complete` until the cap is reached — the run's own driving line tells
+    the model to call it. Before the fix that produced
+    `STATUS done | PLAN [{pending}, {pending}]`, with the model's unverified
+    claim as the summary and no file written; the summary listed only BLOCKED
+    steps, so the pending ones were invisible in the UI. It must end `stalled`
+    and name what was missing.
+    """
+    _Engine.script = [
+        ("manage_plan", {"action": "add", "task": "read the folder"}),
+        ("manage_plan", {"action": "add", "task": "write the prompts"}),
+        ("manage_plan", {"action": "complete", "id": 1}),
+        ("task_complete", {"summary": "all prompts written"}),
+        ("task_complete", {"summary": "all prompts written"}),
+        ("task_complete", {"summary": "all prompts written"}),
+        ("task_complete", {"summary": "all prompts written"}),
+    ]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "make 100 prompts",
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid)
+    assert r["status"] != "done", r
+    assert r["status"] == "stalled"
+    assert "outstanding" in r["summary"]
+    # the step that really is unfinished is named, not glossed over
+    assert "write the prompts" in r["summary"]
+    assert any(t["status"] == "pending" for t in r["plan"])
+
+
+def test_a_run_that_did_nothing_cannot_report_done(engine):
+    """R3-RUN-1: the reported hole.
+
+    When the mission compiler falls back — `parse_spec` returns None for any
+    reply that is not a valid spec object, a documented path — the plan stays
+    EMPTY, so `pending` is empty; and the fallback step's verification is
+    `type: none` with no artifact, so `missing` is empty. Both completion gates
+    were vacuous, and two `task_complete` calls with no tool run at all were
+    enough to write the run `done` with the model's own claim as the summary.
+    The UI rendered "finished — the mission is complete" over nothing.
+
+    It must end `stalled`, and say that nothing was done.
+    """
+    _Engine.script = [
+        ("task_complete", {"summary": "the mission is complete"}),
+        ("task_complete", {"summary": "the mission is complete"}),
+    ]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "make 100 prompts",
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid)
+    assert r["status"] != "done", r
+    assert r["status"] == "stalled"
+    assert "without doing any work" in r["summary"]
+    assert r["plan"] == []
 
 
 def test_run_stalls_on_pure_narration(engine):
@@ -248,7 +310,8 @@ def test_prefill_budget_tolerates_slow_first_token(engine, monkeypatch):
     monkeypatch.setattr(serve, "IDLE_SECS", 0.1)
     monkeypatch.setattr(serve, "PREFILL_SECS", 2.0)
     _Engine.delay = 0.4                                # > IDLE_SECS, < PREFILL_SECS
-    _Engine.script = [("task_complete", {"summary": "quick win"}),
+    _Engine.script = [("sample_files", {"path": "."}),
+                      ("task_complete", {"summary": "quick win"}),
                       ("task_complete", {"summary": "quick win"})]
     c = _client(engine)
     rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
@@ -264,7 +327,8 @@ def test_slow_turn_reports_heartbeat(engine, monkeypatch):
     monkeypatch.setattr(serve, "TICK_SECS", 0.05)
     seen = []
     _Engine.delay = 0.4                   # slow enough to cross several ticks
-    _Engine.script = [("task_complete", {"summary": "s"}),
+    _Engine.script = [("sample_files", {"path": "."}),
+                      ("task_complete", {"summary": "s"}),
                       ("task_complete", {"summary": "s"})]
     c = _client(engine)
     rid = c.post("/api/runs", json={"mission": "x", "budget_hours": 1}).json()["id"]
@@ -467,7 +531,8 @@ def test_run_finishes_via_completion_checkpoint(engine, monkeypatch):
     # model goes quiet (no tools) past the lazy threshold, then — when given the
     # completion ultimatum — calls task_complete. The run must end DONE, not stalled.
     monkeypatch.setattr(serve, "K_LAZY", 3)
-    _Engine.script = [None, None, None,               # 3 idle turns -> would stall
+    _Engine.script = [("sample_files", {"path": "."}),   # real work
+                      None, None, None,               # 3 idle turns -> would stall
                       ("task_complete", {"summary": "all done"}),
                       ("task_complete", {"summary": "all done"})]
     c = _client(engine)
