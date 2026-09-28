@@ -79,6 +79,15 @@ _STATE_EVENTS = (
     # The server's own title for the session, which Rigma otherwise never learns:
     # it invents its own title and the two can disagree.
     "session/title",
+    # The compaction lifecycle. Rigma's NATIVE compaction already reports itself
+    # (`masked`, `housekeeping`, `compacted`), but a DSH turn reported none of it,
+    # so a long turn busy summarising its own context looked exactly like a turn
+    # that had hung. `start`/`end` are a bracket paired by `compactionId`, and
+    # `summary`/`prune` carry the shadowed token count — the number worth showing.
+    "compaction/start",
+    "compaction/summary",
+    "compaction/prune",
+    "compaction/end",
 )
 
 # `assistant/message` carries the step's token accounting. It is the ONLY

@@ -8,6 +8,7 @@ import {
 } from "./chatStore";
 import { formatArgs, previewArgs } from "./toolChip";
 import AgentState from "./AgentState";
+import { compactionLine, running } from "./compaction";
 import { argHint, delegateSentence, summariseDelegate } from "./delegate";
 import { chipOutcome } from "./toolChip";
 
@@ -272,6 +273,9 @@ function HarnessBadge({ name, label }: { name: string; label?: string }) {
 }
 
 function LiveTurn({ turn }: { turn: StreamingTurn }) {
+  // The still-open compaction for THIS turn, if any. Computed here rather than
+  // inline in the JSX so it is one lookup per render, not one per condition.
+  const runningCompaction = running(turn.compactions);
   return (
     <div className="flex flex-col gap-2">
       {/* Named at the START of the turn, so this is on screen while an external
@@ -320,6 +324,28 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
           compacted {turn.compacted} message{turn.compacted === 1 ? "" : "s"} into the summary
         </p>
       )}
+      {/* DSH's compaction, beside Rigma's own. The native path reports
+          `housekeeping`/`masked`/`compacted` above; a DSH turn reported none of
+          it, so a long turn busy summarising its own context looked hung. The
+          running line is the point: it is what turns "frozen" into "working". */}
+      {runningCompaction && (
+        <p className="font-mono text-[11px] text-amber">
+          compacting the context — this can take a while
+        </p>
+      )}
+      {turn.compactions.items.filter((c) => !c.open).map((c) => {
+        const line = compactionLine(c);
+        if (line === null) return null;
+        return (
+          <p
+            key={c.id || "compaction"}
+            className={`font-mono text-[11px] ${c.error ? "text-red" : "text-muted"}`}
+          >
+            {line}
+            {c.model && <span> · by {c.model}</span>}
+          </p>
+        );
+      })}
       {turn.queued > 0 && (
         <p className="font-mono text-[11px] text-amber">
           queued behind the running reply — {turn.queued} waiting
