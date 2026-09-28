@@ -2186,6 +2186,41 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # the duration. The unload path already wraps the same call this way.
         await asyncio.to_thread(_prefix_warm, msgs, str(s.get("id") or ""))
         _mark("prefix_warm")
+        # R3-CHAT-3: compact BEFORE the request, not only after a successful one.
+        #
+        # Auto-compaction fires at the END of a turn, using the engine's real
+        # `prompt_tokens`. That works while the chat grows normally, but it cannot
+        # rescue a chat that is ALREADY over the window: the turn that would have
+        # triggered the compaction never completes, so `prompt_tokens` is never
+        # reported, so the compaction never runs. The chat 400s on every message
+        # from then on and the only way out is manual — which is exactly the state
+        # a user cannot diagnose.
+        #
+        # The estimate here is deliberately crude (chars / 2, where the measured
+        # range on this machine is roughly 1-4 chars per token) and is only used to
+        # decide whether to compact EARLY. A false positive costs one summary; a
+        # false negative leaves the wedged chat wedged, so the constant is chosen
+        # on the pessimistic side of the measured range.
+        if s.get("auto_compact", True) and len(s.get("messages", [])) > AUTO_COMPACT_KEEP:
+            _wctx = compact_budget(s, (st.read_state() or {}).get("ctx", 0))
+            if _wctx:
+                _est = context.session_chars(msgs) // 2
+                if _est >= AUTO_COMPACT_FRACTION * _wctx:
+                    try:
+                        _done = await _compact(s, AUTO_COMPACT_KEEP)
+                        if _done is not None:
+                            s = _done[0]
+                            msgs = sessions.build_messages(
+                                s, _default_prompt(), preset)
+                            yield _sse({"note": "compacted before sending — the "
+                                                "chat was over this model's "
+                                                "context window"},
+                                       event="notice")
+                    except Exception:
+                        # Never fatal: a summariser that is down must not stop the
+                        # user sending a message. The turn proceeds and reports
+                        # whatever the engine says, as before.
+                        _log.exception("pre-send compaction failed")
         # nudges are consumed by the turn that just read them: a reminder
         # that re-injects every turn is nagging, not a trigger. Whether this
         # turn WAS started by a queued nudge is carried to _fire_triggers

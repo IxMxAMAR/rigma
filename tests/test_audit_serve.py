@@ -1180,6 +1180,50 @@ def test_a_disconnect_stops_an_external_agent_and_keeps_the_partial_reply(
 
 
 # --------------------------------------------------------------------------
+# R3-CHAT-3 — a chat already over the window could never compact itself
+
+
+def test_a_chat_over_the_window_compacts_before_sending(home, engine):
+    """Auto-compaction fires at the END of a turn from the engine's real
+    `prompt_tokens`. That cannot rescue a chat that is ALREADY over the window:
+    the turn that would have triggered it never completes, so `prompt_tokens` is
+    never reported, so it never runs — and the chat 400s on every message from
+    then on with no way out that the UI can offer.
+    """
+    _running(ctx=4096)
+    Engine.script = [_say("recovered"), _say("x")]
+    c = _client(engine.port)
+    sid = c.post("/api/sessions", json={}).json()["id"]
+    s = sessions.load(sid)
+    # ~20 messages of 4K chars each: ~40K estimated tokens against a 4K window
+    s["messages"] = [{"role": "user" if i % 2 == 0 else "assistant",
+                      "content": f"m{i} " + "x" * 4000} for i in range(20)]
+    sessions.save(s)
+
+    r = c.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200, r.text
+    assert "compacted before sending" in r.text, r.text[:400]
+    # the summariser call is non-streaming and lands BEFORE the first streamed one
+    kinds = ["aux" if not b.get("stream") else "turn" for b in Engine.seen]
+    assert kinds and kinds[0] == "aux", kinds
+    assert "turn" in kinds, kinds
+
+
+def test_a_short_chat_is_not_compacted_before_sending(home, engine):
+    """The pre-send check is an estimate, so it must not fire on an ordinary
+    chat — a false positive costs a summary the user did not ask for."""
+    _running(ctx=131072)
+    Engine.script = [_say("fine"), _say("x")]
+    c = _client(engine.port)
+    sid = _seed(c, 4)
+    r = c.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200, r.text
+    assert "compacted before sending" not in r.text, r.text[:400]
+    kinds = ["aux" if not b.get("stream") else "turn" for b in Engine.seen]
+    assert kinds[0] == "turn", kinds
+
+
+# --------------------------------------------------------------------------
 # R3-CHAT-2 — nothing watched for a model repeating itself
 
 
