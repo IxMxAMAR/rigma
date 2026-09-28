@@ -614,6 +614,174 @@ def test_the_skills_patch_composes_over_the_capability_patch():
                 "generated skills patch would silently override it")
 
 
+# --- R6-MCP: Rigma's own tools must reach DSH, not only mcode -----------------
+#
+# WHY THIS EXISTS. `harness_mcode.ensure_mcp` has given mcode an `mcp.json`
+# naming Rigma's four MCP tools since R4. DSH got nothing — `patch_file` passed
+# no MCP configuration and no shipped profile mounts `dsh-mcp-client` — so a DSH
+# turn could not search the user's indexed documents or remember anything, and
+# NO LINE ANYWHERE SAID SO. A capability menu that lists what a backend can do,
+# with no entry for the four tools one backend has and the other lacks, is the
+# same class of defect as the plan-mode claim R5-PLANMODE removed.
+#
+# These tests pin the generated row against the plugin's REAL schema, because a
+# row that fails schema validation does not fail the harness: `failOnStartupError`
+# defaults to false, so a bad row logs a warning and the four tools are simply
+# absent — silently, which is exactly the bug being fixed.
+
+_MCP_ROW_ID = "mcp-rigma"
+_MCP_PLUGIN = "@deepseek-ai/dsh-mcp-client"
+
+
+def _mcp_rows(tmp_path, monkeypatch, *, offered=True, cwd=None):
+    """The generated MCP patch's rows, with the roster gate stubbed."""
+    from rigma import mcp_server
+
+    monkeypatch.setattr(mcp_server, "offered",
+                        lambda **kw: (["remember"] if offered else []))
+    path = harness_dsh.mcp_patch_file(tmp_path, cwd=cwd)
+    if not path:
+        return None
+    return yaml.safe_load(open(path, encoding="utf-8"))
+
+
+def test_the_mcp_patch_mounts_the_plugin_the_runtime_actually_ships(tmp_path, monkeypatch):
+    """The row must name a package that exists, or it is a row that does nothing.
+
+    `dsh-mcp-client` is a NAMESPACE plugin: it exports `name`, `inject` and
+    `apply` and deliberately no default export, so the row's `name` must be the
+    package name and the id must be ours.
+    """
+    doc = _mcp_rows(tmp_path, monkeypatch)
+    assert doc, "the MCP patch was not generated"
+    assert len(doc) == 1, doc
+    row = doc[0]
+    assert row["id"] == _MCP_ROW_ID
+    assert row["name"] == _MCP_PLUGIN
+
+
+def test_the_mcp_row_satisfies_every_required_field_of_the_real_schema(tmp_path, monkeypatch):
+    """`transport`, `serverName` and `command` are the fields with NO default.
+
+    Read from the plugin's own schema: `serverName` must match
+    `[A-Za-z0-9_-]{1,32}` and be unique, and `command` is required for stdio.
+    A row missing any of them is rejected at boot — quietly, because
+    `failOnStartupError` defaults to false.
+    """
+    import re
+
+    row = _mcp_rows(tmp_path, monkeypatch)[0]
+    cfg = row["config"]
+    assert cfg["transport"] == "stdio"
+    assert re.fullmatch(r"[A-Za-z0-9_-]{1,32}", cfg["serverName"]), cfg["serverName"]
+    assert cfg["command"], "stdio requires a command"
+    assert cfg["args"] == ["-m", "rigma.mcp_server"]
+
+
+def test_the_mcp_command_is_an_absolute_interpreter_not_a_bare_python(tmp_path, monkeypatch):
+    """`sys.executable`, never `python`.
+
+    The server imports Rigma, so it must be launched by the interpreter that has
+    Rigma installed. A bare `python` may be a different one, and the failure is
+    silent: the server does not start and the four tools are simply absent.
+    """
+    import os
+    import sys
+
+    cfg = _mcp_rows(tmp_path, monkeypatch)[0]["config"]
+    assert cfg["command"] == sys.executable
+    assert os.path.isabs(cfg["command"])
+
+
+def test_the_mcp_env_carries_what_dsh_would_otherwise_scrub_away(tmp_path, monkeypatch):
+    """DSH hands the child a SCRUBBED ambient environment plus exactly this map.
+
+    So the two variables the server needs cannot be inherited — they must be
+    written here. `RIGMA_MCP_ALLOW_CODE` is what makes `undo_last_change` exist
+    at all (the server is pessimistic by default) and `RIGMA_MCP_WORKSPACE` is
+    the chat's directory, passed rather than guessed.
+    """
+    cfg = _mcp_rows(tmp_path, monkeypatch, cwd=r"C:\some\project")[0]["config"]
+    assert cfg["env"]["RIGMA_MCP_ALLOW_CODE"] == "1"
+    assert cfg["env"]["RIGMA_MCP_WORKSPACE"] == r"C:\some\project"
+    assert cfg["env"]["RIGMA_HOME"]
+
+
+def test_the_mcp_workspace_is_omitted_rather_than_guessed_when_there_is_none(tmp_path, monkeypatch):
+    """A tool that silently operated on the wrong directory is worse than one
+    that refused, so an absent cwd must not become some default directory."""
+    cfg = _mcp_rows(tmp_path, monkeypatch, cwd=None)[0]["config"]
+    assert "RIGMA_MCP_WORKSPACE" not in cfg["env"]
+
+
+def test_no_mcp_patch_is_written_when_the_roster_is_empty(tmp_path, monkeypatch):
+    """An empty roster still costs a process launch, and DSH starts a TEMPORARY
+    PROBE PROCESS before the serving one. Paying that for nothing is worse than
+    the tool appearing a turn later than it could."""
+    assert _mcp_rows(tmp_path, monkeypatch, offered=False) is None
+
+
+def test_the_mcp_patch_is_written_where_it_is_told(tmp_path, monkeypatch):
+    """Generated per runtime into the runner's scratch directory.
+
+    Writing it beside the chat's cwd would drop a generated YAML file into the
+    user's own project — a file they never asked for, in the folder their work
+    lives in.
+    """
+    from pathlib import Path
+    from rigma import mcp_server
+
+    monkeypatch.setattr(mcp_server, "offered", lambda **kw: ["remember"])
+    path = harness_dsh.mcp_patch_file(tmp_path, cwd=None)
+    assert Path(path).parent == Path(tmp_path)
+
+
+def test_the_mcp_patch_does_not_fail_the_turn_when_it_cannot_be_built(tmp_path, monkeypatch):
+    """A missing Rigma tool set is a smaller loss than no harness turn at all."""
+    from rigma import mcp_server
+
+    def boom(**kw):
+        raise RuntimeError("roster exploded")
+
+    monkeypatch.setattr(mcp_server, "offered", boom)
+    assert harness_dsh.mcp_patch_file(tmp_path, cwd=None) == ""
+
+
+def test_the_mcp_patch_never_configures_a_row_the_capability_patch_inserts(tmp_path, monkeypatch):
+    """It INSERTS its own row, so it must not collide with a shipped id.
+
+    A patch row naming an id that does not exist is skipped with a warning, and
+    two layers configuring one row means order decides the result.
+    """
+    doc = _mcp_rows(tmp_path, monkeypatch)
+    assert doc, "the MCP patch was not generated"
+    inserted = {r["id"] for r in _patch_rows()}
+    assert _MCP_ROW_ID not in inserted, (
+        "the capability patch now inserts mcp-rigma; the generated MCP patch "
+        "would silently override or duplicate it")
+
+
+def test_dsh_declares_the_mcp_capability_it_now_has():
+    """The disclosure must match the code, in the direction that matters.
+
+    DSH gained these four tools, so the menu must say so — and `_LEAVES_BEHIND`
+    must stop claiming RAG and undo are left behind, because that would now be a
+    FALSE NEGATIVE, which is the same defect as the plan-mode claim.
+    """
+    from rigma.harness import DSH, BACKENDS
+
+    entry = BACKENDS[DSH]
+    caps = " ".join(entry.capabilities)
+    assert "mcp__rigma__remember" in caps
+    assert "mcp__rigma__recall" in caps
+    assert "mcp__rigma__search_my_documents" in caps
+    assert "mcp__rigma__undo_last_change" in caps
+    behind = " ".join(entry.unsupported)
+    assert "no MCP equivalent" in behind
+    assert "Rigma's tools (image-by-reference, undo, sample_files, RAG, methods)" not in behind, (
+        "the old blanket claim is back; RAG and undo DO reach both backends now")
+
+
 # --- R4-DRIFT: the four capabilities the UI draws, guarded the same way ------
 #
 # WHY. Governance, compaction and retry each already had a drift guard — a test

@@ -47,6 +47,10 @@ _PATCH_NAME = "rigma-dsh-patch.yaml"
 # because that one is regenerated per TURN (it carries the window and token
 # budget) while this one is per RUNTIME (it carries a path that does not change).
 _SKILLS_PATCH_NAME = "rigma-dsh-skills.yaml"
+# A THIRD patch, for Rigma's own MCP server. Per RUNTIME like the skills one,
+# because it carries `sys.executable` and the chat's workspace — neither of which
+# the shipped capability patch can hold.
+_MCP_PATCH_NAME = "rigma-dsh-mcp.yaml"
 _SDK_REL = ("python", "sdk", "src")
 _CLI_REL = ("python", "sdk-runtime", "node_modules", ".bin", "dsh.CMD")
 
@@ -229,6 +233,75 @@ def skills_patch_file(tmpdir) -> str:
         "    includeDefaultRoots: true\n"
         "    customSkillDirs:\n"
         f"      - {d}\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def mcp_patch_file(tmpdir, cwd=None) -> str:
+    """Point DSH at Rigma's own MCP server, so its tools reach the agent.
+
+    THE ASYMMETRY THIS CLOSES. mcode has received Rigma's MCP server since
+    `harness_mcode.ensure_mcp`, which writes an `mcp.json` naming four tools:
+    `search_my_documents`, `remember`, `recall`, `undo_last_change`. DSH got
+    nothing — `patch_file` passes no MCP configuration and no shipped profile
+    mounts `dsh-mcp-client` — so a DSH turn could not search the user's indexed
+    documents or remember anything, and NOTHING SAID SO. A capability menu that
+    lists what a backend CAN do, with no line for the four tools one backend has
+    and the other lacks, is the same class of defect as the plan-mode claim.
+
+    Generated rather than shipped, for the same reason as `skills_patch_file`:
+    `command` must be an ABSOLUTE interpreter path (`sys.executable`), because a
+    bare `python` may not be the interpreter that has Rigma installed, and the
+    path depends on this machine. It also carries the workspace, which is the
+    chat's directory and moves from turn to turn.
+
+    WHY THE ENV MATTERS. `dsh-mcp-client` merges this `env` over a SCRUBBED
+    ambient environment, so the two variables Rigma's server needs must be
+    passed here rather than exported: `RIGMA_MCP_ALLOW_CODE` (the server is
+    pessimistic — `undo_last_change` does not exist without it) and
+    `RIGMA_MCP_WORKSPACE` (passed, never guessed; a tool that silently operated
+    on the wrong directory is worse than one that refused). DSH scrubs ambient
+    secrets for the same reason Rigma's own `_env` does, so relying on the
+    ambient environment would work on this machine and fail on a clean one.
+
+    Registered ONLY when there is something to offer, matching mcode's gate: an
+    MCP server with an empty roster still costs a process launch, and DSH starts
+    a temporary probe process before the serving one. `failOnStartupError` is
+    left at its default `false` deliberately — a broken Rigma MCP server must
+    cost the four tools, not the whole turn.
+
+    Returns "" when there is nothing to offer or the spec cannot be built, which
+    leaves DSH exactly as it was rather than adding a row that cannot work.
+    """
+    try:
+        from . import mcp_server
+        from .harness_mcode import _mcp_spec
+
+        if not mcp_server.offered(ws=cwd, code=True):
+            return ""
+        spec = _mcp_spec(cwd)
+    except Exception:
+        return ""
+
+    # JSON string literals are valid YAML scalars, so `json.dumps` is the safe way
+    # to embed an absolute Windows path (backslashes) and the env mapping without
+    # hand-rolling quoting. The env block is emitted as one flow-style map.
+    path = Path(tmpdir) / _MCP_PATCH_NAME
+    env = json.dumps({str(k): str(v) for k, v in (spec.get("env") or {}).items()})
+    args = json.dumps([str(a) for a in (spec.get("args") or [])])
+    path.write_text(
+        "# Generated per runtime: mounts Rigma's own MCP server into DSH.\n"
+        "# `serverName` becomes the tool prefix, so these arrive as\n"
+        "# mcp__rigma__search_my_documents and so on.\n"
+        "- id: mcp-rigma\n"
+        "  name: '@deepseek-ai/dsh-mcp-client'\n"
+        "  config:\n"
+        "    transport: stdio\n"
+        "    serverName: rigma\n"
+        f"    command: {json.dumps(str(spec.get('command') or ''))}\n"
+        f"    args: {args}\n"
+        f"    env: {env}\n",
         encoding="utf-8",
     )
     return str(path)
