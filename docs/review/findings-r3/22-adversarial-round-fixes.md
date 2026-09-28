@@ -479,7 +479,7 @@ memory to lexical-only — the length check still catches the case that breaks.
 
 ---
 
-## 9. Fixed — the fourth batch: stores, the engine fetch, and the CLI
+## 9. Fixed — the fourth batch: stores, the engine fetch, the CLI, and the chat loop
 
 ### R3-ENG-1 · an engine download could land anywhere the pinned host sent it [high]
 
@@ -548,6 +548,35 @@ problem — a test whose result depends on which other tests ran — is what mad
 `tests/test_phase4_lifecycle.py`'s two restart tests fail: they did only
 `manage_plan` work before their first stop, which the R3-RUN-1 evidence gate now
 correctly refuses to call a finished run.
+
+### R3-CHAT-2 · nothing watched for a model repeating itself [medium]
+
+The per-turn round cap is a runaway **backstop** — 1000 by default — and nothing
+else watched the loop. A model that kept issuing the same call with the same
+arguments therefore ran to the ceiling: a thousand round trips, each re-prefilling
+the whole transcript, which on a local card is minutes of GPU time and a context
+full of identical tool results. The chat looks busy the entire time, which is why
+this is worth stopping rather than reporting after the fact.
+
+The signature is the **set** of `(name, args)` pairs in a round, compared on the
+resolved arguments so reformatting the same JSON does not read as progress, and
+reset on any round that differs — so a long turn that keeps doing something new is
+untouched no matter how long it is. Two different calls alternating count as one
+repeating signature, which is the same defect wearing a hat. Four consecutive
+repeats stops the turn.
+
+The notice is stream-only, never persisted as the assistant's own words: a
+server-authored message written into the transcript poisoned a chat once already
+(live corruption 2026-07-21). The end-of-turn notice also distinguishes this from
+the round-limit case, because "raise the limit" is the wrong advice for a loop.
+
+Two things learned while writing its tests, both worth recording because they are
+how a green test can mean nothing: `_say` in the chat-loop harness emits **one SSE
+event per character**, so a reply has to be reassembled from the deltas before it
+can be searched for a phrase — the first version of the "progress" test asserted
+against the raw stream and failed on a turn that had in fact worked. And this
+chat's last **stored** message is a tool-result summary rather than the reply, so
+the assertion belongs on the response body.
 
 ---
 
