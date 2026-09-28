@@ -148,12 +148,43 @@ def allow_code() -> bool:
     return os.environ.get("RIGMA_MCP_ALLOW_CODE") == "1"
 
 
+def allow_absolute_reads() -> bool:
+    """Whether reads may leave the workspace. Off unless asked for.
+
+    AUDIT 13-2 made absolute reads a capability rather than a default, and this
+    second execution path does not inherit them: a registrar that needs them says
+    so. Split out of `ctx` so the roster can ask what WOULD be offered without
+    mutating the environment.
+    """
+    return os.environ.get("RIGMA_MCP_ALLOW_ABSOLUTE_READS") == "1"
+
+
+def allow_outbound_post() -> bool:
+    """Whether a POST carrying a body may leave this machine.
+
+    R3-MCP-1. `ctx` used to omit this key entirely, so `tools.http_request`'s
+    gate (`if not ctx.get("allow_outbound_post")`) was ALWAYS false and an MCP arm
+    could never POST a body — with no way to enable it. The refusal it returned
+    told the caller to "Enable 'allow outbound POST' on the session", advice that
+    cannot be followed from an MCP server, which has no session.
+
+    Failing closed was the safe direction and this is not a hole; it is a
+    capability the native loop has and the MCP path silently did not. Same shape
+    as the absolute-reads grant beside it, because that is what it is.
+    """
+    return os.environ.get("RIGMA_MCP_ALLOW_OUTBOUND_POST") == "1"
+
+
 def ctx() -> dict:
     """The context dict `run_tool` expects.
 
     Deliberately minimal and deliberately pessimistic: `allow_code` is False
     unless the environment says otherwise, so a tool that needs it is refused
     rather than silently permitted by a server nobody configured.
+
+    EVERY grant `run_tool` reads must be present here. A key that is missing is
+    not "unset" to the tool, it is false — so omitting one silently removes a
+    capability, and the only way to notice is that the tool always refuses.
     """
     return {
         "workspace": workspace(),
@@ -166,8 +197,9 @@ def ctx() -> dict:
         "confirm_exec": allow_code(),
         # AUDIT 13-2: absolute reads are a capability, so this second entry
         # point does not inherit them; a caller who needs them says so.
-        "allow_absolute_reads":
-            os.environ.get("RIGMA_MCP_ALLOW_ABSOLUTE_READS") == "1",
+        "allow_absolute_reads": allow_absolute_reads(),
+        # R3-MCP-1: and neither does this one. See `allow_outbound_post`.
+        "allow_outbound_post": allow_outbound_post(),
         "run_id": "",
     }
 

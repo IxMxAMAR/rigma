@@ -7,6 +7,7 @@ server that is only compatible with itself is not compatible with anything.
 """
 import io
 import json
+import re
 
 import pytest
 
@@ -289,3 +290,50 @@ def test_the_workspace_is_passed_not_guessed(monkeypatch):
     assert mcp_server.workspace() == ""
     monkeypatch.setenv("RIGMA_MCP_WORKSPACE", r"C:\work")
     assert mcp_server.workspace() == r"C:\work"
+
+
+def test_every_grant_the_tools_read_is_present_in_the_context(monkeypatch):
+    """R3-MCP-1. A missing key is not "unset" to a tool, it is FALSE — so
+    omitting one silently removes a capability and the only symptom is a tool
+    that always refuses.
+
+    That is exactly what had happened: `ctx` never set `allow_outbound_post`, so
+    `tools.http_request` refused every POST carrying a body, for every MCP arm,
+    with no way to turn it on. The refusal even advised enabling the grant "on
+    the session" — advice an MCP server, which has no session, cannot follow.
+
+    Written against `run_tool`'s own reads rather than a hardcoded list, so a
+    grant added later cannot be forgotten here too."""
+    import inspect
+
+    from rigma import tools as toolkit
+
+    src = inspect.getsource(toolkit)
+    # every `ctx.get("<name>")` / `ctx["<name>"]` the tool layer actually reads
+    read = set(re.findall(r'ctx\.get\(\s*"(\w+)"', src))
+    read |= set(re.findall(r'ctx\[\s*"(\w+)"\s*\]', src))
+    grants = {k for k in read if k.startswith("allow_") or k == "confirm_exec"}
+    assert grants, "the scrape found nothing — it, not the code, is broken"
+
+    have = mcp_server.ctx()
+    missing = sorted(g for g in grants if g not in have)
+    assert not missing, (
+        f"MCP ctx() omits {missing}, so those grants are permanently FALSE for "
+        "every MCP arm — see R3-MCP-1")
+
+
+def test_outbound_post_is_off_by_default_and_can_be_turned_on(monkeypatch):
+    """Off is right; impossible is not. The native loop has this grant, so an MCP
+    arm that can never have it is a missing capability, not a safety win."""
+    monkeypatch.delenv("RIGMA_MCP_ALLOW_OUTBOUND_POST", raising=False)
+    assert mcp_server.ctx()["allow_outbound_post"] is False
+    monkeypatch.setenv("RIGMA_MCP_ALLOW_OUTBOUND_POST", "1")
+    assert mcp_server.ctx()["allow_outbound_post"] is True
+
+
+def test_absolute_reads_are_off_by_default_and_can_be_turned_on(monkeypatch):
+    """The grant this one was modelled on, so the pair cannot drift apart."""
+    monkeypatch.delenv("RIGMA_MCP_ALLOW_ABSOLUTE_READS", raising=False)
+    assert mcp_server.ctx()["allow_absolute_reads"] is False
+    monkeypatch.setenv("RIGMA_MCP_ALLOW_ABSOLUTE_READS", "1")
+    assert mcp_server.ctx()["allow_absolute_reads"] is True
