@@ -15,6 +15,8 @@ existing suite passed *through*, not a case it missed by accident:
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -305,3 +307,295 @@ def test_update_state_tolerates_a_record_that_predates_engine(tmp_path,
         {"model": "m", "quant": "Q4", "backend": "vulkan"}), encoding="utf-8")
     st.update_state(unloaded=True)          # must not raise
     assert st.read_state()["unloaded"] is True
+
+
+# --- R3-HARN-6: one adapter kept the environment leak the other had fixed -----
+
+def test_no_harness_hands_the_agent_the_owners_secrets(monkeypatch):
+    """AUDIT 13-6 fixed this for mcode and left DSH doing `os.environ.copy()`,
+    so the identical leak survived in the sibling adapter. Both must now filter
+    through the one shared allowlist."""
+    from rigma import harness, harness_mcode
+    monkeypatch.setenv("HF_TOKEN", "hf-not-for-the-agent")
+    monkeypatch.setenv("GEMINI_API_KEY", "gm-not-for-the-agent")
+    monkeypatch.setenv("TAVILY_API_KEY", "tv-not-for-the-agent")
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+
+    for env in (harness.harness_env(), harness_mcode._env()):
+        for leaked in ("HF_TOKEN", "GEMINI_API_KEY", "TAVILY_API_KEY"):
+            assert leaked not in env, (leaked, sorted(env))
+        assert "PATH" in env, "a CLI still has to be able to start"
+
+    # The allowlist is shared, not copied: a third adapter cannot forget it.
+    assert harness_mcode._ENV_ALLOWLIST is harness.HARNESS_ENV_ALLOWLIST
+
+
+def test_the_dsh_adapter_no_longer_copies_the_whole_environment():
+    """The specific line that leaked. Asserted against the real function body,
+    because the leak WAS a line of code and a behavioural test would need a live
+    DSH checkout to reach it.
+
+    The env is built in `drive_turn` and handed to `_spawn`, so both are checked
+    — a fix in one that the other undoes is the shape this whole review is about.
+    Comments are stripped first: the fix's own comment QUOTES the offending line,
+    and a naive `in` test matches the explanation rather than the code. (It did.)
+    """
+    import inspect
+
+    from rigma import harness_dsh
+    for fn in (harness_dsh.drive_turn, harness_dsh._spawn):
+        code = "\n".join(
+            ln for ln in inspect.getsource(fn).splitlines()
+            if not ln.lstrip().startswith("#"))
+        assert "os.environ.copy()" not in code, (fn.__name__, code[:400])
+    assert "harness_env(" in inspect.getsource(harness_dsh.drive_turn)
+
+
+def test_the_env_passthrough_still_opts_a_name_in(monkeypatch):
+    """The escape hatch that keeps the old behaviour reachable."""
+    from rigma import harness
+    monkeypatch.setenv("MY_AGENT_EXTRA", "wanted")
+    monkeypatch.setenv("RIGMA_HARNESS_ENV_PASSTHROUGH", "MY_AGENT_EXTRA")
+    assert harness.harness_env().get("MY_AGENT_EXTRA") == "wanted"
+    # …and the legacy name still works, so an existing setup is not broken.
+    monkeypatch.delenv("RIGMA_HARNESS_ENV_PASSTHROUGH")
+    monkeypatch.setenv("RIGMA_MCODE_ENV_PASSTHROUGH", "MY_AGENT_EXTRA")
+    assert harness.harness_env().get("MY_AGENT_EXTRA") == "wanted"
+
+
+def test_harness_env_also_passes_a_name_the_child_cannot_start_without(
+        monkeypatch):
+    """DSH resolves its provider key through `apiKeyEnv: DEEPSEEK_API_KEY`, so
+    filtering it out would leave the agent unable to reach the local server."""
+    from rigma import harness
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "local-placeholder")
+    assert "DEEPSEEK_API_KEY" not in harness.harness_env()
+    assert (harness.harness_env(also=("DEEPSEEK_API_KEY",))
+            .get("DEEPSEEK_API_KEY") == "local-placeholder")
+
+
+# --- R3-STORE-4: RIGMA_HOME="" put the whole store in the CWD -----------------
+
+def test_an_empty_rigma_home_is_not_the_current_directory(monkeypatch):
+    """`os.environ.get("RIGMA_HOME", default)` substitutes only when the variable
+    is ABSENT, so an empty value returned `Path("")` — the current working
+    directory. Every store then landed in whatever folder the command ran from,
+    and a run elsewhere saw none of it."""
+    import importlib
+
+    from rigma import runtime
+    try:
+        monkeypatch.setenv("RIGMA_HOME", "")
+        importlib.reload(runtime)
+        assert runtime.rigma_home() == Path.home() / ".rigma"
+
+        monkeypatch.setenv("RIGMA_HOME", "   ")
+        importlib.reload(runtime)
+        assert runtime.rigma_home() == Path.home() / ".rigma"
+
+        monkeypatch.setenv("RIGMA_HOME", str(Path.home() / ".rigma-test"))
+        importlib.reload(runtime)
+        assert runtime.rigma_home() == Path.home() / ".rigma-test"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(runtime)
+
+
+# --- R3-RUN-3: the spill directory was unbounded ------------------------------
+
+def test_spills_are_pruned_by_count(monkeypatch, tmp_path):
+    """One full-size file per oversized tool result and nothing ever removed
+    them: a long run polling `job_output` every turn left thousands."""
+    from rigma import serve
+    monkeypatch.setattr(serve, "SPILL_KEEP", 5)
+    monkeypatch.setattr(serve, "SPILL_MAX_BYTES", 1 << 30)
+    out = tmp_path / "results"
+    out.mkdir()
+    for i in range(12):
+        f = out / f"grep-{i:04d}.txt"
+        f.write_text("x" * 100, encoding="utf-8")
+        os.utime(f, (1_700_000_000 + i, 1_700_000_000 + i))
+    serve._prune_spills(out)
+    left = sorted(p.name for p in out.iterdir())
+    assert len(left) == 5, left
+    # newest-first: the model is far more likely to want what it just produced
+    assert left == [f"grep-{i:04d}.txt" for i in range(7, 12)], left
+
+
+def test_spills_are_pruned_by_total_bytes(monkeypatch, tmp_path):
+    from rigma import serve
+    monkeypatch.setattr(serve, "SPILL_KEEP", 100)
+    monkeypatch.setattr(serve, "SPILL_MAX_BYTES", 1000)
+    out = tmp_path / "results"
+    out.mkdir()
+    for i in range(10):
+        f = out / f"page-{i:04d}.txt"
+        f.write_text("y" * 400, encoding="utf-8")
+        os.utime(f, (1_700_000_000 + i, 1_700_000_000 + i))
+    serve._prune_spills(out)
+    total = sum(p.stat().st_size for p in out.iterdir())
+    assert total <= 1000, total
+
+
+def test_pruning_never_removes_a_file_it_cannot_see(tmp_path):
+    """Best-effort: a spill that cannot be pruned is still a spill the model can
+    read, which is the point of writing it. Must not raise."""
+    from rigma import serve
+    serve._prune_spills(tmp_path / "does-not-exist")     # no exception
+    f = tmp_path / "one.txt"
+    f.write_text("x", encoding="utf-8")
+    serve._prune_spills(tmp_path)                        # nothing to do
+
+
+# --- R3-RUN-4: a NaN budget produced a six-minute run -------------------------
+
+def test_a_nan_budget_is_refused_not_silently_shortened():
+    """`nan <= 0` is False and `max(0.1, min(nan, 48.0))` is 0.1, so a client
+    asking for an unbounded budget silently got SIX MINUTES. `math.isfinite` is
+    the check; the endpoint must not accept a number nobody chose."""
+    import math
+    # The arithmetic that made it silent, stated as the regression:
+    assert not (float("nan") <= 0)
+    assert max(0.1, min(float("nan"), 48.0)) == 0.1
+    assert not math.isfinite(float("nan"))
+    assert not math.isfinite(float("inf"))
+    assert math.isfinite(8.0)
+
+
+# --- R3-RUN-5: an unreadable run.json stranded the slot ----------------------
+
+def test_an_unreadable_run_is_not_reported_as_deleted(tmp_path, monkeypatch):
+    """`runs.load` returns None for BOTH "deleted" and "could not read", so a
+    transient read failure left run.json `running` with no driver and the slot
+    claimed: pause and inject answered 409 "run has no driver", restart 409 "run
+    is running", a new run 409 "a run is already active". The two cases must be
+    told apart, because only one of them is ours to write a status for."""
+    from rigma import runs, serve
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    rid = runs.create("m", "s1")["id"]
+
+    # A run directory that exists but whose state cannot be read.
+    with monkeypatch.context() as m:
+        m.setattr(runs, "load", lambda _rid: None)
+        got, readable = serve._load_run_for_loop(runs, rid)
+        assert got is None and readable is False, (got, readable)
+
+    # A genuinely deleted run is NOT our state to write.
+    with monkeypatch.context() as m:
+        m.setattr(runs, "load", lambda _rid: None)
+        m.setattr(runs, "run_dir",
+                  lambda _rid, create=False: tmp_path / "nope")
+        got, readable = serve._load_run_for_loop(runs, rid)
+        assert got is None and readable is True, (got, readable)
+
+    # …and an ordinary read is readable, so the two cases above are not just
+    # "this function always says the same thing".
+    got, readable = serve._load_run_for_loop(runs, rid)
+    assert got is not None and readable is True
+
+
+def test_a_transient_read_failure_is_retried_before_giving_up(tmp_path,
+                                                              monkeypatch):
+    """The realistic cause is a Windows sharing violation against the atomic
+    replace, which is gone in milliseconds — so one failure must not be fatal."""
+    from rigma import runs, serve
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    rid = runs.create("m", "s1")["id"]
+    real = runs.load
+    calls = {"n": 0}
+
+    def flaky(_rid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None                 # the transient miss
+        return real(_rid)
+
+    monkeypatch.setattr(runs, "load", flaky)
+    got, readable = serve._load_run_for_loop(runs, rid)
+    assert readable is True and got is not None
+    assert calls["n"] == 2, calls
+
+
+# --- R3-CHAT-1: a message-less turn bypassed the per-session guard ------------
+
+def test_a_continuation_cannot_start_a_second_turn_on_one_session(tmp_path,
+                                                                 monkeypatch):
+    """The guard was `if message and sid in _streaming`, and the `message` half
+    is what made it bypassable: `regenerate` and the queued-prompt replay both
+    call the endpoint with NO message. Two concurrent `{"message": null}` calls
+    both passed, both reached `_cancels[sid] = cancel`, and the second overwrote
+    the first's token — so the first turn became unstoppable by the Stop button
+    and two agent loops shared one transcript.
+
+    Driven through the real endpoint, with `_streaming` seeded to the state a
+    second request actually hits.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from fastapi.testclient import TestClient
+    from rigma import serve
+    from rigma import state as st
+
+    class _Engine(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("content-length", 0))
+            self.rfile.read(n)
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            for chunk in ('data: {"choices":[{"delta":{"content":"a"},'
+                          '"finish_reason":"stop"}]}\n\n',
+                          'data: [DONE]\n\n'):
+                self.wfile.write(chunk.encode())
+            self.wfile.flush()
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _Engine)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+        st.write_state("m", "Q4", 11500, engine_pid=1234, ui_pid=1234)
+        client = TestClient(serve.build_app(upstream_port=srv.server_address[1]))
+
+        sid = client.post("/api/sessions", json={}).json()["id"]
+        # seed one exchange, so the "session has no messages" 400 cannot be what
+        # we are measuring
+        client.post(f"/api/sessions/{sid}/chat", json={"message": "hi"}).text
+
+        # reach the queue/streaming state build_app keeps in its closure
+        streaming = None
+        for route in client.app.routes:
+            fn = getattr(route, "endpoint", None)
+            if fn is None or not fn.__closure__:
+                continue
+            cells = {}
+            for name, cell in zip(fn.__code__.co_freevars, fn.__closure__):
+                try:
+                    cells[name] = cell.cell_contents
+                except ValueError:
+                    pass
+            if "_streaming" in cells:
+                streaming = cells["_streaming"]
+                break
+        assert streaming is not None, "could not reach _streaming"
+
+        streaming.add(sid)
+        try:
+            r = client.post(f"/api/sessions/{sid}/chat", json={"message": None})
+            assert r.status_code == 409, (r.status_code, r.text)
+            assert "already producing a reply" in r.text
+
+            # A NEW prompt is still queued — that is the behaviour this guard
+            # must not have broken.
+            r2 = client.post(f"/api/sessions/{sid}/chat", json={"message": "more"})
+            assert r2.status_code == 200, (r2.status_code, r2.text)
+            assert "queued" in r2.text
+        finally:
+            streaming.discard(sid)
+    finally:
+        srv.shutdown()
+
+

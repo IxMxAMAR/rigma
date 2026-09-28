@@ -18,7 +18,19 @@ from .models import GgufFile, RunPlan
 
 
 def rigma_home() -> Path:
-    return Path(os.environ.get("RIGMA_HOME", str(Path.home() / ".rigma")))
+    """Where Rigma keeps its state: models, engines, sessions, settings.
+
+    R3-STORE-4: `os.environ.get("RIGMA_HOME", default)` only substitutes the
+    default when the variable is ABSENT, so `RIGMA_HOME=""` returned `Path("")`
+    — which is the CURRENT WORKING DIRECTORY. Every store then landed in whatever
+    folder the command happened to be run from: `rigma up` in a git checkout
+    wrote `models/`, `engines/`, `sessions.db` and `settings.json` into the
+    project, and a later run from elsewhere saw none of it. An empty value is
+    the same intent as no value, which is also how the shell idiom
+    `RIGMA_HOME=$SOMETHING rigma up` behaves when SOMETHING is unset.
+    """
+    raw = (os.environ.get("RIGMA_HOME") or "").strip()
+    return Path(raw) if raw else Path.home() / ".rigma"
 
 
 # AUDIT F26: docs/audit-2026-09-04-full.md
