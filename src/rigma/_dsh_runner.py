@@ -42,12 +42,115 @@ def _emit(obj: dict) -> None:
 # in noise on a progress line. Tool activity and failures are the signal.
 _NOTICE_WORTHY = ("tool", "error", "fail", "denied", "retry", "timeout")
 
+# Session-event types Rigma renders as STRUCTURED state rather than as a
+# progress line. These are the capabilities the `sdk-minimal` profile did not
+# mount at all until Rigma patched them in (see
+# data/dsh/agent-capabilities.patch.yml) — so before that patch this table had
+# nothing to carry, and afterwards it is what makes the capability visible.
+#
+# These are passed through as their WHOLE payload, not unwrapped to the one
+# interesting field. `goal/change` is the reason: its payload is
+# {operation, goal: <snapshot>, roundsStarted, createdAt, updatedAt}, and
+# handing on only the snapshot throws away the round count and the operation —
+# which is exactly the context a UI needs to say "round 4 of 60" or "paused".
+_STATE_EVENTS = (
+    "goal/change",
+    "todo/write",
+    "plan/mode",
+    "subagent/descriptor",
+    "subagent/catalog",
+)
+
+# `assistant/message` carries the step's token accounting. It is the ONLY
+# place a DSH turn reports usage, and it is worth a real number in the UI.
+_USAGE_EVENT = "assistant/message"
+
+
+def _event_and_data(notification) -> tuple[str, dict]:
+    """The inner session event and its payload, or ("", {}) when there is none.
+
+    DSH puts almost everything interesting inside `session.event`, whose
+    `event` field is the full session-log envelope: `{type, data, ...}`.
+    `subagent.started` and `subagent.finished` are the exception — they are
+    top-level methods carrying their payload directly.
+    """
+    payload = getattr(notification, "payload", None)
+    if not isinstance(payload, dict):
+        return "", {}
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return "", {}
+    kind = str(event.get("type") or "")
+    data = event.get("data")
+    return kind, data if isinstance(data, dict) else {}
+
+
+def _project(notification) -> list[dict]:
+    """Every event this one notification should produce, in Rigma's vocabulary.
+
+    Returns a LIST because one notification can carry more than one fact, and
+    because the old single-line shape is still what most notifications are.
+    A `session.event` for a tool call becomes a real `tool` event WITH the tool
+    name and arguments — before this, the parent was told the literal string
+    "session.event tool/call", so every DSH turn rendered zero tool chips and
+    the tool name was unrecoverable downstream.
+    """
+    method = str(getattr(notification, "method", "") or "notification")
+    payload = getattr(notification, "payload", None)
+    if not isinstance(payload, dict):
+        payload = {}
+
+    # Subagent lifecycle is top-level and carries its payload directly. It also
+    # did not match the old keyword filter: "subagent.finished" contains
+    # "finish", not "fail", so a subagent could start AND end unseen.
+    if method in ("subagent.started", "subagent.finished"):
+        return [{"type": "state", "event": method, "data": payload}]
+
+    kind, data = _event_and_data(notification)
+
+    if kind == "tool/call":
+        out = {"type": "tool", "name": str(data.get("name") or "")}
+        args = data.get("arguments")
+        if isinstance(args, dict):
+            out["args"] = args
+        call_id = data.get("callId") or data.get("id")
+        if call_id:
+            # The parent keys a chip by this. Without it two calls to the same
+            # tool in one turn collapse onto one chip.
+            out["id"] = str(call_id)
+        return [out]
+
+    if kind == "tool/result":
+        out = {"type": "tool_result", "ok": not data.get("isError", False)}
+        call_id = data.get("callId") or data.get("id")
+        if call_id:
+            out["id"] = str(call_id)
+        content = data.get("content")
+        if isinstance(content, str):
+            out["text"] = content[:4000]
+        return [out]
+
+    if kind in _STATE_EVENTS:
+        return [{"type": "state", "event": kind, "data": data}]
+
+    if kind == _USAGE_EVENT:
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            return [{"type": "state", "event": "usage", "data": usage}]
+
+    # Everything else keeps the old behaviour: a short progress line, and only
+    # when it is one a person watching would want.
+    line = _notice_text(notification)
+    return [{"type": "notice", "text": line}] if line else []
+
 
 def _notice_text(notification) -> str | None:
     """A one-line summary worth showing, or None when it is internal chatter.
 
     The parent renders these live, so a whole payload would be both noise and
     potentially enormous — only the method and the inner event type are used.
+    Structured facts do NOT come through here; they come through `_project`,
+    which is why this stays deliberately lossy.
     """
     method = str(getattr(notification, "method", "") or "notification")
     detail = ""
@@ -62,7 +165,6 @@ def _notice_text(notification) -> str | None:
     if not any(word in blob for word in _NOTICE_WORTHY):
         return None
     return f"{method} {detail}".strip()[:200]
-
 
 def _cli_for(home: str) -> Path | None:
     path = Path(home).joinpath(*_CLI_REL) if home else None
@@ -166,6 +268,16 @@ def _run_turn(job: dict, live: _Live) -> int:
                 from rigma.harness_dsh import patch_file
 
                 patch = str(patch_file(context_window, max_tokens, live.scratch))
+            # The capabilities the minimal profile does not mount — goals,
+            # subagents, todos, skills, plan mode, filesystem tools, compaction.
+            # The minimal tree is standalone and deliberately excludes them, so
+            # without this patch those capabilities do not exist in the runtime
+            # at all and no amount of event forwarding could show them.
+            #
+            # The capability patch goes FIRST and the per-turn llm patch LAST:
+            # patch layers are applied in order and the last write wins per row.
+            cap = str(job.get("capability_path") or "")
+            patches = tuple(p for p in (cap, patch) if p)
             config = DeepSeekHarnessConfig(
                 profile="sdk-minimal",
                 dsh_bin=str(cli),
@@ -176,7 +288,7 @@ def _run_turn(job: dict, live: _Live) -> int:
                 max_tokens=max_tokens,
                 cwd=cwd,
                 runtime_cwd=cwd,
-                patches=(patch,),
+                patches=patches,
             )
             live.harness = DeepSeekHarness(config)
             live.harness.start()
@@ -184,9 +296,8 @@ def _run_turn(job: dict, live: _Live) -> int:
 
         def on_notification(notification) -> None:
             try:
-                line = _notice_text(notification)
-                if line:
-                    _emit({"type": "notice", "text": line})
+                for ev in _project(notification):
+                    _emit(ev)
             except Exception:
                 pass  # a progress line must never break the turn
 

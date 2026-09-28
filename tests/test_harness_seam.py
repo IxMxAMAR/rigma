@@ -170,6 +170,18 @@ def test_the_api_lists_the_harnesses(monkeypatch, tmp_path):
     with TestClient(serve.build_app(upstream_port=11500)) as c:
         body = c.get("/api/harnesses").json()
     assert body["built_in"] == "native"
+    # What Rigma ADDS to each backend: the other half of the `unsupported`
+    # disclosure, and the only place a user can learn that DSH's goals,
+    # subagents and todos are Rigma's doing rather than DSH's own.
+    by_name = {h["name"]: h for h in body["harnesses"]}
+    assert "capabilities" in by_name["native"], "the key must always be present"
+    assert by_name["native"]["capabilities"] == []
+    assert any("goal" in c for c in by_name["dsh"]["capabilities"])
+    assert any("subagent" in c for c in by_name["dsh"]["capabilities"])
+    assert any("todo" in c for c in by_name["dsh"]["capabilities"])
+    # mcode owns its own goals and todos, so its list is about memory and the
+    # workspace crossing the seam instead.
+    assert any("MCP" in c for c in by_name["mcode"]["capabilities"])
     assert body["endpoint"] == "http://127.0.0.1:11500/v1"
     names = {h["name"] for h in body["harnesses"]}
     assert {"native", "dsh", "mcode"} <= names

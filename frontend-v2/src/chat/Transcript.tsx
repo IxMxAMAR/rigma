@@ -7,6 +7,8 @@ import {
   selectStreaming, useChat, type Chip, type Source, type StreamingTurn,
 } from "./chatStore";
 import { formatArgs, previewArgs } from "./toolChip";
+import AgentState from "./AgentState";
+import { argHint, delegateSentence, summariseDelegate } from "./delegate";
 
 function ChipRow({ chip }: { chip: Chip }) {
   return (
@@ -137,6 +139,29 @@ function Bubble({ m }: { m: ChatMessage }) {
             ))}
           </div>
         )}
+        {/* What the research helper did. The server recorded this from the
+            start and nothing drew it, so a delegated answer arrived with no
+            sign of the work behind it. Collapsed by default: it is the receipt,
+            not the answer, and the answer is what the reader came for. */}
+        {!isUser && (m.delegate_trace?.length ?? 0) > 0 && (
+          <details className="rounded-md bg-surface px-2.5 py-1.5 text-[11.5px] mb-2">
+            <summary className="cursor-pointer text-secondary">
+              {delegateSentence(summariseDelegate(m.delegate_trace ?? []))}
+            </summary>
+            <ul className="mt-1 flex flex-col gap-0.5 pl-3 text-muted leading-snug">
+              {(m.delegate_trace ?? []).map((d, i) => (
+                <li key={i} className="font-mono text-[11px]">
+                  <span className={d.blocked ? "text-red" : d.ok === false ? "text-red" : "text-moss"}>
+                    {d.blocked ? "✕" : d.ok === false ? "✕" : "✓"}
+                  </span>{" "}
+                  {d.name}
+                  {argHint(d.args) && <span className="text-muted"> {argHint(d.args)}</span>}
+                  {d.blocked && <span className="text-red"> — not available to a helper</span>}
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
         {images.length > 0 && (
           <div className="flex flex-wrap gap-2 mb-2">
             {images.map((src, i) => (
@@ -253,6 +278,38 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
       {turn.notices.map((n, i) => (
         <p key={i} className="text-[12px] italic text-muted">{n}</p>
       ))}
+      {/* The agent's own state, reported by the backend rather than written
+          by the model: its goal, its todo list, whether it is in plan mode,
+          the subagents it started, and what the step cost. Rendered above the
+          reply because it is the context the reply is happening in. */}
+      <AgentState
+        goal={turn.goal}
+        todos={turn.todos}
+        planMode={turn.planMode}
+        subagents={turn.subagents}
+        usage={turn.usage}
+      />
+      {/* Compaction, observation-masking and the prompt queue. All three were
+          emitted by the server and dropped by the store's default arm, so a
+          long turn looked frozen while it was actually working. */}
+      {turn.housekeeping && (
+        <p className="font-mono text-[11px] text-muted">{turn.housekeeping}</p>
+      )}
+      {turn.masked > 0 && (
+        <p className="font-mono text-[11px] text-muted">
+          masked {turn.masked} earlier observation{turn.masked === 1 ? "" : "s"} to make room
+        </p>
+      )}
+      {turn.compacted > 0 && (
+        <p className="font-mono text-[11px] text-muted">
+          compacted {turn.compacted} message{turn.compacted === 1 ? "" : "s"} into the summary
+        </p>
+      )}
+      {turn.queued > 0 && (
+        <p className="font-mono text-[11px] text-amber">
+          queued behind the running reply — {turn.queued} waiting
+        </p>
+      )}
       <Thinking text={turn.thinking} live={turn.text === ""} />
       {turn.chips.length > 0 && (
         <div className="flex flex-col gap-1">

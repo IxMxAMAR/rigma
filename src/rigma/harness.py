@@ -59,6 +59,19 @@ class TurnEvent:
     name: str = ""
     args: dict | None = None
     ok: bool = True
+    # The backend's OWN event name and payload, when it has one worth keeping.
+    #
+    # Added for the DSH capability bridge. A goal change, a todo list, a plan
+    # mode switch, a subagent's lifecycle and a token count are all STRUCTURED
+    # facts with no home in `text` — squashing them into a string would mean
+    # re-parsing our own prose in the UI, which is how a field quietly becomes
+    # a sentence and stops being data. `event` names what it is (DSH's own
+    # session-event type, e.g. "goal/change"), `data` is its payload verbatim.
+    #
+    # Both default empty, so every existing adapter and every existing
+    # construction of a TurnEvent keeps working unchanged.
+    event: str = ""
+    data: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +126,19 @@ class Harness:
     # inferred, because "ignores it" and "honours it" are both legitimate
     # adapter designs and only the adapter knows which it is.
     honours_permission: bool = True
+    # What Rigma ADDS to this backend, when it would otherwise be missing it.
+    #
+    # `unsupported` says what a backend does not get from Rigma; this says the
+    # opposite, and both are needed to answer the question a user actually has,
+    # which is "what can this thing do for me". It exists because DSH's minimal
+    # profile ships almost no model-facing tools — no goals, subagents, todos,
+    # skills, plan mode, filesystem access or compaction — and Rigma mounts them
+    # with a Cordis patch. Without a line saying so, that is invisible: the
+    # capability appears and nothing anywhere explains where it came from, so a
+    # user cannot tell Rigma's additions from DSH's own.
+    #
+    # Declared by the adapter, because only the adapter knows what it mounts.
+    capabilities: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         return {"name": self.name, "label": self.label, "drives": self.drives,
@@ -120,7 +146,8 @@ class Harness:
                 "needs": self.needs, "wire": self.wire, "verified": self.verified,
                 "built_in": self.built_in,
                 "honours_permission": self.honours_permission,
-                "unsupported": list(self.unsupported), "pending": self.pending}
+                "unsupported": list(self.unsupported), "pending": self.pending,
+                "capabilities": list(self.capabilities)}
 
 
 # AUDIT 13-6 / R3-HARN-6: an external agent is a third-party process with its own
@@ -281,6 +308,21 @@ BACKENDS: dict[str, Harness] = {
         # by design — DSH's confinement is its own bundle's business. Declared so
         # the UI can say that instead of rendering a selector that does nothing.
         honours_permission=False,
+        # What Rigma mounts into the minimal profile. Named one by one rather
+        # than summarised, because the list IS the answer to "is anything
+        # missing" — and because every entry is something `sdk-minimal` does
+        # not ship, so its absence would be silent. Kept in step with
+        # data/dsh/agent-capabilities.patch.yml, which
+        # tests/test_dsh_capabilities.py checks row by row.
+        capabilities=(
+            "goals, with a round driver and a tool to set, read and revise one",
+            "subagents, spawned in-process or forked from this conversation",
+            "a todo list the model maintains and the transcript renders",
+            "plan mode, so it can propose before it changes anything",
+            "skills, discoverable and loadable by the model itself",
+            "filesystem tools: read, write, edit, glob and grep",
+            "agent instructions from AGENTS.md, and context compaction",
+        ),
     ),
     MCODE: Harness(
         name=MCODE,
@@ -310,6 +352,17 @@ BACKENDS: dict[str, Harness] = {
             "its own system prompt: Rigma's is not passed through",
             "the sandbox: a headless turn needs `--permission full`, so a "
             "confined profile does not survive the seam",
+        ),
+        # The other direction: what Rigma hands it that it did not arrive with.
+        # mcode owns its own goals, todos, subagents and skills, so unlike DSH
+        # this list is NOT about mounting capability — it is about the memory and
+        # the workspace crossing the seam.
+        capabilities=(
+            "Rigma's memory, as an MCP server: `remember`, `recall` and "
+            "`undo_last_change`, registered in mcode's own mcp.json",
+            "the chat's workspace and its AGENTS.md, written in before a turn",
+            "a session that survives the process, so its plan, subagents and "
+            "goals continue across turns instead of restarting each one",
         ),
     ),
 }

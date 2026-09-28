@@ -154,6 +154,29 @@ def data_home() -> Path:
     return path
 
 
+def capability_patch() -> str:
+    """The shipped patch that gives DSH the capabilities sdk-minimal omits.
+
+    Rigma boots DSH with `profile="sdk-minimal"`, which is a standalone Cordis
+    tree whose only model-facing tools are two persistent shells — no goals, no
+    subagents, no todos, no skills, no plan mode, no filesystem tools, and no
+    compaction. This file inserts them. Read it before changing it; it explains
+    why a patch is used instead of switching to `profile="sdk"`.
+
+    Read from the PACKAGE, not from the source tree, because the wheel ships it
+    and the installed Rigma has no checkout to point at. Returns "" when it
+    cannot be found, which leaves DSH exactly as it was rather than failing the
+    turn: a missing capability patch is a smaller loss than no harness at all.
+    """
+    try:
+        from importlib import resources
+
+        path = Path(str(resources.files("rigma").joinpath(
+            "data/dsh/agent-capabilities.patch.yml")))
+    except Exception:
+        return ""
+    return str(path) if path.is_file() else ""
+
 def patch_file(context_window: int, max_tokens: int, tmpdir) -> Path:
     """Write the one-row YAML patch that makes DSH talk to Rigma's server.
 
@@ -203,7 +226,6 @@ class _Run:
     tree_killed: bool | None = None
     stderr: deque = field(default_factory=lambda: deque(maxlen=400))
     lines: queue.Queue = field(default_factory=queue.Queue)
-    hstate: dict | None = None          # the backend-owned handle, in and out
     cancel: threading.Event | None = None
 
 
@@ -213,7 +235,14 @@ def _tail(state: _Run) -> str:
 
 
 def _event_for(payload: dict) -> TurnEvent | None:
-    """Translate one runner event, or None when there is nothing to show."""
+    """Translate one runner event, or None when there is nothing to show.
+
+    The runner is the only thing that understands DSH's wire format; this maps
+    its already-translated vocabulary onto the seam's. `state` is the one kind
+    that carries a STRUCTURED fact — a goal, a todo list, a plan-mode switch, a
+    subagent's lifecycle, a token count — so it keeps the backend's own event
+    name and payload instead of being flattened into a sentence.
+    """
     kind = str(payload.get("type") or "").strip().lower()
     if kind in ("text", "thinking", "notice"):
         text = str(payload.get("text") or "")
@@ -226,6 +255,10 @@ def _event_for(payload: dict) -> TurnEvent | None:
             kind="tool",
             name=str(payload.get("name") or ""),
             args=args if isinstance(args, dict) else {},
+            # The call id, so two calls to one tool in a turn stay two chips.
+            # The server falls back to `ev.name` when this is absent, which is
+            # exactly the collapse this avoids.
+            data={"id": str(payload["id"])} if payload.get("id") else None,
         )
     if kind == "tool_result":
         return TurnEvent(
@@ -233,11 +266,18 @@ def _event_for(payload: dict) -> TurnEvent | None:
             text=str(payload.get("text") or ""),
             name=str(payload.get("name") or ""),
             ok=bool(payload.get("ok", True)),
+            data={"id": str(payload["id"])} if payload.get("id") else None,
+        )
+    if kind == "state":
+        data = payload.get("data")
+        return TurnEvent(
+            kind="state",
+            event=str(payload.get("event") or ""),
+            data=data if isinstance(data, dict) else {},
         )
     if kind == "error":
         return TurnEvent(kind="error", text=str(payload.get("text") or "DSH error"))
     return None  # unknown kinds are skipped, so the runner can grow new ones
-
 
 def _start_readers(state: _Run) -> None:
     """Drain both pipes on daemon threads.
@@ -528,13 +568,26 @@ def drive_turn(
     Never raises: a failure arrives as an `error` event, because the caller is a
     tool and a tool that raises teaches the model nothing it can act on.
 
-    `state`, when given, is read for the DSH session to CONTINUE and written back
-    with the one this turn produced. It is the BACKEND's handle and not Rigma's:
-    DSH's own ids look like `session-<32 hex>`, so Rigma's chat id means nothing
-    to it. This parameter was MISSING until 2026-09-21, which made every turn
-    through the web seam raise `TypeError: unexpected keyword argument 'state'`
-    and come back as a failed turn — the adapter worked when driven directly and
-    was broken in the product, which is the gap that driving it end to end found.
+    `state` is ACCEPTED FOR PROTOCOL CONFORMANCE AND OTHERWISE UNUSED, and this
+    docstring used to claim the opposite — that it was "read for the DSH session
+    to CONTINUE and written back with the one this turn produced". That was
+    never true: nothing in this module reads or writes it, `serve.py` therefore
+    always persists an empty backend session for DSH, and the module comment at
+    the top of the file already said so. The contradiction is worth naming
+    rather than quietly deleting, because the false version is the more
+    plausible-sounding one and someone will otherwise "restore" it.
+
+    The parameter must stay regardless: `state` is part of the adapter contract
+    every backend implements, and `serve.py` passes it to whichever adapter is
+    selected. Removing it is what broke every web turn until 2026-09-21 —
+    `TypeError: unexpected keyword argument 'state'` — which is the gap that
+    driving the adapter end to end (rather than directly) is what found.
+
+    CONTINUITY DOES NOT COME FROM HERE. It comes from the pooled runner
+    outliving a turn: the child process holds the DSH session, so the next turn
+    reuses the process and continues the conversation. The SDK has no way to
+    open a session it did not create, so there is no id to hand back even if
+    one were wanted.
 
     `permission` is ACCEPTED AND IGNORED. DSH's confinement is its own bundle's
     business — `sdk-minimal` pins the mode — and mapping a Rigma setting onto it
@@ -580,6 +633,10 @@ def drive_turn(
             "dsh_home": str(root),
             "data_home": str(data_home()),
             "patch_path": "",       # the runner owns the patch for its lifetime
+            # The capabilities the minimal profile does not mount. Passed as a
+            # PATH rather than regenerated in the child so there is exactly one
+            # copy of it to keep correct.
+            "capability_path": capability_patch(),
         }
         # R3-HARN-6: `os.environ.copy()` handed the agent every secret the owner
         # had exported. AUDIT 13-6 fixed exactly this for mcode and left DSH

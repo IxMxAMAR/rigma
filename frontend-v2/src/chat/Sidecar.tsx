@@ -863,6 +863,23 @@ function SamplingCard() {
           which is the sentence that explains the permission selector above.
           `unsupported` is non-empty for every external backend, so this is the
           normal case, not an edge one. */}
+      {/* The other direction, and it goes FIRST: what this backend can do is
+          the question a user is asking when they open this panel. A backend
+          whose capabilities Rigma supplies — DSH's goals, subagents, todos,
+          skills, plan mode and filesystem tools all come from Rigma's patch,
+          not from the minimal profile — reads as featureless without this. */}
+      {selectedHarness && (selectedHarness.capabilities?.length ?? 0) > 0 && (
+        <details className="rounded-md bg-surface px-2.5 py-1.5 text-[11.5px]" open>
+          <summary className="cursor-pointer text-secondary">
+            what Rigma gives {selectedHarness.label}
+          </summary>
+          <ul className="mt-1 flex flex-col gap-0.5 pl-3 text-muted leading-snug">
+            {(selectedHarness.capabilities ?? []).map((c) => (
+              <li key={c}>+ {c}</li>
+            ))}
+          </ul>
+        </details>
+      )}
       {selectedHarness && selectedHarness.runnable && selectedHarness.installed
         && selectedHarness.unsupported.length > 0 && (
         <details className="rounded-md bg-surface px-2.5 py-1.5 text-[11.5px]">

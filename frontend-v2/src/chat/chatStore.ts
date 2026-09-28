@@ -13,6 +13,7 @@ import { responseError } from "../lib/listFetch";
 import { runMacroStream } from "../lib/methods";
 import { streamChat, type SseEvent } from "../lib/sse";
 import { DRAFT_KEY, parseDrafts, saveDrafts } from "./drafts";
+import { foldSubagent, type Subagent } from "./subagents";
 
 export interface Chip {
   id: string;
@@ -50,6 +51,28 @@ export interface StreamingTurn {
    *  the MODEL's text, so the sources reached the model and never the reader —
    *  backwards for the one feature whose value is "which file said this". */
   sources: Source[];
+  /** What the agent is working TOWARD, from the backend's own goal state.
+   *  A goal is not a message and not a todo: it has a phase, a revision and a
+   *  round count, and it outlives the turn that set it. Kept whole rather than
+   *  flattened because the phase is the point. */
+  goal: Record<string, unknown> | null;
+  /** The backend's latest whole-list todo snapshot. `todo_write` REPLACES the
+   *  list every call, so this is an assignment, never a merge. */
+  todos: { content: string; status: string }[];
+  /** Plan mode: the agent is proposing rather than doing. */
+  planMode: boolean;
+  /** Subagents this turn's backend started, folded from its lifecycle. */
+  subagents: Subagent[];
+  /** The step's token accounting, when the backend reported any. */
+  usage: Record<string, unknown> | null;
+  /** These five names were emitted by the server and dropped here by the
+   *  default arm, so a compaction, an observation-masking pass, a queued
+   *  prompt and the server's own retitling were all silent. */
+  housekeeping: string;
+  masked: number;
+  compacted: number;
+  queued: number;
+  title: string;
 }
 
 /** Marks a reply the user cut short, so the transcript never reads as if the
@@ -129,6 +152,16 @@ export const emptyTurn = (): StreamingTurn => ({
   harnessLabel: "",
   notices: [],
   sources: [],
+  goal: null,
+  todos: [],
+  planMode: false,
+  subagents: [],
+  usage: null,
+  housekeeping: "",
+  masked: 0,
+  compacted: 0,
+  queued: 0,
+  title: "",
 });
 
 /** Pure: fold one SSE event into the streaming turn. Returns a NEW object —
@@ -217,6 +250,43 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
       const note = String(d.note ?? "");
       return note ? { ...turn, notices: [...turn.notices, note] } : turn;
     }
+    // The backend's structured state. Each is a fact with its own shape, so
+    // none of them is folded into `text`.
+    case "goal":
+      return { ...turn, goal: d };
+    case "todos": {
+      const raw = Array.isArray(d.todos) ? d.todos : [];
+      return {
+        ...turn,
+        todos: raw.map((t) => {
+          const o = (t ?? {}) as Record<string, unknown>;
+          return { content: String(o.content ?? ""), status: String(o.status ?? "pending") };
+        }),
+      };
+    }
+    case "plan_mode":
+      return { ...turn, planMode: d.active === true };
+    case "subagent":
+      return { ...turn, subagents: foldSubagent(turn.subagents, d) };
+    case "usage":
+      return { ...turn, usage: d };
+    // Emitted by the server and previously dropped by the default arm.
+    case "housekeeping":
+      return d.note != null ? { ...turn, housekeeping: String(d.note) } : turn;
+    case "masked":
+      return d.masked != null ? { ...turn, masked: Number(d.masked) } : turn;
+    case "compacted":
+      return d.archived != null ? { ...turn, compacted: Number(d.archived) } : turn;
+    case "info":
+      return d.queued != null
+        ? { ...turn, queued: Number(d.queued) }
+        : d.note != null
+          ? { ...turn, housekeeping: String(d.note) }
+          : turn;
+    // The server retitles a chat from its first exchange. The rail was never
+    // told, so a renamed chat kept its old name until a reload.
+    case "meta":
+      return d.title != null ? { ...turn, title: String(d.title) } : turn;
     case "message":
     default:
       return d.delta != null
