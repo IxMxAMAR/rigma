@@ -98,7 +98,36 @@ answerer (`dsh --profile web --dump-config`). The `acp` profile mounts
 mounts neither. So the answerer is a **client-side UI plugin** — and Rigma is an SDK
 client, not a UI plugin, on a wire with no reply method.
 
-### 2.3 Slash commands: unreachable by transport
+### 2.3 Why interactive questions cannot work on EITHER DSH transport
+
+This closes the last "could Rigma do better here" question, and the answer is no — for a
+structural reason worth writing down so nobody tries again.
+
+`@deepseek-ai/dsh-client-ui-user-questions` states the rule outright in its README:
+
+> The package is one ownership rule: **rendering a question is a host UI capability,
+> having the tool is an agent capability**, so the `tool-ask-user` row belongs to the
+> host.
+
+And the seam's own README calls `dsh-user-questions` "the **Host-side** question seam
+and its answerer waterfall".
+
+So answering a question requires being the **Host with a UI**. Rigma is an SDK
+*client* of a host process — it is on the wrong side of that boundary, on a wire with
+no reply method. That is why:
+
+- the `web` profile can do it: it mounts `dsh-client-ui-user-questions`, a
+  composer-takeover question surface with option selection, custom answers and skips;
+- the `acp` profile cannot: it mounts the seam with no answerer, and the ACP README
+  lists **elicitation** among the explicitly unsupported surfaces;
+- Rigma cannot: it mounts neither, and could not use them if it did.
+
+Mounting `dsh-tool-ask-user` in Rigma's profile would therefore be worse than leaving
+it out — the model would gain a tool that can only hang or abort. `dsh-tool-ask-user`
+and `dsh-user-questions` are both installed in the runtime and both deliberately
+absent from the patch.
+
+### 2.4 Slash commands: unreachable by transport
 
 DSH ships `dsh-command-goal`, `dsh-command-compact`, `dsh-command-feedback`.
 `parseCommand` (`interaction/commands/src/index.ts:125`) recognises the syntax and its
@@ -106,7 +135,7 @@ only caller is `CommandRuntime.execute` (`:367`), decorated **`@Remote`** — a 
 remote service. There is no wire method to invoke a command with, which is why Rigma
 has its own command surface instead (§4).
 
-### 2.4 `session/fork` does not exist
+### 2.5 `session/fork` does not exist
 
 Verified three ways: no match in the 51-entry dispositions list, no match in
 `HarnessSdkRequestMap`, no match anywhere in `packages/`. DSH forks by seeding an event
@@ -273,6 +302,7 @@ written against an API that cannot be exercised even once.
 | mcode ACP client (goals, delegation, queue, fork, resume) | **`mcode login`** — a browser sign-in to a MiniMax account | `-32000 Authentication required` on every session method |
 | DSH ACP client (answerable permission, model/effort selection, session list/resume) | **nothing technical** — verified working; it is a design decision, since it would add a second DSH transport and give up goals/todos/plans on that path | `tools/dsh_acp_probe.py` output |
 | interactive approvals on the SDK wire | **impossible** — `HarnessSdkNotificationMap` is notifications-only | §1 |
+| `ask_user_question` on **either** DSH transport | **impossible** — answering is a Host UI capability and Rigma is an SDK client; ACP omits elicitation | §2.3 |
 
 ### The honest recommendation on DSH ACP
 
