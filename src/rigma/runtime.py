@@ -47,6 +47,11 @@ def rigma_home() -> Path:
 # worth having because it is three lines and because the FIRST install of any
 # backend has no trust-on-first-use digest to compare against.
 ENGINE_URL_ALLOWLIST = ("https://github.com/ggml-org/llama.cpp/releases/download/",)
+# R3-ENG-1: where the pinned host is allowed to send us. Measured 2026-09-28,
+# GitHub answers a release-asset GET with a 302 here, so without it every
+# legitimate engine download would be refused. Extend with
+# `RIGMA_ENGINE_URL_ALLOW` (comma-separated prefixes) if you mirror the engine.
+ENGINE_REDIRECT_ALLOWLIST = ("https://release-assets.githubusercontent.com/",)
 
 
 def _manifest_ok(cand: object) -> bool:
@@ -119,9 +124,44 @@ def update_engines_manifest(url: str = ENGINES_MANIFEST_URL) -> bool:
         return False
 
 
+def _redirect_allowed(url: str) -> bool:
+    """Whether a request may END at `url`.
+
+    R3-ENG-1. `_manifest_ok` checks the pinned `url_base` is on the allowlist, but
+    that is a statement about where the request STARTS. `follow_redirects=True`
+    was unbounded, so a redirect served by (or injected into) the pinned host
+    could deliver the archive from anywhere — and this is the archive whose
+    extracted binary is then executed.
+
+    `release-assets.githubusercontent.com` is in the list because it is not
+    optional: measured 2026-09-28, GitHub answers a
+    `github.com/<org>/<repo>/releases/download/...` GET with a 302 to a signed
+    `release-assets.githubusercontent.com` URL, so a strict single-host check
+    would refuse every legitimate engine download. It is GitHub's own asset host
+    for the same repository path, which is why the hop is not a widening of trust
+    in the same way an arbitrary host would be.
+
+    `RIGMA_ENGINE_URL_ALLOW` adds prefixes for anyone who needs to mirror the
+    engine elsewhere. It is opt-in and named, not a fallback: an unset variable
+    leaves the two pinned hosts, and there is no "allow anything" value.
+    """
+    prefixes = list(ENGINE_URL_ALLOWLIST) + list(ENGINE_REDIRECT_ALLOWLIST)
+    extra = (os.environ.get("RIGMA_ENGINE_URL_ALLOW") or "").strip()
+    prefixes += [p.strip() for p in extra.split(",") if p.strip()]
+    return any(url.startswith(p) for p in prefixes)
+
+
 def _fetch(url: str, dest: Path) -> None:
     with httpx.stream("GET", url, follow_redirects=True, timeout=600) as r:
         r.raise_for_status()
+        final = str(r.url)
+        if not _redirect_allowed(final):
+            raise RuntimeError(
+                f"refusing to download an engine: {url} redirected to {final}, "
+                f"which is not a host this build names. The engine archive is "
+                f"extracted and its binary executed, so it is not fetched from "
+                f"anywhere the pin does not point. If you mirror the engine "
+                f"yourself, name the prefix in RIGMA_ENGINE_URL_ALLOW.")
         with open(dest, "wb") as f:
             for chunk in r.iter_bytes(1 << 20):
                 f.write(chunk)

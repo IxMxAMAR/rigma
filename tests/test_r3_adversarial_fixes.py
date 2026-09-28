@@ -516,6 +516,57 @@ def test_a_transient_read_failure_is_retried_before_giving_up(tmp_path,
     assert calls["n"] == 2, calls
 
 
+# --- R3-ENG-1: the engine fetch followed a redirect anywhere ------------------
+
+def test_an_engine_redirect_off_the_allowlist_is_refused(monkeypatch, tmp_path):
+    """`_manifest_ok` checks where the request STARTS; `follow_redirects=True` was
+    unbounded, so a redirect could deliver the archive from anywhere — and this is
+    the archive whose extracted binary is executed."""
+    import httpx
+
+    from rigma import runtime
+
+    class _Resp:
+        status_code = 200
+        url = httpx.URL("https://evil.example/payload.zip")
+        def raise_for_status(self): pass
+        def iter_bytes(self, n): return iter([b"x"])
+
+    class _Ctx:
+        def __enter__(self): return _Resp()
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(httpx, "stream", lambda *a, **k: _Ctx())
+    dest = tmp_path / "a.zip"
+    with pytest.raises(RuntimeError) as e:
+        runtime._fetch("https://github.com/ggml-org/llama.cpp/releases/"
+                       "download/b9867/x.zip", dest)
+    assert "redirected to" in str(e.value)
+    assert not dest.exists(), "nothing may be written from a refused host"
+
+
+def test_the_real_github_asset_hop_is_still_allowed():
+    """Measured 2026-09-28: GitHub answers a release-asset GET with a 302 to
+    release-assets.githubusercontent.com, so a strict single-host check would
+    refuse every legitimate engine download."""
+    from rigma import runtime
+    assert runtime._redirect_allowed(
+        "https://github.com/ggml-org/llama.cpp/releases/download/b9867/x.zip")
+    assert runtime._redirect_allowed(
+        "https://release-assets.githubusercontent.com/github-production-"
+        "release-asset/1/2?sp=r")
+    assert not runtime._redirect_allowed("https://evil.example/x.zip")
+    # and the escape hatch is opt-in and named, never "allow anything"
+    assert not runtime._redirect_allowed("http://mirror.lan/x.zip")
+    import os
+    os.environ["RIGMA_ENGINE_URL_ALLOW"] = "http://mirror.lan/"
+    try:
+        assert runtime._redirect_allowed("http://mirror.lan/x.zip")
+        assert not runtime._redirect_allowed("https://evil.example/x.zip")
+    finally:
+        del os.environ["RIGMA_ENGINE_URL_ALLOW"]
+
+
 # --- R3-STORE-10: fixed temp names collided under concurrency -----------------
 
 def test_every_whole_file_store_uses_a_unique_temp():
