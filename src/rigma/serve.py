@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -344,6 +345,12 @@ MAX_COMPLETION_CHALLENGES = 2   # refuse a premature task_complete at most
                                 # twice, so a bad plan can't trap the run
 SPILL_CHARS = 12000     # above this a tool result goes to DISK, not context
 SPILL_PREVIEW = 1500    # how much of it the model sees inline
+# R3-RUN-3: the spill directory was never pruned, so a long run that polled
+# `job_output` every turn left thousands of full-size files behind. Bounded by
+# BOTH count and total bytes, because either alone can be defeated (a few huge
+# pages, or very many small ones).
+SPILL_KEEP = 200        # newest N spill files kept
+SPILL_MAX_BYTES = 256 << 20     # …and never more than this in total
 _SPILL_EXEMPT = {"read_file"}   # the recovery tool must never spill itself
 RESULT_MAX = 8000       # persisted tool-result cap. In one-action mode this
                         # is the ONLY copy the model sees, so a tight cap
@@ -601,14 +608,102 @@ def _engine_has_vision(registry=None) -> bool:
         return False
 
 
+def _load_run_for_loop(runs_mod, run_id: str):
+    """`(run, readable)` for the run loop.
+
+    R3-RUN-5. `runs.load` returns None for BOTH "the file is gone" and "I could
+    not parse/read it", and the loop treated both as "stop, quietly". A transient
+    read failure therefore left the run claiming to be running with nothing
+    driving it. Retried briefly here — the realistic cause is a Windows sharing
+    violation against the `_atomic_write` replace, which is gone in milliseconds —
+    and the caller turns a still-unreadable state into a terminal status.
+
+    `readable` is False only when the run directory exists but its state could not
+    be read. A genuinely deleted run reports (None, True) so the loop stops
+    without inventing a status for a run nobody can see any more.
+    """
+    for attempt in range(3):
+        try:
+            run = runs_mod.load(run_id)
+        except Exception:
+            run = None
+        if run is not None:
+            return run, True
+        try:
+            if not runs_mod.run_dir(run_id).exists():
+                return None, True          # deleted: not our state to write
+        except Exception:
+            return None, True
+        if attempt < 2:
+            time.sleep(0.05 * (attempt + 1))
+    return None, False
+
+
+def _prune_spills(out) -> None:
+    """Bound the spill directory: newest `SPILL_KEEP` files, or 256 MB.
+
+    R3-RUN-3. Nothing ever removed these, and one is written per oversized tool
+    result — `job_output` (a 64 KB ring), a `fetch_url` page, a grep listing. A
+    long unattended run that polls `job_output` every turn left thousands of
+    files holding the full text of each, with no total bound anywhere. That is
+    the run filling the disk the fit math and the pull precheck both assume is
+    free.
+
+    Best-effort and never fatal: a spill that cannot be pruned is still a spill
+    the model can read, which is the point of writing it. Newest-first by mtime,
+    because the model is far more likely to go back for what it just produced.
+    """
+    try:
+        files = [f for f in out.iterdir() if f.is_file()]
+    except OSError:
+        return
+    if len(files) <= SPILL_KEEP:
+        try:
+            total = sum(f.stat().st_size for f in files)
+        except OSError:
+            return
+        if total <= SPILL_MAX_BYTES:
+            return
+    try:
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    total = 0
+    for i, f in enumerate(files):
+        try:
+            total += f.stat().st_size
+        except OSError:
+            continue
+        if i < SPILL_KEEP and total <= SPILL_MAX_BYTES:
+            continue
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
 def _spill_big_result(name: str, result: str, tctx: dict) -> str:
     """A huge tool result is written to DISK and replaced with a preview plus the
     exact call to read the rest. Truncating throws the data away; spilling keeps
     it and hands the model a way back to it.
 
     read_file is exempt on purpose: it is the recovery tool, so spilling it would
-    make paging trigger the very mechanism it exists to escape."""
+    make paging trigger the very mechanism it exists to escape.
+
+    R3-TOOL-7: the file goes INSIDE THE WORKSPACE, not under `rigma_home()`.
+    The instruction below tells the model to read the spill back with
+    `read_file`, but the read gate refuses any absolute path outside the
+    workspace without `allow_absolute_reads` — and the default workspace is the
+    home directory only by coincidence. So in every project workspace, and in
+    every autonomous run (which sets its own), a large result was replaced by an
+    instruction that could not succeed: the data was on disk and unreachable,
+    with nothing saying the missing piece was a grant. Writing into the
+    workspace makes the recovery path work wherever the chat is pointed, and
+    `.rigma-results` is in `IGNORE_DIRS` so Rigma's own scratch output does not
+    show up in the model's own searches."""
     import secrets as _secrets
+
+    from pathlib import Path as _Path
 
     from . import state as _st
     from . import tools as _toolkit
@@ -616,17 +711,39 @@ def _spill_big_result(name: str, result: str, tctx: dict) -> str:
         return result
     if len(result) <= SPILL_CHARS or result.startswith(_toolkit.IMAGE_SENTINEL):
         return result
-    try:
+    ws = str(tctx.get("workspace") or "").strip()
+    out = None
+    if ws:
+        try:
+            cand = _Path(ws)
+            if cand.is_dir():
+                out = cand / ".rigma-results"
+        except Exception:
+            out = None
+    if out is None:
+        # No workspace to spill into: the home fallback still works, because the
+        # default workspace IS the home directory — but it is a fallback now,
+        # not the only case that ever worked.
         out = _st.rigma_home() / "results"
+    try:
         out.mkdir(parents=True, exist_ok=True)
         path = out / f"{name}-{_secrets.token_hex(4)}.txt"
         path.write_text(result, encoding="utf-8", errors="replace")
+        _prune_spills(out)
     except Exception:
         return _clip(result, SPILL_CHARS)      # spilling failed: fall back
+    # A path RELATIVE to the workspace when we have one, so the model's read is
+    # the workspace-confined kind that always works.
+    shown = path
+    if ws:
+        try:
+            shown = path.relative_to(_Path(ws).resolve())
+        except Exception:
+            shown = path
     return (f"(this {name} result was large — {len(result)} chars — so it was "
             f"saved to disk instead of flooding your context)\n"
-            f"Full output: {path}\n"
-            f"Read more with: read_file path=\"{path}\" offset=1 limit=800\n\n"
+            f"Full output: {shown}\n"
+            f"Read more with: read_file path=\"{shown}\" offset=1 limit=800\n\n"
             f"Preview (first {SPILL_PREVIEW} chars):\n{result[:SPILL_PREVIEW]}")
 
 
@@ -2070,6 +2187,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # grants them; both are explicit opt-ins.
                     "allow_absolute_reads": bool(s.get("allow_absolute_reads")),
                     "allow_outbound_post": bool(s.get("allow_outbound_post")),
+                    # R3-TOOL-4: and writing outside the workspace. A grant the
+                    # ctx omits is not "unset" to the tool, it is false — so a
+                    # field missing here would make the UI control a no-op.
+                    "allow_absolute_writes": bool(
+                        s.get("allow_absolute_writes")),
                     "workspace": s.get("workspace") or str(_Path.home()),
                     "has_vision": has_vision,
                     "run_id": run_id, "profile": run_profile,
@@ -2142,6 +2264,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             "confirm_exec": False,
                             "allow_absolute_reads": False,
                             "allow_outbound_post": False,
+                            "allow_absolute_writes": False,
                             "method_draft_id": "", "_reads": {}}
                 q = question + (f"\n(Focus on: {path})" if path else "")
                 msgs = [{"role": "system", "content":
@@ -4457,6 +4580,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             if s0 is not None:
                 s0["mission"] = _mission_mod.spec_block(spec, raw)
                 sessions.save(s0)
+        # R3-RUN-1: the fallback spec is NOT seeded into the plan.
+        #
+        # It is one synthetic step with `verification: none` and no artifact, so
+        # seeding it would add a step that `verify_step` can never fail and that
+        # `manage_plan` would then number AROUND — every `add` would land on #2
+        # and the model's own "step #1" references would point at the wrong
+        # thing. It was the empty plan, not the missing step, that made the
+        # completion gate vacuous, and that is closed directly by the evidence
+        # gate in the completion path (see `evidence` below).
         _runs.append_progress(
             run_id,
             f"plan ready — {len(spec['steps'])} step(s)"
@@ -4629,7 +4761,23 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         prev_sig = None
         try:
             while True:
-                run = _runs.load(run_id)
+                # R3-RUN-5: `_runs.load` swallows EVERY exception and returns
+                # None, so "I could not read my own state" was indistinguishable
+                # from "the run was deleted" — and the loop simply broke. run.json
+                # then stayed `running` with active.json still pointing at it and
+                # no driver: pause and inject answered 409 "run has no driver",
+                # restart answered 409 "run is running", and a new run answered
+                # 409 "a run is already active". Only the Stop button could clear
+                # it. Retried first, because the failure is a transient lock far
+                # more often than a deletion; if it still cannot be read, the slot
+                # is RELEASED with a terminal status instead of being left claimed
+                # by a loop that no longer exists.
+                run, readable = _load_run_for_loop(_runs, run_id)
+                if not readable:
+                    if run is not None:
+                        _runs.set_status(run, "interrupted",
+                                         "run state could not be read")
+                    break
                 if run is None:
                     break
                 if run.get("paused"):
@@ -5021,36 +5169,104 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         if not ok_:
                             missing.append(f"#{st_['id']}: {why}")
                     challenges = run.get("completion_challenges", 0)
-                    if missing and challenges < MAX_COMPLETION_CHALLENGES:
+                    verified_once = bool(run.get("verified_once"))
+                    # R3-RUN-2. This used to accept the completion as soon as
+                    # `challenges` hit the cap, WHATEVER was still outstanding:
+                    # `if missing and challenges < MAX: refuse` / `if pending and
+                    # challenges < MAX: refuse` / `if not verified_once: ...` /
+                    # then straight to "done". So a run whose steps were all still
+                    # PENDING was written done with the model's unverified claim
+                    # as its summary, and the summary listed only BLOCKED steps —
+                    # the pending ones were invisible. Measured: four
+                    # `task_complete` calls on a two-step plan produced
+                    # `STATUS done | CHALLENGES 2 | PLAN [{pending}, {pending}]`
+                    # with zero files written.
+                    #
+                    # The cap exists so a mis-built plan cannot make a run
+                    # unfinishable, and that is still honoured — but it now ends
+                    # the run HONESTLY. `stalled` with the work named beats `done`
+                    # with a claim nobody checked, and the UI renders the
+                    # difference.
+                    if (missing or pending) and challenges < MAX_COMPLETION_CHALLENGES:
                         run["completion_challenges"] = challenges + 1
-                        run["_missing_artifacts"] = missing[:4]
                         run["iteration"] = run.get("iteration", 0) + 1
+                        bits = []
+                        if missing:
+                            run["_missing_artifacts"] = missing[:4]
+                            bits.append("; ".join(missing[:3]))
+                        if pending:
+                            run["_challenge_pending"] = True
+                            bits.append(f"{len(pending)} step(s) still pending — "
+                                        f"finish #{pending[0]['id']} "
+                                        f"{pending[0]['text']}")
                         _runs.append_progress(
-                            run_id, "task_complete refused — deliverables missing",
-                            "; ".join(missing[:3]), run.get("workspace", ""))
+                            run_id, "task_complete refused — work outstanding",
+                            " / ".join(bits), run.get("workspace", ""))
                         _save_run_merged(run)
                         prev_sig = None
                         continue
-                    if pending and challenges < MAX_COMPLETION_CHALLENGES:
-                        run["completion_challenges"] = challenges + 1
-                        run["_challenge_pending"] = True
-                        run["iteration"] = run.get("iteration", 0) + 1
-                        _runs.append_progress(
-                            run_id,
-                            f"task_complete refused — {len(pending)} step(s) "
-                            "still pending",
-                            f"finish #{pending[0]['id']} {pending[0]['text']}",
-                            run.get("workspace", ""))
-                        _save_run_merged(run)
-                        prev_sig = None
-                        continue
-                    if not run.get("verified_once"):
+                    if not verified_once:
+                        # One free extra turn to gather evidence, and only if the
+                        # challenge budget above did not already spend it.
                         run.update(verified_once=True, _verify_pending=True,
                                    error_streak=0, lazy_streak=0)
                         run["iteration"] = run.get("iteration", 0) + 1
                         _save_run_merged(run)
                         prev_sig = None
                         continue
+                    if missing or pending:
+                        # The budget is spent and work is still outstanding. End
+                        # honestly rather than reporting success.
+                        run["summary"] = (
+                            "STOPPED SHORT — the run claimed completion with work "
+                            "outstanding, and the challenge budget is spent.\n"
+                            + ("Missing deliverables: " + "; ".join(missing)
+                               + "\n" if missing else "")
+                            + ("Still pending: "
+                               + "; ".join(f"#{t['id']} {t['text']}"
+                                           for t in pending)
+                               + "\n" if pending else "")
+                            + "Nothing below was verified as complete.")
+                        _runs.append_progress(
+                            run_id, "task_complete rejected — work still "
+                            "outstanding after the challenge budget",
+                            run["summary"][:300], run.get("workspace", ""))
+                        _runs.set_status(run, "stalled", "deliverables missing")
+                        break
+                    # R3-RUN-1: EVIDENCE. A completion claim is only worth
+                    # accepting if the run actually DID something.
+                    #
+                    # This is the gate that closes the reported hole. When the
+                    # mission compiler falls back (`parse_spec` returns None for
+                    # any reply that is not a valid spec object — a documented,
+                    # deliberate path) the plan is EMPTY, so `pending` is empty,
+                    # and the fallback step's verification is `type: none` with no
+                    # artifact, so `missing` is empty too. Both gates were
+                    # therefore vacuous and the run reported "done — mission
+                    # complete" after two `task_complete` calls with no file
+                    # written and no verification tool ever run — the UI rendering
+                    # "finished" over nothing.
+                    #
+                    # Requiring one successful non-bookkeeping tool call is the
+                    # smallest check that is true of real work and false of the
+                    # reported case. It is deliberately measured over the WHOLE
+                    # run, not this turn: a run that did its work earlier and is
+                    # now tidying up must still be able to finish.
+                    done_any = [t for t in trace
+                                if t.get("name") not in _BOOKKEEPING_TOOLS
+                                and call_ok(t)]
+                    if not done_any and not (run.get("evidence_calls") or 0):
+                        run["summary"] = (
+                            "STOPPED SHORT — the run claimed the mission was "
+                            "complete without doing any work: no tool that "
+                            "changes anything ran, and no deliverable was "
+                            "produced. The request could not be compiled into a "
+                            "plan, so there was nothing to check against.")
+                        _runs.append_progress(
+                            run_id, "task_complete rejected — nothing was done",
+                            run["summary"][:300], run.get("workspace", ""))
+                        _runs.set_status(run, "stalled", "no work performed")
+                        break
                     summ = next((t.get("args", {}).get("summary", "")
                                  for t in trace
                                  if t.get("name") == "task_complete"), "")
@@ -5112,6 +5328,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 productive = [t for t in trace
                               if t.get("name") not in _BOOKKEEPING_TOOLS
                               and call_ok(t)]
+                # R3-RUN-1: remember that real work happened, so a completion
+                # claim made on a LATER turn is still backed by evidence from an
+                # earlier one. Without this the gate below would only see the
+                # current turn's calls and would refuse a run that had already
+                # done its work and was now tidying up.
+                if productive:
+                    run["evidence_calls"] = ((run.get("evidence_calls") or 0)
+                                             + len(productive))
                 # ADVANCE THE PLAN OURSELVES. The model rarely calls
                 # manage_plan(complete), so a finished step stays pending and the
                 # driving line repeats "Do this now: #1 ..." forever — the owner
@@ -5338,6 +5562,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except (TypeError, ValueError):
             return JSONResponse(
                 {"error": "budget_hours: must be a number"}, status_code=400)
+        # R3-RUN-4: NaN and Infinity are valid JSON numbers to Python's parser
+        # (the bare `NaN` literal), and both slipped past `<= 0`: `nan <= 0` is
+        # False, and `max(0.1, min(nan, 48.0))` is 0.1 — so a hand-rolled client
+        # asking for an unbounded budget silently got a SIX-MINUTE run. Infinity
+        # became the 48 h cap, which is at least the direction asked for but is
+        # still not a number anyone chose. `math.isfinite` is the check.
+        if not math.isfinite(budget_hours):
+            return JSONResponse(
+                {"error": "budget_hours: must be a finite number"},
+                status_code=400)
         if budget_hours <= 0:
             return JSONResponse(
                 {"error": "budget_hours: must be greater than 0"},
@@ -5732,6 +5966,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     session.get("allow_absolute_reads")),
                 "allow_outbound_post": bool(
                     session.get("allow_outbound_post")),
+                "allow_absolute_writes": bool(
+                    session.get("allow_absolute_writes")),
                 "workspace": session.get("workspace") or "",
                 "session_id": session.get("id", "")}
 
