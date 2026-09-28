@@ -66,7 +66,16 @@ export interface StreamingTurn {
   /** What the agent is working TOWARD, normalised from whichever backend
    *  reported it. A goal is not a message and not a todo: it outlives the turn
    *  that set it. Both harnesses report one and they disagree on the shape, so
-   *  `chat/goal.ts` folds them into this. */
+   *  `chat/goal.ts` folds them into this.
+   *
+   *  R4-PERSIST: it outlives the turn in the AGENT's state, but NOT in Rigma's
+   *  UI. This comment used to claim the field outlives the turn, full stop, and
+   *  that was wrong in the way that matters: `AgentState` renders inside
+   *  `LiveTurn` and the stream is dropped when the turn ends, so a goal is gone
+   *  from the screen on reload. Nothing on the server persists or returns it
+   *  either — the four SSE emitters are the only places a goal is mentioned in
+   *  `src/rigma`. So this is a real gap, and it is recorded rather than papered
+   *  over with a comment that reads as a guarantee. */
   goal: NormalGoal | null;
   /** The backend's latest whole-list todo snapshot. `todo_write` REPLACES the
    *  list every call, so this is an assignment, never a merge. */
