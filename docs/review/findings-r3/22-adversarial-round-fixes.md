@@ -578,6 +578,30 @@ against the raw stream and failed on a turn that had in fact worked. And this
 chat's last **stored** message is a tool-result summary rather than the reply, so
 the assertion belongs on the response body.
 
+### R3-CHAT-3 · a chat already over the window could never compact itself [medium]
+
+Auto-compaction fires at the **end** of a turn, using the engine's real
+`prompt_tokens`. That works while a chat grows normally, but it cannot rescue a
+chat that is **already** over the window: the turn that would have triggered the
+compaction never completes, so `prompt_tokens` is never reported, so the
+compaction never runs. The chat 400s on every message from then on, and the only
+way out is the manual Compact button — which is exactly the state a user cannot
+diagnose from the error.
+
+There is now a pre-send check in `_llm_turn`: if the assembled prompt estimates at
+or over `AUTO_COMPACT_FRACTION` of the budget and there is more than
+`AUTO_COMPACT_KEEP` of history, the fold runs **before** the request, the messages
+are rebuilt, and a stream-only notice says so.
+
+The estimate is deliberately crude (`chars / 2`, against a measured 1–4 chars per
+token on this machine) and is used only to decide whether to compact **early**. A
+false positive costs one summary; a false negative leaves the chat wedged, so the
+constant sits on the pessimistic side of the measured range. A summariser failure
+is logged and the turn proceeds — the user's message is never blocked by an aux
+call being down. The test asserts the summariser request comes **first**, by order
+rather than presence, because "a compaction happened somewhere in this turn" would
+also pass if it fired after the reply that was supposed to fail.
+
 ---
 
 ## 10. Deliberately not changed
