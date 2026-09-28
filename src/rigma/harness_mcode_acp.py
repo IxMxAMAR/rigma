@@ -661,6 +661,235 @@ def answer_elicitation(params: dict, *, accepted: bool,
     return {"action": "accept", "content": dict(content or {})}
 
 
+# --- translating ACP into Rigma's own vocabulary -----------------------------
+#
+# ACP says the same things in a different language. These maps are the whole
+# translation, and each is a place where guessing would be expensive.
+#
+# TOOL STATUS is a three-valued fact here, matching `exec`'s treatment: `pending`
+# and `in_progress` are IN FLIGHT, and in-flight is not success. Returning True for
+# them would put a tick on a call that has not finished — the same error the
+# `_ok_of` numeric enum was carefully kept away from.
+_ACP_TOOL_OK = {
+    "completed": True,
+    "failed": False,
+    "pending": None,
+    "in_progress": None,
+}
+
+# The plan-mode ids. `current_mode_update` carries an ID, not a boolean, and the UI
+# wants a boolean — so the id has to be interpreted, and interpreting it wrongly
+# would light the plan indicator for a session that is not planning.
+_ACP_PLAN_MODES = ("plan",)
+
+
+def acp_tool_ok(status: object) -> bool | None:
+    """Whether an ACP tool call succeeded, or None while it is still in flight."""
+    if status is None:
+        return None
+    return _ACP_TOOL_OK.get(str(status).strip().lower())
+
+
+def _acp_content_text(content: object) -> str:
+    """Flatten an ACP content block or block list to text.
+
+    ACP content is a UNION — a block may be text, an image, a resource link or an
+    embedded resource — so a reader that assumes a string silently drops every
+    non-text block. That is the same class of defect as the `exec` projector's
+    unnamed blocks, and it is named here rather than dropped: a block with no text
+    becomes a short description of what it was instead of nothing.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        ctype = str(content.get("type") or "")
+        if ctype == "image":
+            return "[image]"
+        if ctype == "audio":
+            return "[audio]"
+        if ctype == "resource_link":
+            return f"[link {content.get('name') or content.get('uri') or ''}]"
+        if ctype == "resource":
+            return "[embedded resource]"
+        if "text" in content:
+            return str(content.get("text") or "")
+        return f"[{ctype or 'content'}]"
+    if isinstance(content, (list, tuple)):
+        return "".join(p for p in (_acp_content_text(x) for x in content) if p)
+    return str(content)
+
+
+def map_acp_update(notification: dict) -> list:
+    """Translate one ACP notification into Rigma `TurnEvent`s.
+
+    Returns a LIST because one ACP frame can be several Rigma facts: a `tool_call`
+    whose status is already terminal carries both the call and its outcome, and
+    splitting it into two events is what lets the transcript render a chip and then
+    its result the way every other backend's do.
+
+    Unknown `sessionUpdate` variants return an EMPTY list rather than a notice. The
+    protocol's union has 13 members and will grow; a future variant must not become
+    a wrong row, and it must not become noise either — the honest place for "this
+    build does not render that yet" is the capability menu, not every turn.
+    """
+    from .harness import TurnEvent
+
+    method = str(notification.get("method") or "")
+    params = notification.get("params") or {}
+    out: list = []
+
+    # ---- mcode's extension notifications ---------------------------------
+    if method == "mcode/session/goal_update":
+        goal = params.get("goal")
+        if goal is None:
+            # The clear tombstone. `chat/goal.ts` reads `{cleared: true}` as an
+            # instruction to blank the panel, so this must not be sent as
+            # "unrecognised payload" — that would leave a cleared goal on screen.
+            out.append(TurnEvent("state", event="goal",
+                                 data={"cleared": True,
+                                       "goalId": params.get("goalId")}))
+        else:
+            out.append(TurnEvent("state", event="goal", data=goal))
+        return out
+    if method == "mcode/session/queue_update":
+        items = params.get("items")
+        out.append(TurnEvent("state", event="acp_queue",
+                             data={"items": items if isinstance(items, list) else []}))
+        return out
+    if method == "mcode/session/delegation_update":
+        snap = params.get("snapshot")
+        out.append(TurnEvent("state", event="acp_delegation",
+                             data=snap if isinstance(snap, dict) else {}))
+        return out
+    if method == "mcode/session/current_session_update":
+        out.append(TurnEvent("state", event="acp_current_session",
+                             data={"sessionId": params.get("sessionId")}))
+        return out
+    if method != "session/update":
+        return out
+
+    # ---- the standard session/update union --------------------------------
+    update = params.get("update") or {}
+    kind = str(update.get("sessionUpdate") or "")
+
+    if kind in ("agent_message_chunk", "user_message_chunk"):
+        text = _acp_content_text(update.get("content"))
+        if text:
+            out.append(TurnEvent("text", text))
+        return out
+
+    if kind == "agent_thought_chunk":
+        text = _acp_content_text(update.get("content"))
+        if text:
+            out.append(TurnEvent("thinking", text))
+        return out
+
+    if kind in ("tool_call", "tool_call_update"):
+        call_id = str(update.get("toolCallId") or "")
+        name = str(update.get("name") or update.get("title") or "tool")
+        ok = acp_tool_ok(update.get("status"))
+        args = update.get("rawInput")
+        if not isinstance(args, dict):
+            args = {}
+        text = _acp_content_text(update.get("content"))
+        raw_out = update.get("rawOutput")
+        if raw_out is not None and not text:
+            text = _acp_content_text(raw_out)
+        if ok is None:
+            # Still running. Announce the chip once there is anything to announce:
+            # an id alone is not worth drawing.
+            if kind == "tool_call" and (args or text):
+                out.append(TurnEvent("tool", name=name, args=args, data={"id": call_id}))
+            elif kind == "tool_call_update" and (args or text):
+                out.append(TurnEvent("tool", name=name, args=args, data={"id": call_id}))
+            return out
+        # A terminal status is the RESULT. If nothing was announced yet, the call
+        # goes first so the transcript reads call-then-outcome.
+        out.append(TurnEvent("tool", name=name, args=args, data={"id": call_id}))
+        out.append(TurnEvent("tool_result", text=text, name=name, ok=ok,
+                             data={"id": call_id}))
+        return out
+
+    if kind == "plan_update":
+        plan = update.get("plan") or {}
+        out.append(TurnEvent("state", event="acp_plan", data=plan))
+        return out
+    if kind == "plan_removed":
+        out.append(TurnEvent("state", event="acp_plan",
+                             data={"planId": update.get("planId"), "removed": True}))
+        return out
+
+    if kind == "current_mode_update":
+        mode = str(update.get("currentModeId") or "")
+        # Reported through the SAME name DSH uses, because it is the same fact and
+        # the store already has one arm for it. `active` is derived from the id:
+        # the UI wants a boolean and the wire carries an id.
+        out.append(TurnEvent("state", event="plan/mode",
+                             data={"active": mode in _ACP_PLAN_MODES,
+                                   "modeId": mode}))
+        return out
+
+    if kind == "config_option_update":
+        opts = update.get("configOptions")
+        out.append(TurnEvent("state", event="acp_config",
+                             data={"configOptions": opts if isinstance(opts, list) else []}))
+        return out
+
+    if kind == "available_commands_update":
+        cmds = update.get("availableCommands")
+        out.append(TurnEvent("state", event="acp_commands",
+                             data={"commands": cmds if isinstance(cmds, list) else []}))
+        return out
+
+    if kind == "session_info_update":
+        data: dict = {}
+        if update.get("title") is not None:
+            data["title"] = str(update.get("title"))
+        if update.get("updatedAt") is not None:
+            data["updatedAt"] = update.get("updatedAt")
+        if data:
+            # `session/title` is the BACKEND-side name `serve.py` already routes
+            # (`_ev == "session/title"` -> SSE `session_title`). An earlier version
+            # of this mapper emitted `session_title` — the SSE name, one hop too
+            # early — and the event was dropped silently. The cross-layer drift
+            # guard in tests/test_dsh_capabilities.py caught it, which is exactly
+            # why that guard reads the names from source instead of restating them.
+            out.append(TurnEvent("state", event="session/title", data=data))
+        return out
+
+    if kind == "usage_update":
+        # `used` and `size` are ACP's names for what Rigma's usage line already
+        # renders from `exec`. Translated rather than passed through, because the
+        # renderer keys on its own names and a second vocabulary would show nothing.
+        data = {}
+        if isinstance(update.get("used"), (int, float)):
+            data["usedTokens"] = int(update["used"])
+        if isinstance(update.get("size"), (int, float)):
+            data["contextWindowTokens"] = int(update["size"])
+        cost = update.get("cost")
+        if isinstance(cost, dict) and cost.get("amount") is not None:
+            data["cost"] = cost
+        if data:
+            out.append(TurnEvent("state", event="usage", data=data))
+        return out
+
+    if kind == "plan":
+        entries = update.get("entries")
+        if isinstance(entries, list):
+            # ACP's `plan` variant is the same fact as a todo list: a set of items
+            # with a status each. Rendered through the todos channel so it lands in
+            # the panel that already exists rather than needing a second one.
+            out.append(TurnEvent("state", event="todos", data={"todos": [
+                {"content": _acp_content_text(e.get("content")),
+                 "status": str(e.get("status") or "pending")}
+                for e in entries if isinstance(e, dict)]}))
+        return out
+
+    return out
+
+
 def probe_surface(argv: list[str], *, cwd: str = "", env: dict | None = None,
                   timeout: float = 30.0) -> dict:
     """Handshake, open a session, and report what the server offers.

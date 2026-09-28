@@ -313,6 +313,11 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         subagents={turn.subagents}
         usage={turn.usage}
         governance={turn.governance}
+        acpQueue={turn.acpQueue}
+        acpDelegation={turn.acpDelegation}
+        acpConfig={turn.acpConfig}
+        acpCommands={turn.acpCommands}
+        acpPlan={turn.acpPlan}
       />
       {/* Compaction, observation-masking and the prompt queue. All three were
           emitted by the server and dropped by the store's default arm, so a
@@ -536,6 +541,14 @@ export default function Transcript() {
             subagents={[]}
             usage={null}
             governance={EMPTY_GOVERNANCE}
+            /* R6-ACP: the ACP control plane is deliberately NOT restored here,
+               and that is a decision rather than an omission. A queue is messages
+               waiting for the NEXT turn, a delegation snapshot is live session
+               state, and configOptions are the selects in force right now — all
+               three describe a running session, and none of them survives a
+               reload in mcode either. Restoring them from a durable copy would
+               show a queue that has already drained. The durable panel is for
+               what OUTLIVES the turn, which is the goal and the todos. */
           />
         )}
         {lastError && <TurnError text={lastError} onClose={clearError} />}

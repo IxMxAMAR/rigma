@@ -20,6 +20,7 @@ means a complete one.
 """
 from __future__ import annotations
 
+import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -780,6 +781,110 @@ def test_dsh_declares_the_mcp_capability_it_now_has():
     assert "no MCP equivalent" in behind
     assert "Rigma's tools (image-by-reference, undo, sample_files, RAG, methods)" not in behind, (
         "the old blanket claim is back; RAG and undo DO reach both backends now")
+
+
+# --- R6-DRIFT: the ACP control plane, guarded across all three layers ---------
+#
+# WHY. An ACP event travels four hops: the mapper in `harness_mcode_acp` names it,
+# `serve.py` must route that name to an SSE name, and `chatStore.ts` must have an
+# arm for the SSE name. A name that stops matching at ANY hop is dropped SILENTLY:
+# no error, no log, and the panel simply never shows the queue, the delegation tree
+# or the plan review. Nothing else in the suite would notice, which is exactly why
+# this guard exists rather than a comment asking people to keep them in step.
+#
+# It is the same shape as the R4-DRIFT guard below, extended to the new names.
+
+
+# The ONE ACP event with no store arm, on purpose. `acp_current_session` says which
+# session mcode considers current, which is meaningful only to mcode: `serve.py`
+# routes it and then drops it explicitly, so that a later reader cannot mistake it
+# for an unhandled event. It is named here, in one place, rather than excluded
+# silently inside two functions.
+_ACP_NO_STORE_ARM = {"acp_current_session"}
+
+
+def _acp_event_names() -> set:
+    """Every `event=` the ACP mapper can emit, read from its source.
+
+    Read rather than restated: a constant here would be a fourth place to keep in
+    step, which is the problem this test is about.
+    """
+    import re
+
+    from rigma import harness_mcode_acp
+
+    src = pathlib.Path(harness_mcode_acp.__file__).read_text(encoding="utf-8")
+    return set(re.findall(r'event="([a-z_/]+)"', src))
+
+
+def _serve_routes() -> set:
+    import re
+
+    from rigma import serve
+
+    src = pathlib.Path(serve.__file__).read_text(encoding="utf-8")
+    # The character class includes `/` because backend-side names carry one —
+    # `plan/mode` and `session/title`. Excluding it made the guard report two
+    # routed events as unrouted, which is a false positive that would have been
+    # "fixed" by weakening the guard instead of the regex.
+    return set(re.findall(r'_ev == "([a-z_/]+)":', src))
+
+
+def _store_arms() -> set:
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "frontend-v2" / "src" / "chat"
+    src = (root / "chatStore.ts").read_text(encoding="utf-8")
+    return set(re.findall(r'case "([a-z_]+)":', src))
+
+
+def test_every_acp_event_the_mapper_emits_is_routed_by_serve():
+    """Hop 1 -> 2. An unrouted name reaches the frontend as nothing at all."""
+    emitted = _acp_event_names()
+    routed = _serve_routes()
+    missing = sorted(n for n in emitted if n not in routed)
+    assert not missing, f"the ACP mapper emits these and serve.py drops them: {missing}"
+
+
+def test_every_acp_event_serve_routes_has_a_store_arm():
+    """Hop 2 -> 3. A routed name with no arm falls through the reducer's default
+    case, so the panel stays empty while the server believes it delivered."""
+    routed = {n for n in _serve_routes() if n.startswith("acp_")} - _ACP_NO_STORE_ARM
+    arms = _store_arms()
+    missing = sorted(n for n in routed if n not in arms)
+    assert not missing, f"serve.py emits these and chatStore.ts ignores them: {missing}"
+    # And the excluded one really is excluded on purpose, not by accident.
+    assert _ACP_NO_STORE_ARM <= _serve_routes(), (
+        "acp_current_session is excluded from the store check, so serve.py must at "
+        "least route it — otherwise the exclusion hides a genuinely dropped event")
+
+
+def test_the_acp_drift_guard_would_actually_catch_a_break(monkeypatch):
+    """A guard that cannot fail is not a guard.
+
+    Checked by asserting the three sets are non-empty and that a deliberately
+    invented name is reported missing by the same expression the guard uses.
+    """
+    emitted = _acp_event_names()
+    assert emitted, "the mapper regex found no event names — the guard is broken"
+    assert {n for n in _serve_routes() if n.startswith("acp_")}, "no ACP routes found"
+    assert _store_arms(), "no store arms found"
+    fake = "acp_definitely_not_real"
+    assert fake not in _serve_routes()
+    assert fake not in _store_arms()
+
+
+def test_the_goal_update_reuses_the_existing_goal_channel():
+    """`mcode/session/goal_update` is the SAME fact DSH reports as `goal/change`, so
+    it must travel as `goal` rather than growing a second panel for one concept."""
+    from rigma import harness_mcode_acp
+
+    out = harness_mcode_acp.map_acp_update({
+        "method": "mcode/session/goal_update",
+        "params": {"sessionId": "s1", "goal": {"objective": "x", "status": "active"}},
+    })
+    assert out[0].event == "goal"
+    assert "goal" in _serve_routes()
 
 
 # --- R4-DRIFT: the four capabilities the UI draws, guarded the same way ------

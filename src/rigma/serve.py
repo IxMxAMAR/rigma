@@ -2202,6 +2202,33 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         _persist_agent_state()
                         yield _sse({"active": _active},
                                    event="plan_mode")
+                    # R6-ACP: mcode's control plane, which the `exec` transport
+                    # cannot report at all. These arrive only over the Agent Client
+                    # Protocol. Each is passed through whole and unreshaped: the
+                    # shapes are mcode's own (`mcode/session/queue_update` and
+                    # friends) and `chatStore.ts` owns them, so normalising here
+                    # would mean this side guessing at a schema it does not own.
+                    #
+                    # The `goal` case above already covers `mcode/session/goal_update`,
+                    # because the adapter emits it as `event="goal"` — the same fact
+                    # DSH reports, so it reuses the panel that already exists rather
+                    # than growing a second one.
+                    elif _ev == "acp_queue":
+                        yield _sse(_data, event="acp_queue")
+                    elif _ev == "acp_delegation":
+                        yield _sse(_data, event="acp_delegation")
+                    elif _ev == "acp_config":
+                        yield _sse(_data, event="acp_config")
+                    elif _ev == "acp_commands":
+                        yield _sse(_data, event="acp_commands")
+                    elif _ev == "acp_plan":
+                        yield _sse(_data, event="acp_plan")
+                    elif _ev == "acp_current_session":
+                        # Nothing to draw: it says which session mcode considers
+                        # current, which is only meaningful to mcode itself. Dropped
+                        # HERE rather than left to the frontend's default arm, so it
+                        # cannot be mistaken later for an unhandled event.
+                        pass
                     elif _ev.startswith("subagent"):
                         # R4-MCODE-1: mcode's payload is FLAT (taskId,
                         # subSessionId, name, status) while DSH's is a lifecycle
