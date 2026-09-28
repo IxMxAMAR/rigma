@@ -46,6 +46,11 @@ def env(tmp_path, monkeypatch):
         return _SP()
     monkeypatch.setattr("rigma.runtime.launch_server", fake_launch)
     monkeypatch.setattr(st, "kill_pid", lambda pid: None)
+    # R3-SRV-1: the real probe now reports whether the port actually came free,
+    # and this machine's own Rigma holds 11499 — so the fixture has to answer it
+    # rather than rely on the port happening to be bindable.
+    monkeypatch.setattr(server_ops, "_await_port_free",
+                        lambda *a, **k: True)
     return reg, launched
 
 
@@ -113,7 +118,8 @@ def test_ctx_relaunch_carries_dense_ngl(monkeypatch, tmp_path):
                         (launched.update(ngl=rp.flags.ngl, ctx=rp.flags.ctx)
                          or _SP()))
     monkeypatch.setattr(st, "kill_pid", lambda pid: None)
-    monkeypatch.setattr(server_ops, "_await_port_free", lambda *a, **k: None)
+    monkeypatch.setattr(server_ops, "_await_port_free",
+                        lambda *a, **k: True)   # R3-SRV-1: the port came free
     from rigma.models import CpuInfo, GpuInfo, HardwareProfile
     gpu = GpuInfo(vendor="amd", name="RX 9070 XT", vram_mb=16368, arch="rdna4",
                   slug="amd-radeon-rx-9070-xt-16g", backends=["vulkan"])

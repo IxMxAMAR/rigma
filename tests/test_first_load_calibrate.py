@@ -49,7 +49,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr("rigma.runtime.launch_server", fake_launch)
     monkeypatch.setattr("rigma.bench.launch_server", fake_launch)
     monkeypatch.setattr(st, "kill_pid", lambda pid: None)
-    monkeypatch.setattr(server_ops, "_await_port_free", lambda *a, **k: None)
+    monkeypatch.setattr(server_ops, "_await_port_free",
+                        lambda *a, **k: True)   # R3-SRV-1: the port came free
     return reg, launches
 
 

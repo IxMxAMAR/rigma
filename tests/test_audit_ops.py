@@ -65,7 +65,8 @@ def _record_launch(monkeypatch, tmp_path):
     suite drops it, which is why nothing noticed --mmproj going missing."""
     seen: dict = {}
     monkeypatch.setattr(st, "kill_pid", lambda pid: None)
-    monkeypatch.setattr(server_ops, "_await_port_free", lambda *a, **k: None)
+    monkeypatch.setattr(server_ops, "_await_port_free",
+                        lambda *a, **k: True)   # R3-SRV-1: the port came free
     monkeypatch.setattr("rigma.runtime.ensure_engine",
                         lambda backend, os_name: tmp_path / "llama-server.exe")
 
