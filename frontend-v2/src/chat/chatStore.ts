@@ -111,6 +111,78 @@ export interface StreamingTurn {
   compacted: number;
   queued: number;
   title: string;
+  /** R6-ACP: mcode's control plane, which `exec` cannot report at all.
+   *
+   *  These arrive only over the Agent Client Protocol transport. They are kept as
+   *  the backend sent them rather than reshaped, because the shapes are mcode's
+   *  own (`mcode/session/queue_update` and friends) and a second vocabulary here
+   *  would be one more place for the two to disagree. Each is `null` until the
+   *  backend reports it, so a turn that never spoke ACP renders exactly as before.
+   *
+   *  A QUEUE is prompts waiting for a later turn; a DELEGATION snapshot is the
+   *  parent/child session tree mcode spawned; configOptions are the live model and
+   *  permission selects. All three were unreachable before this round. */
+  acpQueue: AcpQueueItem[];
+  acpDelegation: AcpDelegation | null;
+  acpConfig: AcpConfigOption[];
+  acpCommands: AcpCommand[];
+  /** ACP's own plan review, when the backend offered one. Distinct from
+   *  `todos`, which is the model's checklist, and from `planMode`, which is
+   *  whether the agent is proposing rather than doing. */
+  acpPlan: Record<string, unknown> | null;
+}
+
+/** One prompt mcode is holding for a later turn.
+ *
+ *  Every field is optional because mcode's own projection assigns `itemId`,
+ *  `sessionId` and `status` unconditionally — so any of them may be absent — and
+ *  passes timestamps through unmapped. Typing them as required would be a claim
+ *  about a schema this side does not own. */
+export interface AcpQueueItem {
+  itemId?: string;
+  sessionId?: string;
+  status?: string;
+  content?: unknown;
+  failedReason?: string;
+  [k: string]: unknown;
+}
+
+/** mcode's delegation snapshot: the parent/child session tree under one root.
+ *
+ *  `members[].task` is the member's title — the field is literally named `task`,
+ *  which is worth knowing because `task` reads like an id. `status` is normalised
+ *  by mcode to exactly one of queued/running/completed/failed/stopped/unknown. */
+export interface AcpDelegation {
+  schemaVersion?: number;
+  rootSessionId?: string;
+  members?: {
+    sessionId?: string;
+    parentSessionId?: string;
+    agentName?: string;
+    task?: string;
+    status?: string;
+    backgroundTaskId?: string;
+    createdAtMs?: number;
+    updatedAtMs?: number;
+    errorMessage?: string;
+  }[];
+  [k: string]: unknown;
+}
+
+/** One of mcode's live selects — the model or the permission policy. */
+export interface AcpConfigOption {
+  id?: string;
+  name?: string;
+  currentValue?: unknown;
+  options?: { value?: unknown; name?: string }[];
+  [k: string]: unknown;
+}
+
+/** A slash command the backend says it has. */
+export interface AcpCommand {
+  name?: string;
+  description?: string;
+  [k: string]: unknown;
 }
 
 /** Marks a reply the user cut short, so the transcript never reads as if the
@@ -198,6 +270,11 @@ export const emptyTurn = (): StreamingTurn => ({
   planMode: false,
   subagents: [],
   usage: null,
+  acpQueue: [],
+  acpDelegation: null,
+  acpConfig: [],
+  acpCommands: [],
+  acpPlan: null,
   housekeeping: "",
   masked: 0,
   compacted: 0,
@@ -350,6 +427,30 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
       return { ...turn, planMode: d.active === true };
     case "subagent":
       return { ...turn, subagents: foldSubagent(turn.subagents, d) };
+    // R6-ACP: mcode's control plane over the Agent Client Protocol transport.
+    // Each replaces rather than merges, because mcode sends the WHOLE list or
+    // snapshot on every update — a merge would resurrect a deleted queue item.
+    case "acp_queue": {
+      const items = Array.isArray(d.items) ? d.items : [];
+      return { ...turn, acpQueue: items as AcpQueueItem[] };
+    }
+    case "acp_delegation": {
+      const snap = d && typeof d === "object" ? (d as AcpDelegation) : null;
+      return { ...turn, acpDelegation: snap };
+    }
+    case "acp_config": {
+      const opts = Array.isArray(d.configOptions) ? d.configOptions : [];
+      return { ...turn, acpConfig: opts as AcpConfigOption[] };
+    }
+    case "acp_commands": {
+      const cmds = Array.isArray(d.commands) ? d.commands : [];
+      return { ...turn, acpCommands: cmds as AcpCommand[] };
+    }
+    case "acp_plan": {
+      // A removal is an instruction, like the goal tombstone: the plan is gone.
+      if (d.removed === true) return { ...turn, acpPlan: null };
+      return { ...turn, acpPlan: d };
+    }
     case "usage":
       return { ...turn, usage: d };
     // Emitted by the server and previously dropped by the default arm.

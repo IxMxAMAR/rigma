@@ -23,6 +23,12 @@
 
 import type { Subagent } from "./subagents";
 import { goalTone, phaseLabel, type NormalGoal } from "./goal";
+import type {
+  AcpCommand,
+  AcpConfigOption,
+  AcpDelegation,
+  AcpQueueItem,
+} from "./chatStore";
 import {
   outcomeLabel,
   outcomeTone,
@@ -229,6 +235,202 @@ function modelName(model: unknown): string {
   return "";
 }
 
+/** R6-ACP: mcode's control plane, which only the Agent Client Protocol transport
+ *  can report.
+ *
+ *  WHY THIS IS WORTH A PANEL AT ALL. `mcode exec` is a projection of one turn, so
+ *  a queue, a delegation tree and the live model/permission selects have no `exec`
+ *  representation whatsoever. Over ACP they do — and until this round Rigma drove
+ *  only `exec`, so all three were invisible: not broken, simply unreachable, with
+ *  nothing in the menu saying so.
+ *
+ *  Each section renders only when the backend actually reported it, so a turn that
+ *  never spoke ACP draws exactly as before. Nothing here is guessed: a missing
+ *  field is omitted rather than filled with a default that would read as a fact.
+ */
+function AcpBlock({
+  queue,
+  delegation,
+  config,
+  commands,
+  plan,
+}: {
+  queue: AcpQueueItem[];
+  delegation: AcpDelegation | null;
+  config: AcpConfigOption[];
+  commands: AcpCommand[];
+  plan: Record<string, unknown> | null;
+}) {
+  const members = delegation?.members ?? [];
+  const hasPlan =
+    plan != null && (typeof plan.content === "string" || typeof plan.uri === "string");
+  if (
+    queue.length === 0 && members.length === 0 && config.length === 0 &&
+    commands.length === 0 && !hasPlan
+  ) {
+    return null;
+  }
+  return (
+    <div className="border-t border-line pt-1.5 flex flex-col gap-1.5">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em]">
+          acp
+        </span>
+        {/* The live selects. Shown because these are the two things a session can
+            be switched between mid-flight over ACP, and because an `exec` turn
+            cannot change either without ending the session. */}
+        {config.map((c) => (
+          <span key={String(c.id)} className="font-mono text-[10.5px] text-muted">
+            {String(c.id)}={configLabel(c.currentValue)}
+          </span>
+        ))}
+      </div>
+
+      {hasPlan && (
+        <div>
+          <div className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em] mb-0.5">
+            plan review
+          </div>
+          <pre className="text-[11.5px] text-primary whitespace-pre-wrap break-words max-h-48 overflow-auto">
+            {typeof plan!.content === "string"
+              ? plan!.content
+              : String(plan!.uri ?? "")}
+          </pre>
+        </div>
+      )}
+
+      {members.length > 0 && (
+        <div>
+          <div className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em] mb-0.5">
+            delegations
+          </div>
+          <ul className="flex flex-col gap-0.5">
+            {members.map((m, i) => (
+              <li key={`${String(m.sessionId)}-${String(i)}`}
+                  className="text-[12px] flex items-start gap-1.5">
+                <span className={`font-mono mt-px ${delegationTone(m.status)}`}
+                      aria-hidden="true">
+                  {delegationGlyph(m.status)}
+                </span>
+                <span className="text-primary">
+                  {/* The field is literally named `task` — it holds the member's
+                      title, not an id, which is worth a comment because `task`
+                      reads like one. */}
+                  {m.task || m.agentName || String(m.sessionId ?? "")}
+                </span>
+                {m.status && (
+                  <span className="font-mono text-[10.5px] text-muted">{m.status}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {queue.length > 0 && (
+        <div>
+          <div className="font-mono text-[10.5px] text-muted uppercase tracking-[0.08em] mb-0.5">
+            queued ({queue.length})
+          </div>
+          <ul className="flex flex-col gap-0.5">
+            {queue.map((q, i) => (
+              <li key={`${String(q.itemId)}-${String(i)}`} className="text-[12px] flex gap-1.5">
+                <span className="font-mono text-[10.5px] text-muted">
+                  {String(q.status ?? "queued")}
+                </span>
+                <span className="text-primary">{queueText(q.content)}</span>
+                {q.failedReason && (
+                  <span className="text-red">{String(q.failedReason)}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {commands.length > 0 && (
+        <div className="font-mono text-[10.5px] text-muted">
+          {commands.length} command{commands.length === 1 ? "" : "s"} available:{" "}
+          {commands.map((c) => `/${String(c.name ?? "")}`).join(" ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A configOption's current value, which may be a bare scalar or an object.
+ *
+ *  mcode's `model` option is an opaque id like
+ *  `m:custom_provider%3Arigma:local-test:v:thinking`, so it is shown as-is rather
+ *  than prettified — decoding it here would be this side inventing a schema. */
+function configLabel(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string" || typeof v === "number") return String(v);
+  if (typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    const inner = o.value ?? o.id ?? o.name;
+    if (inner != null) return String(inner);
+  }
+  return JSON.stringify(v);
+}
+
+/** A queued message's text. mcode passes `content` through unmapped, so it may be
+ *  a string, a block list, or absent — and a `[object Object]` in the panel would
+ *  be worse than saying nothing. */
+function queueText(content: unknown): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) =>
+        b && typeof b === "object" && "text" in (b as Record<string, unknown>)
+          ? String((b as Record<string, unknown>).text ?? "")
+          : "",
+      )
+      .join("");
+  }
+  if (typeof content === "object") {
+    const o = content as Record<string, unknown>;
+    if (typeof o.text === "string") return o.text;
+    if (typeof o.content === "string") return o.content;
+  }
+  return "";
+}
+
+function delegationTone(status?: string): string {
+  switch ((status ?? "").toLowerCase()) {
+    case "completed":
+      return "text-moss";
+    case "failed":
+      return "text-red";
+    case "stopped":
+      return "text-muted";
+    case "running":
+      return "text-amber";
+    default:
+      return "text-muted";
+  }
+}
+
+function delegationGlyph(status?: string): string {
+  switch ((status ?? "").toLowerCase()) {
+    case "completed":
+      return "✓";
+    case "failed":
+      return "✕";
+    case "stopped":
+      return "−";
+    case "running":
+      return "▸";
+    case "queued":
+      return "·";
+    default:
+      // mcode normalises an unrecognised status to the literal string "unknown",
+      // so this arm is reached on purpose rather than by accident.
+      return "?";
+  }
+}
+
 export default function AgentState({
   goal,
   todos,
@@ -236,6 +438,11 @@ export default function AgentState({
   subagents,
   usage,
   governance,
+  acpQueue = [],
+  acpDelegation = null,
+  acpConfig = [],
+  acpCommands = [],
+  acpPlan = null,
 }: {
   goal: NormalGoal | null;
   todos: { content: string; status: string }[];
@@ -246,6 +453,13 @@ export default function AgentState({
    *  Required-and-passed-null would work too, but making it optional says why. */
   usage?: Record<string, unknown> | null;
   governance: Governance;
+  /** R6-ACP: optional and defaulted, so every existing call site — including the
+   *  durable panel, which has none of this — keeps compiling and drawing. */
+  acpQueue?: AcpQueueItem[];
+  acpDelegation?: AcpDelegation | null;
+  acpConfig?: AcpConfigOption[];
+  acpCommands?: AcpCommand[];
+  acpPlan?: Record<string, unknown> | null;
 }) {
   // Already normalised by the store, so this draws ONE shape whatever the
   // backend was: DSH's nested `goal/change` envelope and mcode's flat goal
@@ -254,9 +468,12 @@ export default function AgentState({
   const hasUsage = usage != null && Object.keys(usage).length > 0;
   const hasGov =
     governance.approvals.length > 0 || !!governance.sandbox || !!governance.preset;
+  const hasAcp =
+    acpQueue.length > 0 || (acpDelegation?.members?.length ?? 0) > 0 ||
+    acpConfig.length > 0 || acpCommands.length > 0 || acpPlan != null;
   if (
     !hasGoal && todos.length === 0 && !planMode && subagents.length === 0 &&
-    !hasUsage && !hasGov
+    !hasUsage && !hasGov && !hasAcp
   ) {
     return null;
   }
@@ -351,6 +568,12 @@ export default function AgentState({
           )}
         </div>
       )}
+
+      {/* R6-ACP: the control plane, above governance because it is about the
+          WORK (what is queued, what was delegated, which plan) rather than about
+          the connection's permissions. */}
+      <AcpBlock queue={acpQueue} delegation={acpDelegation} config={acpConfig}
+                commands={acpCommands} plan={acpPlan} />
 
       {/* Last, and separated by a rule: this is about the CONNECTION's
           permissions rather than about the work, and putting it above the goal
