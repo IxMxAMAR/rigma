@@ -49,6 +49,11 @@ IGNORE_DIRS = frozenset({
     "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     ".tox", "dist", "build", ".next", ".cache", ".idea", ".vscode",
     "site-packages", ".gradle", "target", "vendor",
+    # R3-TOOL-7: where an oversized tool result is spilled when a workspace is
+    # set. It is Rigma's own scratch output, not the owner's work — it must not
+    # appear in find_files/grep results, must not be watched for undo, and must
+    # not be packaged into a folder upload.
+    ".rigma-results",
 })
 
 # Per-file cap. A file bigger than this is not something an agent edited in a way

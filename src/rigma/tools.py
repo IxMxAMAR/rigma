@@ -728,6 +728,35 @@ def run_tool(name: str, args: dict, ctx: dict | None = None) -> str:
             return f"error: mcp tools are disabled for this run ({prof})"
         if not ctx.get("allow_code"):
             return "error: code execution is not enabled for this chat"
+        # R3-TOOL-2: an MCP server is a PROCESS this machine runs on the model's
+        # behalf, so reaching one has to cost at least what `run_shell` costs.
+        #
+        # This branch checked only `allow_code`, which the product turns ON by
+        # default while leaving `confirm_exec` OFF — so a configured MCP shell or
+        # filesystem server was STRICTLY EASIER to reach than `run_shell`, the
+        # weaker capability, and `exec_decision` (the single decision point the
+        # other three exec tools share) was never consulted. A `no-delete` run
+        # was not honoured either, because `_text_refusal` only ever saw the
+        # arguments of run_shell/run_python/start_job.
+        #
+        # `_exec_confirmed` rather than a raw `ctx["confirm_exec"]` check: a
+        # library embedder that never sets the field keeps the old
+        # `allow_code`-is-the-grant behaviour, while every ctx the PRODUCT builds
+        # sets it explicitly, so the product default is the safe one.
+        if not _exec_confirmed(ctx):
+            return ("error: mcp tools spawn a process on this machine, which "
+                    "needs explicit confirmation for this chat. Enable 'confirm "
+                    "execution' on the session to allow it")
+        # The destructive-text check reads only text, and it is the same rule
+        # set the other exec tools get. The arguments are the only text an MCP
+        # call has, so they are what it is applied to; a tool whose arguments are
+        # not a command simply never matches.
+        try:
+            why = _text_refusal(json.dumps(args or {}, default=str), None, prof)
+        except Exception:
+            why = ""
+        if why:
+            return f"error: {why}"
         try:
             from . import mcp_client
             return _defuse_control_bytes(
@@ -1534,13 +1563,22 @@ def _bad_write_char(rel: str):
             or _reserved_device_name(rel))
 
 
-def _glob_under(root: Path, rel: str) -> list[Path]:
+def _glob_under(root: Path, rel: str, ctx: dict | None = None) -> list[Path]:
     """Resolve a glob pattern under `root`, but only files, and only inside
     the workspace (a `..` in the pattern can't escape). Returns real paths.
 
     AUDIT R3-1: the containment test is on the RESOLVED path, because `glob`
     hands back names built from `root` — a hit reached through a junction is
-    lexically inside the workspace and physically outside it."""
+    lexically inside the workspace and physically outside it.
+
+    R3-TOOL-3: the credential denylist is applied to the RESOLVED HITS when a
+    `ctx` is supplied. It used to be applied only to the literal name the model
+    typed, so `read_file(".env")` refused while `read_file(".en*")` returned the
+    same file's contents — the pattern never existed on disk, the literal check
+    passed it, and `_glob_under` tested containment and nothing else. `.env`,
+    `*.pem` and `*.key` in the workspace root are the common case, not a corner
+    case. Filtering here also covers `_fuzzy_file`, which shares this path.
+    """
     try:
         rroot = root.resolve()
         hits = [p for p in root.glob(rel)
@@ -1548,6 +1586,8 @@ def _glob_under(root: Path, rel: str) -> list[Path]:
                 and p.resolve().is_relative_to(rroot)]
     except (ValueError, OSError):
         return []
+    if ctx is not None:
+        hits = [p for p in hits if not _credential_path_reason(p, ctx)]
     return sorted(hits)
 
 
@@ -1743,15 +1783,40 @@ def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
     return ""
 
 
+def _absolute_writes_allowed(ctx: dict) -> bool:
+    """The explicit grant that allows a write OUTSIDE the workspace.
+
+    R3-TOOL-4. Deliberately separate from `_absolute_reads_allowed`: reading a
+    file and replacing one are different risks, and a user who granted the first
+    did not grant the second."""
+    if ctx.get("profile") == "confined":
+        return False
+    return bool(ctx.get("allow_absolute_writes"))
+
+
 def _write_path(ctx, raw: str) -> Path:
     """Resolve a WRITE target (a move/copy destination).
 
-    AUDIT 13-2 confines READS, but a destination was never a read: the pre-fix
-    behaviour (an absolute destination allowed outside the `confined` profile)
-    is preserved, with the credential denylist still applied so a move cannot
-    plant a file in `.ssh`."""
+    AUDIT 13-2 confined READS; a destination is a write, so it kept its old
+    behaviour — an absolute destination anywhere on disk, needing only the
+    default-on `allow_code`.
+
+    R3-TOOL-4: that made the WEAKER capability the more confined one.
+    `write_file` and `edit_file` have always been pinned to the workspace by
+    `_ws_path`, while `move_files`/`copy_files` — which place a file just as
+    surely — could write to `Startup`, `System32\\Tasks` or a browser extension
+    directory. A planted `.bat`/`.lnk` there is persistence, not data loss.
+    An absolute destination now needs the same kind of explicit grant that
+    absolute reads do, and `confined` refuses it outright.
+    """
     raw = str(raw or "").strip()
     if Path(raw).is_absolute() and ctx.get("profile") != "confined":
+        if not _absolute_writes_allowed(ctx):
+            raise ValueError(
+                f"'{raw}' is outside the workspace and writing there is "
+                f"disabled for this chat. Use a path relative to the "
+                f"workspace, or enable 'write outside the workspace' on the "
+                f"session")
         p = _long_path(Path(raw).resolve())
     else:
         p = _ws_path(ctx, raw or ".")
@@ -1908,6 +1973,11 @@ _GREP_MAX_FILES = 2000
 _GREP_MAX_BYTES = 256 << 20          # 256 MB of file content per grep call
 _GREP_MAX_VISITED = 20000            # directory entries examined per grep call
 _WALK_MAX_ENTRIES = 5000             # directory entries examined by find_files
+# R3-TOOL-6: `edit_file` reads the file once to edit it and again for the undo
+# snapshot, so it needs a ceiling at least as tight as `read_file`'s 8 MB. Kept
+# as its own name rather than sharing that literal, because the two are
+# different budgets that happen to agree today.
+_EDIT_MAX_BYTES = 8_000_000
 
 
 def _glob_re(pat: str):
@@ -2025,7 +2095,8 @@ def _safe_class_body(inner: str) -> str:
     return ("^" if negated else "") + "".join(out)
 
 
-def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict):
+def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict,
+                          ctx: dict | None = None):
     """Files under `root` whose root-relative posix path matches `rx_glob`.
 
     Walks with `os.walk` so `IGNORE_DIRS` is pruned BEFORE descending, and
@@ -2033,6 +2104,9 @@ def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict):
     bounds the WALK, not just the hits. `state["max_visited"]` stops it and
     sets `state["truncated"]`. A symlinked file is the one way a name under the
     root can resolve outside it, so only symlinks pay a `resolve()`.
+
+    `ctx` is optional so a caller that has none still walks; when it is given,
+    the credential denylist is applied to every candidate (R3-TOOL-1).
     """
     from .watch import IGNORE_DIRS, is_reparse_dir
     max_visited = state.get("max_visited")
@@ -2063,6 +2137,23 @@ def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict):
                         continue
                 except OSError:
                     continue
+            # R3-TOOL-1: the credential denylist belongs HERE, in the one walker
+            # `grep` and `find_files` share, not at each tool's entry point.
+            #
+            # It was applied by read_file, list_directory, sample_files and
+            # view_image — every tool that takes a NAME the model chose. Neither
+            # of the two tools that take a PATTERN applied it, so
+            # `grep {"pattern": "API_KEY", "glob": "**/.env"}` returned the
+            # contents of `.env` while `read_file(".env")` refused it. The
+            # default workspace is the home directory, so `.ssh/id_rsa` and
+            # `.aws/credentials` were one grep away, and the content could then
+            # leave through `fetch_url` (an auto-run GET, which the
+            # outbound-POST grant does not gate).
+            #
+            # Filtering in the walker rather than in `_grep` also covers
+            # `find_files`, and any walker-based tool added later.
+            if _credential_path_reason(p, ctx):
+                continue
             yield p
 
 
@@ -2080,7 +2171,7 @@ def _find_files(args, ctx):
     if isinstance(rx_glob, re.error):        # R3-16: a typo is not a 500
         return f"error: bad pattern {pat!r}: {rx_glob}"
     state = {"visited": 0, "truncated": False, "max_visited": _WALK_MAX_ENTRIES}
-    all_hits = list(_iter_workspace_files(root, rx_glob, state))
+    all_hits = list(_iter_workspace_files(root, rx_glob, state, ctx))
     hits = [p.relative_to(root).as_posix() for p in sorted(all_hits)[:200]]
     notes = []
     if len(all_hits) > 200:
@@ -2125,7 +2216,7 @@ def _grep(args, ctx):
     bytes_read = 0
     state = {"visited": 0, "truncated": False,
              "max_visited": _GREP_MAX_VISITED}
-    for p in _iter_workspace_files(root, rx_glob, state):
+    for p in _iter_workspace_files(root, rx_glob, state, ctx):
         if files_read >= _GREP_MAX_FILES or bytes_read >= _GREP_MAX_BYTES:
             state["truncated"] = True
             break
@@ -2623,6 +2714,23 @@ def _edit_file_locked(args, ctx):
     p = _ws_path(ctx, str(args.get("path", "")))
     if not p.is_file():
         return f"error: no such file: {args.get('path')}"
+    # R3-TOOL-6: the same ceiling `read_file` enforces, for the same reason.
+    #
+    # `_edit_file_locked` reads the whole file, and `_snapshot_before_write`
+    # reads it AGAIN for the undo diff — so a 10 GB log or a stray .gguf in the
+    # workspace was pulled into the process that holds the chat sessions and the
+    # model's RAM budget, three times over. `MemoryError` is caught by
+    # `run_tool`, but only after the allocation has been attempted. `read_file`
+    # refuses this exact file at 8 MB, so the sibling tool the model would use
+    # for it was safe while this one was not.
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        return f"error: cannot stat {p.name}: {e}"
+    if size > _EDIT_MAX_BYTES:
+        return (f"error: file too large to edit ({size // 1000} KB, limit "
+                f"{_EDIT_MAX_BYTES // 1000} KB) — edit it in place with "
+                f"run_shell, or split it first")
     # Read and write BYTES, so line endings are ours to decide rather than
     # something the text layer does behind our back. Two bugs live here:
     # write_text() translates every "\n" to os.linesep, so editing one line of
@@ -2799,7 +2907,7 @@ def _read_file(args, ctx):
         # them; none -> point at the tool that's actually for patterns.
         if any(ch in raw for ch in "*?[") and ctx.get("workspace"):
             root = Path(ctx["workspace"]).resolve()
-            hits = _glob_under(root, raw)
+            hits = _glob_under(root, raw, ctx)
             if len(hits) == 1:
                 p = hits[0]
                 _read_note = (f" (your pattern '{raw}' matched one file: "
@@ -3353,6 +3461,14 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
     ps = str(ps).strip().strip('"').strip("'")
     if not ps:
         return None, "empty path", ""
+    # R3-TOOL-5: refuse a control byte before any path work. The refusal is
+    # defused like every other message, and it has to come FIRST: `Path.resolve`
+    # on a NUL raises `ValueError: embedded null character in path`, and this
+    # function's own error strings embed the path the model gave — so the
+    # workspace gate below was reached with a NUL still in hand and the message
+    # the model got was the OS's, not ours.
+    if any(ord(c) < 32 for c in ps):
+        return None, _defuse_control_bytes(f"no such file: {ps}"), ""
     p = Path(ps)
     if not p.is_absolute() or ctx.get("profile") == "confined":
         # AUDIT F04-6: the profile was consulted by _read_path but not here, so
@@ -3363,6 +3479,30 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
             p = _ws_path(ctx, ps)
         except ValueError as e:
             return None, str(e), ""
+    elif (str(ctx.get("workspace") or "").strip()
+          and not _inside_workspace(ctx, p.resolve())
+          and not _absolute_reads_allowed(ctx)):
+        # R3-TOOL-5: an absolute path in a NON-confined profile skipped both
+        # `_ws_path` and the reads grant, so this was the one read path that
+        # ignored `allow_absolute_reads` — while `view_images(folder=...)`,
+        # `list_directory` and `read_file` all enforced it. A prompt-injected
+        # model could pull any image off the disk (≤20 MB, base64'd into the
+        # conversation, and from there out through `fetch_url`) with no grant
+        # and no confirmation. Images living outside the workspace is a real
+        # need, which is exactly why the grant exists; it is just no longer
+        # automatic.
+        #
+        # `_inside_workspace` is the same predicate `_read_path` uses, and the
+        # leading workspace test matters: with NO workspace set there is no
+        # boundary to escape, so there is nothing for the grant to protect.
+        # Refusing there would not confine anything — it would only break a
+        # library embedder that deliberately runs without a workspace. Every ctx
+        # the PRODUCT builds sets one (`serve.py` defaults it to the home
+        # directory), so the product case is always gated.
+        return None, ("reading an absolute path outside the workspace is "
+                      "disabled for this chat — enable 'read outside the "
+                      "workspace' on the session, or pass a path relative to "
+                      "the workspace"), ""
     note = ""
     if not p.is_file():
         # A mangled filename is the model's memory failing, not a missing file
