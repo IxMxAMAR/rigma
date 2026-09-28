@@ -10,6 +10,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from rigma import cli, orphan
@@ -247,3 +248,175 @@ def test_stop_refuses_to_guess_between_two_engines(home, monkeypatch):
     result = CliRunner().invoke(cli.app, ["stop"])
     assert result.exit_code == 1
     assert "stopping none of them" in result.output
+
+
+# --------------------------------------------------------------------------
+# R3-CTX-1 — the record the recovery writes must be one the registry resolves
+
+
+def _a_model_whose_stem_differs_from_its_slug():
+    """(slug, gguf) for a model where the file stem is NOT the registry slug.
+
+    The bug only shows up on those, and which models they are depends on the
+    registry in play — so this finds one rather than naming the owner's.
+    """
+    from pathlib import Path
+
+    from rigma import registry as R
+
+    for slug, spec in R.Registry.load().models.items():
+        for g in (spec.ggufs or []):
+            if Path(g.file).stem != slug:
+                return slug, g
+    return None
+
+
+def test_the_record_names_the_registry_slug_not_the_file_stem():
+    """The difference is not cosmetic and it is not small.
+
+    `server_ops._free_current` looks the slug up to credit the outgoing engine's
+    VRAM back to the budget, and does NOTHING when the lookup fails — so a file
+    stem written where a slug belongs makes the card look full of someone else's
+    memory, and the next context change is refused while the engine is running
+    fine. Measured on the owner's machine: usable VRAM 6,254 MiB (refused at
+    8,192) versus 13,726 MiB (accepted at 65,536), differing only in this string.
+    """
+    found = _a_model_whose_stem_differs_from_its_slug()
+    if found is None:
+        pytest.skip("this registry has no model whose stem differs from its slug")
+    slug, g = found
+    rec = orphan.record_from_props(
+        {"model_path": "C:/models/" + g.file,
+         "default_generation_settings": {"n_ctx": 8192}}, 1, "", 11500)
+    assert rec["model_slug"] == slug, (
+        "the record must carry the registry slug; a stem makes _free_current a "
+        "no-op and the next ctx change is refused")
+    assert rec["quant"] == g.quant
+
+def test_a_file_outside_the_registry_falls_back_to_the_stem(monkeypatch):
+    """A custom install is not in the registry, and a label is better than
+    nothing — but it must not be mistaken for an identity."""
+    monkeypatch.setattr(orphan, "engine_props", lambda port, timeout=5.0: {
+        "model_path": r"C:\models\My-Custom-Model-Q4_K_M.gguf",
+        "default_generation_settings": {"n_ctx": 4096}})
+    rec = orphan.record_from_props(
+        {"model_path": r"C:\models\My-Custom-Model-Q4_K_M.gguf",
+         "default_generation_settings": {"n_ctx": 4096}}, 1, "", 11500)
+    assert rec["model_slug"] == "My-Custom-Model-Q4_K_M"
+    assert rec["gguf"] == "My-Custom-Model-Q4_K_M.gguf"
+
+
+def test_free_current_asks_the_engine_when_the_record_cannot_say(monkeypatch):
+    """`_free_current` credited nothing when the record was empty, which is
+    exactly the state a hard kill leaves behind. It must fall back to what the
+    engine reports, and it must do so BEFORE the `not state` early return — the
+    first version of the fallback sat after it and credited nothing. The repro
+    caught that, not the reasoning.
+
+    Built on a SYNTHETIC registry so it does not depend on which models this
+    machine happens to have, and on the REAL `HardwareProfile` because
+    `_free_current` calls `profile.model_copy(...)`. A `SimpleNamespace` stub
+    failed on exactly that, which is the same trap as the port mocks earlier in
+    this file: a stub that does not behave like the thing it replaces cannot
+    fail on the bug it is meant to catch.
+    """
+    from types import SimpleNamespace
+
+    from rigma import probe, registry as R, server_ops
+    from rigma.resolve import _budgets
+
+    gguf = SimpleNamespace(file="Tiny-Model-Q4_K_M.gguf", bytes=4 * 2**30,
+                           quant="Q4_K_M")
+    spec = SimpleNamespace(ggufs=[gguf], mmproj=None)
+    reg = SimpleNamespace(models={"tiny-model": spec})
+    base = probe.probe_hardware(R.Registry.load().gpus)
+    prof = base.model_copy(update={"ram_free_mb": 4000,
+                                   "vram_used_mb": 9900.0})
+
+    monkeypatch.setattr(orphan, "running_gguf_file",
+                        lambda ui_port: "Tiny-Model-Q4_K_M.gguf")
+    credited = server_ops._free_current(prof, {"public_port": 11500}, reg)
+    assert credited.ram_free_mb > prof.ram_free_mb, (
+        "the outgoing engine's RAM was not credited from an empty record")
+    assert credited.vram_used_mb < prof.vram_used_mb, (
+        "the outgoing engine's VRAM was not credited back to the budget")
+    assert _budgets(credited)[0] > _budgets(prof)[0]
+
+    # and with no engine answering, nothing is credited
+    monkeypatch.setattr(orphan, "running_gguf_file", lambda ui_port: "")
+    plain = server_ops._free_current(prof, {"public_port": 11500}, reg)
+    assert plain.vram_used_mb == prof.vram_used_mb
+
+def test_adopt_writes_a_record_the_registry_can_resolve(home, monkeypatch):
+    """The end the user sees: `rigma up` no longer says "no model loaded" while
+    a model is answering /health."""
+    from rigma import state as st
+
+    monkeypatch.setattr(orphan, "find_engines",
+                        lambda port: [(4242, PROPS)])
+    rec = orphan.adopt(11500)
+    assert rec is not None
+    s = st.read_state()
+    assert s["model"] == rec["model_slug"]
+    assert s["unloaded"] is False, "an adopted engine is loaded, not unloaded"
+    assert s["engine_pid"] == 4242
+    assert s["gguf"] == "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+    assert s["kv_fp"] == ""
+
+
+def test_adopt_declines_when_there_is_nothing_or_too_much(home, monkeypatch):
+    from rigma import state as st
+
+    monkeypatch.setattr(orphan, "find_engines", lambda port: [])
+    assert orphan.adopt(11500) is None
+    monkeypatch.setattr(orphan, "find_engines",
+                        lambda port: [(1, PROPS), (2, PROPS)])
+    assert orphan.adopt(11500) is None, "two engines is not something to adopt"
+    assert st.read_state() is None, "declining must not write a record"
+
+
+def test_reattach_with_nothing_to_adopt_is_an_error(home, monkeypatch, capsys):
+    """Asking to reattach to nothing must fail, not start a UI with no model.
+
+    That quiet start is what produces "no model loaded" and then a harness turn
+    dying with the adapter's own "at least one --model <id> is required" — a
+    failure two screens away from its cause.
+    """
+    monkeypatch.setattr(cli, "_port_holder", lambda p: "")
+    monkeypatch.setattr(cli, "_listening_pid", lambda p: None)
+    monkeypatch.setattr(orphan, "find_engines", lambda port: [])
+    result = CliRunner().invoke(cli.app, ["up", "--reattach", "--port", "11700"])
+    assert result.exit_code == 1, result.output
+    assert "nothing to reattach to" in result.output, result.output
+
+
+def test_an_empty_model_is_refused_before_the_harness_is_spawned(home, monkeypatch):
+    """An external harness is handed `model=str(state.get("model") or "")`. With
+    no model loaded that reaches mcode as "at least one --model <id> is required"
+    and DSH as a runner exiting 1 with an empty stderr tail. Both are true;
+    neither names the cause. The turn must say the cause instead of spawning.
+    """
+    from rigma import serve as _serve
+
+    spawned = []
+
+    class _Adapter:
+        name = "dsh"
+        label = "stub"
+
+        def drive_turn(self, **kw):
+            spawned.append(kw)
+            return iter(())
+
+    monkeypatch.setattr(_serve._harness, "resolve",
+                        lambda name, **kw: _Adapter())
+    monkeypatch.setattr(_serve._harness, "endpoint_for",
+                        lambda port: "http://127.0.0.1:1/v1")
+    app = _serve.build_app(upstream_port=1)
+    c = TestClient(app)
+    sid = c.post("/api/sessions", json={}).json()["id"]
+    c.post(f"/api/sessions/{sid}", json={"harness": "dsh", "use_tools": True})
+    r = c.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    assert r.status_code == 200, r.text
+    assert "no model is loaded" in r.text, r.text[:400]
+    assert not spawned, "the adapter was spawned with no model to run against"
