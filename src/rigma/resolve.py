@@ -770,11 +770,12 @@ def _configured(spec: ModelSpec, *, kv: str = "",
         return spec
     s = spec.model_copy(deep=True)
     if kv:
-        # ONE type: K and V always match (ComboFlags._symmetric_kv — llama.cpp's
-        # fused flash-attention needs ctk == ctv). A "k,v" pair used to be
-        # parsed here and then silently normalised downstream, so an asymmetric
-        # request looked honoured and wasn't. The API rejects that form now;
-        # this only has to not crash on one.
+        # ONE type: K and V always match (ComboFlags._symmetric_kv). Vulkan at
+        # 87268f77 would fuse a mixed pair, but the CUDA/HIP path would not, and
+        # Rigma runs both — see the comment on that validator. A "k,v" pair used
+        # to be parsed here and then silently normalised downstream, so an
+        # asymmetric request looked honoured and wasn't. The API rejects that
+        # form now; this only has to not crash on one.
         k = kv.split(",", 1)[0].strip()
         if k:
             s.cache_type_policy.k = s.cache_type_policy.v = k

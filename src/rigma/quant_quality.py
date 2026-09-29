@@ -134,20 +134,33 @@ def quality_of(quant: str) -> dict | None:
 #     you wanted the long context.
 #
 # ONE figure per cache type, not a K/V pair. Rigma always runs K and V at the
-# same precision — ComboFlags._symmetric_kv enforces it, because llama.cpp's
-# fused flash-attention kernel only fires when ctk == ctv and a mismatch
-# silently drops to a much slower path (RDNA4, 2026-07-17). An earlier version
-# of this module carried a 2:1 K-over-V weighting for asymmetric pairs; that
-# arithmetic could never run, and the tooltip describing it was telling the
-# user about a trade the program does not offer.
+# same precision (ComboFlags._symmetric_kv). The reason is NOT "fused
+# flash-attention needs ctk == ctv" — that is true on the CUDA/HIP path, where
+# fattn.cu without GGML_CUDA_FA_ALL_QUANTS selects no kernel for K->type !=
+# V->type (and the shipped PrismML HIP build does not define that macro, nor
+# accept q4_1/q5_0/q5_1 even symmetric), but FALSE on Vulkan at 87268f77, where
+# supports_op checks K and V independently and accepts any mixed pair except a
+# BF16/non-BF16 mix. Rigma runs BOTH backends, and `-fa on` with a pair the
+# backend rejects falls back to CPU attention SILENTLY, so symmetric is the safe
+# common denominator rather than a universal requirement.
+#
+# Figures are llama.cpp PR 7412's SYMMETRIC K=V measurements, not its K-only
+# column — an earlier version of this table mixed the two and understated q4_1 /
+# q4_0 by ~2x. PR 7412 predates KV rotation, which the fork at 87268f77 enables
+# BY DEFAULT for a quantized cache with head_dim % 64 == 0 (llama-kv-cache.cpp;
+# no CLI flag, only the env LLAMA_ATTN_ROT_DISABLE=1, which Rigma never sets).
+# Rotation measured q4_0/q4_0 at +0.19% on llama-2-7B (vs +2.42% off) and
+# +1.22% on gemma3-4b, so these are an UPPER BOUND on the loss for a quantized
+# cache on this build.
+# https://github.com/ggml-org/llama.cpp/pull/7412#issuecomment-2120427347
 _KV_PPL = {
     "f16":  0.00,
     "bf16": 0.00,
-    "q8_0": 0.06,
-    "q5_1": 0.35,
-    "q5_0": 0.60,
-    "q4_1": 0.90,
-    "q4_0": 1.80,
+    "q8_0": 0.04,
+    "q5_1": 0.43,
+    "q5_0": 0.75,
+    "q4_1": 1.77,
+    "q4_0": 3.31,
 }
 
 

@@ -4426,14 +4426,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     def _bad_kv(kv: str):
         """The explorer takes ONE cache type. K and V are always the same —
-        ComboFlags._symmetric_kv enforces it because llama.cpp's fused
-        flash-attention kernel only fires when ctk == ctv. Accepting "q8_0,q4_0"
-        and normalising it silently would show a verdict for a configuration
-        rigma will not run."""
+        ComboFlags._symmetric_kv enforces it. Not because fused flash-attention
+        universally needs ctk == ctv (Vulkan at 87268f77 accepts a mixed pair;
+        the CUDA/HIP path does not, and Rigma runs both), but because `-fa on`
+        degrades to CPU attention silently when a pair is unsupported. Accepting
+        "q8_0,q4_0" and normalising it silently would show a verdict for a
+        configuration rigma will not run."""
         if "," in kv:
-            return ("K and V always use the same cache type here — llama.cpp's "
-                    "fused flash-attention only fires when they match. Pass one "
-                    "of: " + ", ".join(server_ops_kv_types()))
+            return ("K and V always use the same cache type here — a mixed pair "
+                    "is not fused on every backend Rigma runs. Pass one of: "
+                    + ", ".join(server_ops_kv_types()))
         if kv and kv not in server_ops_kv_types():
             return "kv must be one of " + ", ".join(server_ops_kv_types())
         return None
