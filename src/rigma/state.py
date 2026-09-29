@@ -33,6 +33,10 @@ _FIELD_DEFAULTS = {
     # written before the field existed still merges to a usable value instead of
     # raising KeyError out of `update_state` — see `_write_record`.
     "engine": None,
+    # R3-ENG-3: which BINARY served the launch, as a dict, or None for "not
+    # recorded". Separate from `engine` above: that one is the runtime name and
+    # is compared for equality by calibration, so it must stay a string.
+    "engine_binary": None,
 }
 
 _PID_STAMP = {"engine_pid": "engine_started_at", "ui_pid": "ui_started_at"}
@@ -112,6 +116,14 @@ def _write_record(rec: dict) -> dict:
         # so a caller who does not set it gets the documented default rather than
         # a crash. A record that predates a field must degrade, not explode.
         "engine": rec.get("engine"),
+        # R3-ENG-3: WHICH BINARY served this launch — {"kind", "name", "path", "source"}.
+        # Distinct from `engine` above, which is the runtime (llamacpp/vllm). Needed
+        # because a registered third-party build can now be chosen over the pin, and
+        # "which engine is actually running" was previously unanswerable from state: the
+        # owner found out only by reading the process table. `.get` for the same
+        # back-compat reason as `engine` — a record written before this field exists must
+        # degrade rather than raise.
+        "engine_binary": rec.get("engine_binary"),
     }
     atomic_write_json(state_path(), out)
     return out
@@ -122,7 +134,8 @@ def write_state(model_slug: str, quant: str, public_port: int,
                 use_case: str = "general", ctx: int = 0,
                 unloaded: bool = False, kv_cache: str = "",
                 no_vision: bool = False, gguf: str = "",
-                kv_fp: str = "", engine: str | None = None) -> None:
+                kv_fp: str = "", engine: str | None = None,
+                engine_binary: dict | None = None) -> None:
     """Write a whole record. Every field not named reverts to its default —
     which is what a launch wants and what an edit must never do; see
     `update_state`.
@@ -145,6 +158,7 @@ def write_state(model_slug: str, quant: str, public_port: int,
                    "ctx": ctx, "started_at": time.time(), "unloaded": unloaded,
                    "kv_cache": kv_cache, "no_vision": no_vision, "gguf": gguf,
                    "kv_fp": kv_fp, "engine": engine,
+                   "engine_binary": engine_binary,
                    "engine_started_at": _create_time(engine_pid),
                    "ui_started_at": _create_time(ui_pid)})
 

@@ -133,11 +133,31 @@ def check_types(type_counts: dict | None, *,
     bound = MAINLINE_TYPE_COUNT if engine_type_count is None else int(engine_type_count)
     ids = sorted(type_counts)
     unknown = [t for t in ids if t not in KNOWN_TYPES and t not in FORK_TYPES]
-    forks = {t: FORK_TYPES[t][0] for t in ids if t in FORK_TYPES}
+    # A FORK TYPE IS ONLY A REJECTION WHEN THE ENGINE DOES NOT HAVE IT.
+    #
+    # This used to be every fork type unconditionally, which contradicted the paragraph
+    # above: `engine_type_count` is documented as "the authoritative bound for THAT
+    # build", and the branch returned before consulting it. So the PrismML build, whose
+    # table ends at 144 and which therefore HAS PQ2_0=142, was told a model using 142 was
+    # unloadable — and advised to "install a build of PrismML-Eng/llama.cpp" while
+    # running one. Measured: `check_types({0:353, 30:96, 142:402},
+    # engine_type_count=144)` returned ok=False.
+    #
+    # Filtering by the bound makes `forks` mean what the name says — fork types this
+    # build LACKS — and lets a fork type the build HAS fall out of every rejection list,
+    # so the check reports ok. The comparison is `>=`: the engine rejects any id at or
+    # above its table size, so a fork type is missing precisely when it is not below the
+    # bound. (`<` here was my own first attempt and it inverted the meaning, keeping
+    # exactly the types the engine supports.)
+    forks = {t: FORK_TYPES[t][0] for t in ids if t in FORK_TYPES and t >= bound}
     # Types this build is too old for: known to mainline, but at or above its count.
     too_new = [t for t in ids if t not in forks and t >= bound]
-    # Above mainline entirely, i.e. not mainline numbering at all.
-    above = [t for t in ids if t > MAINLINE_MAX_TYPE and t not in forks]
+    # Above mainline entirely, i.e. not mainline numbering at all — AND not something this
+    # engine has. The `t >= bound` clause is the same correction as `forks`: "made for a
+    # different engine" is a statement about what the ENGINE lacks, so a fork type inside
+    # the engine's own table is not evidence of anything. Without it, a PrismML build was
+    # told a PrismML model "was made for a different engine".
+    above = [t for t in ids if t > MAINLINE_MAX_TYPE and t not in forks and t >= bound]
 
     if not unknown and not forks and not too_new and not above:
         return Compatibility(ok=True)
@@ -274,12 +294,23 @@ def check_engine(type_counts: dict | None, *, engine_type_count: int | None = No
     elif engine_type_count is not None:
         c.reason = f"this engine's type table ends at {engine_type_count}; {c.reason}"
 
-    # PQ2_0 has no Vulkan kernel even on the fork that defines it: its own README
-    # lists Metal/CUDA/HIP/CPU as preferred and points Vulkan users at the
-    # group-64 Q2_0 file instead. A third-party fork exists solely to add the
-    # Vulkan kernel, which is a fair sign it is not in the main line.
+    # THIS NOTE USED TO SAY PQ2_0 HAS NO VULKAN KERNEL. It does, and the claim was
+    # measurably false. The fork's README lists "Vulkan and SYCL backend support" and
+    # carries a Vulkan row in its build table, and its release ships
+    # `bin-win-vulkan-x64`; measured on an RX 9070 XT, the PrismML Vulkan build loaded
+    # this model's 402 PQ2_0 tensors and served it at ~40 tok/s decode. The old note was
+    # read from a card that lists Metal/CUDA/HIP/CPU as *preferred* — a preference, not a
+    # capability — and from the existence of a third-party Vulkan fork, which is not
+    # evidence either.
+    #
+    # What is still true and worth saying: PQ2_0 is not in the PREFERRED list for Vulkan,
+    # and the fork's own guidance is that `*-Q2_0.gguf` on older repos is the deprecated
+    # legacy format that does NOT load on these builds. So the useful advice on Vulkan is
+    # to try it, not to avoid it.
     if backend == "vulkan" and any(t in c.fork_types for t in (142, 143)):
-        c.advice += ("; note that PQ2_0 has no Vulkan kernel even on a PrismML "
-                     "build — use the group-64 Q2_0 variant on Vulkan")
+        c.advice += ("; PQ2_0/PTQ1_0 are not in PrismML's preferred backend list for "
+                     "Vulkan, but the fork does ship a Vulkan build and it loads them — "
+                     "the older group-64 `Q2_0` file is the deprecated format and will "
+                     "NOT load on these builds, so do not swap to it")
     return c
 

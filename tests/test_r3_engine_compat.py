@@ -126,13 +126,34 @@ def test_the_too_new_message_says_a_pin_bump_WILL_help():
     assert not c.fork_types
 
 
-def test_a_fork_type_is_never_excused_by_a_high_count():
-    """The fork case must not be reachable by raising the bound: 142 is not a newer
-    mainline type, it is different numbering, and a fork build reporting COUNT = 144
-    still does not make it mainline."""
+def test_a_fork_type_IS_loadable_by_the_build_that_defines_it():
+    """A fork type stops being a rejection once the engine's own table contains it.
+
+    `engine_type_count` is the `N` from the engine's `should be in [0, N)` refusal, so it
+    is a TABLE SIZE and a build with table 144 accepts every id below it — PQ2_0=142
+    included. The old version of this test asserted the opposite ("never excused by a high
+    count") and so pinned a FALSE NEGATIVE: it told a user running PrismML's own binary
+    that their model could not load, and advised them to install PrismML's own binary.
+
+    The naming fact it was reaching for is still asserted below, on the path where it is
+    actually true — an engine that does NOT have the type.
+    """
     c = engine_compat.check_types(BONSAI, engine_type_count=144)
-    assert c.ok is False
-    assert "NO mainline build" in c.reason
+    assert c.ok is True, c.reason
+
+
+def test_a_fork_type_is_still_named_as_a_fork_when_the_engine_lacks_it():
+    """The naming question survives independently of the capability question.
+
+    A mainline build has no PQ2_0 at all, so the useful answer is not "upgrade" — no
+    mainline version will ever have it — but "this needs PrismML's fork". That is what
+    `forks` is for, and it must still fire here.
+    """
+    for bound in (42, 43):
+        c = engine_compat.check_types(BONSAI, engine_type_count=bound)
+        assert c.ok is False, bound
+        assert "NO mainline build" in c.reason, c.reason
+        assert c.fork_types.get(142), c.fork_types
 
 
 def test_the_default_bound_describes_current_mainline():
@@ -268,17 +289,39 @@ def test_an_unknown_engine_count_still_reports_the_model_problem():
     assert "PQ2_0" in c.reason
 
 
-def test_vulkan_gets_an_extra_warning_about_the_missing_kernel():
-    """PQ2_0 has no Vulkan kernel even on the fork that defines it — its README
-    points Vulkan users at the group-64 Q2_0 file instead."""
-    c = engine_compat.check_engine(BONSAI, engine_type_count=144, backend="vulkan")
+def test_vulkan_advice_no_longer_claims_a_missing_kernel():
+    """The old advice said PQ2_0 has no Vulkan kernel. It does, and the claim was false.
+
+    PrismML's fork README lists "Vulkan and SYCL backend support" and carries a Vulkan row
+    in its build table; its release ships `bin-win-vulkan-x64`; and measured on an RX 9070
+    XT that build loaded this file's 402 PQ2_0 tensors and served it. The old note was
+    read from a card listing Metal/CUDA/HIP/CPU as *preferred* — a preference, not a
+    capability — so this now says what is actually useful instead.
+    """
+    c = engine_compat.check_engine(BONSAI, engine_type_count=42, backend="vulkan")
     assert c.ok is False
     assert "Vulkan" in c.advice
+    assert "no Vulkan kernel" not in c.advice
+    # And the correction it should carry: the legacy file it used to recommend is the one
+    # that will NOT load.
+    assert "deprecated" in c.advice
 
 
-def test_a_non_vulkan_backend_gets_no_kernel_warning():
-    c = engine_compat.check_engine(BONSAI, engine_type_count=144, backend="rocm")
+def test_a_non_vulkan_backend_gets_no_vulkan_note():
+    c = engine_compat.check_engine(BONSAI, engine_type_count=42, backend="rocm")
     assert "Vulkan" not in c.advice
+
+
+def test_an_engine_whose_table_contains_a_fork_type_accepts_the_model():
+    """The end-to-end consequence: PrismML's build loads a PrismML model, with no note.
+
+    This is the pair that the two copies of the rule disagreed about —
+    `engine_registry.select` said the registered engine "accepts every type this model
+    uses" while `check_engine` said it could not, for the same file and the same build.
+    """
+    c = engine_compat.check_engine(BONSAI, engine_type_count=144, backend="vulkan")
+    assert c.ok is True, c.reason
+    assert c.advice == "", c.advice
 
 
 def test_a_truncated_read_is_still_not_a_verdict_on_the_engine_path():
