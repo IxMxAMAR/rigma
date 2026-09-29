@@ -3,11 +3,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   CONTROL_OPS,
+  QUEUE_ACTIONS,
   ROW_OPS,
   controlAvailability,
   controlOpError,
   controlParams,
   controlResultText,
+  rowActionParams,
+  rowActionReady,
 } from "./controlPlane";
 
 describe("R6-ACP-CONTROL: controlOpError", () => {
@@ -133,5 +136,74 @@ describe("R6-ACP-CONTROL: the operation table", () => {
   it("has no duplicate operations", () => {
     const names = CONTROL_OPS.map((o) => o.op);
     expect(new Set(names).size).toBe(names.length);
+  });
+});
+
+describe("R6-ACP-CONTROL-ROW: per-row actions", () => {
+  it("offers the queue's actions and withholds the one that needs an editor", () => {
+    // `queue_update` edits a message's TEXT, which is a different interaction from a
+    // button. Declared as absent rather than silently missing.
+    const ops = QUEUE_ACTIONS.map((a) => a.op);
+    expect(ops).toContain("queue_steer");
+    expect(ops).toContain("queue_delete");
+    expect(ops).not.toContain("queue_update");
+  });
+
+  it("withholds an action whose id the backend did not send", () => {
+    // The id is what the protocol requires. Sending the operation without it would be
+    // refused for a missing parameter — and a round trip to learn that costs a process,
+    // so the button is not drawn at all.
+    const steer = QUEUE_ACTIONS.find((a) => a.op === "queue_steer")!;
+    expect(rowActionReady(steer, { itemId: "q1" })).toBe(true);
+    expect(rowActionReady(steer, {})).toBe(false);
+    expect(rowActionReady(steer, { itemId: "" })).toBe(false);
+    // A non-string id is not an id.
+    expect(rowActionReady(steer, { itemId: 7 })).toBe(false);
+  });
+
+  it("returns null params rather than an operation without its id", () => {
+    const drop = QUEUE_ACTIONS.find((a) => a.op === "queue_delete")!;
+    expect(rowActionParams(drop, { itemId: "q1" })).toEqual({ itemId: "q1" });
+    // Null, NOT `{}`: an empty body would be sent to the server and refused there.
+    expect(rowActionParams(drop, {})).toBeNull();
+  });
+
+  it("has NO per-child delegation action, because the protocol has none", () => {
+    // MEASURED from mcode's own handler:
+    //   onRequest("mcode/session/delegation/stop", xt, async({params:i}) => {
+    //       let s = r(i.sessionId), a = await mo(e.runtime, s);
+    //       return {receipt: await e.runtime.stopDelegation(a)}})
+    // `i.sessionId` is the ROOT session and the whole tree is stopped. So a button on a
+    // member row would say "stop this child" and stop every child — worse than none.
+    //
+    // Asserted as an ABSENCE so that re-adding one has to confront this comment.
+    expect(ROW_OPS as readonly string[]).not.toContain("delegation_stop");
+    expect(CONTROL_OPS.map((o) => o.op)).toContain("delegation_stop");
+  });
+
+  it("says the delegation stop is session-wide, since that is what it does", () => {
+    const stop = CONTROL_OPS.find((o) => o.op === "delegation_stop")!;
+    expect(stop.hint.toLowerCase()).toMatch(/every child|session-wide|not\s+per-child/);
+  });
+
+  it("marks the destructive actions, because that is what decides how they draw", () => {
+    expect(QUEUE_ACTIONS.find((a) => a.op === "queue_delete")!.danger).toBe(true);
+    // Steering a queued message is not destructive: the message still runs.
+    expect(QUEUE_ACTIONS.find((a) => a.op === "queue_steer")!.danger).toBeFalsy();
+  });
+
+  it("only names operations the server's allowlist has", () => {
+    const server = ["queue_steer", "queue_delete", "queue_update"];
+    for (const a of QUEUE_ACTIONS) {
+      expect(server).toContain(a.op);
+      expect(ROW_OPS).toContain(a.op);
+    }
+  });
+
+  it("gives every row action a hint, since a bare verb is not enough", () => {
+    for (const a of QUEUE_ACTIONS) {
+      expect(a.hint.length).toBeGreaterThan(0);
+      expect(a.label.length).toBeGreaterThan(0);
+    }
   });
 });

@@ -26,8 +26,15 @@ export interface ControlOp {
  *
  *  DELIBERATELY NOT ALL FIFTEEN. The server's allowlist is the security boundary and it
  *  is larger than this; the panel offers the ones with a clear use from a chat window.
- *  `queue_update`, `queue_delete`, `queue_steer` and `delegation_stop` act on an id that
- *  the live panel has and a form does not, so they are offered per-row instead of here.
+ *  `queue_update`, `queue_delete` and `queue_steer` act on an id that only the live
+ *  panel has, so they are offered per-row instead of here.
+ *
+ *  `delegation_stop` is HERE rather than per-row, and that is a correction. It used to be
+ *  a row action on the strength of the server table requiring a `sessionId` — but that
+ *  id is the ROOT session, not a member: mcode's handler resolves `params.sessionId` and
+ *  calls `stopDelegation` on the resolved session, stopping the whole tree. A per-child
+ *  button would therefore have stopped every child, which is the kind of control that is
+ *  worse than none.
  */
 export const CONTROL_OPS: ControlOp[] = [
   { op: "goal_create", label: "set a goal", arg: "objective",
@@ -45,11 +52,65 @@ export const CONTROL_OPS: ControlOp[] = [
         + "agent is doing; it does not start a new turn." },
   { op: "activate", label: "make this the active session",
     hint: "Tell mcode this is the session to work on. Matters when several are open." },
+  { op: "delegation_stop", label: "stop all delegated work",
+    hint: "Abandon every child this session delegated to. This is session-wide, not "
+        + "per-child: the protocol has no way to stop just one." },
 ];
 
 /** The operations that need an id from a live row rather than a text field. */
-export const ROW_OPS = ["queue_update", "queue_delete", "queue_steer",
-                        "delegation_stop"] as const;
+export const ROW_OPS = ["queue_update", "queue_delete", "queue_steer"] as const;
+
+/** One row action, as a button.
+ *
+ *  WHY THESE ARE NOT IN `CONTROL_OPS`. They act on an id that only a LIVE row has —
+ *  a queue item's `itemId`. A form has no such id, so offering them there would mean
+ *  asking the user to type one. They belong on the rows.
+ *
+ *  `needs` names the id, so the button can be withheld when the backend did not send it
+ *  rather than sending an operation that would be refused for a missing parameter.
+ */
+export interface RowAction {
+  op: (typeof ROW_OPS)[number];
+  label: string;
+  /** The field on the row this operation requires. */
+  needs: "itemId";
+  /** Destructive actions are drawn differently, and this is what decides. */
+  danger?: boolean;
+  hint: string;
+}
+
+/** The queue's actions. `queue_update` is deliberately absent: it edits a message's
+ *  text, which needs an editor, and an inline rename is a different interaction from a
+ *  button. Declared rather than silently omitted. */
+export const QUEUE_ACTIONS: RowAction[] = [
+  { op: "queue_steer", label: "steer", needs: "itemId",
+    hint: "Promote this queued message into the turn that is running NOW." },
+  { op: "queue_delete", label: "drop", needs: "itemId", danger: true,
+    hint: "Remove this message from the queue. It will never run." },
+];
+
+/* There are no per-child delegation actions, and their absence is deliberate rather
+ * than unfinished. `delegation_stop` is session-wide (see `CONTROL_OPS` above), so a
+ * button on a member row would misstate what it does. Nothing else in mcode's delegation
+ * surface is per-member: `delegation/get` reads the tree and `delegation/stop` clears it.
+ */
+
+/** Whether a row action can be offered: the backend has to have sent the id it needs. */
+export function rowActionReady(a: RowAction, row: Record<string, unknown>): boolean {
+  const v = row[a.needs];
+  return typeof v === "string" && v !== "";
+}
+
+/** The params for a row action, or null when the id is missing.
+ *
+ *  Null rather than `{}` so a caller cannot accidentally send an operation without its
+ *  id — the server would refuse it, but a round trip to learn that is a wasted process. */
+export function rowActionParams(
+  a: RowAction, row: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (!rowActionReady(a, row)) return null;
+  return { [a.needs]: String(row[a.needs]) };
+}
 
 /** Why this operation cannot be sent, or "" if it can.
  *
