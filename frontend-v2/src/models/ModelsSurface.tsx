@@ -913,8 +913,10 @@ function FitControls({ cfg, onChange }: {
       <label className="flex items-center gap-1.5 font-mono text-[11px] text-secondary"
              title={"speed: never move a GPU layer to RAM to gain context (the " +
                     "default). context: spend up to 15% of the layers for a " +
-                    "bigger window — every offloaded layer costs time on EVERY " +
-                    "token of a dense model."}>
+                    "bigger window. Priced, not just bounded: on a 27B dense " +
+                    "hybrid, 7 of 64 layers on the CPU measured 12.6 t/s " +
+                    "against 54.5 all-GPU (4.3x) — a CPU-resident layer runs " +
+                    "its weights on every token."}>
         prefer
         <select className={sel} value={cfg.grow}
                 onChange={(e) => onChange({ ...cfg,

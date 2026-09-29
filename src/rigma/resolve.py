@@ -602,8 +602,15 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
                            f"(ctx {ctx} would push weights off the GPU)")
             break
         if lost:
-            explain.append(f"grow-to-fit: spending {lost} of {cap} GPU layers "
-                           f"to reach ctx {ctx} (budget {allowed})")
+            # Price it. "15% of the layers" reads as a small number; on the
+            # owner's 27B PQ2_0 hybrid a CPU-resident layer measured ~9 ms/token
+            # against ~0.3 ms on the GPU (R3-ENG-13, findings-r3/37), so 7 of 64
+            # layers cost 4.3x. The constants are that measurement, not a
+            # universal law — the line says so.
+            explain.append(
+                f"grow-to-fit: spending {lost} of {cap} GPU layers to reach "
+                f"ctx {ctx} (budget {allowed}); measured on a 27B PQ2_0 hybrid, "
+                f"a CPU-resident layer costs ~9 ms/token vs ~0.3 ms on the GPU")
         explain.append(f"grow-to-fit: ctx {best.ctx} -> {ctx} "
                        f"(n_cpu_moe {best.n_cpu_moe} -> {grown.n_cpu_moe})")
         best = grown
