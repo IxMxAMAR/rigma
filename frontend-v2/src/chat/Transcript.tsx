@@ -294,6 +294,27 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
     }
   }, []);
 
+  // R6-ACP-CONTROL-ROW: a per-row control action on the LIVE turn.
+  //
+  // Live only, and that is the whole point of passing it here rather than to every
+  // `AgentState`: a durable turn's queue and delegation tree are HISTORY, and the ids in
+  // them name a session that may be long gone. The live render is the only place where
+  // "steer this queued message" has a turn to steer.
+  //
+  // Read from the store at click time, like `answerApproval` above, so the handler always
+  // names the chat actually on screen.
+  const rowOp = useCallback(async (op: string, params: Record<string, unknown>) => {
+    const sid = useChat.getState().currentId;
+    if (!sid) return;
+    try {
+      await api.control(sid, op, params);
+    } catch (e) {
+      // Surfaced, not swallowed: these are destructive (drop a message, stop a child),
+      // so a silent failure would leave the user believing something happened.
+      useChat.setState({ lastError: errText(e) });
+    }
+  }, []);
+
   // The still-open compaction for THIS turn, if any. Computed here rather than
   // inline in the JSX so it is one lookup per render, not one per condition.
   const runningCompaction = running(turn.compactions);
@@ -347,6 +368,7 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         acpPlan={turn.acpPlan}
         workflow={turn.workflow}
         onAnswerApproval={answerApproval}
+        onRowOp={rowOp}
       />
       {/* Compaction, observation-masking and the prompt queue. All three were
           emitted by the server and dropped by the store's default arm, so a

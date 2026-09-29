@@ -38,16 +38,6 @@ export interface NormalGoal {
   tokenBudget: number | null;
 }
 
-const EMPTY: NormalGoal = {
-  objective: "",
-  phase: "",
-  rounds: null,
-  maxRounds: null,
-  blocked: "",
-  tokensUsed: null,
-  tokenBudget: null,
-};
-
 const num = (v: unknown): number | null =>
   typeof v === "number" && Number.isFinite(v) ? v : null;
 
@@ -139,5 +129,9 @@ export function phaseLabel(phase: string): string {
   return phase.replace(/_/g, " ");
 }
 
-/** `{...}` for the empty case is never reached; exported for the tests. */
-export const EMPTY_GOAL = EMPTY;
+/* There was an `export const EMPTY_GOAL = EMPTY` here, commented "exported for the
+ * tests". No test imported it and nothing else did either — `EMPTY` above is already the
+ * value the two reducers use, so the export was a second name for a private constant with
+ * a justification that was not true. Removed rather than given a test, because a test
+ * written to justify an unused export is a test that pins nothing.
+ */

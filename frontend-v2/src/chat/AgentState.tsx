@@ -39,6 +39,12 @@ import {
   sandboxTone,
   type Governance,
 } from "./governance";
+import {
+  QUEUE_ACTIONS,
+  rowActionParams,
+  rowActionReady,
+  type RowAction,
+} from "./controlPlane";
 
 /** Amber = in flight, moss = settled well, muted = not started, red = failed. */
 function todoTone(status: string): string {
@@ -400,12 +406,21 @@ function AcpBlock({
   config,
   commands,
   plan,
+  onRowOp,
 }: {
   queue: AcpQueueItem[];
   delegation: AcpDelegation | null;
   config: AcpConfigOption[];
   commands: AcpCommand[];
   plan: Record<string, unknown> | null;
+  /** R6-ACP-CONTROL-ROW: perform a per-row operation.
+   *
+   *  ABSENT ON A DURABLE TURN, deliberately. The queue and the delegation tree of a
+   *  turn that has ENDED are history — the ids in them refer to a session that may be
+   *  long gone, so a button there would offer to steer a turn nobody is running. The
+   *  live render passes this; the historical one does not, and the buttons simply are
+   *  not drawn. */
+  onRowOp?: (op: string, params: Record<string, unknown>) => void;
 }) {
   const members = delegation?.members ?? [];
   const hasPlan =
@@ -427,7 +442,24 @@ function AcpBlock({
             cannot change either without ending the session. */}
         {config.map((c) => (
           <span key={String(c.id)} className="font-mono text-[10.5px] text-muted">
-            {String(c.id)}={configLabel(c.currentValue)}
+            {/* `c.name` is the server's display name for the option; `c.id` is the
+                protocol key. The old code printed the id while the name sat unused. */}
+            {String(c.name || c.id)}={configLabel(c.currentValue)}
+            {/* `c.options` is the list of values the server will ACCEPT. It was received
+                and discarded, so the panel could show the current value and nothing about
+                what else was possible. Rendered only when the server sent it. */}
+            {Array.isArray(c.options) && c.options.length > 0 && (
+              <span className="text-muted/70">
+                {" ("}
+                {c.options
+                  .map((o) => (o && typeof o === "object"
+                    ? String((o as { value?: unknown }).value ?? "")
+                    : String(o)))
+                  .filter((v) => v !== "")
+                  .join("|")}
+                {")"}
+              </span>
+            )}
           </span>
         ))}
       </div>
@@ -467,6 +499,12 @@ function AcpBlock({
                 {m.status && (
                   <span className="font-mono text-[10.5px] text-muted">{m.status}</span>
                 )}
+                {/* WHY the child failed, when the server said. It was being discarded, so
+                    a failed delegation showed only the word "failed" — while the queue
+                    two blocks down already renders its own failure reason. */}
+                {m.errorMessage && (
+                  <span className="text-red">{String(m.errorMessage)}</span>
+                )}
               </li>
             ))}
           </ul>
@@ -488,6 +526,7 @@ function AcpBlock({
                 {q.failedReason && (
                   <span className="text-red">{String(q.failedReason)}</span>
                 )}
+                <RowActions actions={QUEUE_ACTIONS} row={q} onRowOp={onRowOp} />
               </li>
             ))}
           </ul>
@@ -495,12 +534,66 @@ function AcpBlock({
       )}
 
       {commands.length > 0 && (
-        <div className="font-mono text-[10.5px] text-muted">
-          {commands.length} command{commands.length === 1 ? "" : "s"} available:{" "}
-          {commands.map((c) => `/${String(c.name ?? "")}`).join(" ")}
+        <div className="text-[11.5px] text-muted">
+          <span className="font-mono text-[10.5px]">
+            {commands.length} command{commands.length === 1 ? "" : "s"} available
+          </span>
+          {/* The DESCRIPTION the server sends with each command, which used to be thrown
+              away — leaving a row of bare `/names` a user had to guess at. Laid out as a
+              list rather than a joined string precisely because there is now more than a
+              name per entry. */}
+          <ul className="flex flex-col gap-0.5 mt-0.5">
+            {commands.map((c, i) => (
+              <li key={`${String(c.name)}-${i}`} className="flex gap-1.5">
+                <span className="font-mono text-[10.5px] text-primary shrink-0">
+                  /{String(c.name ?? "")}
+                </span>
+                {c.description && (
+                  <span className="text-muted">{String(c.description)}</span>
+                )}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>
+  );
+}
+
+/** R6-ACP-CONTROL-ROW: the per-row control actions.
+ *
+ *  A row is only actionable when the backend actually sent the id the operation needs —
+ *  `rowActionReady` decides, and a row missing its id draws no buttons rather than a
+ *  button that would be refused. Nothing renders at all without `onRowOp`, which is how
+ *  a durable turn stays free of controls.
+ */
+function RowActions({ actions, row, onRowOp }: {
+  actions: RowAction[];
+  row: Record<string, unknown>;
+  onRowOp?: (op: string, params: Record<string, unknown>) => void;
+}) {
+  if (!onRowOp) return null;
+  const ready = actions.filter((a) => rowActionReady(a, row));
+  if (ready.length === 0) return null;
+  return (
+    <span className="ml-auto flex shrink-0 items-center gap-1">
+      {ready.map((a) => (
+        <button
+          key={a.op}
+          type="button"
+          title={a.hint}
+          onClick={() => {
+            const params = rowActionParams(a, row);
+            if (params) onRowOp(a.op, params);
+          }}
+          className={`rounded px-1 py-px font-mono text-[10px] ${
+            a.danger ? "text-red" : "text-secondary"
+          } hover:bg-surface`}
+        >
+          {a.label}
+        </button>
+      ))}
+    </span>
   );
 }
 
@@ -591,6 +684,7 @@ export default function AgentState({
   acpPlan = null,
   workflow = [],
   onAnswerApproval,
+  onRowOp,
 }: {
   goal: NormalGoal | null;
   todos: { content: string; status: string }[];
@@ -614,6 +708,11 @@ export default function AgentState({
   /** R6-ACP-APPROVE: answers a permission request that is BLOCKING the turn. Absent
    *  on the DURABLE panel, which has no live turn to unblock. */
   onAnswerApproval?: (requestId: string, allow: boolean) => void;
+  /** R6-ACP-CONTROL-ROW: a per-row control action (steer or drop a queued message,
+   *  stop a delegated child). Passed ONLY by the live turn — a durable turn's queue and
+   *  delegation tree are history, and a control there would act on a session that may be
+   *  long gone. */
+  onRowOp?: (op: string, params: Record<string, unknown>) => void;
 }) {
   // Already normalised by the store, so this draws ONE shape whatever the
   // backend was: DSH's nested `goal/change` envelope and mcode's flat goal
@@ -732,7 +831,7 @@ export default function AgentState({
           WORK (what is queued, what was delegated, which plan) rather than about
           the connection's permissions. */}
       <AcpBlock queue={acpQueue} delegation={acpDelegation} config={acpConfig}
-                commands={acpCommands} plan={acpPlan} />
+                commands={acpCommands} plan={acpPlan} onRowOp={onRowOp} />
 
       {/* Last, and separated by a rule: this is about the CONNECTION's
           permissions rather than about the work, and putting it above the goal

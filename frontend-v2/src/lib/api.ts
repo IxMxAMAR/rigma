@@ -239,8 +239,10 @@ export const api = {
   stopSession: (id: string) =>
     j<{ ok: boolean; stopped: boolean }>(
       "POST", `/api/sessions/${id}/stop`, {}),
-  /** The honest menu: every backend, including the ones that cannot run a turn
-   *  yet, each with what it would cost.
+  /** The honest menu: every backend, each with what it would cost and what it
+   *  cannot do. `runnable` and `installed` are reported separately even though
+   *  they agree for all three today, because a backend can be present on the
+   *  machine with no adapter written for it yet.
    *
    *  `check` additionally asks each backend what version it actually is, which
    *  costs a subprocess per backend — so the caller asks for the plain list
