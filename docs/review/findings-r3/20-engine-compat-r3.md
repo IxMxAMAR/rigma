@@ -203,7 +203,7 @@ And the pre-flight verdict on three real combinations:
 
 | engine | model | result |
 |---|---|---|
-| pinned `vulkan` (COUNT 42) | Ternary-Bonsai PQ2_0 | explains, names PrismML, adds the Vulkan kernel note |
+| pinned `vulkan` (COUNT 42) | Ternary-Bonsai PQ2_0 | explains, names PrismML, adds a Vulkan note |
 | PrismML fork (COUNT 144) | the same model | **silent** — it loads |
 | pinned `vulkan` | SmolLM2 Q2_K | silent |
 
@@ -245,3 +245,24 @@ Named so a follow-up does not have to rediscover them.
    pruning.
 6. **`pytest-timeout` is still not installed**, so the documented intermittent suite hang
    cannot be capped from inside. This has now cost time twice.
+
+---
+
+## Corrections to this document, made later
+
+Two claims here were wrong and are corrected in
+[`35-prismml-install-and-corrections.md`](35-prismml-install-and-corrections.md):
+
+* The **"adds the Vulkan kernel note"** behaviour described above asserted that PQ2_0 has
+  no Vulkan kernel. It does — the fork ships `bin-win-vulkan-x64` and measured ~52 t/s on
+  it — and the note recommended the deprecated `Q2_0` format, which will not load at all.
+  The note now says that instead.
+* The verdict table's **"PrismML fork (COUNT 144) → silent"** row was the *correct*
+  behaviour but was not what the code did: `check_types` rejected fork types without
+  consulting the engine's bound, so a bound-144 engine was told a PrismML model could not
+  load. A test asserted that wrong behaviour, so the table and the test contradicted each
+  other and the test was wrong. Both are fixed.
+
+Also from that round: `engine_registry.select` had no callers, so a registered engine was
+describable but never selectable — `rigma up` still chose the pin for a PQ2_0 model. The
+launch path now consults the registry first.

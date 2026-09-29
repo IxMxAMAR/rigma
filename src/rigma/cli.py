@@ -1609,7 +1609,10 @@ def sweep(use_case: str = typer.Option("general", "--use-case"),
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"sweeping {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
                f"(scratch engine on :{port}, live server untouched)")
-    exe = runtime.ensure_engine(rp.backend, os_name)
+    # R3-ENG-3: the sweep must measure the engine that would actually serve this model,
+    # or it reports throughput for a binary the user will never run.
+    from .server_ops import engine_binary_for as _engine_binary_for
+    exe, _eb = _engine_binary_for(rp.gguf, rp.backend, os_name)
     model_path = runtime.ensure_model(rp.gguf)
     rows = run_sweep(rp, exe, model_path, port=port,
                      prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
@@ -2318,7 +2321,12 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     sp = None
     for i, cand in enumerate(candidates):
         try:
-            exe = runtime.ensure_engine(cand.backend, os_name)
+            # R3-ENG-3: the same seam `perform_switch` uses. Calling `ensure_engine`
+            # directly here meant a registered engine was bypassed on the CLI path, so
+            # `rigma up --model <pq2_0 model>` launched the pin, the pin refused type 142,
+            # and the fallback ladder below quietly served SmolLM2 instead.
+            from .server_ops import engine_binary_for as _engine_binary_for
+            exe, _eb = _engine_binary_for(cand.gguf, cand.backend, os_name)
             model_path = runtime.ensure_model(cand.gguf)
             extra = []
             spec_c = reg.models.get(cand.model_slug)

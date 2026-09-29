@@ -167,6 +167,66 @@ def _model_on_disk(gguf) -> bool:
     return (rigma_home() / "models" / gguf.file).exists()
 
 
+def _registered_engine_for(gguf, backend: str):
+    """A registered engine that can load this model, or None.
+
+    `engine_registry` could already describe, verify and select a non-pinned engine, but
+    nothing in the launch path ever called `select` — so a model that only a registered
+    fork can load still went to the pin and died with `invalid ggml type 142. should be in
+    [0, 42)`, which is exactly the failure registration was added to prevent. The owner
+    installed PrismML's fork and registered it, and `rigma up` still picked the pinned
+    b9867 build.
+
+    The decision is made on the model's ACTUAL tensor types, read from its header, so this
+    can only ever prefer a build that demonstrably accepts this file. A model the pin can
+    load is unaffected: `select` only returns an engine whose declared types cover every
+    type in the file, and a registered engine with unknown capabilities is not chosen here
+    (it is offered by `rigma engine-runtimes`, where a human can act on it).
+
+    Never raises. Any failure means "no opinion", and the pin is used as before.
+    """
+    try:
+        from . import engine_registry
+        from .gguf_meta import read_tensor_index
+        path = rigma_home() / "models" / gguf.file
+        if not path.exists():
+            return None
+        idx = read_tensor_index(path)
+        if not idx.types_complete or not idx.type_counts:
+            return None
+        engine, _reason = engine_registry.select(list(idx.type_counts), backend)
+        if engine is None or not engine.exe.exists():
+            return None
+        return engine
+    except Exception:
+        return None
+
+
+def engine_binary_for(gguf, backend: str, os_name: str):
+    """The `llama-server` to launch for `gguf` on `backend`: a registered engine that can
+    load it, else the pin. Returns `(exe, record)`.
+
+    THE ONE SEAM. Rigma launches an engine from three places — `up` (which has its own
+    fallback ladder), `sweep`, and `perform_switch` (the UI's path) — and each one
+    previously called `runtime.ensure_engine` directly. A registered engine therefore had
+    to be wired into all three or it was wired into none: fixing only `perform_switch` left
+    `rigma up --model <pq2_0 model>` still launching the pinned b9867 build, which refuses
+    the file with `invalid ggml type 142. should be in [0, 42)` and then silently falls back
+    to SmolLM2. That is exactly what happened after the first version of this fix.
+
+    `record` is the description that goes into `state["engine_binary"]`, so which binary
+    served a launch is answerable afterwards rather than only from the process table.
+    """
+    from . import runtime
+    custom = _registered_engine_for(gguf, backend)
+    if custom is not None:
+        return custom.exe, {"kind": "registered", "name": custom.name,
+                            "path": str(custom.exe), "source": custom.source}
+    exe = runtime.ensure_engine(backend, os_name)
+    return exe, {"kind": "pinned", "name": f"{os_name}/{backend}",
+                 "path": str(exe), "source": ""}
+
+
 def _calib_marker_path():
     return rigma_home() / "calibrating.json"
 
@@ -659,8 +719,18 @@ def perform_switch(model: str, registry=None, profile=None,
         extra = (extra or []) + ["--chat-template-file", str(tmpl)]
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
-    exe = runtime.ensure_engine(rp.backend, os_name)
     model_path = rigma_home() / "models" / rp.gguf.file
+    # R3-ENG-3, the missing half: a registered engine that can load THIS model beats the
+    # pin. Capability is decided by the file's own tensor types, not by a version guess,
+    # and falls back to the pin whenever nothing registered fits — so a machine that never
+    # registered anything behaves exactly as before.
+    #
+    # `_engine_binary` is kept out of `state["engine"]`: that field is the engine RUNTIME
+    # (llamacpp/vllm), a string `bench`/`hwid` compare for equality when attributing
+    # calibration, so a description there would corrupt provenance. It is handed to
+    # `write_state` at the end of the launch instead, because that call rebuilds the record
+    # from its arguments and would drop anything set on `s` here.
+    exe, _engine_binary = engine_binary_for(rp.gguf, rp.backend, os_name)
     port = int(s["public_port"]) - 1
     st.kill_recorded(s, "engine_pid")   # AUDIT F08-1: identity-checked
     if not _await_port_free(port):      # Windows TIME_WAIT grace
@@ -727,7 +797,10 @@ def perform_switch(model: str, registry=None, profile=None,
                    ui_pid=int(s.get("ui_pid", os.getpid())),
                    backend=rp.backend, use_case=s.get("use_case", "general"),
                    ctx=rp.flags.ctx, kv_cache=rp.flags.cache_type_k or "",
-                   no_vision=not vision, gguf=rp.gguf.file, kv_fp=kv_fp)
+                   no_vision=not vision, gguf=rp.gguf.file, kv_fp=kv_fp,
+        # Carried through so `rigma status` can say which binary is serving. Set above
+        # from the selection that actually ran, so it cannot drift from the exe used.
+        engine_binary=_engine_binary)
     return st.read_state() or {}
 
 
