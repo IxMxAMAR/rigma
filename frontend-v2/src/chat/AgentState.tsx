@@ -42,6 +42,8 @@ import {
 import {
   QUEUE_ACTIONS,
   configOptionValues,
+  delegationDepths,
+  planIsRenderable,
   rowActionParams,
   rowActionReady,
   type RowAction,
@@ -424,8 +426,11 @@ function AcpBlock({
   onRowOp?: (op: string, params: Record<string, unknown>) => void;
 }) {
   const members = delegation?.members ?? [];
-  const hasPlan =
-    plan != null && (typeof plan.content === "string" || typeof plan.uri === "string");
+  // Computed once per render, not once per row: each depth is a walk up the parent chain,
+  // and doing that inside `map` would make it O(n^2) in the number of members.
+  const depths = delegationDepths(members);
+  // The shared predicate, NOT a second copy of the rule: see `planIsRenderable`.
+  const hasPlan = planIsRenderable(plan);
   if (
     queue.length === 0 && members.length === 0 && config.length === 0 &&
     commands.length === 0 && !hasPlan
@@ -481,6 +486,10 @@ function AcpBlock({
           <ul className="flex flex-col gap-0.5">
             {members.map((m, i) => (
               <li key={`${String(m.sessionId)}-${String(i)}`}
+                  // THE TREE IS REAL AND WAS BEING FLATTENED. Every member carries
+                  // `parentSessionId`, so a child was drawn as a sibling of its parent.
+                  // Indented by depth instead, which is the whole reason the field exists.
+                  style={{ paddingLeft: `${depths[i] * 12}px` }}
                   className="text-[12px] flex items-start gap-1.5">
                 <span className={`font-mono mt-px ${delegationTone(m.status)}`}
                       aria-hidden="true">
@@ -722,9 +731,11 @@ export default function AgentState({
   const hasUsage = usage != null && Object.keys(usage).length > 0;
   const hasGov =
     governance.approvals.length > 0 || !!governance.sandbox || !!governance.preset;
+  // `planIsRenderable(acpPlan)`, NOT `acpPlan != null`. A plan object the panel cannot
+  // draw must not make this panel draw its container: that is an empty box.
   const hasAcp =
     acpQueue.length > 0 || (acpDelegation?.members?.length ?? 0) > 0 ||
-    acpConfig.length > 0 || acpCommands.length > 0 || acpPlan != null;
+    acpConfig.length > 0 || acpCommands.length > 0 || planIsRenderable(acpPlan);
   if (
     !hasGoal && todos.length === 0 && !planMode && subagents.length === 0 &&
     !hasUsage && !hasGov && !hasAcp && workflow.length === 0

@@ -952,7 +952,25 @@ def map_acp_update(notification: dict) -> list:
         return out
 
     if kind == "plan_update":
-        plan = update.get("plan") or {}
+        plan = update.get("plan")
+        if not isinstance(plan, dict) or not plan:
+            # NOT an empty plan object. `acpPlan = {}` is non-null, so the panel drew its
+            # container around a child that renders nothing — a visible empty box. A
+            # `plan_update` carrying no plan says nothing, and saying nothing is correct.
+            return out
+        entries = plan.get("entries")
+        if isinstance(entries, list):
+            # THE `items` ARM. `PlanUpdateContent` is a three-way union and this arm has
+            # NEITHER `content` NOR `uri`, so the panel could not draw it and the entries
+            # were dropped on the floor. They go to the SAME channel the SDK's sibling
+            # `plan` variant uses for the same data — the todos panel — rather than
+            # needing a second list renderer for a shape that means the same thing.
+            out.append(TurnEvent("state", event="todos", data={"todos": [
+                {"content": _acp_content_text(e.get("content")),
+                 "status": str(e.get("status") or "pending")}
+                for e in entries if isinstance(e, dict)]}))
+            return out
+        # `markdown` carries `content`, `file` carries `uri`; the panel draws both.
         out.append(TurnEvent("state", event="acp_plan", data=plan))
         return out
     if kind == "plan_removed":
