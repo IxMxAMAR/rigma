@@ -44,6 +44,20 @@ export interface ServerInfo {
    *  one, and the UI must show NOTHING in that case rather than assume llama.cpp:
    *  a wrong label here is worse than no label. (R3-VLLM-4) */
   engine?: string | null;
+  /** WHICH BINARY is serving — `{kind, name, path, source}`, or null.
+   *
+   *  A third axis again: `backends` is llama.cpp's compute backend, `engine` is the
+   *  runtime, and this is the actual executable. It matters because a *registered*
+   *  third-party build can now be selected over Rigma's pin when it is the only one
+   *  that can load a model's tensor types — so "which engine is running" is no longer
+   *  answerable from the version string. null for a record written before a launch
+   *  named its binary; show nothing rather than assume the pin. (R3-ENG-9) */
+  engine_binary?: {
+    kind: "registered" | "pinned";
+    name: string;
+    path: string;
+    source: string;
+  } | null;
   /** Which engine runtimes this machine could run, and exactly why not for the
    *  ones it cannot. Separate from `backends` on purpose. Named with the
    *  server's own snake_case, because this layer does NOT rename keys. */
