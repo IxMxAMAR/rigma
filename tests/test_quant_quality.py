@@ -262,10 +262,11 @@ def test_an_explicit_cache_choice_is_not_silently_replaced():
 
 
 def test_k_and_v_are_always_symmetric():
-    """ComboFlags._symmetric_kv normalises them on purpose: llama.cpp's fused
-    flash-attention kernel only fires when ctk == ctv, and a mismatch silently
-    drops to a slow non-fused path (RDNA4, 2026-07-17). Every verdict must come
-    back symmetric — an asymmetric one could never be launched."""
+    """ComboFlags._symmetric_kv normalises them on purpose. The old reason —
+    "llama.cpp's fused flash-attention only fires when ctk == ctv" — is false
+    on Vulkan at 87268f77 (K and V are checked independently) but true on the
+    CUDA/HIP path, and `-fa on` degrades to CPU attention silently when a pair
+    is unsupported, so every verdict must come back symmetric."""
     from rigma.resolve import quant_verdicts
     for kv in ("", "f16", "q8_0", "q4_0"):
         rows = quant_verdicts(_hybrid_spec(11.0), _prof(), kv=kv)
@@ -274,6 +275,21 @@ def test_k_and_v_are_always_symmetric():
         for v in rows:
             if v["ok"]:
                 assert v["kv"] == v["kv_v"], (kv, v)
+
+
+def test_the_cache_table_is_the_symmetric_column():
+    """The published figures are llama.cpp PR 7412's SYMMETRIC K=V numbers. An
+    earlier table mixed in the K-only column (q5_1 0.366) and understated q4_1 /
+    q4_0 by ~2x, while the UI presents them as what running a symmetric cache
+    costs. Re-sourcing must not disturb the ordering the UI sorts on."""
+    from rigma.quant_quality import kv_loss
+    assert kv_loss("q8_0") == pytest.approx(0.04, abs=0.01)
+    assert kv_loss("q5_1") == pytest.approx(0.43, abs=0.02)
+    assert kv_loss("q5_0") == pytest.approx(0.75, abs=0.02)
+    assert kv_loss("q4_1") == pytest.approx(1.77, abs=0.03)
+    assert kv_loss("q4_0") == pytest.approx(3.31, abs=0.03)
+    assert (kv_loss("f16") < kv_loss("q8_0") < kv_loss("q5_1")
+            < kv_loss("q5_0") < kv_loss("q4_1") < kv_loss("q4_0"))
 
 
 def test_kv_loss_takes_one_cache_type():

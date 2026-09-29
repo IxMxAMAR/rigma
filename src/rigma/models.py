@@ -356,10 +356,17 @@ class ComboFlags(BaseModel):
 
     @model_validator(mode="after")
     def _symmetric_kv(self):
-        # llama.cpp's fused flash-attn kernel only fires when ctk==ctv; a
-        # mismatch SILENTLY drops to a slow non-fused path (RDNA4 finding
-        # 2026-07-17). Normalize both to the more-precise type to keep the
-        # fast path without silently degrading quality.
+        # K and V are kept symmetric. The old reason — "the fused flash-attn
+        # kernel only fires when ctk==ctv" — is FALSE on Vulkan at 87268f77,
+        # where supports_op checks K and V independently and rejects only a
+        # BF16/non-BF16 mix, but TRUE on the CUDA/HIP path, where fattn.cu
+        # without GGML_CUDA_FA_ALL_QUANTS selects no kernel for a mismatch (and
+        # the shipped PrismML HIP build does not define it, nor accept
+        # q4_1/q5_0/q5_1 even symmetric). Rigma runs both backends, and
+        # `-fa on` degrades to CPU attention SILENTLY when a pair is
+        # unsupported, so symmetric stays the safe common denominator.
+        # Normalize both to the more-precise type so a half-specified pair
+        # cannot silently degrade quality either.
         #
         # Precision IS CACHE_BYTES: bytes per element per side. The old local
         # rank table listed only f16/q8_0/q4_0 and defaulted every other type to
