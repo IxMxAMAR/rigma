@@ -84,9 +84,9 @@ def _record_fit(monkeypatch):
     from rigma import resolve as _resolve
     real = _resolve.fit_gguf
 
-    def spy(spec, gguf, profile, ctx, explain):
+    def spy(spec, gguf, profile, ctx, explain, backend=""):
         seen.append(spec)
-        return real(spec, gguf, profile, ctx, explain)
+        return real(spec, gguf, profile, ctx, explain, backend=backend)
     monkeypatch.setattr(_resolve, "fit_gguf", spy)
     return seen
 

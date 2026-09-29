@@ -2294,20 +2294,20 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         _spec2, _differs = _fit_spec(_spec_r, rp.flags, vision=_vision)
         if _launch is not None or _differs:
             from .resolve import fit_for_launch as _fit_launch
+            from .resolve import step_down_notice as _step_notice
             _fl, _stepped = _fit_launch(
                 _spec_r, rp.gguf, p, rp.flags.ctx, kv=_launch_kv,
                 vision=_vision, spec_type=rp.flags.spec_type,
-                n_max=rp.flags.spec_n_max, explain=rp.explain)
+                n_max=rp.flags.spec_n_max, backend=rp.backend,
+                explain=rp.explain)
             if _fl is not None:
                 rp.flags = rp.flags.model_copy(update={
                     "ngl": _fl.ngl, "n_cpu_moe": _fl.n_cpu_moe,
                     "cache_type_k": _fl.cache_type_k,
                     "cache_type_v": _fl.cache_type_v})
             if _stepped:
-                typer.echo(f"{_stepped} does not fit fully at ctx "
-                           f"{rp.flags.ctx:,}; using "
-                           f"{rp.flags.cache_type_k} with every layer on the "
-                           f"GPU")
+                typer.echo(_step_notice(_stepped, rp.backend,
+                                        rp.flags.cache_type_k, rp.flags.ctx))
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "

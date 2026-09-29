@@ -36,7 +36,7 @@ def _spec(native_ctx=12288):
 
 def _spy(seen):
     """fit_gguf stand-in: places the model at 8192 and nowhere above it."""
-    def fit(spec, gguf, profile, ctx, explain):
+    def fit(spec, gguf, profile, ctx, explain, backend=""):
         seen.append(ctx)
         return ComboFlags(ctx=ctx) if ctx <= 8192 else None
     return fit
