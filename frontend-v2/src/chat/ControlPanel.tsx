@@ -11,6 +11,16 @@ import {
   type ControlOp,
 } from "./controlPlane";
 
+/** The empty option list, as ONE frozen array.
+ *
+ *  NOT `?? []` INSIDE THE SELECTOR. zustand v5 compares a selector's result with
+ *  `Object.is`, so returning a fresh array literal whenever no turn is streaming makes the
+ *  store believe state changed on every render — the documented "getSnapshot should be
+ *  cached" loop, and it would fire for every session with no live turn, which is most of
+ *  them. A stable module-level value is what makes the selector safe.
+ */
+const NO_CONFIG: AcpConfigOption[] = [];
+
 /** One value a server-sent option list offers, as a string. */
 function optionValue(o: unknown): string {
   if (o && typeof o === "object") {
@@ -61,7 +71,8 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
   /* THE SERVER'S OWN OPTION LISTS. These are the values mcode said it will ACCEPT, which
      is why the settings below are selects and not text fields: the set is closed, and a
      typed value would be refused. Both were already arriving and being discarded. */
-  const config = useChat((s) => selectStreaming(s)?.acpConfig ?? []);
+  // `?? NO_CONFIG`, never `?? []`: see the comment on NO_CONFIG.
+  const config = useChat((s) => selectStreaming(s)?.acpConfig ?? NO_CONFIG);
   const settingsBusy = busy;
 
   const blocked = controlAvailability(harness, transport, hasSession);
