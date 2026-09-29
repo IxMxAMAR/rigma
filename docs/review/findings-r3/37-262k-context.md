@@ -203,7 +203,7 @@ is the shipped source.
 
 Rigma does not need to change its symmetric rule; the comments in `models.py`, `serve.py` and
 `resolve.py` now give the per-backend reason instead of the false universal one (`6e916e5`). The
-cache LADDER did have to change, and did not: `_cache_candidates` still offered q5_1 on ROCm/CUDA
+cache LADDER, however, did need to change: `_cache_candidates` still offered q5_1 on ROCm/CUDA
 until round 2 (`08b029b`, §4 and §6a). Metal is the third case and is now verified: at `87268f77`,
 `ggml_metal_device_supports_op` (`ggml-metal-device.m:1618-1638`) accepts q8_0/q5_1/q4_0 and
 requires `K.type == V.type`, so the full ladder is safe there too.
