@@ -315,7 +315,7 @@ def _budgets(profile: HardwareProfile,
 
 
 def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
-             ctx: int, explain: list[str]) -> ComboFlags | None:
+             ctx: int, explain: list[str], backend: str = "") -> ComboFlags | None:
     usable_vram, usable_ram = _budgets(profile)
     # Two passes, and the order matters: try EVERY cache type fully on the GPU
     # before letting any of them spill weights to RAM. Quantising the cache
@@ -324,7 +324,7 @@ def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     # q8_0-fully-resident, which is strictly the worse trade.
     for strict in (True, False):
         best = None
-        for k, v in _cache_candidates(spec):
+        for k, v in _cache_candidates(spec, backend):
             got = _fit_with_cache(spec, gguf, profile, ctx, k, v,
                                   usable_vram, usable_ram, explain, strict)
             if got is None:
@@ -348,20 +348,20 @@ def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
             # A PINNED policy (the Models-page explorer's "what if the cache
             # were q4_0") is allowed to spill — that is the question it was
             # asked. Say so when a rung the pin removed would have fit fully,
-            # because the alternative is a silent ~4x slowdown: on the owner's
-            # 64-layer hybrid, 7 CPU-resident layers measure 12.6 t/s against
-            # 54.5 all-GPU (findings-r3/36). The plan is unchanged — only the
-            # reason it is slow is now written down where `rigma plan` shows it.
+            # because the alternative is a silent slowdown. The measured size of
+            # that slowdown is model-specific and lives in the findings doc, not
+            # in this string: this line reports the CPU layer count and lets the
+            # number speak for the plan in front of the user.
             if spec.cache_type_policy.pinned and spec.moe is None \
                     and _spilled(spec, best) > 0:
                 rung = _resident_rung(spec, gguf, profile, ctx, usable_vram,
-                                      usable_ram)
+                                      usable_ram, backend)
                 if rung is not None:
                     cpu = _cpu_layers(spec, best)
                     explain.append(
                         f"pinned {spec.cache_type_policy.k} at ctx {ctx} puts "
-                        f"{cpu} of {spec.n_layers} layers on the CPU "
-                        f"(~4x slower); {rung.cache_type_k} fits fully on the GPU")
+                        f"{cpu} of {spec.n_layers} layers on the CPU; "
+                        f"{rung.cache_type_k} fits fully on the GPU")
             return best
     return None
 
@@ -384,7 +384,7 @@ def _cpu_layers(spec: ModelSpec, flags: ComboFlags) -> int:
 
 def _resident_rung(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
                    ctx: int, usable_vram: float,
-                   usable_ram: float) -> ComboFlags | None:
+                   usable_ram: float, backend: str = "") -> ComboFlags | None:
     """The most precise UNPINNED cache that is fully resident at `ctx`, or None.
 
     Only used to explain a pinned spill, so it takes the strict pass directly
@@ -392,7 +392,7 @@ def _resident_rung(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     unpinned = spec.model_copy(update={
         "cache_type_policy": spec.cache_type_policy.model_copy(
             update={"pinned": False})})
-    for k, v in _cache_candidates(unpinned):
+    for k, v in _cache_candidates(unpinned, backend):
         got = _fit_with_cache(unpinned, gguf, profile, ctx, k, v, usable_vram,
                               usable_ram, [], strict=True)
         if got is not None:
@@ -412,19 +412,94 @@ def _spilled(spec: ModelSpec, flags: ComboFlags) -> float:
     return (min(flags.n_cpu_moe, n) / n) * spec.moe.expert_weight_fraction
 
 
-def _cache_candidates(spec: ModelSpec):
-    """Cache types to try, best quality first.
+# Fused flash-attention KV cache types, per backend, from the engines' source.
+#
+# The ladder below steps q8_0 -> q5_1 -> q4_0, but a rung is only a WIN if the
+# backend can run attention over that cache on the GPU. Where it cannot,
+# llama.cpp does not fail: with `-fa on` (Rigma's default) the unsupported node
+# is assigned to the CPU backend and attention runs there SILENTLY (the
+# scheduler falls back; the CPU backend's supports_op returns true), so a plan
+# that reads "fully on the GPU" can still be paying CPU attention on every
+# token.
+#
+#   vulkan   ggml-vulkan.cpp at 87268f77: two INDEPENDENT `fa_kv_ok` calls
+#            (18321-18339) accept {F32,F16,BF16,Q8_0,Q5_1,Q5_0,Q4_1,Q4_0}; only a
+#            BF16/non-BF16 mix is rejected. Mainline b9867's Vulkan build has
+#            the same list (verified) and is the other engine installed here, so
+#            the full ladder is safe.
+#   cuda/hip ggml-cuda/fattn.cu at 87268f77: `ggml_cuda_fattn_kv_type_supported`
+#            returns false for Q4_1/Q5_0/Q5_1 (338-356), and without
+#            GGML_CUDA_FA_ALL_QUANTS it returns NONE for K->type != V->type
+#            (442-446). That macro defaults OFF (ggml/CMakeLists.txt) and the
+#            shipped PrismML HIP binary does not define it (checked in the
+#            binary). Rigma never builds an engine — it downloads a prebuilt
+#            release (runtime.ENGINE_URL_ALLOWLIST) or uses a registered one —
+#            so it cannot turn the macro on. Only f16/bf16/q8_0/q4_0 fuse.
+#   metal    ggml-metal-device.m at 87268f77: `ggml_metal_device_supports_op`
+#            accepts {F32,F16,Q8_0,Q4_0,Q4_1,Q5_0,Q5_1, BF16 iff has_bfloat}
+#            (1618-1635) and REQUIRES K.type == V.type (1636-1638). Wider than a
+#            default CUDA build, and Rigma is always symmetric, so the full
+#            ladder is safe there.
+#   cpu      no separate FA backend — attention is CPU work either way.
+#   ""       unknown/not threaded: keep the historical ladder, so a caller that
+#            does not know its backend cannot make a plan WORSE than before.
+_FA_KV_FULL = ("f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0")
+_FA_KV_CUDA = ("f16", "bf16", "q8_0", "q4_0")
+_FA_KV_BY_BACKEND = {"rocm": _FA_KV_CUDA, "hip": _FA_KV_CUDA, "cuda": _FA_KV_CUDA}
+
+
+def _fa_kv_types(backend: str) -> tuple[str, ...]:
+    """KV cache types `backend`'s fused flash-attention kernel accepts."""
+    return _FA_KV_BY_BACKEND.get((backend or "").lower(), _FA_KV_FULL)
+
+
+def fa_kv_supported(backend: str, kv: str) -> bool:
+    """True when `kv` has a fused flash-attention kernel on `backend`."""
+    return (kv or "").lower() in _fa_kv_types(backend)
+
+
+def step_down_notice(stepped: str, backend: str, used: str, ctx: int) -> str:
+    """One sentence for a cache type the fit could not honour as asked.
+
+    Two different reasons, because the fix the user reaches for is different:
+    a type that does not FIT is a memory question, a type the backend cannot
+    FUSE is a backend question."""
+    if not fa_kv_supported(backend, stepped):
+        return (f"{stepped} has no fused flash-attention on {backend}; using "
+                f"{used} with every layer on the GPU")
+    return (f"{stepped} does not fit fully at ctx {ctx:,}; using {used} with "
+            f"every layer on the GPU")
+
+
+def _cache_candidates(spec: ModelSpec, backend: str = ""):
+    """Cache types to try, best quality first, on THIS backend.
 
     The policy default (f16) is tried first, then q8_0. q8_0 stores 32 values as
     int8 plus one f16 scale — 1.0625 bytes/element vs 2.0, so it HALVES the KV
     cache for ~8.5 effective bits. That is far more precision than the weights
     themselves carry (Q6_K ~6.5 bits, IQ3_M ~3.5), so it is not the accuracy
     bottleneck — but dropping context to 8K to protect it very much is a real
-    cost. Trying it before giving up context is close to free."""
+    cost. Trying it before giving up context is close to free.
+
+    A rung the backend cannot FUSE is not a rung: it moves attention to the CPU
+    without saying so (see the table above). Those are dropped, INCLUDING a
+    requested type — the fit then lands on the most precise rung that actually
+    runs on the GPU, and the caller reports the step-down (`step_down_notice`).
+    """
     k, v = spec.cache_type_policy.k, spec.cache_type_policy.v
-    if spec.cache_type_policy.pinned:
+    allowed = _fa_kv_types(backend)
+    ladder = [(a, b) for a, b in (("q8_0", "q8_0"), ("q5_1", "q5_1"),
+                                  ("q4_0", "q4_0")) if a in allowed]
+    # The requested pair can be answered as asked only if this backend can fuse
+    # it. When it cannot, the request is not answerable at all — pinning the
+    # SUBSTITUTE would ask "what if q8_0" of a user who asked for q5_1, and on a
+    # tight context would then report a spill the ladder exists to avoid. So an
+    # unsupported request falls through to the ladder, which steps to the most
+    # precise rung that actually fits.
+    requested_ok = k in allowed and v in allowed
+    if spec.cache_type_policy.pinned and requested_ok:
         return [(k, v)]          # explorer: answer the question that was asked
-    out = [(k, v)]
+    out = [(k, v)] if requested_ok else []
     # Down to q5_1 and q4_0 before giving up and spilling weights. The ladder
     # used to stop at q8_0, so a 27B at 64K "did not fit" and nine of its
     # sixty-four layers went to the CPU — while q5_1 fit on the GPU with room
@@ -432,8 +507,8 @@ def _cache_candidates(spec: ModelSpec):
     # day, offloading half a gigabyte cost 60% of throughput (32.47 -> 15.86
     # tok/s) and 80% of prefill. One more step of cache quantisation costs a
     # fraction of a percent of perplexity. The trade is not close.
-    for step in (("q8_0", "q8_0"), ("q5_1", "q5_1"), ("q4_0", "q4_0")):
-        if step != (k, v):
+    for step in ladder:
+        if step not in out:
             out.append(step)
     return out
 
@@ -496,7 +571,7 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
 
 def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
                    ctx: int, *, kv: str = "", vision: bool = True,
-                   spec_type: str = "", n_max: int = 0,
+                   spec_type: str = "", n_max: int = 0, backend: str = "",
                    explain: list[str] | None = None
                    ) -> tuple[ComboFlags | None, str]:
     """The fit a LAUNCH will actually run: `(flags, stepped_down_from)`.
@@ -512,6 +587,12 @@ def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     back, and `-ngl 99` paged 622MB to system RAM with no error printed
     (Windows/WDDM). Fitting it in removes the window in which the plan and the
     argv can disagree about the cache.
+
+    `backend` also removes rungs the backend cannot FUSE (ROCm/CUDA: q5_1 is
+    not a flash-attention type without GGML_CUDA_FA_ALL_QUANTS, and with
+    `-fa on` the unsupported node runs on the CPU silently). A requested type
+    that is unsupported steps to the most precise supported rung, and the
+    caller reports it with `step_down_notice`.
 
     A stored spec is never PINNED — `CachePolicy.pinned` is the Models-page
     explorer's knob ("answer the question that was asked") and a real launch
@@ -531,7 +612,7 @@ def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
             "cache_type_policy": fit.cache_type_policy.model_copy(
                 update={"pinned": False})})
     flags = fit_gguf(fit, gguf, profile, ctx,
-                     explain if explain is not None else [])
+                     explain if explain is not None else [], backend=backend)
     stepped = kv if (kv and flags is not None
                      and flags.cache_type_k != kv) else ""
     return flags, stepped
@@ -565,7 +646,7 @@ def _backend(profile: HardwareProfile, override: str | None = None) -> str:
 
 def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
               flags: ComboFlags, explain: list[str],
-              layer_budget: float = 0.0) -> ComboFlags:
+              layer_budget: float = 0.0, backend: str = "") -> ComboFlags:
     """Calculator plans only: double ctx while it still fits, up to native.
 
     CTX_DEFAULT is a starting probe, not a ceiling (owner finding 2026-07-16:
@@ -573,7 +654,7 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     best = start = flags
     ctx = best.ctx * 2
     while ctx <= spec.native_ctx:
-        grown = fit_gguf(spec, gguf, profile, ctx, explain)
+        grown = fit_gguf(spec, gguf, profile, ctx, explain, backend=backend)
         if grown is None:
             break
         # dense: fewer GPU layers is a real per-token cost, so stop before the
@@ -620,7 +701,7 @@ def _grow_ctx(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
 
 def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
                    kv: str = "", vision: bool = True,
-                   grow: str = "speed") -> list[dict]:
+                   grow: str = "speed", backend: str = "") -> list[dict]:
     """Per-quant verdicts, with the three things that were fixed constants.
 
     Every number this returned was computed under one hidden configuration —
@@ -644,6 +725,10 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
     between two screens is worse than none.
     """
     spec = _configured(spec, kv=kv, vision=vision)
+    # The explorer answers for a BACKEND, because the cache types that can be
+    # fused differ per backend and the page is one click from a launch. Default
+    # to the one a launch would pick.
+    be = backend or _backend(profile)
     usable_vram, _ = _budgets(profile)
     mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
     out = []
@@ -657,11 +742,12 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
     for g in spec.ggufs:
         flags = None
         for ctx in ladder:
-            flags = fit_gguf(spec, g, profile, ctx, [])
+            flags = fit_gguf(spec, g, profile, ctx, [], backend=be)
             if flags:
                 flags = _grow_ctx(spec, g, profile, flags, [],
                                   layer_budget=(_GROW_LAYER_BUDGET
-                                                if grow == "context" else 0.0))
+                                                if grow == "context" else 0.0),
+                                  backend=be)
                 break
         if flags is None:
             out.append({"ok": False, "speed": "no", "offload_pct": 100,
@@ -690,14 +776,19 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
         # reason. Same fact as the explain line in fit_gguf, on the surface the
         # owner actually reads.
         note = ""
+        # A requested type this backend cannot fuse is answered with the rung it
+        # stepped to, and said out loud — otherwise the page shows a q8_0
+        # verdict under a q5_1 heading.
+        if kv and not fa_kv_supported(be, kv.split(",", 1)[0].strip()):
+            note = (f"{kv} has no fused flash-attention on {be}; showing "
+                    f"{flags.cache_type_k}")
         if spec.cache_type_policy.pinned and spec.moe is None and spill > 0:
             rung = _resident_rung(spec, g, profile, flags.ctx, usable_vram,
-                                  _budgets(profile)[1])
+                                  _budgets(profile)[1], be)
             if rung is not None:
                 note = (f"{flags.cache_type_k} spills at ctx {flags.ctx} "
                         f"({_cpu_layers(spec, flags)} of {spec.n_layers} layers "
-                        f"on the CPU, ~4x slower); {rung.cache_type_k} fits "
-                        f"fully on the GPU")
+                        f"on the CPU); {rung.cache_type_k} fits fully on the GPU")
         row = {"ok": True, "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe,
                "ngl": flags.ngl, "kv": flags.cache_type_k,
                "kv_v": flags.cache_type_v,
@@ -859,11 +950,15 @@ def _calculate(profile: HardwareProfile, registry: Registry,
             ctx = min(CTX_DEFAULT.get(use_case, 16384), spec.native_ctx)
             floor = _ctx_floor(spec)
             while ctx >= floor:
-                flags = fit_gguf(spec, gguf, profile, ctx, explain)
+                # The backend decides which cache rungs can actually be FUSED,
+                # so it has to be known before the fit, not after it.
+                be = _backend(profile, backend)
+                flags = fit_gguf(spec, gguf, profile, ctx, explain, backend=be)
                 if flags:
-                    flags = _grow_ctx(spec, gguf, profile, flags, explain)
+                    flags = _grow_ctx(spec, gguf, profile, flags, explain,
+                                      backend=be)
                     return RunPlan(model_slug=spec.slug, gguf=gguf,
-                                   backend=_backend(profile, backend),
+                                   backend=be,
                                    flags=flags,
                                    origin="calculator", explain=explain)
                 ctx = _next_ctx_rung(ctx, floor)
@@ -882,7 +977,8 @@ def fallback_plans(plan: RunPlan, registry: Registry,
             flags = None
             floor = _ctx_floor(spec)
             while ctx >= floor and flags is None:
-                flags = fit_gguf(spec, gguf, profile, ctx, explain)
+                flags = fit_gguf(spec, gguf, profile, ctx, explain,
+                                 backend=plan.backend)
                 if flags is None:
                     ctx = _next_ctx_rung(ctx, floor)
             if flags is not None:
@@ -932,7 +1028,8 @@ def _combo_rejection(combo, spec: ModelSpec, gguf: GgufFile,
                     f"machine has {usable_ram:.0f}MB")
     # Even with no declared budget the PLACEMENT has to still exist: the combo's
     # own ctx may no longer be placeable at all on this machine right now.
-    if fit_gguf(spec, gguf, profile, combo.flags.ctx, []) is None:
+    if fit_gguf(spec, gguf, profile, combo.flags.ctx, [],
+                backend=combo.backend) is None:
         return (f"its ctx {combo.flags.ctx} can no longer be placed in "
                 f"{usable_vram:.0f}MB usable VRAM")
     return ""

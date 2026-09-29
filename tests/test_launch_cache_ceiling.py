@@ -26,8 +26,9 @@ from rigma import state as st
 from rigma.models import (CachePolicy, CpuInfo, GgufFile, GpuInfo,
                           HardwareProfile, LaunchDefaults, ModelSpec)
 from rigma.registry import Registry
-from rigma.resolve import (_budgets, fit_for_launch, fit_gguf,
-                           kv_bytes_per_token, quant_verdicts)
+from rigma.resolve import (_budgets, _calculate, _cache_candidates,
+                           fit_for_launch, fit_gguf, kv_bytes_per_token,
+                           quant_verdicts, step_down_notice)
 
 SLUG = "ternary-bonsai-2-27b-uncensored-heretic-pq2-0"
 FILE_BYTES = 7206168928
@@ -73,6 +74,9 @@ def test_a_pinned_policy_that_spills_names_the_rung_that_fits():
     line = next(e for e in explain if "pinned" in e)
     assert "7 of 64 layers" in line            # ngl counts the output layer
     assert "q5_1 fits fully on the GPU" in line
+    # the size of the slowdown is one model's measurement; generic output must
+    # not restate it as a universal multiplier
+    assert "~4x" not in line
 
 
 def test_an_unpinned_spec_does_not_get_the_warning():
@@ -90,6 +94,7 @@ def test_quant_verdicts_carries_the_same_fact():
     assert v["ctx"] == 262144 and v["kv"] == "q8_0"
     assert "q5_1 fits fully on the GPU" in v.get("note", "")
     assert "7 of 64 layers" in v["note"]
+    assert "~4x" not in v["note"]
 
 
 # --- the launch fit (the shared ceiling rule) ---------------------------------
@@ -201,3 +206,101 @@ def test_the_stored_spec_is_not_mutated(env):
     before = json.dumps(spec.model_dump(), sort_keys=True)
     server_ops.perform_switch(SLUG, reg, _profile())
     assert json.dumps(reg.models[SLUG].model_dump(), sort_keys=True) == before
+
+
+# --- the ladder is backend-aware ----------------------------------------------
+#
+# `-fa on` with a KV type the backend has no flash-attention kernel for does not
+# fail: the scheduler puts the node on the CPU backend and attention runs there
+# silently. So a rung is only a rung if the launch backend can FUSE it.
+#
+#   vulkan  ggml-vulkan.cpp 87268f77: two independent fa_kv_ok calls accept
+#           q8_0/q5_1/q4_0 (mainline b9867 identical — verified).
+#   rocm    ggml-cuda/fattn.cu: `ggml_cuda_fattn_kv_type_supported` returns
+#           false for q4_1/q5_0/q5_1, and the shipped PrismML HIP build does not
+#           define GGML_CUDA_FA_ALL_QUANTS. Only f16/bf16/q8_0/q4_0 fuse.
+#   metal   ggml-metal-device.m: accepts q5_1 too (and requires K == V).
+
+def test_the_ladder_drops_rungs_the_backend_cannot_fuse():
+    spec = _spec(pinned=False)
+    assert _cache_candidates(spec, "vulkan") == [
+        ("q8_0", "q8_0"), ("q5_1", "q5_1"), ("q4_0", "q4_0")]
+    for backend in ("rocm", "hip", "cuda"):
+        assert _cache_candidates(spec, backend) == [
+            ("q8_0", "q8_0"), ("q4_0", "q4_0")], backend
+
+
+def test_an_unverified_backend_keeps_the_historical_ladder():
+    """Metal accepts q5_1 (verified); an unknown backend must not silently get a
+    NARROWER ladder than before this change."""
+    spec = _spec(pinned=False)
+    for backend in ("metal", "cpu", ""):
+        assert ("q5_1", "q5_1") in _cache_candidates(spec, backend), backend
+
+
+def test_vulkan_at_262144_keeps_q5_1_and_rocm_steps_to_q4_0():
+    """The owner's numbers: 16GB card, model 6872MB, ctx 262144. On Vulkan q5_1
+    fuses and fits fully (13,016MB against 14,954MB); on ROCm it cannot fuse, so
+    the fit lands on q4_0 rather than putting attention on the CPU."""
+    spec, prof = _spec(pinned=False), _profile()
+    budget, _ = _budgets(prof)
+    vk, vstep = fit_for_launch(spec, spec.ggufs[0], prof, 262144, kv="q8_0",
+                               vision=False, backend="vulkan")
+    assert (vk.cache_type_k, vk.cache_type_v, vk.ngl) == ("q5_1", "q5_1", 99)
+    assert vstep == "q8_0"
+    assert _model_plus_kv_mb(spec, vk) <= budget
+    rc, rstep = fit_for_launch(spec, spec.ggufs[0], prof, 262144, kv="q8_0",
+                               vision=False, backend="rocm")
+    assert (rc.cache_type_k, rc.cache_type_v, rc.ngl) == ("q4_0", "q4_0", 99)
+    assert rstep == "q8_0"
+    assert _model_plus_kv_mb(spec, rc) <= budget
+
+
+def test_an_unfusible_requested_type_is_reported_as_a_fusion_step_down():
+    spec, prof = _spec(pinned=False), _profile()
+    flags, stepped = fit_for_launch(spec, spec.ggufs[0], prof, 262144,
+                                    kv="q5_1", vision=False, backend="rocm")
+    assert stepped == "q5_1" and flags.cache_type_k == "q4_0"
+    msg = step_down_notice(stepped, "rocm", flags.cache_type_k, 262144)
+    assert "no fused flash-attention on rocm" in msg
+    # ...while a memory step-down still reads as a memory reason
+    mem = step_down_notice("q8_0", "vulkan", "q5_1", 262144)
+    assert "does not fit fully" in mem and "flash-attention" not in mem
+    # the same request on a backend that CAN fuse it is honoured as asked
+    ok, step2 = fit_for_launch(spec, spec.ggufs[0], prof, 262144, kv="q5_1",
+                               vision=False, backend="vulkan")
+    assert step2 == "" and ok.cache_type_k == "q5_1"
+
+
+def test_the_explorer_reports_the_substitution_not_a_pinned_spill():
+    """A pinned q5_1 on ROCm must not pin the q8_0 SUBSTITUTE and then report a
+    spill the ladder exists to avoid."""
+    spec, prof = _spec(pinned=True), _profile()
+    row = quant_verdicts(spec, prof, kv="q5_1", vision=False, grow="context",
+                         backend="rocm")[0]
+    assert row["kv"] == "q4_0" and row["ngl"] == 99
+    assert "no fused flash-attention on rocm" in row.get("note", "")
+    # ...and a SUPPORTED pinned type still answers exactly what was asked
+    vk = quant_verdicts(spec, prof, kv="q5_1", vision=False, grow="context",
+                        backend="vulkan")[0]
+    assert vk["kv"] == "q5_1" and vk["ngl"] == 99
+
+
+def test_calculate_picks_the_backend_supported_rung():
+    spec, prof = _spec(pinned=False), _profile()
+    reg = Registry([], {SLUG: spec}, {})
+    for backend, want in (("vulkan", "q5_1"), ("rocm", "q4_0")):
+        plan = _calculate(prof, reg, "general", backend)
+        assert plan.backend == backend
+        assert plan.flags.cache_type_k == want and plan.flags.ngl == 99
+
+
+def test_perform_switch_threads_the_backend_into_the_fit(env):
+    """The launch path must not just accept `backend` — it must fit with it."""
+    reg, seen = env
+    out = server_ops.perform_switch(SLUG, reg, _profile(), ctx=262144,
+                                    kv="q5_1", backend="rocm")
+    f = seen["plan"].flags
+    assert f.cache_type_k == "q4_0" and f.ngl == 99
+    assert "no fused flash-attention on rocm" in out.get("notice", "")
+    assert out["kv_cache"] == "q4_0"

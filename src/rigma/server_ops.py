@@ -666,7 +666,7 @@ def perform_switch(model: str, registry=None, profile=None,
     if ctx is not None:
         # honest relaunch at a requested context: real fit math, not hope.
         # rp.flags.ctx is the calculator's grow-to-fit maximum for this quant.
-        from .resolve import fit_for_launch
+        from .resolve import fit_for_launch, step_down_notice
         want = max(2048, min(int(ctx), spec_full.native_ctx))
         # The requested cache type — an explicit `kv`, or the model's stored
         # launch default — is a CEILING, fitted in BEFORE the placement is
@@ -675,10 +675,13 @@ def perform_switch(model: str, registry=None, profile=None,
         # 16GB card, ctx 262144 + q8_0 is 15,576MB against a 14,954MB budget, so
         # the resolver's fully-resident q5_1 was overwritten by q8_0 and
         # `-ngl 99` paged 622MB to system RAM with no error printed (WDDM).
+        # `backend` matters too: on ROCm/CUDA a q5_1 cache has no fused
+        # flash-attention kernel, and `-fa on` would run attention on the CPU
+        # without saying so.
         flags, stepped = fit_for_launch(
             spec_full, rp.gguf, p, want, kv=kv or "", vision=vision,
             spec_type=rp.flags.spec_type, n_max=rp.flags.spec_n_max,
-            explain=rp.explain)
+            backend=rp.backend, explain=rp.explain)
         if flags is None:
             raise RuntimeError(
                 f"ctx {want:,} doesn't fit — {model} ({rp.gguf.quant}) tops "
@@ -691,8 +694,8 @@ def perform_switch(model: str, registry=None, profile=None,
         update.update(_measured_placement(rp, want))
         rp.flags = rp.flags.model_copy(update=update)
         if stepped:
-            notice = (f"{stepped} does not fit fully at ctx {want:,}; launched "
-                      f"with {flags.cache_type_k} and every layer on the GPU")
+            notice = step_down_notice(stepped, rp.backend, flags.cache_type_k,
+                                      want)
             rp.explain.append(notice)
     else:
         # No ctx asked for, so the plan is the resolver's — which priced the
@@ -703,11 +706,11 @@ def perform_switch(model: str, registry=None, profile=None,
         # resolver priced the spec's policy, not the request.
         fit_spec, differs = launch_fit_spec(spec_full, rp.flags, vision=vision)
         if differs or kv is not None:
-            from .resolve import fit_for_launch
+            from .resolve import fit_for_launch, step_down_notice
             got, stepped = fit_for_launch(
                 spec_full, rp.gguf, p, rp.flags.ctx, kv=kv or "", vision=vision,
                 spec_type=rp.flags.spec_type, n_max=rp.flags.spec_n_max,
-                explain=rp.explain)
+                backend=rp.backend, explain=rp.explain)
             if got is not None:
                 update = {"ngl": got.ngl, "n_cpu_moe": got.n_cpu_moe,
                           "cache_type_k": got.cache_type_k,
@@ -721,9 +724,8 @@ def perform_switch(model: str, registry=None, profile=None,
                 update.update(_measured_placement(rp, rp.flags.ctx))
                 rp.flags = rp.flags.model_copy(update=update)
                 if stepped:
-                    notice = (f"{stepped} does not fit fully at ctx "
-                              f"{rp.flags.ctx:,}; launched with "
-                              f"{got.cache_type_k} and every layer on the GPU")
+                    notice = step_down_notice(stepped, rp.backend,
+                                              got.cache_type_k, rp.flags.ctx)
                     rp.explain.append(notice)
     # NOTE: the requested `kv` is deliberately NOT re-applied here. It was
     # fitted in above; forcing it afterwards is the bug this ordering removes.
