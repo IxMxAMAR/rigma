@@ -48,6 +48,55 @@ def emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
+# The root's id does not exist when the members are seeded, so the two top-level members
+# carry this and `session/new` resolves it.
+ROOT_PLACEHOLDER = "\x00root"
+
+
+def _snapshot(state: dict) -> dict:
+    """The delegation snapshot, with the root placeholder resolved to the real session id.
+
+    Built HERE rather than resolved once at `session/new`, because a process that RESUMES a
+    session never runs `session/new` — and every control operation runs in its own process.
+    """
+    members = []
+    for m in state["members"]:
+        m = dict(m)
+        if m.get("parentSessionId") == ROOT_PLACEHOLDER:
+            m["parentSessionId"] = state["sessionId"]
+        members.append(m)
+    return {"schemaVersion": 1, "rootSessionId": state["sessionId"], "members": members}
+
+
+def _seed_members(state: dict, flag: str) -> None:
+    """Populate the delegation ledger when asked, from mcode's MEASURED member shape.
+
+    `Se(e)` in mcode's `chunks/chunk-M5QJG5VT.js` emits
+    {sessionId, parentSessionId, agentName?, task?, status, backgroundTaskId?,
+     createdAtMs?, updatedAtMs?, errorMessage?} — note `task` holds the session's TITLE, and
+    the three `?` fields appear only when present. This builds a three-deep tree with one
+    failed member so the indentation, the status glyphs and the `errorMessage` span all have
+    something real to render.
+    """
+    if flag != "tree":
+        return
+    # `parentSessionId` is left EMPTY here on purpose: there is no session yet. The two
+    # top-level members name a placeholder that `session/new` resolves below, because a
+    # seeder that runs before the session exists cannot know its id — and seeding "" makes
+    # every member look top-level, which is the flat tree this is meant to disprove.
+    state["members"] = [
+        {"sessionId": "mvs_child", "parentSessionId": ROOT_PLACEHOLDER,
+         "agentName": "explore", "task": "map the call sites", "status": "running",
+         "createdAtMs": 1700000000000, "updatedAtMs": 1700000001000},
+        {"sessionId": "mvs_grandchild", "parentSessionId": "mvs_child",
+         "agentName": "worker", "task": "read the harness", "status": "queued"},
+        {"sessionId": "mvs_bg", "parentSessionId": ROOT_PLACEHOLDER,
+         "task": "background sweep", "status": "failed",
+         "backgroundTaskId": "bg-7",
+         "errorMessage": "the worker exited with code 3"},
+    ]
+
+
 def _load_state(path: str) -> dict:
     """The persisted session, or {} when there is none.
 
@@ -91,6 +140,8 @@ def main(argv: list[str]) -> int:
     resume_unknown = False
     record_path = ""
     state_path = ""
+    # "" keeps the tree EMPTY, which is what the existing tests assert.
+    delegation = ""
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -118,6 +169,13 @@ def main(argv: list[str]) -> int:
             state_path = argv[i + 1]
             i += 2
             continue
+        elif a == "--delegation" and i + 1 < len(argv):
+            # `--delegation tree` populates the members ledger. OFF by default, because the
+            # existing tests assert an EMPTY tree (`members == []`) and turning members on
+            # for every run would change what those tests mean without anyone deciding it.
+            delegation = argv[i + 1]
+            i += 2
+            continue
         elif a == "--resume-renames":
             resume_renames = True
         elif a == "--resume-unknown":
@@ -128,6 +186,7 @@ def main(argv: list[str]) -> int:
             continue
         i += 1
 
+    # Seeded AFTER the state exists, so the members can name it as their root.
     state = {"sessionId": "", "mode": modes[0] if modes else "default",
              "permission": "auto", "model": "m:custom_provider%3Arigma:local-test:v:thinking",
              "goal": None, "asked": 0, "queue": [], "members": [],
@@ -139,6 +198,7 @@ def main(argv: list[str]) -> int:
              # already carries the resumed sessionId, and `delegation_stop` requires a
              # `sessionId`, so the override had a natural-looking spelling.
              "named": [],
+             # The delegation ledger is seeded just below, once this dict exists.
              # THE GATE. mcode gates ALL FOUR extension notifications on the client
              # declaring this; it is not symmetric with the extension list it
              # advertises in the initialize RESPONSE. Reproduced here so the client's
@@ -183,6 +243,10 @@ def main(argv: list[str]) -> int:
     # than inside the request loop because a per-request save at the top of the body
     # records the state as of BEFORE the request, silently dropping the last change.
     atexit.register(lambda: _save_state(state_path, state))
+
+    # Populate the delegation ledger for the tests that ask for it. Seeded HERE, after the
+    # state dict exists, so the members can name the session as their root.
+    _seed_members(state, delegation)
 
     def ask(method: str, params: dict):
         """Send a SERVER-INITIATED request and block for its reply."""
@@ -256,6 +320,7 @@ def main(argv: list[str]) -> int:
 
         if method == "session/new":
             state["sessionId"] = "mvs_fake_session"
+            # Resolve the placeholder the seeded members carry, now that the root exists.
             emit({"jsonrpc": "2.0", "id": rid, "result": {
                 "sessionId": state["sessionId"],
                 "modes": {"currentModeId": state["mode"],
@@ -438,10 +503,8 @@ def main(argv: list[str]) -> int:
             # THE REAL SHAPE. It is a `snapshot` with `members`, not a `delegations`
             # list, and `AcpDelegation` in the UI is built from those member fields —
             # so the old shape was one no client could have been reading correctly.
-            emit({"jsonrpc": "2.0", "id": rid, "result": {"snapshot": {
-                "schemaVersion": 1,
-                "rootSessionId": state["sessionId"],
-                "members": list(state["members"])}}})
+            emit({"jsonrpc": "2.0", "id": rid, "result": {
+                "snapshot": _snapshot(state)}})
             continue
         if method == "mcode/session/delegation/stop":
             # THE MEASURED CONTRACT, which is NOT member-scoped. mcode's own handler is
@@ -465,20 +528,35 @@ def main(argv: list[str]) -> int:
                       "error": {"code": -32602,
                                 "message": f"Unknown session: {params.get('sessionId')}"}})
                 continue
+            # THE RECEIPT SHAPE IS MEASURED, not invented. mcode's `stop()` returns
+            # {schemaVersion, rootSessionId, rootStopped, stoppedSessionIds,
+            #  activeSessionIds, failedSessionIds} — there is no `stopped` array. This
+            # answered `{"receipt": {"stopped": [...]}}` and the client read the same
+            # invented field, so the two agreed with each other about a field the server
+            # does not have.
+            live = ("queued", "running", "unknown")
             stopped = [m["sessionId"] for m in state["members"]
-                       if m.get("status") in ("queued", "running", "unknown")]
+                       if m.get("status") in live]
+            # A member already marked `failed` cannot be stopped, which is the case that
+            # makes `failedSessionIds` non-empty and the result sentence honest.
+            failed = [m["sessionId"] for m in state["members"]
+                      if m.get("status") == "failed"]
             for member in state["members"]:
-                if member.get("status") in ("queued", "running", "unknown"):
+                if member.get("status") in live:
                     member["status"] = "stopped"
-            emit({"jsonrpc": "2.0", "id": rid,
-                  "result": {"receipt": {"stopped": stopped}}})
+            emit({"jsonrpc": "2.0", "id": rid, "result": {"receipt": {
+                "schemaVersion": 1,
+                "rootSessionId": state["sessionId"],
+                "rootStopped": True,
+                "stoppedSessionIds": stopped,
+                "activeSessionIds": [],
+                "failedSessionIds": failed,
+            }}})
             if state["extensions_enabled"]:
                 emit({"jsonrpc": "2.0",
                       "method": "mcode/session/delegation_update",
                       "params": {"sessionId": state["sessionId"],
-                                 "snapshot": {"schemaVersion": 1,
-                                              "rootSessionId": state["sessionId"],
-                                              "members": list(state["members"])}}})
+                                 "snapshot": _snapshot(state)}})
             continue
 
         if method == "session/cancel":
@@ -516,6 +594,15 @@ def main(argv: list[str]) -> int:
                                  "update": {"sessionUpdate": "agent_message_chunk",
                                             "content": {"type": "text",
                                                         "text": f"answer={json.dumps(answer)}"}}}})
+            # The delegation snapshot, when there is a tree. mcode pushes this MID-TURN
+            # whenever a delegation event occurs, which is the only way the panel ever
+            # learns about a member — so a double that only sends it on `delegation/stop`
+            # leaves the entire members path unexercised.
+            if state["members"] and state["extensions_enabled"]:
+                emit({"jsonrpc": "2.0",
+                      "method": "mcode/session/delegation_update",
+                      "params": {"sessionId": state["sessionId"],
+                                 "snapshot": _snapshot(state)}})
             emit({"jsonrpc": "2.0", "method": "session/update",
                   "params": {"sessionId": state["sessionId"],
                              "update": {"sessionUpdate": "agent_message_chunk",

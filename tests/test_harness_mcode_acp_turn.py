@@ -64,6 +64,132 @@ def test_a_turn_produces_text(fake_acp):
     assert text, f"a turn must produce text; got {[e.kind for e in events]}"
 
 
+def _map(update):
+    """Run one `session/update` through the mapper and return the events it produced.
+
+    `map_acp_update` takes the WHOLE notification frame and reads `params.update` itself.
+    """
+    return acp.map_acp_update(
+        {"method": "session/update", "params": {"update": update}})
+
+
+def test_all_three_plan_arms_are_handled():
+    """`PlanUpdateContent` is a THREE-way union and only two arms were drawn.
+
+    READ from `@agentclientprotocol/sdk@1.4.0`:
+
+        PlanUpdateContent = (PlanItems  & {type:"items"})
+                          | (PlanFile   & {type:"file"})
+                          | (PlanMarkdown & {type:"markdown"})
+
+    `PlanItems` carries `entries` and NEITHER `content` NOR `uri`, so the plan panel could
+    not draw it — and its entries were dropped rather than routed anywhere. mcode today
+    sends only `markdown`, which is why this looked fine: the defect is one conformant
+    server away, and the SDK is the authority this module already cites.
+    """
+    # markdown -> the plan panel, which draws `content`.
+    md = _map({"sessionUpdate": "plan_update",
+               "plan": {"type": "markdown", "planId": "p1", "content": "# Plan"}})
+    assert [e.event for e in md] == ["acp_plan"], [e.event for e in md]
+    assert md[0].data["content"] == "# Plan"
+
+    # file -> the plan panel too, which draws `uri`.
+    fl = _map({"sessionUpdate": "plan_update",
+               "plan": {"type": "file", "planId": "p1", "uri": "file:///p.md"}})
+    assert [e.event for e in fl] == ["acp_plan"], [e.event for e in fl]
+
+    # items -> the TODOS channel, the same place the SDK's sibling `plan` variant sends the
+    # same data. This is the arm that used to vanish.
+    it = _map({"sessionUpdate": "plan_update",
+               "plan": {"type": "items", "planId": "p1", "entries": [
+                   {"content": "first", "status": "completed"},
+                   {"content": "second", "status": "in_progress"}]}})
+    assert [e.event for e in it] == ["todos"], [e.event for e in it]
+    assert [t["content"] for t in it[0].data["todos"]] == ["first", "second"]
+    assert [t["status"] for t in it[0].data["todos"]] == ["completed", "in_progress"]
+
+
+def test_a_plan_update_with_no_plan_says_nothing():
+    """`or {}` used to make this emit `acpPlan = {}`, which is NON-NULL.
+
+    The outer panel gated on non-null and the inner one on a string `content`/`uri`, so the
+    container was drawn around a child that rendered nothing: a visible empty box. An update
+    carrying no plan has nothing to say, and saying nothing is the correct answer.
+    """
+    for empty in ({"sessionUpdate": "plan_update"},
+                  {"sessionUpdate": "plan_update", "plan": None},
+                  {"sessionUpdate": "plan_update", "plan": {}}):
+        events = _map(empty)
+        assert events == [], f"{empty} produced {[e.event for e in events]}"
+
+
+def test_a_real_delegation_tree_reaches_the_panel(fake_acp):
+    """The delegation path had NO end-to-end coverage: the fake always sent an empty list.
+
+    `Se(e)` in mcode's `chunks/chunk-M5QJG5VT.js` is the member mapper, so this drives the
+    fake's seeded tree through a real turn and checks that every field the panel reads
+    survives the trip — including `errorMessage`, which is emitted only when present and
+    which nothing in `tests/` had ever produced.
+    """
+    fake_acp["argv_extra"] = ["--delegation", "tree"]
+    state: dict = {}
+    _drive("hello", state=state)
+    delegations = [e for e in _drive("again", state=state)
+                   if e.kind == "state" and e.event == "acp_delegation"]
+    assert delegations, "the turn must surface the delegation snapshot"
+    snap = delegations[0].data
+    assert snap.get("schemaVersion") == 1, snap
+    assert snap.get("rootSessionId"), "the snapshot names its root"
+    members = {m["sessionId"]: m for m in snap["members"]}
+    assert set(members) == {"mvs_child", "mvs_grandchild", "mvs_bg"}, sorted(members)
+
+    # THE TREE. `parentSessionId` is what makes this a tree rather than a flat list, and it
+    # is emitted unconditionally by mcode.
+    assert members["mvs_child"]["parentSessionId"] == snap["rootSessionId"]
+    assert members["mvs_grandchild"]["parentSessionId"] == "mvs_child"
+
+    # `task` holds the session's TITLE, not an id.
+    assert members["mvs_child"]["task"] == "map the call sites"
+    # The status vocabulary, normalised by mcode.
+    assert members["mvs_child"]["status"] == "running"
+    assert members["mvs_bg"]["status"] == "failed"
+    # The two conditional fields. Both are REAL and neither had a producer in this repo.
+    assert members["mvs_bg"]["errorMessage"] == "the worker exited with code 3"
+    assert members["mvs_bg"]["backgroundTaskId"] == "bg-7"
+    # And they are absent, not empty, when the server did not send them.
+    assert "errorMessage" not in members["mvs_child"]
+    assert "backgroundTaskId" not in members["mvs_child"]
+
+
+def test_the_stop_receipt_names_what_it_stopped_and_what_it_could_not(fake_acp):
+    """The receipt shape is MEASURED, and the double used to invent a different one.
+
+    mcode's `stop()` returns `{schemaVersion, rootSessionId, rootStopped, stoppedSessionIds,
+    activeSessionIds, failedSessionIds}` — there is no `stopped`. The fake answered
+    `{"receipt": {"stopped": [...]}}` and the client read that same invented field, so the
+    two agreed with each other about a field the server does not have, and the UI reported
+    "all delegated work stopped" for every outcome.
+    """
+    fake_acp["argv_extra"] = ["--delegation", "tree"]
+    state: dict = {}
+    _drive("hello", state=state)
+    sid = state.get("session_id")
+    assert sid, "the first turn must establish a session"
+
+    from rigma import harness_mcode_acp as acp_mod
+    res = acp_mod.drive_control("delegation_stop", None, exe=sys.executable,
+                                session_id=sid, timeout=30.0)
+    receipt = (res or {}).get("result", {}).get("receipt")
+    assert receipt, res
+    # The names mcode actually uses.
+    assert "stopped" not in receipt, f"the invented field is back: {receipt}"
+    assert set(receipt["stoppedSessionIds"]) == {"mvs_child", "mvs_grandchild"}
+    # The member that had already FAILED is reported as unstoppable rather than counted as
+    # stopped — which is what makes the UI's partial-failure sentence possible.
+    assert receipt["failedSessionIds"] == ["mvs_bg"]
+    assert receipt["rootStopped"] is True
+
+
 def test_the_handshakes_own_option_list_reaches_the_ui(fake_acp):
     """The settings block is gated on this list, so it has to arrive on a turn.
 

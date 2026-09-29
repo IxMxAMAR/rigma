@@ -109,7 +109,11 @@ export const QUEUE_ACTIONS: RowAction[] = [
     // Only a message still WAITING can be promoted. A failed or completed one cannot, and
     // those rows stay in the list, so without this the button appears on rows where it
     // could only fail.
-    statuses: ["queued", "pending"],
+    // `queued` and `paused` are the two mcode's own TUI treats as actionable
+    // (`items.filter(r => r.status === "queued" || r.status === "paused")`). Its status
+    // normaliser emits exactly queued/running/completed/failed/stopped/unknown, so
+    // "pending" — which this said before — can never match anything.
+    statuses: ["queued", "paused"],
     hint: "Promote this queued message into the turn that is running NOW." },
   { op: "queue_delete", label: "drop", needs: "itemId", danger: true,
     hint: "Remove this message from the queue. It will never run." },
@@ -183,6 +187,76 @@ export function controlParams(spec: ControlOp, arg: string,
   return spec.arg === "objective" ? { objective: value } : { text: value };
 }
 
+/** Whether a plan payload is something the plan panel can actually draw.
+ *
+ *  ONE DEFINITION, used by BOTH the panel that draws the plan and the panel that decides
+ *  whether to draw its container. Those were two copies of this rule and they DISAGREED:
+ *  the child required a string `content` or `uri`, the parent only required non-null. A
+ *  plan object with neither passed the parent and failed the child, so the container was
+ *  drawn around nothing — a visible empty box.
+ *
+ *  ACP's `PlanUpdateContent` is a three-way union. `markdown` carries `content`, `file`
+ *  carries `uri`, and `items` carries NEITHER — it carries `entries`, which the mapper
+ *  routes to the todos channel instead. So "has neither" is a real, conformant case and not
+ *  only a malformed one.
+ */
+export function planIsRenderable(plan: Record<string, unknown> | null | undefined): boolean {
+  return plan != null
+    && (typeof plan.content === "string" || typeof plan.uri === "string");
+}
+
+/** The indent depth of each delegation member, so the tree can be DRAWN as one.
+ *
+ *  MEASURED: every member carries `parentSessionId` (mcode's `Se(e)` in
+ *  `chunks/chunk-M5QJG5VT.js` emits it unconditionally). The panel drew the list flat and
+ *  threw that away, so a child looked like a sibling of its parent.
+ *
+ *  Returns the depth of each member in the order given, where a member whose parent is not
+ *  in the list — or is the root — is depth 0. A CYCLE is impossible in mcode's own model
+ *  (its root-resolution walks the chain and throws on a cycle), but a malformed payload
+ *  could still contain one, so the walk is bounded by the list length and anything past
+ *  that depth is clamped. An unbounded walk on hostile input is a hang, and a hang in a
+ *  render is a frozen window.
+ */
+export function delegationDepths(
+  members: { sessionId?: unknown; parentSessionId?: unknown }[],
+): number[] {
+  const parentOf = new Map<string, string>();
+  const ids = new Set<string>();
+  for (const m of members) {
+    const id = typeof m.sessionId === "string" ? m.sessionId : "";
+    if (id) ids.add(id);
+    const parent = typeof m.parentSessionId === "string" ? m.parentSessionId : "";
+    if (id && parent) parentOf.set(id, parent);
+  }
+  const limit = members.length + 1;
+  return members.map((m) => {
+    let id = typeof m.sessionId === "string" ? m.sessionId : "";
+    let depth = 0;
+    // The set is seeded as the walk goes, at the TOP of each step, so the starting node is
+    // on the path from the first iteration. Seeding it before the loop instead makes
+    // `!seen.has(id)` false immediately and every depth comes back 0 — the loop must be
+    // able to take its first step.
+    const seen = new Set<string>();
+    // Walk UP to the root, counting the links. The step is taken and COUNTED first, then the
+    // walk stops if it landed somewhere already on the path — checking before the step
+    // instead made a self-parent count as zero while a two-node cycle counted as one, and
+    // both are a single link back onto the path. `limit` is the backstop that keeps the
+    // bound true even if the data is stranger than a cycle.
+    while (id && parentOf.has(id) && !seen.has(id) && depth < limit) {
+      seen.add(id);
+      const parent = parentOf.get(id)!;
+      // A parent that is NOT itself a member is the root: the chain ends there. Checked
+      // BEFORE counting, so a top-level child indents by one and no more.
+      if (!ids.has(parent)) break;
+      id = parent;
+      depth += 1;
+      if (seen.has(parent)) break;
+    }
+    return depth;
+  });
+}
+
 /** The printable values of an ACP configOption's `options`, in order.
  *
  *  WHY THIS IS NOT INLINE IN THE COMPONENT. It used to be: the JSX checked
@@ -241,11 +315,24 @@ export function controlResultText(op: string, result: unknown): string {
     case "delegation_stop": {
       // Session-wide, so the sentence has to say so: a user who expected one child to stop
       // needs to know the whole tree did.
-      const stopped = (r.receipt as Record<string, unknown> | undefined)?.stopped;
-      const n = Array.isArray(stopped) ? stopped.length : null;
-      return n === null ? "all delegated work stopped"
-                        : n === 0 ? "nothing was still running"
-                                  : `stopped ${n} delegated ${n === 1 ? "task" : "tasks"}`;
+      //
+      // THE FIELD NAMES ARE MEASURED, not guessed. mcode's `stop()` returns
+      //   {schemaVersion, rootSessionId, rootStopped, stoppedSessionIds,
+      //    activeSessionIds, failedSessionIds}
+      // so there is no `receipt.stopped` — reading one reported "all delegated work
+      // stopped" for every outcome, including the one where nothing was running.
+      const rc = (r.receipt ?? {}) as Record<string, unknown>;
+      const n = (v: unknown) => (Array.isArray(v) ? v.length : null);
+      const stopped = n(rc.stoppedSessionIds);
+      const failed = n(rc.failedSessionIds);
+      if (stopped === null) return "all delegated work stopped";
+      if (stopped === 0) {
+        return failed ? `nothing was still running (${failed} could not be stopped)`
+                      : "nothing was still running";
+      }
+      const one = stopped === 1 ? "task" : "tasks";
+      return failed ? `stopped ${stopped} delegated ${one}; ${failed} could not be stopped`
+                    : `stopped ${stopped} delegated ${one}`;
     }
     case "queue_enqueue": {
       const pos = r.position;

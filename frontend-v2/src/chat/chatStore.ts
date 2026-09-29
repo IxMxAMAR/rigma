@@ -144,12 +144,30 @@ export interface StreamingTurn {
  *  `sessionId` and `status` unconditionally — so any of them may be absent — and
  *  passes timestamps through unmapped. Typing them as required would be a claim
  *  about a schema this side does not own. */
+/** One queued message.
+ *
+ *  MEASURED from mcode's queue-item mapper (`chunks/chunk-E2AN54L4.js`, `Tve(a)`):
+ *
+ *      {itemId, sessionId, status, ...source, ...reviewRequest, ...content,
+ *       ...attachments, ...modelInfo, ...createdAt, ...expiresAt, ...startedAt,
+ *       ...finishedAt, ...failedReason}
+ *
+ *  The timestamps are mcode's own names (`createdAt`, not `createdAtMs` — unlike the
+ *  delegation members, which use the `Ms` suffix). `failedReason` is real: mcode's TUI
+ *  renders it as "Couldn't send · <reason>" on a failed row. */
 export interface AcpQueueItem {
   itemId?: string;
   sessionId?: string;
   status?: string;
   content?: unknown;
+  /** Why the send failed. mcode's TUI shows this, so a row that only said "failed"
+   *  was withholding something the backend had already sent. */
   failedReason?: string;
+  source?: string;
+  createdAt?: unknown;
+  expiresAt?: unknown;
+  startedAt?: unknown;
+  finishedAt?: unknown;
   [k: string]: unknown;
 }
 
@@ -157,7 +175,22 @@ export interface AcpQueueItem {
  *
  *  `members[].task` is the member's title — the field is literally named `task`,
  *  which is worth knowing because `task` reads like an id. `status` is normalised
- *  by mcode to exactly one of queued/running/completed/failed/stopped/unknown. */
+ *  by mcode to exactly one of queued/running/completed/failed/stopped/unknown.
+ *
+ *  EVERY FIELD HERE IS MEASURED, not inferred, from mcode's own member mapper
+ *  (`chunks/chunk-M5QJG5VT.js`, `Se(e)`):
+ *
+ *      {sessionId, parentSessionId,
+ *       ...agentName ? {agentName} : {}, ...title ? {task: title} : {},
+ *       status: D(e.status),
+ *       ...purpose.startsWith("local-background-task:")
+ *           ? {backgroundTaskId: purpose.slice(len)} : {},
+ *       ...createdAtMs, ...updatedAtMs,
+ *       ...errorMessage ? {errorMessage} : {}}
+ *
+ *  The status normaliser `D(e)` maps EVERY raw status onto exactly those six values, and
+ *  `errorMessage` and `backgroundTaskId` are real — each is emitted only when present,
+ *  which is why a search for them in one bundle file finds nothing. */
 export interface AcpDelegation {
   schemaVersion?: number;
   rootSessionId?: string;
