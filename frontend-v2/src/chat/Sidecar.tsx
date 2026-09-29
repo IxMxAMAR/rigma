@@ -624,6 +624,11 @@ function SamplingCard() {
   // Read from the fetch below rather than fetched again — the control plane acts on an
   // mcode SESSION, and there is none until the first turn has run.
   const [mcodeSession, setMcpSession] = useState("");
+  /* Whether a turn is running anywhere. Used ONLY to notice the moment one ENDS, because
+     that is when mcode may have created (or renamed) this chat's backend session — and
+     the effect above is keyed on `currentId`, which a turn does not change. */
+  const anyStreaming = useChat(selectAnyStreaming);
+  const wasStreaming = useRef(false);
   const [menu, setMenu] = useState<HarnessInfo[]>([]);
   // The one backend that moved, if any. Only INSTALLED ones count: a backend
   // that is not here cannot have drifted, and reporting it would be noise.
@@ -676,6 +681,34 @@ function SamplingCard() {
       setDirty(false);
     }).catch(() => {});
   }, [currentId]);
+
+  // R7-CONTROL-SESSION: the backend session id is CREATED BY A TURN, and a turn does not
+  // change `currentId` — so the effect above never re-ran and the control panel stayed
+  // blocked with "it appears after the first turn" for the life of the chat, describing a
+  // transition it could not observe.
+  //
+  // Read on the streaming -> idle edge, which is exactly when a turn has finished. A
+  // separate, minimal fetch rather than widening the effect above: that one also reloads
+  // the sampling fields and the system prompt, and re-running it on every turn end would
+  // wipe whatever the user is typing into them.
+  useEffect(() => {
+    const was = wasStreaming.current;
+    wasStreaming.current = anyStreaming;
+    if (!currentId || anyStreaming || !was) return;
+    let live = true;
+    api.getSession(currentId)
+      .then((s) => {
+        if (!live) return;
+        const hs = (s as unknown as { harness_sessions?: Record<string, string> })
+          .harness_sessions;
+        const id = String(hs?.mcode ?? "");
+        // Only when it CHANGED, so a chat with no mcode session does not re-render the
+        // panel on every turn.
+        setMcpSession((prev) => (prev === id ? prev : id));
+      })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [anyStreaming, currentId]);
 
   // A grant is a real write, so it is NOT fire-and-forget: the server refuses
   // a bad value and the checkbox must not keep showing a permission the chat

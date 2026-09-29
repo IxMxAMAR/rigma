@@ -7,11 +7,13 @@ import {
   controlAvailability,
   controlOpError,
   controlParams,
+  controlReady,
   controlResultText,
   type ControlOp,
 } from "./controlPlane";
 
-/** The empty option list, as ONE frozen array.
+/** The empty option list, as ONE shared array. It is NOT frozen — nothing mutates it,
+ *  and `Object.freeze` would only turn a future mistake into a throw.
  *
  *  NOT `?? []` INSIDE THE SELECTOR. zustand v5 compares a selector's result with
  *  `Object.is`, so returning a fresh array literal whenever no turn is streaming makes the
@@ -50,8 +52,9 @@ function optionLabel(o: unknown): string {
  *  or re-implement its validation — `controlOpError` mirrors the one rule that keeps a
  *  button disabled, and the server's allowlist is what actually decides. It also does not
  *  try to be a full console: the per-row actions (delete a queued message, steer a
- *  specific one, stop a specific delegate) belong on the rows that already carry those
- *  ids, not in a form.
+ *  specific one) belong on the rows that already carry those ids, not in a form. There is
+ *  no per-delegate action at all — `delegation_stop` is session-wide, which is why it is
+ *  in the operation list above rather than on a member row.
  *
  *  EVERY OPERATION IS A MUTATION, so the result is always shown. A button that appears
  *  to do nothing is indistinguishable from one that failed.
@@ -64,6 +67,8 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
 }) {
   const [op, setOp] = useState<ControlOp>(CONTROL_OPS[0]);
   const [arg, setArg] = useState("");
+  /** The chosen value for an operation whose parameter is a closed set. */
+  const [choice, setChoice] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState("");
   const [error, setError] = useState("");
@@ -73,10 +78,15 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
      typed value would be refused. Both were already arriving and being discarded. */
   // `?? NO_CONFIG`, never `?? []`: see the comment on NO_CONFIG.
   const config = useChat((s) => selectStreaming(s)?.acpConfig ?? NO_CONFIG);
+  const recordConfigOption = useChat((s) => s.setAcpConfigOption);
   const settingsBusy = busy;
 
   const blocked = controlAvailability(harness, transport, hasSession);
   const argError = controlOpError(op, arg);
+  // One gate for the button: text operations use `argError`, choice operations use the
+  // presence of a value. `controlReady` is the single place that decides, so the button
+  // and the send path cannot disagree about whether an operation is attemptable.
+  const ready = controlReady(op, arg, choice);
 
   /** Change one server-sent session option, and say what happened. */
   const setOption = async (optionId: string, value: string) => {
@@ -87,6 +97,14 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
     try {
       const r = await api.control(sessionId, "config_set", { optionId, value });
       setResult(controlResultText("config_set", r.result));
+      // RECORD IT, because nothing else will. The select reads the live turn's
+      // `acpConfig`, which is written only by a `config_option_update` notification —
+      // and a control operation runs on its OWN short-lived mcode process whose
+      // notifications nobody reads. So without this the change SUCCEEDS, the panel says
+      // "done", and the select snaps back to the old value and stays stale.
+      //
+      // After the await, so this records an accepted fact rather than a guess.
+      recordConfigOption(optionId, value);
     } catch (e) {
       setError(e instanceof Error ? e.message : "the change failed");
     } finally {
@@ -95,12 +113,12 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
   };
 
   const send = async () => {
-    if (argError || busy) return;
+    if (!ready || busy) return;
     setBusy(true);
     setResult("");
     setError("");
     try {
-      const r = await api.control(sessionId, op.op, controlParams(op, arg));
+      const r = await api.control(sessionId, op.op, controlParams(op, arg, choice));
       setResult(controlResultText(op.op, r.result));
       // Cleared only on success: a rejected goal should not also lose what was typed.
       if (op.arg) setArg("");
@@ -133,6 +151,7 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
                 if (next) {
                   setOp(next);
                   setArg("");
+                  setChoice("");
                   setResult("");
                   setError("");
                 }
@@ -145,6 +164,26 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
               ))}
             </select>
           </label>
+          {/* A CLOSED SET is a select, not a text field: the server defines the valid
+              values, and typing one would be a way to be refused. */}
+          {op.choices && (
+            <label className="flex items-center gap-2">
+              <span className="w-20 shrink-0 text-secondary">{op.choices.param}</span>
+              <select
+                value={choice || op.choices.values[0] || ""}
+                aria-label={`mcode control ${op.choices.param}`}
+                onChange={(e) => setChoice(e.target.value)}
+                className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12px]
+                           outline-none"
+              >
+                {op.choices.values.map((v, i) => (
+                  <option key={v} value={v}>
+                    {op.choices?.labels?.[i] ?? v}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {op.arg && (
             <label className="flex items-center gap-2">
               <span className="w-20 shrink-0 text-secondary">{op.arg}</span>
@@ -176,26 +215,36 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
               <span className="text-[10.5px] text-muted uppercase tracking-[0.08em]">
                 session settings
               </span>
-              {config.map((c: AcpConfigOption) => {
+              {config.map((c: AcpConfigOption, i) => {
                 const values = Array.isArray(c.options) ? c.options : [];
                 const current = optionValue(c.currentValue);
+                // A configOption with neither an id nor a name is a malformed payload.
+                // `String(undefined)` would render the literal word "undefined", give
+                // every such entry the SAME React key, and label the control
+                // "mcode undefined" for a screen reader — so the position is used as a
+                // last resort, which is unique and honest about being a fallback.
+                const key = String(c.id ?? c.name ?? `#${i}`);
+                const shown = String(c.name ?? c.id ?? `option ${i + 1}`);
                 return (
-                  <label key={String(c.id)} className="flex items-center gap-2">
-                    <span className="w-20 shrink-0 text-secondary">
-                      {String(c.name || c.id)}
-                    </span>
+                  <label key={key} className="flex items-center gap-2">
+                    <span className="w-20 shrink-0 text-secondary">{shown}</span>
                     <select
                       value={current}
                       disabled={settingsBusy || values.length === 0}
-                      aria-label={`mcode ${String(c.id)}`}
+                      aria-label={`mcode ${key}`}
                       onChange={(e) => void setOption(String(c.id), e.target.value)}
                       className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12px]
                                  outline-none disabled:opacity-50"
                     >
                       {/* The current value is always an option, even when the server did
                           not list it — otherwise the select would silently show the first
-                          entry as if it were the live one. */}
-                      {!values.some((o) => optionValue(o) === current) && (
+                          entry as if it were the live one.
+                          NOT WHEN IT IS EMPTY, though: `value=""` with no label renders a
+                          selected option that displays NOTHING, so "unset" becomes
+                          indistinguishable from "unknown". An unset option says so. */}
+                      {current === "" ? (
+                        <option value="">(not set)</option>
+                      ) : !values.some((o) => optionValue(o) === current) && (
                         <option value={current}>{current}</option>
                       )}
                       {values.map((o, i) => (
@@ -213,7 +262,7 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
             <button
               type="button"
               onClick={() => void send()}
-              disabled={busy || argError !== ""}
+              disabled={busy || !ready}
               title={argError}
               className="rounded-md bg-surface px-2 py-1 text-[11.5px] text-secondary
                          disabled:opacity-50"

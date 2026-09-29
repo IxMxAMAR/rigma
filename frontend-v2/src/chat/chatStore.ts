@@ -756,6 +756,19 @@ export interface ChatState {
    *  mode that asks fails the run headlessly, so the default is `full`. */
   setPermission: (mode: string) => Promise<void>;
   setMcodeTransport: (wire: string) => Promise<void>;
+  /** R7-SETTINGS: record a configOption change the SERVER already accepted.
+   *
+   *  WHY THIS IS NEEDED AT ALL. The select's value comes from the live turn's
+   *  `acpConfig`, which is written only by the `acp_config` SSE event — and that event
+   *  comes from a `config_option_update` NOTIFICATION on the connection that ran the
+   *  turn. A control operation runs on its OWN short-lived mcode process whose
+   *  notifications nobody reads, so the change succeeds and no event ever arrives: the
+   *  panel said "done" and the select snapped back to the old value.
+   *
+   *  Called only AFTER the server confirmed the change, so this is a record of an
+   *  accepted fact rather than an optimistic guess.
+   */
+  setAcpConfigOption: (optionId: string, value: string) => void;
 }
 
 /** The live turn for the chat on screen — nothing else may render. */
@@ -1273,4 +1286,18 @@ export const useChat = create<ChatState>((set, get) => ({
   pushNotice: (text) => set({ notice: text }),
 
   clearNotice: () => set({ notice: null }),
+
+  setAcpConfigOption: (optionId, value) =>
+    set((st) => {
+      const id = st.currentId;
+      if (!id) return {};
+      const turn = st.streams[id];
+      if (!turn) return {};
+      // A NEW array and NEW option objects: `selectStreaming(s)?.acpConfig` is handed to
+      // React through a zustand selector, so mutating in place would leave the reference
+      // identical and the select would not re-render.
+      const acpConfig = turn.acpConfig.map((c) =>
+        String(c.id) === optionId ? { ...c, currentValue: value } : c);
+      return { streams: { ...st.streams, [id]: { ...turn, acpConfig } } };
+    }),
 }));
