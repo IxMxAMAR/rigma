@@ -597,6 +597,28 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
 # How much of the model the "context" growth policy may push off the GPU for
 # each doubling of the window. 0.15 = up to 15% of the layers; the "speed"
 # policy uses 0.0, which is the historical behaviour (never trade a layer).
+#
+# MEASURED, and much more expensive than "15% of the layers" sounds. On a 64-layer
+# dense hybrid (Qwen3.5-family, 48 SSM + 16 attention, full_attention_interval=4)
+# with a 6872 MB file on a 16 GB card, at a FIXED ctx 131072:
+#
+#     -ngl 99 (0 spilled)   54.5 t/s
+#     -ngl 58 (6 spilled)   12.6 t/s   (mean of six runs, sd 1.0)
+#     -ngl 48 (16 spilled)   5.9 t/s
+#
+# 4.3x from spilling 6 of 64 layers — about 0.6 GB, 9% of the weights. The reason is
+# that llama.cpp does NOT put a spilled layer's KV cache on the GPU: `llama-kv-cache.cpp`
+# allocates each layer's K/V on that layer's own device
+# (`if (offload) { auto * dev = model.dev_layer(il); buft = ggml_backend_dev_buffer_type(dev); }`).
+# So one CPU-resident ATTENTION layer drags its whole context-proportional cache into
+# host RAM, where attention then runs on the CPU every token. The cost scales with
+# context and is invisible in the "9% of layers" framing. This is not a missing CPU
+# kernel: PQ2_0 has a vectorized AVX2/VNNI `vec_dot` (`ggml-cpu.c`, type_traits_cpu).
+#
+# The user selects this policy (Models page -> Growth policy), so it is not forced —
+# but the dropdown prices it as "more context" and never as "4x slower". Left at 0.15
+# deliberately: other models genuinely prefer the window, and changing a global default
+# on one machine's measurement would be worse than documenting it.
 _GROW_LAYER_BUDGET = 0.15
 
 

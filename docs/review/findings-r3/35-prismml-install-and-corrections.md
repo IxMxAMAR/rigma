@@ -259,11 +259,14 @@ that had just done 55 t/s. Two causes were identified and one is a real trap:
 
 ---
 
-## R3-ENG-11 — `_engine_type_count` cannot see what it looks for
+## R3-ENG-11 — I was wrong: `_engine_type_count` works
 
-`cli._engine_type_count` exists to read an engine's `[0, N)` bound out of the engine's own
-refusal. It runs `llama-fit-params` and parses the output with
-`engine_compat.parse_type_count`. Measured across three builds:
+**This section originally claimed `_engine_type_count` "always returns `None`" because
+`llama-fit-params` "exits 0 and prints no error for a file the engine cannot load". Both
+halves are false.** It is left here, corrected, because the wrong version was reported as
+fact and the method error is the interesting part.
+
+What I originally ran:
 
 ```
 prism-vulkan        fit_params_bin -> ...\vulkan\llama-fit-params.exe
@@ -272,15 +275,60 @@ prism-hip           load_error=''   parse_type_count -> None
 pinned-b9867-rocm   load_error=''   parse_type_count -> None
 ```
 
-Run directly against a file the pinned engine cannot load, `llama-fit-params` **exits 0 and
-prints no error** — it reports fitted CLI arguments instead. So `_engine_type_count` always
-returns `None`, and `_engine_compat_note` returns `""` immediately when the count is `None`.
+Every one of those three builds **loads this file**, so `None` was the correct answer and I
+read it as a malfunction. `pinned-b9867-rocm` was not the mainline build I assumed it was —
+the ROCm tree also holds a `rocm-mainline-b9867` variant — and I never checked which binary I
+had actually pointed at.
 
-**Consequence:** the pre-flight note is silent for *every* pair, including ones that will
-fail. It is currently harmless — `check_engine` is also silent when the engine accepts the
-file, which is the correct verdict — but the "explain why this engine refuses your model"
-path that R3-ENG-2 was built for never fires. The bound is reachable from `llama-server`'s
-own refusal, not from `llama-fit-params`. Recorded as a latent gap, not fixed here.
+Reading the source shows why the claim was wrong on its own terms:
+
+* `tools/fit-params/fit-params.cpp` calls `exit(1)` when `common_fit_params` does not return
+  `COMMON_PARAMS_FIT_STATUS_SUCCESS`. A refusal is a non-zero exit, not a silent zero.
+* `_engine_type_count` never parses the fit oracle's *output*. It reads `FitResult.load_error`,
+  which `memtruth` fills from `_LOAD_FAIL_RE` — a regex that already matches
+  `invalid ggml type`. My probe inspected the wrong thing and I generalised from it.
+
+Measured against the real mainline binaries and the real PQ2_0 file:
+
+```
+llama-fit-params, b9867/vulkan (mainline)   exit=1
+  E gguf_init_from_reader: tensor 'output.weight' has invalid ggml type 142. should be in [0, 42)
+  E gguf_init_from_reader: failed to read tensor info
+llama-fit-params, b9867/cpu    (mainline)   exit=1   (same)
+llama-fit-params, prism/vulkan (fork)       exit=0   stdout: -c 512 -ngl 1
+
+_engine_type_count(b9867/vulkan, model) -> 42
+_engine_type_count(b9867/cpu,    model) -> 42
+_engine_type_count(prism/vulkan, model) -> None
+```
+
+The fingerprint works exactly as its docstring claims: **42** for the pinned build, and
+`None` for the fork because the fork *loaded* the file — which is the authoritative answer
+"this engine can load it", and correctly suppresses the warning. The verdict that follows is
+right too:
+
+```
+b9867/vulkan -> ok=False  this engine's type table ends at 42 …
+prism/vulkan -> (no verdict: the engine loaded it)
+```
+
+There is no gap here. R3-ENG-2's "explain why this engine refuses your model" path fires
+exactly when an engine refuses.
+
+### What is genuinely unavailable, and should stay that way
+
+An engine's type count is discoverable *only* by making it refuse a file. When an engine loads
+a model successfully Rigma learns nothing about that engine's table — it cannot, and it does
+not need to: a successful load is the strongest available evidence, and recording a bound for
+a working engine would store a guess in a field that reads like a fact.
+
+### The method error
+
+I had a probe that called the wrong function against the wrong binaries, and I reported its
+`None` as a property of the code rather than of the probe. The tell was there: the finding
+said three different builds all returned `None`, including one whose whole purpose is to load
+this model. A result that uniform should have prompted a second look before it was written
+down as a latent gap.
 
 ---
 
