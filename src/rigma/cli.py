@@ -2196,9 +2196,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     # perform_switch, so without this a pinned default would apply to the UI's
     # load button and silently not to the CLI.
     _launch = getattr(reg.models.get(rp.model_slug), "launch", None)
+    _launch_kv = ""
     _vision = _wants_vision(reg.models.get(rp.model_slug))
     if _launch is not None:
         _d = _launch.as_overrides()
+        _launch_kv = _d.get("kv", "")
         if "quant" in _d:
             from .server_ops import _model_on_disk
             want = _d["quant"].strip().lower()
@@ -2219,8 +2221,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         _upd = {}
         if ctx is None and "ctx" in _d:
             _upd["ctx"] = _d["ctx"]
-        if "kv" in _d:
-            _upd["cache_type_k"] = _upd["cache_type_v"] = _d["kv"]
+        # `kv` is deliberately NOT written straight onto the flags here. It is a
+        # CEILING the re-fit below has to price: applying it after the fit let a
+        # stored `kv: q8_0` re-impose a cache the fit had rejected, and on this
+        # 16GB card ctx 262144 + q8_0 pages 622MB to system RAM with no error.
+        # See resolve.fit_for_launch.
         if spec is None and "spec_type" in _d:
             # only when THIS file carries the head — see the --spec branch below
             from .hangar import file_has_mtp
@@ -2288,11 +2293,21 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         from .server_ops import launch_fit_spec as _fit_spec
         _spec2, _differs = _fit_spec(_spec_r, rp.flags, vision=_vision)
         if _launch is not None or _differs:
-            from .resolve import fit_gguf as _fit
-            _fl = _fit(_spec2, rp.gguf, p, rp.flags.ctx, [])
+            from .resolve import fit_for_launch as _fit_launch
+            _fl, _stepped = _fit_launch(
+                _spec_r, rp.gguf, p, rp.flags.ctx, kv=_launch_kv,
+                vision=_vision, spec_type=rp.flags.spec_type,
+                n_max=rp.flags.spec_n_max, explain=rp.explain)
             if _fl is not None:
                 rp.flags = rp.flags.model_copy(update={
-                    "ngl": _fl.ngl, "n_cpu_moe": _fl.n_cpu_moe})
+                    "ngl": _fl.ngl, "n_cpu_moe": _fl.n_cpu_moe,
+                    "cache_type_k": _fl.cache_type_k,
+                    "cache_type_v": _fl.cache_type_v})
+            if _stepped:
+                typer.echo(f"{_stepped} does not fit fully at ctx "
+                           f"{rp.flags.ctx:,}; using "
+                           f"{rp.flags.cache_type_k} with every layer on the "
+                           f"GPU")
     os_name = {"Windows": "windows", "Linux": "linux",
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
