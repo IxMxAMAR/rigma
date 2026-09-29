@@ -4021,6 +4021,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except Exception:
             out["engine_runtimes"] = []
         out["engine"] = s.get("engine") or None
+        # WHICH BINARY is serving, when a launch recorded it. Separate from `engine`
+        # above (the runtime): a registered third-party build can be chosen over the pin,
+        # and before this the only way to find out which one was running was to read the
+        # process table. `None` for a record written before the field existed, so the UI
+        # shows a label only when a launch actually named its binary.
+        out["engine_binary"] = s.get("engine_binary") or None
         # What the DESKTOP is holding. Windows overcommits VRAM rather than
         # refusing, so this is the difference between a plan that is resident
         # and one that is silently paged over PCIe — and it is the one number

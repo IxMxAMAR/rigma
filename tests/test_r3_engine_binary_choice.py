@@ -261,3 +261,39 @@ def test_engine_binary_survives_an_unrelated_update(home):
                                   "path": "p", "source": ""})
     st.update_state(ctx=8192)
     assert st.read_state()["engine_binary"]["kind"] == "pinned"
+
+
+# --- the UI surface ----------------------------------------------------------
+
+def test_api_server_reports_the_engine_binary(home):
+    """Recording it is not enough — the Engine page has to be able to show it, or the
+    only way to learn which binary is serving remains the process table."""
+    import os
+
+    from fastapi.testclient import TestClient
+
+    from rigma import serve
+    from rigma import state as st
+    st.write_state("m", "Q2_0", 11500, engine_pid=os.getpid(), ui_pid=os.getpid(),
+                   backend="vulkan", engine="llamacpp",
+                   engine_binary={"kind": "registered", "name": "prism-b10743-vulkan",
+                                  "path": "C:/x/llama-server.exe", "source": "PrismML"})
+    body = TestClient(serve.build_app(upstream_port=11500)).get("/api/server").json()
+    assert body["engine_binary"]["name"] == "prism-b10743-vulkan"
+    assert body["engine_binary"]["kind"] == "registered"
+    # and the runtime axis is untouched by it
+    assert body["engine"] == "llamacpp"
+
+
+def test_api_server_reports_null_when_no_binary_was_recorded(home):
+    """An older record must not be made to look like the pin."""
+    import os
+
+    from fastapi.testclient import TestClient
+
+    from rigma import serve
+    from rigma import state as st
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(), ui_pid=os.getpid(),
+                   backend="vulkan")
+    body = TestClient(serve.build_app(upstream_port=11500)).get("/api/server").json()
+    assert body.get("engine_binary") is None

@@ -13,10 +13,11 @@ function uptime(startedAt: number): string {
   return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
 }
 
-function Stat({ label, value, tone }: { label: string; value: string;
-                                        tone?: "amber" | "moss" | "red" }) {
+function Stat({ label, value, tone, title }: { label: string; value: string;
+                                        tone?: "amber" | "moss" | "red";
+                                        title?: string }) {
   return (
-    <div className="flex flex-col gap-0.5">
+    <div className="flex flex-col gap-0.5" title={title}>
       <span className="font-mono text-[11px] text-muted uppercase tracking-[0.08em]">
         {label}
       </span>
@@ -136,6 +137,15 @@ export default function EngineSurface() {
   const now = Date.now() / 1000;
   const verdictTone =
     info.verdict === "healthy" ? "moss" : info.verdict ? "red" : undefined;
+  // Which BINARY is serving. A registered build is named as such, because it is a
+  // third-party executable the user supplied rather than Rigma's pin — that difference
+  // is the whole point of recording it. "pinned" reads as the engine's own version, so
+  // it is not repeated here. Absent means the launch did not name one: show nothing
+  // rather than implying the pin.
+  const eb = info.engine_binary;
+  const engineBinaryLabel = !eb
+    ? "\u2014"
+    : eb.kind === "registered" ? `registered: ${eb.name}` : "pinned";
 
   return (
     <main className="flex-1 overflow-y-auto p-6">
@@ -192,6 +202,17 @@ export default function EngineSurface() {
           <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-4">
             <Stat label="quant" value={String(info.quant ?? "—")} />
             <Stat label="backend" value={String(info.backend ?? "—")} />
+            {/* Which BINARY is serving. A registered third-party build can be chosen over
+                Rigma's pin when it is the only one that can load the model's tensor types,
+                so this is not derivable from the version string — and before R3-ENG-9 the
+                only way to find out was to read the process table. Shown only when a
+                launch named it, so an older record shows "—" rather than implying the pin. */}
+            <Stat
+              label="engine"
+              value={engineBinaryLabel}
+              tone={info.engine_binary?.kind === "registered" ? "amber" : undefined}
+              title={info.engine_binary?.path ?? undefined}
+            />
             <Stat label="context" value={info.ctx ? `${Math.round((info.ctx as number) / 1024)}K` : "—"} />
             <Stat
               label="tok/s"
