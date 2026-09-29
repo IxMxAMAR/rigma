@@ -56,7 +56,11 @@ PROTOCOL_VERSION = 1
 # hardcoded into calls so a version that drops or renames one is visible instead
 # of producing a confusing "Method not found" at the point of use.
 # The standard ACP session methods Rigma uses, kept beside the extension list so the
-# drift guard in the tests covers both. `session/load` and `session/resume` take
+# drift guard in `tests/test_acp_control.py` can cover both. (No such guard existed when
+# this sentence was written — it described an intention, not a fact. It exists now, and it
+# fails when a table and the code that uses it disagree.)
+#
+# `session/load` and `session/resume` take
 # `{sessionId}` and answer `{sessionId}`, measured from the handlers:
 #   onRequest(ee.agent.session.resume, async z => s(z.params.sessionId, ...))
 #   onRequest(ee.agent.session.load,   async z => s(z.params.sessionId, ...))
@@ -226,8 +230,23 @@ class AcpClient:
                     proc.stdin.close()
                 except Exception:
                     pass
-            proc.terminate()
-            proc.wait(timeout=timeout)
+            # CLOSING STDIN IS THE GRACEFUL SHUTDOWN, and it has to be given a moment
+            # before the kill. mcode reads EOF, finishes, and exits — and anything it
+            # does on the way out (flushing a session store, running its own atexit
+            # hooks) only happens if it is allowed to. Terminating in the same breath
+            # makes that a race the child usually loses: the signal arrives first and
+            # the flush never runs.
+            #
+            # This is not hypothetical. The test double persists its session through
+            # `atexit`, so the race decides whether a control operation's result is
+            # visible to the next process — and it made a `--record` assertion vacuous
+            # in the same way. A short grace period costs nothing when the child exits
+            # promptly, which is the normal case.
+            try:
+                proc.wait(timeout=min(2.0, timeout))
+            except Exception:
+                proc.terminate()
+                proc.wait(timeout=timeout)
         except Exception:
             try:
                 proc.kill()
@@ -325,6 +344,23 @@ class AcpClient:
         except Exception:
             pass
 
+    def _decline(self, method: str, params: dict) -> Any:
+        """The protocol's own refusal for a request this client cannot serve.
+
+        WHY `None` WAS WRONG. A JSON-RPC `result` of `null` is a valid envelope but not a
+        valid ANSWER. `session/request_permission` expects an `outcome` envelope and
+        `elicitation/create` expects an `action`; mcode reads an unrecognised shape as a
+        malformed reply rather than as a refusal, and the failure surfaces as a generic
+        502 on a short-lived process. The module already knew the correct shapes —
+        `answer_permission(allow=None)` and `answer_elicitation(accepted=False)` — they
+        were simply not wired to this path.
+        """
+        if method == "session/request_permission":
+            return answer_permission(params, allow=None)
+        if method == "elicitation/create":
+            return answer_elicitation(params, accepted=False)
+        return None
+
     def _handle_request(self, frame: dict) -> None:
         """A server-initiated request. We MUST answer, or the turn stalls."""
         method = str(frame.get("method") or "")
@@ -332,10 +368,10 @@ class AcpClient:
         result: Any = None
         error: dict | None = None
         if self._on_request is None:
-            # No handler is a REAL answer, not silence: an unanswered request would
-            # leave mcode waiting forever. `None` is what the protocol uses for
-            # "declined", and it is what makes the runtime fall back.
-            result = None
+            # No handler is still a REAL answer, not silence: an unanswered request would
+            # leave mcode waiting forever. It is now the SHAPE the protocol defines for a
+            # refusal rather than a bare `null`, which mcode could only read as malformed.
+            result = self._decline(method, params)
         else:
             try:
                 result = self._on_request(method, params)
@@ -356,6 +392,15 @@ class AcpClient:
         if proc is None or proc.stdin is None:
             raise AcpUnavailable("the mcode acp process is not running")
         body = json.dumps(obj, separators=(",", ":"))
+        # THE OUTBOUND HALF OF `_FRAME_MAX`. That constant bounds what the server may send
+        # US, and nothing bounded what we send it — so a request carrying a very large
+        # `text` went to the child's pipe whole. The UI cannot produce such a value, but
+        # the route accepts JSON from any client, and an unbounded write to a child's
+        # stdin is the kind of thing that surfaces as a hang rather than as an error.
+        if len(body) > _FRAME_MAX:
+            raise AcpError(
+                f"the request is too large to send ({len(body)} bytes, limit "
+                f"{_FRAME_MAX})")
         with self._write_lock:
             proc.stdin.write(body + "\n")
             proc.stdin.flush()
@@ -431,8 +476,15 @@ class AcpClient:
         `goal_update` is dropped, which looks like "mcode does not notify" rather
         than "we never said we could hear it".
         """
+        # NO `fs`. This used to declare `{"readTextFile": True, "writeTextFile": True}`
+        # while nothing in this package handled `fs/read_text_file` or
+        # `fs/write_text_file` — so Rigma told mcode it could read and write files on
+        # request and then refused every request. mcode PLANS around a declared
+        # capability, so the claim was worse than silence.
+        #
+        # Left unimplemented on purpose: it would give the agent file access through a
+        # second path beside the sandbox policy that already governs its tools.
         client_capabilities: dict = {
-            "fs": {"readTextFile": True, "writeTextFile": True},
             "terminal": False,
         }
         if declare_elicitation:
@@ -793,9 +845,16 @@ def map_acp_update(notification: dict) -> list:
     its result the way every other backend's do.
 
     Unknown `sessionUpdate` variants return an EMPTY list rather than a notice. The
-    protocol's union has 13 members and will grow; a future variant must not become
-    a wrong row, and it must not become noise either — the honest place for "this
-    build does not render that yet" is the capability menu, not every turn.
+    protocol's union has 15 members and will grow; a future variant must not become a
+    wrong row, and it must not become noise either — the honest place for "this build
+    does not render that yet" is the capability menu, not every turn.
+
+    (This said 13. VERIFIED against `@agentclientprotocol/sdk@1.4.0` as resolved in the
+    DSH checkout: the union declares 15, adding `compaction_update` and
+    `compaction_summary_chunk`. The count is a wire fact that moves with the SDK, so it
+    is stated as of a version rather than as a constant, and
+    `test_the_docstring_does_not_claim_a_union_size_it_cannot_know` fails if a bare
+    count is reintroduced.)
     """
     from .harness import TurnEvent
 
@@ -836,6 +895,23 @@ def map_acp_update(notification: dict) -> list:
     # ---- the standard session/update union --------------------------------
     update = params.get("update") or {}
     kind = str(update.get("sessionUpdate") or "")
+
+    if kind in ("compaction_update", "compaction_summary_chunk"):
+        # A STANDARD variant as of `@agentclientprotocol/sdk@1.4.0` (VERIFIED in the DSH
+        # checkout's resolved copy: the union declares 15 members, and these are the two
+        # that were missing from the 13 this mapper used to know).
+        #
+        # Handled rather than dropped because the OTHER adapter already renders this fact:
+        # the DSH path maps its `compaction/` lifecycle onto one `compaction` SSE event,
+        # so the identical event would have rendered on one backend and vanished on the
+        # other. The payload is passed through WHOLE, matching the DSH arm's reason —
+        # `summary` is a ContentBlock list and reshaping it here would stop the UI folding
+        # it.
+        #
+        # VERIFIED: mcode 0.5.4's own bundle mentions neither string, so this is
+        # forward-compatibility rather than a path a turn takes today.
+        out.append(TurnEvent("state", event="compaction/" + kind, data=update))
+        return out
 
     if kind in ("agent_message_chunk", "user_message_chunk"):
         text = _acp_content_text(update.get("content"))
@@ -1098,7 +1174,18 @@ _CONTROL_OPS: dict[str, tuple[str, tuple[str, ...]]] = {
     "steer":          ("inject text into the running turn", ("text",)),
     "activate":       ("make this the active session", ()),
     "delegation_get": ("read the delegation tree", ()),
-    "delegation_stop": ("stop a delegated child", ("sessionId",)),
+    # NO PARAMS, and that is the correction. The server resolves `params.sessionId` as the
+    # ROOT session and stops the whole delegation for it; there is no member id in this
+    # call. The old `("sessionId",)` was the root id under a name that collided with the
+    # context key, which is what let a request body redirect the operation to another
+    # session. The session id comes from the chat row, so nothing is required here.
+    "delegation_stop": ("stop this session's delegated work", ()),
+    # REACHABLE OVER HTTP, NO UI CONTROL YET, and the reason is a missing input rather
+    # than an omission: the valid `modeId`s arrive in `session/new`'s response
+    # (`availableModes`), which Rigma does not store. `config_set` can be a dropdown
+    # because the server re-sends its option list on every `config_option_update`; this
+    # one has nothing to read. Hardcoding `plan`/`default` was rejected — it would be a
+    # control that silently stops matching the server on the next mcode version.
     "mode_set":       ("change the mode (plan/default)", ("modeId",)),
     "config_set":     ("change a configOption (model, permissionMode)",
                        ("optionId", "value")),
@@ -1127,7 +1214,49 @@ def control_op_error(op: str, params: dict | None) -> str:
     return ""
 
 
-def drive_control(op: str, params: dict | None = None, *, exe: str = "",
+def _control_argv(exe: "str | list[str]") -> list[str]:
+    """The argv for a control client, from a path, an argv, or a test double.
+
+    THE SPACE IS THE WHOLE POINT. `bin_path()` returns an UNQUOTED path, and mcode very
+    often lives under one containing a space — the per-user npm directory is the
+    ordinary Windows install. `shlex.split(posix=False)` splits a `Program Files` path
+    into its first two words,
+    so argv[0] became a directory that does not exist and every control operation failed
+    with a 502 while the `exec` turn path — which never splits — worked fine on the same
+    value.
+
+    So a real path is taken as ONE token. A string is split only when it is not an
+    existing file, which is the test-double case (an interpreter plus a script) and
+    nothing else; that keeps one parameter serving both without guessing.
+
+    `acp` is appended unless it is already the last argument, so a caller that passed a
+    complete command line is not given it twice. Checking the LAST argument rather than
+    "anywhere" matters: a directory merely named `acp` earlier in a path would otherwise
+    suppress the subcommand entirely.
+    """
+    if isinstance(exe, (list, tuple)):
+        argv = [str(a) for a in exe]
+    else:
+        raw = str(exe)
+        if os.path.isfile(raw):
+            argv = [raw]
+        else:
+            try:
+                import shlex as _shlex
+
+                argv = _shlex.split(raw, posix=(os.name != "nt"))
+            except Exception:
+                argv = [raw]
+            argv = [a.strip('"') for a in argv] or [raw]
+    if not argv:
+        return ["acp"]
+    if argv[-1] != "acp":
+        argv.append("acp")
+    return argv
+
+
+def drive_control(op: str, params: dict | None = None, *,
+                  exe: "str | list[str]" = "",
                   session_id: str, cwd: str = "", timeout: float = 60.0) -> dict:
     """Perform ONE control-plane operation on an existing session.
 
@@ -1149,68 +1278,78 @@ def drive_control(op: str, params: dict | None = None, *, exe: str = "",
         out["error"] = ("this chat has no mcode session yet; the control plane needs "
                         "one, so it becomes available after the first turn")
         return out
-    exe = exe or _default_exe()
+    # The id goes into a protocol frame verbatim, so it is bounded rather than trusted.
+    # A real one is short; this catches a mangled row or a caller passing something else.
+    if len(session_id) > 256 or any(c in session_id for c in "\r\n\x00"):
+        out["error"] = ("this chat's mcode session id is not usable "
+                        "(it is empty, over-long, or contains control characters)")
+        return out
+    if not exe:
+        exe = _default_exe()
     if not exe:
         out["error"] = "mcode is not on PATH"
         return out
 
-    body = dict(params or {})
-    # `exe` is a COMMAND LINE, not necessarily a single token: the turn paths build
-    # `[exe, "acp"]`, which is right for a real binary and wrong for a test double, which
-    # needs an interpreter too. Splitting here makes one string serve both, and the
-    # `shlex` failure falls back to the whole string rather than losing the executable.
+    # THE SESSION ID IS NOT A PARAMETER. It was one: `params` was passed through to
+    # `body.update(params)`, and every client method builds `{"sessionId":
+    # self.session_id}` first — so a request body carrying `sessionId` drove a DIFFERENT
+    # mcode session than the chat it was sent to. `delegation_stop` requires a
+    # `sessionId`, which made the override look like a normal argument.
     #
-    # The `acp` subcommand is appended only when it is not already there, so a caller
-    # that passed a complete command line is not given it twice.
-    try:
-        import shlex as _shlex
-
-        argv = _shlex.split(exe, posix=(os.name != "nt"))
-    except Exception:
-        argv = [exe]
-    argv = [a.strip('"') for a in argv] or [exe]
-    if not any(a == "acp" for a in argv):
-        argv.append("acp")
-    client = AcpClient(argv, cwd=cwd or None, default_timeout=timeout)
+    # Dropped here rather than at the eight call sites because the resumed session is the
+    # operation's CONTEXT, not its input: no operation in `_CONTROL_OPS` has any business
+    # naming a session, and the route already decided which one by looking it up on the
+    # chat row. A caller who needs a different session must send to a different chat.
+    body = dict(params or {})
+    body.pop("sessionId", None)
+    # THE BUDGET IS FOR THE WHOLE OPERATION, NOT FOR EACH REQUEST. `timeout` is what the
+    # route advertises, and this function makes three requests: initialize, resume, and the
+    # operation itself. Giving each the full budget made the real worst case about three
+    # times the advertised one, inside a single `asyncio.to_thread` — and that thread comes
+    # from the default executor, so concurrent control requests could starve unrelated
+    # routes that use it too. A third each, with a floor so a small budget cannot produce
+    # an instant timeout on work that would have succeeded.
+    each = max(5.0, float(timeout) / 3.0)
+    client = AcpClient(_control_argv(exe), cwd=cwd or None, default_timeout=each)
     try:
         client.start()
         # `declare_extensions` matters even here: without it the server still ANSWERS
         # every call correctly and sends no `goal_update`, so the panel would not
         # refresh after the user changed something. The answer and the notification are
         # separately gated, which is the asymmetry this module documents.
-        client.initialize(timeout=timeout)
-        client.session_resume(session_id, timeout=timeout)
+        client.initialize(timeout=each)
+        client.session_resume(session_id, cwd=cwd or None, timeout=each)
         if op == "goal_get":
-            res = client.goal_get(timeout=timeout)
+            res = client.goal_get(timeout=each)
         elif op == "goal_create":
-            res = client.goal_create(body, timeout=timeout)
+            res = client.goal_create(body, timeout=each)
         elif op == "goal_patch":
-            res = client.goal_patch(body, timeout=timeout)
+            res = client.goal_patch(body, timeout=each)
         elif op == "goal_clear":
-            res = client.goal_clear(timeout=timeout)
+            res = client.goal_clear(timeout=each)
         elif op == "queue_list":
-            res = client.queue_list(timeout=timeout)
+            res = client.queue_list(timeout=each)
         elif op == "queue_enqueue":
-            res = client.queue_enqueue(body, timeout=timeout)
+            res = client.queue_enqueue(body, timeout=each)
         elif op == "queue_update":
-            res = client.queue_update(body, timeout=timeout)
+            res = client.queue_update(body, timeout=each)
         elif op == "queue_delete":
-            res = client.queue_delete(body, timeout=timeout)
+            res = client.queue_delete(body, timeout=each)
         elif op == "queue_steer":
-            res = client.queue_steer(body, timeout=timeout)
+            res = client.queue_steer(body, timeout=each)
         elif op == "steer":
-            res = client.steer(body, timeout=timeout)
+            res = client.steer(body, timeout=each)
         elif op == "activate":
-            res = client.activate(timeout=timeout)
+            res = client.activate(timeout=each)
         elif op == "delegation_get":
-            res = client.delegation_get(timeout=timeout)
+            res = client.delegation_get(timeout=each)
         elif op == "delegation_stop":
-            res = client.delegation_stop(body, timeout=timeout)
+            res = client.delegation_stop(body, timeout=each)
         elif op == "mode_set":
-            res = client.set_mode(str(body["modeId"]), timeout=timeout)
+            res = client.set_mode(str(body["modeId"]), timeout=each)
         elif op == "config_set":
             res = client.set_config_option(str(body["optionId"]), body["value"],
-                                          timeout=timeout)
+                                          timeout=each)
         else:  # pragma: no cover - `control_op_error` already refused these
             raise AcpError(f"unhandled operation {op!r}")
         out["result"] = res

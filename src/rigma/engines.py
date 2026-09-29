@@ -48,7 +48,10 @@ from pathlib import Path
 LLAMACPP = "llamacpp"
 VLLM = "vllm"
 ENGINE_RUNTIMES = (LLAMACPP, VLLM)
-DEFAULT_ENGINE_RUNTIME = LLAMACPP
+# There was a `DEFAULT_ENGINE_RUNTIME = LLAMACPP` here. Nothing read it — every default is
+# spelled `LLAMACPP` at its use site — so it was a second name for the same fact, which is
+# the kind of thing that goes stale in one place and not the other. The order of
+# `ENGINE_RUNTIMES` is the preference order, and it says the same thing once.
 
 # --- vLLM's measured support matrix ----------------------------------------
 # docs/getting_started/installation/gpu.md: "OS: Linux", "Python: 3.10 -- 3.13",

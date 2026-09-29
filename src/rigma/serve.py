@@ -1908,10 +1908,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def list_harnesses(check: int = 0):
         """The agent backends, and what choosing one would cost.
 
-        Only the built-in can run a turn today; the external ones are listed
-        with `installed` (is the SDK/CLI present?) kept separate from
-        `runnable` (can a turn be handed to it?), so a probe is never mistaken
-        for a working integration.
+        Every listed backend can be handed a turn; `installed` (is the SDK/CLI
+        present?) is kept separate from `runnable` (can a turn be handed to it?),
+        so a probe is never mistaken for a working integration. The two are equal
+        for all three backends today, and they are separate fields because they
+        answer different questions — an adapter can exist for something that is
+        not installed here.
 
         `check=1` also asks each backend what version it actually is and reports
         whether it still matches the build its adapter was measured against.
@@ -5066,9 +5068,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             (s.get("harness_sessions") or {}).get("mcode") or "")
         # Validated here as well as in the adapter, so an unknown operation is a 400
         # rather than a 200 carrying an error field — the caller sent a bad request.
-        # Imported here rather than at module scope: `serve.py` reaches every adapter
-        # through `_harness.resolve` so that one backend's import cost — and any
-        # failure inside it — is not paid by a UI that never selects that backend.
+        # Imported here rather than at module scope for the same reason every other
+        # adapter is reached through `_harness.resolve`: one backend's import cost should
+        # not be paid by a UI that never selects it.
+        #
+        # NOTE: by this point `harness == "mcode"` has already been established, so the
+        # deferral buys nothing for THIS request. It is kept because the import is
+        # genuinely optional for the rest of the module, and an ImportError here is not
+        # swallowed — it surfaces as a 500, which is the honest outcome for "the adapter
+        # is broken" rather than a status code pretending the request was at fault.
         from . import harness_mcode
 
         why = harness_mcode.control_op_error(op, params)

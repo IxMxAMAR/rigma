@@ -81,11 +81,18 @@ def available() -> bool:
     return sdk_src() is not None and dsh_bin() is not None
 
 
-# Deliberately EMPTY. DSH has never been driven end to end from this machine —
-# the module docstring says so — so there is no build this adapter was measured
-# against, and inventing a number would make `conformance` report agreement with
-# something that was never checked. Empty means "unknown", and `conformance`
-# says unknown rather than implying fine.
+# THE BUILD THIS ADAPTER WAS MEASURED AGAINST. Not empty, and the distinction is
+# load-bearing: `conformance` computes drift as
+# `(have != want) if (have and want) else None`, so an empty value here would turn DSH
+# drift detection off and report "unknown" forever.
+#
+# This comment used to say the value was "Deliberately EMPTY ... DSH has never been
+# driven end to end from this machine", which was the opposite of the line under it and
+# cited a module docstring that says no such thing. The measurements are real and dated
+# (see :93, :115 and :781 below, and the `hardware`-marked live test in
+# `tests/test_harness_dsh_live.py`, which runs a real turn when asked for by name).
+#
+# Empty still means "unknown" for an adapter that has not been measured. This one has.
 VERIFIED = "0.1.6-alpha.2"
 
 # WHY CONTINUITY IS A PROCESS, NOT A SESSION ID — read before changing `_pool`.
