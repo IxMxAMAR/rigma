@@ -877,8 +877,7 @@ def _interaction_dead_end(stderr_tail: str) -> str:
     sentence below offers the switch without promising the replay.
 
     What is not fixable is retrying on `exec`, which is the one thing a stuck user
-    tries first. What IS fixable is saying so.
-    works — a NEW chat, because retrying this one cannot succeed.
+    tries first. What IS fixable is saying so, and offering the switch that works.
     """
     low = stderr_tail.lower()
     if "requires an interactive host" not in low and \

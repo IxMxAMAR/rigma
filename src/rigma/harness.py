@@ -41,7 +41,13 @@ MCODE = "mcode"
 
 
 class HarnessError(ValueError):
-    """A harness cannot be used: unknown, not installed, or not implemented."""
+    """A harness cannot be used: unknown, or present with no turn to hand it.
+
+    The second case is one of `installed`/`runnable` disagreeing — the backend is
+    on this machine but has no adapter — which is what `pending` explains. No
+    backend Rigma ships is in that state, so the message is written to describe
+    the situation rather than to name a backend that is in it.
+    """
 
 
 @dataclass
@@ -79,9 +85,14 @@ class Harness:
     """One agent backend.
 
     `runnable` is whether a turn can actually be handed to it TODAY, and it is
-    deliberately separate from `installed`. DSH is a real, studied integration
-    whose availability can be probed; that does not make it wired up, and
-    conflating the two is how a probe becomes a silent fallback.
+    deliberately separate from `installed`. The two are equal for every backend
+    Rigma ships — all three are wired — but they answer different questions, and
+    conflating them is how a probe becomes a silent fallback: something can be
+    present on this machine with no adapter written for it yet, and a menu that
+    read `installed` as "usable" would offer a turn that cannot be handed over.
+
+    (This docstring used DSH as its example of "probeable but not wired up". DSH
+    is wired now, so the example was teaching the reverse of the field's meaning.)
     """
 
     name: str
@@ -388,9 +399,12 @@ BACKENDS: dict[str, Harness] = {
         # The turn is still driven over `exec`, deliberately: swapping the live
         # transport is a separate, riskier change than building the client, and the
         # client is what makes the control plane reachable at all.
-        drives="a subprocess turn: `mcode exec --output-format stream-json`. Its "
-               "Agent Client Protocol surface is reachable too — Rigma has a "
-               "working ACP client — but the chat turn does not use it yet",
+        drives="a subprocess turn: `mcode exec --output-format stream-json`. The "
+               "same chat can instead run over mcode's Agent Client Protocol (ACP) — the "
+               "`transport` selector on this chat switches it — which is what makes "
+               "its session control plane and an answerable permission prompt "
+               "reachable. `exec` stays the DEFAULT, because it is the wire that has "
+               "been exercised against a real engine",
         runnable=True,
         needs="mcode",
         probe=_mcode_available,
@@ -442,9 +456,10 @@ BACKENDS: dict[str, Harness] = {
             # of one turn and these are all session-scoped. Disclosed because the
             # menu's job is to say what is reachable, and "unreachable with no line
             # saying so" is the defect this whole round is about.
-            "over ACP, its session control plane: goals, a prompt queue, "
+            "over ACP, its session control plane — goals, a prompt queue, "
             "steering, delegation of a turn to a child session, plan mode, and "
-            "switching the model or the permission policy mid-session",
+            "switching the model or the permission policy mid-session — and the "
+            "control panel can OPERATE it, not only display it",
             "over ACP, an ANSWERABLE permission prompt — mcode asks and waits, so "
             "a permission request can be granted or refused instead of only "
             "displayed. This is the one interaction channel mcode offers that DSH "

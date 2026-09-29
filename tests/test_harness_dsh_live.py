@@ -30,10 +30,23 @@ from rigma import harness_dsh
 
 FAKE = Path(__file__).parent / "fake_oai_server.py"
 
-pytestmark = pytest.mark.skipif(
-    not harness_dsh.available(),
-    reason="no DeepSeek Harness checkout on this machine "
-           "(set RIGMA_DSH_HOME)")
+# MARKED `hardware`, AND THAT IS NOT A FORMALITY. The guard below OPENS this module
+# when DSH is installed — and DSH is installed on the development machine — so without a
+# marker `pytest -m "not hardware"` (the documented command, and what CI runs) collected
+# two tests that spawn the real `dsh` CLI and run a REAL agent turn. Only the model is
+# fake; the turn is not. The standing order for this work forbids live harness turns, and
+# the guard alone was quietly running them.
+#
+# `hardware` is this project's existing marker for "needs the real thing", and every
+# documented test command already excludes it. So the live turn now happens only when it
+# is asked for by name:  pytest tests/test_harness_dsh_live.py -m hardware
+pytestmark = [
+    pytest.mark.hardware,
+    pytest.mark.skipif(
+        not harness_dsh.available(),
+        reason="no DeepSeek Harness checkout on this machine "
+               "(set RIGMA_DSH_HOME)"),
+]
 
 
 def _free_port() -> int:

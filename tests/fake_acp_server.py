@@ -131,6 +131,14 @@ def main(argv: list[str]) -> int:
     state = {"sessionId": "", "mode": modes[0] if modes else "default",
              "permission": "auto", "model": "m:custom_provider%3Arigma:local-test:v:thinking",
              "goal": None, "asked": 0, "queue": [], "members": [],
+             # EVERY sessionId A REQUEST NAMED, in order. The state blob is keyed by
+             # nothing — `session/resume` simply adopts the id it is asked for — so
+             # without this a client that let a request body override the session id
+             # would look identical to one that did not. That is the exact bug this
+             # records against: `drive_control` passes params through to a body that
+             # already carries the resumed sessionId, and `delegation_stop` requires a
+             # `sessionId`, so the override had a natural-looking spelling.
+             "named": [],
              # THE GATE. mcode gates ALL FOUR extension notifications on the client
              # declaring this; it is not symmetric with the extension list it
              # advertises in the initialize RESPONSE. Reproduced here so the client's
@@ -209,6 +217,11 @@ def main(argv: list[str]) -> int:
         rid = req.get("id")
         method = str(req.get("method") or "")
         params = req.get("params") or {}
+
+        # Record the session every request NAMES, before dispatch, so a test can assert
+        # the client never let a request body replace the session it resumed.
+        if isinstance(params.get("sessionId"), str) and params["sessionId"]:
+            state["named"].append(params["sessionId"])
 
         if silent and method not in ("initialize", "session/new"):
             # Deliberately answer nothing. A client must report this as "no reply",
@@ -431,20 +444,34 @@ def main(argv: list[str]) -> int:
                 "members": list(state["members"])}}})
             continue
         if method == "mcode/session/delegation/stop":
-            # ADVERTISED AND PREVIOUSLY UNHANDLED. Stops the named member and reports
-            # its terminal status, which is what the caller needs to know the stop
-            # landed rather than merely being requested.
-            target = str(params.get("sessionId") or "")
-            found = None
-            for member in state["members"]:
-                if member["sessionId"] == target:
-                    member["status"] = "stopped"
-                    found = member
-            if found is None:
+            # THE MEASURED CONTRACT, which is NOT member-scoped. mcode's own handler is
+            #
+            #   onRequest("mcode/session/delegation/stop", xt, async({params:i}) => {
+            #       let s = r(i.sessionId), a = await mo(e.runtime, s);
+            #       return {receipt: await e.runtime.stopDelegation(a)}
+            #   })
+            #
+            # so `params.sessionId` is resolved as the ROOT session (the same resolver
+            # `delegation/get` uses) and the WHOLE delegation tree for that session is
+            # stopped. There is no member id in the call, and the answer is a `receipt`,
+            # not a `member`.
+            #
+            # The previous version of this handler invented a member-scoped stop that the
+            # real server does not implement, which made a UI button for "stop this
+            # child" look correct against the double. A fake that is more capable than
+            # the server is the same defect as one that is less capable.
+            if str(params.get("sessionId") or "") != state["sessionId"]:
                 emit({"jsonrpc": "2.0", "id": rid,
-                      "error": {"code": -32602, "message": f"No such member: {target}"}})
+                      "error": {"code": -32602,
+                                "message": f"Unknown session: {params.get('sessionId')}"}})
                 continue
-            emit({"jsonrpc": "2.0", "id": rid, "result": {"member": found}})
+            stopped = [m["sessionId"] for m in state["members"]
+                       if m.get("status") in ("queued", "running", "unknown")]
+            for member in state["members"]:
+                if member.get("status") in ("queued", "running", "unknown"):
+                    member["status"] = "stopped"
+            emit({"jsonrpc": "2.0", "id": rid,
+                  "result": {"receipt": {"stopped": stopped}}})
             if state["extensions_enabled"]:
                 emit({"jsonrpc": "2.0",
                       "method": "mcode/session/delegation_update",

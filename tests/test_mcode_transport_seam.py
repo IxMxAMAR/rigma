@@ -66,14 +66,30 @@ def test_the_acp_driver_has_the_seam_s_call_signature():
 
 
 def test_the_acp_driver_declares_what_it_does_not_do():
-    """The driver is a PARALLEL path, not the default, and the adapter's `drives`
-    line must say so — a menu that implies the chat turn already uses ACP would be
-    describing a turn that is not happening."""
+    """The driver is a PARALLEL path, not the default, and the adapter's `drives` line
+    must say so — a menu that implies the chat turn already uses ACP would be describing a
+    turn that is not happening.
+
+    THIS ASSERTED THE WRONG THING UNTIL R7. It required the literal sentence "does not use
+    it yet", which was true when the ACP client landed and stopped being true at
+    R6-ACP-SEAM, when the transport selector arrived. A test that pins a SENTENCE rather
+    than a FACT keeps a stale disclosure in place by failing the fix, which is the same
+    defect as the stale claim itself — so this now asserts the fact.
+    """
     # `list_harnesses()` is the module's own registry accessor and returns dicts, so
     # the row is selected by name rather than by position — an order-dependent test
     # would break the day a backend is inserted.
     rows = {h["name"]: h for h in harness.list_harnesses()}
     drives = rows[harness.MCODE]["drives"]
+
+    # Both wires are named...
     assert "exec" in drives
     assert "ACP" in drives or "acp" in drives
-    assert "does not use it yet" in drives, drives
+    # ...`exec` is named as the DEFAULT, which is the actual constraint the docstring
+    # describes — the menu must not imply ACP is what runs...
+    assert "DEFAULT" in drives or "default" in drives, drives
+    # ...and it must not still claim ACP is unused.
+    assert "does not use it yet" not in drives, drives
+    # The control that switches it has to be named, or the user cannot act on the
+    # disclosure.
+    assert "transport" in drives, drives

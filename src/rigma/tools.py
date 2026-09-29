@@ -108,6 +108,10 @@ _SCAN_MAX = 2000
 # A tier decides ONLY what is advertised. It is never a permission: `use_tools`
 # pulls any permitted tool back on request, and the run loop keeps the unlock
 # for the rest of the run (see serve.py), so a wrong guess costs one step.
+# NAMED FOR THE READER, NOT FOR THE CODE. Nothing iterates this, and it is not dead:
+# `_TIER`'s values are drawn from it, and the tuple is what says the set is CLOSED — a
+# typo'd tier in the dict below is otherwise invisible, because a string that no tier list
+# contains still looks like a tier.
 TIERS = ("core", "extended", "specialist")
 _TIER: dict[str, str] = {
     # near-duplicates of a broader tool: view_images already takes a list of one
