@@ -1,5 +1,16 @@
 # llama.cpp 5x partial-offload penalty: findings
 
+> **PARTLY SUPERSEDED 2026-09-29 (R3-ENG-14).** The placement facts below are confirmed
+> against the fork at `87268f77` and stand: offload is from the end, `ngl` counts the output
+> layer, weights stay resident, and the PQ2_0 CPU kernel is vectorized. **Q1's "cliff" and
+> Q3's arithmetic are refuted.** Attention does not read the whole context-proportional
+> cache: `get_n_kv` returns the occupied, padded cell count (`n_kv` = 512 for a ~260-token
+> run), so the KV term is ≤0.3 ms per CPU layer, not 45-70 ms/token. The cost is the CPU
+> matmul of the PQ2_0 weights: a straight line, ~9.18 ms per CPU-resident layer at
+> ~11.4 GiB/s (R² 0.99992), which is compute-bound rather than DRAM-bound. The source quotes
+> below are from `master`; the pinned-commit equivalents are in
+> `37-262k-context.md`. See also the correction banner in `36-partial-offload-cliff.md`.
+
 Method: `web_search` was unavailable (no API key), so I used DuckDuckGo HTML + direct fetches. I verified llama.cpp internals by cloning **ggml-org/llama.cpp** (master) and the actual fork **PrismML-Eng/llama.cpp** (commit `87268f77`, 2026-09-28) and reading the source locally. Code refs below are from those clones.
 
 ## Premise corrections (source-verified)

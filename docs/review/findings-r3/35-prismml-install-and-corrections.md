@@ -378,6 +378,18 @@ measures 82% on the same kind of trade, and the two agree in direction and rough
 0.15 budget is therefore far more expensive for a dense hybrid model than its framing
 suggests.
 
+> **CORRECTED 2026-09-29 (R3-ENG-14).** The comparison above moved `-c` and `-ngl` together
+> (65536/ngl 99 vs 131072/ngl 58), so it could not separate context from spill — the same
+> confound this document flags a few lines down. The controlled runs in
+> `36-partial-offload-cliff.md` fix the context and move only `-ngl`: 54.5 t/s at 0 CPU
+> layers, 12.6 t/s at 7, 5.9 t/s at 17 — a 4.3x loss for 7 layers, not 82% for 6. The
+> mechanism was also wrong: the cost is the CPU matmul throughput of the PQ2_0 weights
+> (~9.2 ms per CPU layer at ~11.4 GiB/s), not a context-proportional KV cache read, because
+> attention only ever runs over the occupied padded cells (`n_kv` = 512 for a ~260-token
+> run). And **262144 fits fully on this card at q5_1/q5_1** (13016 MB against a 14954 MB
+> budget); the spill at 262144 was caused by a pinned q8_0 cache policy, now removed.
+> See `37-262k-context.md`.
+
 This is **not changed here** — it is a global policy, and other models may genuinely prefer
 the window. The model's spec is pinned to `launch.ctx = 65536` with `--ctx` available as an
 explicit override, which re-fits `ngl` (verified: `rigma up --ctx 65536 --dry-run` produces
