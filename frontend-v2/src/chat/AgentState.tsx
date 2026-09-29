@@ -41,6 +41,7 @@ import {
 } from "./governance";
 import {
   QUEUE_ACTIONS,
+  configOptionValues,
   rowActionParams,
   rowActionReady,
   type RowAction,
@@ -448,15 +449,10 @@ function AcpBlock({
             {/* `c.options` is the list of values the server will ACCEPT. It was received
                 and discarded, so the panel could show the current value and nothing about
                 what else was possible. Rendered only when the server sent it. */}
-            {Array.isArray(c.options) && c.options.length > 0 && (
+            {configOptionValues(c.options).length > 0 && (
               <span className="text-muted/70">
                 {" ("}
-                {c.options
-                  .map((o) => (o && typeof o === "object"
-                    ? String((o as { value?: unknown }).value ?? "")
-                    : String(o)))
-                  .filter((v) => v !== "")
-                  .join("|")}
+                {configOptionValues(c.options).join("|")}
                 {")"}
               </span>
             )}
@@ -562,10 +558,15 @@ function AcpBlock({
 
 /** R6-ACP-CONTROL-ROW: the per-row control actions.
  *
- *  A row is only actionable when the backend actually sent the id the operation needs —
- *  `rowActionReady` decides, and a row missing its id draws no buttons rather than a
- *  button that would be refused. Nothing renders at all without `onRowOp`, which is how
- *  a durable turn stays free of controls.
+ *  A row is only actionable when the backend actually sent the id the operation needs AND
+ *  the row is in a state the operation applies to — `rowActionReady` decides both, and a
+ *  row that fails either check draws no button rather than a button that would be refused.
+ *  Nothing renders at all without `onRowOp`, which is how a durable turn stays free of
+ *  controls.
+ *
+ *  QUEUE ROWS ONLY. There used to be a per-child delegation action here; it was removed
+ *  because mcode's `delegation/stop` is session-wide (see `controlPlane.ts`), so a button
+ *  on a member row would have stopped every member.
  */
 function RowActions({ actions, row, onRowOp }: {
   actions: RowAction[];

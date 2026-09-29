@@ -1501,6 +1501,23 @@ def drive_turn_acp(prompt: str, *, exe: str = "", base_url: str = "",
                 client.session_new(cwd or "", timeout=min(timeout, 60.0))
             if state is not None:
                 state["session_id"] = client.session_id
+            # THE HANDSHAKE'S OWN OPTION LIST, FORWARDED.
+            #
+            # `session_new`/`session_resume` already answered with `configOptions`, and
+            # `AcpClient` stored them — but the only thing that could put them on the wire
+            # as an `acp_config` event was a `config_option_update` NOTIFICATION. So the
+            # panel's session-settings block, which is gated on the list being non-empty,
+            # rendered nothing at all on a server that does not push an update, and the
+            # values were stale on any server that does.
+            #
+            # This is the server's current truth as of this turn, which is exactly what the
+            # panel should draw. Sent unconditionally, including when the list is empty, so
+            # a session with no configOptions says so rather than leaving the previous
+            # turn's list on screen.
+            opts = getattr(client, "config_options", None)
+            events.put(TurnEvent("state", event="acp_config",
+                                 data={"configOptions": opts
+                                       if isinstance(opts, list) else []}))
             # The permission policy is set through the protocol, which is how a
             # session changes it mid-flight — something `exec` cannot do at all.
             try:

@@ -27,7 +27,7 @@ import sys
 import pytest
 from fastapi.testclient import TestClient
 
-from rigma import harness_mcode, sessions
+from rigma import harness_mcode, harness_mcode_acp, sessions
 from rigma.serve import build_app
 
 FAKE = pathlib.Path(__file__).with_name("fake_acp_server.py")
@@ -366,16 +366,33 @@ def test_the_panel_and_the_row_actions_do_not_overlap():
     import re
 
     plane = (FRONTEND / "controlPlane.ts").read_text(encoding="utf-8")
+    panel = (FRONTEND / "ControlPanel.tsx").read_text(encoding="utf-8")
     form = re.search(r"CONTROL_OPS: ControlOp\[\] = \[(.*?)\n\];", plane, re.S)
     rows = re.search(r"QUEUE_ACTIONS: RowAction\[\] = \[(.*?)\n\];", plane, re.S)
     assert form and rows, "the operation tables were not found"
     form_ops = set(re.findall(r'op: "([a-z_]+)"', form.group(1)))
     row_ops = set(re.findall(r'op: "([a-z_]+)"', rows.group(1)))
     assert form_ops and row_ops, (form_ops, row_ops)
+
+    # AND THE OPERATIONS THE PANEL SENDS DIRECTLY. `config_set` is not in either table —
+    # `ControlPanel` passes it as a string literal, because it is driven by the
+    # session-settings selects rather than by the operation dropdown. Reading only
+    # `controlPlane.ts` left the newest operation outside the guard.
+    direct = set(re.findall(r'api\.control\(\s*sessionId,\s*"([a-z_]+)"', panel))
+    assert direct, "no direct api.control call was found in ControlPanel"
+    form_ops |= direct
     # The overlap that must not exist: the form has no id, so an id-taking operation
     # offered there would be a button that always fails.
     assert not (form_ops & row_ops), (
         f"offered both as a form operation and as a row action: {form_ops & row_ops}")
+
+    # THE REVERSE DIRECTION, which was unchecked. Every operation the UI can send has to be
+    # one the server's allowlist declares — a typo in an operation name is otherwise a 400
+    # the user discovers by clicking. This is the guard that would have caught it.
+    server = set(harness_mcode_acp.CONTROL_OPS)
+    unknown = (form_ops | row_ops) - server
+    assert not unknown, (
+        f"the UI can send operations the server's allowlist does not have: {sorted(unknown)}")
     # And no per-member delegation table, because the protocol has no member-scoped stop.
     assert "MEMBER_ACTIONS" not in plane, (
         "a per-member action table is back; mcode's delegation/stop is session-wide")

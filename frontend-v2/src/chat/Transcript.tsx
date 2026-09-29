@@ -309,8 +309,10 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
     try {
       await api.control(sid, op, params);
     } catch (e) {
-      // Surfaced, not swallowed: these are destructive (drop a message, stop a child),
-      // so a silent failure would leave the user believing something happened.
+      // Surfaced, not swallowed: dropping a queued message is destructive, so a silent
+      // failure would leave the user believing something happened. (This said "stop a
+      // child" too, which was the per-delegate action that no longer exists —
+      // `delegation_stop` is session-wide and lives in the control panel.)
       useChat.setState({ lastError: errText(e) });
     }
   }, []);

@@ -5,9 +5,11 @@ import {
   CONTROL_OPS,
   QUEUE_ACTIONS,
   ROW_OPS,
+  configOptionValues,
   controlAvailability,
   controlOpError,
   controlParams,
+  controlReady,
   controlResultText,
   rowActionParams,
   rowActionReady,
@@ -154,11 +156,61 @@ describe("R6-ACP-CONTROL-ROW: per-row actions", () => {
     // refused for a missing parameter — and a round trip to learn that costs a process,
     // so the button is not drawn at all.
     const steer = QUEUE_ACTIONS.find((a) => a.op === "queue_steer")!;
-    expect(rowActionReady(steer, { itemId: "q1" })).toBe(true);
+    expect(rowActionReady(steer, { itemId: "q1", status: "queued" })).toBe(true);
     expect(rowActionReady(steer, {})).toBe(false);
     expect(rowActionReady(steer, { itemId: "" })).toBe(false);
     // A non-string id is not an id.
     expect(rowActionReady(steer, { itemId: 7 })).toBe(false);
+  });
+
+  it("withholds a status-changing action on a row that is no longer in that status", () => {
+    // A queue item that already FAILED or COMPLETED stays in the list — the type carries
+    // `failedReason` precisely because those rows persist. mcode refuses to promote a
+    // message that is not still queued, so the button could only ever produce an error the
+    // user did not need to see.
+    const steer = QUEUE_ACTIONS.find((a) => a.op === "queue_steer")!;
+    expect(rowActionReady(steer, { itemId: "q1", status: "queued" })).toBe(true);
+    expect(rowActionReady(steer, { itemId: "q1", status: "failed" })).toBe(false);
+    expect(rowActionReady(steer, { itemId: "q1", status: "completed" })).toBe(false);
+    // An UNREADABLE status is not ready either: a row whose state we cannot see is not one
+    // to offer a state-changing control on.
+    expect(rowActionReady(steer, { itemId: "q1" })).toBe(false);
+    // And an action that declares no statuses is unaffected — dropping a message works
+    // whatever state it is in.
+    const drop = QUEUE_ACTIONS.find((a) => a.op === "queue_delete")!;
+    expect(rowActionReady(drop, { itemId: "q1", status: "failed" })).toBe(true);
+  });
+
+  it("prints no empty bracket pair when an option list has no usable values", () => {
+    // The list used to be decided in the JSX: it checked `options.length > 0` and then
+    // FILTERED empty values out of what it printed — so entries that all lacked a `value`
+    // rendered a literal " ()" with nothing inside the brackets.
+    expect(configOptionValues([{ value: "a" }, { value: "b" }])).toEqual(["a", "b"]);
+    expect(configOptionValues([{ value: "a" }, { name: "no value" }])).toEqual(["a"]);
+    // Every one of these is empty, so the caller draws NOTHING.
+    expect(configOptionValues([{ name: "x" }, { value: "" }, null])).toEqual([]);
+    expect(configOptionValues([])).toEqual([]);
+    // Not an array at all is the same as empty, not a crash.
+    expect(configOptionValues(undefined)).toEqual([]);
+    expect(configOptionValues("queued")).toEqual([]);
+    // A bare string entry is a value, and an object is unwrapped rather than stringified
+    // into "[object Object]".
+    expect(configOptionValues(["low", { value: 7 }])).toEqual(["low", "7"]);
+  });
+
+  it("gives every closed-set operation a value it can actually send", () => {
+    // `goal_patch` used to carry no arg and no choices, so the panel sent it with NO
+    // params: the server accepted the empty patch, returned the goal UNCHANGED, and the
+    // result line printed the old status as the outcome. A button that does nothing and
+    // reports success is the failure this module exists to prevent.
+    const patchOp = CONTROL_OPS.find((o) => o.op === "goal_patch")!;
+    expect(patchOp.choices?.param).toBe("status");
+    expect(patchOp.choices!.values.length).toBeGreaterThan(0);
+    // The default (first value) is what an untouched select sends, so it must be real.
+    expect(controlParams(patchOp, "")).toEqual({ status: "active" });
+    expect(controlParams(patchOp, "", "paused")).toEqual({ status: "paused" });
+    // And readiness follows the value, not the text field it does not use.
+    expect(controlReady(patchOp, "")).toBe(true);
   });
 
   it("returns null params rather than an operation without its id", () => {

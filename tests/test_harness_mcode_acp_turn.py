@@ -64,6 +64,50 @@ def test_a_turn_produces_text(fake_acp):
     assert text, f"a turn must produce text; got {[e.kind for e in events]}"
 
 
+def test_the_handshakes_own_option_list_reaches_the_ui(fake_acp):
+    """The settings block is gated on this list, so it has to arrive on a turn.
+
+    The handshake already ANSWERS with `configOptions`; the only thing that could put them
+    on the wire as an `acp_config` event was a `config_option_update` notification. So on a
+    server that does not push one — and the fake does not — the panel's session-settings
+    controls rendered NOTHING, gated on a list that never arrived.
+    """
+    events = _drive("hello")
+    # `event` is a TOP-LEVEL field on TurnEvent — "the backend's own event name" — and the
+    # payload is `data` beside it.
+    config = [e for e in events if e.kind == "state" and e.event == "acp_config"]
+    assert config, ("the handshake's configOptions must be forwarded as an acp_config "
+                    f"event; got {[e.event for e in events if e.kind == 'state']}")
+    opts = config[0].data.get("configOptions")
+    assert isinstance(opts, list) and opts, f"the option list was {opts!r}"
+    ids = {str(o.get("id")) for o in opts if isinstance(o, dict)}
+    # The two the fake's handshake declares. A list that arrives but names nothing the
+    # panel can draw is the same defect one step later.
+    assert {"permissionMode", "model"} <= ids, f"the list named {sorted(ids)}"
+
+
+def test_the_option_list_is_sent_even_when_it_is_empty(fake_acp, monkeypatch):
+    """An empty list has to be SAID, not omitted.
+
+    If the event were skipped when there is nothing to report, the panel would keep
+    drawing the PREVIOUS turn's options after a session that has none — stale settings
+    presented as current, which is worse than no settings at all.
+    """
+    real_resume = acp.AcpClient.session_resume
+
+    def _no_options(self, *a, **kw):
+        res = real_resume(self, *a, **kw)
+        self.config_options = []
+        return res
+
+    monkeypatch.setattr(acp.AcpClient, "session_resume", _no_options)
+    state = {"session_id": "mvs_fake_session"}
+    events = _drive("hello", state=state)
+    config = [e for e in events if e.kind == "state" and e.event == "acp_config"]
+    assert config, "an empty list must still be reported"
+    assert config[0].data.get("configOptions") == []
+
+
 def test_the_session_id_is_written_back_for_the_next_turn(fake_acp):
     """Continuity is the whole reason to hand a turn to an agent rather than a
     prompt, so a turn that forgets its session id is a turn that starts over."""
