@@ -126,16 +126,50 @@ for ($ngl in 99,58,48) {
 }
 ```
 
-| ngl | CPU layers (VERIFIED: `n_layer_all+1-ngl`) | PREDICTED t/s |
-|---|---:|---:|
-| 99 | 0 | 37.12 (all-GPU q5_1 at depth) |
-| 58 | 7 | ~12.6 (MEASURED at shallow depth, doc 36) |
-| 48 | 17 | ~5.9 (MEASURED at shallow depth) |
+### The CPU term is NOT depth-flat — reworked prediction
 
-The linear model is `ms/token = 0.280*L_gpu + 9.18*L_cpu` (R^2 0.99992). At depth the GPU term
-grows (more KV traffic) while the CPU term is flat, so the *ratio* should compress with depth:
-7 CPU layers at depth 131072 should be **less** than 4.3x slower than all-GPU. That is a
-falsifiable prediction of the corrected mechanism, and it is the cleanest way to test it.
+`-ngl` keeps the FIRST layers on the CPU, and full attention is exactly `il % 4 == 3`
+(`src/models/qwen35.cpp:21-27` at `87268f77`, VERIFIED), so a CPU-resident *attention* layer has
+its KV slice in host RAM (the KV-follows-layer-device fact from doc 36) and reads it every token:
+
+| ngl | CPU layers (`n_layer_all+1-ngl`) | CPU attention layers | which |
+|---|---:|---:|---|
+| 99 | 0 | 0 | — |
+| 58 | 7 (0..6) | **1** | il=3 |
+| 48 | 17 (0..16) | **4** | il 3, 7, 11, 15 |
+
+So the CPU term has three parts, and only the first is depth-flat:
+
+```
+T_cpu(d) = 9.18 * c                                  # PQ2_0 CPU matmul, MEASURED (37- §2)
+         + a_c * (1536 * d / BW_host)                # that layer's KV from system RAM
+         + a_c * (20480 * d / F_cpu)                 # CPU attention compute: QK+PV,
+                                                     # 20 q-heads x 256 head_dim x 4 flops/key
+```
+with `1536 B/token` = q5_1 per attention layer (24576/16), `BW_host` 40-80 GB/s and `F_cpu`
+100-300 GFLOP/s — the last two are PREDICTION, and `F_cpu` is the widest error bar in this
+document (there is no in-house measurement of it). The GPU side keeps the measured decomposition:
+`0.280 ms` per GPU layer, plus `0.537 ms` per GPU attention layer at d=131072, scaling with d
+(from the all-GPU column: 26.94 ms at 131072 against 18.34 ms at depth 0 = 8.60 ms for 16 layers).
+
+At **depth 131072**, with the arithmetic shown (`T_gpu` includes the GPU-side KV read):
+
+| ngl | T_cpu | T_gpu | total | PREDICTED t/s | at depth 0 (MEASURED) |
+|---:|---:|---:|---:|---:|---:|
+| 99 | 0 | 26.5 ms | 26.5 ms | 37.7 | 54.5 |
+| 58 | 75.7-96.1 ms | 24.0 ms | 99.7-120.1 ms | **8.3-10.0** | 12.59 |
+| 48 | 201.7-283.3 ms | 19.6 ms | 221.3-302.9 ms | **3.3-4.5** | 5.9 |
+
+Worked example, ngl 58: `15.96 (57 GPU layers) + 64.26 (7 CPU layers) + 8.06 (15 GPU attention
+layers) + [2.5..5.0] (192 MiB host KV) + [8.9..26.8] (2.68 GFLOP of CPU attention)` = 99.7-120.1 ms.
+ngl 48: `13.16 + 156.06 (17 CPU layers) + 6.44 (12 GPU attention) + 4x[2.5..5.0] + 4x[8.9..26.8]`.
+
+**The ratio ngl58/ngl99 is therefore roughly FLAT with depth, not compressing and not
+exploding**: 4.4x at depth 0 (measured 4.3x), 3.8-4.5x at depth 131072 — the CPU attention term
+grows with depth at about the same rate as the GPU's KV traffic, so the two effects very nearly
+cancel. That is the falsifiable claim: if the measured ratio at depth is far outside ~3.8-4.5x,
+the CPU-attention term is mis-sized. `37-` §2's linear model is a SHORT-DEPTH model and is tested
+by the depth-0 row, not by the depth behaviour.
 
 ## 5. Rotation A/B (sizes the quality caveat in `37-` §4)
 
@@ -218,15 +252,41 @@ card cool.
 |---|---|
 | q8_0 @ 131072 near 54 t/s, not 33 | the KV-bytes depth model is wrong; `37-` §3 must be re-derived |
 | q8_0 @ 131072 near 33 t/s | `37-` §3 confirmed at the most important cell |
-| spill curve ratio *grows* with depth | the CPU attention term dominates after all; `37-` §2 is wrong |
-| spill curve ratio *shrinks* with depth | corrected mechanism confirmed (CPU matmul is depth-flat) |
-| Rigma argv still says q8_0 at 262144 | `e520b06` regressed |
+| ngl58/ngl99 ratio at depth 131072 far ABOVE ~4.5x | the CPU attention term is more expensive than assumed — `F_cpu` below ~100 GFLOP/s, or the GPU KV term smaller |
+| ngl58/ngl99 ratio at depth 131072 far BELOW ~3.8x | the CPU attention term is cheaper than assumed (`F_cpu` above ~300 GFLOP/s) or the host KV read is not happening |
+| the ratio near 3.8-4.5x at depth 131072 | §4's reworked prediction holds: the CPU attention term grows with depth at the same rate as the GPU KV term |
+| ngl 48 collapses far below 3.3 t/s | 4 CPU attention layers cost more than the model allows for; `F_cpu` is low |
+| the depth-0 spill curve moves | `37-` §2's measured linear model (0.280 / 9.18 ms) is not reproducible |
+| Rigma argv still says q8_0 at 262144 on Vulkan | `e520b06` regressed |
+| Rigma argv says q5_1 on ROCm | `08b029b` regressed — q5_1 has no FA kernel there |
 | HIP mixed K/V is not a cliff | the `-fa on` source reading is wrong |
 | rotation A/B differs >5% in speed | the quality caveat needs a speed caveat too |
+
+`37-` §2's linear model is a SHORT-DEPTH model. Testing it means testing the depth-0 rows; testing
+the *mechanism* means testing whether the CPU term grows with depth as §4 predicts.
+
+## 11. Optional later experiment — `--kv-mean-center` (do not wire into Rigma)
+
+The fork ships a K-cache bias correction that is relevant to the ROCm/CUDA pick (q4_0) in `37-`
+§4: `--kv-mean-center FNAME` (`common/arg.cpp:2451-2459`, env `LLAMA_ARG_KV_MEAN_CENTER`) subtracts
+a precomputed per-(kv-head, channel) bias from K before Q4_0 quantization. It is softmax-invariant
+(the `q·k̄` term is constant per row), claimed to cost nothing at decode time, and requires
+`-ctk q4_0` (enforced at `llama-context.cpp:3913-3917`); it supports hybrid memory
+(`llama-context.cpp:504-506` collects the hybrid attention cache). **The fork publishes no
+perplexity and no speed number** — `docs/kv-mean-center.md` says so explicitly and defers to
+`tools/kv-mean-center/README.md`, which reports logit-KLD only (rotation alone 0.00144, centering
+alone 0.00149, matched rotated-basis bias 0.00111). So it is a candidate to make q4_0 on ROCm
+closer to q8_0 quality, not a measured win.
+
+Testing it needs calibration work (the `llama-kv-mean-center` tool over a text corpus) plus a
+quality run — GPU/CPU work for another night. It is recorded here so the ROCm q4_0 fallback has a
+documented path to better quality, and deliberately **not** wired into Rigma until a number exists.
 
 ## Provenance
 
 Flags and semantics: `PrismML-Eng/llama.cpp` at `87268f77`, `tools/llama-bench/llama-bench.cpp`
 (fetched via `raw.githubusercontent.com`; full text cached at the DSH spill path for this
-session). Predictions: `37-262k-context.md` §3. Measurements quoted for comparison: `35-`, `36-`,
-`~/.rigma/calibration.json`. Binary paths: directory listing of `~/.rigma/engines` (read-only).
+session), `src/models/qwen35.cpp` (attention indices), `common/arg.cpp` and
+`docs/kv-mean-center.md` (section 11). Predictions: `37-262k-context.md` §3 and §4. Measurements
+quoted for comparison: `35-`, `36-`, `~/.rigma/calibration.json`. Binary paths: directory listing
+of `~/.rigma/engines` (read-only). Round-2 verification notes: `.scratch/r3-37/r2-verify.md`.

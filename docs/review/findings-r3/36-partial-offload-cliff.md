@@ -91,8 +91,8 @@ not:
 | `PQ2_0` may have no CPU kernel, falling back to a slow path | **false** — it has a vectorized AVX2/AVX-VNNI one |
 | Thread oversaturation (llama.cpp's documented trap) | **ruled out** — 10 physical cores, 10 threads, `n_threads = 10` |
 | The KV cache follows its layer's device | **TRUE — verified in source**, but not the cost |
-| One CPU attention layer re-reads its **whole context-proportional** cache every token | **FALSE (R3-ENG-14)** — attention runs over occupied, padded cells only |
-| CPU attention over that cache is the dominant term | **FALSE (R3-ENG-14)** — ≤0.3 ms of 9.2 ms per layer |
+| One CPU attention layer re-reads its **whole context-proportional** cache every token | **FALSE at short depth (R3-ENG-14)**, TRUE once the cache is occupied — attention runs over occupied, padded cells only, so this is depth-dependent (`37a` §4) |
+| CPU attention over that cache is the dominant term | **FALSE at short depth (R3-ENG-14)** — ≤0.3 ms of 9.2 ms per layer; it becomes a real term at depth (`37a` §4) |
 | The cost is a "cliff" in fraction of layers | **false** — it is a straight line in CPU layers |
 | `PQ2_0` has no scalar fallback | **imprecise** — a generic scalar `#else` exists, but is not taken on x86-64 |
 
@@ -149,9 +149,11 @@ this machine, and it is linear in the number of CPU-resident layers.
 
 llama.cpp offloads from the **end**; the CPU keeps the FIRST layers. With 64 layers and
 `-ngl 58`, layers 0-6 (seven) stay on the CPU and layers 7-63 plus the output go to the GPU.
-I had assumed the opposite. For a hybrid with `full_attention_interval = 4`, the first 7
-layers contain attention layers 3 and 7, so the CPU holds at least one attention layer — and
-its cache — but per (a) that cache is not what the 9 ms is spent on.
+I had assumed the opposite. For a hybrid with `full_attention_interval = 4`, full attention is
+exactly `il % 4 == 3` (`src/models/qwen35.cpp:21-27` at `87268f77`, verified in round 2), so the
+first 7 layers (0-6) contain **one** full-attention layer, il=3 — and its cache is in host RAM.
+Per (a) that cache is not what the 9 ms is spent on at SHORT depth; at depth it is, because both
+that layer's host KV read and its CPU attention compute grow with the token count (`37a` §4).
 
 ---
 
