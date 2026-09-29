@@ -662,14 +662,23 @@ def perform_switch(model: str, registry=None, profile=None,
     # switch vision back on and eat the VRAM the user just freed.
     if vision is None:
         vision = not bool((st.read_state() or {}).get("no_vision"))
+    notice = ""
     if ctx is not None:
         # honest relaunch at a requested context: real fit math, not hope.
         # rp.flags.ctx is the calculator's grow-to-fit maximum for this quant.
-        from .resolve import fit_gguf
+        from .resolve import fit_for_launch
         want = max(2048, min(int(ctx), spec_full.native_ctx))
-        fit_spec, _ = launch_fit_spec(spec_full, rp.flags, vision=vision,
-                                      ctx=want)
-        flags = fit_gguf(fit_spec, rp.gguf, p, want, [])
+        # The requested cache type — an explicit `kv`, or the model's stored
+        # launch default — is a CEILING, fitted in BEFORE the placement is
+        # chosen. Applying it AFTER the fit (the old order, below) let a stored
+        # `kv: q8_0` re-impose a cache the fit had just rejected: on the owner's
+        # 16GB card, ctx 262144 + q8_0 is 15,576MB against a 14,954MB budget, so
+        # the resolver's fully-resident q5_1 was overwritten by q8_0 and
+        # `-ngl 99` paged 622MB to system RAM with no error printed (WDDM).
+        flags, stepped = fit_for_launch(
+            spec_full, rp.gguf, p, want, kv=kv or "", vision=vision,
+            spec_type=rp.flags.spec_type, n_max=rp.flags.spec_n_max,
+            explain=rp.explain)
         if flags is None:
             raise RuntimeError(
                 f"ctx {want:,} doesn't fit — {model} ({rp.gguf.quant}) tops "
@@ -681,17 +690,28 @@ def perform_switch(model: str, registry=None, profile=None,
         # ...except where the placement was MEASURED at this exact context.
         update.update(_measured_placement(rp, want))
         rp.flags = rp.flags.model_copy(update=update)
+        if stepped:
+            notice = (f"{stepped} does not fit fully at ctx {want:,}; launched "
+                      f"with {flags.cache_type_k} and every layer on the GPU")
+            rp.explain.append(notice)
     else:
         # No ctx asked for, so the plan is the resolver's — which priced the
         # full spec. Re-place the weights only when the resident overhead has
         # actually moved; the freed projector memory is worth GPU layers, and
-        # an unbudgeted draft cache is worth an offload nobody planned.
+        # an unbudgeted draft cache is worth an offload nobody planned. A
+        # requested cache type is a reason to re-fit on its own, because the
+        # resolver priced the spec's policy, not the request.
         fit_spec, differs = launch_fit_spec(spec_full, rp.flags, vision=vision)
-        if differs:
-            from .resolve import fit_gguf
-            got = fit_gguf(fit_spec, rp.gguf, p, rp.flags.ctx, [])
+        if differs or kv is not None:
+            from .resolve import fit_for_launch
+            got, stepped = fit_for_launch(
+                spec_full, rp.gguf, p, rp.flags.ctx, kv=kv or "", vision=vision,
+                spec_type=rp.flags.spec_type, n_max=rp.flags.spec_n_max,
+                explain=rp.explain)
             if got is not None:
-                update = {"ngl": got.ngl, "n_cpu_moe": got.n_cpu_moe}
+                update = {"ngl": got.ngl, "n_cpu_moe": got.n_cpu_moe,
+                          "cache_type_k": got.cache_type_k,
+                          "cache_type_v": got.cache_type_v}
                 # AUDIT F17/F18: docs/audit-2026-09-04-full.md — same rule as the
                 # ctx branch above. `resolve` may already have written a measured
                 # placement into these two keys; the calculator must not overwrite
@@ -700,9 +720,13 @@ def perform_switch(model: str, registry=None, profile=None,
                 # that is the 37.59 -> 9.95 tok/s collapse the audit measured.
                 update.update(_measured_placement(rp, rp.flags.ctx))
                 rp.flags = rp.flags.model_copy(update=update)
-    if kv is not None:
-        rp.flags = rp.flags.model_copy(update={"cache_type_k": kv,
-                                               "cache_type_v": kv})
+                if stepped:
+                    notice = (f"{stepped} does not fit fully at ctx "
+                              f"{rp.flags.ctx:,}; launched with "
+                              f"{got.cache_type_k} and every layer on the GPU")
+                    rp.explain.append(notice)
+    # NOTE: the requested `kv` is deliberately NOT re-applied here. It was
+    # fitted in above; forcing it afterwards is the bug this ordering removes.
     # vision projector: attach it if it's on disk, otherwise run text-only
     # rather than refusing — a vision model still works for text, and the user
     # can download the projector separately to turn vision on
@@ -801,7 +825,13 @@ def perform_switch(model: str, registry=None, profile=None,
         # Carried through so `rigma status` can say which binary is serving. Set above
         # from the selection that actually ran, so it cannot drift from the exe used.
         engine_binary=_engine_binary)
-    return st.read_state() or {}
+    out = st.read_state() or {}
+    if notice:
+        # Transient, in the response only: a switch that stepped the cache down
+        # must say so where the caller can see it, without writing a key that
+        # every later read would have to know to clear.
+        out = {**out, "notice": notice}
+    return out
 
 
 def _await_port_free(port: int, tries: int = 10, delay: float = 0.3) -> None:

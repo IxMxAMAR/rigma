@@ -5,8 +5,8 @@ import re
 
 from pydantic import ValidationError
 
-from .models import (CACHE_BYTES, ComboFlags, GgufFile, HardwareProfile,
-                     ModelSpec, RunPlan)
+from .models import (CACHE_BYTES, CachePolicy, ComboFlags, GgufFile,
+                     HardwareProfile, ModelSpec, RunPlan)
 from .registry import Registry
 
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
@@ -345,7 +345,58 @@ def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
                     f"cache {best.cache_type_k} over "
                     f"{spec.cache_type_policy.k}: keeps "
                     f"{_spilled(spec, best):.0%} of the weights off system RAM")
+            # A PINNED policy (the Models-page explorer's "what if the cache
+            # were q4_0") is allowed to spill — that is the question it was
+            # asked. Say so when a rung the pin removed would have fit fully,
+            # because the alternative is a silent ~4x slowdown: on the owner's
+            # 64-layer hybrid, 7 CPU-resident layers measure 12.6 t/s against
+            # 54.5 all-GPU (findings-r3/36). The plan is unchanged — only the
+            # reason it is slow is now written down where `rigma plan` shows it.
+            if spec.cache_type_policy.pinned and spec.moe is None \
+                    and _spilled(spec, best) > 0:
+                rung = _resident_rung(spec, gguf, profile, ctx, usable_vram,
+                                      usable_ram)
+                if rung is not None:
+                    cpu = _cpu_layers(spec, best)
+                    explain.append(
+                        f"pinned {spec.cache_type_policy.k} at ctx {ctx} puts "
+                        f"{cpu} of {spec.n_layers} layers on the CPU "
+                        f"(~4x slower); {rung.cache_type_k} fits fully on the GPU")
             return best
+    return None
+
+
+def _cpu_layers(spec: ModelSpec, flags: ComboFlags) -> int:
+    """Transformer layers llama.cpp leaves on the CPU under these flags.
+
+    `ngl` counts the OUTPUT layer as one of the offloaded layers
+    (llama-model.cpp: `i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)`,
+    and the output layer is assigned through the same list), so `-ngl 58` on a
+    64-layer model pins layers 0-6 — seven — not six. `_spilled` reports the
+    weight fraction and reads as 6/64; both are used where they belong.
+    """
+    n = spec.n_layers or 0
+    if n <= 0:
+        return 0
+    ngl = min(max(flags.ngl, 0), n + 1)
+    return max(0, (n + 1) - ngl)
+
+
+def _resident_rung(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
+                   ctx: int, usable_vram: float,
+                   usable_ram: float) -> ComboFlags | None:
+    """The most precise UNPINNED cache that is fully resident at `ctx`, or None.
+
+    Only used to explain a pinned spill, so it takes the strict pass directly
+    and never offloads."""
+    unpinned = spec.model_copy(update={
+        "cache_type_policy": spec.cache_type_policy.model_copy(
+            update={"pinned": False})})
+    for k, v in _cache_candidates(unpinned):
+        got = _fit_with_cache(unpinned, gguf, profile, ctx, k, v, usable_vram,
+                              usable_ram, [], strict=True)
+        if got is not None:
+            return got
     return None
 
 
@@ -441,6 +492,49 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     if n_off <= spec.n_layers and n_off * per_layer <= usable_ram:
         return ComboFlags(ctx=ctx, n_cpu_moe=n_off, cache_type_k=k, cache_type_v=v)
     return None
+
+
+def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
+                   ctx: int, *, kv: str = "", vision: bool = True,
+                   spec_type: str = "", n_max: int = 0,
+                   explain: list[str] | None = None
+                   ) -> tuple[ComboFlags | None, str]:
+    """The fit a LAUNCH will actually run: `(flags, stepped_down_from)`.
+
+    A requested cache type — an explicit `kv`, or the model's stored launch
+    default — is a CEILING, not a hard pin. The two passes in `fit_gguf` take
+    the requested type whenever it fits FULLY on the GPU and step DOWN the
+    ladder (q8_0 -> q5_1 -> q4_0) rather than spilling weights when it does
+    not. That is the whole point of the ladder, and the launch paths used to
+    defeat it by applying the type AFTER the fit: on the owner's 16GB card,
+    ctx 262144 with a stored `kv: q8_0` is 15,576MB against a 14,954MB budget,
+    so the resolver fitted q5_1 (fully resident), the post-fit force put q8_0
+    back, and `-ngl 99` paged 622MB to system RAM with no error printed
+    (Windows/WDDM). Fitting it in removes the window in which the plan and the
+    argv can disagree about the cache.
+
+    A stored spec is never PINNED — `CachePolicy.pinned` is the Models-page
+    explorer's knob ("answer the question that was asked") and a real launch
+    keeps the ladder so a too-large cache degrades instead of failing. A stored
+    spec that carries the flag anyway is honoured as "no opinion" here.
+
+    Returns "" for the second value when the requested type was used as-is, or
+    the requested type when the fit stepped down from it.
+    """
+    fit = with_launch_overheads(spec, vision=vision, ctx=ctx,
+                                spec_type=spec_type, n_max=n_max)
+    if kv:
+        fit = fit.model_copy(update={"cache_type_policy":
+                                     CachePolicy(k=kv, v=kv)})
+    elif fit.cache_type_policy.pinned:
+        fit = fit.model_copy(update={
+            "cache_type_policy": fit.cache_type_policy.model_copy(
+                update={"pinned": False})})
+    flags = fit_gguf(fit, gguf, profile, ctx,
+                     explain if explain is not None else [])
+    stepped = kv if (kv and flags is not None
+                     and flags.cache_type_k != kv) else ""
+    return flags, stepped
 
 
 def _backend(profile: HardwareProfile, override: str | None = None) -> str:
@@ -583,14 +677,31 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
                      * spec.moe.expert_weight_fraction)
         speed = "gpu" if spill <= 0.001 else ("light" if spill <= 0.15
                                               else "offload")
-        out.append({"ok": True, "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe,
-                    "ngl": flags.ngl, "kv": flags.cache_type_k,
-                    "kv_v": flags.cache_type_v,
-                    "offload_pct": round(spill * 100), "speed": speed,
-                    "budget": _budget_rows(spec, g, mm_mb, flags.ctx,
-                                           usable_vram,
-                                           flags.cache_type_k,
-                                           flags.cache_type_v)})
+        # The explorer pins the requested type on purpose, so a spill here is
+        # the answer — but if a rung the pin removed would have been fully
+        # resident, the page must say so rather than showing "offload" with no
+        # reason. Same fact as the explain line in fit_gguf, on the surface the
+        # owner actually reads.
+        note = ""
+        if spec.cache_type_policy.pinned and spec.moe is None and spill > 0:
+            rung = _resident_rung(spec, g, profile, flags.ctx, usable_vram,
+                                  _budgets(profile)[1])
+            if rung is not None:
+                note = (f"{flags.cache_type_k} spills at ctx {flags.ctx} "
+                        f"({_cpu_layers(spec, flags)} of {spec.n_layers} layers "
+                        f"on the CPU, ~4x slower); {rung.cache_type_k} fits "
+                        f"fully on the GPU")
+        row = {"ok": True, "ctx": flags.ctx, "n_cpu_moe": flags.n_cpu_moe,
+               "ngl": flags.ngl, "kv": flags.cache_type_k,
+               "kv_v": flags.cache_type_v,
+               "offload_pct": round(spill * 100), "speed": speed,
+               "budget": _budget_rows(spec, g, mm_mb, flags.ctx,
+                                      usable_vram,
+                                      flags.cache_type_k,
+                                      flags.cache_type_v)}
+        if note:
+            row["note"] = note
+        out.append(row)
     return out
 
 
@@ -598,27 +709,47 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
 # each doubling of the window. 0.15 = up to 15% of the layers; the "speed"
 # policy uses 0.0, which is the historical behaviour (never trade a layer).
 #
-# MEASURED, and much more expensive than "15% of the layers" sounds. On a 64-layer
-# dense hybrid (Qwen3.5-family, 48 SSM + 16 attention, full_attention_interval=4)
-# with a 6872 MB file on a 16 GB card, at a FIXED ctx 131072:
+# MEASURED, and much more expensive than "15% of the layers" sounds. On a
+# 64-layer dense hybrid (Qwen3.5-family, 48 SSM + 16 attention,
+# full_attention_interval=4) with a 6872 MB PQ2_0 file on a 16 GB card, at a
+# FIXED ctx 131072 (findings-r3/36, re-derived in findings-r3/37):
 #
-#     -ngl 99 (0 spilled)   54.5 t/s
-#     -ngl 58 (6 spilled)   12.6 t/s   (mean of six runs, sd 1.0)
-#     -ngl 48 (16 spilled)   5.9 t/s
+#     -ngl 99 (0 CPU layers)   54.5 t/s    18.3 ms/token
+#     -ngl 58 (7 CPU layers)   12.6 t/s    79.4 ms   (mean of six, sd 1.0)
+#     -ngl 48 (17 CPU layers)   5.9 t/s   169.5 ms
 #
-# 4.3x from spilling 6 of 64 layers — about 0.6 GB, 9% of the weights. The reason is
-# that llama.cpp does NOT put a spilled layer's KV cache on the GPU: `llama-kv-cache.cpp`
-# allocates each layer's K/V on that layer's own device
-# (`if (offload) { auto * dev = model.dev_layer(il); buft = ggml_backend_dev_buffer_type(dev); }`).
-# So one CPU-resident ATTENTION layer drags its whole context-proportional cache into
-# host RAM, where attention then runs on the CPU every token. The cost scales with
-# context and is invisible in the "9% of layers" framing. This is not a missing CPU
-# kernel: PQ2_0 has a vectorized AVX2/VNNI `vec_dot` (`ggml-cpu.c`, type_traits_cpu).
+# `ngl` counts the OUTPUT layer (llama-model.cpp:
+# `i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)`, output placed by the
+# same rule), so -ngl 58 leaves layers 0-6 — SEVEN — on the CPU, not six.
+# `_spilled` reports the WEIGHT fraction (6/64); the two are different numbers
+# and neither is the other.
 #
-# The user selects this policy (Models page -> Growth policy), so it is not forced —
-# but the dropdown prices it as "more context" and never as "4x slower". Left at 0.15
-# deliberately: other models genuinely prefer the window, and changing a global default
-# on one machine's measurement would be worse than documenting it.
+# The cost is a straight line, not a context-sized cliff:
+#     ms/token ~= 0.28 x GPU layers + 9.18 x CPU layers   (R^2 0.99992)
+# Each CPU-resident layer streams ~107 MB of PQ2_0 weights through the CPU
+# 2-bit unpack + AVX2/VNNI `dpbusd` kernels at ~11.4 GiB/s — a COMPUTE-bound
+# kernel (desktop DRAM is 40-80 GB/s), not DRAM bandwidth and not the KV
+# cache. llama.cpp attends only over the OCCUPIED, padded cells, not the
+# allocated window: `get_n_kv` pads to 256, so a ~260-token run sees n_kv=512,
+# and llama-kv-cache.h calls n_kv "a heuristic, to avoid attending the full
+# cache if it is not yet utilized". The CPU attention term is <=0.3 ms of the
+# 9.18. An earlier note blamed "the spilled layer's context-proportional KV
+# cache"; KV-on-layer-device is real (`llama-kv-cache.cpp`: `if (offload) {
+# auto * dev = model.dev_layer(il); ... }`) but with a barely-filled cache it
+# is not what costs the time.
+#
+# 262144 FITS FULLY on this card with a smaller cache: q8_0/q8_0 is 8704 MB of
+# KV (15576 MB total against a 14954 MB budget, so it spills 7 layers), while
+# q5_1/q5_1 is 6144 MB (13016 MB total, 1938 MB of headroom) and keeps every
+# layer on the GPU. A pinned q8_0 policy is what turns a fully-resident 262K
+# plan into a 7-layer spill (~4x slower); `fit_for_launch` now treats the
+# requested type as a CEILING so that cannot happen silently.
+#
+# The user selects this policy (Models page -> Growth policy), so it is not
+# forced — but the dropdown prices it as "more context" and never as "4x
+# slower". Left at 0.15 deliberately: other models genuinely prefer the window,
+# and changing a global default on one machine's measurement would be worse
+# than documenting it.
 _GROW_LAYER_BUDGET = 0.15
 
 
