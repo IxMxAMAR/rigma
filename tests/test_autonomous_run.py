@@ -842,17 +842,21 @@ def test_start_run_responds_immediately(engine, monkeypatch):
     _wait(c, r.json()["id"], timeout=25)
 
 
-def test_compiled_spec_seeds_the_plan(engine):
+def test_compiled_spec_seeds_the_plan(engine, tmp_path):
     # a good compile means the model EXECUTES a plan instead of inventing one
+    # the deliverable lives under tmp_path: an absolute "D:/..." artifact makes
+    # anchor_spec stat a drive whose state is machine-specific (D: is
+    # BitLocker-locked here, and mission.anchor_spec's parent.exists() raises).
+    deliverable = str(tmp_path / "out" / "a.txt")
     _Engine.compile_reply = json.dumps({
         "objective": "write prompts in batches",
-        "deliverables": [{"path": "D:/out/a.txt", "description": "batch 1"}],
+        "deliverables": [{"path": deliverable, "description": "batch 1"}],
         "constraints": ["do not modify originals"],
         "steps": [
             {"id": 1, "description": "sample images", "artifact": "",
              "verification": {"type": "none"}},
             {"id": 2, "description": "write prompts 1-25",
-             "artifact": "D:/out/a.txt",
+             "artifact": deliverable,
              "verification": {"type": "file_min_size", "value": 100}}]})
     _Engine.script = [None]
     c = _client(engine)
