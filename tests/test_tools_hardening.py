@@ -58,6 +58,21 @@ def test_view_image_rejects_non_image(tmp_path):
     assert "not an image" in out
 
 
+def test_view_image_refuses_a_directory_named_like_an_image(tmp_path):
+    """A DIRECTORY named `adir.png` must not come back as a viewable image.
+
+    `_fuzzy_file`'s exists() accepts a directory, the suffix check passes, and
+    stat() succeeds on a directory — so `_resolve_image` returned the path and
+    `_view_image` emitted the IMAGE_SENTINEL: a FALSE SUCCESS that hands the
+    model a "picture" it can never describe. `read_file` and `view_images` both
+    re-check is_file() after the fuzzy repair; view_image is the odd one out."""
+    d = tmp_path / "adir.png"
+    d.mkdir()
+    out = tools.run_tool("view_image", {"path": str(d)}, {"has_vision": True})
+    assert tools.IMAGE_SENTINEL not in out
+    assert "no such file" in out
+
+
 def test_view_image_missing_file():
     out = tools.run_tool("view_image", {"path": "D:/nope/gone.png"},
                          {"has_vision": True})

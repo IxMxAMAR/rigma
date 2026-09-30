@@ -3801,6 +3801,16 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
         if found is None:
             return None, f"no such file: {ps}" + _candidates(p), ""
         p = found
+    # The fuzzy repair can hand back a DIRECTORY: `_fuzzy_file`'s exists()
+    # accepts one, and it returns `p` itself when `p` is a directory named like
+    # an image. The suffix check below passes and stat() succeeds on a
+    # directory, so `adir.png` was returned as a viewable image and
+    # `_view_image` emitted the sentinel — a FALSE SUCCESS that hands the model
+    # a "picture" it can never describe. `read_file` and `view_images` both
+    # re-check is_file() after the repair; view_image was the odd one out. Answer
+    # with the SAME "no such file" a genuinely missing file gets.
+    if not _stat_ok(p, "is_file"):
+        return None, f"no such file: {ps}" + _candidates(p), ""
     # AUDIT R3-7: this branch never consulted the credential denylist, so an
     # image inside `.ssh`, a browser profile or Rigma's own state dir was the
     # one read the 13-2 fix did not cover — the grant is irrelevant to it, and
