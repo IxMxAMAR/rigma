@@ -990,6 +990,24 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
     # Both branches below RE-READ inside the lock. `rows`/`best` were read
     # before the await; writing that snapshot back clobbered any outcome score
     # (a +1 from a completed step) committed while the gate was answering.
+    #
+    # Re-reading is not enough on its own. The verdict was asked about
+    # `best`'s TEXT, and a second Rigma process can rewrite (or delete) that
+    # row during the gate — `await complete(...)` can take 1-120 s. The id is
+    # stable, so the row found under the lock may now say something else
+    # entirely, and a CONFLICT verdict applied to it would retire or demote a
+    # rule on the strength of a comparison that was never true (10-R3-16).
+    # The lock is deliberately NOT held across `complete`: that is I/O, and
+    # every writer in both processes would block behind it. Instead the
+    # nomination is re-validated here — same id AND same text — and a
+    # nomination that no longer holds is treated exactly like no verdict:
+    # append. A false append is recoverable; a false merge or retire is not.
+    def _still_nominated(rows: list[dict]) -> dict | None:
+        for r in rows:
+            if r.get("id") == best.get("id"):
+                return r if r.get("text") == best.get("text") else None
+        return None
+
     if is_conflict:
         # The NEW observation supersedes — but how far depends on the old
         # rule's standing. A wrong CONFLICT verdict against a VERIFIED rule
@@ -997,34 +1015,38 @@ async def add_consolidated(store: MemoryStore, kind: str, text: str,
         # draft (the worst possible trade), so verified rules are DEMOTED to
         # draft rather than retired: still retrievable, must re-earn their
         # status. Only drafts die outright.
+        applied = False
         with store._xlock():
             rows = store.all()
-            for r in rows:
-                if r.get("id") != best.get("id"):
-                    continue
-                if r.get("status") == "verified":
-                    r["status"] = "draft"
+            hit = _still_nominated(rows)
+            if hit is not None:
+                if hit.get("status") == "verified":
+                    hit["status"] = "draft"
                     log.info("memory: %r demoted by conflict with %r",
-                             r.get("text", "")[:50], text[:50])
+                             hit.get("text", "")[:50], text[:50])
                 else:
-                    r["status"] = "retired"
+                    hit["status"] = "retired"
                     log.info("memory: %r superseded %r", text[:50],
-                             r.get("text", "")[:50])
-                break
-            store._write_all(rows)
+                             hit.get("text", "")[:50])
+                applied = True
+                store._write_all(rows)
+        if not applied:
+            log.info("memory: conflict verdict for %r dropped — the nominated "
+                     "rule changed while the gate answered", text[:50])
         return store.add(kind=kind, text=text, born_run=run_id)
     if is_duplicate:
+        merged = None
         with store._xlock():
             rows = store.all()
-            for r in rows:
-                if r.get("id") != best.get("id"):
-                    continue
-                r["seen_count"] = r.get("seen_count", 1) + 1
-                r["last_seen"] = time.time()
-                best = r
-                break
-            store._write_all(rows)
-        return best
+            hit = _still_nominated(rows)
+            if hit is not None:
+                hit["seen_count"] = hit.get("seen_count", 1) + 1
+                hit["last_seen"] = time.time()
+                merged = hit
+                store._write_all(rows)
+        if merged is not None:
+            return merged
+        return store.add(kind=kind, text=text, born_run=run_id)
     return store.add(kind=kind, text=text, born_run=run_id)
 
 

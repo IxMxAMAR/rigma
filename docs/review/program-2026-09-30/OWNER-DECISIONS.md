@@ -137,3 +137,34 @@ capability at the same time. Both need one live mcode session to verify.
 **If nothing is decided:** the seam keeps working as it does today; questions continue to be
 auto-declined, and the drop is now *visible* (item B2 makes dropped events a notice rather than a
 silent discard).
+
+---
+
+## OD-7 — How many method drafts are kept on disk, and how long is a draft "in use"? (10-R3-17 / A15)
+
+**State today:** `~/.rigma/method_drafts/` had no budget at all — a draft was removed only by
+`promote()`, so a creation chat the user abandons left its file there forever. Item A15 adds
+`DELETE /api/methods/drafts/{id}` (plus the singular `/api/methods/draft/{id}` its siblings use) and
+a cap enforced when a new draft is created. **This one is implemented**, unlike OD-1..6; the two
+numbers are the product decision.
+
+**The numbers A15 chose** (both in `src/rigma/method_drafts.py`):
+- `MAX_DRAFTS = 20` — drafts kept.
+- `_DRAFT_LIVE_SECONDS = 12 h` — a draft written inside this window counts as in use and is never
+  evicted while any older candidate exists. The builder chat rewrites its draft on every tool call,
+  so an open chat keeps its draft live.
+
+**Options**
+1. Keep 20 / 12 h. A draft is a single-digit-KB JSON, so 20 is disk hygiene rather than a resource
+   bound; 12 h makes it very unlikely an open chat loses its draft, and abandoned ones age out
+   within a day.
+2. A smaller cap or shorter lease (e.g. 5 / 1 h). Reaps faster, but can drop a draft a chat is still
+   pointed at — the builder tool then answers "the draft is gone".
+3. Reap on a timer or at startup instead of on creation. More even, but adds a background task for
+   a few KB.
+
+**Recommendation: option 1.** The cap deliberately yields rather than drop a live draft: if every
+draft is fresh the store stays over the cap until one ages. Dropping a live draft is the one outcome
+the eviction rule must not produce.
+
+**If nothing is decided:** the numbers stand; changing either is a one-line edit.
