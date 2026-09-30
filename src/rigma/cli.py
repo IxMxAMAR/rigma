@@ -2096,6 +2096,11 @@ def up(use_case: str = typer.Option("general", "--use-case"),
            None, "--reasoning-budget",
            help="Max thinking tokens per turn (0 = end thinking "
                 "immediately, -1 = unlimited)"),
+       ctx_checkpoints: int = typer.Option(
+           None, "--ctx-checkpoints",
+           help="Max context checkpoints per slot on a hybrid/recurrent model "
+                "(0 disables; unset keeps the engine default of 32). More "
+                "checkpoints buy cheaper rewinds at a memory cost"),
        fa: str = typer.Option(None, "--fa",
                               help="FlashAttention: on|off|auto"),
        spec: str = typer.Option(None, "--spec",
@@ -2351,6 +2356,14 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         rp.flags = rp.flags.model_copy(
             update={"reasoning_budget": reasoning_budget})
         rp.origin += "+rbudget-override"
+    if ctx_checkpoints is not None:
+        if ctx_checkpoints < 0:
+            typer.echo("--ctx-checkpoints must be 0 or greater "
+                       "(0 disables checkpoints)")
+            raise typer.Exit(2)
+        rp.flags = rp.flags.model_copy(
+            update={"ctx_checkpoints": ctx_checkpoints})
+        rp.origin += "+ctxcp-override"
     if fa is not None:
         if fa not in ("on", "off", "auto"):
             typer.echo("--fa must be on, off, or auto")

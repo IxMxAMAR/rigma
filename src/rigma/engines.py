@@ -102,6 +102,7 @@ LLAMACPP_ONLY_FLAGS = (
     "-m", "-ngl", "-c", "-b", "-ub", "-fa",
     "--n-cpu-moe", "--cache-type-k", "--cache-type-v",
     "--parallel", "--kv-unified", "--cache-reuse", "--checkpoint-min-step",
+    "--ctx-checkpoints",
     "--slot-save-path", "--spec-type", "--spec-draft-n-max",
     "--reasoning", "--reasoning-budget", "--reasoning-budget-message",
     "--mmproj", "--chat-template-file", "--no-mmap", "--tensor-split",
