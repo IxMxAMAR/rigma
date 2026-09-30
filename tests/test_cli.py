@@ -353,6 +353,31 @@ def test_up_ctx_override_and_clamp(tmp_path, monkeypatch):
     assert res.exit_code == 0 and "-c 262144" in res.output  # qwen native cap
 
 
+def test_up_surfaces_a_clamped_default_ngl(tmp_path, monkeypatch):
+    """C10-nits N3: the resolver records a clamp in `explain` ("launch default
+    ngl 999 exceeds what fits ...: using 99"), but `rigma up` never printed it —
+    so a launch could run at a clamped ngl with no notice while `rigma plan
+    --explain` showed the note. The dry-run preview must show it too."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    from rigma.models import LaunchDefaults
+    real_load = cli.Registry.load
+
+    def _load(*a, **k):
+        reg = real_load(*a, **k)
+        models = dict(reg.models)
+        spec = models["qwen3.6-35b-a3b"]
+        models["qwen3.6-35b-a3b"] = spec.model_copy(
+            update={"launch": LaunchDefaults(ngl=999)})
+        return cli.Registry(reg.gpus, models, reg.combos)
+
+    monkeypatch.setattr(cli.Registry, "load", staticmethod(_load))
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run"])
+    assert res.exit_code == 0, res.output
+    assert "launch default ngl 999 exceeds what fits" in res.output
+
+
 def test_up_reasoning_override(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)

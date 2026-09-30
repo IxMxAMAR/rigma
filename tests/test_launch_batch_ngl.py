@@ -256,6 +256,28 @@ def test_an_unplaceable_ngl_keeps_the_resolvers_placement():
     assert any("cannot be placed" in e for e in plan.explain), plan.explain
 
 
+def test_a_calibrated_placement_names_the_explicit_ngl_it_overrode(
+        tmp_path, monkeypatch):
+    """C10-nits N2: a measured calibration row silently beat an explicit stored
+    `ngl`, and the fit's own note ("launch default ngl 40 (the fit allows 59)")
+    then described a value the plan no longer carried. The override must be
+    visible in the plan's note."""
+    from rigma.bench import save_calibration
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(resolve_mod, "_desktop_vram_mb", lambda profile: None)
+    spec = _spec(launch=LaunchDefaults(ngl=40))
+    reg = Registry([], {"w10a-fixed": spec}, {})
+    save_calibration("w10a-fixed:Q4:vulkan", {"tg_tps": 12.0},
+                     flags={"ngl": 63}, backend="vulkan")
+    plan = resolve(_profile(), reg, use_case="general",
+                   model_override="w10a-fixed")
+    assert plan.flags.ngl == 63                      # the measurement wins
+    assert any("launch default ngl 40 (the fit allows" in e
+               for e in plan.explain), plan.explain
+    assert any("calibration override changed ngl 40 -> 63" in e
+               for e in plan.explain), plan.explain
+
+
 # --- no override, no change -------------------------------------------------
 
 def test_no_batch_override_leaves_the_plan_byte_identical():
