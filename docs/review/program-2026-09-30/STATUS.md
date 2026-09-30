@@ -19,7 +19,7 @@ Baseline full suite: **2935 non-hardware tests, all pass (exit 0)**; `ruff check
 which passes in isolation. Its traceback is `serve.py:5508 TypeError: 'NoneType' object is not subscriptable`,
 i.e. the real **A18** bug (a transient first read killing the run loop), not a flaky test.**
 
-Integration branch head: `45a907f`.
+Integration branch head: `773d39d`.
 
 > **Commit-identity note (2026-09-30).** Early in the run the orchestrator overrode the git author for
 > its merge commits, and several implementers committed under a local identity
@@ -39,7 +39,7 @@ Integration branch head: `45a907f`.
 |---|---|---|---|
 | — | 0 | `8de0434` | Program docs written (BACKLOG / STATUS / HANDOFF / OWNER-DECISIONS); no source change. |
 | A1 | 1 | `4eaec9d` (`82e2bbe`) | Chat-turn persist: a fully-failed save is no longer reported as saved; the failure reaches the user on the turn-level `event: notice` channel and is logged with its `StaleWriteError` reason. |
-| A17/S2 | 1 | `30e711e` (`28ce163`) | The engine's own load log is parsed: model/KV/RS/compute buffers, host-vs-device split, `n_seq_max`, `graph splits`, and plan-vs-actual divergence (+2275.57 MiB / +32.51 % on the real log). Unknown is reported as UNKNOWN, never 0. |
+| A17/S2 | 1 | `30e711e` (`28ce163`) | The engine's own load log is parsed: model/KV/RS/compute buffers, host-vs-device split, `n_seq_max`, `graph splits`, and plan-vs-actual divergence. Unknown is reported as UNKNOWN, never 0. **Its first split baseline (1) and its VRAM comparison were both wrong and would have flagged the owner's healthy log — corrected in A17b/A17c (`099e2c1`), which the orchestrator had to flag via GUIDANCE 4+5 because no wave had read the live channel.** |
 | A4 | 1 | `5df51a6` (`8280d1c`) | `**/` glob patterns whose groups interleave with a literal separator can no longer compile to a catastrophic-backtracking regex; a DP matcher handles them (1.5 s → 0.0002 s at the base worst case). |
 | A2 | 1 | `f93ea8e` (`0ab5e3a`) | Fit: the hybrid's per-sequence recurrent-state buffer is charged (149.625 MiB/seq × `LAUNCH_PARALLEL` = 299.25 MiB at 2 slots), derived from the real GGUF `ssm.*` geometry and matching the engine's own logged `RS buffer size = 149.62 MiB`. |
 | A3 | 1 | `f93ea8e` (`97b804c`) | `_spilled` counts the output layer, matching `_cpu_layers` (7/64, not 6/64), including the duplicate formula the explorer used. |
@@ -70,7 +70,17 @@ Integration branch head: `45a907f`.
 | A8c | 5 | `335dffe` | The switch notice the backend returns is typed and rendered instead of discarded. |
 | B6b | 5 | `6361ca2` | The ACP usage cost the store already holds is rendered. |
 | OD-10 | 4 | `45a907f` | The approval trail is mounted but inert, and the file now says why (false claim removed). |
-| A18 | — | _open — highest value_ | The run loop's **initial** `_runs.load` is unguarded, so a transient unreadable `run.json` kills the driver and wedges the run `running` forever with its slot claimed. Found by the full suite, not by reading. |
+| A18 | 6 | `622f6ef` (`1bcb4fe`) | **The wedge is closed.** The run loop's **first** load is guarded and retried, and a permanently unreadable `run.json` releases the slot with a terminal `interrupted` status + reason instead of leaving the run `running` forever with its slot claimed. Found by the full suite; the verifier reproduced the exact `serve.py:5602 TypeError` on base and confirmed the slot is released in every branch. |
+| D2 (backend) | 6 | `622f6ef` (`3870586`) | Launch defaults gained a GET, `backend` is accepted, `null` clears all seven fields, and a `first_load` signal exists for the dialog. The registry-model refusal is unchanged by design (**OD-11**). |
+| D3a | 6 | `622f6ef` (`2b81d63`) | A turn's `streaming` state is on the session list rows and the single-session body, so a reloaded chat can tell "still streaming" from "interrupted". |
+| B7d | 6 | `622f6ef` (`92f0de0`) | The `/v1` proxy's tool-parameter layer requires a non-empty `tools` list; a non-list falls back to the byte-identical passthrough. |
+| B5c/B6a | 6 | `ddd0dfc` | The ACP method table no longer advertises what it cannot do, its guard can fail, and the session's **real** advertised modes are surfaced for a UI control (B6d). |
+| A13b/A13d/A2b/A2d | 6 | `50f24e7` | A registered engine is identified by the binary that will actually run (not the pin), the identity memo keys on nanosecond mtime, the explorer budget charges the recurrent-state term, and an unrecognised recurrent geometry reports `unknown` instead of a silent zero. |
+| A17b/A17c | 7 | `099e2c1` | **GUIDANCE 4+5.** The split baseline comes from the plan — **2** for a healthy all-GPU dense load, because the token-embedding lookup runs on the host — MoE expert offload reads `not_comparable` instead of crying wolf, and the VRAM divergence compares against the plan's own prediction for the same ctx/cache/slots (+2.63 %, not the bogus +35 %). **The owner's real log now yields no finding.** |
+| B1b/D4 | 7 | `30122c3` | The ACP child is detached **and** its group is signalled, so mcode's subagents die with a cancelled turn (POSIX; Windows byte-identical and pinned). D4 closed as **not redundant**: `POST /api/methods` is the only overwrite-by-id path, pinned by a test. |
+| A5c/A11c/A7b | 7 | `773d39d` | `--refuse` is reachable on `plan`/`up` and can no longer be swallowed by the fallback ladder — **`typer.Exit` IS a `RuntimeError`**, so `up` was serving the next model after a refusal; the restore region holds the store lock; an unknown MCP profile is refused instead of coerced. |
+| A2d-gap/A11b/A16e | 8 | `acc5c41` | The `rs=unknown` label now fires in the one shape where the count can be wrong (an explicit `attention.recurrent_layers` array **plus** `full_attention_interval`), the CRLF contract is pinned by test, and a dead assignment is gone. |
+| W5F1a/A16b/B6c/D4a | 6 | `baa1178`…`4edea5e` | Frontend wave 2: the wave-1 render fixes are testable, a broken fit renders as broken, advertised ACP commands are runnable, and `/api/settings` has a UI. |
 
 Legend: `_in flight_` = implementer working · `_verifying_` = verifier running · `_merged_` = on the
 integration branch · `_rejected once_` = sent back to the implementer with the verifier's finding.
