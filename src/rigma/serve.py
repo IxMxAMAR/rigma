@@ -615,6 +615,15 @@ def _engine_has_vision(registry=None) -> bool:
         return False
 
 
+# Sessions with a turn streaming in them right now. MODULE scope, not a
+# `build_app` local: D3a — a reloaded chat has to be able to ask whether a turn
+# is still running, and a test has to be able to say so without an engine.
+# `build_app` keeps a local alias (`_streaming = STREAMING`) so the routes'
+# closure cells are unchanged for the tests that read them. In-memory on
+# purpose: a server restart ends every turn.
+STREAMING: set[str] = set()
+
+
 def _model_last_used() -> dict:
     """The `last_used` map from stats.json — {model slug: epoch seconds}.
 
@@ -1743,6 +1752,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def list_sessions():
         # file scans block the loop with many/large chats — thread them
         rows = await asyncio.to_thread(sessions.list_sessions)
+        # D3a: a reloaded chat must be able to tell "still streaming" from
+        # "interrupted", or it renders the last checkpoint's "this reply was
+        # interrupted" notice over a turn that is still running.
+        for r in rows:
+            r["streaming"] = r.get("id") in _streaming
         # AUDIT 03-5: the run's "🤖 …" chat is not a chat the owner can type
         # into while the run drives it, so it must not appear as an ordinary
         # writable row in the rail. Only the ACTIVE run is hidden: once a run
@@ -1819,7 +1833,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
-        return s
+        # D3a: the single-session body carries the same flag as the rail rows.
+        return {**s, "streaming": sid in _streaming}
 
     @app.get("/api/sessions/{sid}/export")
     async def export_session(sid: str, fmt: str = "md"):
@@ -4938,7 +4953,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # queue stored there loses the race against that turn's own save — and a
     # prompt waiting behind a generation means nothing once the server has
     # restarted.
-    _streaming: set[str] = set()
+    #
+    # D3a: `_streaming` itself is the module-level `STREAMING` set (so a route
+    # can report it and a test can seed it); this local alias keeps the routes'
+    # closure cells exactly as they were.
+    _streaming = STREAMING
     _queued: dict[str, list] = {}
     # R3-5: how many prompts one chat may have waiting behind its running reply.
     # The queue is in memory only, so an unbounded one is a memory leak a client

@@ -23,7 +23,11 @@ def test_session_crud_cycle(client):
     assert s["title"] == "t" and s["messages"] == []
     assert client.get("/api/sessions").json()[0]["id"] == s["id"]
     got = client.get(f"/api/sessions/{s['id']}").json()
-    assert got == s
+    # D3a: the GET body carries the read-only `streaming` flag alongside the
+    # stored row, so the exact-equality check names it rather than pretending the
+    # payload is unchanged.
+    assert {k: v for k, v in got.items() if k != "streaming"} == s
+    assert got["streaming"] is False
     upd = client.post(f"/api/sessions/{s['id']}",
                       json={"system_prompt": "be brief", "use_rag": True,
                             "id": "EVIL"}).json()
