@@ -1798,6 +1798,41 @@ def _absolute_writes_allowed(ctx: dict) -> bool:
     return bool(ctx.get("allow_absolute_writes"))
 
 
+def _write_allowlist_contains(ctx: dict, path: Path) -> bool:
+    """OD-2: is `path` inside one of the configured absolute write roots?
+
+    Containment is `Path.resolve()` + `Path.is_relative_to`, NEVER a string
+    prefix — `C:\\ws` must not admit `C:\\ws2`. A destination EQUAL to a root
+    is inside it. A non-absolute or unparseable entry is IGNORED rather than
+    raised: the allowlist is configuration, and one bad entry must not make
+    every write fail.
+
+    `path` must already be resolved and NOT long-prefixed: `\\\\?\\C:\\...` is
+    not `is_relative_to` the unprefixed root, so the caller tests containment
+    before `_long_path` adds the prefix (same ordering as `_ws_path`).
+    """
+    entries = ctx.get("write_allowlist")
+    if not isinstance(entries, (list, tuple, set)):
+        return False           # a bare string is not a list of roots
+    for entry in entries:
+        try:
+            cand = Path(str(entry))
+        except (TypeError, ValueError):
+            continue
+        if not cand.is_absolute():
+            continue           # a relative entry names no absolute root
+        try:
+            root = cand.resolve()
+        except (OSError, ValueError):
+            continue
+        try:
+            if path == root or path.is_relative_to(root):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def _write_path(ctx, raw: str) -> Path:
     """Resolve a WRITE target (a move/copy destination).
 
@@ -1810,18 +1845,30 @@ def _write_path(ctx, raw: str) -> Path:
     `_ws_path`, while `move_files`/`copy_files` — which place a file just as
     surely — could write to `Startup`, `System32\\Tasks` or a browser extension
     directory. A planted `.bat`/`.lnk` there is persistence, not data loss.
-    An absolute destination now needs the same kind of explicit grant that
-    absolute reads do, and `confined` refuses it outright.
+
+    OD-2 (option 1, accepted by the owner): an absolute destination is now
+    permitted only when the session holds the explicit `allow_absolute_writes`
+    grant OR the destination resolves INSIDE one of the configured
+    `write_allowlist` roots — the folders the owner already works in
+    (`sessions.default_write_allowlist`). `confined` still refuses every
+    absolute destination outright, through EITHER route, because the whole
+    absolute branch is skipped for it. The credential denylist runs on the
+    final path in every case.
     """
     raw = str(raw or "").strip()
     if Path(raw).is_absolute() and ctx.get("profile") != "confined":
-        if not _absolute_writes_allowed(ctx):
+        # resolve FIRST: `_long_path` would prefix `\\?\`, which is not
+        # `is_relative_to` the unprefixed allowlist roots, so containment must
+        # be tested on the plain resolved path.
+        resolved = Path(raw).resolve()
+        if not (_absolute_writes_allowed(ctx)
+                or _write_allowlist_contains(ctx, resolved)):
             raise ValueError(
                 f"'{raw}' is outside the workspace and writing there is "
                 f"disabled for this chat. Use a path relative to the "
                 f"workspace, or enable 'write outside the workspace' on the "
                 f"session")
-        p = _long_path(Path(raw).resolve())
+        p = _long_path(resolved)
     else:
         p = _ws_path(ctx, raw or ".")
     denied = _credential_path_reason(p, ctx)
