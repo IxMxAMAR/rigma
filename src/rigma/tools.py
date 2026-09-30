@@ -1681,7 +1681,14 @@ def _read_path(ctx, raw: str) -> Path:
         p = _long_path(p)
     else:
         p = _ws_path(ctx, raw or ".")
-    denied = _credential_path_reason(p, ctx)
+    # ODR-6-residual: `_ws_path`/`_long_path` hand back a `\\?\`-prefixed path
+    # once it is >=260 chars, and the STATE-DIR branch of
+    # `_credential_path_reason` is `is_relative_to` on the resolved path —
+    # `\\?\C:\...` is not relative to the unprefixed `~/.rigma`, so a long path
+    # under the state dir read as an ordinary file. (The credential FILE and
+    # DIRECTORY rules match on name/parts and were never affected.) `_unlong`
+    # makes the state-dir rule see what the OS sees.
+    denied = _credential_path_reason(_unlong(p), ctx)
     if denied:
         raise ValueError(f"refusing to read {p} — {denied}")
     return p
@@ -1720,6 +1727,69 @@ _BROWSER_PROFILE_RE = re.compile(
     r"(?i)(google[\\/]chrome|microsoft[\\/]edge|brave-browser|brave[\\/]user"
     r" data|chromium|mozilla[\\/]firefox[\\/]profiles|opera software"
     r"|vivaldi|librewolf)[\\/]")
+
+# ODR-1: locations whose purpose is to make code run LATER, or to change what a
+# tool runs. A write here is not a data change, it is persistence: a `.cmd` in
+# `Startup`, a `core.fsmonitor` line in `.gitconfig`, a PowerShell profile, a
+# scheduled task. `_ws_path` only checks CONTAINMENT, and the product DEFAULT
+# workspace is the home directory (`serve.py`: `s.get("workspace") or
+# str(Path.home())`), so a prompt-injected model in a new chat can reach all of
+# these with an ordinary RELATIVE path and no grant. The credential denylist
+# cannot help — none of these is a credential.
+#
+# Each entry is `(anchor, *parts)`. The anchor is resolved at call time so a
+# test can monkeypatch the environment (`APPDATA`, `PROGRAMDATA`, `SystemRoot`,
+# `Path.home`) and get a hermetic answer. Matching is on the RESOLVED path, so
+# `..`, mixed separators, 8.3 aliases and junctions all land on the directory
+# they actually name. It is a module constant so the whole policy is auditable
+# in one place.
+#
+# Deliberately NOT blocked: `%APPDATA%` / `%LOCALAPPDATA%` as a whole (every
+# application keeps its data there — that is not persistence), `~/.config` as a
+# whole (`~/.config/autostart` alone is), a repository's own `.git/config` and
+# hooks (normal project files inside the workspace), and any ordinary
+# document/source path.
+_PERSISTENCE_DIR_SHAPES = (
+    # Windows Startup, user and common — the classic per-user persistence point.
+    ("APPDATA", "Microsoft", "Windows", "Start Menu", "Programs", "Startup"),
+    ("PROGRAMDATA", "Microsoft", "Windows", "Start Menu", "Programs", "StartUp"),
+    # The whole Start Menu, not just Startup: a `.lnk` under Programs runs from
+    # the Start menu too.
+    ("APPDATA", "Microsoft", "Windows", "Start Menu"),
+    ("PROGRAMDATA", "Microsoft", "Windows", "Start Menu"),
+    # `%APPDATA%\Microsoft\Windows` is the Start Menu's parent and also holds
+    # Templates / SendTo / Network Shortcuts, none of which is user data.
+    ("APPDATA", "Microsoft", "Windows"),
+    # The same tree spelled relative to the profile, for when `%APPDATA%` is
+    # unset or the model reaches it from a home workspace by a relative path.
+    ("HOME", "AppData", "Roaming", "Microsoft", "Windows"),
+    ("HOME", "AppData", "Roaming", "Microsoft", "Windows", "Start Menu"),
+    ("HOME", "AppData", "Roaming", "Microsoft", "Windows", "Start Menu",
+     "Programs", "Startup"),
+    # PowerShell profiles: `$PROFILE` in both of its default locations.
+    ("HOME", "Documents", "WindowsPowerShell"),
+    ("HOME", "Documents", "PowerShell"),
+    # Scheduled tasks: a write here schedules code with no further interaction.
+    ("SYSTEMROOT", "System32", "Tasks"),
+    ("SYSTEMROOT", "SysWOW64", "Tasks"),
+    # POSIX autostart: the `Startup` folder's counterpart.
+    ("HOME", ".config", "autostart"),
+)
+_PERSISTENCE_FILE_SHAPES = (
+    # git runs `core.fsmonitor` (and aliases / a pager) named in here.
+    ("HOME", ".gitconfig"),
+    ("HOME", "_gitconfig"),                 # Windows' HOMEDRIVE/HOMEPATH name
+    ("HOME", ".config", "git", "config"),
+    # Shell startup files: the POSIX equivalent of Startup.
+    ("HOME", ".bashrc"),
+    ("HOME", ".bash_profile"),
+    ("HOME", ".bash_login"),
+    ("HOME", ".profile"),
+    ("HOME", ".zshrc"),
+    ("HOME", ".zprofile"),
+    ("HOME", ".zshenv"),
+    ("HOME", ".config", "fish", "config.fish"),
+)
 
 
 def credential_exclude_globs() -> list[str]:
@@ -1811,6 +1881,159 @@ def _credential_path_reason(p: Path, ctx: dict | None = None) -> str:
     return ""
 
 
+def _persistence_anchors() -> dict:
+    """Resolve the anchor names used by the persistence shapes above.
+
+    Read from the environment on EVERY call, never cached at import: a test can
+    monkeypatch `Path.home` / `APPDATA` / `PROGRAMDATA` / `SystemRoot` and get a
+    hermetic answer, and a long-lived server sees an env change without a
+    restart. A non-absolute anchor is dropped — a relative `%APPDATA%` names no
+    fixed location, and resolving it against the cwd could only mislead."""
+    anchors: dict = {}
+    try:
+        home = Path.home()
+        if home.is_absolute():
+            anchors["HOME"] = home
+    except (OSError, RuntimeError):
+        pass
+    for env in ("APPDATA", "PROGRAMDATA"):
+        raw = (os.environ.get(env) or "").strip()
+        if raw:
+            try:
+                cand = Path(raw)
+            except (TypeError, ValueError):
+                continue
+            if cand.is_absolute():
+                anchors[env] = cand
+    root = (os.environ.get("SystemRoot") or os.environ.get("WINDIR") or "").strip()
+    if root:
+        try:
+            cand = Path(root)
+            if cand.is_absolute():
+                anchors["SYSTEMROOT"] = cand
+        except (TypeError, ValueError):
+            pass
+    return anchors
+
+
+def _strip_trailing_dots(p: Path) -> Path:
+    """Drop trailing dots/spaces from every component (Windows only).
+
+    Windows strips them at the filesystem API, so `PowerShell.` and `PowerShell`
+    name the SAME directory — but `Path.resolve()` canonicalises a component
+    only when it already EXISTS. The creation case (the whole threat) is a
+    component that does not exist yet, so the resolved path still reads
+    `PowerShell.` and a lexical `==`/`is_relative_to` against the shape
+    `PowerShell` misses. On POSIX a trailing dot is a real, distinct name, so
+    this is Windows-only. A shape whose ancestor is itself a shape
+    (`Startup./x.cmd`) hid this: the ancestor matched, so the escape only
+    showed on the shapes that stand alone (`.gitconfig.`, `PowerShell./…`)."""
+    if os.name != "nt":
+        return p
+    try:
+        anchor = p.anchor
+        parts = list(p.parts)
+        if anchor and parts and parts[0] == anchor:
+            parts = parts[1:]
+        parts = [part.rstrip(" .") for part in parts]
+        return Path(anchor, *parts) if anchor else Path(*parts)
+    except (OSError, ValueError, RuntimeError):
+        return p
+
+
+def _local_host_names() -> set:
+    """Names that mean THIS machine in a UNC server position."""
+    names = {"localhost", "127.0.0.1", "::1", "[::1]"}
+    for env in ("COMPUTERNAME", "HOSTNAME"):
+        raw = (os.environ.get(env) or "").strip().lower()
+        if raw:
+            names.add(raw)
+    return names
+
+
+def _local_unc_to_drive(p: Path) -> Path:
+    r"""Map a LOCAL admin-share UNC spelling to its drive form, or return `p`.
+
+    `\\localhost\c$\x`, `\\<COMPUTERNAME>\c$\x` and the `\\?\UNC\` spelling
+    (already dropped by `_unlong`) name the same directory as `c:\x`, but
+    `Path.resolve()` keeps them as UNC, so the drive-letter anchors never match.
+    A genuinely REMOTE share is returned unchanged — it is not a local
+    persistence directory, and refusing it would break a real capability."""
+    if os.name != "nt":
+        return p
+    s = str(p)
+    if not s.startswith("\\\\"):
+        return p
+    server, sep, tail = s[2:].partition("\\")
+    if not sep:
+        return p
+    share, _sep2, sub = tail.partition("\\")
+    if not (len(share) == 2 and share.endswith("$") and share[0].isalpha()):
+        return p
+    if server.lower() not in _local_host_names():
+        return p
+    return Path(share[0].upper() + ":\\" + sub)
+
+
+def _persistence_hit(rp: Path, shapes, anchors: dict, *, subdirs: bool) -> bool:
+    """Is the already-resolved `rp` one of `shapes`? Equality always counts;
+    containment counts only for the directory shapes. Both sides are put
+    through the same local-UNC and trailing-dot normalisation as `rp`."""
+    for anchor, *parts in shapes:
+        root = anchors.get(anchor)
+        if root is None:
+            continue
+        try:
+            target = _strip_trailing_dots(
+                _local_unc_to_drive(root.joinpath(*parts).resolve()))
+        except (OSError, ValueError, RuntimeError):
+            continue
+        try:
+            if rp == target or (subdirs and rp.is_relative_to(target)):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _persistence_path_reason(p: Path, ctx: dict | None = None) -> str:
+    r"""Why `p` may not be WRITTEN, or "" when it may. ODR-1.
+
+    The sibling of `_credential_path_reason` for the other half of the same
+    surface: a credential file leaks data, a persistence file RUNS CODE. Both
+    are refused on the final path regardless of any grant, because a grant is
+    about WHERE the owner lets a write land, not whether a write may install a
+    startup hook.
+
+    `p` is RESOLVED first (after dropping a `\\?\` prefix), so `..`, mixed
+    separators, 8.3 short names and junctions all compare as the directory they
+    actually name; then a local-UNC spelling is mapped to its drive form and
+    every component has trailing dots/spaces stripped, because `resolve()`
+    canonicalises neither for a component that does not exist yet. Resolution is
+    done on a copy: the caller keeps its own path, which is what lets
+    `_write_file_locked` still create parent folders after the check passes."""
+    try:
+        rp = Path(_unlong(p)).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return ""
+    rp = _strip_trailing_dots(_local_unc_to_drive(rp))
+    anchors = _persistence_anchors()
+    if (_persistence_hit(rp, _PERSISTENCE_DIR_SHAPES, anchors, subdirs=True)
+            or _persistence_hit(rp, _PERSISTENCE_FILE_SHAPES, anchors,
+                                subdirs=False)):
+        return ("that is a persistence location — writing there could make "
+                "code run later, which this chat may not do")
+    return ""
+
+
+def _refuse_persistence_write(p: Path, ctx: dict | None = None) -> None:
+    """Raise the same ValueError style as the credential denylist when `p` is a
+    persistence location. Called by every write path (ODR-1)."""
+    why = _persistence_path_reason(p, ctx)
+    if why:
+        raise ValueError(f"refusing to write {p} — {why}")
+
+
 def _absolute_writes_allowed(ctx: dict) -> bool:
     """The explicit grant that allows a write OUTSIDE the workspace.
 
@@ -1876,8 +2099,8 @@ def _write_path(ctx, raw: str) -> Path:
     `write_allowlist` roots — the folders the owner already works in
     (`sessions.default_write_allowlist`). `confined` still refuses every
     absolute destination outright, through EITHER route, because the whole
-    absolute branch is skipped for it. The credential denylist runs on the
-    final path in every case.
+    absolute branch is skipped for it. The credential denylist and the ODR-1
+    persistence denylist run on the final path in every case.
     """
     raw = str(raw or "").strip()
     if Path(raw).is_absolute() and ctx.get("profile") != "confined":
@@ -1895,9 +2118,16 @@ def _write_path(ctx, raw: str) -> Path:
         p = _long_path(resolved)
     else:
         p = _ws_path(ctx, raw or ".")
-    denied = _credential_path_reason(p, ctx)
+    # ODR-6-residual: same long-path hole as `_read_path` — a >=260-char
+    # destination under the state dir was written because the state-dir rule
+    # saw the `\\?\`-prefixed spelling.
+    denied = _credential_path_reason(_unlong(p), ctx)
     if denied:
         raise ValueError(f"refusing to write {p} — {denied}")
+    # ODR-1: a persistence destination is refused through EITHER route — the
+    # blanket grant and the allowlist both change WHERE a write may land, not
+    # whether it may install a startup hook.
+    _refuse_persistence_write(p, ctx)
     return p
 
 
@@ -2372,7 +2602,11 @@ def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict,
             #
             # Filtering in the walker rather than in `_grep` also covers
             # `find_files`, and any walker-based tool added later.
-            if _credential_path_reason(p, ctx):
+            #
+            # ODR-6-residual: the root comes from `_ws_path`, so a >=260-char
+            # workspace makes EVERY walked path `\\?\`-prefixed and the shape
+            # match below would miss all of them. `_unlong` first.
+            if _credential_path_reason(_unlong(p), ctx):
                 continue
             yield p
 
@@ -2721,6 +2955,8 @@ def _undo_last_change(args, ctx):
     raw = str(args.get("path", "") or "").strip()
     if raw:
         p = _ws_path(ctx, raw)
+        # ODR-1: undo restores a file, which is a write like any other.
+        _refuse_persistence_write(p, ctx)
         entry = idx.get(str(p))
         if entry is None:
             return f"error: no recorded change for {raw}"
@@ -2738,6 +2974,10 @@ def _undo_last_change(args, ctx):
                     "index covers the whole install). Pass `path` if you "
                     "meant a specific file")
         p = Path(key)
+        # ODR-1: the no-path branch writes too, and its key comes from the undo
+        # index (which the workspace watcher also feeds), so it needs the same
+        # refusal as the named branch above.
+        _refuse_persistence_write(p, ctx)
         entry = idx[key]
     snap = d / entry["snap"]
     if not snap.is_file():
@@ -3037,6 +3277,10 @@ def _edit_file(args, ctx):
 
 def _edit_file_locked(args, ctx):
     p = _ws_path(ctx, str(args.get("path", "")))
+    # ODR-1: edit_file is the other way a model authors a persistence file
+    # (and the way it MODIFIES one it could not create). Same refusal as
+    # write_file, on the same resolved path.
+    _refuse_persistence_write(p, ctx)
     if not p.is_file():
         return f"error: no such file: {args.get('path')}"
     # R3-TOOL-6: the same ceiling `read_file` enforces, for the same reason.
@@ -3585,6 +3829,11 @@ def _write_file_locked(args, ctx):
         return (f"error: '{bad}' is a reserved device name on Windows, so no "
                 "file can be created with it. Choose a different name.")
     p = _ws_path(ctx, raw)
+    # ODR-1: `_ws_path` checks containment only, and the product default
+    # workspace is the home directory — so this refusal is what stops a
+    # relative `AppData/Roaming/.../Startup/x.cmd` from becoming persistence.
+    # It runs BEFORE mkdir, so a refused write creates no directory either.
+    _refuse_persistence_write(p, ctx)
     p.parent.mkdir(parents=True, exist_ok=True)
     content = str(args.get("content", ""))
     if _CTRL_RUN.search(content):
@@ -3906,11 +4155,11 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
     # one read the 13-2 fix did not cover — the grant is irrelevant to it, and
     # the two image modes disagreed with `view_images(folder=…)`, which goes
     # through `_read_path` and refuses.
-    #
-    # ODR-6: `_unlong`, because the denylist's state-dir test is
+    # ODR-6 / ODR-6-residual: `_unlong`, because the denylist's state-dir test is
     # `p.is_relative_to(rigma_home())` and `\\?\C:\...` is not relative to the
-    # unprefixed root — a >=260-char path under the state dir would otherwise
-    # slip through even now that the path is resolved first.
+    # unprefixed root — a >=260-char image path reaches here `\\?\`-prefixed from
+    # `_ws_path`, so the state-dir rule would otherwise slip through even now
+    # that the path is resolved first.
     denied = _credential_path_reason(_unlong(p), ctx)
     if denied:
         return None, f"refusing to read {p} — {denied}", ""
