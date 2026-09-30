@@ -481,6 +481,43 @@ def test_every_control_op_dispatches_to_a_method_the_tables_declare():
             f"operation {op!r} dispatches to client.{meth}(), which does not exist")
 
 
+def _methods_the_client_sends() -> set:
+    """Every method literal a `self.request(...)` call site sends, read from the AST.
+
+    WHY AST AND NOT A REGEX. This used to be
+    `re.findall(r'self\\.request\\(\\s*"([a-z_/]+)"', src)`, and the standard-methods
+    guard then FILTERED its own result through "does this literal appear anywhere in
+    the file" — which every entry did, because the table itself quotes them. That
+    guard was therefore incapable of failing for any entry. Measured by the verifier:
+    the pre-filter set was `['session/list', 'session/load']` and the post-filter set
+    was `[]`, so all seven entries were exempt rather than the two that had a caller
+    removed.
+
+    Reading the CALL SHAPE from the AST cannot be satisfied by a tuple of strings, so
+    the guard can fail — and it has been shown to fail on a bogus entry and on a
+    commented-out call site (see the B5c commit message).
+    """
+    import ast
+
+    from rigma import harness_mcode_acp as acp
+
+    tree = ast.parse(pathlib.Path(acp.__file__).read_text(encoding="utf-8"))
+    sent: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        # `self.request(...)` and nothing else: a call on some other object, or a
+        # bare function, is not a client call site.
+        if not (isinstance(fn, ast.Attribute) and fn.attr == "request"
+                and isinstance(fn.value, ast.Name) and fn.value.id == "self"):
+            continue
+        if (node.args and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            sent.add(node.args[0].value)
+    return sent
+
+
 def test_the_extension_method_table_matches_the_client_methods():
     """Every `mcode/session/...` method the client can send is in `EXTENSION_METHODS`,
     and every entry in that table is really sent by some client method.
@@ -489,13 +526,10 @@ def test_the_extension_method_table_matches_the_client_methods():
     instead of producing a confusing `Method not found` at the point of use" — which it
     can only do if it is complete and has no entries nothing sends.
     """
-    import re
-
     from rigma import harness_mcode_acp as acp
 
-    src = pathlib.Path(acp.__file__).read_text(encoding="utf-8")
-    # Every `self.request("<method>", ...)` literal in the client.
-    sent = set(re.findall(r'self\.request\(\s*"([a-z_/]+)"', src))
+    # Every `self.request("<method>", ...)` call site in the client, by call shape.
+    sent = _methods_the_client_sends()
     # `activate` sends one of two names depending on the server; both must be declared.
     assert "session/activate" in acp.EXTENSION_METHODS
     assert "mcode/session/activate" in acp.EXTENSION_METHODS
@@ -513,20 +547,25 @@ def test_the_extension_method_table_matches_the_client_methods():
 
 def test_every_standard_method_in_the_table_is_one_the_client_can_send():
     """`STANDARD_METHODS` is documentation-with-a-guard: it lists the standard ACP
-    session methods Rigma uses. Every entry must be reachable from a client method, or
-    the table is describing a surface the code does not have."""
-    import re
+    session methods Rigma uses. Every entry must be reachable from a client call site,
+    or the table is describing a surface the code does not have.
 
+    THIS GUARD USED TO BE INCAPABLE OF FAILING, for ALL SEVEN entries. It subtracted
+    the sent methods and then removed every remaining entry whose quoted literal
+    appeared ANYWHERE in the file — and every entry's literal appears in the table
+    itself. Measured by the verifier: the pre-filter set was
+    `['session/list', 'session/load']` and the post-filter set was `[]`. The check is
+    now against the CALL SHAPE (`self.request("<literal>", ...)`, read from the AST),
+    which the table's own tuple of strings cannot satisfy.
+    """
     from rigma import harness_mcode_acp as acp
 
-    src = pathlib.Path(acp.__file__).read_text(encoding="utf-8")
-    sent = set(re.findall(r'self\.request\(\s*"([a-z_/]+)"', src))
+    sent = _methods_the_client_sends()
+    assert sent, "the AST found no `self.request(...)` call sites — the guard is broken"
     unreachable = set(acp.STANDARD_METHODS) - sent
-    # `session/new` and `session/prompt` are sent by the turn path through
-    # `_session_new`/`prompt`, so accept them if the string appears anywhere.
-    unreachable = {m for m in unreachable if f'"{m}"' not in src}
     assert not unreachable, (
-        f"STANDARD_METHODS lists {sorted(unreachable)}, which no code path sends")
+        f"STANDARD_METHODS lists {sorted(unreachable)}, which no `self.request(...)` "
+        "call site sends")
 
 
 def test_every_extension_notification_is_actually_mapped():
