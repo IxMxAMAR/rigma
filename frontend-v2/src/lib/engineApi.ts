@@ -133,6 +133,16 @@ export interface Fit {
   /** % of weights left in system RAM — 0 means fully GPU-resident */
   offload_pct?: number;
   speed?: "gpu" | "light" | "offload" | "no";
+  /** A16: the fit ARITHMETIC failed, so this row carries no verdict at all.
+   *
+   *  Only a broken fit sets this. The three shapes the Models page can receive
+   *  are otherwise indistinguishable on `ok`/`speed` alone:
+   *    - a quant the resolver computed and refused: `{ok:false, speed:"no"}`
+   *    - a fit that threw while being computed:      `{ok:false, speed:"no", error}`
+   *    - no hardware profile at all:                 `{}`
+   *  `hangar.list_models` attaches `error: "fit failed"` to every row when
+   *  `quant_verdicts` raises (hangar.py:949-950). */
+  error?: string;
 }
 
 /** Reference quality for the quant FORMAT — see src/rigma/quant_quality.py.
