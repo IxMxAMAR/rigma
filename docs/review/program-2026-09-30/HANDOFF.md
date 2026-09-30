@@ -1,5 +1,15 @@
 # HANDOFF — Rigma improvement program, 2026-09-30
 
+> ## BEFORE ANY PUSH — one commit message must be rewritten first
+>
+> Commit `7ea1827` ("docs 37: fix a garbled sentence about the cache ladder") carries a co-author trailer that
+> the owner's rules forbid in any commit. Removing it rewrites every later commit on this branch (300+), and
+> every `impl/*` branch created after it also contains it. The orchestrator's rewrite was stopped by the
+> harness as a destructive git operation, so it waits for the owner's go-ahead. Until then: do not push this
+> branch, and never `git push --all` from this clone. When approved: rewrite only that message
+> (`git filter-branch --msg-filter` over `7ea1827^..review/deep-audit-2026-09-22`, logging an old->new map
+> with a `--commit-filter`), then re-point the commit hashes cited in `docs/review/**` using that map.
+
 > ## READ FIRST — Waves 20–22 closed the OD-2/OD-15 deep-review findings (2026-09-30 21:45–23:xx UTC)
 >
 > **ODR-1 (HIGH, security) IS MERGED** (`2d58d55`+`562b20f`, merged `7ec8712`): a persistence-location write
