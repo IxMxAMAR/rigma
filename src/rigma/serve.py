@@ -1866,7 +1866,9 @@ def _apply_restore(store, targets, patch, normalized, rows):
                 detail += ("; rollback of " + ", ".join(failed)
                            + " failed — the store may be left part-applied")
             raise _RestoreFailed(detail) from e
-    return before, after
+    # ODR-7: the caller's response names the ids the restore actually deleted,
+    # so the confirmation can say what it removed instead of only what it wrote.
+    return before, after, stale_ids
 
 
 def build_app(upstream_port: int, default_prompt: str | None = None,
@@ -7452,12 +7454,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             _methods._method_file(full["id"])))
         targets.append(("memory", store.path))
         try:
-            before, after = await asyncio.to_thread(
+            before, after, deleted = await asyncio.to_thread(
                 _apply_restore, store, targets, patch, normalized, rows)
         except _RestoreFailed as e:
             return JSONResponse({"error": str(e)}, status_code=500)
         return {"restored": True, "version": BACKUP_VERSION,
                 "methods": len(normalized),
+                "deleted": deleted,
                 "memory": {"before": before, "after": after},
                 "settings": app_settings.load()}
 
