@@ -198,6 +198,36 @@ describe("stopRemote asks the server, and lets the server decide", () => {
     expect(useChat.getState().remoteStopRequested.s1).toBe(true);
   });
 
+  it("drops an UNNAMEABLE request once the server names a turn (DR3-3)", async () => {
+    // The control is drawn from the server's `streaming` flag alone, so it can be
+    // clicked before the turn's first checkpoint exists — `liveTurnId` is then
+    // null and the pin is `{ turn: null, lost: false }`. The old rule required a
+    // name neither side had, so it returned false forever: "stop requested…"
+    // stayed disabled across every later turn and `stopRemote`'s early return
+    // made the chat unstoppable. The tab cannot prove a nameable turn is its own,
+    // so it must spend the request instead.
+    seed({ messages: [] });
+    vi.stubGlobal("fetch", route(
+      () => reply(200, { ok: true, stopped: true }),
+      () => reply(200, { id: "s1", messages: [partial("ckA")], streaming: true }),
+    ));
+    await useChat.getState().stopRemote("s1");
+    expect(useChat.getState().remoteStopRequested.s1).toBeUndefined();
+    expect(useChat.getState().remoteStreaming.s1).toBe(true);
+  });
+
+  it("keeps an UNNAMEABLE request while the server cannot name a turn either", async () => {
+    // The other side of DR3-3: nothing has changed, so there is nothing to spend.
+    // Keeping it armed is what stops a fast double-click from POSTing twice.
+    seed({ messages: [] });
+    vi.stubGlobal("fetch", route(
+      () => reply(200, { ok: true, stopped: true }),
+      () => reply(200, { id: "s1", messages: [], streaming: true }),
+    ));
+    await useChat.getState().stopRemote("s1");
+    expect(useChat.getState().remoteStopRequested.s1).toBe(true);
+  });
+
   it("does not invent an answer when the server omits `stopped`", async () => {
     // An absent key is UNKNOWN, not false. Reading it as false would print
     // "already finished — nothing was running to stop" against a server that
