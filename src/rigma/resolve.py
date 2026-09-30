@@ -962,6 +962,16 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
     layer. Same term, same multiplier, one source: `recurrent_state_mb` times
     `LAUNCH_PARALLEL`, exactly as the fit computes it. Zero for a dense model and
     for a hybrid whose geometry is unknown (the fit says `rs=unknown` there).
+
+    A2d-budget: `rs_unknown` rides BESIDE the charge. The fit's explain line has
+    said `rs=unknown(est N MB)` since A2d-gap (acc5c41), but this row — the
+    arithmetic behind the Models page's "OVER by / headroom" line — still
+    reported a bare number for the same shape, and a number with no provenance
+    reads as a measured one. The flag never replaces the charge: dropping the
+    term would free VRAM llama.cpp is about to allocate, which is the launch OOM
+    the fit exists to prevent. A boolean beside `rs_mb`, not a string in it, so
+    every existing numeric consumer of the row is untouched (nothing indexes the
+    row positionally; the row is JSON over the API and a new key is additive).
     """
     k = k or spec.cache_type_policy.k
     v = v or spec.cache_type_policy.v
@@ -971,6 +981,7 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
     rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
     return {"file_mb": round(file_mb), "mmproj_mb": round(mm_mb),
             "kv_mb": round(kv_mb), "rs_mb": round(rs_mb),
+            "rs_unknown": recurrent_state_unknown(spec),
             "budget_mb": round(usable_vram),
             "over_mb": round(file_mb + mm_mb + kv_mb + rs_mb - usable_vram),
             "ctx": ctx, "kv_type": k}
