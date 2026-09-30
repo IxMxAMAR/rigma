@@ -69,6 +69,16 @@ _SEMANTIC = [
     ("?", "a", True),
     ("?", "ab", False),
     ("?", "/", False),                  # `?` is `[^/]`
+    # DR5: `?` is one character EACH — a run must not collapse to one.
+    ("??.py", "ab.py", True),
+    ("??.py", "a.py", False),
+    ("??.py", "abc.py", False),
+    ("ch??.md", "ch12.md", True),
+    ("ch??.md", "ch1.md", False),
+    ("???", "abc", True),
+    ("???", "ab", False),
+    ("a??b", "axyb", True),
+    ("a??b", "axb", False),
     ("[abc].txt", "b.txt", True),
     ("[abc].txt", "d.txt", False),
     ("[!abc].txt", "d.txt", True),
@@ -110,6 +120,9 @@ def test_the_linear_matcher_agrees_with_its_own_regex():
     pats = ["**/a/" * k + "x.py" for k in (1, 2, 3, 4, 5)]
     pats += ["**a" * k + "b" for k in (1, 2, 3, 4)]
     pats += ["**/a/**/b/**/c.txt", "***/*", "****/**/*", "**/[a-z]**/*"]
+    # `?` tokens go through the DP path too, so the two must agree on them.
+    pats += ["**/a/" * 3 + "??", "**/a/" * 3 + "?b?", "**/a/" * 2 + "x?.py",
+             "**a" * 2 + "??"]
     paths = [""]
     for a in ("a", "b", "x.py", "c.txt"):
         paths.append(a)
@@ -153,3 +166,35 @@ def test_an_absurd_glob_returns_normally(tmp_path, monkeypatch):
 
     out = tools._grep({"pattern": "print", "glob": "**/a/" * 200 + "*.py"}, ctx)
     assert out.startswith("no matches"), out
+
+
+# ---- DR5: `?` is one character each, through the TOOLS ----------------------
+
+def test_a_two_question_glob_finds_a_two_character_stem(tmp_path, monkeypatch):
+    """The model's `??.py` must answer with the files that exist.
+
+    Before DR5 the run collapsed to a single `[^/]`, so this returned "no files
+    match ab.py"-style nothing for a tree that plainly had `ab.py` — and the
+    model's next move was to conclude the file did not exist.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    (tmp_path / "ab.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "a.py").write_text("print(2)\n", encoding="utf-8")
+    ctx = {"workspace": str(tmp_path)}
+
+    out = tools._find_files({"pattern": "??.py"}, ctx)
+    assert out.strip() == "ab.py", out
+
+
+def test_a_two_question_GLOB_filters_grep_to_two_character_stems(tmp_path,
+                                                                 monkeypatch):
+    """The same collapse reached `grep`'s `glob` argument (A4 carried it into the
+    token list), so a two-character stem was invisible to grep too."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    (tmp_path / "ch12.md").write_text("needle\n", encoding="utf-8")
+    (tmp_path / "ch1.md").write_text("needle\n", encoding="utf-8")
+    ctx = {"workspace": str(tmp_path)}
+
+    out = tools._grep({"pattern": "needle", "glob": "ch??.md"}, ctx)
+    assert "ch12.md:1:" in out, out
+    assert "ch1.md:1:" not in out, out

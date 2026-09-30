@@ -2025,8 +2025,10 @@ def _glob_re(pat: str):
     the event loop it takes the whole UI with it. Collapsing a RUN of `**/` into
     one group is not a behaviour change: `(?:.*/)?(?:.*/)?` accepts exactly the
     strings `(?:.*/)?` does, because `.*` already spans `/` under the `(?s:)`
-    wrapper. The same collapse is applied to runs of `*` and `?`, which are
-    quadratic rather than exponential but free to fix in the same pass.
+    wrapper. The same collapse is applied to runs of `*`, which are quadratic
+    rather than exponential but free to fix in the same pass. `?` is NOT
+    collapsed: unlike `*`, `?` is not idempotent, so a run of them means one
+    character each (DR5).
 
     SECOND, the character-class branch copied the user's class body into the
     output verbatim, so `[z-a]` reached `re.compile` and raised `re.error` — out
@@ -2104,10 +2106,15 @@ def _glob_tokens(pat: str) -> tuple[str, list[tuple[str, str | None]]]:
             toks.append(("star", None))
             continue
         elif c == "?":
-            while i < n and pat[i] == "?":
-                i += 1
-            out.append("[^/]")          # `?` likewise
+            # ONE token per `?` (DR5). `?` is NOT idempotent under `[^/]` the way
+            # `*` is under `[^/]*`: a run of `?` used to collapse to a single
+            # `[^/]`, so `??.py` matched only one-character stems, `find_files`
+            # answered "no files match", and the model concluded the files did
+            # not exist. The token list collapsed the same way, which is why the
+            # DP-vs-regex test could not see it — both were wrong together.
+            out.append("[^/]")
             toks.append(("q", None))
+            i += 1
             continue
         elif c == "[":
             j = i + 1
