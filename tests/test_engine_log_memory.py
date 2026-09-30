@@ -751,3 +751,126 @@ def test_mapped_and_pinned_labels_are_host_not_devices():
 
     assert engine_log.device_labels(load) == ["CUDA0"]
     assert engine_log.expected_splits_for_load(load) == 2
+
+
+# ---------------------------------------------------------------------------
+# DR2-1: the plan's prediction is the WHOLE FILE, so it is only a device-side
+# figure when the engine put the whole file on the device.
+#
+# `memtruth.planned_mb`'s weight term is `plan.gguf.bytes / 2**20` — the whole
+# GGUF file. `compare_plan`'s `actual_vram_mb` sums DEVICE buffers only. For a
+# plan that does not place the whole file on the GPU — a dense spill
+# (`ngl < n_layers`, a first-class plan shape) or MoE expert offload
+# (`n_cpu_moe > 0`) — the whole-file prediction overstates the device figure by
+# exactly the RAM-resident weight bytes, and above the slack that is a
+# `plan_divergence` on EVERY launch of a healthy, intended configuration.
+#
+# Every `findings()` test above omits `expected_vram_mb`, so none of them ever
+# reached this state. These do.
+# ---------------------------------------------------------------------------
+
+# A 64-layer dense model with 32 layers spilled (offloaded 33/65), `graph
+# splits = 2` = healthy. Device model buffer 3281.20 + KV 2176.00 + RS 149.62 +
+# compute 410.28 = 6017.10 MiB; against the plan's whole-file prediction
+# 9037.70 MiB that is -3020.60 MiB / -33.4%, i.e. a `plan_divergence` before the
+# fix. The host `CPU_Mapped` holds the 32 CPU-resident layers' weights.
+SPILL_PREDICTION_MB = 9037.70
+SPILLED_LOAD = (
+    "0.00.987.636 I print_info: n_expert              = 0\n"
+    "0.01.522.670 I load_tensors: offloaded 33/65 layers to GPU\n"
+    "0.01.522.675 I load_tensors:   CPU_Mapped model buffer size =  3300.00 MiB\n"
+    "0.01.522.676 I load_tensors:        ROCm0 model buffer size =  3281.20 MiB\n"
+    "0.04.285.857 I llama_context: n_seq_max             = 1\n"
+    "0.04.364.938 I llama_kv_cache:      ROCm0 KV buffer size =  2176.00 MiB\n"
+    "0.04.369.729 I llama_memory_recurrent:      ROCm0 RS buffer size =   149.62 MiB\n"
+    "0.04.417.931 I sched_reserve:      ROCm0 compute buffer size =   410.28 MiB\n"
+    "0.04.417.938 I sched_reserve:  ROCm_Host compute buffer size =    84.28 MiB\n"
+    "0.04.417.939 I sched_reserve: graph splits = 2\n"
+)
+
+
+def test_a_spilled_load_is_not_a_device_side_prediction():
+    load = engine_log.parse_load(SPILLED_LOAD)
+
+    assert load["offloaded_layers"] == (33, 65)
+    assert engine_log.weights_are_device_resident(load) is False
+
+    r = engine_log.compare_plan(load, SPILL_PREDICTION_MB)
+
+    assert r["actual_vram_mb"] == pytest.approx(6017.10)
+    assert r["vram_verdict"] == "not_comparable", r
+    assert r["vram_why"] == "not_device_resident"
+    assert r["divergence_mb"] is None
+    assert r["diverges"] is False
+    assert "offloaded 33/65 layers to GPU" in r["detail"]
+
+
+def test_a_healthy_spilled_load_yields_no_finding():
+    """DR2-1 acceptance, direction one: the owner's intended spill must produce
+    NO finding when the plan's own prediction is supplied. Before the fix this
+    same log read `['plan_divergence']`."""
+    assert engine_log.findings(SPILLED_LOAD,
+                               expected_vram_mb=SPILL_PREDICTION_MB) == []
+
+
+def test_a_moe_expert_offload_yields_no_finding_with_a_plan_prediction():
+    """DR2-1 acceptance: the owner's 35B MoE shape. The load offloads every
+    layer but keeps expert weights in a `CPU` model buffer, so the whole-file
+    prediction is not a device-side figure either. Before the fix, supplying the
+    prediction fired `plan_divergence` (device 18600 vs prediction 9048)."""
+    load = engine_log.parse_load(MOE_EXPERT_OFFLOAD)
+
+    assert engine_log.weights_are_device_resident(load) is False
+    assert engine_log.findings(MOE_EXPERT_OFFLOAD,
+                               expected_vram_mb=PLAN_PREDICTION_MB) == []
+
+
+def test_a_genuinely_wrong_prediction_is_still_caught_on_a_resident_load():
+    """DR2-1 acceptance, direction two: the gate keys on RESIDENCY, not on the
+    sign of the divergence. The same low device figure as SPILLED_LOAD, but the
+    engine reports EVERY layer offloaded, so the plan's whole-file prediction IS
+    a device-side figure and a -33% gap is a real divergence."""
+    resident = SPILLED_LOAD.replace("offloaded 33/65 layers to GPU",
+                                    "offloaded 65/65 layers to GPU")
+    load = engine_log.parse_load(resident)
+
+    assert engine_log.weights_are_device_resident(load) is True
+
+    r = engine_log.compare_plan(load, SPILL_PREDICTION_MB)
+
+    assert r["actual_vram_mb"] == pytest.approx(6017.10)
+    assert r["vram_verdict"] == "diverges"
+    assert r["divergence_pct"] == pytest.approx(-33.42, abs=0.01)
+    assert r["diverges"] is True
+    assert engine_log.findings(
+        resident, expected_vram_mb=SPILL_PREDICTION_MB
+    )[0]["id"] == "plan_divergence"
+
+
+def test_the_healthy_all_gpu_load_is_still_compared_and_still_healthy():
+    """The gate must not suppress the case it was built for: the real all-GPU
+    load has no `CPU` model buffer, so it stays comparable and stays `ok`."""
+    load = engine_log.parse_load(REAL_LOAD)
+
+    assert engine_log.weights_are_device_resident(load) is True
+
+    r = engine_log.compare_plan(load, PLAN_PREDICTION_MB)
+
+    assert r["vram_verdict"] == "ok"
+    assert r["vram_why"] is None
+    assert engine_log.findings(REAL_LOAD,
+                               expected_vram_mb=PLAN_PREDICTION_MB) == []
+
+
+def test_a_load_with_no_placement_line_is_not_a_device_side_prediction():
+    """A truncated log with buffer lines but no `offloaded N/M` line cannot say
+    whether the whole file is resident; "cannot tell" must not produce a verdict
+    (and must not fire a divergence)."""
+    load = engine_log.parse_load(
+        "0.01.522.676 I load_tensors: ROCm0 model buffer size = 3281.20 MiB\n"
+        "0.04.364.938 I llama_kv_cache: ROCm0 KV buffer size = 2176.00 MiB\n")
+
+    assert engine_log.weights_are_device_resident(load) is False
+    assert engine_log.compare_plan(load, SPILL_PREDICTION_MB)[
+        "vram_verdict"] == "not_comparable"
+
