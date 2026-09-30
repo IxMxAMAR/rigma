@@ -25,6 +25,13 @@ const PARAM_DEFS_ADV = [
 ];
 const INT_PARAMS = ["max_tokens", "dry_allowed_length", "top_k", "seed"];
 
+/* The engine's own context floor, named rather than repeated as a bare 2048 at
+   the custom-ctx input below. The server refuses a ctx under this
+   (serve.py's "ctx must be at least 2048") and `hangar.MIN_NATIVE_CTX` is the
+   same 2048 for the native probe, so the input must not offer a value the
+   server would reject. */
+const CTX_FLOOR = 2048;
+
 function el(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -387,12 +394,12 @@ async function renderServerTab() {
   const ctxIn = el("input");
   ctxIn.type = "number";
   ctxIn.placeholder = "custom";
-  ctxIn.min = 2048;
+  ctxIn.min = CTX_FLOOR;
   ctxIn.step = 1024;
   const ctxGo = el("button", "act mini", "Apply");
   ctxGo.onclick = () => {
     const v = parseInt(ctxIn.value, 10);
-    if (v >= 2048) applyCtx(v);
+    if (v >= CTX_FLOOR) applyCtx(v);
   };
   ctxIn.onkeydown = (e) => { if (e.key === "Enter") ctxGo.onclick(); };
   ctxRow.append(ctxIn, ctxGo);
