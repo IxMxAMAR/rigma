@@ -11,6 +11,7 @@ import {
 } from "../lib/engineApi";
 import { pct, progressLine } from "../lib/download";
 import SwitchNote from "../lib/SwitchNote";
+import LaunchDefaultsDialog from "./LaunchDefaultsDialog";
 
 // IMP-2: the server already measures `done`, a rolling `bps` and an `eta` for
 // every pull in flight (serve's pull_samples); the page showed only a
@@ -281,6 +282,10 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
   // A8c: the switch's own note (a KV-cache restore it refused, or a cache it
   // stepped down). Neutral, not red — the load succeeded, the note says how.
   const [note, setNote] = useState<string | null>(null);
+  // D2: the first-load dialog. A load of a model the server says is a
+  // `first_load` is held here so the user can pin how it comes up before the
+  // engine actually starts.
+  const [setup, setSetup] = useState(false);
   const downloading = q.pull?.status === "downloading";
   const run = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -293,6 +298,40 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
       // that the file is still not there but never WHY the pull was refused
       // (bad repo, dead network, full disk). Keep the server's sentence on the
       // row instead of discarding it.
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+    onAction();
+  };
+  /** D2: `GET .../defaults` first. `first_load` is the server's own signal —
+   *  nothing is pinned and no turn has ever finished — and it is the only
+   *  honest moment to ask how the model should come up. A failed read must not
+   *  block the load: it falls through to the switch exactly as before. */
+  const load = async () => {
+    setBusy(true);
+    setErr(null);
+    setNote(null);
+    try {
+      const md = await engineApi.modelDefaults(card.slug).catch(() => null);
+      if (md?.first_load) {
+        setBusy(false);
+        setSetup(true);
+        return;
+      }
+      setNote(switchNotice(await engineApi.switchTo(card.slug, q.quant)));
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+    onAction();
+  };
+  const switchNow = async () => {
+    setBusy(true);
+    setErr(null);
+    setNote(null);
+    try {
+      setNote(switchNotice(await engineApi.switchTo(card.slug, q.quant)));
+    } catch (e) {
       setErr((e as Error).message);
     }
     setBusy(false);
@@ -349,7 +388,7 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
         {q.on_disk && !q.running && !downloading && (
           <button
             disabled={busy}
-            onClick={() => void run(() => engineApi.switchTo(card.slug, q.quant))}
+            onClick={() => void load()}
             className="rounded-md bg-moss/15 text-moss px-2.5 py-0.5 text-[12px] font-semibold disabled:opacity-40"
             title={"Stop the engine and load THIS quant. Two quants on disk had "
                    + "no way to choose between them."}
@@ -401,6 +440,15 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
              className="text-red font-mono text-[11px] pl-3.5 pt-0.5 break-words">
           download failed: {q.pull.error}
         </div>
+      )}
+      {setup && (
+        <LaunchDefaultsDialog
+          slug={card.slug}
+          open
+          firstLoad
+          onClose={() => { setSetup(false); void switchNow(); }}
+          onSaved={() => { setSetup(false); void switchNow(); }}
+        />
       )}
     </li>
   );
@@ -566,10 +614,52 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  // D2: `run` asks the server whether this is a first load before it switches.
+  // `setup` holds the dialog open across that question; `showDefaults` opens it
+  // from the card itself, so a model that has already been loaded can still
+  // have its defaults edited.
+  const [setup, setSetup] = useState(false);
+  const [showDefaults, setShowDefaults] = useState(false);
   const anyOnDisk = card.quants.some((q) => q.on_disk);
   const onDiskGb = card.quants.filter((q) => q.on_disk)
     .reduce((n, q) => n + q.bytes, 0)
     + (card.mmproj?.on_disk ? card.mmproj.bytes : 0);
+
+  const switchNow = async () => {
+    setBusy(true);
+    setErr(null);
+    setNote(null);
+    try {
+      setNote(switchNotice(await engineApi.switchTo(card.slug)));
+    } catch (e) {
+      // AUDIT F11-4: a refused switch is not "still polling"
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+    onAction();
+  };
+
+  /** D2: the server's own `first_load` decides whether to ask first. A failed
+   *  read falls through to the switch — an unreachable defaults route must not
+   *  make a model unloadable. */
+  const load = async () => {
+    setBusy(true);
+    setErr(null);
+    setNote(null);
+    try {
+      const md = await engineApi.modelDefaults(card.slug).catch(() => null);
+      if (md?.first_load) {
+        setBusy(false);
+        setSetup(true);
+        return;
+      }
+      setNote(switchNotice(await engineApi.switchTo(card.slug)));
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+    onAction();
+  };
 
   // Only custom (Hangar-added) models can be removed outright — a registry
   // model would just reappear on the next `rigma update`, so for those the
@@ -606,22 +696,21 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
         {anyOnDisk && !card.running && (
           <button
             disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              setErr(null);
-              setNote(null);
-              try {
-                setNote(switchNotice(await engineApi.switchTo(card.slug)));
-              } catch (e) {
-                // AUDIT F11-4: a refused switch is not "still polling"
-                setErr((e as Error).message);
-              }
-              setBusy(false);
-              onAction();
-            }}
+            onClick={() => void load()}
             className="ml-auto rounded-md bg-amber/15 text-amber px-2.5 py-0.5 text-[12px] font-semibold disabled:opacity-40"
           >
             {busy ? "switching…" : "run"}
+          </button>
+        )}
+        {card.custom && !card.running && (
+          <button
+            disabled={busy}
+            onClick={() => setShowDefaults(true)}
+            title="change how this model comes up when it is loaded without an explicit setting"
+            aria-label={`defaults for ${card.slug}`}
+            className={`${anyOnDisk ? "" : "ml-auto "}shrink-0 rounded-md px-2 py-0.5 font-mono text-[11.5px] text-muted hover:text-amber hover:bg-surface disabled:opacity-40`}
+          >
+            defaults
           </button>
         )}
         {card.custom && !card.running && (
@@ -679,6 +768,23 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
           />
         ) : undefined}
       />
+      {setup && (
+        <LaunchDefaultsDialog
+          slug={card.slug}
+          open
+          firstLoad
+          onClose={() => { setSetup(false); void switchNow(); }}
+          onSaved={() => { setSetup(false); void switchNow(); }}
+        />
+      )}
+      {showDefaults && (
+        <LaunchDefaultsDialog
+          slug={card.slug}
+          open
+          onClose={() => setShowDefaults(false)}
+          onSaved={() => { setShowDefaults(false); onAction(); }}
+        />
+      )}
     </section>
   );
 }
