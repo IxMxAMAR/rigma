@@ -199,3 +199,115 @@ def test_an_unreadable_first_load_releases_the_slot(engine, home):
     assert runs.active() is None, (
         "the run slot stayed claimed — every later POST /api/runs answers 409 "
         '"a run is already active"')
+
+
+# ---------------------------------------------------------------------------
+# A18c: a READABLE but UNUSABLE run.json is the same defect class.
+#
+# A18 only guarded `runs.load` returning None. But `runs.load` is a bare
+# `json.loads`: `{}`, `[]` and `{"session_id": null}` are all VALID JSON, parse
+# fine, and then die at `run["session_id"]` — the loop task gone, the run
+# `running` on disk, the slot still claimed. `_run_is_drivable` closes it.
+# ---------------------------------------------------------------------------
+
+# Every shape that parses but cannot be driven. `{"id": rid, "session_id": ""}`
+# is the nastiest: it HAS an id, so it reaches the session_id dereference.
+_BAD_RECORDS = [
+    {},
+    [],
+    {"session_id": None},
+    {"session_id": ""},
+    {"id": "placeholder", "session_id": ""},
+]
+
+
+def _terminal_doc(rid):
+    """The run.json as a dict, or None while it is absent/torn."""
+    try:
+        return json.loads((runs.run_dir(rid) / "run.json").read_text(
+            encoding="utf-8"))
+    except Exception:
+        return None
+
+
+@pytest.mark.parametrize("bad", _BAD_RECORDS)
+def test_load_run_for_loop_rejects_an_undrivable_record(home, bad):
+    """The inner loop's loader must not hand the loop a record it will crash
+    on. `(None, False)` is what makes the caller release the slot."""
+    run = runs.create("mission", "sess-1")
+    rid = run["id"]
+    (runs.run_dir(rid) / "run.json").write_text(
+        json.dumps(bad), encoding="utf-8")
+
+    got = serve._load_run_for_loop(runs, rid)
+
+    assert got == (None, False), (
+        f"a readable-but-unusable run.json ({bad!r}) was reported as drivable: "
+        f"{got!r} — the loop would die at run['session_id']")
+
+
+def test_load_run_for_loop_still_accepts_a_real_record(home):
+    """The guard must not reject the healthy case."""
+    run = runs.create("mission", "sess-1")
+
+    got, readable = serve._load_run_for_loop(runs, run["id"])
+
+    assert readable is True
+    assert got["session_id"] == "sess-1"
+
+
+@pytest.mark.parametrize("bad", _BAD_RECORDS)
+def test_release_handles_an_undrivable_record(home, bad):
+    """`_release_unreadable_run` must write a terminal status for a record that
+    is not a dict (or has no usable id), not crash on `run.get` / `run['id']`."""
+    run = runs.create("mission", "sess-1")
+    rid = run["id"]
+    record = ({**bad, "id": rid} if isinstance(bad, dict) and "id" not in bad
+              else bad)
+    (runs.run_dir(rid) / "run.json").write_text(
+        json.dumps(record), encoding="utf-8")
+
+    serve._release_unreadable_run(runs, rid, "run state could not be read")
+
+    doc = _terminal_doc(rid)
+    assert doc is not None, "the release never wrote a record"
+    assert doc.get("id") == rid
+    assert doc.get("status") == "interrupted", (
+        f"a usable-looking-but-undrivable run.json left the run non-terminal: "
+        f"{doc}")
+    assert doc.get("halt_reason"), "the release must say WHY it happened"
+    assert doc.get("stop_reason") == "interrupted"
+    assert runs.active() is None, "the run slot stayed claimed"
+
+
+def test_an_empty_object_run_json_releases_the_loop_slot(engine, home):
+    """The exact reported case, end to end: a run whose run.json is `{}` while
+    the loop is loading it must end terminal, not `running` forever."""
+    c = _client(engine)
+    real = runs.load
+
+    def empty_for_the_loop(rid):
+        frame = inspect.currentframe().f_back
+        caller = frame.f_code.co_name if frame is not None else ""
+        if caller in ("_run_loop", "_load_run_for_loop"):
+            return {}
+        return real(rid)
+
+    runs.load = empty_for_the_loop
+    try:
+        rid = c.post("/api/runs", json={"mission": "small job",
+                                        "budget_hours": 1}).json()["id"]
+        end = time.monotonic() + 10
+        doc = None
+        while time.monotonic() < end:
+            doc = _terminal_doc(rid)
+            if doc and doc.get("status") in runs.TERMINAL:
+                break
+            time.sleep(0.05)
+    finally:
+        runs.load = real
+    assert doc is not None and doc.get("id") == rid
+    assert doc.get("status") == "interrupted", (
+        f"run.json = {{}} wedged the run: {doc}")
+    assert doc.get("halt_reason")
+    assert runs.active() is None
