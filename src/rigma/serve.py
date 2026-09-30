@@ -2599,10 +2599,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             elicitation with `decline` and the agent silently took its
             non-interactive fallback — nobody was ever shown the question.
 
-            This is the SAME handshake as `_answer_permission`: one `_approvals`
-            slot per session, the same `approval/asked` event, the same
-            `/api/sessions/{sid}/approval` route. A second mechanism would be a
-            second thing to keep in step, and the UI already reads this channel.
+            This is the SAME handshake as `_answer_permission`: the same
+            `approval/asked` event, the same `/api/sessions/{sid}/approval`
+            route. A second mechanism would be a second thing to keep in step,
+            and the UI already reads this channel.
+
+            OD12-n2: the slot lives in `_questions`, keyed by the REQUEST ID
+            minted here, not in the per-session `_approvals`. A question has no
+            natural id (unlike a permission's toolCallId), so one slot per
+            session meant a second concurrent question for the same session
+            overwrote the first — and, worse, the first handler's `finally`
+            popped the second's slot, leaving a live question unanswerable.
 
             Returns the answer object, or None when nobody answered — which
             `drive_turn_acp` reports as `answer_elicitation(accepted=False)`, a
@@ -2622,7 +2629,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             slot = {"requestId": request_id, "answer": None, "kind": "question",
                     "event": threading.Event(), "lock": threading.Lock(),
                     "expired": False}
-            _approvals[sid] = slot
+            # OD12-n2: keyed by request id, so each question has its own slot and
+            # the route finds it by the id it was asked with.
+            _questions[request_id] = slot
             # Same `approval/asked` channel as a permission ask. `kind` is what lets
             # the UI draw a question form rather than an allow/deny card; the message
             # and the requested schema are the question.
@@ -2651,8 +2660,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         if not answered:
                             slot["expired"] = True
             finally:
-                # Cleared even on the timeout path, exactly like a permission slot.
-                _approvals.pop(sid, None)
+                # Cleared even on the timeout path, exactly like a permission slot —
+                # but only THIS question's slot, so a first question finishing can
+                # never pop a second one that is still waiting (OD12-n2).
+                _questions.pop(request_id, None)
             # The decision, in the shape `approval/decided` already has: the SAME id
             # as the ask, plus a verdict. `decision` is the field that names the
             # outcome; `outcome` carries the same value because that is the field the
@@ -5401,6 +5412,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # a different chat, which a global slot would have silently accepted.
     _approvals: dict[str, dict] = {}
 
+    # OD12-n2. A QUESTION cannot use the per-session slot above: ACP mints no id
+    # for an elicitation, so serve.py mints one, and two questions in flight for
+    # one session would overwrite each other there (and the first handler's
+    # `finally` would pop the second's slot). Question slots are keyed by that
+    # minted request id instead, and the route finds them by it. A permission
+    # keeps its per-session `_approvals` slot, unchanged.
+    _questions: dict[str, dict] = {}
+
     # How long the reader thread waits for the user before giving up. Bounded because
     # an unbounded wait is worse than a decline: the client's reader thread is blocked
     # for the whole time, so a UI that never answers would wedge the transport rather
@@ -5710,10 +5729,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse(
                 {"error": "allow: must be true or false"}, status_code=400)
         request_id = str(body.get("requestId") or "")
-        slot = _approvals.get(sid)
+        # OD12-n2: a QUESTION slot is found by its own REQUEST ID, not by session,
+        # so two questions in flight for one session cannot overwrite each other.
+        # A permission keeps its per-session `_approvals` slot, unchanged.
+        if answer is not None:
+            slot = _questions.get(request_id) if request_id else None
+        else:
+            slot = _approvals.get(sid)
         if slot is None:
             return JSONResponse(
-                {"error": "this chat is not waiting on a permission request"},
+                {"error": ("this chat is not waiting on a question"
+                           if answer is not None else
+                           "this chat is not waiting on a permission request")},
                 status_code=409)
         if request_id and request_id != slot.get("requestId"):
             return JSONResponse(
