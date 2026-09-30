@@ -461,3 +461,49 @@ is captured precisely.
 **If nothing is decided:** the suite stays green when run alone (which is how it is normally run) and
 the failure mode stays unrecorded in code — so the next person to see it will spend an hour
 concluding the product is broken.
+
+---
+
+### UPDATE, 16:50Z — **DIAGNOSED AND FIXED** (`43e63de`), so option 1 is done
+
+The shared resource was a **fixed TCP port**, and it was the only one in the whole suite.
+
+`tests/test_bench.py`'s `oai_server` fixture started `tests/fake_oai_server.py` with `--port 11598`
+and then decided its own child was up by polling `http://127.0.0.1:11598/health` for a `200`. Every
+**other** server in the suite passes `0` and lets the kernel choose (checked across the ~40
+in-process servers and all three `fake_*_server.py` scripts; `11598` is the only literal bind). So
+two concurrent runs shared it, and the failure is exactly the recorded one:
+
+* the second run's child died on `address already in use`;
+* the second run's readiness poll then got its `200` **from the first run's server**, so the fixture
+  reported "ready" and its tests silently measured another process's engine;
+* when the first run tore that server down, the second blocked on an established socket to a server
+  that had gone away — the frozen suite, and the children left behind.
+
+**Demonstrated, not asserted.** With a foreign HTTP server answering `200` on 11598, the old
+readiness check reports ready while its own child never started:
+
+```
+OLD_READINESS_CHECK ready=True  (the child never started; the 200 came from another process)
+```
+
+and with that same impostor still listening, the fixed fixture passes (`12 passed in 3.27s`). The
+fixture now draws a fresh ephemeral port per attempt, treats a **dead child** as "try another port"
+rather than "ready", retries five times, and always reaps the child it started. No test assertion
+changed. Provenance: **Head-Agent-sourced, single-sourced** (this resumed session cannot spawn
+subagents); the demonstration script is `.scratch/orchestrator/rec1-old-logic.py` and the squatting
+server `.scratch/orchestrator/squat-11598.py`.
+
+**The leaked children are a symptom, not a second defect.** With two orphaned suites running, 72
+`tests/fake_acp_server.py` processes were alive and idle (0.00–0.05 s CPU, unchanged over 6 s).
+Running `tests/test_harness_mcode_acp.py` **alone** left the count unchanged —
+`61 passed in 13.93s`, **delta 0** — so that file reaps correctly and the 72 belong to the two
+frozen runs, which hold them open. `AcpClient.stop` already escalates stdin-EOF → SIGTERM/`taskkill /T`
+→ SIGKILL, so nothing in `tests/` needs a reaper.
+
+**What is still open (option 3, the belt-and-braces half).** Nothing now *stops* two full-suite runs
+from starting; the "at most three pytest processes" rule permits it, and the remaining cost is two
+runs fighting for the machine rather than a deadlock. A `conftest.py` session lock that makes a
+second **full** run exit with a clear message is still worth having, and is now the only part of this
+item left.
+
