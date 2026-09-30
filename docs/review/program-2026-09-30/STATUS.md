@@ -7,8 +7,11 @@ Hand-off and resume instructions: `HANDOFF.md`. Wave log: `.scratch/orchestrator
 Base: `review/deep-audit-2026-09-22` @ `7ea1827` (unchanged). Program docs first committed as `8de0434`.
 Baseline full suite: **2935 non-hardware tests, all pass (exit 0)**; `ruff check src tests` clean.
 **Full suite on the wave-1 merges: exit 0, no failures, 3 skipped.**
+**Full suite at `e745820` (waves 1–3 merged): 1 failure — `tests/test_phase4_lifecycle.py::test_restart_reattaches_and_finishes`,
+which passes in isolation. Its traceback is `serve.py:5508 TypeError: 'NoneType' object is not subscriptable`,
+i.e. the real **A18** bug (a transient first read killing the run loop), not a flaky test.**
 
-Integration branch head: `e6e8c3d`.
+Integration branch head: `45a907f`.
 
 > **Commit-identity note (2026-09-30).** Early in the run the orchestrator overrode the git author for
 > its merge commits, and several implementers committed under a local identity
@@ -40,17 +43,26 @@ Integration branch head: `e6e8c3d`.
 | A15 | 2 | `ca83bc0` (`17ade5c`) | Method drafts are bounded (`MAX_DRAFTS = 20`, live drafts pinned) and deletable (`DELETE /api/methods/drafts/{id}`). |
 | A7 | 3 | `e6e8c3d` (`10590b1`) | An unknown run profile returns 400 naming the allowed set, instead of being silently coerced to the most permissive profile; the absent-key default (`"all"`, OD-1) is unchanged. |
 | A11 | 3 | `e6e8c3d` (`3a55987`) | `/api/restore` snapshots and rolls back so a mid-loop failure cannot leave a half-restored store, and the 500 names the failing section. |
-| B1 | 1 | _rejected once, fixed, re-verifying_ | `harness.kill_tree` delegating to `tools._kill_tree` would `killpg` Rigma's own process group on POSIX (harness children are not detached). Fixed in `8afc625` by detaching on POSIX plus a never-signal-our-own-group guard in `tools._signal_tree`. |
-| D1 | 2 | _sent back once_ | The benchmark's prompt is lexically varied and carries an optional fill depth — but the verifier measured that the "unchanged default path" is in fact 11.1 % shorter and the test's 15 % tolerance hides it, so it is back with the implementer. |
-| A8 | 3 | _verifying_ | KV-restore refusal is loud (log + `explain` + the `/api/server/switch` notice) instead of silent. The implementer deliberately did **not** clear `kv_fp`: it is the key the slot is saved under, so clearing it would make the unreadable blob immortal. |
-| B7 | 3 | _verifying_ | `--alias` and `--reasoning-format deepseek` are emitted, and the `/v1` proxy applies the parameter layer only when `tools` is present. |
-| A16 | 4 | _in flight_ | `list_models` fit exceptions, the GGUF version check, the unbounded `params`, and `engine_log` attribution (06R3-7/8/9/10). |
-| A9 | 4 | _in flight_ | Idle auto-unload failure is logged with its reason instead of `except Exception: pass`. |
-| A12 | 4 | _in flight_ | The chat prompt queue is bounded and is no longer popped on an unwind. |
-| B4 | 4 | _in flight_ | mcode `ask_user` elicitation gets an `on_question` handler on the existing permission channel instead of being auto-declined. |
-| C1 | 4 | _in flight_ | `--ctx-checkpoints`/`-ctxcp` lever. |
-| C3 | 4 | _in flight_ | `--reasoning-effort` lever (fork-gated if it is fork-only). |
-| B8 | 4 | _in flight_ | `dsh-user-approval` / `dsh-permission-presets` rows in the DSH capability patch. |
+| B1 | 3 | `f0b78b3` (`eb79687`, `b0d3e1e`, `6dab549`) | Harness children are detached on POSIX and `tools._signal_tree` refuses to signal a group equal to Rigma's own, so a tree-kill can no longer kill Rigma itself. **Rejected once** (the first version still signalled our own group), fixed, re-verified. |
+| D1/S3 | 4 | `dbb2110` (`c8b326a`, `79ae31b`) | The benchmark prompt is lexically varied at the **legacy** size — word-identical to the pre-change module at 512/2048/131072 — and carries an optional fill depth; the 0.15 tolerance is gone. **Rejected once** (the first version silently shrank the default prompt). |
+| A8 | 3 | `e745820` | KV-restore refusal is loud (log + `explain` + the `/api/server/switch` notice). The implementer deliberately did **not** clear `kv_fp` — it is the key the slot is saved under, so clearing it would make the unreadable blob immortal; the verifier accepted that deviation and corrected the row's stated consequence. |
+| B7 | 3 | `d53d65d` (`67e7a58`, `a92125e`) | The model slug is served as an engine `--alias` and the `/v1` proxy applies the tool-parameter layer only to requests that carry tools. **The verifier corrected two premises:** `/v1/chat/completions` never reads the request `model` in single-model mode (so `docs/AGENTS.md` is right and this is *not* a compatibility fix), and `--reasoning-format` was already the compiled default at both pins (a guard, not a fix). |
+| B5 | 4 | `e2a9ce0` (`99d7fb7`) | The two genuinely-dead `AcpClient` session wrappers are deleted; `session_activate` was **kept** because a real-pipe test is its only caller. Recorded as OD-9. |
+| A16 | 4 | `46b53f5` (`bd0eaa8`, `9859970`, `7717b22`, `a2aafef`, `a71d47d`) | A broken fit is distinguishable (`error`), an unknown GGUF version is refused loudly, `params` is bounded, and `findings` attributes to the **current** run (the marker is line 1 of all 16 real logs). |
+| B3 | 4 | `e770ac0` (`1ff09c8`) | The subagent descriptor carries the child id the rail fold reads. **The verifier corrected the row's premise:** the lifecycle already opened the row, so this *renames* an existing entry rather than making activity appear. |
+| A9 | 4 | `9c47346` (`a807187`) | A failed idle auto-unload is logged with its reason; the engine stays loaded and the idle state is unchanged. |
+| A12 | 4 | — | **Already fixed in-tree** by `9b8d983` (R3-5) before the wave base: `_QUEUE_MAX = 32` with a visible 429, popped only on delivery. Independently confirmed, so it was recorded as already-done rather than re-implemented. |
+| B4 | 4 | `9c47346` (`ef83a6e`) | mcode's `ask_user` rides the existing permission channel with a minted elicitation id and a 5 s bound that returns a real decline. The UI half is unwritten (**B4b**). |
+| B8 | 4 | `a78a82e` (`ed7010e`, `2cb6bb4`, `ef9bf13`) | The approval/permission services are mounted, notices are one capped line, and two docstrings are corrected. The verifier measured that the rows are a **disclosed-but-inert prerequisite** (**OD-10**) and found a **false claim in the file**, now corrected in `ebd6998`. |
+| C1 | 4 | _verified, held_ | `--ctx-checkpoints`/`-ctxcp` lever, verified correct and independently mergeable; held only because it shares a branch with C3. |
+| C3 | 4 | _re-verifying_ | `--reasoning-effort` lever. **Rejected once:** the fork gate was re-derived at argv-build time, so on a first run the fork-only flag reached the pinned mainline binary and llama-server would have exited in argparse. Fixed by freezing the gate onto the plan at engine-choice time, with a non-fatal relaunch fallback. |
+| C2 | 4 | `7f8991c` (`e78190e`) | `--no-op-offload` is trialled as a sweep axis; the OFF case emits nothing, so every pre-existing trial's argv is byte-identical. |
+| D5 | 5 | `b63ff92` | The **first `*.test.tsx`** in the tree: `HarnessFacts` extracted and pinned with real markup assertions — no new dependency. |
+| A10 | 5 | `036a5d3` | A refused workspace save is surfaced and no longer reported as saved. |
+| A8c | 5 | `335dffe` | The switch notice the backend returns is typed and rendered instead of discarded. |
+| B6b | 5 | `6361ca2` | The ACP usage cost the store already holds is rendered. |
+| OD-10 | 4 | `45a907f` | The approval trail is mounted but inert, and the file now says why (false claim removed). |
+| A18 | — | _open — highest value_ | The run loop's **initial** `_runs.load` is unguarded, so a transient unreadable `run.json` kills the driver and wedges the run `running` forever with its slot claimed. Found by the full suite, not by reading. |
 
 Legend: `_in flight_` = implementer working · `_verifying_` = verifier running · `_merged_` = on the
 integration branch · `_rejected once_` = sent back to the implementer with the verifier's finding.
