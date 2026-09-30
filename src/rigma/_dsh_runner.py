@@ -472,8 +472,17 @@ def _forward(notification, streamed: "_Streamed | None" = None) -> None:
         events = _project(notification, streamed)
     except Exception as exc:
         method = str(getattr(notification, "method", "") or "notification")
+        # B2c: the LOG line takes the same whitespace collapse as the notice it
+        # accompanies. Before this, a multi-line exception message put its
+        # newlines straight into the log record — one projector failure read as
+        # a wall of lines, and a message that merely wrapped was mis-shaped —
+        # and the raw message was the one place §0.3 prose could ride into a
+        # log. This is `_one_line` (collapse), NOT the notice's 200-char cap: a
+        # log is read after the fact, so its diagnostic value stays whole on one
+        # line, and whether logs must also be capped is the §0.3 policy question
+        # the backlog leaves open rather than a call this fix makes.
         _log.warning("dsh: projector failed for %s: %s: %s",
-                     method, type(exc).__name__, exc)
+                     _one_line(method), type(exc).__name__, _one_line(exc))
         # The WHOLE line goes through `_notice_line`, not just the detail: the
         # old shape capped `f"{type(exc).__name__}: {exc}"` at 200 and then
         # prepended a ~40-character prefix, so the finished notice could reach
@@ -486,8 +495,10 @@ def _forward(notification, streamed: "_Streamed | None" = None) -> None:
         for ev in events:
             _emit(ev)
     except Exception as exc:
+        # Same shape as the projector-failure line above and the same defect:
+        # an exception message is collapsed before it reaches the log record.
         _log.warning("dsh: could not emit a projected event: %s: %s",
-                     type(exc).__name__, exc)
+                     type(exc).__name__, _one_line(exc))
 
 
 def _cli_for(home: str) -> Path | None:
