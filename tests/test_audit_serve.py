@@ -857,6 +857,51 @@ def test_idle_unload_never_fires_while_a_turn_is_streaming(home, engine,
                    "suspecting the unload guard.")
 
 
+def test_a_failed_idle_unload_is_logged_and_leaves_the_engine_loaded(
+        home, engine, monkeypatch, caplog):
+    """A9: the poller's unload sat under `except Exception: pass`, so a failed
+    unload left the card occupied and nothing said why. The failure must be
+    logged with its reason, and the idle state left exactly as it was —
+    `perform_unload` records `unloaded=True` only on success, so a raise must
+    neither be reported as an unload nor clear the loaded state."""
+    import asyncio
+
+    from rigma import server_ops
+    from rigma import state as st
+
+    def _boom():
+        raise RuntimeError("unload exploded: the card is still held")
+
+    monkeypatch.setattr(server_ops, "perform_unload", _boom)
+    monkeypatch.setattr(serve, "KEEPALIVE_POLL_SECS", 0.02)
+    monkeypatch.setenv("RIGMA_KEEP_ALIVE_MIN", "0.0005")   # 30ms of idle
+    _running()
+    c = _client(engine.port)
+    sid = _seed(c, 2)
+    app = build_app(upstream_port=engine.port)
+
+    async def scenario():
+        async with app.router.lifespan_context(app):
+            await _stream(app, f"/api/sessions/{sid}/chat", {"message": "go"})
+            # the poller fires once the turn is over and the 30ms clock is out
+            for _ in range(1000):
+                if any("idle auto-unload failed" in r.getMessage()
+                       for r in caplog.records):
+                    break
+                await asyncio.sleep(0.02)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(scenario())
+
+    reasons = [r.getMessage() for r in caplog.records
+               if "idle auto-unload failed" in r.getMessage()]
+    assert reasons, ("a failed idle unload was not logged, so the card stayed "
+                     "occupied with nothing to explain why")
+    assert "unload exploded" in reasons[0], reasons
+    assert not st.read_state().get("unloaded"), (
+        "a failed unload was recorded as an unload")
+
+
 # --------------------------------------------------------------------------
 # F15 — steering a run was confirmed to the user and then discarded
 
