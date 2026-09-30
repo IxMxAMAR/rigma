@@ -7325,7 +7325,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             doc = json.loads(body)
         except (ValueError, UnicodeDecodeError):
             return body
-        if not isinstance(doc, dict) or not doc.get("tools"):
+        if not isinstance(doc, dict):
+            return body
+        # B7d: `tools` was tested for TRUTHINESS, so `"abc"`, `{"a": 1}` and `1`
+        # all took the merge path and the engine received re-serialised JSON
+        # instead of the caller's exact bytes. Only a NON-EMPTY LIST is a tool
+        # request.
+        tools = doc.get("tools")
+        if not isinstance(tools, list) or not tools:
             return body
         # Weakest to strongest: model card < RUN_PARAMS < caller. RUN_PARAMS is
         # the same layer Rigma's own turns use, and the caller's own values
