@@ -160,6 +160,17 @@ def register(app, *, sse, drive_turn, aux_complete, tool_ctx_for) -> None:
             return JSONResponse({"error": "no such draft"}, status_code=404)
         return d
 
+    # 10-R3-17: an abandoned creation chat left its draft on disk and a client
+    # had no way to throw one away. Both spellings are registered so the
+    # plural path the backlog names and the singular one its siblings use both
+    # resolve; the body is the same delete_method idiom as above.
+    @app.delete("/api/methods/draft/{did}")
+    @app.delete("/api/methods/drafts/{did}")
+    async def delete_draft(did: str):
+        if not method_drafts.delete(did):
+            return JSONResponse({"error": "no such draft"}, status_code=404)
+        return {"deleted": did}
+
     @app.post("/api/methods/draft/{did}/promote")
     async def promote_draft(did: str):
         saved, errs = method_drafts.promote(did)
