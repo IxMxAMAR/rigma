@@ -181,6 +181,34 @@ def config_of(plan, engine: str = "", engine_version: str | None = None) -> dict
     }
 
 
+def launched_engine_identity(rp, exe) -> str:
+    """The measured identity of the binary that WILL run (A13b).
+
+    `config_of`'s default — `engine_identity(plan.backend)` — answers for the
+    PIN's directory: it looks under `~/.rigma/engines/<manifest version>/<backend>`.
+    `engine_binary_for` does not always choose that binary. When a model's tensor
+    types need a REGISTERED engine it launches one from an arbitrary path (this
+    machine has `prism-b10743-vulkan` and `prism-b10743-hip`), and the fingerprint
+    recorded that path beside the PIN's version — so an in-place swap of the
+    registered engine produced the same fingerprint and a cache taken under the
+    old build was restored under the new one. The path is not the build.
+
+    `launch_fingerprint` already receives the exe that will actually run, so the
+    identity is measured from THAT file. Falls back to `engine_identity(backend)`
+    when the file cannot be measured, which is exactly the value the pinned path
+    used before this existed — an unreadable binary is "what the rest of the code
+    would have said", never a guess.
+    """
+    from . import engine_build
+    try:
+        got = engine_build.cached_build(exe)
+        if got.ok:
+            return got.identity
+    except Exception:
+        pass
+    return engine_identity(getattr(rp, "backend", ""))
+
+
 def launch_fingerprint(rp, exe) -> str:
     """The fingerprint for a plan that is about to be launched.
 
@@ -190,8 +218,13 @@ def launch_fingerprint(rp, exe) -> str:
     rather than re-deriving it. Two copies of this expression is exactly how they
     stop agreeing, and a disagreement here is the silent-corruption case this
     module exists to prevent.
+
+    The engine identity comes from the launched binary, not from the backend's
+    pin directory — see `launched_engine_identity`. For a pinned launch the two
+    are the same file, so the fingerprint is unchanged.
     """
-    return fingerprint(config_of(rp, str(exe)))
+    return fingerprint(config_of(rp, str(exe),
+                                 engine_version=launched_engine_identity(rp, exe)))
 
 
 def save(port: int, save_dir: Path, fp: str, *, meta: dict | None = None,
