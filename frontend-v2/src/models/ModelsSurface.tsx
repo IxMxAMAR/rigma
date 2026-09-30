@@ -50,8 +50,16 @@ const SPEED: Record<string, { dot: string; text: string; label: string; hint: st
 
 /** The arithmetic behind a single "8K". A bare number cannot show that a
  *  doubling was missed by 46MB, or that 888MB of it went to a vision projector
- *  you may not want. */
-function budgetHint(fit?: QuantRow["fit"]): string {
+ *  you may not want.
+ *
+ *  A2d-budget: the recurrent-state term is charged for a hybrid's SSM buffers,
+ *  and when the geometry could not be read the fit calls it an ESTIMATE — the
+ *  fit's own explain line has said `rs=unknown(est N MB)` since A2d-gap, but
+ *  this row (the number behind "OVER by / headroom") printed a bare figure for
+ *  the same shape. A number with no provenance reads as a measured one, which
+ *  is exactly the silent confidence the A2 family exists to remove. Exported so
+ *  the sentence is assertable without mounting the page. */
+export function budgetHint(fit?: QuantRow["fit"]): string {
   // A16: checked FIRST, because a broken fit has no budget and would otherwise
   // fall through to the "does not fit this machine" sentence below — a verdict
   // nobody computed.
@@ -63,22 +71,39 @@ function budgetHint(fit?: QuantRow["fit"]): string {
   if (!b) {
     return fit?.ok ? "fits this machine" : "does not fit this machine";
   }
+  // A2d-budget: say what the term IS, not only how big it is. The estimate is
+  // still charged — dropping it would free VRAM llama.cpp is about to allocate
+  // — so the label is the whole fix.
+  const rs = b.rs_unknown
+    ? (b.rs_mb
+        ? `recurrent state ${b.rs_mb.toLocaleString()} MB  ← ESTIMATE, not a `
+          + "measurement (this model's recurrent geometry could not be read)"
+        : "recurrent state  unknown geometry — 0 is charged for lack of "
+          + "evidence, NOT because there is nothing to allocate")
+    : b.rs_mb
+      ? `recurrent state ${b.rs_mb.toLocaleString()} MB`
+      : "";
+  const caveat = b.rs_unknown
+    ? " — the recurrent-state term is an estimate, not a measurement"
+    : "";
   const L = [
     `weights        ${b.file_mb.toLocaleString()} MB`,
     ...(b.mmproj_mb ? [`vision proj    ${b.mmproj_mb.toLocaleString()} MB  (always resident)`] : []),
     `KV @ ${K(b.ctx)} ${b.kv_type}   ${b.kv_mb.toLocaleString()} MB`,
+    ...(rs ? [rs] : []),
     `──`,
     `VRAM budget    ${b.budget_mb.toLocaleString()} MB`,
     b.over_mb > 0
-      ? `OVER by        ${b.over_mb.toLocaleString()} MB → that much spills to RAM`
-      : `headroom       ${(-b.over_mb).toLocaleString()} MB`,
+      ? `OVER by        ${b.over_mb.toLocaleString()} MB → that much spills to RAM${caveat}`
+      : `headroom       ${(-b.over_mb).toLocaleString()} MB${caveat}`,
   ];
   return L.join("\n");
 }
 
 /** Context this quant can actually hold here — its own column, because it is
- *  the number people compare across quants and it must line up to be read. */
-function CtxCell({ fit }: { fit?: QuantRow["fit"] }) {
+ *  the number people compare across quants and it must line up to be read.
+ *  Exported so a render test can read the tooltip `budgetHint` produces. */
+export function CtxCell({ fit }: { fit?: QuantRow["fit"] }) {
   const has = fit?.ok && fit.ctx;
   return (
     <span

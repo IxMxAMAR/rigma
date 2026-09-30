@@ -177,6 +177,17 @@ export interface Budget {
   over_mb: number;
   ctx: number;
   kv_type: string;
+  /** A2b: the recurrent-state term the fit charges for a hybrid's SSM/linear
+   *  attention buffers, times `LAUNCH_PARALLEL`. It was missing from this row,
+   *  so a row could read "fits" while the fit it described offloaded a layer.
+   *  Optional because a server older than A2b does not send it. */
+  rs_mb?: number;
+  /** A2d-budget: `true` when the model gives evidence of recurrent layers but
+   *  no geometry to size them with, so `rs_mb` is an ESTIMATE (or a 0 charged
+   *  for lack of evidence, not because there is nothing to allocate). A boolean
+   *  BESIDE `rs_mb` on purpose — the term is still charged, and every numeric
+   *  consumer of the row is untouched. */
+  rs_unknown?: boolean;
 }
 
 /** The explorer's knobs. These only change what the fit math ASSUMES — nothing
