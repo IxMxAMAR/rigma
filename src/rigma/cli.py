@@ -2649,7 +2649,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             if (ctx is None and not no_calibrate and cand.backend != "cpu"
                     and os.environ.get("RIGMA_AUTO_CALIBRATE", "1") != "0"
                     and not is_calibrated(cand.model_slug, cand.gguf.quant,
-                                          cand.backend)):
+                                          cand.backend, cand.flags)):
                 typer.echo(f"tuning {cand.model_slug} for your hardware "
                            f"(one-time, a few minutes)...")
                 cand = auto_calibrate(

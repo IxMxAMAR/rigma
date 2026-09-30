@@ -906,6 +906,102 @@ def test_auto_calibrate_on_a_q4_tools_plan_caches_nothing_to_calibrate(
     assert "already quantizes the KV cache to q4_0" not in caplog.text
 
 
+def test_a_cached_nothing_to_calibrate_is_rechecked_when_the_plan_changes(
+        monkeypatch, tmp_path, caplog):
+    """W15AN2-n1. The "nothing to calibrate" entry was cached under
+    `model:quant:backend:identity`, which omits the plan flags that made the
+    decision a no-op. Once a q4_0 plan had cached it, the callers'
+    `not is_calibrated` gate skipped `auto_calibrate` FOREVER — even for a plan
+    that had since become calibratable (its KV cache is no longer q4_0). The
+    entry now records its decision basis, and both readers re-derive it: a plan
+    that still drops every trial stays a cache hit, a plan that no longer does
+    is swept again.
+
+    The no-op entry must also never become readable as a measured placement: it
+    still carries no `flags` and no `measured` numbers."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+    launched = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(*a, **k):
+        launched.append(1)
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    monkeypatch.setattr(bench, "quick_configs", lambda base, moe, caps=(): [
+        ("baseline", {}),
+        ("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}})])
+
+    q4 = _plan(cache_type_k="q4_0", cache_type_v="q4_0")
+    with caplog.at_level("WARNING", logger="rigma.bench"):
+        bench.auto_calibrate(q4, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                             port=11601)
+    assert launched == []
+    assert "already quantizes the KV cache to q4_0" in caplog.text
+    entry = _only_entry()
+    assert not entry.get("flags")              # never a measured placement
+    assert not (entry.get("measured") or {})   # no numbers were measured
+
+    # A plan that is still a no-op is still a cache hit: no launch, no warning.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="rigma.bench"):
+        bench.auto_calibrate(q4, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                             port=11601)
+    assert launched == []
+    assert "already quantizes the KV cache to q4_0" not in caplog.text
+
+    # The KV cache is no longer q4_0, so the plan IS calibratable now. The next
+    # load must sweep again, replacing the decision with a measured placement.
+    plain = _plan()
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="rigma.bench"):
+        out = bench.auto_calibrate(plain, tmp_path / "srv.exe",
+                                   tmp_path / "m.gguf", port=11601)
+    assert launched, "the now-calibratable plan was not swept"
+    assert "already quantizes the KV cache to q4_0" not in caplog.text
+    after = _only_entry()
+    assert after.get("calibrated") is True
+    assert not after.get("no_calibrate")
+    assert after.get("measured")
+    assert out is not None
+
+
+def test_the_is_calibrated_gate_rechecks_a_cached_nothing_to_calibrate(
+        monkeypatch, tmp_path, caplog):
+    """W15AN2-n1. `is_calibrated` is the gate the loaders use
+    (`server_ops.py`, `cli.py`): with the plan's flags it must report a cached
+    "nothing to calibrate" as calibrated only while the same condition still
+    drops every trial. Otherwise the gate skips `auto_calibrate` forever."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    monkeypatch.setattr(bench, "quick_configs", lambda base, moe, caps=(): [
+        ("baseline", {}),
+        ("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}})])
+
+    q4 = _plan(cache_type_k="q4_0", cache_type_v="q4_0")
+    with caplog.at_level("WARNING", logger="rigma.bench"):
+        bench.auto_calibrate(q4, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                             port=11601)
+    # Still a no-op: the gate keeps the caller away from `auto_calibrate`.
+    assert bench.is_calibrated("m", "Q4", "vulkan", q4.flags) is True
+    # Calibratable now: the gate must let `auto_calibrate` run again.
+    assert bench.is_calibrated("m", "Q4", "vulkan", _plan().flags) is False
+
+
 def test_a_calibration_merged_one_sided_q4_plan_is_dropped_too(
         monkeypatch, tmp_path):
     """The shape the CONSTRUCTOR cannot make but a calibration merge can.
