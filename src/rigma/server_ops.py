@@ -9,7 +9,7 @@ import time
 import psutil
 
 from .atomicio import atomic_write_json
-from .models import CACHE_BYTES
+from .models import CACHE_BYTES, MIN_LAUNCH_CTX
 from .runtime import rigma_home
 from . import engine_compat
 
@@ -807,7 +807,7 @@ def perform_switch(model: str, registry=None, profile=None,
         # honest relaunch at a requested context: real fit math, not hope.
         # rp.flags.ctx is the calculator's grow-to-fit maximum for this quant.
         from .resolve import fit_for_launch, step_down_notice
-        want = max(2048, min(int(ctx), spec_full.native_ctx))
+        want = max(MIN_LAUNCH_CTX, min(int(ctx), spec_full.native_ctx))
         # The requested cache type — an explicit `kv`, or the model's stored
         # launch default — is a CEILING, fitted in BEFORE the placement is
         # chosen. Applying it AFTER the fit (the old order, below) let a stored

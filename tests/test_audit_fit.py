@@ -8,8 +8,8 @@ or refused one it does:
   * a sliding-window model's second, window-sized KV cache was budgeted as
     zero — ~400 MiB on a 27B-class SWA model;
   * an integrated GPU's share of system RAM was summed as video RAM;
-  * a model whose native window is under CTX_FLOOR could never enter the fit
-    loop at all, so it was planned onto the CPU at a context larger than it
+  * a model whose native window is under PLAN_CTX_FLOOR could never enter the
+    fit loop at all, so it was planned onto the CPU at a context larger than it
     was trained on.
 """
 import pytest
@@ -19,7 +19,7 @@ from rigma.bench import VRAM_DRIFT_TOLERANCE_MB, save_calibration
 from rigma.models import (CachePolicy, ComboFlags, CpuInfo, GgufFile, GpuInfo,
                           HardwareProfile, ModelSpec, RunPlan)
 from rigma.registry import Registry
-from rigma.resolve import (CACHE_BYTES, CTX_FLOOR, _budgets, fallback_plans,
+from rigma.resolve import (CACHE_BYTES, PLAN_CTX_FLOOR, _budgets, fallback_plans,
                            fit_gguf, kv_bytes_per_token, resolve)
 
 MIB = 2 ** 20
@@ -293,7 +293,7 @@ def _small_ctx_registry(native_ctx=2048, size_gb=1.0):
 
 def test_a_2k_model_is_not_exiled_to_the_cpu(home):
     """A Phi-2/TinyLlama-class model, or any gguf whose header omits
-    context_length: `while ctx >= CTX_FLOOR` never runs its body, so fit_gguf
+    context_length: `while ctx >= PLAN_CTX_FLOOR` never runs its body, so fit_gguf
     is never called and the plan falls through to the absolute floor — CPU,
     ngl=0 — on a card it fits in four times over."""
     reg = _small_ctx_registry()
@@ -304,7 +304,7 @@ def test_a_2k_model_is_not_exiled_to_the_cpu(home):
 
 
 def test_the_floor_plan_never_asks_for_more_context_than_the_model_has(home):
-    """When nothing fits, the floor plan hardcoded ctx=CTX_FLOOR — launching a
+    """When nothing fits, the floor plan hardcoded ctx=PLAN_CTX_FLOOR — launching a
     2048-token model with -c 8192, a window it was never trained on."""
     reg = _small_ctx_registry(native_ctx=2048, size_gb=64.0)
     tiny_card = _profile(vram=2048, ram_free=512)
@@ -313,16 +313,16 @@ def test_the_floor_plan_never_asks_for_more_context_than_the_model_has(home):
 
 
 def test_a_normal_model_still_bottoms_out_at_the_floor(home):
-    """The floor is per-model now; for anything trained past CTX_FLOOR it must
-    still be CTX_FLOOR."""
+    """The floor is per-model now; for anything trained past PLAN_CTX_FLOOR it must
+    still be PLAN_CTX_FLOOR."""
     reg = _small_ctx_registry(native_ctx=131072, size_gb=64.0)
     plan = resolve(_profile(vram=2048, ram_free=512), reg, use_case="general")
-    assert plan.flags.ctx == CTX_FLOOR
+    assert plan.flags.ctx == PLAN_CTX_FLOOR
 
 
 def test_fallback_plans_clamp_the_floor_too(home):
     """The launch-failed path builds its own floor plan, with the same
-    hardcoded CTX_FLOOR — a fallback that cannot start is not a fallback."""
+    hardcoded PLAN_CTX_FLOOR — a fallback that cannot start is not a fallback."""
     tiny = _small_ctx_registry(native_ctx=2048, size_gb=1.0).models["tiny"]
     big = ModelSpec(slug="big", family="llama", kind="dense", n_layers=48,
                     full_attn_layers=48, kv_heads=8, head_dim=128,
@@ -355,7 +355,7 @@ def test_the_models_page_never_offers_more_context_than_the_model_has(home):
 
 
 def test_a_normal_model_keeps_the_whole_ladder(home):
-    """Every shipped model is trained past CTX_FLOOR; nothing about the cap may
+    """Every shipped model is trained past PLAN_CTX_FLOOR; nothing about the cap may
     change what they report."""
     from rigma.resolve import quant_verdicts
     spec = _small_ctx_registry(native_ctx=131072).models["tiny"]

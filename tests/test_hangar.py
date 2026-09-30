@@ -1127,10 +1127,13 @@ def test_a_validation_message_drops_only_pydantics_prefix():
 
 def test_the_native_ctx_floor_is_a_named_constant():
     """N3: the literal 2048 that floors a probed window lived inline in
-    `spec_fields_from_probe`. Naming it stops THIS site drifting from the 2048
-    launch floor the routes and the dialog also hard-code (unifying those four
-    is a later wave). The value and the behaviour are unchanged."""
+    `spec_fields_from_probe`. It is now an ALIAS of `models.MIN_LAUNCH_CTX`,
+    the one constant the relaunch raise-to, the `/api/server/ctx` guard and the
+    `quant_verdicts` ladder all read, so this site cannot drift from them. The
+    value and the behaviour are unchanged."""
+    from rigma.models import MIN_LAUNCH_CTX
     assert hangar.MIN_NATIVE_CTX == 2048
+    assert hangar.MIN_NATIVE_CTX is MIN_LAUNCH_CTX
     f = {"n_layers": 2, "full_attn_layers": 2, "kv_heads": 2, "head_dim": 64,
          "native_ctx": 512}
     assert hangar.spec_fields_from_probe(f)["native_ctx"] == hangar.MIN_NATIVE_CTX

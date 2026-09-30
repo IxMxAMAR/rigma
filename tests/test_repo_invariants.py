@@ -116,3 +116,75 @@ def test_ci_runs_the_newest_python_the_metadata_admits():
         encoding="utf-8"))
     matrix = ci["jobs"]["test"]["strategy"]["matrix"]["py"]
     assert "3.13" in matrix, matrix
+
+
+# --- W5F5B-N3: the context floors are named, not repeated --------------------
+#
+# `2048` was a bare literal at four Python sites that all have to agree: the
+# relaunch raise-to, the `/api/server/ctx` preflight guard, the gguf probe's
+# floor for a header-less `context_length`, and the bottom rung of the
+# `quant_verdicts` ladder. The value now lives once, in `models.MIN_LAUNCH_CTX`.
+# These two checks are what stops the fifth copy reappearing.
+
+def _source_of(path, only_function=None):
+    """A module's source, or just one function's, for a grep-style check."""
+    import ast
+    text = path.read_text(encoding="utf-8")
+    if only_function is None:
+        return text
+    tree = ast.parse(text)
+    node = next(n for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == only_function)
+    return ast.get_source_segment(text, node)
+
+
+def _int_constants(path, only_function=None):
+    """Every int literal in a module — or in one function of it — as
+    (lineno, value). Comments and strings do not count; a literal does."""
+    import ast
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    if only_function is not None:
+        tree = next(n for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name == only_function)
+    return [(n.lineno, n.value) for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and type(n.value) is int]
+
+
+def test_the_launch_context_floor_is_read_not_repeated():
+    """The four Python sites must READ `models.MIN_LAUNCH_CTX`.
+
+    A second copy of the number is not a style question: the guard rejects what
+    the raise-to would otherwise have accepted and silently bumped, and the
+    Models page prices a window no launch produces. Both halves are checked —
+    the constant must be mentioned, and the literal must be gone — because
+    either one alone passes on code that has quietly gone back to two numbers.
+    """
+    src = ROOT / "src" / "rigma"
+    sites = [(src / "serve.py", None),
+             (src / "server_ops.py", None),
+             (src / "hangar.py", None),
+             (src / "resolve.py", "quant_verdicts")]
+    silent = [p.name for p, fn in sites
+              if "MIN_LAUNCH_CTX" not in _source_of(p, fn)]
+    repeated = [f"{p.name}:{n}" for p, fn in sites
+                for n, v in _int_constants(p, fn) if v == 2048]
+    assert not repeated, (
+        "these sites re-state the launch context floor as a literal instead of "
+        "reading models.MIN_LAUNCH_CTX:\n  " + "\n  ".join(repeated))
+    assert not silent, (
+        "these sites do not read models.MIN_LAUNCH_CTX:\n  "
+        + "\n  ".join(silent))
+
+
+def test_the_two_context_floors_are_named_apart():
+    """The launch floor (2048) and the planning floor (8192) are different
+    quantities, so they must not share a name — the UI spells its 2048
+    `CTX_FLOOR`, and this module used to spell the 8192 the same way."""
+    from rigma.models import MIN_LAUNCH_CTX
+    from rigma.resolve import PLAN_CTX_FLOOR
+    assert MIN_LAUNCH_CTX == 2048
+    assert PLAN_CTX_FLOOR == 8192
+    assert MIN_LAUNCH_CTX != PLAN_CTX_FLOOR
+    assert not hasattr(__import__("rigma.resolve", fromlist=["x"]), "CTX_FLOOR")

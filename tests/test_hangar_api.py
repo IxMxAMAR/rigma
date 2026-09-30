@@ -270,6 +270,40 @@ def test_ctx_endpoint_relaunches_at_requested_size(home, upstream,
     assert r.status_code == 502 and "tops out" in r.json()["error"]
 
 
+def test_the_ctx_guard_reads_the_one_launch_floor(home, upstream, monkeypatch):
+    """W5F5B-N3: the preflight guard and the relaunch raise-to are ONE number.
+
+    The route used to repeat the literal `2048`, so a change to the launch
+    floor would leave the guard rejecting at the old value — an API that
+    refuses exactly what a launch would have accepted and silently raised.
+    Move the one constant and the guard (and its message) must move with it;
+    before this change `serve` had no such name at all.
+    """
+    import os
+
+    from rigma import serve as serve_mod
+    from rigma import server_ops
+    from rigma import state as st
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), ctx=32768)
+    seen = []
+
+    def fake_switch(model, reg=None, prof=None, ctx=None, *a, **k):
+        seen.append(ctx)
+        return {"model": model, "ctx": ctx, "unloaded": False}
+    monkeypatch.setattr(server_ops, "perform_switch", fake_switch)
+    monkeypatch.setattr(serve_mod, "MIN_LAUNCH_CTX", 4096)
+    client = TestClient(build_app(upstream_port=upstream))
+
+    r = client.post("/api/server/ctx", json={"ctx": 4096})
+    assert r.status_code == 200, r.json()
+    assert seen == [4096], "the route did not pass the requested ctx through"
+    r = client.post("/api/server/ctx", json={"ctx": 4095})
+    assert r.status_code == 400, r.json()
+    assert "4096" in r.json()["error"]      # the message follows the constant
+    assert seen == [4096], "the engine was touched for a refused ctx"
+
+
 def test_prefill_not_doubled_when_engine_echoes(home, tmp_path, monkeypatch):
     """User-reported 2026-07-18: prefill appeared twice. llama-server echoes
     the assistant prefix, so we must not also stream/prepend it."""

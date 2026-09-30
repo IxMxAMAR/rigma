@@ -6,8 +6,8 @@ import re
 from pydantic import ValidationError
 
 from .models import (CACHE_BYTES, ENGINE_DEFAULT_UBATCH, LAUNCH_PARALLEL,
-                     CachePolicy, ComboFlags, GgufFile, HardwareProfile,
-                     ModelSpec, RunPlan)
+                     MIN_LAUNCH_CTX, CachePolicy, ComboFlags, GgufFile,
+                     HardwareProfile, ModelSpec, RunPlan)
 from .registry import Registry
 
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
@@ -108,7 +108,13 @@ def launch_ngl(spec: ModelSpec) -> int:
 # cache type live next to it. Re-exported here because this module is where the
 # cache arithmetic lives and callers import it from `rigma.resolve`.
 CTX_DEFAULT = {"coding": 32768}
-CTX_FLOOR = 8192
+# The PLANNING floor: the smallest context the planner will plan for a model
+# whose own window is at least this big. It is NOT `models.MIN_LAUNCH_CTX`
+# (2048), which is the smallest context a LAUNCH will ask the engine for — the
+# two are different quantities, so they are named apart (this was `CTX_FLOOR`,
+# which the UI also spells `CTX_FLOOR` for the 2048 launch floor; W5F5B-N3).
+# `_ctx_floor` clamps it down to the model's own window when that is smaller.
+PLAN_CTX_FLOOR = 8192
 
 
 class ResolveError(RuntimeError):
@@ -288,17 +294,18 @@ def _apply_calibration(plan: RunPlan,
 def _ctx_floor(spec: ModelSpec) -> int:
     """The smallest context worth trying for THIS model.
 
-    CTX_FLOOR was a global 8192, so a model trained on 4096 (a Llama-2
+    PLAN_CTX_FLOOR was a global 8192, so a model trained on 4096 (a Llama-2
     derivative) or 2048 (Phi-2, TinyLlama, or any gguf whose header omits
     context_length) never entered the fit loop at all: `_calculate` starts at
-    min(CTX_DEFAULT, native_ctx) and the `while ctx >= CTX_FLOOR` body never
+    min(CTX_DEFAULT, native_ctx) and the `while ctx >= PLAN_CTX_FLOOR` body never
     ran, so fit_gguf was never called and the plan fell through to the absolute
     floor — CPU, ngl=0 — on a card the model fits in four times over, while
     quant_verdicts (which probes 8192/4096/2048) told the Models page the same
     model runs on the GPU. A model cannot be asked for more context than it
     has, so its own window is the floor.
     """
-    return min(CTX_FLOOR, spec.native_ctx) if spec.native_ctx > 0 else CTX_FLOOR
+    return (min(PLAN_CTX_FLOOR, spec.native_ctx) if spec.native_ctx > 0
+            else PLAN_CTX_FLOOR)
 
 
 # AUDIT F06-5
@@ -1107,9 +1114,11 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
     # the model's own window. It used to report a 2048-token model as fitting
     # "at 8192", a window it was never trained on, while the resolver refused
     # the same model outright: the two screens disagreed about one model
-    # because only one of them had a floor.
-    ladder = ([c for c in (8192, 4096, 2048) if c <= spec.native_ctx]
-              or [spec.native_ctx or 2048])
+    # because only one of them had a floor. The bottom rung IS the launch floor
+    # (`models.MIN_LAUNCH_CTX`), so the page cannot price a context below the
+    # one a launch would ask the engine for (W5F5B-N3).
+    ladder = ([c for c in (8192, 4096, MIN_LAUNCH_CTX) if c <= spec.native_ctx]
+              or [spec.native_ctx or MIN_LAUNCH_CTX])
     for g in spec.ggufs:
         flags = None
         for ctx in ladder:
