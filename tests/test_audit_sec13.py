@@ -133,6 +133,57 @@ def test_move_files_to_an_absolute_destination_is_still_a_write(home):
     assert (allowed / "b.txt").is_file()
 
 
+def test_move_files_gates_the_source_parent_as_a_write(home):
+    """ODR-3: a move REMOVES its source, so the source's directory is a write.
+
+    Only `allow_absolute_reads` gated it, so a read-only session could delete
+    `Documents\\thesis.docx` by moving it. The parent now passes the same
+    workspace/grant/allowlist check as a destination; `copy_files` (which only
+    reads the source) is unchanged.
+    """
+    ws = home / "ws"
+    ws.mkdir()
+    docs = home / "Documents"
+    docs.mkdir()
+    (docs / "thesis.docx").write_text("x", encoding="utf-8")
+    base = {"workspace": str(ws), "allow_code": True,
+            "allow_absolute_reads": True}
+
+    # the read grant is NOT a write grant — the move is refused and the
+    # original stays exactly where it was
+    out = tools.run_tool("move_files",
+                         {"paths": [str(docs / "thesis.docx")],
+                          "dest": "sorted"}, base)
+    assert out.startswith("error"), out
+    assert "outside the workspace" in out and str(docs) in out
+    assert (docs / "thesis.docx").is_file()
+    assert not (ws / "sorted").exists()
+
+    # copy_files only READS the source, so the same call still works
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(docs / "thesis.docx")],
+                          "dest": "sorted"}, base)
+    assert out.startswith("copied 1"), out
+    assert (docs / "thesis.docx").is_file()
+
+    # a source parent INSIDE the workspace needs no grant at all
+    (ws / "inside.txt").write_text("y", encoding="utf-8")
+    out = tools.run_tool("move_files",
+                         {"paths": [str(ws / "inside.txt")], "dest": "sorted"},
+                         base)
+    assert out.startswith("moved 1 file(s)"), out
+    assert (ws / "sorted" / "inside.txt").is_file()
+
+    # and a WRITE-ALLOWLISTED source parent is the second route, exactly as it
+    # is for a destination — no blanket write grant needed
+    out = tools.run_tool("move_files",
+                         {"paths": [str(docs / "thesis.docx")],
+                          "dest": "sorted"},
+                         {**base, "write_allowlist": [str(docs)]})
+    assert out.startswith("moved 1 file(s)"), out
+    assert not (docs / "thesis.docx").exists()
+
+
 def test_a_destination_outside_every_allowlisted_root_is_refused(home):
     """OD-2: the allowlist is a boundary, not a second blanket grant — a
     destination that is in NO root still gets the existing refusal and creates
