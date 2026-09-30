@@ -233,7 +233,12 @@ def test_a_stream_failure_does_not_leak_the_child(fake_cli, monkeypatch):
 
     def spy(*a, **k):
         p = real_popen(*a, **k)
-        proc_seen["p"] = p
+        if p.stdout is not None:
+            # the TURN's child, not one of the setup commands (`provider list`
+            # is run through subprocess.run, which has no pipe). Hold the pipe
+            # ITSELF: Popen drops the attribute once the child is reaped, and
+            # the leak this checks for is the FD, not the attribute.
+            proc_seen["p"], proc_seen["out"] = p, p.stdout
         return p
 
     monkeypatch.setattr(harness_mcode.subprocess, "Popen", spy)
@@ -242,7 +247,7 @@ def test_a_stream_failure_does_not_leak_the_child(fake_cli, monkeypatch):
     assert [e.kind for e in got] == ["error"], got
     p = proc_seen["p"]
     assert p.poll() is not None, "the mcode child outlived the failed turn"
-    assert p.stdout.closed, "the stdout pipe was left open"
+    assert proc_seen["out"].closed, "the stdout pipe was left open"
 
 
 def test_the_memo_is_per_turn_not_per_process():
