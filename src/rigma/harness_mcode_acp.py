@@ -60,15 +60,22 @@ PROTOCOL_VERSION = 1
 # this sentence was written — it described an intention, not a fact. It exists now, and it
 # fails when a table and the code that uses it disagree.)
 #
-# `session/load` and `session/resume` take
-# `{sessionId}` and answer `{sessionId}`, measured from the handlers:
+# `session/resume` takes `{sessionId}` and answers `{sessionId}`, measured from the
+# handler:
 #   onRequest(ee.agent.session.resume, async z => s(z.params.sessionId, ...))
+#
+# `session/load` — the alternate wire spelling, registered to a near-identical
+# handler — and `session/list` are NOT in this table. Neither has a caller in
+# `src/`, `tests/` or the frontend: B5 deleted the two `AcpClient` wrappers that
+# sent them, and what was removed is preserved in OD-9 and in git history. They
+# used to sit here as a record of the measured surface, but this table's own
+# sentence says it lists the standard methods Rigma USES, so keeping them made it
+# a false record — and the guard below could not say so, because its fallback
+# accepted any literal that appeared anywhere in the file, including the table.
 #   onRequest(ee.agent.session.load,   async z => s(z.params.sessionId, ...))
 STANDARD_METHODS = (
     "session/new",
-    "session/load",
     "session/resume",
-    "session/list",
     "session/set_mode",
     "session/set_config_option",
     "session/prompt",
