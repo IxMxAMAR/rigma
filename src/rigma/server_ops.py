@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import platform
+import time
 
 import psutil
 
@@ -468,7 +469,60 @@ def planned_vram_mb(state: dict, registry=None) -> float | None:
     quant, no ctx, an unknown model/quant, or an invalid cache type. A bare file
     size would read as a divergence that is only the KV cache (GUIDANCE 5), so
     "cannot compute" must stay None and let the axis say `not_comparable`.
+
+    DR2-2: ONE registry, and no re-parse per poll. The spec is resolved once from
+    the registry the caller handed (or one `Registry.load()` when it handed
+    none) and passed into `memtruth.planned_mb`, so the weight term and the KV
+    term can no longer come from two different registries — and no hidden second
+    load happens inside `planned_mb`. The whole prediction is then memoised for a
+    short TTL (below), because `/api/server` polls every 5 s from every open tab
+    and the live server is built with `registry=None`, so without the memo each
+    poll paid a full registry parse.
     """
+    state = state if isinstance(state, dict) else {}
+    key = _plan_cache_key(state, registry)
+    now = time.monotonic()
+    if (_plan_cache["key"] == key
+            and now - _plan_cache["at"] < _PLAN_CACHE_TTL):
+        return _plan_cache["mb"]
+    mb = _planned_vram_mb(state, registry)
+    # Hold the registry reference too: `id()` is only unique among LIVE objects,
+    # and a cached id whose object was collected could otherwise be reused.
+    _plan_cache.update(key=key, at=now, mb=mb, registry=registry)
+    return mb
+
+
+# DR2-2: the prediction for a RUNNING plan is a pure function of the running
+# model's spec, its ctx and its cache types — none of which moves while the
+# engine is up — so it is memoised rather than rebuilt on every poll. Measured
+# on this machine before the fix: `Registry.load()` 6.3 ms and
+# `planned_vram_mb(state)` (two loads, one hidden inside `planned_mb`) 12.8 ms.
+# After the fix a cache miss is one load and a hit is ~0.05 ms. Keyed on the
+# RIGMA_HOME as well, so two apps in one process (tests) cannot read each
+# other's registry; the caller's registry object is held, so its id cannot be
+# recycled. A registry that changes on disk is picked up within the TTL.
+_PLAN_CACHE_TTL = 20.0
+_plan_cache: dict = {"key": None, "at": 0.0, "mb": None, "registry": None}
+
+
+def _plan_cache_key(state: dict, registry) -> tuple:
+    """A total cache key: never raises, so a hand-edited state cannot 500 the poll."""
+    try:
+        from .runtime import rigma_home
+        home = str(rigma_home())
+    except Exception:
+        home = ""
+    try:
+        ctx = int(state.get("ctx") or 0)
+    except (TypeError, ValueError):
+        ctx = str(state.get("ctx"))
+    return (home, None if registry is None else id(registry),
+            str(state.get("model") or ""), str(state.get("quant") or ""), ctx,
+            str(state.get("kv_cache") or ""), str(state.get("backend") or ""))
+
+
+def _planned_vram_mb(state: dict, registry) -> float | None:
+    """The uncached body of `planned_vram_mb` (see it for the contract)."""
     from . import memtruth
     from .models import ComboFlags, RunPlan
     from .registry import Registry
@@ -491,7 +545,9 @@ def planned_vram_mb(state: dict, registry=None) -> float | None:
                        flags=ComboFlags(ctx=ctx, cache_type_k=k,
                                         cache_type_v=k),
                        origin="state")
-        return float(memtruth.planned_mb(plan))
+        # DR2-2: pass the spec resolved from THIS registry, so the KV geometry
+        # cannot come from a different (process-global) one.
+        return float(memtruth.planned_mb(plan, spec))
     except Exception:
         # A state written by a hand edit, or a registry that predates the model,
         # is "no prediction", never an error on a read route.

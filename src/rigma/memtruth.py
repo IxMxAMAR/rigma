@@ -412,7 +412,7 @@ def free_memory_disagreement(oracle_free_mb: int | None,
             f"is usable here")
 
 
-def planned_mb(plan) -> float:
+def planned_mb(plan, spec=None) -> float:
     """What Rigma's own arithmetic says the plan will hold, in MiB.
 
     Deliberately the SAME two terms the resolver budgets — the quantised weights
@@ -427,10 +427,19 @@ def planned_mb(plan) -> float:
     `spec` field, and an earlier version of this function read `plan.spec` behind
     a `hasattr`, so it returned 0.0 for every real plan and compared nothing.
     A silent zero here would make every plan look catastrophically under-budgeted.
+
+    DR2-2: a caller that has ALREADY resolved the spec from a registry (in
+    particular a registry it was handed, not the process global) must pass it as
+    `spec`. The weight term follows `plan.gguf.bytes` — the caller's registry —
+    so a fresh `Registry.load()` here for the KV term made the prediction a
+    chimera of two registries whenever they disagreed, and paid a full registry
+    parse per call. `spec=None` keeps the old behaviour for callers that have no
+    registry to hand.
     """
     from .resolve import kv_bytes_per_token, swa_kv_bytes
-    from .registry import Registry
-    spec = Registry.load().models.get(getattr(plan, "model_slug", ""))
+    if spec is None:
+        from .registry import Registry
+        spec = Registry.load().models.get(getattr(plan, "model_slug", ""))
     if spec is None:
         raise ValueError(
             f"no registry spec for {getattr(plan, 'model_slug', '')!r}, so "
