@@ -677,6 +677,27 @@ def _engine_version(backend: str = "") -> str:
 _QUALITY_ENV_LEVERS = ("LLAMA_ATTN_ROT_DISABLE",)
 
 
+def _quality_env_levers_in(env: dict | None) -> list[str]:
+    """The `_QUALITY_ENV_LEVERS` names that `env` sets, matched case-INSENSITIVELY.
+
+    llama.cpp reads each lever with the C library's `getenv`
+    (`ggml-org/llama.cpp@b9867 src/llama-kv-cache.cpp`:
+    `getenv("LLAMA_ATTN_ROT_DISABLE")`), and on Windows that lookup ignores
+    case — Microsoft's own reference: "getenv isn't case sensitive in the
+    Windows operating system"
+    (learn.microsoft.com/en-us/cpp/c-runtime-library/reference/getenv-wgetenv).
+    So a lowercase `llama_attn_rot_disable` really does disable the rotation
+    there and must be gated. On POSIX `getenv` IS case-sensitive, so this
+    over-matches there — the safe direction (a dropped trial, never a crowned
+    or persisted lever).
+
+    Returns the canonical names (not the caller's spelling) so a message names
+    the lever, not a hand-edited alias of it.
+    """
+    present = {str(k).upper() for k in (env or {})}
+    return [name for name in _QUALITY_ENV_LEVERS if name.upper() in present]
+
+
 def _carries_quality_env_lever(flags: dict | None) -> bool:
     """Whether a trial's override flips an engine default that protects QUALITY.
 
@@ -687,9 +708,26 @@ def _carries_quality_env_lever(flags: dict | None) -> bool:
     on tokens/sec alone would write it to calibration.json, and
     `runtime.launch_server` would merge it into every later launch's child
     environment — a silent quality regression traded for a speed win.
+
+    The name match is case-insensitive (`_quality_env_levers_in`) because the
+    engine's own lookup is on Windows.
     """
-    env = (flags or {}).get("env") or {}
-    return any(name in env for name in _QUALITY_ENV_LEVERS)
+    return bool(_quality_env_levers_in((flags or {}).get("env")))
+
+
+def _effective_env(plan_flags, override: dict) -> dict:
+    """The child environment a trial ACTUALLY runs with.
+
+    `run_sweep` builds each trial as `plan.flags.model_copy(update=override)`,
+    so an override that names `env` REPLACES the plan's whole env dict rather
+    than merging into it; `runtime.launch_server` then merges the result over
+    `os.environ`. The trial gate must ask about THIS dict, not the override
+    alone: a lever already on `plan.flags.env` — e.g. one merged from a
+    `calibration.json` entry by `resolve._apply_calibration` — is invisible to a
+    check of the override, so on a tools-capable model the sweep would launch
+    every trial with rotation off while believing it had dropped the axis.
+    """
+    return getattr(plan_flags.model_copy(update=override), "env", None) or {}
 
 
 def crowned_row(rows: list[dict],
@@ -857,11 +895,15 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     # registry's DeltaNet q8_0 cache policy.) C11's rotation env toggle is the
     # same class of hazard through the child environment, so it is dropped here
     # too; on a non-tools model `crowned_row` still refuses to crown it.
+    # C11-nits: ask about the EFFECTIVE env (`_effective_env`), not the override
+    # alone — the plan may already carry the lever (a merged calibration row),
+    # in which case every env-less override would inherit it.
     if _tools_capable(plan.model_slug):
         configs = [(label, o) for label, o in configs
                    if o.get("cache_type_k") != "q4_0"
                    and o.get("cache_type_v") != "q4_0"
-                   and not _carries_quality_env_lever(o)]
+                   and not _carries_quality_env_lever(
+                       {"env": _effective_env(plan.flags, o)})]
     rows: list[dict] = []
     for label, override in configs:
         flags = plan.flags.model_copy(update=override)
