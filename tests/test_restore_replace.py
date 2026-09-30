@@ -131,6 +131,46 @@ def test_a_failure_in_the_delete_step_leaves_the_store_exactly_as_it_was(
         "keepme", "mine", "other"]
 
 
+def test_a_memory_failure_after_the_deletes_restores_the_deleted_methods(
+        client, home, monkeypatch):
+    """Rule 13's state: the deletes SUCCEED and then the memory stage fails.
+
+    The delete-step test above never gets past its second delete. Here the
+    methods are really gone before memory fails, so the rollback has to put them
+    back — otherwise a failed restore would have destroyed the owner's methods
+    on its way to failing.
+    """
+    store = _seed(home, method_ids=("mine", "keepme"), minutes=12)
+    doc = {"rigma_backup": 1, "settings": {},
+           "methods": [_doc("aaa")],
+           "memory": [{"id": "mem-1", "kind": "technique",
+                       "text": "Prefer q8_0."}]}
+    before = _snapshot(home, store)
+
+    real = methods.delete_user
+    deleted: list[str] = []
+
+    def record(mid):
+        deleted.append(mid)
+        return real(mid)
+
+    def boom(self, rows):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(methods, "delete_user", record)
+    monkeypatch.setattr(MemoryStore, "restore", boom)
+    r = client.post("/api/restore", json=doc)
+    assert r.status_code == 500, r.text
+    assert "memory" in r.json()["error"], r.text
+    # the deletes really ran before memory failed...
+    assert sorted(deleted) == ["keepme", "mine"], deleted
+
+    # ...and were undone, byte for byte, with everything else
+    assert _snapshot(home, store) == before
+    assert sorted(m["id"] for m in methods.user_methods()) == [
+        "keepme", "mine"]
+
+
 def test_the_happy_path_still_restores_memory(client, home):
     """The replace must not break the section that already worked.
 
