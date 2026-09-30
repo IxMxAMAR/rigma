@@ -464,8 +464,127 @@ def _rag_source_folders(base: Path) -> list[str]:
     return out
 
 
+def _resolved_dirs(raw: list) -> list[Path]:
+    """Resolve each candidate floor location, dropping the unparseable ones.
+
+    Resolved ONCE per seed build, not per stored workspace: `resolve()` is a
+    syscall and the floor is recomputed on every new chat.
+    """
+    out: list[Path] = []
+    for entry in raw:
+        try:
+            out.append(Path(entry).resolve())
+        except (OSError, ValueError, TypeError):
+            continue
+    return out
+
+
+def _appdata_bases() -> list[Path]:
+    """The roaming-profile roots to floor, from the environment.
+
+    ODR-2b: `%APPDATA%` can be UNSET (a service or a stripped environment). The
+    Windows fallback is `home/AppData/Roaming`, and the home floor does NOT
+    cover it — it neither equals nor contains the home dir — so the fallback
+    must be added explicitly. Off Windows there is no roaming profile and this
+    is harmless.
+    """
+    raw = os.environ.get("APPDATA")
+    if raw:
+        return [Path(raw)]
+    try:
+        return [Path.home() / "AppData" / "Roaming"]
+    except (OSError, RuntimeError):
+        return []
+
+
+def _seed_broad_floors() -> list[Path]:
+    """Locations a seeded write root may not equal or CONTAIN.
+
+    A root at or above one of these is not a working folder — it is the whole
+    user profile, the whole roaming profile, or (through `p.parent == p`) the
+    machine. A NARROW folder INSIDE them stays eligible on purpose: that is
+    the normal workspace this seed exists to preserve.
+    """
+    raw: list[Path] = []
+    try:
+        raw.append(Path.home())
+    except (OSError, RuntimeError):
+        pass
+    raw.extend(_appdata_bases())
+    return _resolved_dirs(raw)
+
+
+def _seed_persistence_floors() -> list[Path]:
+    """The known persistence/profile locations, derived from the environment.
+
+    ODR-2: a stored workspace that IS `...\\Startup` (or lives inside it) is a
+    persistence root, not a folder the owner works in, so it must never become
+    a seeded write root. These are the same shapes the OD-2 write denylist
+    names — Startup (per-user and all-user), the Start Menu trees, the
+    PowerShell profile dirs and `System32\\Tasks`. An unset variable simply
+    contributes nothing, so this is a no-op off Windows; the per-user family
+    still derives from the `%APPDATA%` FALLBACK when that variable is unset.
+    """
+    out: list[Path] = []
+
+    def add(base, *parts):
+        if not base:
+            return
+        try:
+            out.append(Path(base).joinpath(*parts))
+        except (TypeError, ValueError):
+            pass
+
+    for roaming in _appdata_bases():
+        add(roaming, "Microsoft", "Windows", "Start Menu")
+        add(roaming, "Microsoft", "Windows", "Start Menu", "Programs",
+            "Startup")
+        add(roaming, "Microsoft", "Windows", "PowerShell")
+    add(os.environ.get("PROGRAMDATA"), "Microsoft", "Windows", "Start Menu")
+    add(os.environ.get("PROGRAMDATA"), "Microsoft", "Windows", "Start Menu",
+        "Programs", "Startup")
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+    add(windir, "System32", "Tasks")
+    add(windir, "System32")
+    try:
+        home = Path.home()
+    except (OSError, RuntimeError):
+        home = None
+    if home is not None:
+        add(home, "Documents", "WindowsPowerShell")
+        add(home, ".config", "powershell")
+    return _resolved_dirs(out)
+
+
+def _seed_floor_reason(p: Path, broad: list[Path],
+                       persistence: list[Path]) -> str:
+    """Why `p` may NOT be a seeded write root, or "" when it may.
+
+    ODR-2. `p` is already absolute and resolved. A filesystem root contains
+    everything; a broad floor is refused when `p` equals it OR contains it (an
+    ancestor of the home dir is as wide as the home dir); a persistence floor
+    is refused when `p` equals it, contains it, OR sits inside it. A narrow
+    folder inside the home dir is none of those and passes.
+    """
+    if p.parent == p:
+        return "it is a filesystem root"
+    for base in broad:
+        try:
+            if p == base or base.is_relative_to(p):
+                return "it is (or contains) your home or roaming folder"
+        except (OSError, ValueError):
+            continue
+    for loc in persistence:
+        try:
+            if p == loc or p.is_relative_to(loc) or loc.is_relative_to(p):
+                return "it is (or contains) a persistence location"
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
 def default_write_allowlist(home=None) -> list[str]:
-    """OD-2: the absolute write roots a NEW session starts with.
+    r"""OD-2: the absolute write roots a NEW session starts with.
 
     The owner's EXISTING working folders, used as metadata only: the
     `workspace` of every session already in the store, plus the folders
@@ -478,18 +597,48 @@ def default_write_allowlist(home=None) -> list[str]:
     regression rather than a confinement. An EMPTY store and no RAG sources
     therefore returns `[]` — exactly today's behaviour.
 
+    ODR-2: the seed is FLOORED. A single old chat whose `workspace` was the
+    home dir, a drive root, an ancestor of `%APPDATA%` or a persistence folder
+    would otherwise hand every new chat that root, and the UI never shows the
+    list — the owner could neither see nor remove it. The floor keeps "the
+    folders the owner works in" from becoming "the whole machine"; a narrow
+    folder (including one inside the home dir) is seeded exactly as before.
+
+    ODR-2b: `resolve()` does NOT normalize an extended-length (`\\?\`), device
+    (`\\.\`) or UNC (`\\host\share`) path, so an alias of the home dir would
+    never match the floor's lexical comparison and would be seeded — and
+    `_write_path` would then admit an absolute destination under it. A local
+    working folder is never written in one of those forms, so the whole family
+    is ignored BEFORE `resolve()`.
+
     Entries are resolved and deduped (case-insensitively on Windows); a
     non-absolute or unparseable entry is ignored, never raised.
     """
     base = Path(home).expanduser() if home is not None else rigma_home()
+    broad = _seed_broad_floors()
+    persistence = _seed_persistence_floors()
     roots: list[str] = []
     seen: set[str] = set()
     for raw in _store_workspaces(base) + _rag_source_folders(base):
+        text = str(raw).strip()
+        # ODR-2b: `\\?\`, `\\.\` and `\\host\share` (either separator) are
+        # aliases `resolve()` leaves untouched, so the floor cannot see them.
+        if text.startswith(("\\\\", "//")):
+            continue
         try:
-            p = Path(str(raw)).resolve()
+            cand = Path(text)
+        except (OSError, ValueError, TypeError):
+            continue
+        # ODR-2: test `is_absolute` on the RAW entry, BEFORE `resolve()`.
+        # Resolving first made this check dead: a stored `workspace` of "."
+        # or "C:" became the SERVER's current directory and was seeded.
+        if not cand.is_absolute():
+            continue
+        try:
+            p = cand.resolve()
         except (OSError, ValueError):
             continue
-        if not p.is_absolute():
+        if _seed_floor_reason(p, broad, persistence):
             continue
         key = os.path.normcase(str(p))
         if key in seen:
