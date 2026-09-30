@@ -13,6 +13,21 @@ def _fake_probe(gpu_table, raw_gpus=None):
     return probe_hardware(gpu_table, raw_gpus=RAW)
 
 
+def _free_port() -> int:
+    """An ephemeral loopback port the OS just told us was free.
+
+    REC-1: these tests used the literals 11596/11593. 11596 was a real bind, so
+    two concurrent runs collided there (OSError). Binding 0 keeps the assertion
+    (the port is in use / the port is clear) with no shared resource.
+    """
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
 def test_version_flag():
     import rigma
     res = runner.invoke(cli.app, ["--version"])
@@ -31,11 +46,12 @@ def test_up_fails_fast_when_port_taken(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "launch_server",
                         lambda *a, **k: called.append(1))
     blocker = socket.socket()
-    blocker.bind(("127.0.0.1", 11596))
+    blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
+    port = int(blocker.getsockname()[1])
     try:
         res = runner.invoke(cli.app, ["up", "--use-case", "coding",
-                                      "--yes", "--port", "11596"])
+                                      "--yes", "--port", str(port)])
     finally:
         blocker.close()
     assert res.exit_code == 1
@@ -57,7 +73,8 @@ def test_up_no_model_starts_ui_only(tmp_path, monkeypatch):
     seen = {}
     monkeypatch.setattr(serve, "run_ui",
                         lambda port, eport: seen.update(state=st.read_state()))
-    res = runner.invoke(cli.app, ["up", "--port", "11593", "--no-browser"])
+    res = runner.invoke(cli.app, ["up", "--port", str(_free_port()),
+                                  "--no-browser"])
     assert res.exit_code == 0
     assert did == []                                  # nothing loaded
     assert seen["state"]["model"] == ""               # UI-only, no model

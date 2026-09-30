@@ -1,5 +1,7 @@
 import json
+import socket
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -9,10 +11,29 @@ from rigma import rag
 FAKE = Path(__file__).parent / "fake_raggity_server.py"
 
 
+def _free_port() -> int:
+    """An ephemeral loopback port the OS just told us was free.
+
+    REC-1: the sidecar tests used the literal 11597 through the REAL
+    `ensure_sidecar`, so two concurrent runs shared it and `_is_raggity_health`
+    would accept the other run's fake as this run's sidecar. The port is now
+    per-run, and the fake echoes a per-run RIGMA_FAKE_TOKEN that the lifecycle
+    test asserts, so a foreign raggity cannot be mistaken for ours either.
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+SIDECAR_PORT = _free_port()
+_TOKEN = uuid.uuid4().hex
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setenv("RIGMA_RAGGITY_CMD", f"{sys.executable} {FAKE}")
+    monkeypatch.setenv("RIGMA_FAKE_TOKEN", _TOKEN)
     return tmp_path
 
 
@@ -41,18 +62,21 @@ def test_raggity_cmd_none_when_absent(home, monkeypatch):
 
 def test_sidecar_lifecycle_and_endpoints(home):
     rag.add_source("docs")
-    health = rag.ensure_sidecar(port=11597, timeout=30)
+    health = rag.ensure_sidecar(port=SIDECAR_PORT, timeout=30)
     try:
         assert health["status"] == "ok" and health["documents"] == 42
+        assert health.get("token") == _TOKEN, (
+            "the /healthz 200 came from a foreign process, not the sidecar we "
+            "launched (REC-1)")
         # idempotent: second call reuses the live server
-        assert rag.ensure_sidecar(port=11597)["version"] == "0.12.0"
-        r = rag.retrieve("q", port=11597)
+        assert rag.ensure_sidecar(port=SIDECAR_PORT)["version"] == "0.12.0"
+        r = rag.retrieve("q", port=SIDECAR_PORT)
         assert r["chunks"][0]["text"] == "alpha"
-        a = rag.ask("what is alpha?", port=11597)
+        a = rag.ask("what is alpha?", port=SIDECAR_PORT)
         assert a["answer"].startswith("grounded:")
     finally:
         assert rag.stop_sidecar() is True
-    assert rag.sidecar_health(port=11597) is None
+    assert rag.sidecar_health(port=SIDECAR_PORT) is None
 
 
 # --- F52: the record must mean "answering", not "we once ran Popen" ----------
@@ -63,16 +87,16 @@ def test_sidecar_lifecycle_and_endpoints(home):
 # `search_my_documents` advertised to the model on every turn — while
 # /api/rag/status, which asks the port, correctly said it was down.
 
-DEAD_PORT = 11596          # nothing listens here in these tests
+DEAD_PORT = _free_port()   # nothing listens here in these tests
 
 
 def test_the_sidecar_is_recorded_only_once_it_answers(home):
     rag.add_source("docs")
     try:
-        rag.ensure_sidecar(port=11597, timeout=30)
+        rag.ensure_sidecar(port=SIDECAR_PORT, timeout=30)
         assert (rag.rag_dir() / "sidecar.json").is_file(), (
             "a healthy sidecar must be recorded, or nothing can reuse it")
-        assert rag.live_sidecar_port() == 11597
+        assert rag.live_sidecar_port() == SIDECAR_PORT
     finally:
         rag.stop_sidecar()
 

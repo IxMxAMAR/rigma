@@ -2,6 +2,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -25,19 +26,67 @@ from rigma.models import ComboFlags, GgufFile, RunPlan
 def _free_port() -> int:
     """An ephemeral loopback port the OS just told us was free.
 
-    REC-1: this fixture used to hard-code 11598, and it is the ONLY server in
-    the suite that binds a literal port — every other one passes 0 and lets the
-    kernel choose. So two concurrent `pytest tests` runs collided here: the
-    second run's child died on `address already in use`, the parent's /health
-    poll was then answered by the FIRST run's server (so the fixture reported
-    "ready" and the tests silently measured another process), and when the
-    first run tore its server down the second blocked on an established socket
-    to a server that had gone away — the frozen-suite / leaked-children failure
-    recorded as REC-1. Binding an ephemeral port removes the shared resource.
+    REC-1: this fixture used to hard-code 11598. It was not the only literal
+    port in the suite — 11594/11595/11596 were blocker sockets and 11597/11599
+    were the rag and runtime fakes — but it was the one whose readiness poll
+    could silently adopt another run's server. Two concurrent `pytest tests`
+    runs therefore collided here: the second run's child lost the bind race (on
+    Windows it can also bind alongside the first, because http.server's
+    HTTPServer sets SO_REUSEADDR, and dies only against an exclusive binder),
+    and the parent's /health poll could be answered by the FIRST run's server —
+    so the fixture reported "ready" and the tests silently measured another
+    process, while teardown blocked on a socket to a server that had gone away.
+    That is the frozen-suite / leaked-children failure recorded as REC-1.
+    Binding an ephemeral port removes the shared resource.
     """
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+# The fake server echoes this header on /health with the token it was started
+# with, so a bare 200 is never accepted as "ours" (REC-1 verification, r2).
+_TOKEN_HEADER = "X-Rigma-Fake-Token"
+
+
+def _probe_own_server(proc, port: int, token: str) -> str:
+    """Did OUR child answer /health on `port`?
+
+    REC-1: a 200 alone is not proof of readiness. The child does not die
+    immediately when it loses the bind race (0.6 s in the verifier's probe, up
+    to ~3 s against a bare listener here), so `proc.poll()` is still None on the
+    first probe and a foreign listener on the port would otherwise be mistaken
+    for ours — the independent verifier forced exactly that and the fixed
+    fixture yielded the impostor after 0.67 s. The fake server now answers
+    /health with the per-child token we passed it, and only a 200 carrying that
+    token from a live child counts.
+
+    Returns "ready", or the reason to give the port up:
+      "dead"    — our child is gone;
+      "foreign" — something answered, but it is not our child;
+      "waiting" — nothing is bound yet, our child may still be starting.
+    """
+    if proc.poll() is not None:
+        return "dead"
+    try:
+        resp = httpx.get(f"http://127.0.0.1:{port}/health", timeout=1)
+    except httpx.ConnectError:
+        return "waiting"  # nothing is bound yet
+    except httpx.TimeoutException:
+        # On this host a closed loopback port also times out (the SYN is
+        # dropped), so a timeout cannot be read as "somebody else is there" —
+        # keep waiting; the dead-child check above/below ends the attempt if the
+        # port was taken by someone else and our child could not bind it.
+        return "waiting"
+    except Exception:
+        return "waiting"
+    if resp.status_code != 200:
+        return "foreign"
+    if resp.headers.get(_TOKEN_HEADER) != token:
+        return "foreign"
+    if proc.poll() is not None:
+        return "dead"  # it answered, then died before we could use it
+    return "ready"
 
 
 @pytest.fixture
@@ -45,22 +94,22 @@ def oai_server():
     fake = Path(__file__).parent / "fake_oai_server.py"
     # Retry on a fresh port: the child can still lose the race to another
     # process between our probe and its bind. What must NOT happen is falling
-    # through to someone else's server, so a dead child is treated as "try
-    # again", never as "ready".
+    # through to someone else's server, so readiness requires a live child AND
+    # our own token; anything else on the port is abandoned for a new port.
     for _attempt in range(5):
         port = _free_port()
-        proc = subprocess.Popen([sys.executable, str(fake), "--port", str(port)])
+        token = uuid.uuid4().hex
+        proc = subprocess.Popen([sys.executable, str(fake), "--port", str(port),
+                                 "--token", token])
         ready = False
         for _ in range(50):
-            if proc.poll() is not None:
-                break  # the child could not bind — pick another port
-            try:
-                if httpx.get(f"http://127.0.0.1:{port}/health",
-                             timeout=1).status_code == 200:
-                    ready = True
-                    break
-            except Exception:
-                time.sleep(0.1)
+            verdict = _probe_own_server(proc, port, token)
+            if verdict == "ready":
+                ready = True
+                break
+            if verdict in ("dead", "foreign"):
+                break  # not our port — pick another one
+            time.sleep(0.1)
         if ready:
             try:
                 yield port
@@ -70,12 +119,14 @@ def oai_server():
                     proc.wait(timeout=5)
                 except Exception:
                     proc.kill()
+                    proc.wait(timeout=5)  # reap: kill() alone collects nothing
             return
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+            proc.wait(timeout=5)  # reap: kill() alone collects nothing
     # the loop used to fall through silently, so a server that never came
     # up surfaced as a confusing connection error inside whichever test
     # happened to run first (AUDIT F60)
