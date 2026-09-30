@@ -919,3 +919,46 @@ def test_a_non_tools_sweep_still_trials_a_q4_plan(monkeypatch, tmp_path):
                                                "cache_type_v": "q8_0"})])
     assert [r["label"] for r in rows] == ["baseline", "kv-q8"]
 
+
+def test_the_sweep_and_its_guards_build_a_trial_the_same_way(monkeypatch, tmp_path):
+    """W13B-1: one construction, not three copies of it.
+
+    `run_sweep`'s launch loop and the two trial guards (`_effective_env`,
+    `_effective_flags`) each used to spell out
+    `plan.flags.model_copy(update=override)` for themselves. They agreed, but
+    nothing kept them agreeing — and a guard that reads a different flag set from
+    the one the child is launched with is worse than no guard, because it reports
+    on a trial that never ran. This pins the single source: every trial the sweep
+    launches must be built through `bench._trial_flags`, which is exactly what
+    the guards read.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    configs = [("baseline", {}), ("fa-off", {"flash_attn": "off"})]
+    built: list[dict] = []
+    real = bench._trial_flags
+
+    def spy(plan_flags, override):
+        built.append(dict(override))
+        return real(plan_flags, override)
+
+    monkeypatch.setattr(bench, "_trial_flags", spy)
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    monkeypatch.setattr(bench, "sweep_configs",
+                        lambda base, moe, caps=(): list(configs))
+
+    bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf", port=11602)
+
+    # The launch loop's calls are the last `len(configs)`; any earlier ones are
+    # the guards, which read the same helper and are the point of the pin.
+    assert built[-len(configs):] == [o for _, o in configs], (
+        "run_sweep must build every trial through bench._trial_flags — the same "
+        "helper the q4_0 and env guards read, so the guard cannot report on a "
+        "trial that never ran")
+
