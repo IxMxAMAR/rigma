@@ -131,6 +131,10 @@ describe("the restore card", () => {
     });
     expect(posts).toEqual([DOC]);
     expect(container.textContent).toContain("restored 2 method(s)");
+    // the success line is the CARD's, not the confirmation panel's: `replace()`
+    // clears `pending` (unmounting the panel) before it sets `done`, so a `done`
+    // prop on the panel could never render
+    expect(byText("replace memory and merge the rest")).toBeUndefined();
   });
 
   it("shows the server's refusal and keeps the file on screen", async () => {

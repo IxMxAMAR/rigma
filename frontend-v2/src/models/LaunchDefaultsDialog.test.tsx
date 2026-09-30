@@ -207,4 +207,23 @@ describe("the launch-defaults dialog against the real route", () => {
     await clickSave();
     expect(posts).toEqual([{ backend: "vulkan" }]);
   });
+
+  it("cannot save an unchanged draft, so the empty payload is unreachable", async () => {
+    // The reason `save()` carries no empty-payload branch: the button is
+    // disabled on `!changed`, and `changed` is exactly "the payload is
+    // non-empty". Pin that guard so the removed branch cannot come back to life
+    // as a silent no-op save.
+    serve(() => reply(200, {}));
+    await mount();
+    const save = [...container.querySelectorAll("button")]
+      .find((b) => b.textContent === "save as default") as HTMLButtonElement;
+    expect(save).not.toBeUndefined();
+    expect(save.disabled).toBe(true);
+    expect(container.textContent).toContain("nothing changed yet");
+    await act(async () => {
+      save.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(posts).toEqual([]);
+  });
 });

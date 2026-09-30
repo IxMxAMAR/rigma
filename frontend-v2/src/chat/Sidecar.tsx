@@ -35,7 +35,9 @@ const CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 262144];
  * heading and their own warning, because they are NOT per-chat: one engine
  * serves every session, and each of these stops it and starts it again.
  */
-function EngineCard() {
+/** Exported so a test can read the launch-defaults tooltip without mounting the
+ *  whole panel (the same reason `SamplingCard` and `MethodCard` are). */
+export function EngineCard() {
   const [srv, setSrv] = useState<ServerInfo | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -232,12 +234,15 @@ measure rather than assume.">
           onClick={() => setShowDefaults(true)}
           className="mt-0.5 rounded-md px-2.5 py-1 text-[11.5px] text-muted hover:text-amber text-left disabled:opacity-40"
           title={"How this model comes up when it is loaded without an explicit "
-                 + "setting. The dialog opens on the RUNNING configuration, so "
-                 + "this is how you remember what you just relaunched with — and "
-                 + "it can also pin the quant and the compute backend, which the "
-                 + "one-click version could not. The resolver's guess is not "
-                 + "always the fast one: on this hardware the gap between "
-                 + "configurations of the same model has measured 4x."}
+                 + "setting. The dialog prefills fields the stored launch leaves "
+                 + "UNSET from the running configuration, so it is how you "
+                 + "remember what you just relaunched with — a field that is "
+                 + "already pinned is shown as stored, never overwritten by the "
+                 + "running config. It can also pin the quant and the compute "
+                 + "backend, which the one-click version could not. The "
+                 + "resolver's guess is not always the fast one: on this "
+                 + "hardware the gap between configurations of the same model "
+                 + "has measured 4x."}
         >
           launch defaults…
         </button>

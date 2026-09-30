@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useChat } from "./chatStore";
-import { SamplingCard } from "./Sidecar";
+import { EngineCard, SamplingCard } from "./Sidecar";
 
 // W5F1a residual — the wave-1 D5 call site. D5 extracted the harness disclosure
 // into the pure `HarnessFacts`, but its single call site (`Sidecar.tsx:903`) had
@@ -105,5 +105,50 @@ describe("the Sidecar's harness card", () => {
     // The card still renders its own heading; the disclosure has nothing to say.
     expect(container.textContent).toContain("this chat");
     expect(container.textContent).not.toContain("what Rigma gives");
+  });
+});
+
+describe("the engine card's launch-defaults tooltip", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean })
+      .IS_REACT_ACT_ENVIRONMENT = true;
+    useChat.setState({ streams: {}, currentId: null });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    await act(async () => { root.unmount(); });
+    container.remove();
+    vi.unstubAllGlobals();
+  });
+
+  it("says the seed only fills fields the stored launch leaves unset", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (String(url) === "/api/server") {
+        return reply(200, {
+          model: "m", ctx: 8192, kv_cache: "f16", backend: "rocm",
+          native_ctx: 32768, no_vision: false, has_mmproj: false,
+          backends: [], unloaded: false,
+        });
+      }
+      return reply(200, {});
+    }));
+    await act(async () => {
+      root.render(<EngineCard />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const btn = [...container.querySelectorAll("button")]
+      .find((b) => b.textContent === "launch defaults…");
+    expect(btn, "no launch defaults button").not.toBeUndefined();
+    const title = btn!.getAttribute("title") ?? "";
+    expect(title).toContain("prefills fields the stored launch leaves UNSET");
+    expect(title).toContain("never overwritten by the running config");
+    // the old claim was false whenever a field was already pinned
+    expect(title).not.toContain("opens on the RUNNING configuration");
   });
 });
