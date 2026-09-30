@@ -1681,7 +1681,14 @@ def _read_path(ctx, raw: str) -> Path:
         p = _long_path(p)
     else:
         p = _ws_path(ctx, raw or ".")
-    denied = _credential_path_reason(p, ctx)
+    # ODR-6-residual: `_ws_path`/`_long_path` hand back a `\\?\`-prefixed path
+    # once it is >=260 chars, and the STATE-DIR branch of
+    # `_credential_path_reason` is `is_relative_to` on the resolved path —
+    # `\\?\C:\...` is not relative to the unprefixed `~/.rigma`, so a long path
+    # under the state dir read as an ordinary file. (The credential FILE and
+    # DIRECTORY rules match on name/parts and were never affected.) `_unlong`
+    # makes the state-dir rule see what the OS sees.
+    denied = _credential_path_reason(_unlong(p), ctx)
     if denied:
         raise ValueError(f"refusing to read {p} — {denied}")
     return p
@@ -1909,15 +1916,76 @@ def _persistence_anchors() -> dict:
     return anchors
 
 
+def _strip_trailing_dots(p: Path) -> Path:
+    """Drop trailing dots/spaces from every component (Windows only).
+
+    Windows strips them at the filesystem API, so `PowerShell.` and `PowerShell`
+    name the SAME directory — but `Path.resolve()` canonicalises a component
+    only when it already EXISTS. The creation case (the whole threat) is a
+    component that does not exist yet, so the resolved path still reads
+    `PowerShell.` and a lexical `==`/`is_relative_to` against the shape
+    `PowerShell` misses. On POSIX a trailing dot is a real, distinct name, so
+    this is Windows-only. A shape whose ancestor is itself a shape
+    (`Startup./x.cmd`) hid this: the ancestor matched, so the escape only
+    showed on the shapes that stand alone (`.gitconfig.`, `PowerShell./…`)."""
+    if os.name != "nt":
+        return p
+    try:
+        anchor = p.anchor
+        parts = list(p.parts)
+        if anchor and parts and parts[0] == anchor:
+            parts = parts[1:]
+        parts = [part.rstrip(" .") for part in parts]
+        return Path(anchor, *parts) if anchor else Path(*parts)
+    except (OSError, ValueError, RuntimeError):
+        return p
+
+
+def _local_host_names() -> set:
+    """Names that mean THIS machine in a UNC server position."""
+    names = {"localhost", "127.0.0.1", "::1", "[::1]"}
+    for env in ("COMPUTERNAME", "HOSTNAME"):
+        raw = (os.environ.get(env) or "").strip().lower()
+        if raw:
+            names.add(raw)
+    return names
+
+
+def _local_unc_to_drive(p: Path) -> Path:
+    r"""Map a LOCAL admin-share UNC spelling to its drive form, or return `p`.
+
+    `\\localhost\c$\x`, `\\<COMPUTERNAME>\c$\x` and the `\\?\UNC\` spelling
+    (already dropped by `_unlong`) name the same directory as `c:\x`, but
+    `Path.resolve()` keeps them as UNC, so the drive-letter anchors never match.
+    A genuinely REMOTE share is returned unchanged — it is not a local
+    persistence directory, and refusing it would break a real capability."""
+    if os.name != "nt":
+        return p
+    s = str(p)
+    if not s.startswith("\\\\"):
+        return p
+    server, sep, tail = s[2:].partition("\\")
+    if not sep:
+        return p
+    share, _sep2, sub = tail.partition("\\")
+    if not (len(share) == 2 and share.endswith("$") and share[0].isalpha()):
+        return p
+    if server.lower() not in _local_host_names():
+        return p
+    return Path(share[0].upper() + ":\\" + sub)
+
+
 def _persistence_hit(rp: Path, shapes, anchors: dict, *, subdirs: bool) -> bool:
     """Is the already-resolved `rp` one of `shapes`? Equality always counts;
-    containment counts only for the directory shapes."""
+    containment counts only for the directory shapes. Both sides are put
+    through the same local-UNC and trailing-dot normalisation as `rp`."""
     for anchor, *parts in shapes:
         root = anchors.get(anchor)
         if root is None:
             continue
         try:
-            target = root.joinpath(*parts).resolve()
+            target = _strip_trailing_dots(
+                _local_unc_to_drive(root.joinpath(*parts).resolve()))
         except (OSError, ValueError, RuntimeError):
             continue
         try:
@@ -1929,7 +1997,7 @@ def _persistence_hit(rp: Path, shapes, anchors: dict, *, subdirs: bool) -> bool:
 
 
 def _persistence_path_reason(p: Path, ctx: dict | None = None) -> str:
-    """Why `p` may not be WRITTEN, or "" when it may. ODR-1.
+    r"""Why `p` may not be WRITTEN, or "" when it may. ODR-1.
 
     The sibling of `_credential_path_reason` for the other half of the same
     surface: a credential file leaks data, a persistence file RUNS CODE. Both
@@ -1937,15 +2005,18 @@ def _persistence_path_reason(p: Path, ctx: dict | None = None) -> str:
     about WHERE the owner lets a write land, not whether a write may install a
     startup hook.
 
-    `p` is RESOLVED first (after dropping a `\\\\?\\` prefix), so `..`, mixed
+    `p` is RESOLVED first (after dropping a `\\?\` prefix), so `..`, mixed
     separators, 8.3 short names and junctions all compare as the directory they
-    actually name. Resolution is done on a copy: the caller keeps its own path,
-    which is what lets `_write_file_locked` still create parent folders after
-    the check passes."""
+    actually name; then a local-UNC spelling is mapped to its drive form and
+    every component has trailing dots/spaces stripped, because `resolve()`
+    canonicalises neither for a component that does not exist yet. Resolution is
+    done on a copy: the caller keeps its own path, which is what lets
+    `_write_file_locked` still create parent folders after the check passes."""
     try:
         rp = Path(_unlong(p)).resolve()
     except (OSError, ValueError, RuntimeError):
         return ""
+    rp = _strip_trailing_dots(_local_unc_to_drive(rp))
     anchors = _persistence_anchors()
     if (_persistence_hit(rp, _PERSISTENCE_DIR_SHAPES, anchors, subdirs=True)
             or _persistence_hit(rp, _PERSISTENCE_FILE_SHAPES, anchors,
@@ -2047,7 +2118,10 @@ def _write_path(ctx, raw: str) -> Path:
         p = _long_path(resolved)
     else:
         p = _ws_path(ctx, raw or ".")
-    denied = _credential_path_reason(p, ctx)
+    # ODR-6-residual: same long-path hole as `_read_path` — a >=260-char
+    # destination under the state dir was written because the state-dir rule
+    # saw the `\\?\`-prefixed spelling.
+    denied = _credential_path_reason(_unlong(p), ctx)
     if denied:
         raise ValueError(f"refusing to write {p} — {denied}")
     # ODR-1: a persistence destination is refused through EITHER route — the
@@ -2528,7 +2602,11 @@ def _iter_workspace_files(root: Path, rx_glob: re.Pattern, state: dict,
             #
             # Filtering in the walker rather than in `_grep` also covers
             # `find_files`, and any walker-based tool added later.
-            if _credential_path_reason(p, ctx):
+            #
+            # ODR-6-residual: the root comes from `_ws_path`, so a >=260-char
+            # workspace makes EVERY walked path `\\?\`-prefixed and the shape
+            # match below would miss all of them. `_unlong` first.
+            if _credential_path_reason(_unlong(p), ctx):
                 continue
             yield p
 
@@ -4034,7 +4112,9 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
     # one read the 13-2 fix did not cover — the grant is irrelevant to it, and
     # the two image modes disagreed with `view_images(folder=…)`, which goes
     # through `_read_path` and refuses.
-    denied = _credential_path_reason(p, ctx)
+    # ODR-6-residual: a >=260-char image path reaches here `\\?\`-prefixed from
+    # `_ws_path`, so the state-dir rule missed it. `_unlong` first.
+    denied = _credential_path_reason(_unlong(p), ctx)
     if denied:
         return None, f"refusing to read {p} — {denied}", ""
     if p.suffix.lower() not in _IMAGE_EXTS:
