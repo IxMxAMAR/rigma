@@ -296,6 +296,21 @@ describe("an elicitation the turn is blocked on", () => {
     expect(container.textContent).not.toContain("send answer");
     expect(container.textContent).not.toContain("allow once");
   });
+
+  it("draws an ANSWERED question as a tick, not as the failure cross (OD12-n1)", async () => {
+    // The server's other question verdict. The glyph rule used to be "tick for
+    // allowed-once, cross for everything else", so a question the user DID
+    // answer read as a failure.
+    let g = questionGov();
+    g = foldApproval(g, {
+      event: "approval/decided",
+      data: { id: "q-abc", kind: "question", decision: "answered", outcome: "answered" },
+    });
+    await mount(g, vi.fn());
+    expect(container.textContent).toContain("answered");
+    expect(container.textContent).toContain("✓");
+    expect(container.textContent).not.toContain("send answer");
+  });
 });
 
 // B4b/OD-12. The route's 409 is the server's own word that it is no longer

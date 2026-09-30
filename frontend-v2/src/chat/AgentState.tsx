@@ -34,6 +34,7 @@ import type {
 import type { WorkflowAgent, WorkflowRun } from "../lib/api";
 import {
   isQuestion,
+  outcomeGlyph,
   outcomeLabel,
   outcomeTone,
   sandboxLabel,
@@ -267,7 +268,7 @@ function GovernanceBlock({ gov, onAnswer }: {
                 }`}
                 aria-hidden="true"
               >
-                {a.outcome ? (a.outcome === "allowed-once" ? "✓" : "✕") : "?"}
+                {outcomeGlyph(a.outcome)}
               </span>
               <span className="flex-1 min-w-0">
                 <span className="font-mono text-secondary">{a.toolName || a.kind}</span>
