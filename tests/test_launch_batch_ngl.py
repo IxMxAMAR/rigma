@@ -41,7 +41,10 @@ def compute_buffer_mb(ubatch: int = 0) -> float:
 # path and the arithmetic below is the whole answer.
 VRAM_MB = 16368
 USABLE_MB = 15018.0
-UB2048_COMPUTE_MB = 600.0
+# DR2-3: 410.28 MiB at ubatch 512 (the engine's own `sched_reserve` line,
+# `.scratch/prism-v.log:4669`) * 2048/512 — NOT the old 150 * 4 = 600, which
+# under-reserved by ~1 GB against this machine's own data point.
+UB2048_COMPUTE_MB = 1641.12
 
 
 def _profile(vram=VRAM_MB, ram_free=9100, slug="w10a-card"):
@@ -150,10 +153,41 @@ def test_compute_buffer_is_unchanged_at_the_default():
     assert compute_buffer_mb(512) == 150.0
 
 
-def test_compute_buffer_scales_with_a_larger_ubatch():
-    """PREDICTION, linear from the one measured point: 2048/512 * 150 = 600."""
+def test_compute_buffer_below_the_measured_point_is_byte_identical():
+    """DR2-3 acceptance: at or below 512 NOTHING changes. Every value the lever
+    can be handed at or under the engine default is the old constant, bit for
+    bit — no `max`, no float drift, no scaling."""
+    for ub in (0, 1, 2, 256, 511, 512):
+        assert compute_buffer_mb(ub) == 150.0, ub
+    # and the budget that contains it is the old one exactly
+    assert _budgets(_profile())[0] == USABLE_MB
+
+
+def test_compute_buffer_above_the_measured_point_scales_the_engines_own_line():
+    """DR2-3: above the measured point the base is the engine's OWN compute
+    buffer (410.28 MiB at 512), not the 150 floor — scaling 150 charged 600 at
+    ubatch 2048 where the machine's own data point implies ~1641, i.e. it
+    under-reserved by ~1 GB."""
+    assert compute_buffer_mb(1024) == 820.56
     assert compute_buffer_mb(2048) == UB2048_COMPUTE_MB
-    assert compute_buffer_mb(1024) == 300.0
+    assert compute_buffer_mb(2048) > 150.0 * 2048 / 512     # the old, unsafe one
+    for ub in (513, 1024, 2048, 4096, 8192, 16384):
+        assert compute_buffer_mb(ub) == \
+            resolve_mod.MEASURED_COMPUTE_BUFFER_MB * ub / 512, ub
+
+
+def test_the_base_is_not_below_the_engines_own_logged_compute_buffer():
+    """The constant must be pinned to the engine's own observation, not a
+    smaller guess: the repo's committed engine-log fixture carries the real
+    line `ROCm0 compute buffer size = 410.28 MiB` (also
+    `.scratch/prism-v.log:4669`)."""
+    import re
+
+    from test_engine_log_memory import CPU_ATTENTION_FALLBACK
+    m = re.search(r"compute buffer size =\s*([\d.]+) MiB",
+                  CPU_ATTENTION_FALLBACK)
+    assert m is not None, CPU_ATTENTION_FALLBACK
+    assert resolve_mod.MEASURED_COMPUTE_BUFFER_MB >= float(m.group(1))
 
 
 def test_compute_buffer_never_shrinks_below_the_constant():
@@ -173,13 +207,13 @@ def test_the_requested_ubatch_is_charged_against_the_budget():
 
 def test_a_requested_ubatch_reaches_the_fit_and_the_argv():
     """The value is in the argv AND the fit has already paid for it: charging
-    600MB instead of 150 costs two GPU layers on this fixture (59 -> 57)."""
+    1641MB instead of 150 costs seven GPU layers on this fixture (59 -> 52)."""
     base_spec, base = _plan(None)
     spec, plan = _plan(LaunchDefaults(ubatch=2048))
     assert "-ub" in plan.server_args("C:/m/f.gguf", 8080)
     argv = plan.server_args("C:/m/f.gguf", 8080)
     assert argv[argv.index("-ub") + 1] == "2048"
-    assert plan.flags.ngl == 57
+    assert plan.flags.ngl == 52
     assert plan.flags.ngl < base.flags.ngl
     assert _spilled(spec, plan.flags) > _spilled(base_spec, base.flags)
 
