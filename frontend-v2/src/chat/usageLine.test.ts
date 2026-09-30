@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { usageLine } from "./AgentState";
+import { costLine, usageLine } from "./AgentState";
 
 // The usage panel used to be a generic `key value` join filtered to numbers. It
 // therefore rendered `durationMs 4200` with no unit, and dropped `model` and
@@ -94,5 +94,47 @@ describe("the usage line names what the backend actually reported", () => {
   it("does not treat a zero count as absent", () => {
     // 0 is a real number and a real answer; only `typeof` decides.
     expect(usageLine({ inputTokens: 0, outputTokens: 0 })).toBe("in 0 · out 0");
+  });
+});
+
+// B6: ACP's `usage_update` carries a `cost` object. It was stored and never
+// rendered — the numeric loop skipped it because it is an object, so the price
+// of a turn was invisible.
+describe("the usage line renders what a turn cost", () => {
+  it("renders ACP's cost with its currency", () => {
+    expect(costLine({ amount: 0.0123, currency: "USD" })).toBe("USD 0.0123");
+  });
+
+  it("renders the amount when the backend names no currency", () => {
+    expect(costLine({ amount: 0.5 })).toBe("0.5");
+  });
+
+  it("says nothing for a cost it cannot read", () => {
+    expect(costLine(null)).toBe("");
+    expect(costLine(undefined)).toBe("");
+    expect(costLine("free")).toBe("");
+    expect(costLine([])).toBe("");
+    expect(costLine({ currency: "USD" })).toBe("");
+    expect(costLine({ amount: "free" })).toBe("");
+    expect(costLine({ amount: Number.NaN })).toBe("");
+    expect(costLine({ amount: Number.POSITIVE_INFINITY })).toBe("");
+  });
+
+  it("appends the cost after the numbers it summarises", () => {
+    expect(usageLine({
+      usedTokens: 1200,
+      contextWindowTokens: 8192,
+      cost: { amount: 0.0123, currency: "USD" },
+    })).toBe("usedTokens 1200 · contextWindowTokens 8192 · USD 0.0123");
+  });
+
+  it("adds nothing at all for a malformed cost", () => {
+    expect(usageLine({ inputTokens: 1, cost: "free" })).toBe("in 1");
+    expect(usageLine({ inputTokens: 1, cost: null })).toBe("in 1");
+  });
+
+  it("never prints a bare numeric cost as an unnamed key", () => {
+    // The generic numeric loop would have made this `cost 0.01`.
+    expect(usageLine({ inputTokens: 1, cost: 0.01 })).toBe("in 1");
   });
 });
