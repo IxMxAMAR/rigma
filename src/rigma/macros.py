@@ -236,6 +236,29 @@ def trust(method_id: str, macro_id: str) -> None:
     p.write_text(json.dumps(all_, indent=2), encoding="utf-8")
 
 
+def forget_method(method_id: str) -> int:
+    """Drop every 'Always allow' recorded for `method_id`; return how many.
+
+    ODR-5: trust is keyed `method_id:macro_id`, so it OUTLIVES the method's
+    own bytes. The restore route can replace a method under the same id (or
+    delete it), and a decision made about the OLD macros must not stand for
+    steps that arrived in a backup from somewhere else — that is the same
+    reason `/api/methods/import` refuses to overwrite an existing id. Clearing
+    by method id keeps the untouched methods' decisions.
+    """
+    all_ = _trust_all()
+    prefix = f"{method_id}:"
+    gone = [k for k in all_ if k.startswith(prefix)]
+    if not gone:
+        return 0
+    for key in gone:
+        del all_[key]
+    p = trust_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(all_, indent=2), encoding="utf-8")
+    return len(gone)
+
+
 # --- the interpreter ------------------------------------------------------
 
 async def run_macro(session: dict, method: dict, macro: dict, *,

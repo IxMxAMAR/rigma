@@ -171,6 +171,35 @@ def test_a_memory_failure_after_the_deletes_restores_the_deleted_methods(
         "keepme", "mine"]
 
 
+def test_restore_clears_macro_trust_for_every_method_it_writes_or_deletes(
+        client, home):
+    """ODR-5: trust is keyed `method_id:macro_id` and deliberately lives
+    outside the method file (that is why `/api/methods/import` refuses to
+    overwrite an id), so a restore that REPLACES a trusted method's macro — or
+    deletes the method — must drop the old "Always allow" too. Otherwise a
+    backup "from another machine" can swap in a `write_file` step that then
+    runs with no confirmation."""
+    from rigma import macros
+
+    _seed(home, method_ids=("mine", "keepme"), minutes=12)
+    macros.trust("mine", "peek")           # rewritten by the document
+    macros.trust("keepme", "peek")         # deleted as stale
+    macros.trust("untouched", "peek")      # neither written nor deleted
+    assert macros.is_trusted("mine", "peek") is True
+
+    doc = {"rigma_backup": 1, "settings": {},
+           "methods": [_doc("mine")], "memory": []}
+    r = client.post("/api/restore", json=doc)
+    assert r.status_code == 200, r.text
+
+    assert macros.is_trusted("mine", "peek") is False, \
+        "a rewritten method kept its old 'Always allow'"
+    assert macros.is_trusted("keepme", "peek") is False, \
+        "a deleted method kept its old 'Always allow'"
+    # the clear is by the ids the restore touched, not a wipe of the file
+    assert macros.is_trusted("untouched", "peek") is True
+
+
 def test_the_happy_path_still_restores_memory(client, home):
     """The replace must not break the section that already worked.
 

@@ -1771,8 +1771,14 @@ def _apply_restore(store, targets, patch, normalized, rows):
     does not name is deleted through `methods.delete_user`. The stale methods
     are resolved BEFORE the snapshot and added to the undo log, because the
     delete is the one step here that removes data the restore did not write.
+
+    ODR-5: every method id this writes or deletes also loses its macro trust
+    (`macros.forget_method`), because `macro_trust.json` is keyed by method id
+    and outlives the method file — a replaced macro must not inherit the old
+    decision, and a deleted method must not leave a live one behind.
     """
     from . import app_settings
+    from . import macros
     from . import methods as _methods
     with store.locked():
         # OD-15: the deletion set is part of the transaction. Resolve it (and
@@ -1805,6 +1811,23 @@ def _apply_restore(store, targets, patch, normalized, rows):
                 app_settings.replace(patch)
             except Exception as e:
                 raise _RestoreStageError("settings", str(e)) from e
+            # ODR-5: trust is keyed `method_id:macro_id` and deliberately lives
+            # outside the method file, so replacing a method's macros — or
+            # deleting the method — must drop the old "Always allow" too, or a
+            # backup from another machine could swap in a `write_file` step
+            # that runs unconfirmed. Clear it BEFORE the first method write so
+            # there is no window in which a rewritten macro is still trusted.
+            # A rollback puts the method BYTES back but leaves trust cleared:
+            # losing a confirmation is the safe direction to fail in.
+            try:
+                for full in normalized:
+                    mid = full.get("id")
+                    if mid is not None:
+                        macros.forget_method(mid)
+                for mid in stale_ids:
+                    macros.forget_method(mid)
+            except Exception as e:
+                raise _RestoreStageError("trust", str(e)) from e
             for full in normalized:
                 try:
                     _, errs = _methods.save_user(full)
