@@ -365,6 +365,30 @@ def test_parameter_and_expert_counts_come_from_tensor_dims(tmp_path):
     assert info.spec_fields["expert_params"] == 400
 
 
+# --- 06R3-9: a tensor dimension that overflows is not a plausible count ------
+
+def test_an_overflowing_tensor_dimension_is_refused_not_multiplied(tmp_path):
+    """06R3-9: rank 8 with every dim 2**64-1 multiplied out to a 3.4e153-element
+    count. Python has no overflow, so the number survived every downstream
+    ratio — `moe_from_probe` kept a plausible-looking expert share and
+    `measured_bpw` reported a -100% drift as a real finding. A file with more
+    than _MAX_PARAMS elements is corrupt, and the parse must say so."""
+    tensors = [_tensor(b"blk.0.attn_q.weight", [2**64 - 1] * 8)]
+    with pytest.raises(GgufParseError, match="implausible tensor size"):
+        inspect_gguf(_write(tmp_path, DENSE, tensors=tensors))
+
+
+def test_a_large_but_real_tensor_table_still_counts(tmp_path):
+    """The bound must not clip a real file: a 67M-element projection and a
+    134M-element expert stack are ordinary."""
+    tensors = [
+        _tensor(b"blk.0.attn_q.weight", [8192, 8192]),
+        _tensor(b"blk.0.ffn_down_exps.weight", [4096, 4096, 8]),
+    ]
+    info = inspect_gguf(_write(tmp_path, DENSE, tensors=tensors))
+    assert info.spec_fields["params"] == 8192 * 8192 + 4096 * 4096 * 8
+
+
 # --- an absent chat template is not a finding about the model ----------------
 def test_missing_chat_template_is_reported_not_silently_empty(tmp_path):
     kvs = [k for k in _MTP_KVS if b"chat_template" not in k]
