@@ -254,6 +254,38 @@ def test_subagent_lifecycle_is_top_level_and_no_longer_filtered_out():
     assert finished["event"] == "subagent.finished"
 
 
+def test_a_subagent_descriptor_carries_the_child_id_the_fold_needs():
+    """B3: the descriptor's `label` is the child's durable creation label, and
+    DSH appends the event inside the CHILD's own session — so the envelope's
+    `sessionId`, which `_event_and_data` discards, IS the child's id. Without it
+    the descriptor reached the UI and died in the fold for want of an id
+    (`frontend-v2/src/chat/subagents.ts:141-143` reads `childId ?? childSessionId`
+    and found neither)."""
+    out = runner._project(_session_event("subagent/descriptor", {
+        "version": 3, "mode": "one-shot", "provider": "spawn",
+        "label": "scout the parser",
+    }))[0]
+    assert out["event"] == "subagent/descriptor"
+    assert out["data"]["childId"] == "s1"
+    # The descriptor's own payload is kept whole — only the missing id is added.
+    assert out["data"]["label"] == "scout the parser"
+    assert out["data"]["provider"] == "spawn"
+    assert out["data"]["version"] == 3
+
+
+def test_an_explicit_child_id_wins_and_only_the_descriptor_borrows_the_session_id():
+    """A `childId` the payload already carries is authoritative: the envelope id
+    is an inference from WHERE DSH filed the event, and an inference must not
+    overwrite a fact. And the injection is not general — a sibling state event's
+    data is untouched, so nothing else on the wire changes shape."""
+    explicit = runner._project(_session_event("subagent/descriptor", {
+        "version": 3, "mode": "one-shot", "provider": "spawn", "childId": "explicit",
+    }))[0]
+    assert explicit["data"]["childId"] == "explicit"
+    goal = runner._project(_session_event("goal/change", {"operation": "create"}))[0]
+    assert goal["data"] == {"operation": "create"}
+
+
 def test_former_internal_chatter_is_now_an_explicit_notice():
     """B2: these four used to be dropped in SILENCE, and this test used to assert
     `== []`. The contract changed, deliberately.

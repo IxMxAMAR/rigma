@@ -311,6 +311,27 @@ def _project(notification, streamed: "_Streamed | None" = None) -> list[dict]:
         return [out]
 
     if kind in _STATE_EVENTS:
+        if kind == "subagent/descriptor" and not data.get("childId"):
+            # B3: DSH appends the descriptor INSIDE the child's own session
+            # (`descriptor.ts`: "Providers append it turn-enclosed in the child's
+            # initial turn"), so the envelope's `sessionId` — which
+            # `_event_and_data` throws away — IS the child's id. The descriptor's
+            # own payload is `{version, mode, provider, label?, ...}` and carries
+            # no id in ANY variant, so without this the frontend fold sees the
+            # child's creation `label` and has no row to attach it to
+            # (`frontend-v2/src/chat/subagents.ts:141-143` reads
+            # `childId ?? childSessionId` and finds neither).
+            #
+            # `data["childId"]` WINS over the envelope when both are present: a
+            # field the event states about itself is authoritative, while the
+            # envelope id is an inference from WHERE DSH filed the event, and an
+            # inference must never overwrite a fact. That is also why the whole
+            # branch is skipped when `childId` is already there — the projection
+            # is then byte-identical to before. Only this ONE event borrows the
+            # envelope id; every other `_STATE_EVENTS` shape is untouched.
+            session_id = payload.get("sessionId")
+            if session_id:
+                data = {**data, "childId": str(session_id)}
         return [{"type": "state", "event": kind, "data": data}]
 
     if kind == _USAGE_EVENT:
