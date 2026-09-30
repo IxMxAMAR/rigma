@@ -41,7 +41,7 @@ MAIN_SLOT = 0
 # is in the dict" so that adding a flag to ComboFlags cannot silently widen what
 # counts as the same cache.
 FINGERPRINT_FIELDS = (
-    "model", "quant", "gguf", "backend", "engine",
+    "model", "quant", "gguf", "backend", "engine", "engine_version",
     "ctx", "cache_type_k", "cache_type_v",
     "ngl", "n_cpu_moe", "spec_type", "spec_n_max",
     # AUDIT 02-3: the calibration sweep always trials `flash_attn: off`
@@ -56,6 +56,23 @@ FINGERPRINT_FIELDS = (
     # costs correctness.
     "flash_attn",
 )
+
+# VLLM-1 (docs/review/findings-r3/17-vllm-engine.md): `engine` is the binary
+# PATH, and a path is not a build. Replacing the binary in place — which is
+# exactly how a hand-installed fork arrives — left the name unchanged, so a
+# cache taken under the old build was restorable under the new one. The finding
+# framed this as the runtime axis (llama.cpp vs vLLM); the same defect exists
+# WITHIN llama.cpp whenever two builds share a path. `engine_version` is the
+# MEASURED identity of the build at that path, read from `engine_identity`, the
+# one source the rest of the code uses for "which build is this", so a build
+# change invalidates the cache exactly when calibration would go stale.
+#
+# Adding a field changes every hash and therefore invalidates every cache
+# already on disk. That is the intended, safe direction: `fingerprint` maps a
+# MISSING field to the NUL sentinel, so an entry written by the old field list
+# reads as "unknown" and is never accepted — it does not crash and it does not
+# match. The user pays one re-prefill; the alternative is a context that does
+# not describe its own history.
 
 # How many saved caches to keep. Each is roughly ctx x the KV bytes per token —
 # ~2.9GB for a 120K window at q5_1 — so this is disk measured in tens of GB.
@@ -111,14 +128,52 @@ def slot_action(port: int, slot: int, action: str, filename: str,
     return None
 
 
-def config_of(plan, engine: str = "") -> dict:
+def engine_identity(backend: str = "") -> str:
+    """The measured identity of the engine build a launch on `backend` will use.
+
+    VLLM-1. Deliberately delegates to `server_ops.engine_version`, which is the
+    single answer the rest of the code already uses to "which build is this"
+    (`resolve._engine_now`, `bench._engine_version`): it runs the binary's own
+    `--version` and returns `engine_build`'s build+commit identity, falling back
+    to the manifest version when no binary can be run. Going through the same
+    source means a KV cache is invalidated exactly when calibration would go
+    stale, rather than on a second, subtly different notion of "changed".
+
+    Never raises: an unreadable engine is "unknown" (`""`). `fingerprint` hashes
+    an absent field differently from an empty one, so "unknown" can never
+    compare equal to a real build identity.
+
+    WHAT THIS CANNOT DETECT: a vLLM runtime. There is no vLLM version probe
+    anywhere in the codebase, and vLLM is not wired into this launch path, so
+    `server_ops.engine_version` has no answer for it. The `engine` field (the
+    executable path) is what separates two runtimes today; whenever vLLM is
+    wired in it must be given its own identity here rather than inheriting
+    llama.cpp's manifest string.
+    """
+    try:
+        from .server_ops import engine_version
+        return engine_version(backend)
+    except Exception:
+        return ""
+
+
+def config_of(plan, engine: str = "", engine_version: str | None = None) -> dict:
     """The fingerprint input for a RunPlan. One place, so the launch path and
     the restore path cannot drift into disagreeing about what "the same
-    configuration" means."""
+    configuration" means.
+
+    `engine` is the binary PATH; `engine_version` is the measured identity of
+    the build at that path (VLLM-1). When the caller does not supply one it is
+    read from `engine_identity(plan.backend)`, the same source the rest of the
+    code uses, so both launch paths get it without repeating the expression.
+    """
     f = plan.flags
+    if engine_version is None:
+        engine_version = engine_identity(getattr(plan, "backend", ""))
     return {
         "model": plan.model_slug, "quant": plan.gguf.quant,
         "gguf": plan.gguf.file, "backend": plan.backend, "engine": engine,
+        "engine_version": engine_version,
         "ctx": f.ctx, "cache_type_k": f.cache_type_k,
         "cache_type_v": f.cache_type_v, "ngl": f.ngl,
         "n_cpu_moe": f.n_cpu_moe, "spec_type": f.spec_type,
