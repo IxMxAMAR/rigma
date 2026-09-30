@@ -582,7 +582,11 @@ function harnessShort(h: HarnessInfo): string {
   return "";
 }
 
-function SamplingCard() {
+/** W5F1a: exported so a render test can reach the `<HarnessFacts>` call site this
+ *  card holds (`Sidecar.tsx`'s D5 wiring). The wave-2 verifier measured that
+ *  deleting that call left the whole suite green; a test has to mount the card
+ *  that draws it, and the card is not the default export. */
+export function SamplingCard() {
   const currentId = useChat((s) => s.currentId);
   // the cap follows the ENGINE's context — a hardcoded 32768 silently
   // clamped a 131072 the user had set (owner report 2026-07-21)
