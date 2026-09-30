@@ -96,15 +96,17 @@ latter). `LLAMA_ATTN_ROT_DISABLE` exists at both pins as an env var only.
 
 | id | flag | why | tag |
 |---|---|---|---|
-| C1 | `--ctx-checkpoints`/`-ctxcp` | tunes the hybrid rewind cost Rigma already manipulates via `--checkpoint-min-step 4096`; fork `arg.cpp:1687`, mainline `:1449` | **VERIFIED, HELD** (W4) |
+| C1 | `--ctx-checkpoints`/`-ctxcp` | tunes the hybrid rewind cost Rigma already manipulates via `--checkpoint-min-step 4096`; fork `arg.cpp:1687`, mainline `:1449` | **DONE** (W4; verified correct, held one wave because it shared a branch with C3, merged in `7b74403`) |
 | C2 | `--no-op-offload` | same class as the AMD-driver env toggles the sweep already trials (`bench.py:482-484`) — sweep config only | **DONE** (W4) |
-| C3 | `--reasoning-effort` | fork-only (`arg.cpp:3678`); mainline b9867 lacks it — gate on the detected engine | **SENT BACK once**, fix re-verifying (W4) |
+| C3 | `--reasoning-effort` | fork-only (`arg.cpp:3678`); mainline b9867 lacks it — gate on the detected engine | **DONE** (W4; **rejected once** — the gate was re-derived at argv-build time so the fork-only flag reached the pinned mainline binary — then fixed by freezing the gate onto the plan, and re-verified) |
 | C4 | `--kv-mean-center` | fork-only (`arg.cpp:2452-2459`), requires `--cache-type-k q4_0` and a per-model calibrated bias GGUF; Rigma excludes q4_0 for tools models (`bench.py:536-539`) | **SKIP** (needs the GPU to calibrate; nothing to gain here) |
 | C5 | `--image-min/max-tokens` | Rigma's fit math does not count image tokens, so exposing it would silently invalidate the VRAM plan | **SKIP** (the fit would have to learn image tokens first) |
 | C6 | `--tensor-split`/`-ot`/`-sm`/`-mg`, `--numa`, `--threads*`, `--mlock`, `--no-mmap`, `--defrag-thold`, sampler flags | single GPU, single socket; sampling is per-request (`sessions.py:236-238`); `--mlock`/`--no-mmap`/`--defrag-thold` are deprecated in the fork | **SKIP** (no effect on this machine) |
 | C7 | `--context-shift` | KV shifting is unsupported on the DeltaNet hybrid (`models.py:443-445`) | **SKIP** (would corrupt the recurrent state) |
 | C8 | `--cache-ram` | default 8192 MiB already on; raising it competes with MoE offload for system RAM | **SKIP** (leave the default) |
 | C9 | LoRA attach (`--lora`/`--lora-scaled` + `/lora-adapters`) | Rigma has no LoRA code at all and the owner trains LoRAs | **OWNER-DECISION** (a feature, not a knob; scoped in OWNER-DECISIONS.md) |
+| **C10** | **`-b`/`-ub`/`-ngl` are producible in the argv but have NO UI control** (`models.py:329-330, 423-426`; the sweep sets batch 16384 / ubatch 2048 at `bench.py:481`). The owner can only reach them from the CLI, so the launch dialog cannot express "this model at batch 2048" — a missing lever, not a missing flag. | Tier C's own premise correction | extend the launch-defaults API + the D2 dialog with batch / ubatch / ngl, validated against the fit (a larger ubatch raises the compute buffer; the fit must be re-run, not bypassed) | `models.py`, `serve.py`, `frontend-v2` | **DO** (backend + frontend; frontend wave 5, backend after `impl/w9a` merges) |
+| **C11** | **`LLAMA_ATTN_ROT_DISABLE` exists at both pins as an env var only**, and the sweep cannot trial it, although it already trials env toggles of the same class (`bench.py:482-484`, and C2's `--no-op-offload` axis) | Tier C's premise correction | add it as a sweep axis with the OFF case emitting nothing at all (C2's acceptance criterion) | `bench.py` | **DO** (assigned to `impl/w10b`) |
 
 ---
 
