@@ -88,6 +88,16 @@ describe("the restore card", () => {
     [...container.querySelectorAll("button")]
       .find((b) => b.textContent === label);
 
+  it("does not claim a restore reproduces the file's state", async () => {
+    // OD-15 (recorded, not decided here): `/api/restore` REPLACES memory and
+    // MERGES settings and methods, so "getting back to a known state" was a
+    // promise the route does not keep. The card must say what it does.
+    serve(() => reply(200, {}));
+    await mount();
+    expect(container.textContent).toContain("MERGES");
+    expect(container.textContent).not.toContain("getting back to a known state");
+  });
+
   it("names what is replaced and what is merged, and will not replace it in one click", async () => {
     serve(() => reply(200, { restored: true, methods: 2,
                              memory: { before: 3, after: 3 } }));
