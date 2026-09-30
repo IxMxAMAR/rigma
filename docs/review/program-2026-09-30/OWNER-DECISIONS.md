@@ -168,3 +168,44 @@ draft is fresh the store stays over the cap until one ages. Dropping a live draf
 the eviction rule must not produce.
 
 **If nothing is decided:** the numbers stand; changing either is a one-line edit.
+
+---
+
+## OD-9 — ACP session management (list / load / activate) was removed as dead code; wiring it to a route + UI is a feature of its own (B5)
+
+**State today:** three `AcpClient` wrappers had no product consumer. Item B5 **deleted two of them**
+from `src/rigma/harness_mcode_acp.py`: `session_list` (`session/list`) and `session_load`
+(`session/load`, the alternate wire spelling of the `session_resume` that `drive_control` already
+calls at `:1339`). **`session_activate` was kept, because it is not dead**:
+`tests/test_harness_mcode_acp.py::test_both_spellings_of_activate_work_and_the_notice_is_gated`
+(`:471`) calls it against a real child process (`tests/fake_acp_server.py`) over real pipes and
+asserts both spellings emit `mcode/session/current_session_update` — so the backlog's "zero callers
+anywhere" is wrong for that one name. `session/list` and `session/load` had no caller in `src/`,
+`tests/`, `frontend-v2/` or `src/rigma/data/`, and nothing reaches them dynamically: `drive_control`
+is an explicit `if/elif` chain, `_CONTROL_OPS` (`:1181`) lists neither, and the client is never
+dispatched through `getattr`.
+
+**Options**
+1. Leave them deleted. The ACP control plane keeps exactly the session operations it has a caller for.
+2. Re-add `session_list` and wire it to a route + a UI session picker, so a chat can continue an mcode
+   session Rigma did not start. Needs the route, the UI, and a decision about which listed session
+   becomes the chat's.
+3. Re-add `session_list` + `session_load`/`session_activate` as a full session-management panel: list,
+   reattach, mark active. The largest option, and `session_activate`'s only observable effect is the
+   `current_session_update` notice, so it needs a reason to exist beyond the panel itself.
+
+**Evidence:** the deletion is in this commit; `harness_mcode_acp.py:1339` (`session_resume` is the
+reattach that is actually wired); `tests/test_harness_mcode_acp.py:471`; the `STANDARD_METHODS`
+entries `session/load` (`:69`) and `session/list` (`:71`) were deliberately left in place — they still
+record the measured mcode surface, and the guard at `tests/test_acp_control.py:514-529` still passes
+because its fallback accepts a method whose literal appears anywhere in the file.
+
+**Recommendation: option 1**, with option 2 as its own item if the owner wants a chat to continue an
+mcode session Rigma did not start. Deleting was right because `session_list`'s only proposed consumer
+was a route with no UI caller — the anti-pattern backlog row D4 complains about — and a wrapper nothing
+calls is a false signal of capability. One honest caveat: `session_load` is *not* a capability
+`session_resume` lacks (both reattach; only the wire method name differs), so its deletion removes a
+fallback spelling, not a feature.
+
+**If nothing is decided:** nothing changes; Rigma reaches mcode sessions only through `session/new` and
+`session/resume`. This is not a blocker.
