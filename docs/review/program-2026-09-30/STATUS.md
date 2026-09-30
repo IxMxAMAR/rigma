@@ -64,8 +64,26 @@ Integration branch head: `f6a0874` (plus the docs commits that follow it).
 > `b4895fb→f8dc5b8`, `8e412f6→ca83bc0`, `091cff1→698f45f`, `be80260→17ade5c`.
 > `0ab5e3a` (A2) and `97b804c` (A3) were already correct and kept their hashes.
 
-| id | wave | commit | outcome |
-|---|---|---|---|
+## Wave 19 — the owner's decisions implemented (2026-09-30, ~20:30–21:30 UTC)
+
+The owner said **"I will trust you on those Recommendations"**, so every recommendation in
+`OWNER-DECISIONS.md` is ACCEPTED. This wave implements the contained ones and records the rest. Every
+verdict below came from a FRESH independent verifier whose brief contained rule 13; every merge was
+serial and conflict-checked (`ast.parse` + a conflict-marker grep). One conflict (dtests vs statguard,
+both in `test_tools_hardening.py`) was resolved by keeping both tests.
+
+| id | commit | outcome |
+|---|---|---|
+| dtests | `852592d` (merged `75d9cf5`) | The two full-suite failures are fixed at the source: `test_view_image_missing_file` and `test_compiled_spec_seeds_the_plan` now build their fixtures under `tmp_path`. Verifier independently reverted the hunks and reproduced both failures. |
+| OD-2 | `fcc586f` (merged `0b84d57`) | The `copy/move_files` **destination allowlist** (option 1). `write_allowlist` is a session list seeded for a new session from the owner's existing session workspaces (SQLite `json_extract`, metadata only) + RAG source folders; `_write_path` accepts the workspace, an allowlisted root, or the blanket grant. Verifier: **32 escape probes, none escaped** (prefix sibling, `..`, junctions, UNC, 8.3, case, ≥260-char paths); seed leaked no prose. |
+| OD-3 | `e60d7e9` (merged `3e519d8`) + UI `25eda5b` | A **true rebuild index** (option 2): `rag.rebuild_index()` stops the recorded sidecar, deletes the index directory, then re-ingests with the current credential denylist; `POST /api/rag/reindex` (202 / 409 busy / 400 no-raggity), owner-triggered only — no timer, no startup path. Verifier confirmed the true-rebuild ordering and the 10-5 sidecar identity check. |
+| OD-15 | `d76f08d`+`9d940b5` (merged `e706b5a`) + card `f2acf81` | `/api/restore` **truly replaces** (option 1): settings reset (`app_settings.replace`), stale user methods deleted via the store's own `delete_user`, deletions folded into A11's rollback region. Verifier's own probe forced a 500 mid-restore and proved settings + every method file + memory **byte-identical**; the card copy now says the truth. |
+| statguard | `3278b95`+`8e76911` (merged `8d5d17d`) | The **root cause** the D:-tests exposed: `anchor_spec`'s `parent.exists()` raise escaped `compile_mission`, serve swallowed it, and `run["spec"]` stayed `None` with `fallback_spec` never stored. Guarded, plus `tools._stat_ok`; and `view_image` no longer returns a **directory** named `x.png` as `IMAGE_SENTINEL`. |
+| OD-1 / OD-7 / OD-8 / OD-10 / OD-11 / OD-14 | (no code change) | Recommendations are the status quo and are recorded as IMPLEMENTED; OD-1's profile chooser gained a pinning test in `25eda5b`. OD-4/OD-5/OD-6/OD-14-option-1 are SCHEDULED with reasons. |
+
+Nits from all five verifiers are recorded in `BACKLOG.md`'s "Wave 19 nits" section; none blocks.
+
+
 | — | 0 | `8de0434` | Program docs written (BACKLOG / STATUS / HANDOFF / OWNER-DECISIONS); no source change. |
 | A1 | 1 | `4eaec9d` (`82e2bbe`) | Chat-turn persist: a fully-failed save is no longer reported as saved; the failure reaches the user on the turn-level `event: notice` channel and is logged with its `StaleWriteError` reason. |
 | A17/S2 | 1 | `30e711e` (`28ce163`) | The engine's own load log is parsed: model/KV/RS/compute buffers, host-vs-device split, `n_seq_max`, `graph splits`, and plan-vs-actual divergence. Unknown is reported as UNKNOWN, never 0. **Its first split baseline (1) and its VRAM comparison were both wrong and would have flagged the owner's healthy log — corrected in A17b/A17c (`099e2c1`), which the orchestrator had to flag via GUIDANCE 4+5 because no wave had read the live channel.** |

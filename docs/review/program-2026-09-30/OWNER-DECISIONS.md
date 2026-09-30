@@ -39,6 +39,8 @@ want a behavioural change, option 2 is the next best.
 
 ## OD-2 — `view_image` reads absolute paths outside the workspace; `copy/move_files` can write anywhere (R3-9, R3-10)
 
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1).** IMPLEMENTED in `fcc586f` (merged `0b84d57`): `view_image` already used the `allow_absolute_reads` grant (R3-TOOL-5) and an absolute transfer destination already needed the `allow_absolute_writes` grant (R3-TOOL-4); this adds the configured destination allowlist — `write_allowlist`, a session list seeded from the owner's existing session workspaces and RAG source folders (metadata only) — which `_write_path` accepts in addition to the workspace and the blanket grant. Independently verified PASS-WITH-NITS: 32 escape probes (prefix sibling, `..`, junctions, UNC, 8.3, case, ≥260-char paths) found no escape, and the seed leaked no prose. Nits recorded in `BACKLOG.md`.
+
 **State today:** `read_file` refuses an absolute path outside the workspace without a grant, but
 `view_image` does not (`findings-r3/04-sandbox-r3.md:225`), and `copy_files`/`move_files` accept any
 absolute destination — including the Startup folder (`:250`). Both are read/write confinement gaps,
@@ -64,6 +66,8 @@ the Head Agent's call.
 ---
 
 ## OD-3 — A pre-fix RAG index still holds secrets until it is reindexed (R3-11 residual)
+
+**DECIDED 2026-09-30: owner accepted the recommendation (option 2).** IMPLEMENTED: the backend is `e60d7e9` (merged `3e519d8`) — `rag.rebuild_index()` stops the recorded sidecar, deletes the index directory, then re-ingests with the current credential denylist, exposed as `POST /api/rag/reindex` (202 / 409 busy / 400 no-raggity) and never run automatically; the UI is `25eda5b`, a "rebuild index" control in the Grounding card. Both independently verified PASS-WITH-NITS; nits recorded in `BACKLOG.md`.
 
 **State today:** the credential-`exclude` denylist fix (`R3-17`) applies to *new* indexing. An index
 built before the fix still contains whatever was indexed. Reindexing is the fix, but reindexing
@@ -424,6 +428,8 @@ is the point: the next session should not rediscover it as a mystery.
 ---
 
 ## OD-15 — Should `POST /api/restore` truly replace the store, or keep merging? (D4c)
+
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1).** IMPLEMENTED in `d76f08d` + `9d940b5` (merged `e706b5a`): `POST /api/restore` now truly replaces — memory replaced, settings replaced (`app_settings.replace` resets keys the document omits), and user methods not in the document deleted through the store's own `delete_user`; the deletions are folded into A11's undo log so a failed restore rolls back byte-exactly. The Backup/Restore card copy was corrected in `f2acf81` (it had promised a replace all along). Independently verified PASS-WITH-NITS, including a fresh probe that forced a 500 mid-restore and proved settings + every method file + memory were byte-identical afterwards.
 
 **State today:** the new Backup/Restore card tells the user that restoring *"replaces the whole store…
 anything not in the file is gone"*. An independent TestClient probe measured what the route actually

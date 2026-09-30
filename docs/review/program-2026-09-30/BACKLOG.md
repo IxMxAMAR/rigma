@@ -354,3 +354,27 @@ real recorded gap. Ordered by severity within each wave. **`impl/regr`, `impl/ub
 | **W13B-3** | **DEFERRED, no commit.** The sweep's quality-lever gate cannot see a lever exported in the process env while `runtime.launch_server` merges `os.environ` into the child; the naive fix (read `os.environ`) keeps **0 of 8** configs, which destroys the measurement rather than fixing it. | `bench._effective_env`, `runtime.py:460-461` | independently confirmed correct by the verifier. The only right future fix is ambient/delta-aware (drop a config only when the trial introduces a lever beyond the ambient baseline) or a loud runtime warning — neither exists, neither is test-backed, and it is an **owner decision**. A measurement caveat, not a write-path hole. |
 
 
+
+
+## Wave 19 nits (the owner's-decisions wave)
+
+Found by the five independent verifiers; **none blocks a merge**. Recorded so a future session does not
+rediscover them as mysteries. Ordered by item.
+
+| id | nit | where | why it was not in the landed commit |
+|---|---|---|---|
+| **OD2-n1** | `tests/test_audit_sec13.py:278` `assert "credential" in out.lower()` is **vacuous** — pytest's `tmp_path` is `...\test_the_credential_denylist0\`, so even the wrong "outside the workspace" message contains "credential". It is not a guard at all. | `tests/test_audit_sec13.py` | test-strength only; the credential denylist itself really fires (proven separately). |
+| **OD2-n2** | `_write_allowlist_contains` accepts a FILE or a non-existent path as a root (no `is_dir()`), unlike the RAG half of the seed. Bounded: `mkdir` then fails, no write leaves. | `tools.py` | narrowing it is a small follow-up. |
+| **OD2-n3** | The session PATCH accepts and stores a list of non-strings (`[1,{},None]`); handled safely by `str(entry)`. | `sessions.py` | cosmetic. |
+| **OD2-n4** | A reparse-point (alias directory) workspace seeds as its resolved TARGET, broader than the literal path. | `sessions.default_write_allowlist` | intentional (both sides resolve); recorded. |
+| **OD2-n5** | Pre-existing: `_credential_path_reason` runs on the long-path-prefixed path, so its state-dir check misses >=260-char destinations. | `tools.py` | pre-existing, untouched. |
+| **OD3-n1** | The `index_dir.exists()` FALSE branch (first-ever rebuild, no index dir) has no test; the verifier verified it manually. | `rag.py` | coverage gap. |
+| **OD3-n2** | `exists()` not `is_dir()`, so a stray FILE named `index` surfaces a raw WinError 267 (busy is still cleared, no wedge). | `rag.py` | narrow. |
+| **OD3-n3** | `/api/rag/sources` still has no busy guard, so adding a source during a rebuild can still race two ingests. | `serve.py` | pre-existing, one-directional protection. |
+| **OD15-n1** | `app_settings.replace()` rebinds `clean` from the raw patch to the validated output; settings are validated twice on the restore path. | `app_settings.py`, `serve.py` | cosmetic. |
+| **OD15-n2** | `_snapshot`'s settings-absent branch is not exercised by the new tests. | `tests/test_restore_replace.py` | the verifier verified that path by reading. |
+| **OD15FE-n1** | The card says "anything not in the file is gone", but built-in methods (code constants) survive and a user-method file whose id `_method_file` refuses is skipped. | `BackupCard.tsx` | true of user-managed state; recorded. |
+| **STAT-n1** | `anchor_spec` keeps an impossible absolute path when the parent exists as a FILE (the guard covers a stat ERROR, not a wrong-type parent). | `mission.py:224` | `verify_step` degrades gracefully; a separate narrowing. |
+| **STAT-n2** | `_fuzzy_file`'s internal `x.is_file()` still leaks `[Errno 13] access denied` for a statable directory with a denied child. | `tools.py:1508` | same class, narrower state. |
+| **STAT-n3** | `mission.verify_step` still raises `[Errno 22]` on an unstatable artifact (reachable; the caller at `serve.py:6637` is not in a try). | `mission.py:152` | flagged by the implementer as out of scope. |
+| **STAT-n4** | A directory with a non-image extension now says "no such file" instead of "is not an image". | `tools.py::_resolve_image` | wording only. |

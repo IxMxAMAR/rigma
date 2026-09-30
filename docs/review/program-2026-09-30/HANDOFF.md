@@ -226,7 +226,10 @@ _(see `STATUS.md` for the per-item table with outcomes and verifier corrections)
 
 | 18 | `b5d8d61` `57bde6e` | **UBATCH-n1** (`impl/ubatch`, the compute charge reads back the ubatch the launch actually used) and **UBATCH-n1's second path** (`impl/clival`, the CLI's merged launch flags are validated before they are used — reachable via a **calibration row**, not the combo the brief guessed). Both verified; the clival verifier **corrected the commit's own arithmetic** (the tolerance is `max(512, 15%)`, not a flat 512). |
 
-Integration head at this hand-off: **`57bde6e`** (plus the docs commits that follow it). `STATUS.md`
+Integration head at this hand-off: **`3e519d8`** (plus the docs commits that follow it). **Wave 19 (the
+owner's decisions) is merged**: dtests `852592d`/`75d9cf5`, OD-2 `fcc586f`/`0b84d57`, OD-3
+`e60d7e9`/`3e519d8` + UI `25eda5b`, OD-15 `d76f08d`+`9d940b5`/`e706b5a` + card `f2acf81`, statguard
+`3278b95`+`8e76911`/`8d5d17d` — all independently verified. `STATUS.md`
 carries the per-item table and the note on the metadata-only author rewrite (with the old→new hash
 mapping for every pre-rewrite commit).
 
@@ -401,11 +404,14 @@ numbered: **W13B-3's ambient-env lever** (see the NEEDS-GPU list).
   with identical results (`2 failed, 3477 passed`, both failures pre-existing). Before believing a
   deadlock, **redirect the suite's output to a file** and re-run. That said, the six-port fix's
   guarantee deserves a re-test under load: do not read this note as proof that REC-1 is gone.
-- **Two full-suite failures are ENVIRONMENTAL, not code.** `test_tools_hardening.py::test_view_image_missing_file`
-  and `test_autonomous_run.py::test_compiled_spec_seeds_the_plan` both use `D:/...` paths, and **`D:` is
-  a BitLocker-locked drive on this host** (it does not appear in `Get-PSDrive`), so Windows returns
-  `[WinError -2144272384] This drive is locked by BitLocker` instead of "no such file". Both reproduce
-  **identically at the base `7ea1827`**. Unlock/remount `D:` or change the two tests' paths.
+- ~~Two full-suite failures are ENVIRONMENTAL, not code.~~ **FIXED in wave 19** (`852592d`, merged
+  `75d9cf5`): `test_tools_hardening.py::test_view_image_missing_file` and
+  `test_autonomous_run.py::test_compiled_spec_seeds_the_plan` built their fixtures under `tmp_path`
+  instead of hard-coding `D:/...`. The underlying **product** gap they exposed is also fixed
+  (`impl/statguard` `3278b95`, merged `8d5d17d`): a stat error on an artifact's parent used to abort
+  the mission compile silently (`run["spec"]` stayed `None` and `fallback_spec` was never stored);
+  `anchor_spec` now treats an unstatable parent as missing, and `tools._stat_ok` keeps the OS message
+  out of the tool replies. `view_image` also no longer passes a directory as an image (`8e76911`).
 - **`test_phase4_lifecycle.py` has a low-rate flake** (`test_restart_reattaches_and_finishes`, the A18
   acceptance test): 1 failure in 6 isolated runs, 12/12 in every full run. Same class as the W14-E
   flake that was fixed — worth a look, not a regression.
