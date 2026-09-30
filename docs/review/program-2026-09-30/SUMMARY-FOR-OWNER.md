@@ -1,8 +1,11 @@
 # What changed in Rigma today — a summary for the owner
 
-*Plain language. Written 2026-09-30 by the review session that has been working on
-`review/deep-audit-2026-09-22`. Every claim here is traceable to a commit and to the documents under
-`docs/review/program-2026-09-30/`; nothing in this file was measured on your GPU tonight.*
+*Plain language. Written 2026-09-30 by the review session working on
+`review/deep-audit-2026-09-22`; this version covers the whole day, including the evening
+re-verification wave. Every claim here is traceable to a commit and to the documents under
+`docs/review/program-2026-09-30/`. **Nothing in this file was measured on your GPU tonight** — the
+machine was never allowed to load a model, and every memory and speed figure below is either quoted
+from a log that already existed or labelled as a prediction.*
 
 ---
 
@@ -14,10 +17,19 @@ the API, in the CLI and in the launch dialog. Before today they were constants i
 only way to change the batch size was to edit Rigma. Setting an impossible pair is now refused with
 the *server's own* sentence, and the dialog shows you the fit's answer next to your choice.
 
+**`rigma up` restores your KV cache instead of always cold-starting.** The save/restore path existed
+but was never wired into the launch — every start re-computed the prompt cache from scratch. It now
+restores it, and if the restore is refused you get a warning and a sentence instead of silence.
+
 **You can stop a chat that is streaming on another device.** The stop control used to be tied to the
 turn the page had started; a chat streaming from a phone or another tab had no way to be stopped from
 here. There is now a real server route for it, and a request that arrives late cannot stop the *next*
 turn by accident.
+
+**A question that times out says so.** When an agent asked you something and you did not answer within
+five seconds, the question was declined but the UI was never told — the form stayed clickable and a
+late click produced an error. The server now emits a "this expired" event and the form goes disabled;
+when you do answer, the row shows an answered tick.
 
 **The launch dialog tells you what the fit actually answered, and refuses to invent a number.** It
 used to guess a context window when it could not read one, offer you steps that were impossible, store
@@ -30,17 +42,18 @@ question is on your desk (OD-15).
 
 **The budget surface names the numbers it is guessing at.** The VRAM estimate for the hybrid model's
 recurrent state used to be invisible — you could not tell a considered estimate from a placeholder.
-The plan and the UI now name it, with its provenance.
+The plan and the UI now name it, with its provenance. The KV-cache charge now carries an explicit
+"this geometry is only partly known" flag rather than being presented as a measurement.
 
-**The plan-versus-actual report is honest again.** See §2 — this one was broken *by its own fix* and
-is now fixed properly.
+**The plan-versus-actual report is honest again.** See §2 — this one was broken *by its own fix*,
+twice, and is now fixed properly.
 
 ---
 
 ## 2. The bugs that would have bitten you — in the order they would have hurt
 
-These are the ones worth reading. Each was fixed with a test that fails without the fix, and each fix
-was checked by a **separate** agent that did not write it.
+These are the ones worth reading. Each was fixed with a test that fails without the fix, and — for
+every item in waves 16 and 17 — checked by a **separate** agent that did not write it.
 
 ### Your chat history could be silently damaged
 - **A reply that failed to save could erase someone else's messages.** When a save failed, the code
@@ -55,6 +68,9 @@ was checked by a **separate** agent that did not write it.
   the session id, so "restart" answered *"the run's chat session was deleted"* — permanently. The
   test that was supposed to protect this pinned the destructive overwrite as the desired behaviour.
   Fixed, and the boot-time reaper now reconciles orphaned runs *without* touching an unreadable file.
+- **A driver could be mistaken for a live one after its process id was recycled.** Each run records
+  *which process* drives it, but the check that read that record did not actually run on the path that
+  mattered, and an identity that could not be read at all could wedge the run. Both fixed.
 
 ### The plan could be wrong on your exact model
 - **The fit did not charge the hybrid model's recurrent state.** Your 27B is 48 recurrent layers of 64;
@@ -66,11 +82,20 @@ was checked by a **separate** agent that did not write it.
   was a *differenced* quantity; your own log says the engine really uses **410.28 MiB** at ubatch 512.
   Scaling that difference up to ubatch 2048 under-reserved by **1041 MiB**. Fixed so the measured term
   is what scales.
-- **A plan-versus-actual warning fired on every launch of a healthy load — twice.** First the split
-  baseline was wrong; then its fix compared the engine's *device* VRAM against the plan's *whole-file*
-  prediction, so a perfectly healthy 33-of-65-layer spill was reported as a divergence (6017 vs 9038
-  MiB, −33 %). Fixed: a load that is not device-resident is reported as *not comparable*, never as
-  divergence — while a genuinely wrong figure still fires.
+- **A plan-versus-actual warning fired on every launch of a healthy load — twice, and then a third
+  time.** First the split baseline was wrong; then its fix compared the engine's *device* VRAM against
+  the plan's *whole-file* prediction, so a perfectly healthy 33-of-65-layer spill was reported as a
+  divergence (6017 vs 9038 MiB, −33 %). That was fixed by refusing to compare a non-device-resident
+  load — but the two sides of the comparison were then still on **different bases**: the engine's
+  device figure includes its compute/reserve buffers and the plan's deliberately excludes them. A
+  512 MiB tolerance hid that until the spill was deep, and then a healthy deep spill was reported as
+  broken again. **Fixed properly in the evening** by charging the plan the same compute term the
+  resolver already reserves against — the two sides now agree to within a rounding error — **not** by
+  widening the tolerance, which would have hidden real divergences too. A genuinely wrong figure still
+  fires, at every spill depth, and that is now pinned by a test.
+- **The plan recorded the placement you asked for, not the one it used.** On a model that has to spill
+  layers to system memory, the recorded figure was the request rather than the outcome. It now records
+  what it actually did, so the comparison above is meaningful on your MoE model too.
 
 ### A sweep could quietly make every later launch worse
 - **The calibration sweep could crown "disable attention rotation" on speed alone.** A trial that
@@ -84,6 +109,28 @@ was checked by a **separate** agent that did not write it.
   the plan, and then every trial of a tools-capable model ran the very cache the guard exists to
   avoid. Fixed, and a plan that already carries `q4_0` now **says so** instead of quietly shrinking
   the sweep.
+- **A sweep trial could be launched with settings the sweep never trialled.** The trial's flags were
+  built in two places and could drift apart. There is now one construction, and the test pins which
+  function called it rather than just its name.
+- **A tune that never happened was cached as if it had.** When there is nothing to sweep, Rigma now
+  remembers that so it stops warning on every launch — but the first version of that memory keyed the
+  decision without the settings that made it a no-op, so a plan that *later* became sweepable was
+  skipped forever. **Caught by its verifier the same hour** and fixed: the cached decision now records
+  *why* it was made and is re-checked on every launch.
+
+### A question card could lose an answer, or send an empty one
+- **Two questions at once, and one answer was lost.** The server kept one question slot per chat, so a
+  second question overwrote the first — and the first one's cleanup then freed the *second* one's
+  slot. The first answer was refused and the still-live second question became unanswerable. Fixed by
+  keying each question on its own request id.
+- **…and the first fix dropped a safety check.** With slots keyed by request id, an answer for one
+  chat was accepted through another chat's route. **Caught by the verifier the same hour** and closed;
+  the permission path (which is a different thing) was verified untouched.
+- **The question form could submit a required field as absent.** The "is the form ready?" check
+  counted the rows on screen while the code that builds the answer dropped blank rows — so a required
+  list containing only blank rows passed validation and posted an answer with that key missing
+  entirely. One function now decides whether a field is empty, so the two cannot disagree. Verified
+  against 22 hand-built shapes plus a 4,000-case random fuzz: 198 bad submissions before, 0 after.
 
 ### Processes and files
 - **On Windows, stopping an ACP agent left the agent and its subagents running.** The stop killed the
@@ -101,56 +148,68 @@ was checked by a **separate** agent that did not write it.
 ### Things that made other people's work fail
 - **A flaky test.** `test_a_pause_does_not_burn_the_clock` failed about 1 run in 10. It was a *test*
   race, not a product bug — the test set up the exact state the pause bound stalls on and released the
-  engine turn too early. A flaky test makes everyone else's work look broken; it is fixed.
-- **Two full test-suite runs at once deadlock, and the suite leaks its fake servers.** Found tonight:
-  two overlapping runs both froze (not slow — *stopped*, 0 CPU over 25 s) with **72** orphaned
-  `fake_acp_server.py` processes. Alone, the suite is green. **This one was diagnosed and fixed**
-  (`43e63de`): the shared resource was a **fixed TCP port** — `tests/test_bench.py` was the only
-  server in the whole suite that bound a literal port (11598) instead of letting the kernel choose
-  one, so the second run's child died on `address already in use` and the second run's readiness
-  check was then answered by the *first* run's server, meaning its tests silently measured another
-  process; when the first run stopped that server the second blocked on the dead socket. With a
-  foreign server answering on 11598 the old check reported "ready" while its own child never started;
-  with the same impostor listening, the fixed fixture passes. **It then happened again during the
-  final hand-off** — two more orphaned runs, another 72 leaked processes — and the session's own
-  safety guard refused to let it clean them up. The 72 are a *symptom* of those frozen runs, not a
-  second defect: `test_harness_mcode_acp.py` run alone leaves the count unchanged (61 passed, delta
-  0). The one thing left is a `conftest.py` session lock so a second full run stops with a message
-  instead of competing for the machine; see **OD-16**.
+  engine turn too early. A flaky test makes everyone else's work look broken; it is fixed, and the
+  full-suite run below is the proof.
+- **Two full test-suite runs at once deadlock, and the suite leaks its fake servers.** Two overlapping
+  runs both froze (not slow — *stopped*, 0 CPU over 25 s) with **72** orphaned `fake_acp_server.py`
+  processes. Alone, the suite is green. **Diagnosed and fixed:** the shared resource was not one fixed
+  TCP port but **six** of them (`11594`–`11599`) — test fixtures that bound a literal port instead of
+  letting the kernel choose one, so a second run's child died on "address already in use" and the
+  second run's readiness check was then answered by the *first* run's server, meaning its tests
+  silently measured another process. All six now let the kernel choose. On top of that, a second
+  **full** suite now refuses to start and exits with a clear message rather than competing for the
+  machine; deliberately, running a *single test file* is not blocked, because that is what everyday
+  work does. Verified end to end (a second full run exits 4, a single file runs fine, a run whose
+  owner died is taken over).
 
 ---
 
-## 3. How it was checked — and the one place the checking is weaker than it looks
+## 3. How it was checked — and the one weakness, and how it was closed
 
-- For **waves 0–13**, every change was verified by a **separate** agent that did not write it, on a
-  test that was first observed **failing** on the unmodified code. That is the standard, and it held.
-- **From ~16:20 UTC it did not.** Your PC shut down mid-run at 15:55 UTC; when the session resumed,
-  it had lost the ability to start subagents (`SubagentDepthError`). The work still got done and was
-  still checked — but the person checking was the same one who wrote it. That is a real weakening, so
-  it is written into `verify-w15a.md`, into `HANDOFF.md`, and here rather than glossed over. **The
-  items affected are waves 14–15** (the frontend nits, the 400-message wording, the flaky-test fix,
-  and the two deep-review-3 fixes below). They have tests and delete-the-line proofs; they have **not**
-  had an independent reader. The next session should re-verify them first.
-- **Three independent deep reviews** were run over work that had already passed those checks. They
-  found **19 real defects**, including one introduced *by a fix* and three that were the same mistake
-  one lever over. That is why the reviews exist: the tests had been shaped to the fixes. The
-  counter-measure is now a standing rule (*"name one realistic state the test does not put the code
-  in, and check the fix there"*), written into the guidance file and every verifier brief.
-- `ruff` clean; the frontend builds reproducibly, type-checks, and its 656 tests pass.
-- The full Python suite was re-run after the last merge; the result is recorded in
-  `.scratch/orchestrator/WAVES.log` and in `STATUS.md`.
+- For **waves 0–15**, every change was verified by a **separate** agent that did not write it, on a
+  test that was first observed **failing** on the unmodified code.
+- **From ~16:20 UTC that stopped.** Your PC shut down mid-run at 15:55 UTC; when the session resumed,
+  it had lost the ability to start subagents. Waves 14–15 were therefore written *and* checked by the
+  same agent. That was written down here, in `HANDOFF.md` and in `verify-w15a.md` rather than glossed
+  over — and **the first thing the evening session did was close it.** Every single-sourced verdict
+  merged after the power cut was handed to a **fresh independent verifier**, each of which also had to
+  answer the program's standing question (*"name one realistic state the test does not put the code
+  in, and check the fix there"*). That re-verification wave found real defects: one fix (the KV
+  "geometry unknown" flag) **failed** its re-verification outright — it flagged every pure-Mamba model
+  as unknown — and had to be fixed and re-verified before it could stay. **There are no single-sourced
+  verdicts left in the tree.**
+- **Four independent deep reviews** were run over work that had already passed those checks. They
+  found **23 real defects**, including several introduced *by a fix* and several that were the same
+  mistake one lever over. That is why the reviews exist: the tests had been shaped to the fixes. The
+  evening wave is the clearest proof — **two of the evening's own fixes were caught, by their
+  verifiers, introducing a regression the same hour**, and both were fixed and re-verified before the
+  night ended.
+- `ruff` clean; the frontend builds reproducibly, type-checks, and its **709** tests pass.
+- The full Python suite was re-run after the last merge, alone, with nothing else touching the tree:
+  **3,473 passed, 3 skipped, 5 deselected, 2 failed** in 8 m 05 s. **Both failures are pre-existing
+  and environmental, not regressions:** `test_view_image_missing_file` and
+  `test_compiled_spec_seeds_the_plan` both use `D:/...` paths, and **`D:` is a BitLocker-locked drive
+  on this machine** (it does not even appear in `Get-PSDrive`), so Windows answers with a BitLocker
+  error instead of "no such file". Both were reproduced **identically at the base commit `7ea1827`**,
+  and neither file was touched by this program. So: **25 merges and 3 direct commits, zero
+  regressions.**
 
 ---
 
 ## 4. What is waiting on the GPU (nothing here was run tonight)
 
 The single plan is `docs/review/findings-r3/37a-262k-verification-plan.md`; the consolidated list is
-now folded into it. The one that matters most:
+folded into it. The ones that matter most:
 
 **Launch your 27B hybrid at 2 slots and capture the buffer lines.** That one run settles four separate
 questions at once: where `token_embd` really lands, what the compute buffer really is at 2 slots,
 whether the split count the code expects is right, and — if you also run it at ubatch 1024 or 2048 —
 whether the new compute-buffer scaling is a measurement instead of a prediction.
+
+**Run one launch with `--ubatch` set, above and below `-b`.** The plan-versus-actual comparison now
+charges the compute buffer at the physical batch the launch actually used, read back from the run's
+record — but Rigma cannot know whether the engine *clamped* that value, so one real load would confirm
+the two agree.
 
 Also waiting: the 262K-context verification itself; one live mcode session (to answer `ask_user`
 end-to-end and to see the Windows ACP stop against a real agent); vLLM, which needs Linux/WSL; a
@@ -160,18 +219,21 @@ multi-GPU box; and a quality run before the fork's K-cache bias correction could
 
 ## 5. What is waiting on you
 
-Fifteen decisions, each written up with options, evidence and a recommendation, in
-`OWNER-DECISIONS.md`. The ones that would change behaviour if you chose differently:
+Sixteen decisions, each written up with options, evidence and a recommendation, in
+`OWNER-DECISIONS.md`. **Two were resolved today** (OD-12, the question-expiry event, and OD-16, the
+concurrent-suite deadlock) because the recorded recommendation was clear and cheap. The ones that
+would change behaviour if you chose differently:
 
 - **OD-15** — should "restore a backup" really *replace* your settings and methods, or is the merge
   fine now that the card says so?
-- **OD-16** — the concurrent-suite deadlock is **fixed** (a fixed TCP port); what is left is whether to
-  add a session lock so a second full run refuses to start.
-- **OD-12** — should a question that times out tell the client it expired, instead of just going quiet?
 - **OD-14** — `taskkill /T` can hit a reused process id; a Job Object per child is the real fix.
 - **OD-2** — how confined should `view_image` / `copy_files` be?
-- **OD-5** — the GPU measurements above.
 - **OD-11** — may a model shipped in the registry store your launch defaults?
+- **OD-5** — the GPU measurements above.
+- **A new one, recorded but not numbered:** the calibration sweep's quality-lever gate cannot see a
+  quality setting exported in your shell's environment (the engine inherits it, but the sweep's gate
+  does not). The obvious fix would make the sweep drop **every** candidate config, so it was
+  deliberately **not** applied — it is a measurement caveat, and the right fix is an owner decision.
 
 Nothing in this program rewrote history: the base commit `7ea1827` is untouched, every commit carries
 your identity, and nothing was pushed.

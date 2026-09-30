@@ -158,6 +158,24 @@ integration branch · `_rejected once_` = sent back to the implementer with the 
 
 - Every merged item's new test was **executed against the unmodified base** by an independent
   verifier and observed to fail there, then pass on the branch. Verdicts: `.scratch/orchestrator/verify-*.md`.
+- **Wave 16 closed the single-sourced gap.** Waves 14–15 had been written *and* checked by the same
+  Head Agent (the 15:55 resume could not spawn subagents). Every verdict merged after that power cut
+  was handed to a **fresh independent verifier**, each also answering rule 13. **There are no
+  single-sourced verdicts left in the tree.** One of them — A2d-kv — **FAILED** its re-verification
+  (the derived `kv_geometry_unknown` clause flagged every pure-Mamba spec) and had to be fixed at
+  `aa7ed80` and re-verified before it could stay.
+- **Wave 17's own fixes were caught by the verifiers that checked them.** Two regressions introduced
+  by fixes merged the same hour — `OD12N2-n1` (moving question slots to request-id keys silently
+  dropped the cross-session scoping check) and `W15AN2-n1` (the cached "nothing to calibrate"
+  decision omitted the flags that made it a no-op) — were found by the independent verifiers, fixed on
+  `impl/regr` (`b6b04dd`), and re-verified PASS. That is the program's whole premise working.
+- **FULL SUITE at `b5d8d61`: 2 failed, 3473 passed, 3 skipped, 5 deselected** in 485.78 s. Both
+  failures are **PRE-EXISTING and ENVIRONMENTAL**, reproduced **identically at the base `7ea1827`** in
+  a throwaway worktree: `test_tools_hardening.py::test_view_image_missing_file` and
+  `test_autonomous_run.py::test_compiled_spec_seeds_the_plan` both use `D:/...` paths, and **`D:` is a
+  BitLocker-locked drive on this host** (absent from `Get-PSDrive`), so Windows returns
+  `[WinError -2144272384] This drive is locked by BitLocker` instead of "no such file". Neither file
+  was touched by this program. **Zero regressions from 25 merges + 3 direct commits.**
 - A2's charge moved two existing expectations on purpose (`test_launch_cache_ceiling`: ngl 58→55 and
   "7 of 64"→"10 of 64"; `test_quant_quality`: ngl 52→53). The verifier recomputed both by hand and
   agreed they are the exact consequence of the charge, not weakened assertions.

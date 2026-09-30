@@ -318,6 +318,23 @@ a second one.** The open fit questions it should now also answer:
    device labels and cannot be executed here).
 6. `E2` — re-derive `COMPUTE_BUFFER_MB` from a measurement (Tier G's `G4` warns that raising it
    blindly re-introduces a double count of the draft head's buffers).
+7. **Is `plan.flags.ubatch` the engine's physical `n_ubatch`?** (`impl/ubatch` @ `07342df`.) The
+   plan-side compute charge now reads back the `-ub` the launch emitted, from `state.json`. Rigma
+   refuses `ubatch > batch` at write time, but **llama.cpp can clamp `n_ubatch` to `n_batch`** and no
+   engine ran to confirm the two agree. One real load with `--ubatch N`, above and below `batch`,
+   reading the engine's own `n_ubatch`, settles it. UBATCH-n1 is the related latent hole: the CLI's
+   merged flags are unvalidated, so a combo-set `batch` plus a larger `--ubatch` would record the
+   request while the engine clamps.
+8. **The compute charge at a second ubatch point** (item 1(b), restated with a reason). The 150 MiB
+   default charge plus the 512 MiB tolerance is what keeps a healthy load quiet (DR21RN1-n2), and
+   that arithmetic is a PREDICTION from the one measured 410.28 MiB at ub 512. One load at ubatch
+   1024 or 2048 turns it into a measurement.
+9. **W13B-3's ambient-env lever** (deferred; owner decision). The sweep's quality-lever gate cannot
+   see a lever exported in the process env while `runtime.launch_server` merges `os.environ` into the
+   child; the naive fix keeps **0 of 8** configs, so it was correctly deferred. Deciding whether the
+   sweep should be ambient-aware needs a real sweep with a quality lever exported, on a card.
+
+The same list, in more detail, is in `findings-r3/37a-262k-verification-plan.md`.
 
 ## What is waiting on the owner
 
@@ -325,9 +342,11 @@ a second one.** The open fit questions it should now also answer:
 stale RAG index, OD-4 LoRA feature, OD-5 the two GPU measurements, OD-6 the ACP client, OD-7 draft
 retention, OD-8 the queue cap and question wait, OD-9 ACP session management, OD-10 the DSH approval
 trail, OD-11 whether a shipped registry model may store launch defaults, OD-12 the question-expiry
-event, OD-13 the remote-stop affordance (**implemented** — option 1 was the recommendation), OD-14
-`taskkill /T` pid reuse vs a Job Object, OD-15 whether `/api/restore` should truly replace. Each has
-options, evidence and a recommendation.
+event (**RESOLVED** — option 1 was implemented), OD-13 the remote-stop affordance (**implemented** —
+option 1 was the recommendation), OD-14 `taskkill /T` pid reuse vs a Job Object, OD-15 whether
+`/api/restore` should truly replace, OD-16 the concurrent-suite deadlock (**RESOLVED** — options 1
+and 3 both taken). Each has options, evidence and a recommendation. One item is recorded but not yet
+numbered: **W13B-3's ambient-env lever** (see the NEEDS-GPU list).
 
 ## How to continue the program in a new session
 
@@ -335,7 +354,8 @@ options, evidence and a recommendation.
    file and `STATUS.md`.
 2. `git log --oneline -25` on `review/deep-audit-2026-09-22` to see what landed.
 3. `[DateTime]::UtcNow` — the tokenjuice model retires **2026-09-30 23:59 UTC**. Start no new item
-   after **22:00 UTC**; the hand-off must be committed by **22:45 UTC**.
+   after **21:30 UTC**; the final record must be committed by **22:15 UTC**. (`Get-Date -AsUTC` does
+   not exist on this host — use `[DateTime]::UtcNow`.)
 4. Pick the next `DO` item from `BACKLOG.md` (ranked), spawn one implementer per item on disjoint
    files (brief = the item's cause/resolution/evidence + the §0 text verbatim + the pytest
    semaphore + "read GUIDANCE.md"), then one INDEPENDENT verifier per diff (fresh context; reads only
