@@ -282,6 +282,41 @@ Testing it needs calibration work (the `llama-kv-mean-center` tool over a text c
 quality run — GPU/CPU work for another night. It is recorded here so the ROCm q4_0 fallback has a
 documented path to better quality, and deliberately **not** wired into Rigma until a number exists.
 
+## The consolidated NEEDS-GPU list (folded in 2026-09-30, from the program hand-off)
+
+This is the single place the program's GPU-blocked questions live. **Do not start a second plan.**
+Everything below needs a free card and is labelled with what it would settle.
+
+1. **The hybrid at 2 slots (the highest-value one).** Launch
+   `Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf` (arch `qwen35`, 64 layers, 48 recurrent,
+   `full_attention_interval=4`) at **ctx 65536, ubatch 512, `--parallel 2 --kv-unified`**, and capture
+   the `load_tensors` / `sched_reserve` / `llama_memory_recurrent` / `graph splits` lines. It answers
+   four separate code questions at once:
+   - (a) does `token_embd` still land in `CPU_Mapped` host memory at 2 slots — and is that a property
+     of the fork or of the model? (`CPU_Mapped model buffer size = 322.07 MiB` in the existing log.)
+   - (b) what is `compute buffer size` at 2 slots? `COMPUTE_BUFFER_MB = 150` in `resolve.py` is a
+     **differenced** quantity (the draft head's buffers were subtracted), and C10 now scales the
+     engine's **measured** `410.28 MiB` above ubatch 512 — so this turns a PREDICTION into a
+     measurement. `E2`/`G4`: raising the constant blindly re-introduces a double count.
+   - (c) **A17b's** code expects `graph splits = 2` on exactly this load, and `.scratch/prism-v.log`
+     is the only evidence that it does.
+   - (d) **DR2-3's** second ubatch point: run it once more at **ubatch 1024 or 2048** and the linear
+     scaling `compute_buffer_mb = 410.28 * ubatch/512` becomes measured instead of predicted.
+2. **The 262K-context verification itself** — the depth table in `37-262k-context.md` §3–§4, run
+   top-to-bottom per this document.
+3. **One live mcode session** — answering `ask_user` end-to-end and the DSH ACP client (OD-6). Also
+   the only way to observe the **Windows** ACP stop (DR2) against a real `mcode.cmd` + node agent
+   rather than the fake, and the only way to see whether the DR6 grep wall clock is ever hit by a
+   legitimate scan.
+4. **vLLM phases 1–5** need Linux/WSL + a GPU; on Windows `vllm_availability` refuses
+   (`engines.py:288-291`). Only unit-level work with fakes is possible on this host.
+5. **A multi-GPU machine** would settle **A17e** — the device-count split baseline is derived from
+   the load's own device labels and cannot be executed here — and would give DR2-1's
+   `weights_are_device_resident` a real two-device spill to judge.
+6. **A quality run for the fork's K-cache bias correction** (`--kv-mean-center`, see the section
+   above): it needs the `llama-kv-mean-center` calibration over a corpus plus a perplexity run. It is
+   deliberately **not** wired into Rigma until a number exists.
+
 ## Provenance
 
 Flags and semantics: `PrismML-Eng/llama.cpp` at `87268f77`, `tools/llama-bench/llama-bench.cpp`
