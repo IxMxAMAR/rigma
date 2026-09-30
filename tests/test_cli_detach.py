@@ -28,11 +28,29 @@ def _fake_probe(gpu_table, raw_gpus=None):
                            disk_free_gb=400.0)
 
 
-def _block_port(port):
+def _free_port() -> int:
+    """An ephemeral loopback port the OS just told us was free."""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
+def _block_port(port: int = 0):
+    """Occupy a loopback port and return (socket, port).
+
+    REC-1: this used to be `_block_port(11594)` / `_block_port(11595)` — literal
+    binds shared by every concurrent run, so two runs collided here with an
+    OSError. Binding 0 and reading the kernel's choice keeps the assertion (the
+    port is in use) with no shared resource. The blocker stays open for the
+    caller to close.
+    """
     s = socket.socket()
     s.bind(("127.0.0.1", port))
     s.listen(1)
-    return s
+    return s, int(s.getsockname()[1])
 
 
 def test_detached_argv_drops_detach_and_avoids_prompts(monkeypatch):
@@ -70,9 +88,9 @@ def test_detach_checks_the_port_first_ui_only(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     spawned = []
     monkeypatch.setattr(cli, "_spawn_detached", lambda port: spawned.append(port))
-    blocker = _block_port(11595)
+    blocker, port = _block_port()
     try:
-        res = runner.invoke(cli.app, ["up", "--detach", "--port", "11595"])
+        res = runner.invoke(cli.app, ["up", "--detach", "--port", str(port)])
     finally:
         blocker.close()
     assert res.exit_code == 1 and "in use" in res.output.lower()
@@ -84,11 +102,11 @@ def test_detach_checks_the_port_first_with_model(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
     spawned = []
     monkeypatch.setattr(cli, "_spawn_detached", lambda port: spawned.append(port))
-    blocker = _block_port(11594)
+    blocker, port = _block_port()
     try:
         res = runner.invoke(cli.app, ["up", "--detach", "--model",
                                       "qwen3.6-35b-a3b", "--use-case", "coding",
-                                      "--port", "11594"])
+                                      "--port", str(port)])
     finally:
         blocker.close()
     assert res.exit_code == 1 and "in use" in res.output.lower()
@@ -99,8 +117,9 @@ def test_detach_spawns_once_the_port_is_clear(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     spawned = []
     monkeypatch.setattr(cli, "_spawn_detached", lambda port: spawned.append(port))
-    res = runner.invoke(cli.app, ["up", "--detach", "--port", "11592"])
-    assert res.exit_code == 0 and spawned == [11592]
+    port = _free_port()  # ephemeral, not the literal 11592 a concurrent run shares
+    res = runner.invoke(cli.app, ["up", "--detach", "--port", str(port)])
+    assert res.exit_code == 0 and spawned == [port]
 
 
 def test_detached_log_path_is_under_rigma_home(tmp_path, monkeypatch):
