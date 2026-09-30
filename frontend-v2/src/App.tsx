@@ -17,6 +17,7 @@ import Palette from "./Palette";
 import WorkspacePanel from "./WorkspacePanel";
 import { parseParamRanges } from "./lib/paramLimits";
 import { tpsHint } from "./lib/telemetry";
+import { saveWorkspace } from "./lib/workspace";
 import { SURFACES, useApp } from "./store";
 
 function Sidebar() {
@@ -87,17 +88,19 @@ function Header() {
   const currentId = useChat((s) => s.currentId);
   const [copied, setCopied] = useState(false);
   const [editingWs, setEditingWs] = useState(false);
+  const [wsErr, setWsErr] = useState<string | null>(null);
   const setWorkspacePath = useApp((s) => s.setWorkspacePath);
   const saveWs = async (raw: string) => {
     setEditingWs(false);
+    setWsErr(null);
     const v = raw.trim();
     if (v === workspacePath || !currentId) return;
-    await fetch(`/api/sessions/${currentId}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ workspace: v }),
-    }).catch(() => {});
-    setWorkspacePath(v);
+    // The path is written to the store ONLY when the server accepted it.
+    // Setting it optimistically is how the header came to show a working
+    // directory the session was not using, with the failure swallowed (A10).
+    const res = await saveWorkspace(currentId, v);
+    if (res.ok) setWorkspacePath(v);
+    else setWsErr(res.error);
   };
   return (
     <header className="h-12 shrink-0 flex items-center gap-4 px-5 bg-panel">
@@ -156,6 +159,17 @@ function Header() {
                 <External />
               </button>
             </>
+          )}
+          {/* The server's reason the path was not saved. Without it a refused
+              save was indistinguishable from a saved one (A10). */}
+          {wsErr && (
+            <span
+              role="alert"
+              title={wsErr}
+              className="min-w-0 truncate text-[11px] text-red"
+            >
+              {wsErr}
+            </span>
           )}
         </span>
       )}
