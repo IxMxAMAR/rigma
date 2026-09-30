@@ -114,6 +114,10 @@ def test_vulkan_advice_is_included_when_the_model_needs_a_fork(monkeypatch):
 # --- the engine fingerprint --------------------------------------------------
 
 def test_a_missing_oracle_yields_no_fingerprint():
-    """No oracle means no measurement, and no measurement must not become a verdict."""
+    """No oracle means no measurement, and no measurement must not become a verdict.
+
+    A5: "no oracle" is now `_ENGINE_UNASKED`, distinct from `None` (the engine ran and
+    did not refuse the file). The two used to collapse, which let the model-side guess
+    be printed as the engine's verdict."""
     assert cli._engine_type_count(Path("nope") / "llama-server.exe",
-                                  Path("model.gguf")) is None
+                                  Path("model.gguf")) is cli._ENGINE_UNASKED

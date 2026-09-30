@@ -416,7 +416,7 @@ def update():
     """Fetch the latest community combo registry (and engine pin) from
     GitHub."""
     from .registry import update_registry
-    from .runtime import _engines_manifest, update_engines_manifest
+    from .runtime import _engines_manifest, update_engines_manifest_result
 
     before = Registry.load()
     dest = update_registry()
@@ -426,12 +426,28 @@ def update():
                f"combos {len(before.combos)} -> {len(after.combos)}")
     # engine pin rides the same update: llama.cpp ships weekly, pip doesn't
     old_v = _engines_manifest().get("version", "?")
-    if update_engines_manifest():
-        new_v = _engines_manifest().get("version", "?")
-        typer.echo(f"engine pin: {old_v} -> {new_v}"
-                   + ("" if new_v != old_v else " (unchanged)"))
-    else:
-        typer.echo(f"engine pin: {old_v} (no newer pin published)")
+    typer.echo(_engine_pin_line(old_v, update_engines_manifest_result()))
+
+
+def _engine_pin_line(old_v: str, res) -> str:
+    """One line for the engine half of `rigma update` (A6).
+
+    Every failure used to print "(no newer pin published)", so an offline user or a
+    failed download was told the pin was current. Each outcome now says what
+    actually happened, in the CLI's one-line voice."""
+    from .runtime import (MANIFEST_CURRENT, MANIFEST_NETWORK, MANIFEST_UNSAVED,
+                          MANIFEST_UNUSABLE)
+    if res.status == MANIFEST_CURRENT:
+        return f"engine pin: {old_v} (already current)"
+    if res.status == MANIFEST_NETWORK:
+        return f"engine pin: {old_v} (could not reach the network — not checked)"
+    if res.status == MANIFEST_UNUSABLE:
+        return (f"engine pin: {old_v} (the published pin was fetched but is "
+                f"unusable)")
+    if res.status == MANIFEST_UNSAVED:
+        return (f"engine pin: {old_v} (fetched {res.version or '?'} but could not "
+                f"save it)")
+    return f"engine pin: {old_v} -> {res.version or '?'}"
 
 
 def _port_status(port: int) -> str:
@@ -983,11 +999,13 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
     # how the owner met this: an opaque `invalid ggml type 142. should be in [0, 42)`.
     #
     # The engine's own `[0, N)` bound is measured, not assumed, so the verdict is for
-    # THIS build rather than for mainline in general.
+    # THIS build rather than for mainline in general. Only the ENGINE's refusal may
+    # refuse (A5): a model-side note is printed for the user but never blocks a launch,
+    # because it is a heuristic known to be wrong for fork quant types.
     _compat_note = _engine_compat_note(model_path, server_exe, rp.backend)
     if _compat_note:
         typer.echo(_compat_note)
-        if refuse:
+        if refuse and _compat_note_refuses(_compat_note):
             raise typer.Exit(1)
     res, disagree = memtruth.verify_plan(
         rp, str(model_path), server_exe,
@@ -1017,6 +1035,35 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
         raise typer.Exit(1)
 
 
+# `_engine_type_count` returns this when the engine could not be asked at all: no
+# `llama-fit-params` oracle beside the server, or the probe itself raised. It is NOT
+# the same answer as `None`. `None` means the engine RAN and did not refuse the file,
+# which is a verdict ("it loads"); this means there is no verdict.
+class _Unasked:
+    """The type of `_ENGINE_UNASKED`; one instance exists, as a sentinel."""
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "_ENGINE_UNASKED"
+
+
+_ENGINE_UNASKED = _Unasked()
+
+# The engine's own refusal is the only compat note that may trip `--refuse` (A5). A
+# model-side note is shown to the user but must NOT refuse: the model-side heuristic is
+# known to be wrong for fork quant types, and an engine that cannot be asked (a fork
+# build shipping no `llama-fit-params`) is exactly the case where refusing would block
+# a model the fork loads.
+_ENGINE_REFUSAL_BANNER = "verify: THIS ENGINE CANNOT LOAD THIS MODEL"
+_MODEL_SIDE_BANNER = ("verify: the engine could not be asked — this is an UNVERIFIED "
+                      "model-side check")
+
+
+def _compat_note_refuses(note: str) -> bool:
+    """Whether a compat note is the ENGINE's own refusal, i.e. may trip `--refuse`."""
+    return note.startswith(_ENGINE_REFUSAL_BANNER)
+
+
 def _engine_compat_note(model_path, server_exe, backend: str) -> str:
     """Whether this engine can load this model, as a printable note (R3-ENG-2/4).
 
@@ -1028,8 +1075,28 @@ def _engine_compat_note(model_path, server_exe, backend: str) -> str:
     running the cheap `llama-fit-params` oracle, so the bound describes THIS build:
     the pinned b9867 accepts ids below 42 and therefore rejects Q2_0 = 42, which
     exists on master only.
+
+    The model side is checked first (base order): an unreadable file is an unknown, not
+    a verdict, and a file the model-side heuristic is happy with needs no engine probe.
+    Only when it flags a problem is the engine asked, and then the ENGINE's answer is
+    authoritative — it may load a file the model-side check calls unloadable. The
+    model-side verdict is used as a refusal ONLY when the engine cannot be asked; that
+    note carries `_MODEL_SIDE_BANNER` and does NOT trip `--refuse`
+    (`_compat_note_refuses`), because the model-side heuristic is known to be wrong for
+    fork quant types and an unaskable engine (a fork build with no `llama-fit-params`)
+    is exactly the case where refusing would block a model the fork loads.
+
+    What A5 actually fixed, honestly: a model the engine CAN load was never reported
+    unloadable on the ordinary path — a non-None `_engine_type_count` means the engine
+    really did refuse (`memtruth.load_error` is set only on a load failure). The real
+    defects were (1) the stale model-side `c` printed under the engine's banner when
+    the explanation re-read raised, and (2) `None` conflating "the engine loaded it"
+    with "the engine could not be asked", which would have made the model-side fallback
+    reintroduce the original false alarm.
     """
     from . import engine_compat
+
+    # The model side first, exactly as before: unreadable is an unknown, not a verdict.
     try:
         c = engine_compat.check_gguf(model_path)
     except Exception:
@@ -1037,30 +1104,60 @@ def _engine_compat_note(model_path, server_exe, backend: str) -> str:
     if c.ok:
         return ""
 
-    # The model side says it needs something mainline lacks. Before saying so, ASK
-    # THE ENGINE — a registered fork may load this file perfectly well, and warning
-    # about a model that loads is exactly the false alarm this must not produce.
-    # `_engine_type_count` returns None precisely when the engine did NOT refuse the
-    # file, which is the authoritative answer and overrides the model-side guess.
+    # The model side says it needs something mainline lacks. Before saying so, ASK THE
+    # ENGINE — a registered fork may load this file perfectly well. Three answers: a
+    # count (it refused), None (it ran and did not refuse — it loads), or
+    # _ENGINE_UNASKED (no oracle / probe died). Collapsing the last two is what let the
+    # model-side guess masquerade as the engine's verdict.
     count = _engine_type_count(server_exe, model_path)
     if count is None:
+        # The engine ran and did not refuse the file: it loads. Authoritative, and it
+        # overrides the model-side guess — a registered fork may load a file the
+        # model-side check calls unloadable, and warning about a model that loads is
+        # exactly the false alarm this must not produce.
         return ""
+
+    if count is _ENGINE_UNASKED:
+        # No engine answer is available, so the model-side heuristic is all there is.
+        # Print it, but under a banner that says it is unverified and that the refuse
+        # gate will not act on.
+        return _compat_lines(_MODEL_SIDE_BANNER, c.reason, c.advice,
+                             "model-side heuristic (the engine could not be asked)")
+
+    # The engine refused the file. Re-read the histogram and let `check_engine` explain
+    # it, so the reason names THIS engine's bound rather than mainline's.
     try:
         from .gguf_meta import read_tensor_index
         idx = read_tensor_index(model_path)
         c = engine_compat.check_engine(idx.type_counts, engine_type_count=count,
                                        backend=backend, complete=idx.types_complete)
     except Exception:
-        pass
+        # The engine refused, but the histogram could not be re-read to say which type.
+        # The REFUSAL still stands — it is the engine's own measured answer, and base
+        # behaviour refused here — so return an engine-sourced note, not "" and never
+        # the model-side guess.
+        return _compat_lines(
+            _ENGINE_REFUSAL_BANNER,
+            f"the engine refused this file: its type table ends at {count}, so it "
+            f"rejects any type id at or above that",
+            "",
+            "the engine's own type-table bound")
     if c.ok:
         return ""
-    lines = ["verify: THIS ENGINE CANNOT LOAD THIS MODEL", f"         {c.reason}"]
-    if c.advice:
-        lines.append(f"         fix: {c.advice}")
+    return _compat_lines(_ENGINE_REFUSAL_BANNER, c.reason, c.advice,
+                         "the engine's own type-table bound")
+
+
+def _compat_lines(banner: str, reason: str, advice: str, source: str) -> str:
+    """The printable compat note, ending with WHERE the verdict came from."""
+    lines = [banner, f"         {reason}"]
+    if advice:
+        lines.append(f"         fix: {advice}")
+    lines.append(f"         source: {source}")
     return "\n".join(lines)
 
 
-def _engine_type_count(server_exe, model_path) -> int | None:
+def _engine_type_count(server_exe, model_path) -> int | None | _Unasked:
     """The engine's `GGML_TYPE_COUNT`, read from its own refusal to load a model.
 
     llama.cpp prints `should be in [0, N)` where N is the binary's compiled-in type
@@ -1069,18 +1166,23 @@ def _engine_type_count(server_exe, model_path) -> int | None:
     that reports it (the research checked), so a deliberate failed load is the only
     way to ask.
 
+    Returns that count when the engine REFUSED the file, `None` when the engine ran
+    and did NOT refuse it (so the file loads), or `_ENGINE_UNASKED` when the engine
+    could not be asked at all. The last two are different answers and must not be
+    conflated.
+
     Cheap: `llama-fit-params` does no allocation and rejects an unloadable file in
     about a tenth of a second.
     """
     from . import engine_compat, memtruth
     exe = memtruth.fit_params_bin(server_exe)
     if exe is None:
-        return None
+        return _ENGINE_UNASKED
     try:
         res = memtruth.run_fit(str(exe), ["-m", str(model_path), "-c", "512",
                                           "-ngl", "1"], timeout=30.0)
     except Exception:
-        return None
+        return _ENGINE_UNASKED
     return engine_compat.parse_type_count(getattr(res, "load_error", "") or "")
 
 
