@@ -646,6 +646,60 @@ def _load_run_for_loop(runs_mod, run_id: str):
     return None, False
 
 
+def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
+    """Release the one-run slot for a run whose state cannot be read.
+
+    A18 / R3-RUN-5. `runs.load` returns None for BOTH "the file is gone" and "I
+    could not read it"; `_load_run_for_loop` retries and tells the two apart.
+    When the state is STILL unreadable there is no run dict to hand `set_status`
+    — and `runs.active()` cannot see the run either, because it loads the same
+    file, so `set_status`'s own slot release never fires. Left alone, the loop
+    died there and run.json stayed `running` with active.json still pointing at
+    it: pause and inject answered 409 "run has no driver", restart 409 "run is
+    running", a new run 409 "a run is already active". Only Stop cleared it.
+
+    So the slot is released explicitly: a terminal status for the id we were
+    asked to drive, then the active pointer dropped when it points here. The
+    record written is minimal when the real one could not be read, so whatever
+    is on disk is copied aside first — a release must be recoverable, not
+    destructive. The run's mission and transcript survive on its session, so
+    `restart` still reattaches meaningfully.
+    """
+    run = None
+    try:
+        run = runs_mod.load(run_id)      # the lock may have cleared by now
+    except Exception:
+        run = None
+    if run is None:
+        try:
+            src = runs_mod.run_dir(run_id) / "run.json"
+            dst = src.with_name(f"run.json.unreadable-{int(time.time())}")
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+        except Exception:
+            pass            # nothing to preserve, or it is locked as well
+        run = {"id": run_id}
+    if run.get("status") not in runs_mod.TERMINAL:
+        try:
+            runs_mod.set_status(run, "interrupted", reason)
+        except Exception:
+            _log.exception("run %s: could not write a terminal status", run_id)
+    # The pointer is read directly, by id: `runs.active()` returns None for an
+    # unreadable run, and clearing unconditionally could free a DIFFERENT run's
+    # slot — a new run may have started since this one wedged.
+    try:
+        raw = json.loads(runs_mod._active_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = None
+    except Exception:
+        raw = {"id": run_id}    # an unreadable pointer is nobody's claim
+    if isinstance(raw, dict) and raw.get("id") == run_id:
+        try:
+            runs_mod.clear_active()
+        except Exception:
+            _log.exception("run %s: could not release the active slot", run_id)
+
+
 def _patch_session(sid: str, body: dict) -> dict | None:
     """Apply only the fields in `body` to a session, without clobbering a turn.
 
@@ -5598,7 +5652,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         from . import tools as toolkit
 
         from . import runs as _runs
-        run = _runs.load(run_id)
+        # A18: the FIRST load gets the same guard as every later one. It used to
+        # be a bare `_runs.load(run_id)` followed by `run["session_id"]`, and
+        # `load` swallows every exception and returns None — so one transient
+        # unreadable run.json raised TypeError HERE, the driver task died before
+        # its first iteration, and the run stayed `running` with its slot
+        # claimed: pause and inject answered 409 "run has no driver", restart
+        # 409 "run is running", a new run 409 "a run is already active". Only
+        # Stop cleared it. Found by the full suite under concurrency
+        # (test_phase4_lifecycle's restart test), not by reading.
+        run, readable = _load_run_for_loop(_runs, run_id)
+        if not readable:
+            _release_unreadable_run(_runs, run_id, "run state could not be read")
+            return
+        if run is None:
+            return                    # deleted: nothing to drive
         sid = run["session_id"]
         try:
             await _compile_spec(run_id, sid)
@@ -5620,9 +5688,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # by a loop that no longer exists.
                 run, readable = _load_run_for_loop(_runs, run_id)
                 if not readable:
-                    if run is not None:
-                        _runs.set_status(run, "interrupted",
-                                         "run state could not be read")
+                    # A18: `run` is None here by construction, so the old
+                    # `if run is not None: set_status(...)` was dead code and
+                    # the slot stayed claimed. Release it explicitly.
+                    _release_unreadable_run(_runs, run_id,
+                                            "run state could not be read")
                     break
                 if run is None:
                     break
