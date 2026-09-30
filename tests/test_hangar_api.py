@@ -304,6 +304,44 @@ def test_the_ctx_guard_reads_the_one_launch_floor(home, upstream, monkeypatch):
     assert seen == [4096], "the engine was touched for a refused ctx"
 
 
+def test_a_ctx_below_the_floor_is_raised_to_the_launch_floor():
+    """CTXFLOOR-n4: the raise-to, not only the preflight guard.
+
+    `test_the_ctx_guard_reads_the_one_launch_floor` fakes `perform_switch`, so it
+    proves the guard and its 400 body follow `MIN_LAUNCH_CTX`; the raise-to
+    INSIDE `perform_switch` is never run. The real `perform_switch` cannot be
+    driven past the raise-to without launching an engine (§0.1 forbids that
+    here), so this pins the pure function that computes it —
+    `server_ops._raised_launch_ctx` — and checks structurally that
+    `perform_switch` is its caller, so the arithmetic cannot be re-inlined
+    behind the test's back. The only seam left unexecuted is `perform_switch`
+    itself.
+    """
+    import inspect
+
+    from rigma import models, server_ops
+
+    floor = models.MIN_LAUNCH_CTX
+    # Below the floor is RAISED, not rejected: the route's 400 is the front
+    # door, and this is the defensive path a non-route caller (a model's stored
+    # launch default) reaches.
+    assert server_ops._raised_launch_ctx(1, 32768) == floor
+    assert server_ops._raised_launch_ctx(floor - 1, 32768) == floor
+    # At and above the floor the request passes through unchanged...
+    assert server_ops._raised_launch_ctx(floor, 32768) == floor
+    assert server_ops._raised_launch_ctx(floor + 1, 32768) == floor + 1
+    # ...until the model's native window caps it (still a ceiling)...
+    assert server_ops._raised_launch_ctx(999999, 32768) == 32768
+    # ...and even a native window BELOW the floor cannot price under it.
+    assert server_ops._raised_launch_ctx(999999, floor - 1) == floor
+    # The floor is the live module global, not a copy bound at definition time.
+    assert server_ops._raised_launch_ctx(1, 32768, floor=4096) == 4096
+    # The call site: `perform_switch` must use the one helper, not re-inline it.
+    body = inspect.getsource(server_ops.perform_switch)
+    assert "_raised_launch_ctx(" in body
+    assert "MIN_LAUNCH_CTX" not in body
+
+
 def test_prefill_not_doubled_when_engine_echoes(home, tmp_path, monkeypatch):
     """User-reported 2026-07-18: prefill appeared twice. llama-server echoes
     the assistant prefix, so we must not also stream/prepend it."""
