@@ -1,10 +1,12 @@
 // D4c: `/api/backup` (GET) and `/api/restore` (POST), from the UI's side.
 //
-// `/api/restore` OVERWRITES THE WHOLE STORE — settings, every user method, and
-// memory — so the decision this module owns is not "how do we render it" but
-// "what, exactly, is about to be replaced". `restoreSummary` answers that from
-// the file itself, before anything is sent, and the card refuses to post until
-// the user has confirmed that sentence.
+// `/api/restore` REPLACES MEMORY and MERGES settings and methods: the file's
+// settings keys are written over the stored ones, each file method is saved by
+// id (nothing is deleted), and the memory store is replaced outright
+// (`serve.py::_apply_restore`). So the decision this module owns is not "how do
+// we render it" but "what, exactly, is about to change". `restoreSummary`
+// answers that from the file itself, before anything is sent, and the card
+// refuses to post until the user has confirmed that sentence.
 //
 // The route is all-or-nothing (A11): it validates the WHOLE document and then
 // applies it, so the only errors the UI can show are the server's own — a bad
@@ -60,9 +62,9 @@ export function parseBackup(text: string): ParseBackup {
   return { ok: true, doc: o as unknown as BackupDoc };
 }
 
-/** What the file will put in place — the sentence the confirmation shows. It
- *  names the three stores the route writes, with the counts the document
- *  actually carries, so "restore" is never a blind click. */
+/** What the file carries — the sentence the confirmation shows. It names the
+ *  three sections the route applies, with the counts the document actually
+ *  carries, so "restore" is never a blind click. */
 export function restoreSummary(doc: BackupDoc): string {
   const keys = doc.settings ? Object.keys(doc.settings).length : 0;
   const methods = doc.methods?.length ?? 0;

@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseBackup, postRestore, restoreSummary } from "./backup";
 
-// D4c. `/api/restore` replaces the whole store, so the two facts this module
-// must get right are: what the file actually contains (so the confirmation can
-// name it), and the server's own sentence when it refuses.
+// D4c. `/api/restore` replaces memory and merges settings and methods, so the
+// two facts this module must get right are: what the file actually contains (so
+// the confirmation can name it), and the server's own sentence when it refuses.
 
 const DOC = {
   rigma_backup: 1,
