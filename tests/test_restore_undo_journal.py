@@ -121,3 +121,101 @@ def test_a_clean_restore_clears_the_journal(home):
     undo = serve._restore_undo_dir()
     assert not undo.exists() or not any(undo.iterdir()), (
         "a clean restore left its undo journal behind")
+
+
+# ---------------------------------------------------------------------------
+# E1 (verifier escape): the journal had no COMMIT record.
+#
+# It was spent only by deleting the directory, so a kill between the commit and
+# the clear — the exact crash class the feature targets — or a silent rmtree
+# failure made the next boot's replay roll back a restore that had already
+# been applied. The boot step must DISCARD a committed journal, never replay it.
+# ---------------------------------------------------------------------------
+
+
+def test_committed_restore_is_not_reverted_when_the_clear_fails(
+        home, monkeypatch):
+    """`rmtree` fails silently after a successful apply: the journal is still
+    on disk and carries the commit marker, so boot must discard it."""
+    store = MemoryStore(home / "memory" / "memories.jsonl")
+    store.add(kind="pitfall", text="original")
+    full, errs = methods.validate_user(_doc("mine"))
+    assert not errs, errs
+    monkeypatch.setattr(serve.shutil, "rmtree", lambda *a, **k: None)
+
+    serve._apply_restore(
+        store,
+        [("settings", app_settings.settings_path()),
+         ("memory", store.path)],
+        {"idle_unload_minutes": 5},
+        [full],
+        [{"id": "m1", "kind": "technique", "text": "restored"}])
+    assert [m["text"] for m in store.all()] == ["restored"]
+
+    undo = serve._restore_undo_dir()
+    assert (undo / "manifest.json").is_file(), "clear did not (silently) fail"
+
+    serve._replay_restore_undo()
+    assert [m["text"] for m in store.all()] == ["restored"], (
+        "a COMMITTED restore was rolled back because the clear failed")
+
+
+def test_kill_between_commit_and_clear_keeps_the_committed_restore(
+        home, monkeypatch):
+    """The process dies after the apply committed but before the journal is
+    cleared. The commit marker is already durable, so boot discards the
+    journal and the committed restore survives."""
+    store = MemoryStore(home / "memory" / "memories.jsonl")
+    store.add(kind="pitfall", text="original")
+    full, errs = methods.validate_user(_doc("mine"))
+    assert not errs, errs
+    real_clear = serve._clear_restore_undo
+
+    def kill():
+        raise KeyboardInterrupt("power cut right after the commit")
+
+    monkeypatch.setattr(serve, "_clear_restore_undo", kill)
+    with pytest.raises(KeyboardInterrupt):
+        serve._apply_restore(
+            store,
+            [("settings", app_settings.settings_path()),
+             ("memory", store.path)],
+            {},
+            [full],
+            [{"id": "m1", "kind": "technique", "text": "restored"}])
+    monkeypatch.setattr(serve, "_clear_restore_undo", real_clear)
+
+    assert [m["text"] for m in store.all()] == ["restored"]  # it committed
+    serve._replay_restore_undo()
+    assert [m["text"] for m in store.all()] == ["restored"], (
+        "a committed restore was rolled back by the boot replay")
+
+
+def test_an_uncommitted_journal_is_still_rolled_back(home, monkeypatch):
+    """The commit marker must not disarm the recovery it was added for: a
+    journal written before the apply (no `committed` flag) still rolls back."""
+    store = MemoryStore(home / "memory" / "memories.jsonl")
+    store.add(kind="pitfall", text="original")
+    saved, errs = methods.save_user(_doc("mine"))
+    assert saved is not None and not errs, errs
+    real_delete = methods.delete_user
+
+    def killed(mid):
+        real_delete(mid)
+        raise KeyboardInterrupt("power cut mid-apply")
+
+    monkeypatch.setattr(methods, "delete_user", killed)
+    with pytest.raises(KeyboardInterrupt):
+        serve._apply_restore(
+            store,
+            [("settings", app_settings.settings_path()),
+             ("memory", store.path)],
+            {},
+            [],
+            [{"id": "m1", "kind": "technique", "text": "restored"}])
+    monkeypatch.setattr(methods, "delete_user", real_delete)
+
+    serve._replay_restore_undo()
+    assert methods._method_file("mine").is_file(), (
+        "an uncommitted journal was not rolled back")
+    assert [m["text"] for m in store.all()] == ["original"]
