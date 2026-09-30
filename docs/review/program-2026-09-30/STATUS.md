@@ -1,5 +1,13 @@
 # STATUS — Rigma improvement program, 2026-09-30
 
+> **GUIDANCE 4+5 (posted 12:20 UTC) — READ AND ACTIONED in wave 7.** A17's split baseline is wrong
+> (a healthy all-GPU load has `graph splits = 2`, because the token-embedding lookup runs on the host;
+> `compare_plan`'s `expected_splits=1` and `test_engine_log_memory.py:156` therefore flag the owner's
+> real, healthy log as "unexpected"), and the VRAM divergence must compare against the plan's own
+> prediction for the same ctx/cache/slots, never a bare file size (the fixture's 9275.57 MiB includes
+> KV at ctx 65536). Both are assigned to `impl/w7b` (launched 13:05 UTC). The live channel
+> `.scratch/orchestrator/GUIDANCE.md` is now re-read before every wave, as the brief requires.
+
 One line per item: id · commit · one-sentence outcome. Updated at every wave boundary.
 Backlog with causes/evidence: `BACKLOG.md`. Owner decisions: `OWNER-DECISIONS.md`.
 Hand-off and resume instructions: `HANDOFF.md`. Wave log: `.scratch/orchestrator/WAVES.log`.
