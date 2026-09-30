@@ -22,7 +22,7 @@ from rigma.gguf_meta import inspect_gguf
 from rigma.hangar import spec_fields_from_probe
 from rigma.models import (LAUNCH_PARALLEL, CachePolicy, CpuInfo, GgufFile,
                           GpuInfo, HardwareProfile, ModelSpec)
-from rigma.resolve import (fit_gguf, recurrent_state_mb,
+from rigma.resolve import (_budget_rows, fit_gguf, recurrent_state_mb,
                            recurrent_state_unknown)
 
 MIB = 2 ** 20
@@ -66,7 +66,7 @@ SSM = ((b"ssm.state_size", 128), (b"ssm.inner_size", 4096),
        (b"ssm.conv_kernel", 4), (b"ssm.group_count", 1))
 
 
-def _hybrid_kvs(declared: bool) -> list[bytes]:
+def _hybrid_kvs(declared: bool, ssm: bool = True) -> list[bytes]:
     kvs = [
         _kv_str(b"general.architecture", b"hyb3"),
         _kv_u32(b"hyb3.block_count", BLOCKS),
@@ -76,7 +76,8 @@ def _hybrid_kvs(declared: bool) -> list[bytes]:
         _kv_u32(b"hyb3.attention.head_count_kv", 2),      # scalar: interval shape
         _kv_u32(b"hyb3.full_attention_interval", INTERVAL),
     ]
-    kvs += [_kv_u32(b"hyb3." + key, val) for key, val in SSM]
+    if ssm:
+        kvs += [_kv_u32(b"hyb3." + key, val) for key, val in SSM]
     if declared:
         # the upstream shape: a per-layer bool array of length n_layers,
         # written ALONGSIDE full_attention_interval
@@ -85,8 +86,10 @@ def _hybrid_kvs(declared: bool) -> list[bytes]:
     return kvs
 
 
-def _spec(tmp_path, declared: bool, name="hyb.gguf") -> ModelSpec:
-    fields = inspect_gguf(_write(tmp_path, _hybrid_kvs(declared), name)).spec_fields
+def _spec(tmp_path, declared: bool, ssm: bool = True,
+          name="hyb.gguf") -> ModelSpec:
+    fields = inspect_gguf(_write(tmp_path, _hybrid_kvs(declared, ssm),
+                                 name)).spec_fields
     return ModelSpec(slug="hyb", family="hyb3", kind="dense", custom=True,
                      cache_type_policy=CachePolicy(),
                      ggufs=[GgufFile(repo="local", file=name,
@@ -170,3 +173,52 @@ def test_a_dense_model_is_unaffected(tmp_path):
     flags = fit_gguf(spec, spec.ggufs[0], _profile(), 8192, explain)
     assert flags is not None
     assert not any("rs=" in ln for ln in explain), explain
+
+
+def test_the_budget_row_marks_the_unknown_recurrent_geometry(tmp_path):
+    """A2d-budget: the fit's explain line says `rs=unknown(est N MB)` for the
+    both-present shape, but `_budget_rows` — the arithmetic behind the Models
+    page's "OVER by / headroom" line — emitted a bare numeric `rs_mb` with
+    nothing to say the number is an interval estimate, not a measured one.
+
+    The flag rides BESIDE the charge, never in place of it: dropping the term
+    would free VRAM llama.cpp is about to allocate, which is the launch OOM the
+    fit exists to prevent. The fix is the label, not the number."""
+    spec = _spec(tmp_path, declared=True)
+    assert recurrent_state_unknown(spec)
+    rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
+    assert rs_mb > 0, "the interval-derived count did not produce a buffer"
+    row = _budget_rows(spec, spec.ggufs[0], 0.0, 8192, 15000.0)
+    assert row["rs_mb"] == round(rs_mb)      # still charged, unchanged
+    assert row["rs_unknown"] is True         # and now labelled
+    # ... and it survives the path the Models page actually reads:
+    # quant_verdicts (hangar.list_models -> GET /api/models) puts this dict under
+    # "budget" and JSONResponse serialises it untyped, so the new key is additive
+    # there too — no consumer indexes the row positionally.
+    from rigma.resolve import quant_verdicts
+    verdicts = quant_verdicts(spec, _profile())
+    assert verdicts[0]["budget"]["rs_unknown"] is True
+    assert verdicts[0]["budget"]["rs_mb"] == round(rs_mb)
+
+
+def test_a_zero_recurrent_charge_with_no_geometry_is_marked_unknown(tmp_path):
+    """A2d's original shape: evidence of recurrent layers, no `ssm.*` to size
+    them with. The row charges 0 AND says the 0 is an absence of evidence —
+    without the flag a reader cannot tell it from a dense model's real zero."""
+    spec = _spec(tmp_path, declared=False, ssm=False)
+    assert spec.recurrent_layers > 0
+    assert recurrent_state_mb(spec) == 0.0
+    assert recurrent_state_unknown(spec)
+    row = _budget_rows(spec, spec.ggufs[0], 0.0, 8192, 15000.0)
+    assert row["rs_mb"] == 0
+    assert row["rs_unknown"] is True
+
+
+def test_a_fully_declared_uniform_hybrid_is_not_marked_unknown(tmp_path):
+    """Negative control: the owner's real shape keeps its confident charge and
+    must NOT be labelled — a flag that fires on every hybrid is noise."""
+    spec = _spec(tmp_path, declared=False)
+    assert not recurrent_state_unknown(spec)
+    row = _budget_rows(spec, spec.ggufs[0], 0.0, 8192, 15000.0)
+    assert row["rs_mb"] > 0
+    assert row["rs_unknown"] is False
