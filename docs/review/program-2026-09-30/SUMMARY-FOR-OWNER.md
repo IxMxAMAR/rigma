@@ -79,10 +79,19 @@ was checked by a **separate** agent that did not write it.
   (measured in the repo's own notes: +2.42 % perplexity with it off versus +0.19 % on). Fixed on both
   the write path and the read path, and the Windows-specific case-sensitivity hole in that gate is
   closed too (`getenv` on Windows ignores case; the pinned source reads the variable directly).
+- **…and the same guard was wrong one lever over.** It checked the *cache type* on the setting being
+  trialled rather than on what the trial would actually run with. A calibration row can put `q4_0` on
+  the plan, and then every trial of a tools-capable model ran the very cache the guard exists to
+  avoid. Fixed, and a plan that already carries `q4_0` now **says so** instead of quietly shrinking
+  the sweep.
 
 ### Processes and files
 - **On Windows, stopping an ACP agent left the agent and its subagents running.** The stop killed the
   `.cmd` shim and nothing else. **Your platform.** Fixed.
+- **A boot-time cleanup could mark a *live* run as interrupted.** If you ever run two Rigma servers on
+  one home directory — the CLI's own "pass a different `--port`" invites it — the second one's startup
+  sweep would write `interrupted` into a run the first one was still driving. Each run now records
+  *which process* is driving it, and the sweep leaves another live process's run alone.
 - **A KV cache could be restored under the wrong engine build** when the engine's version could not be
   measured — it fell back to the *pin's* identity instead of saying "unknown". Fixed.
 - **A grep pattern could wedge the server.** An exponential regex could not be interrupted even with
@@ -95,20 +104,38 @@ was checked by a **separate** agent that did not write it.
   engine turn too early. A flaky test makes everyone else's work look broken; it is fixed.
 - **Two full test-suite runs at once deadlock, and the suite leaks its fake servers.** Found tonight:
   two overlapping runs both froze (not slow — *stopped*, 0 CPU over 25 s) with **72** orphaned
-  `fake_acp_server.py` processes. Alone, the suite is green. This is a defect in the *harness*, not in
-  the product, and it is on your desk as **OD-16**.
+  `fake_acp_server.py` processes. Alone, the suite is green. **This one was diagnosed and fixed**
+  (`43e63de`): the shared resource was a **fixed TCP port** — `tests/test_bench.py` was the only
+  server in the whole suite that bound a literal port (11598) instead of letting the kernel choose
+  one, so the second run's child died on `address already in use` and the second run's readiness
+  check was then answered by the *first* run's server, meaning its tests silently measured another
+  process; when the first run stopped that server the second blocked on the dead socket. With a
+  foreign server answering on 11598 the old check reported "ready" while its own child never started;
+  with the same impostor listening, the fixed fixture passes. **It then happened again during the
+  final hand-off** — two more orphaned runs, another 72 leaked processes — and the session's own
+  safety guard refused to let it clean them up. The 72 are a *symptom* of those frozen runs, not a
+  second defect: `test_harness_mcode_acp.py` run alone leaves the count unchanged (61 passed, delta
+  0). The one thing left is a `conftest.py` session lock so a second full run stops with a message
+  instead of competing for the machine; see **OD-16**.
 
 ---
 
-## 3. How it was checked
+## 3. How it was checked — and the one place the checking is weaker than it looks
 
-- Every change was verified by a **separate** agent that did not write it, on a test that was first
-  observed **failing** on the unmodified code.
+- For **waves 0–13**, every change was verified by a **separate** agent that did not write it, on a
+  test that was first observed **failing** on the unmodified code. That is the standard, and it held.
+- **From ~16:20 UTC it did not.** Your PC shut down mid-run at 15:55 UTC; when the session resumed,
+  it had lost the ability to start subagents (`SubagentDepthError`). The work still got done and was
+  still checked — but the person checking was the same one who wrote it. That is a real weakening, so
+  it is written into `verify-w15a.md`, into `HANDOFF.md`, and here rather than glossed over. **The
+  items affected are waves 14–15** (the frontend nits, the 400-message wording, the flaky-test fix,
+  and the two deep-review-3 fixes below). They have tests and delete-the-line proofs; they have **not**
+  had an independent reader. The next session should re-verify them first.
 - **Three independent deep reviews** were run over work that had already passed those checks. They
-  found **19 real defects**, including one introduced *by a fix* and two that were the same mistake
-  one lever over. That is why the reviews exist: the tests had been shaped to the fixes. The counter-
-  measure is now a standing rule (*"name one realistic state the test does not put the code in, and
-  check the fix there"*), written into the guidance file and every verifier brief.
+  found **19 real defects**, including one introduced *by a fix* and three that were the same mistake
+  one lever over. That is why the reviews exist: the tests had been shaped to the fixes. The
+  counter-measure is now a standing rule (*"name one realistic state the test does not put the code
+  in, and check the fix there"*), written into the guidance file and every verifier brief.
 - `ruff` clean; the frontend builds reproducibly, type-checks, and its 656 tests pass.
 - The full Python suite was re-run after the last merge; the result is recorded in
   `.scratch/orchestrator/WAVES.log` and in `STATUS.md`.
@@ -138,7 +165,8 @@ Fifteen decisions, each written up with options, evidence and a recommendation, 
 
 - **OD-15** — should "restore a backup" really *replace* your settings and methods, or is the merge
   fine now that the card says so?
-- **OD-16** — fix the concurrent-suite deadlock and the leaked processes, or just document it?
+- **OD-16** — the concurrent-suite deadlock is **fixed** (a fixed TCP port); what is left is whether to
+  add a session lock so a second full run refuses to start.
 - **OD-12** — should a question that times out tell the client it expired, instead of just going quiet?
 - **OD-14** — `taskkill /T` can hit a reused process id; a Job Object per child is the real fix.
 - **OD-2** — how confined should `view_image` / `copy_files` be?
