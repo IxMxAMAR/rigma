@@ -429,6 +429,7 @@ function AcpBlock({
   commands,
   plan,
   onRowOp,
+  onRunCommand,
 }: {
   queue: AcpQueueItem[];
   delegation: AcpDelegation | null;
@@ -443,6 +444,14 @@ function AcpBlock({
    *  live render passes this; the historical one does not, and the buttons simply are
    *  not drawn. */
   onRowOp?: (op: string, params: Record<string, unknown>) => void;
+  /** B6c: run a command the BACKEND advertised.
+   *
+   *  The list used to be a dead menu: `/name description` with no control, so a
+   *  capability mcode had announced could not be invoked from the UI at all. Each
+   *  name becomes a button when this is passed; WITHOUT it the names still draw, as
+   *  text — the list is information, and the durable panel (which has no live session
+   *  to send a prompt to) keeps it that way. */
+  onRunCommand?: (name: string) => void;
 }) {
   const members = delegation?.members ?? [];
   // Computed once per render, not once per row: each depth is a walk up the parent chain,
@@ -567,16 +576,36 @@ function AcpBlock({
               list rather than a joined string precisely because there is now more than a
               name per entry. */}
           <ul className="flex flex-col gap-0.5 mt-0.5">
-            {commands.map((c, i) => (
-              <li key={`${String(c.name)}-${i}`} className="flex gap-1.5">
-                <span className="font-mono text-[10.5px] text-primary shrink-0">
-                  /{String(c.name ?? "")}
-                </span>
-                {c.description && (
-                  <span className="text-muted">{String(c.description)}</span>
-                )}
-              </li>
-            ))}
+            {commands.map((c, i) => {
+              const name = String(c.name ?? "");
+              return (
+                <li key={`${name}-${i}`} className="flex gap-1.5">
+                  {/* B6c: a command the backend advertised is RUNNABLE. The name is
+                      the whole control — the invocation is a prompt whose text is
+                      `/<name>`, sent by the caller through `send()` so Rigma's own
+                      slash parser (which knows a different roster) cannot intercept
+                      it. A command the server sent without a name gets no button:
+                      the only thing it could send is a bare "/". */}
+                  {onRunCommand && name ? (
+                    <button
+                      type="button"
+                      onClick={() => onRunCommand(name)}
+                      title={`run /${name} on the backend`}
+                      className="font-mono text-[10.5px] text-primary shrink-0 hover:text-amber underline decoration-dotted"
+                    >
+                      /{name}
+                    </button>
+                  ) : (
+                    <span className="font-mono text-[10.5px] text-primary shrink-0">
+                      /{name}
+                    </span>
+                  )}
+                  {c.description && (
+                    <span className="text-muted">{String(c.description)}</span>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}
@@ -714,6 +743,7 @@ export default function AgentState({
   workflow = [],
   onAnswerApproval,
   onRowOp,
+  onRunCommand,
 }: {
   goal: NormalGoal | null;
   todos: { content: string; status: string }[];
@@ -742,6 +772,10 @@ export default function AgentState({
    *  delegation tree are history, and a control there would act on a session that may be
    *  long gone. */
   onRowOp?: (op: string, params: Record<string, unknown>) => void;
+  /** B6c: run an ACP command the backend advertised. Passed ONLY by the live
+   *  turn, like `onRowOp`: the advertised list belongs to a running session, and
+   *  the invocation is a prompt that session has to receive. */
+  onRunCommand?: (name: string) => void;
 }) {
   // Already normalised by the store, so this draws ONE shape whatever the
   // backend was: DSH's nested `goal/change` envelope and mcode's flat goal
@@ -862,7 +896,8 @@ export default function AgentState({
           WORK (what is queued, what was delegated, which plan) rather than about
           the connection's permissions. */}
       <AcpBlock queue={acpQueue} delegation={acpDelegation} config={acpConfig}
-                commands={acpCommands} plan={acpPlan} onRowOp={onRowOp} />
+                commands={acpCommands} plan={acpPlan} onRowOp={onRowOp}
+                onRunCommand={onRunCommand} />
 
       {/* Last, and separated by a rule: this is about the CONNECTION's
           permissions rather than about the work, and putting it above the goal

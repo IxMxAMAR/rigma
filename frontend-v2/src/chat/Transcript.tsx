@@ -14,6 +14,7 @@ import { compactionLine, running } from "./compaction";
 import { retryLine } from "./retry";
 import { argHint, delegateSentence, summariseDelegate } from "./delegate";
 import { chipOutcome } from "./toolChip";
+import { commandPrompt } from "./commands";
 
 // How each outcome is drawn. `unknown` is deliberately NOT moss — see
 // `chipOutcome` in toolChip.ts for why an unreported result is not a success.
@@ -317,6 +318,30 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
     }
   }, []);
 
+  // B6c: run a command the BACKEND advertised.
+  //
+  // Straight to `send()`, NOT through the composer: the invocation is a
+  // `session/prompt` whose text is the command, and `parseSlash` knows only
+  // Rigma's own roster — an advertised name that collides with one of them
+  // (`/compact`) would be intercepted and Rigma's command would run instead.
+  //
+  // `send()` refuses while a reply is streaming, and this panel is only drawn
+  // during one, so that refusal is the COMMON case rather than an edge: it is
+  // surfaced through the chat's notice line instead of being swallowed, because
+  // a click that does nothing is indistinguishable from a broken button. (The
+  // server would queue a new prompt behind the running reply — serve.py:5017 —
+  // but the store's one-turn-at-a-time guard stops it before the request; see
+  // the B6c report.)
+  const runCommand = useCallback((name: string) => {
+    void useChat.getState().send(commandPrompt(name)).then((ok) => {
+      if (!ok) {
+        useChat.getState().pushNotice(
+          `/${name} was not sent — this chat is already producing a reply.`,
+        );
+      }
+    });
+  }, []);
+
   // The still-open compaction for THIS turn, if any. Computed here rather than
   // inline in the JSX so it is one lookup per render, not one per condition.
   const runningCompaction = running(turn.compactions);
@@ -371,6 +396,7 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
         workflow={turn.workflow}
         onAnswerApproval={answerApproval}
         onRowOp={rowOp}
+        onRunCommand={runCommand}
       />
       {/* Compaction, observation-masking and the prompt queue. All three were
           emitted by the server and dropped by the store's default arm, so a
