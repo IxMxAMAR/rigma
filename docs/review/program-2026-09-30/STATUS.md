@@ -64,6 +64,32 @@ Integration branch head: `f6a0874` (plus the docs commits that follow it).
 > `b4895fb→f8dc5b8`, `8e412f6→ca83bc0`, `091cff1→698f45f`, `be80260→17ade5c`.
 > `0ab5e3a` (A2) and `97b804c` (A3) were already correct and kept their hashes.
 
+## Wave 21–22 — the GUIDANCE 14–15 escape (ODR-1b/ODR-1c) and the optional ODR-4/ODR-8/ODR-9 (2026-09-30, ~22:36–23:15 UTC)
+
+The orchestrator's 22:36 UTC review of the merged ODR-1 found a remaining escape of the same class, and
+GUIDANCE 14–15 assigned it; the optional ODR-4/ODR-8/ODR-9 were then taken because the clock allowed.
+Both follow-on waves are merged and independently verified.
+
+| id | commit | outcome |
+|---|---|---|
+| ODR-1b (HIGH, security) | `2e41045` (merged `1c57d77`) | `_do_transfer` vetted only the destination FOLDER through `_write_path`, so the per-file target `_free_name(dest, src.name)` was never checked and the FILE shapes were reachable: with the default home workspace, `write_file("x/.bashrc", …)` (allowed — not the home `.bashrc`) then `copy_files(paths=["x/.bashrc"], dest=".")` created `~/.bashrc`, which Git Bash sources on every start. Each target is now passed to `_refuse_persistence_write` before `copy2`/`move`; a refused move leaves its source in place. Verified PASS-WITH-NITS: the exact scenario refused for copy AND move; every file shape refused as a source basename, including `.config/git/config` and `.config/fish/config.fish` where the folder is not a dir shape and the per-file check is the sole defence; case/trailing-dot/8.3 variants refused; the `_free_name` rename is harmless, not a bypass; ordinary transfers unaffected. Base actually created `~/.bashrc` (7 failed); fix 101 passed. |
+| ODR-1c (small) | `2e41045` (merged `1c57d77`) | `_persistence_path_reason` returned `""` (ALLOW) when `resolve()` raised; a path that cannot be checked is now refused with a clear message. The branch is not reachable end-to-end (an earlier `_ws_path` resolve already refuses a NUL), so it is defence-in-depth. |
+| ODR-4 (MED) | `8752c98`+`28fba74`+`19a5d7d` (merged `bf35e05`) | `methods.save_user` is now atomic (temp + `os.replace`); the restore writes the prior bytes of every file it will overwrite/delete to `~/.rigma/restore-undo/` before applying, and a boot step replays an uncommitted journal / discards a committed one. The verifier found a MED defect (E1): with no commit record, a kill after the apply committed but before the clear made the next boot **roll back a committed restore**. `19a5d7d` adds a durable `committed: true` marker before the best-effort clear and makes replay discard a committed journal; re-verified PASS (the two deterministic reproductions now fail at the buggy assertion, a mid-apply kill still rolls back, the clear is inside the lock). |
+| ODR-8 (LOW) | `eba1c76` (merged `bf35e05`) | New `rigma.writelock.WRITER_LOCK` (RLock) taken by `methods.save_user`/`delete_user` and `app_settings.save`/`replace`, held outermost by `_apply_restore` for the whole method+settings region (including the journal write and clear). Order documented `WRITER_LOCK -> MemoryStore._xlock`; verified acyclic and deadlock-free in the attempted orderings. |
+| ODR-9 (LOW) | `355326b` (merged `bf35e05`) | `create_session` awaits `asyncio.to_thread(sessions.create, …)`, so the seed's `json_extract` over every session body no longer runs on the event loop. Verified same args/return, exceptions propagate, and a slow create does not stall a concurrent ticker. |
+
+**Full suite at `1c57d77` (the final head; run once, alone, output to `.scratch/orchestrator/full-suite-wave22.txt`):**
+**0 failed, 3 skipped, exit rc 0; 3594 test marks in the progress stream (≈3591 passed + 3 skipped), zero
+`F`/`E`.** The terminal summary line was again lost to the PowerShell 5.1 `*>` redirect; the count is
+reconstructed from the progress stream and confirmed by rc 0. Wave-20's baseline was 3577 marks / 0 failed
+/ 3 skipped; the +17 are ODR-1b's 7 and ODR-4/8/9's 10. `ruff check src tests` clean on every branch.
+**Zero regressions from all eleven merges tonight.**
+
+Nits carried to `BACKLOG.md`: ODR-1b's `dest.mkdir` runs before the per-file check, so a refused copy can
+leave an empty `~/.config/git` directory (smallest fix: vet all targets before `mkdir`); ODR-1c is
+defence-in-depth only; a UNC spelling of the machine's own LAN IP is not mapped by `_local_unc_to_drive`
+and needs the write grant; a corrupt restore-journal manifest is inert litter (never cleared).
+
 ## Wave 20 — the OD-2/OD-15 deep-review findings closed (2026-09-30, ~21:48–23:xx UTC)
 
 A new Head Agent took over at 21:45 UTC after the previous session ended without actioning GUIDANCE 11–13.

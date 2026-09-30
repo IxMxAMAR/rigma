@@ -16,9 +16,11 @@ file out of your workspace now needs the same permission as writing there; the l
 may write into can no longer contain your whole home folder or a drive root; and restoring a backup now
 clears the "always allow" trust on any method it rewrites, so a backup from another machine cannot smuggle
 in a trusted method that writes files. The restore card now says exactly what a restore replaces and lists
-which methods it deleted. Two items from the review — an on-disk undo for a restore interrupted by a crash,
-and a lock so a save cannot race a restore — are written down as the first work for the next session, not
-done tonight.
+which methods it deleted. One more way around the file-tools fix was caught by a second look: the tools checked the folder a copied
+file was going into but not the file's own name, so a file named `.bashrc` could still be dropped into your
+home folder — that is closed as well. And the two crash-safety items I first listed as next-session work
+are done: a restore interrupted by a crash is recovered from a small on-disk journal when Rigma next
+starts, a save can no longer race a restore, and a crash right after a restore finished no longer undoes it.
 
 **Restoring a backup now actually restores.** The Backup/Restore card promised that a restore
 "replaces the whole store — anything not in the file is gone". It didn't: it replaced your memories

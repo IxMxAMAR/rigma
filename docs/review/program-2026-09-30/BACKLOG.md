@@ -399,3 +399,8 @@ the workspace walker, `_resolve_image` all pass `_unlong(p)`); the two remaining
 | **ODR7FE-n2** | `deletedLine` uses `String(x)`, so a malformed id array renders `[object Object]` / a blank id rather than "did not report"; duplicates are not deduped. | `lib/backup.ts` | cosmetic; the server sends strings. |
 | **ODR6-n1** | `encode_image_data_uri`'s raw-bytes fallback still base64s a non-image file with an image name (content-type nit, not a denylist bypass). | `tools.py` | recorded. |
 | **ODR-HK** | Owner housekeeping: a verifier's scratch file `C:\nonexistent-odr1\a.txt` could not be deleted (the guard blocks deletes outside the workspace). | host | needs the owner. |
+| **ODR1b-n1** | `dest.mkdir` runs before the per-file check, so a refused copy can leave an empty `~/.config/git` directory. Smallest fix: vet all targets before `mkdir`. | `tools.py::_do_transfer` | non-security; follow-up. |
+| **ODR1b-n2** | ODR-1c's fail-closed branch is not reachable end-to-end (an earlier `_ws_path` resolve already refuses a NUL); defence-in-depth, tested via a monkeypatched `Path.resolve`. | `tools.py::_persistence_path_reason` | defence-in-depth. |
+| **ODR1b-n3** | A UNC spelling of the machine's own LAN IP is not mapped by `_local_unc_to_drive` and needs the write grant (inherited from ODR-1, not an ODR-1b regression). | `tools.py::_local_unc_to_drive` | accepted. |
+| **ODR4-n1** | A corrupt restore-journal manifest is returned from early and never cleared (inert litter). | `serve.py::_replay_restore_undo` | inert. |
+| **ODR4-n2** | The boot replay writes the memory file without the memory store's cross-process `_xlock` (fine at boot; races a second live process). | `serve.py` | accepted at boot. |
