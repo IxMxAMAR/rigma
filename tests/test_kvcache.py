@@ -18,7 +18,8 @@ BASE = {
     "quant": "Q3_K_M [mtp]",
     "gguf": "RVN-Q3_K_M-mtp.gguf",
     "backend": "vulkan",
-    "engine": "b9867",
+    "engine": "C:/engines/b9867/vulkan/llama-server.exe",
+    "engine_version": "b9867+152d337fa",
     "ctx": 122880,
     "cache_type_k": "q5_1",
     "cache_type_v": "q5_1",
@@ -44,7 +45,8 @@ def test_key_order_does_not_change_the_name():
     ("quant", "Q3_K_L [mtp]"),
     ("gguf", "RVN-Q3_K_M.gguf"),
     ("backend", "rocm"),
-    ("engine", "b9900"),
+    ("engine", "C:/engines/b9900/vulkan/llama-server.exe"),
+    ("engine_version", "b10709+9a9394a89"),
     ("ctx", 131072),
     ("cache_type_k", "q4_0"),
     ("cache_type_v", "q4_0"),
@@ -117,3 +119,105 @@ def test_prune_keeps_the_newest_and_removes_their_metadata(tmp_path):
 
 def test_prune_on_a_missing_directory_is_not_an_error(tmp_path):
     assert kvcache.prune(tmp_path / "nope") == []
+
+
+# --- VLLM-1: the fingerprint must identify the engine RUNTIME, not a path -----
+#
+# `engine` is the BINARY PATH, and a path is not a build: replacing the binary
+# in place (which is exactly how a hand-installed fork arrives) left the name
+# unchanged, so a cache taken under the old build was restored under the new
+# one. The fingerprint now also carries the measured engine identity, from the
+# SAME source the rest of the code uses for "which build is this"
+# (`server_ops.engine_version`, via `resolve._engine_now`/`bench._engine_version`),
+# so a build change invalidates the cache exactly when calibration would go stale.
+
+
+def _plan(backend="vulkan"):
+    """The plan attributes `config_of` reads, without building a whole RunPlan."""
+    from types import SimpleNamespace
+    flags = SimpleNamespace(ctx=122880, cache_type_k="q5_1", cache_type_v="q5_1",
+                            ngl=63, n_cpu_moe=0, spec_type="draft-mtp",
+                            spec_n_max=1, flash_attn="on")
+    return SimpleNamespace(model_slug="qwen38-ara-v5",
+                           gguf=SimpleNamespace(quant="Q3_K_M [mtp]",
+                                                file="RVN-Q3_K_M-mtp.gguf"),
+                           backend=backend, flags=flags)
+
+
+def test_config_of_carries_the_measured_engine_identity(monkeypatch):
+    # The fix is only real if the field is POPULATED from the shared source; a
+    # new FINGERPRINT_FIELDS entry that nobody fills in would hash to the
+    # "unknown" sentinel forever and detect nothing.
+    from rigma import server_ops
+    monkeypatch.setattr(server_ops, "engine_version",
+                        lambda backend="": "b9867+152d337fa")
+    cfg = kvcache.config_of(_plan(), "C:/engines/b9867/vulkan/llama-server.exe")
+    assert cfg["engine_version"] == "b9867+152d337fa"
+
+
+def test_a_different_engine_build_changes_the_launch_fingerprint(monkeypatch):
+    from rigma import server_ops
+    rp = _plan()
+    exe = "C:/engines/b9867/vulkan/llama-server.exe"
+    monkeypatch.setattr(server_ops, "engine_version",
+                        lambda backend="": "b9867+152d337fa")
+    same_build = kvcache.launch_fingerprint(rp, exe)
+    monkeypatch.setattr(server_ops, "engine_version",
+                        lambda backend="": "b10709+9a9394a89")
+    fork = kvcache.launch_fingerprint(rp, exe)
+    assert same_build != fork
+
+
+def test_a_cache_from_another_engine_version_is_refused(tmp_path, monkeypatch):
+    # Runtime A wrote the cache; runtime B (a different build string) must not
+    # be handed it. The refusal is by name, so the HTTP restore is never even
+    # attempted — which is what the failing monkeypatch pins.
+    a = {**BASE, "engine_version": "b9867+152d337fa"}
+    b = {**BASE, "engine_version": "b10709+9a9394a89"}
+    assert kvcache.fingerprint(a) != kvcache.fingerprint(b)
+    (tmp_path / kvcache.cache_name(kvcache.fingerprint(a))).write_bytes(b"x")
+    monkeypatch.setattr(kvcache, "slot_action",
+                        lambda *a, **k: pytest.fail(
+                            "runtime B was handed runtime A's cache"))
+    restored, note = kvcache.restore(1, tmp_path, kvcache.fingerprint(b))
+    assert restored is False
+    assert note is None
+
+
+def test_the_same_engine_version_still_matches(tmp_path, monkeypatch):
+    # No false invalidation: the identical configuration still offers its cache
+    # to the engine. A fingerprint that changed on every call would silently
+    # disable restore, which is the failure the empty-fingerprint bug caused.
+    cfg = {**BASE, "engine_version": "b9867+152d337fa"}
+    fp = kvcache.fingerprint(cfg)
+    assert fp == kvcache.fingerprint(dict(cfg))
+    (tmp_path / kvcache.cache_name(fp)).write_bytes(b"x")
+    offered = []
+    monkeypatch.setattr(kvcache, "slot_action",
+                        lambda *a, **k: offered.append(a) or None)
+    restored, note = kvcache.restore(1, tmp_path, fp)
+    assert restored is True
+    assert note is None
+    assert offered, "the matching cache must actually be offered to the engine"
+
+
+def test_a_legacy_entry_without_the_engine_version_is_invalid_not_a_match(
+        tmp_path, monkeypatch):
+    # An on-disk cache written before this field existed. Its name was hashed
+    # over the OLD field list, so the new fingerprint asks for a different file:
+    # "unknown" reads as invalid, never as a match, and nothing raises. The cost
+    # is a re-prefill — the safe direction.
+    legacy = {k: v for k, v in BASE.items() if k != "engine_version"}
+    modern = {**BASE, "engine_version": "b9867+152d337fa"}
+    assert kvcache.fingerprint(legacy) != kvcache.fingerprint(modern)
+    # And a genuinely unknown identity ("") is its own value, distinct from the
+    # absent sentinel — neither can collide with a real build string.
+    assert kvcache.fingerprint(legacy) \
+        != kvcache.fingerprint({**modern, "engine_version": ""})
+    (tmp_path / kvcache.cache_name(kvcache.fingerprint(legacy))).write_bytes(b"x")
+    monkeypatch.setattr(kvcache, "slot_action",
+                        lambda *a, **k: pytest.fail(
+                            "a legacy cache was silently accepted"))
+    restored, note = kvcache.restore(1, tmp_path, kvcache.fingerprint(modern))
+    assert restored is False
+    assert note is None
