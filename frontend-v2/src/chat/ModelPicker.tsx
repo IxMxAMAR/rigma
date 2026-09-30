@@ -4,6 +4,7 @@
 // for typing; sending is what needs a model.
 import { useEffect, useRef, useState } from "react";
 import { engineApi, switchNotice, type ModelCard } from "../lib/engineApi";
+import SwitchNote from "../lib/SwitchNote";
 import { errText } from "./chatStore";
 import { useApp } from "../store";
 
@@ -123,7 +124,7 @@ export default function ModelPicker() {
           </ul>
         )}
         {note && (
-          <div className="px-4 py-2 text-[12px] text-secondary">{note}</div>
+          <SwitchNote note={note} className="px-4 py-2 text-[12px] text-secondary" />
         )}
         {err && (
           <div className="px-4 py-2 text-[12px] text-red">{err} — try the Engine page.</div>

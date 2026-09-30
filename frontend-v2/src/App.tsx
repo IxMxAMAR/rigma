@@ -80,7 +80,26 @@ function Sidebar() {
   );
 }
 
-function Header() {
+/** A10: the server's reason a workspace path was not saved.
+ *
+ *  Its own component, and exported, because the header holds the refusal as
+ *  local state — so `renderToStaticMarkup(<Header/>)` can never reach it (it
+ *  renders initial state once). Split out, the markup is assertable directly,
+ *  and the wiring from the refused save to this line is pinned separately by
+ *  the jsdom test in `App.test.tsx`. */
+export function WsAlert({ error }: { error: string }) {
+  return (
+    <span
+      role="alert"
+      title={error}
+      className="min-w-0 truncate text-[11px] text-red"
+    >
+      {error}
+    </span>
+  );
+}
+
+export function Header() {
   const surface = useApp((s) => s.surface);
   const server = useApp((s) => s.server);
   const workspacePath = useApp((s) => s.workspacePath);
@@ -162,15 +181,7 @@ function Header() {
           )}
           {/* The server's reason the path was not saved. Without it a refused
               save was indistinguishable from a saved one (A10). */}
-          {wsErr && (
-            <span
-              role="alert"
-              title={wsErr}
-              className="min-w-0 truncate text-[11px] text-red"
-            >
-              {wsErr}
-            </span>
-          )}
+          {wsErr && <WsAlert error={wsErr} />}
         </span>
       )}
       <div className="ml-auto flex items-center gap-4 font-mono text-[12px]">

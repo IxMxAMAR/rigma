@@ -10,6 +10,7 @@ import {
   type QuantRow,
 } from "../lib/engineApi";
 import { pct, progressLine } from "../lib/download";
+import SwitchNote from "../lib/SwitchNote";
 
 // IMP-2: the server already measures `done`, a rolling `bps` and an `eta` for
 // every pull in flight (serve's pull_samples); the page showed only a
@@ -358,9 +359,10 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
         </div>
       )}
       {note && (
-        <div className="text-secondary font-mono text-[11px] pl-3.5 pt-0.5 break-words">
-          {note}
-        </div>
+        <SwitchNote
+          note={note}
+          className="text-secondary font-mono text-[11px] pl-3.5 pt-0.5 break-words"
+        />
       )}
       {/* IMP-2: a pull that FAILED is not a pull that finished. hangar keeps
           the reason on the pull record, and the row used to drop it, so a dead
@@ -613,9 +615,10 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
         </div>
       )}
       {note && (
-        <div className="rounded-md bg-surface text-secondary px-2.5 py-1.5 font-mono text-[11.5px] mb-2">
-          {note}
-        </div>
+        <SwitchNote
+          note={note}
+          className="rounded-md bg-surface text-secondary px-2.5 py-1.5 font-mono text-[11.5px] mb-2"
+        />
       )}
       <NoTemplateNotice card={card} />
       <div className="font-mono text-[11.5px] text-muted mb-2">
