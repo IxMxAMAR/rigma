@@ -120,6 +120,39 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8",
         raise
 
 
+def atomic_write_bytes(path: Path, data: bytes) -> bool:
+    """`atomic_write_text` for bytes, and byte-EXACT.
+
+    A11/R3-3: the restore undo log has to put back the file that was there, and
+    a text round-trip is not that file on Windows. `Path.write_text` translates
+    `\\n` to `os.linesep` (so a method file written by `methods.save_user` is
+    CRLF), while `atomic_write_text` pins `newline="\\n"` — rolling a snapshot
+    back through it would silently rewrite every line ending and the rollback
+    would not be byte-identical to what it replaced. There was no bytes writer
+    here; this is it.
+
+    Same temp-beside-target, unique-name, fsync-then-retried-replace rules as
+    `atomic_write_text`. `create_only` is not offered: nothing needs it, and a
+    half-implemented exclusive mode is a worse lie than an absent one.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _replace_retrying(tmp, path)
+        return True
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def atomic_write_json(path: Path, obj, *, indent: int = 2) -> None:
     """`atomic_write_text` for a JSON-serialisable object."""
     import json
