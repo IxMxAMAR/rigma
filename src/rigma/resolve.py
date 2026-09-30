@@ -408,6 +408,26 @@ def recurrent_state_unknown(spec: ModelSpec) -> bool:
     return spec.recurrent_layers > 0 and recurrent_state_mb(spec) == 0.0
 
 
+def kv_geometry_unknown(spec: ModelSpec) -> bool:
+    """True when the model gives evidence of a KV cache whose WIDTH or LAYER
+    SPLIT could not be derived, so `kv_bytes_per_token` (and `swa_kv_bytes`)
+    return a number that is a guess — often exactly 0 — rather than a measured
+    charge. The fit says `kv=unknown` in its explain line instead of presenting
+    that number as confident.
+
+    Set by `gguf_meta` while the header is parsed (`kv_geometry_unknown`). The
+    derived clause is the same statement for a spec written by an older probe,
+    which stored no flag: attention layers are declared but the growing cache's
+    width computes to zero. A pure-Mamba spec has `full_attn_layers == 0` and
+    is NOT flagged — it genuinely has no KV cache, and its missing count is
+    what `rs_unknown` already reports.
+    """
+    if getattr(spec, "kv_geometry_unknown", False):
+        return True
+    return spec.full_attn_layers > 0 and (spec.kv_heads <= 0
+                                          or spec.head_dim <= 0)
+
+
 # Speculative decoding's draft head needs its own KV cache and compute buffers.
 # MEASURED on an RX 9070 XT, 2026-08-21, five repeats per point, by differencing
 # dedicated VRAM against the same model without the head:
@@ -762,7 +782,18 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         rs_txt = f"rs={rs_mb:.0f}MB "
     else:
         rs_txt = ""
-    explain.append(f"{gguf.quant}@ctx{ctx} kv={k}: file={file_mb:.0f}MB kv={kv_mb:.0f}MB "
+    # A2d-kv: the KV charge gets the same provenance label the RS charge has.
+    # `kv_geometry_unknown` means the cache's width or layer split could not be
+    # derived, so the number is a guess — and for a missing
+    # `attention.head_count_kv` it is exactly 0. The charge is NOT dropped:
+    # freeing VRAM llama.cpp is about to allocate is the launch OOM this fit
+    # exists to prevent. The label says what the number is.
+    if kv_geometry_unknown(spec):
+        kv_txt = (f"kv=unknown(est {kv_mb:.0f}MB)" if kv_mb else "kv=unknown")
+    else:
+        kv_txt = f"kv={kv_mb:.0f}MB"
+    explain.append(f"{gguf.quant}@ctx{ctx} kv={k}: file={file_mb:.0f}MB "
+                   + kv_txt + " "
                    + (f"(incl. {swa_mb:.0f}MB windowed) " if swa_mb else "")
                    + (f"mmproj={mm_mb:.0f}MB " if mm_mb else "")
                    + rs_txt
@@ -1232,6 +1263,11 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
     the fit exists to prevent. A boolean beside `rs_mb`, not a string in it, so
     every existing numeric consumer of the row is untouched (nothing indexes the
     row positionally; the row is JSON over the API and a new key is additive).
+
+    A2d-kv: `kv_unknown` rides beside `kv_mb` for the same reason, for the KV
+    cache this time — a missing `attention.head_count_kv` or a partial
+    sliding-window geometry produced a confident 0 here with nothing to say it
+    was an absence of evidence. Same shape: additive boolean, charge unchanged.
     """
     k = k or spec.cache_type_policy.k
     v = v or spec.cache_type_policy.v
@@ -1240,7 +1276,8 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
     file_mb = gguf.bytes / 2**20
     rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
     return {"file_mb": round(file_mb), "mmproj_mb": round(mm_mb),
-            "kv_mb": round(kv_mb), "rs_mb": round(rs_mb),
+            "kv_mb": round(kv_mb), "kv_unknown": kv_geometry_unknown(spec),
+            "rs_mb": round(rs_mb),
             "rs_unknown": recurrent_state_unknown(spec),
             "budget_mb": round(usable_vram),
             "over_mb": round(file_mb + mm_mb + kv_mb + rs_mb - usable_vram),
