@@ -9,6 +9,7 @@ state so it's trivially testable.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import time
@@ -38,6 +39,59 @@ def _runs_dir() -> Path:
     d = rigma_home() / "runs"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# DR3-4: WHO is driving a run, in a form a LATER boot can check.
+#
+# The boot sweep reconciles every `running`/`paused` run directory, because at
+# boot no task here is driving anything. That is right for a run left over by a
+# crash — but it is wrong for a run being driven by a DIFFERENT live Rigma
+# process on the same RIGMA_HOME, and two servers sharing one home is reachable:
+# the CLI's own "port is already in use — free it or pass a different --port"
+# invites a second instance. Such a sweep would write `interrupted` into a live
+# run, and `save`'s sticky-terminal rule would then force the real driver's run
+# terminal too.
+#
+# So every non-terminal save stamps the writing process, and the sweep skips a
+# run whose stamp names a DIFFERENT live process. The create time is recorded
+# beside the pid for the same reason `state._is_recorded_process` records it for
+# the engine and UI pids: a recycled pid must not make a dead driver look alive.
+_DRIVER_STAMP: dict | None = None
+
+
+def _driver_stamp() -> dict:
+    """This process's identity, cached — one psutil call per process, not per save."""
+    global _DRIVER_STAMP
+    if _DRIVER_STAMP is None:
+        started = 0.0
+        try:
+            from .state import _create_time
+            started = _create_time(os.getpid())
+        except Exception:
+            started = 0.0
+        _DRIVER_STAMP = {"driver_pid": os.getpid(),
+                         "driver_started_at": started}
+    return dict(_DRIVER_STAMP)
+
+
+def driver_is_live_elsewhere(run: dict) -> bool:
+    """Is this run being driven RIGHT NOW by a DIFFERENT live process?
+
+    False for a record with no stamp (written before this existed), for our own
+    process (a `running` record WE hold at boot is exactly the orphan the sweep
+    is for), and for a stamp whose process is gone or whose pid has been reused.
+    """
+    try:
+        pid = int(run.get("driver_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        from .state import _is_recorded_process
+        return bool(_is_recorded_process(pid, run.get("driver_started_at")))
+    except Exception:
+        return False
 
 
 # A run id becomes a DIRECTORY name and arrives from a URL path parameter.
@@ -137,6 +191,11 @@ def save(run: dict, revive: bool = False) -> None:
     on-disk status wins and the rest of the snapshot (iteration counters, token
     accounting) still persists. `revive=True` is the single deliberate
     exception — restart_run, which reattaches a loop on purpose.
+
+    DR3-4: a NON-TERMINAL write also stamps the writing process, so a boot sweep
+    in another Rigma process on the same home can tell a live run from an orphan.
+    Stamping here rather than at each start site means the stamp cannot go stale
+    while a loop keeps saving — which is the property the check needs.
     """
     if not revive and run.get("status") not in TERMINAL:
         cur = load(run["id"])
@@ -145,6 +204,8 @@ def save(run: dict, revive: bool = False) -> None:
             # sees the halt on its next check instead of running on stale state
             run["status"] = cur["status"]
             run["halt_reason"] = cur.get("halt_reason", "")
+    if run.get("status") not in TERMINAL:
+        run.update(_driver_stamp())
     _atomic_write(run_dir(run["id"], create=True) / "run.json",
                   json.dumps(run, indent=2))
 
