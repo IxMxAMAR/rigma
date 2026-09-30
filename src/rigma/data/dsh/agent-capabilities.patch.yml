@@ -248,10 +248,29 @@
     # with no approval answerer (the SDK wire has no approval-response method)
     # falls through to the fail-closed `unavailable` and DENIES the call. Rigma
     # runs unconfined, so `never` is the policy that matches the sandbox it
-    # actually has: an ask is rejected deterministically without a prompt, and
-    # the model is told so in its runtime context. A `!!js` expression is also
-    # unusable here — the file is read by Python's `yaml.safe_load` in
-    # tests/test_dsh_capabilities.py, which has no `!!js` constructor.
+    # actually has: an ask is rejected deterministically without a prompt.
+    #
+    # HONEST SCOPE — measured by an independent verifier, not assumed. Mounting
+    # this row does NOT yet make the trail fill, for two independent reasons:
+    #   * The model is NOT told the policy. sdk-minimal sets
+    #     `includeRuntimeContext: false` (bundle/sdk-minimal/cordis.patch.yml),
+    #     which suppresses EVERY runtime-context contribution — including the
+    #     `approval:policy` entry this service registers — so the sentence never
+    #     reaches the model. An earlier revision of this comment claimed the
+    #     opposite; that claim was false and is corrected here.
+    #   * Nothing can ask. sdk-minimal's `sandbox-policy` is hardcoded
+    #     `danger-full-access` and only a strictly-wider target escalates, so
+    #     `approval/asked` and `approval/decided` stay quiet.
+    # The row's observable effect today is creating `ctx.approval` (a different
+    # deny *reason* if an ask ever fires). Making the trail real needs
+    # `includeRuntimeContext: true` — an owner decision, because it changes the
+    # system prompt for every turn — plus a confining shell row. Recorded so the
+    # next reader is not misled the way this comment once was.
+    #
+    # A `!!js` expression is also unusable here — the file is read by Python's
+    # `yaml.safe_load` in tests/test_dsh_capabilities.py, which has no `!!js`
+    # constructor. (DSH's own JS loader accepts it, and the runtime consumes the
+    # patch by PATH, so the restriction is on the Python consumers only.)
     - id: approval
       name: '@deepseek-ai/dsh-user-approval'
       config:
@@ -268,6 +287,12 @@
     # neither `dsh-pwsh-sandbox` nor `dsh-bash-sandbox`), this row stays
     # dormant and `permission/preset` stays quiet. That is named here rather
     # than left as a silent gap, which is the whole reason O4 existed.
+    #
+    # LATENT LANDMINE, named so it is not discovered as a boot failure: if an
+    # UNCONFINED `ctx.shell` provider is ever added, this row activates and its
+    # constructor THROWS ("the mounted bash executor does not confine"), taking
+    # the boot down. A *sandboxed* shell row is the intended way to wake it; a
+    # plain one is not.
     #
     # The preset table is restated from the base bundle because `config:`
     # REPLACES the row's whole config, and `danger-full-access` must keep
