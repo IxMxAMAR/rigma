@@ -786,3 +786,94 @@ def test_a_tools_capable_sweep_drops_a_lowercase_lever_too(monkeypatch,
     assert [r["label"] for r in rows] == ["baseline"]
     assert launched == [{}]
 
+
+# ---------------------------------------------------------------------------
+# DR3-2: the KV-cache guard must read the EFFECTIVE flags, not the override.
+#
+# `cache_type_k`/`cache_type_v` are in `resolve._CALIBRATION_PLACEMENT_KEYS`, so
+# a plan can already carry q4_0 (a row written when the slug was not yet known
+# to be tools-capable, hand-edited, or written by an older build). The old check
+# looked only at the override, so every config that did not itself name a cache
+# type was trialled with the very cache the guard exists to keep off a
+# tools-capable model — the same asymmetry `_effective_env` closes next door.
+# ---------------------------------------------------------------------------
+
+def test_a_tools_capable_sweep_drops_a_q4_plan_it_already_carries(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+    launched = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(exe, plan, model_path, **k):
+        launched.append((plan.flags.cache_type_k, plan.flags.cache_type_v))
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    plan = _plan(cache_type_k="q4_0", cache_type_v="q4_0")
+    rows = bench.run_sweep(plan, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601,
+                           configs=[("baseline", {}),
+                                    ("kv-q8", {"cache_type_k": "q8_0",
+                                               "cache_type_v": "q8_0"}),
+                                    ("kv-q4", {"cache_type_k": "q4_0",
+                                               "cache_type_v": "q4_0"})])
+    # Only the config that REPLACES the cache type may run: `baseline` inherits
+    # the plan's q4_0 and `kv-q4` asks for it outright.
+    assert [r["label"] for r in rows] == ["kv-q8"]
+    assert launched == [("q8_0", "q8_0")]
+
+
+def test_a_tools_capable_q4_plan_that_drops_everything_says_so(
+        monkeypatch, tmp_path, caplog):
+    """Dropping trials cannot fix a plan that already carries q4_0, and an
+    empty sweep must not look like "nothing worth measuring"."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    plan = _plan(cache_type_k="q4_0", cache_type_v="q4_0")
+    with caplog.at_level("WARNING", logger="rigma.bench"):
+        rows = bench.run_sweep(plan, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                               port=11601,
+                               configs=[("baseline", {}),
+                                        ("kv-q4", {"cache_type_k": "q4_0",
+                                                   "cache_type_v": "q4_0"})])
+    assert rows == []
+    assert "already quantizes the KV cache to q4_0" in caplog.text
+    assert "every config was dropped" in caplog.text
+
+
+def test_a_non_tools_sweep_still_trials_a_q4_plan(monkeypatch, tmp_path):
+    """The non-tools path is unchanged by DR3-2: q4_0 is a legitimate
+    measurement there (it just cannot be crowned), so a plan carrying it must
+    not silently lose its baseline."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: False)
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    plan = _plan(cache_type_k="q4_0", cache_type_v="q4_0")
+    rows = bench.run_sweep(plan, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601,
+                           configs=[("baseline", {}),
+                                    ("kv-q8", {"cache_type_k": "q8_0",
+                                               "cache_type_v": "q8_0"})])
+    assert [r["label"] for r in rows] == ["baseline", "kv-q8"]
+
