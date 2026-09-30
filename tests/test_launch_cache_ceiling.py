@@ -48,6 +48,12 @@ def _spec(*, pinned: bool = True, launch: LaunchDefaults | None = None):
         slug=SLUG, family="qwen35", kind="dense", n_layers=64,
         full_attn_layers=16, kv_heads=4, head_dim=256, native_ctx=262144,
         custom=True,
+        # The hybrid geometry the file actually carries: 48 of the 64 layers are
+        # recurrent, and llama.cpp allocates a per-sequence RS buffer for them
+        # (149.62 MiB each, 299.25 MiB at the launch's --parallel 2).
+        full_attention_interval=4, recurrent_layers=48,
+        ssm_state_size=128, ssm_inner_size=6144, ssm_conv_kernel=4,
+        ssm_group_count=16,
         ggufs=[GgufFile(repo="local", file="b.gguf", bytes=FILE_BYTES,
                         quant="Q2_0")],
         use_cases=["general"],
@@ -70,9 +76,12 @@ def test_a_pinned_policy_that_spills_names_the_rung_that_fits():
     explain: list[str] = []
     flags = fit_gguf(spec, spec.ggufs[0], prof, 262144, explain)
     assert flags.cache_type_k == "q8_0"
-    assert flags.ngl == 58                     # 7 of 64 transformer layers on CPU
+    # 55, not 58: the fit now also charges the hybrid's recurrent state — two
+    # sequences of 149.62 MiB, the buffer the engine actually allocates — which
+    # is another 299 MiB of the card and three more layers on the CPU.
+    assert flags.ngl == 55
     line = next(e for e in explain if "pinned" in e)
-    assert "7 of 64 layers" in line            # ngl counts the output layer
+    assert "10 of 64 layers" in line          # ngl counts the output layer
     assert "q5_1 fits fully on the GPU" in line
     # the size of the slowdown is one model's measurement; generic output must
     # not restate it as a universal multiplier
@@ -93,7 +102,7 @@ def test_quant_verdicts_carries_the_same_fact():
                        grow="context")[0]
     assert v["ctx"] == 262144 and v["kv"] == "q8_0"
     assert "q5_1 fits fully on the GPU" in v.get("note", "")
-    assert "7 of 64 layers" in v["note"]
+    assert "10 of 64 layers" in v["note"]
     assert "~4x" not in v["note"]
 
 
