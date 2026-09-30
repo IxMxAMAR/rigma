@@ -5200,8 +5200,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         return {"slug": slug,
                 "launch": spec.launch.model_dump() if spec.launch else None,
                 # a registry model's launch settings are hand-authored and the
-                # POST refuses to overwrite them (owner decision) — the UI
-                # disables Save and says why
+                # POST refuses to overwrite them (owner decision) — the dialog
+                # keeps Save live so the server's own 400 sentence is shown
+                # verbatim (OD-11)
                 "custom": spec.custom,
                 "last_used": stamp,
                 "first_load": spec.launch is None and stamp is None}
