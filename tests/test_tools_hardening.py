@@ -58,8 +58,12 @@ def test_view_image_rejects_non_image(tmp_path):
     assert "not an image" in out
 
 
-def test_view_image_missing_file():
-    out = tools.run_tool("view_image", {"path": "D:/nope/gone.png"},
+def test_view_image_missing_file(tmp_path):
+    # the path must be guaranteed-missing on THIS machine: a hard-coded "D:/..."
+    # depends on the state of one drive (D: is BitLocker-locked here, so Windows
+    # answers WinError -2144272384 instead of "no such file").
+    out = tools.run_tool("view_image",
+                         {"path": str(tmp_path / "nope" / "gone.png")},
                          {"has_vision": True})
     assert "no such file" in out
 
