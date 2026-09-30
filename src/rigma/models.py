@@ -503,6 +503,25 @@ class ComboFlags(BaseModel):
             raise ValueError("flash_attn must be on, off, or auto")
         return v
 
+    @field_validator("alias")
+    @classmethod
+    def _alias_is_one_name(cls, v: str) -> str:
+        # llama.cpp does NOT take `--alias` verbatim: it runs the value through
+        # `string_split(value, ',')` (PrismML-Eng 87268f77 common/arg.cpp:2997,
+        # ggml-org b9867 :2707) into a `std::set<std::string>`, and
+        # `server-context.cpp` serves `*model_alias.begin()` — the
+        # lexicographically FIRST element. So a hand-written alias containing a
+        # comma silently becomes several names and the one the server answers
+        # to may not be the one the user wrote. An auto-slug can never do this
+        # (`hangar._slugify` strips every non-`[a-z0-9.]` character), so the
+        # only way in is a hand-written alias, which is what this rejects.
+        # Empty stays legal: "" means "use the plan's slug".
+        if "," in v:
+            raise ValueError(
+                "alias must not contain a comma: llama.cpp splits --alias on "
+                "commas into multiple names, and only the first is served")
+        return v
+
     @field_validator("reasoning_format")
     @classmethod
     def _known_reasoning_format(cls, v: str) -> str:
