@@ -17,6 +17,17 @@ _SIMPLE = {0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
 _MAX_STR = 10_000_000      # metadata strings top out ~100KB (chat templates)
 _MAX_KEPT_ARRAY = 4096     # per-layer arrays are tiny; vocab arrays are not
 
+# AUDIT 06R3-8: the layouts this reader implements, exactly. The check used to
+# be `version < 2` — a floor — so a header declaring v4, v5 or 4294967295 was
+# parsed as if it were v2/v3 and every field (n_layers, kv_heads,
+# context_length) was silently wrong, which is how a wrong number becomes "a
+# model that will not load". A later version is NOT a newer file this reader
+# understands: both engines Rigma launches define GGUF_VERSION 3 — mainline
+# `b9867` (ggml/include/gguf.h and gguf-py/gguf/constants.py) and PrismML
+# `87268f77` (ggml/include/gguf.h) — so an allow-list trades a wrong number for
+# a refusal that names the version.
+_KNOWN_GGUF_VERSIONS = (2, 3)
+
 
 class GgufParseError(ValueError):
     pass
@@ -96,8 +107,10 @@ def _read_meta(f) -> tuple[dict, int]:
     if f.read(4) != b"GGUF":
         raise GgufParseError("not a GGUF file")
     version = _read(f, "<I", 4)
-    if version < 2:
-        raise GgufParseError(f"gguf v{version} is too old")
+    if version not in _KNOWN_GGUF_VERSIONS:
+        raise GgufParseError(
+            f"unsupported gguf version {version} (this reader implements "
+            + " and ".join(str(v) for v in _KNOWN_GGUF_VERSIONS) + ")")
     n_tensors = _read(f, "<Q", 8)
     n_kv = _read(f, "<Q", 8)
     if n_kv > 100_000:
