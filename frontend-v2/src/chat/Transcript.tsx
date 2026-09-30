@@ -285,11 +285,16 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
   // or the request timed out) surfaces as a 409 rather than as a silent no-op. That
   // refusal is deliberately NOT swallowed: a click that did nothing must not look
   // like one that worked.
-  const answerApproval = useCallback(async (requestId: string, allow: boolean) => {
+  const answerApproval = useCallback(async (requestId: string, allow: boolean,
+                                             answer?: Record<string, unknown>) => {
     const sid = useChat.getState().currentId;
     if (!sid) return;
     try {
-      await api.answerApproval(sid, { allow, requestId });
+      // B4: exactly one of the two shapes. The route refuses a question answered
+      // with `allow` (409) and a permission answered with an object, so the choice
+      // is made here from what the card submitted rather than by sending both.
+      await api.answerApproval(sid, answer !== undefined
+        ? { requestId, answer } : { allow, requestId });
     } catch (e) {
       useChat.setState({ lastError: errText(e) });
     }
