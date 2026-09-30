@@ -1,5 +1,11 @@
 # STATUS — Rigma improvement program, 2026-09-30
 
+> **ORCHESTRATOR NOTE (21:35 UTC).** Time-box the 0xC0000005 investigation to 15 minutes (GUIDANCE 13) and start the ODR-1 security fix NOW in parallel (GUIDANCE 11). Delete this note once both are under way.
+
+
+> **ORCHESTRATOR NOTE (21:15 UTC) - SECURITY.** An independent deep review of OD-2/OD-15 found a HIGH: with the default home workspace the write tools can create persistence files (Startup folder, .gitconfig, PowerShell profile) with no grant. Read GUIDANCE.md entries 11-12 and `.scratch/orchestrator/deep-review-od.md` before the next wave; delete this note once they are scheduled.
+
+
 > **ORCHESTRATOR NOTE (14:50 UTC) — GUIDANCE 6/7 actioned; a SECOND deep review is in
 > `.scratch/orchestrator/deep-review-2.md`.** GUIDANCE 6's nine findings (DR1–DR9) are all fixed and merged
 > (DR1/DR3/DR8 `ed52928`, DR2/DR4/DR5/DR6 `c4d3541`, DR7 `a903474`). The second review, over the diff since
@@ -83,7 +89,21 @@ both in `test_tools_hardening.py`) was resolved by keeping both tests.
 
 Nits from all five verifiers are recorded in `BACKLOG.md`'s "Wave 19 nits" section; none blocks.
 
+**Full suite at `3e519d8` (+ the docs commit): 3513 passed, 3 skipped, 5 deselected, 0 failed** in
+521.13 s — the two `D:`-path failures that had stood since the base are gone. Baseline at the
+pre-wave-19 `05e0398`: **2 failed, 3477 passed, 3 skipped, 5 deselected** in 494.54 s (the same two
+`D:` tests). **The run is intermittent, and the record must say so:** of four HEAD attempts, two
+stalled with the CPU flat and 36 `fake_acp_server` children alive at
+`test_phase4_lifecycle.py::test_restart_reattaches_and_finishes` — the REC-1-class stall already
+recorded below, and the same file's known low-rate flake (it passes alone 3/3 in ~1.5 s); a third,
+run under a `faulthandler` stack-dump wrapper, was stuck in `test_download_resume.py` when the dump
+fired at 120 s and then died with an access violation (`0xC0000005`), so that attempt is **not**
+counted as a product signal (the wrapper is the likely contributor and was not used again); the
+fourth, clean attempt completed as above. The stall is therefore **not attributable to wave 19 and
+not cleared of it** — the base was run once. It is the strongest reason to re-test REC-1 next session.
 
+| id | wave | commit | outcome |
+|---|---|---|
 | — | 0 | `8de0434` | Program docs written (BACKLOG / STATUS / HANDOFF / OWNER-DECISIONS); no source change. |
 | A1 | 1 | `4eaec9d` (`82e2bbe`) | Chat-turn persist: a fully-failed save is no longer reported as saved; the failure reaches the user on the turn-level `event: notice` channel and is logged with its `StaleWriteError` reason. |
 | A17/S2 | 1 | `30e711e` (`28ce163`) | The engine's own load log is parsed: model/KV/RS/compute buffers, host-vs-device split, `n_seq_max`, `graph splits`, and plan-vs-actual divergence. Unknown is reported as UNKNOWN, never 0. **Its first split baseline (1) and its VRAM comparison were both wrong and would have flagged the owner's healthy log — corrected in A17b/A17c (`099e2c1`), which the orchestrator had to flag via GUIDANCE 4+5 because no wave had read the live channel.** |
@@ -205,6 +225,12 @@ integration branch · `_rejected once_` = sent back to the implementer with the 
   likely an artifact of this session's output capture (a full pipe buffer blocking the writer), not a
   Rigma deadlock — recorded rather than dismissed, because the six-port fix's guarantee deserves a
   re-test under load and a future session should not mistake the artifact for a new bug.
+  **Wave 19 correction: the "artifact of output capture" reading above is too strong.** Two further
+  **file-redirected** HEAD runs stalled the same way (CPU flat, 36 `fake_acp_server` children, at
+  `test_phase4_lifecycle.py::test_restart_reattaches_and_finishes`), so the stall is **real and
+  intermittent**, not merely a buffered-pipe effect. It reproduced only at HEAD in the wave-19 window,
+  but the base was run once and completed, and the stall is on the pre-existing REC-1 list — so it is
+  neither attributed to nor cleared of wave 19. Next session: re-test REC-1 directly.
 - **A flake in `test_phase4_lifecycle.py`.** Run six times in isolation it passed 12/12 five times and
   once failed `test_restart_reattaches_and_finishes` (the A18 acceptance test). In every full run that
   file passed 12/12. So it is a low-rate flake, not a regression — but it is the same class as the

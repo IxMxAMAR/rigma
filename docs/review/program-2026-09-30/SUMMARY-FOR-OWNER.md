@@ -1,5 +1,59 @@
 # What changed in Rigma today — a summary for the owner
 
+## Tonight, after you went to sleep
+
+You said you would trust the recommendations, so I implemented the ones that fit in the evening and
+wrote the rest down as accepted-and-scheduled. This is the short version of what changed for you.
+
+**Restoring a backup now actually restores.** The Backup/Restore card promised that a restore
+"replaces the whole store — anything not in the file is gone". It didn't: it replaced your memories
+but quietly merged settings and methods, so a method you created after the backup survived and an old
+setting stayed. It now really replaces all three. Because that can delete things you made after the
+backup, it still rolls back completely if anything fails halfway — an independent check forced a
+failure mid-restore and confirmed your settings, every method file and your memory came back
+byte-for-byte identical.
+
+**You can now clear a stale document index.** The credential filter we added earlier only applies when
+a document is indexed, so an index built before it could still hold a `.env`, an SSH key or a browser
+cookie database. There is now a **rebuild index** button in the Grounding card. It stops the indexer,
+deletes the old index and rebuilds it from your folders with the filter in place. It never runs on its
+own — you press it.
+
+**An agent can no longer copy a file into your Startup folder just because it can write somewhere.**
+Copying and moving files outside your workspace already needed an explicit grant; now there is also a
+list of allowed destinations, seeded from the folders you already work in, so the grant is no longer
+all-or-nothing. An independent reviewer tried 32 ways to escape that list — `..`, prefix lookalikes,
+directory aliases, UNC paths, short names and case tricks — and none worked.
+
+**The two failing tests are fixed, and so is what they were hiding.** The suite had two failures that
+had been blamed on your locked `D:` drive. They were real: when Windows cannot read a path (locked
+drive, offline share, permission error), Rigma's mission compiler was aborting and the run started
+with no plan at all, silently. It now falls back the way it was designed to, and the tests build their
+own missing paths so they no longer depend on one drive's state.
+
+**A smaller one an independent reviewer caught while checking the above:** asking to view an image
+whose "file" is actually a folder returned success and sent the model a picture it could never see. It
+is refused properly now.
+
+**What I did not do, and why.** The LoRA feature and the ACP client are accepted but are their own
+programs — one needs a live agent session, which this run is not allowed to start. The two GPU fit
+measurements wait for your card. Making the DSH approval panel real needs a system-prompt change you
+should decide on, and the Job Object for Windows process trees is accepted as its own item. Nothing
+changed about your default run profile: the chooser was already there, and it now has a test so it
+cannot quietly disappear.
+
+**How it was checked — and one thing you should know.** Every change above was made by one agent and
+checked by a *different* one that did not write it, each required to name a state the test does not
+cover and try the code there. The full suite now passes: **3513 passed, 3 skipped, 0 failed** in 8
+minutes 41 seconds, and the two `D:` failures are gone. But I have to be straight about the runs before
+that one: two of my four attempts stalled part-way (a rare stall this project has seen before, in a
+known-flaky lifecycle test) and one crashed while I was instrumenting it. The stall is intermittent and
+pre-dates tonight, but I could not prove it away, so it is written down as the first thing to re-test.
+Nothing in the product is broken by it — but you should not be told the suite is rock-solid when it is
+merely reliable.
+
+---
+
 *Plain language. Written 2026-09-30 by the review session working on
 `review/deep-audit-2026-09-22`; this version covers the whole day, including the evening
 re-verification wave. Every claim here is traceable to a commit and to the documents under

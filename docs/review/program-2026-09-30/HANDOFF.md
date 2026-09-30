@@ -401,9 +401,14 @@ numbered: **W13B-3's ambient-env lever** (see the NEEDS-GPU list).
   2026-09-30 a run sat at 0 CPU for over a minute with 36 `fake_acp_server` children still alive — the
   exact REC-1 symptom — and both times its stdout was being **buffered rather than drained**. The
   identical command with output **drained live** or **redirected to a file** completed **3 of 3 times**
-  with identical results (`2 failed, 3477 passed`, both failures pre-existing). Before believing a
-  deadlock, **redirect the suite's output to a file** and re-run. That said, the six-port fix's
-  guarantee deserves a re-test under load: do not read this note as proof that REC-1 is gone.
+  with identical results (`2 failed, 3477 passed`, both failures pre-existing). **Wave 19 correction:
+  this reading is too strong.** Two further **file-redirected** HEAD runs stalled the same way (CPU
+  flat, 36 `fake_acp_server` children, at `test_phase4_lifecycle.py::test_restart_reattaches_and_finishes`);
+  the clean run that finally completed gave **`3513 passed, 3 skipped, 5 deselected, 0 failed`** in
+  521 s, and the pre-wave-19 base `05e0398` gave `2 failed, 3477 passed` in 495 s. So the stall is
+  **real and intermittent**, not a buffered-pipe artifact, and it is the first thing to re-test. The
+  six-port fix's guarantee still deserves a re-test under load: do not read this note as proof that
+  REC-1 is gone.
 - ~~Two full-suite failures are ENVIRONMENTAL, not code.~~ **FIXED in wave 19** (`852592d`, merged
   `75d9cf5`): `test_tools_hardening.py::test_view_image_missing_file` and
   `test_autonomous_run.py::test_compiled_spec_seeds_the_plan` built their fixtures under `tmp_path`
