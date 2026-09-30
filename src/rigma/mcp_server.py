@@ -127,14 +127,43 @@ def workspace() -> str:
     return str(os.environ.get("RIGMA_MCP_WORKSPACE") or "").strip()
 
 
+def _validated_profile(value) -> str:
+    """One of `runs.PROFILES`, or a refusal that NAMES the allowed set.
+
+    A7b: the twin of A7's route fix. `offered(prof=...)` — and the
+    `profile()`/`ctx()` that read the environment — passed any string through
+    to `tool_specs`, where an unrecognised profile matches none of the
+    restrictive branches and therefore behaves exactly like `all`: the profile
+    that grants the full network and delete surface. A typo, or a registrar
+    that sent "read-only", silently produced the MOST permissive roster.
+
+    Absent (`None`) still means "all" (the owner's OD-1 choice, unchanged). A
+    value that is PRESENT must be one of the four exactly — `""`, `"all "` and
+    `"ALL"` are refused, as the route refuses them. The type is checked first
+    because `[] in PROFILES` raises TypeError rather than answering False.
+    """
+    if value is None:
+        return "all"
+    from . import runs
+    if not isinstance(value, str) or value not in runs.PROFILES:
+        raise ValueError("profile: must be one of "
+                         + ", ".join(sorted(runs.PROFILES)))
+    return value
+
+
 def profile() -> str:
     """The run profile, so the same gates the native loop applies still apply.
 
     This server is a SECOND execution path into Rigma's tools, and a second path
     that skipped the profile gates would be a hole rather than a feature. Read
     from the environment for the same reason the workspace is.
+
+    A7b: validated, because an unknown value used to reach `tool_specs` and be
+    treated as `all`. A bad environment now raises here, which `call()` reports
+    as an error and `handle("tools/list")` answers as a protocol error — the
+    same refusal the run-creation route gives, rather than a permissive roster.
     """
-    return str(os.environ.get("RIGMA_MCP_PROFILE") or "all").strip() or "all"
+    return _validated_profile(os.environ.get("RIGMA_MCP_PROFILE"))
 
 
 def allow_code() -> bool:
@@ -239,7 +268,7 @@ def offered(*, ws: str | None = None, prof: str | None = None,
     from . import tools as toolkit
 
     ws = workspace() if ws is None else str(ws or "").strip()
-    prof = profile() if prof is None else (str(prof or "").strip() or "all")
+    prof = profile() if prof is None else _validated_profile(prof)
     code = allow_code() if code is None else bool(code)
 
     try:
@@ -323,7 +352,13 @@ def handle(msg) -> dict | None:
                          "capabilities": {"tools": {"listChanged": False}},
                          "serverInfo": {"name": SERVER_NAME, "version": _version()}})
     if method == "tools/list":
-        return _ok(mid, {"tools": offered()})
+        try:
+            tools = offered()
+        except ValueError as e:
+            # A7b: a bad RIGMA_MCP_PROFILE must not kill the read loop. The arm
+            # gets the same named refusal the run-creation route gives.
+            return _err(mid, -32602, str(e))
+        return _ok(mid, {"tools": tools})
     if method == "tools/call":
         # `or {}` rescues only FALSY values, so a truthy non-dict (`params:
         # "hot"`) survived and `.get` raised straight out of the read loop,
