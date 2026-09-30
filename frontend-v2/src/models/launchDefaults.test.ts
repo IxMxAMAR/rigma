@@ -4,6 +4,8 @@ import {
   defaultsChanged,
   defaultsPayload,
   draftFromLaunch,
+  fitAnswer,
+  fitForQuant,
   KV_TYPES,
 } from "./launchDefaults";
 
@@ -78,13 +80,95 @@ describe("draftFromLaunch", () => {
   it("reads the stored sentinels as unset, not as values", () => {
     expect(draftFromLaunch({ quant: "", ctx: 0, kv: "", vision: null,
                              backend: "" }))
-      .toEqual({ quant: "", ctx: "", kv: "", vision: "keep", backend: "" });
+      .toEqual({ quant: "", ctx: "", kv: "", vision: "keep", backend: "",
+                 batch: "", ubatch: "", ngl: "" });
   });
 
   it("keeps an explicit vision off distinct from the tri-state null", () => {
     expect(draftFromLaunch({ vision: false }).vision).toBe("off");
     expect(draftFromLaunch({ vision: true }).vision).toBe("on");
     expect(draftFromLaunch({}).vision).toBe("keep");
+  });
+
+  it("reads ngl 0 as a real request and -1 as the sentinel", () => {
+    // `-ngl 0` is every layer on the CPU — a real answer. -1 is "no opinion".
+    expect(draftFromLaunch({ ngl: 0 }).ngl).toBe("0");
+    expect(draftFromLaunch({ ngl: -1 }).ngl).toBe("");
+    expect(draftFromLaunch({ ngl: 40 }).ngl).toBe("40");
+  });
+});
+
+// C10. The three new levers have the same two rules as every other field —
+// a cleared value is `null`, an unchanged one is omitted — plus one of their
+// own: a stored spec that predates C10 has NO key, which is the sentinel, so a
+// blank input must send nothing rather than a clear.
+describe("the C10 payload: batch, ubatch and ngl", () => {
+  it("sends nothing for a pre-C10 stored spec with the fields left blank", () => {
+    const draft = draftFromLaunch(STORED);      // STORED has no batch keys
+    expect(defaultsPayload(draft, STORED)).toEqual({});
+  });
+
+  it("sends the changed sizes as numbers, and the untouched one not at all", () => {
+    const draft = { ...draftFromLaunch(STORED), batch: "8192", ubatch: "2048" };
+    expect(defaultsPayload(draft, STORED)).toEqual({ batch: 8192, ubatch: 2048 });
+  });
+
+  it("clears a stored size with null, not with 0", () => {
+    const stored = { ...STORED, batch: 8192, ubatch: 2048, ngl: 40 };
+    const draft = { ...draftFromLaunch(stored), batch: "", ubatch: "", ngl: "" };
+    expect(defaultsPayload(draft, stored)).toEqual({
+      batch: null, ubatch: null, ngl: null,
+    });
+  });
+
+  it("omits an unparseable size instead of sending it as a clear", () => {
+    const stored = { ...STORED, batch: 8192 };
+    const draft = { ...draftFromLaunch(stored), batch: "abc" };
+    expect(defaultsPayload(draft, stored)).toEqual({});
+  });
+
+  it("omits a negative ngl rather than sending it", () => {
+    // -1 is the sentinel, so the way to express it is a blank field.
+    const draft = { ...draftFromLaunch(STORED), ngl: "-1" };
+    expect(defaultsPayload(draft, STORED)).toEqual({});
+  });
+});
+
+describe("the fit the dialog must show", () => {
+  const FIT = {
+    ok: true, ctx: 16384, ngl: 59, kv: "q4_0", offload_pct: 0,
+    budget: { file_mb: 14200, mmproj_mb: 0, kv_mb: 800, budget_mb: 15018,
+              over_mb: -18, ctx: 16384, kv_type: "q4_0" },
+  };
+
+  it("names the fit's own ngl and says an override is a cap, not a pin", () => {
+    const line = fitAnswer(FIT, 64);
+    expect(line).toContain("places 59 of 64 layers");
+    expect(line).toContain("ngl is the fit's output");
+    expect(line).toContain("clamped");
+  });
+
+  it("says nothing at all when there is no verdict to show", () => {
+    expect(fitAnswer(undefined, 64)).toBe("");
+    expect(fitAnswer({}, 64)).toBe("");
+  });
+
+  it("says a fit that cannot place the model cannot be overridden into one", () => {
+    expect(fitAnswer({ ok: false, speed: "no" }, 64))
+      .toContain("cannot make it fit");
+  });
+
+  it("picks the fit for the named quant, else the first on-disk row", () => {
+    const rows = [
+      { file: "a", quant: "q8_0", bytes: 1, on_disk: false, pullable: true,
+        fit: { ok: true, ngl: 1 } },
+      { file: "b", quant: "q4_0", bytes: 1, on_disk: true, pullable: true,
+        fit: { ok: true, ngl: 2 } },
+    ];
+    expect(fitForQuant(rows, "q8_0")?.ngl).toBe(1);
+    expect(fitForQuant(rows, "")?.ngl).toBe(2);
+    expect(fitForQuant([], "q4_0")).toBeUndefined();
+    expect(fitForQuant(undefined, "q4_0")).toBeUndefined();
   });
 });
 

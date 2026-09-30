@@ -18,13 +18,21 @@
 //     never as the empty string the stored sentinel would round-trip.
 import { useEffect, useRef, useState } from "react";
 
-import { engineApi, type LaunchDefaults } from "../lib/engineApi";
+import {
+  engineApi,
+  type Budget,
+  type Fit,
+  type LaunchDefaults,
+  type ModelCard,
+} from "../lib/engineApi";
 import {
   CTX_STEPS,
   KV_TYPES,
   defaultsChanged,
   defaultsPayload,
   draftFromLaunch,
+  fitAnswer,
+  fitForQuant,
   type DefaultsDraft,
 } from "./launchDefaults";
 
@@ -67,6 +75,14 @@ export interface LaunchDefaultsFormProps {
   nativeCtx: number | null;
   hasMmproj: boolean;
   backends: string[];
+  /** C10: the fit the Models page already computed for the selected quant. The
+   *  dialog must SHOW it — `ngl` is the fit's output and an override is a cap,
+   *  and a larger `ubatch` costs VRAM the fit pays. `undefined` when the
+   *  hardware probe failed, in which case the form says nothing rather than
+   *  inventing a verdict. */
+  fit?: Fit & { budget?: Budget };
+  /** `spec.n_layers`, so "59 of 64 layers" can be said out loud. */
+  nLayers?: number;
   /** D2: opened because `first_load` was true, rather than from the Sidecar. */
   firstLoad?: boolean;
   busy: boolean;
@@ -85,7 +101,7 @@ function ctxKnown(n: number | null): n is number {
 
 export function LaunchDefaultsForm({
   slug, draft, initial, custom, quants, nativeCtx, hasMmproj, backends,
-  firstLoad, busy, saved, error, onDraft, onSave, onClose,
+  fit, nLayers, firstLoad, busy, saved, error, onDraft, onSave, onClose,
 }: LaunchDefaultsFormProps) {
   const row = "flex items-center gap-2 text-[12.5px]";
   const label = "w-28 shrink-0 text-secondary";
@@ -107,6 +123,8 @@ export function LaunchDefaultsForm({
   const qs = quants.slice();
   if (draft.quant && !qs.includes(draft.quant)) qs.push(draft.quant);
   const changed = defaultsChanged(draft, initial);
+  const fitLine = fitAnswer(fit, nLayers);
+  const storedUbatch = Number(draft.ubatch) || 0;
 
   return (
     <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center"
@@ -181,6 +199,53 @@ context that fits, but cache error is written per token and compounds.">
             {KV_TYPES.map((k) => <option key={k} value={k}>{k}</option>)}
           </select>
         </label>
+
+        {/* C10: the two batch sizes and the GPU-layer cap. Rigma could already
+            EMIT -b/-ub/-ngl; until this route accepted them no caller could ask
+            for them. The two sizes are a REQUEST (the fit cannot contradict
+            them), `ngl` is a CAP on the fit's own output. */}
+        <label className={row} title="The logical batch: how many tokens are processed per prompt step (-b). Blank = the engine's 2048.">
+          <span className={label}>batch</span>
+          <input className={sel} type="number" min={0} inputMode="numeric"
+                 value={draft.batch} disabled={busy}
+                 placeholder="engine default (2048)"
+                 aria-label="Default batch"
+                 onChange={(e) => onDraft({ ...draft, batch: e.target.value })} />
+        </label>
+
+        <label className={row} title="The physical batch: the slice llama.cpp sizes its compute buffer for (-ub). Blank = the engine's 512.">
+          <span className={label}>ubatch</span>
+          <input className={sel} type="number" min={0} inputMode="numeric"
+                 value={draft.ubatch} disabled={busy}
+                 placeholder="engine default (512)"
+                 aria-label="Default ubatch"
+                 onChange={(e) => onDraft({ ...draft, ubatch: e.target.value })} />
+        </label>
+        <p role="note" className="text-[11.5px] text-amber pl-28 -mt-1">
+          llama.cpp sizes its compute buffer from the physical batch, so a
+          larger ubatch costs VRAM the fit must pay — it is not free. The fit
+          below is priced at the stored ubatch
+          {storedUbatch ? ` (${storedUbatch})` : " (the engine default 512)"};
+          saving a new value re-prices it. A physical batch larger than the
+          logical one is refused by the engine, so the server will answer 400.
+        </p>
+
+        <label className={row} title="A CAP on the fit's own placement (-ngl). Blank = the fit decides. 0 = every layer on the CPU.">
+          <span className={label}>ngl</span>
+          <input className={sel} type="number" min={0} inputMode="numeric"
+                 value={draft.ngl} disabled={busy}
+                 placeholder="the fit's choice"
+                 aria-label="Default ngl"
+                 onChange={(e) => onDraft({ ...draft, ngl: e.target.value })} />
+        </label>
+        {fitLine && (
+          // The fit's OWN answer, straight from /api/models. Shown because ngl
+          // is its output and an override is only a cap: without this the field
+          // reads as a free choice, which is the thing C10 must not present.
+          <p role="note" className="text-[11.5px] text-muted pl-28 -mt-1">
+            {fitLine}
+          </p>
+        )}
 
         {hasMmproj && (
           <label className={row} title="Tri-state on purpose: 'last launch' keeps
@@ -270,7 +335,7 @@ export default function LaunchDefaultsDialog({
   const [draft, setDraft] = useState<DefaultsDraft | null>(null);
   const [initial, setInitial] = useState<LaunchDefaults | null>(null);
   const [custom, setCustom] = useState(true);
-  const [quants, setQuants] = useState<string[]>([]);
+  const [modelCard, setModelCard] = useState<ModelCard | null>(null);
   // `null` = the window is UNKNOWN. It used to default to 262144, which is how
   // a failed model API turned into an invented native window (DR2-4).
   const [nativeCtx, setNativeCtx] = useState<number | null>(null);
@@ -305,8 +370,7 @@ export default function LaunchDefaultsDialog({
         const card = models?.models.find((m) => m.slug === slug) ?? null;
         setInitial(md.launch);
         setCustom(md.custom);
-        setQuants(card ? card.quants.filter((q) => q.on_disk).map((q) => q.quant)
-                       : []);
+        setModelCard(card);
         setNativeCtx(card?.native_ctx || srv?.native_ctx || null);
         setHasMmproj(!!card?.mmproj || srv?.has_mmproj === true);
         setBackends((srv?.backends ?? []).filter((b) => b.buildable)
@@ -366,6 +430,13 @@ export default function LaunchDefaultsDialog({
     );
   }
 
+  // Derived from the card so the fit follows the SELECTED quant as the user
+  // changes it. The card is the only place the fit is computed; the dialog must
+  // not re-derive the arithmetic (`resolve.py` owns it).
+  const quants = modelCard
+    ? modelCard.quants.filter((q) => q.on_disk).map((q) => q.quant) : [];
+  const fit = fitForQuant(modelCard?.quants, draft.quant);
+
   return (
     <LaunchDefaultsForm
       slug={slug}
@@ -376,6 +447,8 @@ export default function LaunchDefaultsDialog({
       nativeCtx={nativeCtx}
       hasMmproj={hasMmproj}
       backends={backends}
+      fit={fit}
+      nLayers={modelCard?.n_layers}
       firstLoad={firstLoad}
       busy={busy}
       saved={saved}

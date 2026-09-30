@@ -99,6 +99,40 @@ describe("LaunchDefaultsForm markup", () => {
     expect(markup).toContain("q5_0");
     expect(markup).toContain("bf16");
   });
+
+  // --- C10: batch, ubatch, ngl ---------------------------------------------
+
+  it("offers the three C10 levers and says a larger ubatch is not free", () => {
+    const markup = renderToStaticMarkup(<LaunchDefaultsForm {...base} />);
+    expect(markup).toContain('aria-label="Default batch"');
+    expect(markup).toContain('aria-label="Default ubatch"');
+    expect(markup).toContain('aria-label="Default ngl"');
+    // The whole point of the note: the physical batch buys the compute buffer,
+    // so an override is a VRAM cost, not a free knob.
+    expect(markup).toContain("costs VRAM");
+    expect(markup).toContain("not free");
+  });
+
+  it("shows the fit's own answer, because ngl is the fit's output", () => {
+    const markup = renderToStaticMarkup(
+      <LaunchDefaultsForm
+        {...base}
+        nLayers={64}
+        fit={{
+          ok: true, ctx: 16384, ngl: 59, kv: "q4_0", offload_pct: 0,
+          budget: { file_mb: 14200, mmproj_mb: 0, kv_mb: 800,
+                    budget_mb: 15018, over_mb: -18, ctx: 16384,
+                    kv_type: "q4_0" },
+        }} />);
+    expect(markup).toContain("places 59 of 64 layers");
+    expect(markup).toContain("18 MB of headroom");
+    expect(markup).toContain("clamped");
+  });
+
+  it("says nothing about a fit it does not have", () => {
+    const markup = renderToStaticMarkup(<LaunchDefaultsForm {...base} />);
+    expect(markup).not.toContain("layers on the GPU");
+  });
 });
 
 describe("the launch-defaults dialog against the real route", () => {
@@ -170,6 +204,19 @@ describe("the launch-defaults dialog against the real route", () => {
     await act(async () => {
       save!.click();
       await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  /** A controlled number input only sees a change through the native setter. */
+  async function type(label: string, value: string) {
+    const inp = container.querySelector<HTMLInputElement>(
+      `[aria-label="${label}"]`);
+    expect(inp, `no input labelled ${label}`).not.toBeNull();
+    const setValue = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype, "value")!.set!;
+    await act(async () => {
+      setValue.call(inp, value);
+      inp!.dispatchEvent(new Event("input", { bubbles: true }));
     });
   }
 
@@ -297,5 +344,30 @@ describe("the launch-defaults dialog against the real route", () => {
     await mount();
     expect(container.textContent).toContain("262144");
     expect(container.textContent).toMatch(/clamps it to 32768/);
+  });
+
+  // --- C10: the server's own 400, verbatim ---------------------------------
+
+  it("draws the server's own 400 for a batch pair the engine refuses", async () => {
+    // The pair is refused by `hangar` (`batch_pair_error`), not by a local
+    // guess: the dialog must not rewrite or swallow that sentence.
+    const REFUSAL_400 = "ubatch 8192 exceeds batch 4096: llama.cpp refuses to "
+      + "start when the physical batch is larger than the logical batch";
+    serve(() => reply(400, { error: REFUSAL_400 }));
+    await mount();
+    await type("Default batch", "4096");
+    await type("Default ubatch", "8192");
+    await clickSave();
+    expect(posts).toEqual([{ batch: 4096, ubatch: 8192 }]);
+    expect(container.textContent).toContain(REFUSAL_400);
+  });
+
+  it("sends the C10 levers the user set and nothing else", async () => {
+    serve(() => reply(200, { slug: "m", launch: null }));
+    await mount();
+    await type("Default ubatch", "2048");
+    await type("Default ngl", "40");
+    await clickSave();
+    expect(posts).toEqual([{ ubatch: 2048, ngl: 40 }]);
   });
 });

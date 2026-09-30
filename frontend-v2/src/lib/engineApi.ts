@@ -276,6 +276,12 @@ export interface LaunchDefaults {
   spec_type?: string | null;
   spec_n_max?: number | null;
   backend?: string | null;
+  /** C10: `-b`/`-ub`/`-ngl`. 0 on either batch field and -1 on `ngl` are the
+   *  "no opinion" sentinels, so a caller that means to CLEAR one sends null and
+   *  not the sentinel. `-ngl 0` is a real request (every layer on the CPU). */
+  batch?: number | null;
+  ubatch?: number | null;
+  ngl?: number | null;
 }
 
 /** `GET /api/models/{slug}/defaults` — the D2 route. `first_load` is the
