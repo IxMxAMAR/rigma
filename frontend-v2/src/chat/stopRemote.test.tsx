@@ -45,10 +45,15 @@ function route(
 function seed(extra: Partial<ChatState> = {}) {
   useChat.setState({
     currentId: "s1", messages: [], streams: {}, aborts: {},
-    remoteStreaming: { s1: true }, remoteStopRequested: {},
+    remoteStreaming: { s1: true }, remoteStopRequested: {}, remoteStopTurn: {},
     sessions: [], savedAgent: {}, drafts: {}, lastError: null, notice: null,
     ...extra,
   });
+}
+
+/** A transcript carrying the server's per-turn checkpoint id (api.ts:48-50). */
+function partial(ckpt: string) {
+  return { role: "assistant" as const, content: "…", partial: true, ckpt_id: ckpt };
 }
 
 describe("stopRemote asks the server, and lets the server decide", () => {
@@ -128,6 +133,83 @@ describe("stopRemote asks the server, and lets the server decide", () => {
     await useChat.getState().refreshRemote("s1");
     expect(useChat.getState().remoteStopRequested.s1).toBeUndefined();
     expect(useChat.getState().remoteStreaming.s1).toBe(false);
+  });
+
+  it("does not let a request outlive its turn across a FAILED refresh", async () => {
+    // P9 (verify-w14a): the click's follow-up read fails, so `remoteStreaming`
+    // stays stale `true`; the network recovers only after a NEW remote turn has
+    // begun. The request was made before any checkpoint existed, so the tab
+    // cannot name its turn — and a lost confirmation means it cannot prove the
+    // turn it now hears about is that one. It must not keep a disabled "stop
+    // requested…" on a turn this tab never asked to stop.
+    let fail = true;
+    vi.stubGlobal("fetch", route(
+      () => reply(200, { ok: true, stopped: true }),
+      () => {
+        if (fail) throw new Error("network down");
+        return reply(200, { id: "s1", messages: [], streaming: true });
+      },
+    ));
+    await useChat.getState().stopRemote("s1");
+    // the failed read left the request armed and the flag stale
+    expect(useChat.getState().remoteStopRequested.s1).toBe(true);
+    expect(useChat.getState().remoteStreaming.s1).toBe(true);
+
+    // the network recovers and a new remote turn is already running
+    fail = false;
+    await useChat.getState().refreshRemote("s1");
+    expect(useChat.getState().remoteStopRequested.s1).toBeUndefined();
+    expect(useChat.getState().remoteStreaming.s1).toBe(true);
+  });
+
+  it("drops a request the server answers for a DIFFERENT turn", async () => {
+    // The turn the request belongs to is named by the checkpoint on screen
+    // (`ckpt_id`, api.ts:48-50). When the server reports a different turn, the
+    // request belongs to a turn that has ended — even though the chat is still
+    // generating.
+    seed({ messages: [partial("ckA")] });
+    vi.stubGlobal("fetch", route(
+      () => reply(200, { ok: true, stopped: true }),
+      () => reply(200, { id: "s1", messages: [partial("ckB")], streaming: true }),
+    ));
+    await useChat.getState().stopRemote("s1");
+    expect(useChat.getState().remoteStopRequested.s1).toBeUndefined();
+    expect(useChat.getState().remoteStreaming.s1).toBe(true);
+  });
+
+  it("keeps the request while the server still reports the SAME turn", async () => {
+    // The other side of P9: the fix must not drop every request. A failed read
+    // that recovers to the SAME turn leaves the request live, so the control
+    // stays honest about having asked.
+    seed({ messages: [partial("ckA")] });
+    let fail = true;
+    vi.stubGlobal("fetch", route(
+      () => reply(200, { ok: true, stopped: true }),
+      () => {
+        if (fail) throw new Error("network down");
+        return reply(200, { id: "s1", messages: [partial("ckA")], streaming: true });
+      },
+    ));
+    await useChat.getState().stopRemote("s1");
+    expect(useChat.getState().remoteStopRequested.s1).toBe(true);
+
+    fail = false;
+    await useChat.getState().refreshRemote("s1");
+    expect(useChat.getState().remoteStopRequested.s1).toBe(true);
+  });
+
+  it("does not invent an answer when the server omits `stopped`", async () => {
+    // An absent key is UNKNOWN, not false. Reading it as false would print
+    // "already finished — nothing was running to stop" against a server that
+    // simply did not say — a fact nobody stated.
+    vi.stubGlobal("fetch", route(
+      () => reply(200, { ok: true }),
+      () => reply(200, { id: "s1", messages: [], streaming: false }),
+    ));
+    await useChat.getState().stopRemote("s1");
+    expect(useChat.getState().notice).not.toContain("already finished");
+    expect(useChat.getState().notice).not.toContain("nothing was running");
+    expect(useChat.getState().notice).toContain("did not say");
   });
 });
 

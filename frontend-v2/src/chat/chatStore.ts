@@ -749,6 +749,19 @@ export interface ChatState {
    *  POST. It is dropped the moment the server says the chat is no longer
    *  generating, so a later remote turn cannot inherit a spent request. */
   remoteStopRequested: Record<string, boolean>;
+  /** OD-13/P9: WHICH turn a stop request was made against.
+   *
+   *  `remoteStopRequested` alone could not answer "is this still the same
+   *  turn?" once a refresh had failed: the flag survived a new remote turn and
+   *  left a disabled "stop requested…" on a turn this tab never asked to stop.
+   *  A request is only meaningful for the turn running when it was made, and
+   *  the server's own per-turn checkpoint id (`ChatMessage.ckpt_id`,
+   *  api.ts:48-50) names that turn whenever a checkpoint was on screen.
+   *  `turn: null` means the request was made before any checkpoint existed, so
+   *  the tab cannot name it; `lost` records that a refresh failed while the
+   *  request was outstanding, so the tab can no longer prove that the turn it
+   *  next hears about is the one it asked to stop. */
+  remoteStopTurn: Record<string, { turn: string | null; lost: boolean }>;
   /** The take a regenerate set aside, per session — it is folded back in when
    *  THAT session's turn returns, however many chats later. */
   pendingVariants: Record<string, { content: unknown; variants: unknown[] }>;
@@ -909,6 +922,35 @@ const patchTurn =
     return cur ? { streams: { ...st.streams, [sid]: fn(cur) } } : {};
   };
 
+/** The server's per-turn identity inside a transcript: the `ckpt_id` of the
+ *  live checkpoint (`api.ts:48-50`), or null before the turn's first checkpoint
+ *  and after its finished reply replaces it. The id is stable across rewrites
+ *  of one turn, which is exactly what tells one turn's partial from another's. */
+export function liveTurnId(messages: ChatMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.partial === true && typeof m.ckpt_id === "string") return m.ckpt_id;
+  }
+  return null;
+}
+
+/** OD-13/P9: has a stop request outlived the turn it was made for?
+ *
+ *  `pin` is `remoteStopTurn[id]`. Spent when the server says the chat is no
+ *  longer generating, or when it reports a DIFFERENT turn, or when a refresh
+ *  failed while the request was outstanding and the server's turn cannot be
+ *  shown to be the pinned one. Pure, so the rule is assertable without a fetch. */
+export function stopRequestSpent(
+  streaming: boolean, serverTurn: string | null,
+  pin: { turn: string | null; lost: boolean } | undefined,
+): boolean {
+  if (!streaming) return true;                    // the server says it is over
+  if (pin === undefined) return false;            // nothing pinned: cannot judge
+  if (pin.turn !== null && pin.turn === serverTurn) return false;   // same turn
+  if (pin.lost) return true;                      // evidence of sameness was lost
+  return pin.turn !== null && serverTurn !== null && serverTurn !== pin.turn;
+}
+
 export const useChat = create<ChatState>((set, get) => ({
   sessions: [],
   currentId: null,
@@ -926,6 +968,7 @@ export const useChat = create<ChatState>((set, get) => ({
   savedAgent: {},
   remoteStreaming: {},
   remoteStopRequested: {},
+  remoteStopTurn: {},
 
   loadSessions: async () => {
     try {
@@ -935,19 +978,26 @@ export const useChat = create<ChatState>((set, get) => ({
       // reads this map, and two sources for one fact must not disagree.
       const cur = get().currentId;
       const curRow = cur ? rows.find((r) => r.id === cur) : undefined;
-      set((st) => ({
-        sessions: rows,
-        ...(cur && curRow
-          ? { remoteStreaming: { ...st.remoteStreaming,
-                                 [cur]: curRow.streaming === true },
-              // OD-13: the server says this chat is done, so any stop request
-              // this tab made is spent — keeping it would arm the NEXT remote
-              // turn with a stale "stop requested…".
-              ...(curRow.streaming === true
-                ? {} : { remoteStopRequested:
-                           without(st.remoteStopRequested, cur) }) }
-          : {}),
-      }));
+      set((st) => {
+        if (!cur || !curRow) return { sessions: rows };
+        // OD-13: the server says this chat is done, so any stop request this
+        // tab made is spent — keeping it would arm the NEXT remote turn with a
+        // stale "stop requested…". P9: a request whose confirmation was lost
+        // (a failed poll) is spent too, because this summary cannot name the
+        // turn (no `ckpt_id`) and so cannot prove it is still the same one.
+        const spent = st.remoteStopRequested[cur] === true
+          && stopRequestSpent(curRow.streaming === true, null,
+                              st.remoteStopTurn[cur]);
+        return {
+          sessions: rows,
+          remoteStreaming: { ...st.remoteStreaming,
+                             [cur]: curRow.streaming === true },
+          ...(spent
+            ? { remoteStopRequested: without(st.remoteStopRequested, cur),
+                remoteStopTurn: without(st.remoteStopTurn, cur) }
+            : {}),
+        };
+      });
     } catch (e) {
       set({ lastError: errText(e) });
     }
@@ -962,18 +1012,37 @@ export const useChat = create<ChatState>((set, get) => ({
       // stream this tab owns is authoritative for its own chat, and the server's
       // durable copy carries the mid-turn checkpoint as a message — replacing
       // `messages` under it would draw that reply twice.
-      set((st) => ({
-        remoteStreaming: { ...st.remoteStreaming, [id]: s.streaming === true },
-        // OD-13: a stop request only means anything while the server still says
-        // the chat is generating. Its own flag is the truth, so the moment it
-        // says otherwise the request is spent.
-        ...(s.streaming === true
-          ? {} : { remoteStopRequested: without(st.remoteStopRequested, id) }),
-        ...(st.currentId === id && !st.streams[id]
-          ? { messages: s.messages } : {}),
-      }));
+      set((st) => {
+        // OD-13: a stop request only means anything for the turn it was made
+        // for. The server's own `streaming` flag and its per-turn `ckpt_id` are
+        // the truth, so a request is spent the moment the server says the chat
+        // is done OR reports a different turn — and, when a poll failed while
+        // the request was outstanding, unless the server's turn is provably the
+        // pinned one (P9: it must not outlive its turn and disable the control
+        // on a later turn this tab never asked to stop).
+        const spent = st.remoteStopRequested[id] === true
+          && stopRequestSpent(s.streaming === true, liveTurnId(s.messages ?? []),
+                              st.remoteStopTurn[id]);
+        return {
+          remoteStreaming: { ...st.remoteStreaming, [id]: s.streaming === true },
+          ...(spent
+            ? { remoteStopRequested: without(st.remoteStopRequested, id),
+                remoteStopTurn: without(st.remoteStopTurn, id) }
+            : {}),
+          ...(st.currentId === id && !st.streams[id]
+            ? { messages: s.messages } : {}),
+        };
+      });
     } catch {
-      // A poll that failed is not worth a banner; the next tick retries.
+      // A poll that failed is not worth a banner; the next tick retries. But it
+      // IS a hole in a stop request's evidence: without the server's answer the
+      // tab can no longer prove that the turn it next hears about is the one it
+      // asked to stop, so record that on the pin rather than leaving a request
+      // armed across a turn boundary it cannot see (P9).
+      set((st) => st.remoteStopRequested[id] === true
+        ? { remoteStopTurn: { ...st.remoteStopTurn,
+            [id]: { turn: st.remoteStopTurn[id]?.turn ?? null, lost: true } } }
+        : {});
     }
   },
 
@@ -1012,6 +1081,8 @@ export const useChat = create<ChatState>((set, get) => ({
       remoteStreaming: without(st.remoteStreaming, id),
       // OD-13: and neither must a stop request made against it.
       remoteStopRequested: without(st.remoteStopRequested, id),
+      // P9: nor the turn that request was pinned to.
+      remoteStopTurn: without(st.remoteStopTurn, id),
       // the draft was typed for a chat that is about to stop existing
       drafts: without(st.drafts, id),
       // R5-PERSIST: and so was the agent state. Same reason as the draft — every
@@ -1051,18 +1122,24 @@ export const useChat = create<ChatState>((set, get) => ({
   open: async (id) => {
     try {
       const s = await api.getSession(id);
+      // OD-13: the same truth decides whether a stop request is still live.
+      // Opening a chat the server says is NOT generating clears any spent
+      // request, so the control cannot open already reading "stop requested…".
+      // P9: it is spent too when the server reports a different turn, or when a
+      // failed refresh left the tab unable to prove this is the pinned turn.
+      const spent = get().remoteStopRequested[id] === true
+        && stopRequestSpent(s.streaming === true, liveTurnId(s.messages ?? []),
+                            get().remoteStopTurn[id]);
       set({ currentId: id, messages: s.messages,
             harness: s.harness ?? "native",
         permission: s.permission ?? "full", mcodeTransport: s.mcode_transport ?? "exec", lastError: null,
         notice: null,
         // D3b: the reload's own answer to "is this chat still generating?".
         remoteStreaming: { ...get().remoteStreaming, [id]: s.streaming === true },
-        // OD-13: the same truth decides whether a stop request is still live.
-        // Opening a chat the server says is NOT generating clears any spent
-        // request, so the control cannot open already reading "stop requested…".
-        ...(s.streaming === true
-          ? {} : { remoteStopRequested:
-                     without(get().remoteStopRequested, id) }),
+        ...(spent
+          ? { remoteStopRequested: without(get().remoteStopRequested, id),
+              remoteStopTurn: without(get().remoteStopTurn, id) }
+          : {}),
         // R5-PERSIST: the agent's durable state comes back with the chat, so the
         // panel survives a reload. Replaced rather than merged — this is the
         // server's authoritative copy for THIS chat, and a stale local fragment
@@ -1448,17 +1525,28 @@ export const useChat = create<ChatState>((set, get) => ({
     if (get().remoteStopRequested[id]) return;
     set((st) => ({
       remoteStopRequested: { ...st.remoteStopRequested, [id]: true },
+      // P9: pin the request to the turn on screen right now. `messages` is this
+      // tab's view of the OPEN chat, so a request for any other session is left
+      // unnamed rather than pinned to the wrong turn.
+      remoteStopTurn: { ...st.remoteStopTurn,
+        [id]: { turn: st.currentId === id ? liveTurnId(st.messages) : null,
+                lost: false } },
       lastError: null,
     }));
-    let stopped: boolean;
+    // UNKNOWN is not false. The route always sends `stopped` today, but a
+    // server that omits it must not be read as "nothing was running" — that
+    // would print a fact nobody stated.
+    let stopped: boolean | null;
     try {
-      stopped = (await api.stopSession(id)).stopped === true;
+      const r = await api.stopSession(id);
+      stopped = typeof r.stopped === "boolean" ? r.stopped : null;
     } catch (e) {
       // The route refused or the request never landed. Nothing was stopped, so
       // clear the request rather than leaving the control stuck on
       // "stop requested…", and keep the server's sentence.
       set((st) => ({
         remoteStopRequested: without(st.remoteStopRequested, id),
+        remoteStopTurn: without(st.remoteStopTurn, id),
         lastError: errText(e),
       }));
       return;
@@ -1467,11 +1555,17 @@ export const useChat = create<ChatState>((set, get) => ({
     // the turn is over. `refreshRemote` also drops the request if it is.
     await get().refreshRemote(id);
     if (get().remoteStreaming[id] === true) return;   // still unwinding
-    if (!stopped) {
+    if (stopped === false) {
       // The event this route sets did not exist: the turn was already over
       // (finished, or stopped by another tab). Say that, do not claim a stop.
       set({ notice: "the server says that turn had already finished — "
                     + "nothing was running to stop" });
+    } else if (stopped === null) {
+      // The server did not say whether anything was running, so the tab must
+      // not invent an answer in either direction. All it can honestly report is
+      // what its own state read showed: this chat is not generating now.
+      set({ notice: "the server did not say whether a turn was running — "
+                    + "this chat is not generating now" });
     }
   },
 

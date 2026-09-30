@@ -262,9 +262,13 @@ export const api = {
    *  is reading it: that only drops this browser's end, and the backend keeps
    *  working — for an external agent, keeps running and keeps spawning
    *  subagents while the UI says stopped. `stopped` says whether anything was
-   *  actually running, so the UI can be honest about what it did. */
+   *  actually running, so the UI can be honest about what it did.
+   *
+   *  `stopped` is OPTIONAL because absent means UNKNOWN, not false: the route
+   *  always sends it today (`serve.py stop_chat`), but a server that omits it
+   *  must not be read as "nothing was running" — that is a fact nobody stated. */
   stopSession: (id: string) =>
-    j<{ ok: boolean; stopped: boolean }>(
+    j<{ ok: boolean; stopped?: boolean }>(
       "POST", `/api/sessions/${id}/stop`, {}),
   /** The honest menu: every backend, each with what it would cost and what it
    *  cannot do. `runnable` and `installed` are reported separately even though
