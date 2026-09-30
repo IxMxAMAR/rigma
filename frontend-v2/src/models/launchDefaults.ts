@@ -12,7 +12,12 @@
 //   2. Only the fields the user actually changed may be sent. The route merges
 //      what it is given over the stored defaults, so a payload that named every
 //      field would silently clear the ones the dialog does not show.
-import type { LaunchDefaults } from "../lib/engineApi";
+import type {
+  Budget,
+  Fit,
+  LaunchDefaults,
+  QuantRow,
+} from "../lib/engineApi";
 
 /** Every cache type `server_ops.KV_CACHE_TYPES` accepts — `tuple(CACHE_BYTES)`
  *  in models.py:20-28. The Sidecar's own picker was a stale 4-value subset
@@ -33,6 +38,11 @@ export interface DefaultsDraft {
   kv: string;
   vision: "keep" | "on" | "off";
   backend: string;
+  /** C10. Strings because a text input's value is a string; "" is "no opinion"
+   *  for the two batch sizes, and for `ngl` — whose sentinel is -1, NOT 0. */
+  batch: string;
+  ubatch: string;
+  ngl: string;
 }
 
 /** The stored defaults as the form's state. A missing launch is all-unset. */
@@ -44,7 +54,23 @@ export function draftFromLaunch(l: LaunchDefaults | null | undefined): DefaultsD
     kv: (l?.kv ?? "").trim(),
     vision: l?.vision === true ? "on" : l?.vision === false ? "off" : "keep",
     backend: (l?.backend ?? "").trim(),
+    batch: l?.batch ? String(l.batch) : "",
+    ubatch: l?.ubatch ? String(l.ubatch) : "",
+    // -1 is the sentinel and 0 is a REAL request (`-ngl 0` = every layer on the
+    // CPU), so this cannot use the falsy test the two sizes use.
+    ngl: l?.ngl !== undefined && l?.ngl !== null && l.ngl >= 0
+      ? String(l.ngl) : "",
   };
+}
+
+/** A size field as the route wants it: `null` when cleared, the integer when
+ *  it parses, and `undefined` when it does not — an unparseable entry must be
+ *  OMITTED, never sent as a clear, or typing "abc" would delete a default. */
+function sizeField(v: string): number | null | undefined {
+  const s = v.trim();
+  if (s === "") return null;
+  if (!/^\d+$/.test(s)) return undefined;
+  return Number(s);
 }
 
 /** Only what changed, with `null` for a field the user cleared.
@@ -82,7 +108,67 @@ export function defaultsPayload(
   const b = d.backend.trim();
   if (b !== (init.backend ?? "").trim()) p.backend = b || null;
 
+  // C10: the two batch sizes and the ngl cap. `0` (sizes) and `-1` (ngl) are
+  // the stored sentinels, so a cleared field is `null` — the route maps it back
+  // to the sentinel — and an unchanged field is omitted entirely. A stored
+  // launch that predates C10 has no key at all, which is the same as the
+  // sentinel, so a blank input on it must send NOTHING (not a clear).
+  for (const f of ["batch", "ubatch"] as const) {
+    const n = sizeField(d[f]);
+    if (n === undefined) continue;
+    const stored = init[f] ?? 0;
+    if (n === null ? stored !== 0 : n !== stored) p[f] = n;
+  }
+  const g = sizeField(d.ngl);
+  if (g !== undefined) {
+    const stored = init.ngl ?? -1;
+    if (g === null ? stored !== -1 : g !== stored) p.ngl = g;
+  }
+
   return p;
+}
+
+/** The fit the Models page already computed for the quant this dialog will
+ *  default to. `draft.quant` names it when set; otherwise the first on-disk
+ *  row — the same one `hangar.list_models` marks `on_disk`. */
+export function fitForQuant(
+  rows: QuantRow[] | undefined,
+  quant: string,
+): (Fit & { budget?: Budget }) | undefined {
+  if (!rows || rows.length === 0) return undefined;
+  const named = quant ? rows.find((r) => r.quant === quant) : undefined;
+  return (named ?? rows.find((r) => r.on_disk) ?? rows[0])?.fit;
+}
+
+/** One honest sentence for the fit's OWN answer, or "" when there is no verdict
+ *  to show (no hardware probe, or the fit threw). `ngl` is the fit's OUTPUT:
+ *  this is the number a stored override is priced against, and the ubatch note
+ *  in the form is why a larger physical batch is not free. */
+export function fitAnswer(
+  fit: (Fit & { budget?: Budget }) | undefined,
+  nLayers?: number,
+): string {
+  if (!fit) return "";
+  const where = `at ctx ${fit.ctx ?? fit.budget?.ctx ?? "?"} with a `
+    + `${fit.kv ?? fit.budget?.kv_type ?? "?"} cache`;
+  if (fit.ok === false) {
+    // The refused shape carries no `ngl` at all, so this must be answered
+    // BEFORE the `ngl === undefined` test below.
+    return `the fit cannot place this model on this machine ${where} — an ngl `
+      + "override cannot make it fit.";
+  }
+  if (fit.ngl === undefined) return "";
+  const of = nLayers ? ` of ${nLayers}` : "";
+  const b = fit.budget;
+  const vram = b
+    ? (b.over_mb > 0
+        ? `; ${b.over_mb} MB OVER the ${b.budget_mb} MB budget`
+        : `; ${-b.over_mb} MB of headroom under the ${b.budget_mb} MB budget`)
+    : "";
+  return `the fit places ${fit.ngl}${of} layers on the GPU ${where}`
+    + ` (${fit.offload_pct ?? 0}% of the weights offloaded)${vram}. ngl is the`
+    + " fit's output: a lower value is honoured, a higher one is clamped to"
+    + " what the fit allows at launch, and the plan says which.";
 }
 
 /** True when the draft says something the stored defaults do not. The Save
