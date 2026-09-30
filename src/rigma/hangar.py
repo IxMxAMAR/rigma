@@ -1031,6 +1031,11 @@ def list_models(registry=None, profile=None, *, kv: str = "",
             "has_template": spec.has_template,
             # a repaired template standing in for a missing one
             "template_override": template_override(slug),
+            # D2: how this model comes up, so the UI can open a first-load
+            # dialog on what is already pinned (and on `null` = nothing is).
+            # Cheap here — the spec is already in hand; a second GET per model
+            # would not be.
+            "launch": spec.launch.model_dump() if spec.launch else None,
             "running": bool(state and state.get("model") == slug)})
     du = shutil.disk_usage(mdir)
     return {"models": models,
@@ -1136,6 +1141,17 @@ def set_launch_defaults(slug: str, registry=None, **fields) -> ModelSpec:
     if unknown:
         raise HangarError(f"unknown launch setting(s): {', '.join(sorted(unknown))}")
     for key, value in fields.items():
+        if value is None:
+            # "Passing None CLEARS it", as the docstring above promises — but
+            # six of the seven fields are non-optional and their unset value is
+            # a falsy SENTINEL ("" or 0), not None. Assigning None made
+            # `LaunchDefaults(**current)` raise ValidationError inside pydantic,
+            # which the HTTP route does not catch (it catches HangarError), so
+            # the documented way to remove a default answered 500 for six
+            # fields out of seven. Map None to the field's own declared default:
+            # "" / 0 for the sentinels, and None for `vision`, whose unset value
+            # really is None because it is tri-state.
+            value = LaunchDefaults.model_fields[key].get_default()
         current[key] = value
     launch = LaunchDefaults(**current)
     # Everything cleared means no opinion at all; store None rather than an

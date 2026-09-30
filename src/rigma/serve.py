@@ -615,6 +615,31 @@ def _engine_has_vision(registry=None) -> bool:
         return False
 
 
+# Sessions with a turn streaming in them right now. MODULE scope, not a
+# `build_app` local: D3a — a reloaded chat has to be able to ask whether a turn
+# is still running, and a test has to be able to say so without an engine.
+# `build_app` keeps a local alias (`_streaming = STREAMING`) so the routes'
+# closure cells are unchanged for the tests that read them. In-memory on
+# purpose: a server restart ends every turn.
+STREAMING: set[str] = set()
+
+
+def _model_last_used() -> dict:
+    """The `last_used` map from stats.json — {model slug: epoch seconds}.
+
+    D2: the nearest honest first-load signal. Usage stats are best-effort (the
+    turn loop swallows their write failures), so a missing or unreadable file
+    means "no evidence", never an error on a read-only route.
+    """
+    try:
+        f = st.rigma_home() / "stats.json"
+        data = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+        last = data.get("last_used") if isinstance(data, dict) else None
+        return last if isinstance(last, dict) else {}
+    except Exception:
+        return {}
+
+
 def _load_run_for_loop(runs_mod, run_id: str):
     """`(run, readable)` for the run loop.
 
@@ -644,6 +669,60 @@ def _load_run_for_loop(runs_mod, run_id: str):
         if attempt < 2:
             time.sleep(0.05 * (attempt + 1))
     return None, False
+
+
+def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
+    """Release the one-run slot for a run whose state cannot be read.
+
+    A18 / R3-RUN-5. `runs.load` returns None for BOTH "the file is gone" and "I
+    could not read it"; `_load_run_for_loop` retries and tells the two apart.
+    When the state is STILL unreadable there is no run dict to hand `set_status`
+    — and `runs.active()` cannot see the run either, because it loads the same
+    file, so `set_status`'s own slot release never fires. Left alone, the loop
+    died there and run.json stayed `running` with active.json still pointing at
+    it: pause and inject answered 409 "run has no driver", restart 409 "run is
+    running", a new run 409 "a run is already active". Only Stop cleared it.
+
+    So the slot is released explicitly: a terminal status for the id we were
+    asked to drive, then the active pointer dropped when it points here. The
+    record written is minimal when the real one could not be read, so whatever
+    is on disk is copied aside first — a release must be recoverable, not
+    destructive. The run's mission and transcript survive on its session, so
+    `restart` still reattaches meaningfully.
+    """
+    run = None
+    try:
+        run = runs_mod.load(run_id)      # the lock may have cleared by now
+    except Exception:
+        run = None
+    if run is None:
+        try:
+            src = runs_mod.run_dir(run_id) / "run.json"
+            dst = src.with_name(f"run.json.unreadable-{int(time.time())}")
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+        except Exception:
+            pass            # nothing to preserve, or it is locked as well
+        run = {"id": run_id}
+    if run.get("status") not in runs_mod.TERMINAL:
+        try:
+            runs_mod.set_status(run, "interrupted", reason)
+        except Exception:
+            _log.exception("run %s: could not write a terminal status", run_id)
+    # The pointer is read directly, by id: `runs.active()` returns None for an
+    # unreadable run, and clearing unconditionally could free a DIFFERENT run's
+    # slot — a new run may have started since this one wedged.
+    try:
+        raw = json.loads(runs_mod._active_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = None
+    except Exception:
+        raw = {"id": run_id}    # an unreadable pointer is nobody's claim
+    if isinstance(raw, dict) and raw.get("id") == run_id:
+        try:
+            runs_mod.clear_active()
+        except Exception:
+            _log.exception("run %s: could not release the active slot", run_id)
 
 
 def _patch_session(sid: str, body: dict) -> dict | None:
@@ -1673,6 +1752,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def list_sessions():
         # file scans block the loop with many/large chats — thread them
         rows = await asyncio.to_thread(sessions.list_sessions)
+        # D3a: a reloaded chat must be able to tell "still streaming" from
+        # "interrupted", or it renders the last checkpoint's "this reply was
+        # interrupted" notice over a turn that is still running.
+        for r in rows:
+            r["streaming"] = r.get("id") in _streaming
         # AUDIT 03-5: the run's "🤖 …" chat is not a chat the owner can type
         # into while the run drives it, so it must not appear as an ordinary
         # writable row in the rail. Only the ACTIVE run is hidden: once a run
@@ -1749,7 +1833,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         s = sessions.load(sid)
         if s is None:
             return JSONResponse({"error": "no such session"}, status_code=404)
-        return s
+        # D3a: the single-session body carries the same flag as the rail rows.
+        return {**s, "streaming": sid in _streaming}
 
     @app.get("/api/sessions/{sid}/export")
     async def export_session(sid: str, fmt: str = "md"):
@@ -4719,7 +4804,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def models_set_defaults(slug: str, body: dict):
         """Pin how this model comes up. Send only the fields you mean to set;
         send null to clear one."""
-        allowed = {"quant", "ctx", "kv", "vision", "spec_type", "spec_n_max"}
+        # D2: `backend` belongs here — `LaunchDefaults` stores it and the
+        # launcher consumes it, so leaving it out of the allowlist made a
+        # per-model compute backend silently unsettable over HTTP.
+        allowed = {"quant", "ctx", "kv", "vision", "spec_type", "spec_n_max",
+                   "backend"}
         fields = {k: v for k, v in (body or {}).items() if k in allowed}
         if not fields:
             return JSONResponse(
@@ -4741,6 +4830,35 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             registry.models[slug] = spec
         return {"slug": slug,
                 "launch": spec.launch.model_dump() if spec.launch else None}
+
+    @app.get("/api/models/{slug}/defaults")
+    async def models_get_defaults(slug: str):
+        """How this model comes up, and whether it ever has.
+
+        D2: the only defaults route was a POST, so a dialog could WRITE a
+        default but had no way to show what was already pinned (the GET answered
+        405). `first_load` is the honest first-load signal: `last_used` is
+        written per completed turn, so the flag says "nothing is pinned AND this
+        model has never finished a turn" — the evidence, with `last_used`
+        beside it so the caller can apply its own rule.
+        """
+        from .registry import Registry
+        reg = registry if registry is not None else await asyncio.to_thread(
+            Registry.load)
+        spec = reg.models.get(slug)
+        if spec is None:
+            return JSONResponse({"error": f"unknown model: {slug}"},
+                                status_code=404)
+        last_used = await asyncio.to_thread(_model_last_used)
+        stamp = last_used.get(slug)
+        return {"slug": slug,
+                "launch": spec.launch.model_dump() if spec.launch else None,
+                # a registry model's launch settings are hand-authored and the
+                # POST refuses to overwrite them (owner decision) — the UI
+                # disables Save and says why
+                "custom": spec.custom,
+                "last_used": stamp,
+                "first_load": spec.launch is None and stamp is None}
 
     @app.post("/api/models/{slug}/reprobe")
     async def models_reprobe(slug: str):
@@ -4835,7 +4953,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     # queue stored there loses the race against that turn's own save — and a
     # prompt waiting behind a generation means nothing once the server has
     # restarted.
-    _streaming: set[str] = set()
+    #
+    # D3a: `_streaming` itself is the module-level `STREAMING` set (so a route
+    # can report it and a test can seed it); this local alias keeps the routes'
+    # closure cells exactly as they were.
+    _streaming = STREAMING
     _queued: dict[str, list] = {}
     # R3-5: how many prompts one chat may have waiting behind its running reply.
     # The queue is in memory only, so an unbounded one is a memory leak a client
@@ -5598,7 +5720,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         from . import tools as toolkit
 
         from . import runs as _runs
-        run = _runs.load(run_id)
+        # A18: the FIRST load gets the same guard as every later one. It used to
+        # be a bare `_runs.load(run_id)` followed by `run["session_id"]`, and
+        # `load` swallows every exception and returns None — so one transient
+        # unreadable run.json raised TypeError HERE, the driver task died before
+        # its first iteration, and the run stayed `running` with its slot
+        # claimed: pause and inject answered 409 "run has no driver", restart
+        # 409 "run is running", a new run 409 "a run is already active". Only
+        # Stop cleared it. Found by the full suite under concurrency
+        # (test_phase4_lifecycle's restart test), not by reading.
+        run, readable = _load_run_for_loop(_runs, run_id)
+        if not readable:
+            _release_unreadable_run(_runs, run_id, "run state could not be read")
+            return
+        if run is None:
+            return                    # deleted: nothing to drive
         sid = run["session_id"]
         try:
             await _compile_spec(run_id, sid)
@@ -5620,9 +5756,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # by a loop that no longer exists.
                 run, readable = _load_run_for_loop(_runs, run_id)
                 if not readable:
-                    if run is not None:
-                        _runs.set_status(run, "interrupted",
-                                         "run state could not be read")
+                    # A18: `run` is None here by construction, so the old
+                    # `if run is not None: set_status(...)` was dead code and
+                    # the slot stayed claimed. Release it explicitly.
+                    _release_unreadable_run(_runs, run_id,
+                                            "run state could not be read")
                     break
                 if run is None:
                     break
@@ -7187,7 +7325,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             doc = json.loads(body)
         except (ValueError, UnicodeDecodeError):
             return body
-        if not isinstance(doc, dict) or not doc.get("tools"):
+        if not isinstance(doc, dict):
+            return body
+        # B7d: `tools` was tested for TRUTHINESS, so `"abc"`, `{"a": 1}` and `1`
+        # all took the merge path and the engine received re-serialised JSON
+        # instead of the caller's exact bytes. Only a NON-EMPTY LIST is a tool
+        # request.
+        tools = doc.get("tools")
+        if not isinstance(tools, list) or not tools:
             return body
         # Weakest to strongest: model card < RUN_PARAMS < caller. RUN_PARAMS is
         # the same layer Rigma's own turns use, and the caller's own values
