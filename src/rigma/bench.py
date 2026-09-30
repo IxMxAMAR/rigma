@@ -24,6 +24,34 @@ class BenchResult(BaseModel):
     # zero (see `measured_depth`). `prompt_tokens` is the size actually sent.
     depth: int | None = None
     ctx: int | None = None
+    # Which prompt generator produced the number (see FILLER_GENERATION). The
+    # filler changed while the calibration KEY did not, so a stored entry has to
+    # say which generator it came from or old and new numbers are silently
+    # compared.
+    filler: str | None = None
+
+    def as_measured(self) -> dict:
+        """The dict to persist — `model_dump`, but `depth`/`ctx` are OMITTED when
+        unknown rather than written as null.
+
+        A caller reading `"depth" in measured` must be able to tell "no depth was
+        recorded" (an old entry, or a depth-less run) from a recorded value. Both
+        `measured_depth` and `measured_filler` read a missing key as UNKNOWN, but
+        writing the key as null is a second spelling of the same fact and invites
+        the `in` test to disagree.
+        """
+        d = self.model_dump()
+        for k in ("depth", "ctx"):
+            if d.get(k) is None:
+                d.pop(k, None)
+        return d
+
+
+# The id of the prompt generator whose numbers are in the store. Bump this if
+# `bench_text` ever changes shape again: a stored entry with no `filler` key (or
+# a different one) was measured with different text and is not comparable with
+# the current numbers, even under the same calibration key.
+FILLER_GENERATION = "varied-v1"
 
 
 # --- the bench prompt ---------------------------------------------------------
@@ -43,7 +71,9 @@ class BenchResult(BaseModel):
 # So the filler is replaced with deterministic, seeded, lexically varied text,
 # generated here — never fetched and never the owner's prose. It is built once
 # per size and cached, so it cannot come to dominate a benchmark that loads a
-# model per config.
+# model per config. Its LENGTH is deliberately unchanged: `bench_text(n)` emits
+# the same 9*(n//8) words the old filler did, so the default measurement keeps
+# the exact prompt size it always had and only the text's variety differs.
 _BENCH_VOCAB = tuple(dict.fromkeys((
     "time", "year", "people", "way", "day", "thing", "woman", "life", "child",
     "world", "school", "state", "family", "student", "group", "country",
@@ -111,7 +141,15 @@ _TEXT_CACHE: dict[int, str] = {}
 
 def _prng(seed: int):
     """A tiny seeded LCG, so the text is byte-identical across processes and
-    Python versions rather than depending on `random`'s internals."""
+    Python versions rather than depending on `random`'s internals.
+
+    The constants are Knuth's MMIX linear congruential generator (multiplier
+    6364136223846793005, increment 1442695040888963407), the same pair PCG uses
+    by default; it has a full 2**64 period. We take bits 11..63 of the state
+    rather than the low bits, because an LCG's low bits have short periods and
+    would repeat within a single sentence. This is text variety, not
+    cryptography — the only requirements are determinism and no visible cycle.
+    """
     state = seed & 0xFFFFFFFFFFFFFFFF
 
     def _next(lo: int, hi: int) -> int:
@@ -124,26 +162,34 @@ def _prng(seed: int):
 
 
 def bench_text(n_tokens: int) -> str:
-    """Deterministic, varied synthetic text of exactly `n_tokens` words.
+    """Deterministic, varied synthetic text, sized EXACTLY like the old filler.
 
-    "Tokens" here are words — the unit the old filler was sized in — so a budget
-    means the same thing to the caller as it always did. The text is seeded from
-    the size, so the same budget always builds the same bytes (numbers stay
-    comparable run to run) while different budgets build different text.
+    "Tokens" here are words — the unit the old filler was sized in — and the
+    count is `9 * (n_tokens // 8)`, the same words-per-budget the repeated
+    sentence produced. So the default path's prompt is the same SIZE it always
+    was and only its variety changes: replacing the filler must not move the
+    prompt size, or every stored number silently shifts for a second reason. The
+    text is seeded from the size, so the same budget always builds the same
+    bytes while different budgets build different text.
 
-    Variety is the point: a MoE router spreads over experts on this and does not
-    on a repeated sentence (owner's measurement, 2026-08-23 — see above).
+    The INTENT of the variety is to avoid measuring a routing pattern that
+    repetitive text can produce: the owner measured on 2026-08-23 that
+    `n_cpu_moe 18` was crowned on filler while `n_cpu_moe 0` beat it by 24% on
+    varied text (see the module comment above). Whether this particular text
+    spreads any given MoE router is not measured here — no engine is run by this
+    function or its tests.
     """
-    if n_tokens <= 0:
-        return ""
-    cached = _TEXT_CACHE.get(n_tokens)
+    if n_tokens < 8:
+        return ""                      # 9 * (n // 8) == 0, exactly as before
+    n_words = 9 * (n_tokens // 8)
+    cached = _TEXT_CACHE.get(n_words)
     if cached is not None:
         return cached
-    rng = _prng(_BENCH_SEED ^ ((n_tokens * 2654435761) & 0xFFFFFFFFFFFFFFFF))
+    rng = _prng(_BENCH_SEED ^ ((n_words * 2654435761) & 0xFFFFFFFFFFFFFFFF))
     vocab = _BENCH_VOCAB
     last = len(vocab) - 1
     sentences: list[str] = []
-    remaining = n_tokens
+    remaining = n_words
     while remaining > 0:
         take = min(rng(6, 16), remaining)   # varied sentence lengths
         words = [vocab[rng(0, last)] for _ in range(take)]
@@ -151,7 +197,7 @@ def bench_text(n_tokens: int) -> str:
         sentences.append(" ".join(words) + ".")
         remaining -= take
     text = " ".join(sentences)
-    _TEXT_CACHE[n_tokens] = text
+    _TEXT_CACHE[n_words] = text
     return text
 
 
@@ -169,6 +215,18 @@ def measured_depth(entry: dict) -> int | None:
     return d
 
 
+def measured_filler(entry: dict) -> str | None:
+    """Which prompt generator produced a STORED measurement, or None if unknown.
+
+    The filler changed while the calibration key did not, so without this marker
+    an old entry's number and a new one's are silently compared as if the same
+    prompt produced them. None means the entry predates the marker and was
+    measured with the old repeated sentence.
+    """
+    f = (entry.get("measured") or {}).get("filler")
+    return f if isinstance(f, str) and f else None
+
+
 def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128,
               depth: int | None = None, ctx: int | None = None) -> BenchResult:
     """Measure prefill/generation on the running server.
@@ -177,8 +235,12 @@ def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128,
     EXTENDED (never shortened) so at least that many tokens occupy the KV window
     at generation time — otherwise "tok/s at 131K" is measured with an almost
     empty window and says nothing about a filled one. `depth=None` is the old
-    behaviour exactly: the measured prompt is the whole window. `ctx` is only
-    recorded, as provenance for the number.
+    behaviour exactly: the measured prompt is the whole window, at the same size
+    the old filler produced. `ctx` is only recorded, as provenance for the number.
+
+    With no `depth`, `prompt_tokens` is recorded exactly as before; with one, it
+    records the occupancy actually requested (the size of the prompt sent is
+    `bench_text`'s legacy `9*(n//8)` words for that budget).
     """
     sent_tokens = max(prompt_tokens, depth) if depth else prompt_tokens
     filler = bench_text(sent_tokens)
@@ -204,7 +266,7 @@ def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128,
                            "generation — no usable measurement")
     return BenchResult(pp_tps=pp, tg_tps=tg,
                        prompt_tokens=sent_tokens, gen_tokens=gen_tokens,
-                       depth=depth, ctx=ctx)
+                       depth=depth, ctx=ctx, filler=FILLER_GENERATION)
 
 
 def _capabilities(slug: str) -> tuple:
@@ -575,14 +637,19 @@ def _log_rows(plan, rows: list[dict], best: dict | None) -> None:
         won = (best or {}).get("label")
         stamp = datetime.date.today().isoformat()
         for r in rows:
-            _log_row({"date": stamp, "model": plan.model_slug,
-                      "quant": plan.gguf.quant, "backend": plan.backend,
-                      "ctx": plan.flags.ctx, "engine": _engine_version(plan.backend),
-                      "label": r.get("label"), "flags": r.get("flags") or {},
-                      "tg_tps": r.get("tg_tps"), "pp_tps": r.get("pp_tps"),
-                      "depth": r.get("depth"),
-                      "ok": bool(r.get("ok")), "error": r.get("error", ""),
-                      "crowned": r.get("label") == won})
+            entry = {"date": stamp, "model": plan.model_slug,
+                     "quant": plan.gguf.quant, "backend": plan.backend,
+                     "ctx": plan.flags.ctx, "engine": _engine_version(plan.backend),
+                     "label": r.get("label"), "flags": r.get("flags") or {},
+                     "tg_tps": r.get("tg_tps"), "pp_tps": r.get("pp_tps"),
+                     "filler": r.get("filler"),
+                     "ok": bool(r.get("ok")), "error": r.get("error", ""),
+                     "crowned": r.get("label") == won}
+            # Omit rather than null: "no depth recorded" must not be spelled the
+            # same way as a recorded value (see BenchResult.as_measured).
+            if r.get("depth") is not None:
+                entry["depth"] = r["depth"]
+            _log_row(entry)
     except Exception:
         pass          # a sweep that lost its log is still a sweep
 
@@ -709,22 +776,26 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
         trial = plan.model_copy(update={"flags": flags})
         if progress:
             progress(label)
+        # `depth` is added only when one was requested: a depth-less row must not
+        # carry a null that a reader could mistake for a recorded value.
+        base = {"label": label, "flags": override,
+                "filler": FILLER_GENERATION}
+        if depth is not None:
+            base["depth"] = depth
         try:
             srv = launch_server(exe, trial, model_path, port=port, timeout=300.0,
                                 extra_args=extra_args)
         except Exception as e:  # a config that OOMs/crashes is a valid "loss"
-            rows.append({"label": label, "flags": override, "tg_tps": 0.0,
-                         "pp_tps": 0.0, "depth": depth, "ok": False,
+            rows.append({**base, "tg_tps": 0.0, "pp_tps": 0.0, "ok": False,
                          "error": str(e)[:200]})
             continue
         try:
             res = run_bench(port, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
                             depth=depth, ctx=plan.flags.ctx or None)
-            rows.append({"label": label, "flags": override, "tg_tps": res.tg_tps,
-                         "pp_tps": res.pp_tps, "depth": res.depth, "ok": True})
+            rows.append({**base, "tg_tps": res.tg_tps,
+                         "pp_tps": res.pp_tps, "ok": True})
         except Exception as e:  # loaded but wouldn't serve — count as a loss
-            rows.append({"label": label, "flags": override, "tg_tps": 0.0,
-                         "pp_tps": 0.0, "depth": depth, "ok": False,
+            rows.append({**base, "tg_tps": 0.0, "pp_tps": 0.0, "ok": False,
                          "error": str(e)[:200]})
         finally:
             srv.stop()
@@ -733,8 +804,11 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     _log_rows(plan, rows, best)
     if best is not None and (best["flags"] or mark_calibrated):
         key = calibration_key(plan.model_slug, plan.gguf.quant, plan.backend)
-        save_calibration(key, {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"],
-                               "depth": best.get("depth")},
+        measured = {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"],
+                    "filler": best.get("filler") or FILLER_GENERATION}
+        if best.get("depth") is not None:
+            measured["depth"] = best["depth"]
+        save_calibration(key, measured,
                          flags=best["flags"], calibrated=mark_calibrated,
                          ctx=plan.flags.ctx, backend=plan.backend,
                          identity=_identity_cache_key(plan.backend))
