@@ -429,6 +429,99 @@ def test_up_refuses_an_illegal_batch_pair(tmp_path, monkeypatch):
     assert res.exit_code == 2, res.output
 
 
+def _calibrate_every_quant(tmp_path, model, flags):
+    """Write a legacy-key calibration row carrying `flags` for EVERY quant and
+    backend this model could resolve to, so the row applies whichever the use
+    case picks. `resolve._apply_calibration` merges such a row onto the plan."""
+    import json
+
+    from rigma.bench import legacy_key
+    reg = cli.Registry.load()
+    cal = {legacy_key(model, g.quant, be): {"flags": flags, "date": "2026-01-01"}
+           for g in reg.models[model].ggufs for be in ("vulkan", "rocm")}
+    (tmp_path / "calibration.json").write_text(json.dumps(cal), encoding="utf-8")
+
+
+def test_up_refuses_a_cli_ubatch_above_the_plans_calibrated_batch(tmp_path,
+                                                                  monkeypatch):
+    """UBATCH-n1, the reachable route: `resolve._apply_calibration` merges a
+    stored `batch` onto `rp.flags` on this `--model` path, but the CLI's own
+    check validated only against the MODEL's launch defaults — where `batch` is
+    unset, so the engine's 2048 stood. `batch: 1024` plus `--ubatch 2048`
+    therefore passed and reached the argv as `-b 1024 -ub 2048`; llama.cpp
+    CLAMPS `n_ubatch` to `n_batch`, so the launch is healthy at 1024 while the
+    plan charged 2048 (+820.56 MiB) and reported a healthy load as
+    `plan_divergence`."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    _calibrate_every_quant(tmp_path, "qwen3.6-35b-a3b", {"batch": 1024})
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run",
+                                  "--ubatch", "2048"])
+    assert res.exit_code == 2, res.output
+    assert "ubatch 2048 exceeds batch 1024" in res.output
+    assert "-ub 2048" not in res.output
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_up_accepts_a_cli_ubatch_at_or_below_the_plans_calibrated_batch(
+        tmp_path, monkeypatch):
+    """The same calibrated `batch: 1024` with a LEGAL `--ubatch 512` still
+    launches and records the request: the new re-validation must refuse only the
+    illegal pair."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    _calibrate_every_quant(tmp_path, "qwen3.6-35b-a3b", {"batch": 1024})
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run",
+                                  "--ubatch", "512"])
+    assert res.exit_code == 0, res.output
+    assert "-b 1024" in res.output
+    assert "-ub 512" in res.output
+    assert "+cli-request" in res.output
+
+
+def test_up_a_calibrated_batch_with_no_cli_override_is_unchanged(tmp_path,
+                                                                 monkeypatch):
+    """A calibrated `batch` on its own is untouched: no CLI batch flag means the
+    merge block never runs, so no `-ub` and no `+cli-request`."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    _calibrate_every_quant(tmp_path, "qwen3.6-35b-a3b", {"batch": 1024})
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run"])
+    assert res.exit_code == 0, res.output
+    assert "-b 1024" in res.output
+    assert "-ub " not in res.output
+    assert "+cli-request" not in res.output
+
+
+def test_up_refuses_a_cli_ubatch_above_a_plan_carried_batch(tmp_path,
+                                                            monkeypatch):
+    """The merge point's obligation, independent of WHERE the pre-existing
+    `batch` came from: a combo carries one through `resolve`'s combo branch
+    (`ComboFlags.batch`), a calibration row carries one through
+    `_apply_calibration`, and a plan built by either is what `up` sees. The
+    merged pair must be refused with the same message and exit code the stored
+    default path uses."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    real_resolve = cli.resolve
+
+    def _resolve(*a, **k):
+        plan = real_resolve(*a, **k)
+        plan.flags = plan.flags.model_copy(update={"batch": 1024})
+        return plan
+
+    monkeypatch.setattr(cli, "resolve", _resolve)
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run",
+                                  "--ubatch", "2048"])
+    assert res.exit_code == 2, res.output
+    assert "ubatch 2048 exceeds batch 1024" in res.output
+    assert "-ub 2048" not in res.output
+
+
 def test_up_reasoning_override(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
