@@ -268,3 +268,47 @@ def test_run_sweep_default_records_unknown_depth(monkeypatch, tmp_path):
     assert bench.measured_depth(entry) is None
     # the generator marker is always written by the new path
     assert bench.measured_filler(entry) == bench.FILLER_GENERATION
+
+
+def test_as_measured_omits_a_nonpositive_depth():
+    """D1d: `run_bench` already treats a falsy depth as depth-less
+    (``max(prompt_tokens, depth) if depth else prompt_tokens``), and
+    `measured_depth` reads a stored 0/negative value as UNKNOWN. The write path
+    gated on ``is not None`` instead, so a caller doing ``"depth" in measured``
+    could see a "recorded" depth that `measured_depth` reports as unknown."""
+    for bad in (0, -5):
+        d = BenchResult(pp_tps=1, tg_tps=2, prompt_tokens=8, gen_tokens=8,
+                        depth=bad).as_measured()
+        assert "depth" not in d, bad
+
+
+def test_run_sweep_never_persists_a_nonpositive_depth(monkeypatch, tmp_path):
+    """D1d: the row, log and calibration entry must all agree with
+    `measured_depth` that a non-positive depth is UNKNOWN. Before the fix the
+    sweep wrote ``"depth": 0`` / ``"depth": -5`` into all three, so
+    ``"depth" in measured`` was not a valid test for ``depth <= 0``."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+
+    class _Srv:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _Srv())
+    monkeypatch.setattr(bench, "run_bench",
+                        lambda port, **k: BenchResult(
+                            pp_tps=120, tg_tps=70, prompt_tokens=8,
+                            gen_tokens=8, depth=k.get("depth")))
+    monkeypatch.setattr(bench, "sweep_configs",
+                        lambda base, moe, caps=(): [("fa-off", {"flash_attn": "off"})])
+
+    for bad in (0, -5):
+        rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                               port=11601, depth=bad)
+        assert "depth" not in rows[0], bad
+        logged = [json.loads(x) for x in
+                  (tmp_path / "logs" / "bench-rows.jsonl").read_text(
+                      encoding="utf-8").splitlines() if x]
+        assert "depth" not in logged[-1], bad
+        entry = next(iter(bench.load_calibration().values()))
+        assert "depth" not in entry["measured"], bad
+        assert bench.measured_depth(entry) is None
