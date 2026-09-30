@@ -5,8 +5,8 @@ import re
 
 from pydantic import ValidationError
 
-from .models import (CACHE_BYTES, CachePolicy, ComboFlags, GgufFile,
-                     HardwareProfile, ModelSpec, RunPlan)
+from .models import (CACHE_BYTES, LAUNCH_PARALLEL, CachePolicy, ComboFlags,
+                     GgufFile, HardwareProfile, ModelSpec, RunPlan)
 from .registry import Registry
 
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
@@ -210,6 +210,45 @@ def swa_kv_bytes(spec: ModelSpec, k: str, v: str, ctx: int) -> float:
                                + per_side * CACHE_BYTES[v])
 
 
+def recurrent_state_mb(spec: ModelSpec) -> float:
+    """Per-SEQUENCE MiB llama.cpp allocates for a hybrid's recurrent state.
+
+    A Mamba/DeltaNet layer holds a fixed-size state instead of a growing KV
+    cache, and llama.cpp gives it its own buffer — `llama_memory_recurrent`,
+    sized `n_embd_r() + n_embd_s()` per recurrent layer per sequence, both f32
+    (llama-memory-recurrent.cpp builds one `r` and one `s` tensor of
+    `mem_size * (1 + n_rs_seq)` rows; llama-hparams.cpp sizes the rows):
+
+        n_embd_s() = ssm_d_state * ssm_d_inner
+        n_embd_r() = (ssm_d_conv - 1) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state)
+
+    MEASURED, not predicted: a real load of Ternary-Bonsai-2-27B (qwen35, 64
+    layers, 48 recurrent) at n_seq_max=1 logged `RS buffer size = 149.62 MiB`
+    and `R (f32): 5.62 MiB, S (f32): 144.00 MiB` (.scratch/prism-v.log). The 48
+    layers are what `recurrent_layers` counts and the four ssm_* numbers are the
+    file's own header keys. Zero for a dense model, and zero — with
+    `recurrent_state_unknown` true — for a hybrid whose header omitted them.
+    """
+    n = spec.recurrent_layers
+    if n <= 0:
+        return 0.0
+    state, inner = spec.ssm_state_size, spec.ssm_inner_size
+    if state <= 0 or inner <= 0:
+        return 0.0
+    s_bytes = state * inner * 4
+    r_bytes = max(spec.ssm_conv_kernel - 1, 0) * (
+        inner + 2 * spec.ssm_group_count * state) * 4
+    return n * (s_bytes + r_bytes) / 2**20
+
+
+def recurrent_state_unknown(spec: ModelSpec) -> bool:
+    """True when the model declares recurrent layers but its header carried no
+    `ssm.*` geometry, so `recurrent_state_mb` returns 0 for lack of evidence
+    rather than because there is nothing to allocate. The fit says so in its
+    explain line instead of silently reading the model as dense."""
+    return spec.recurrent_layers > 0 and recurrent_state_mb(spec) == 0.0
+
+
 # Speculative decoding's draft head needs its own KV cache and compute buffers.
 # MEASURED on an RX 9070 XT, 2026-08-21, five repeats per point, by differencing
 # dedicated VRAM against the same model without the head:
@@ -373,7 +412,7 @@ def _cpu_layers(spec: ModelSpec, flags: ComboFlags) -> int:
     (llama-model.cpp: `i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)`,
     and the output layer is assigned through the same list), so `-ngl 58` on a
     64-layer model pins layers 0-6 — seven — not six. `_spilled` reports the
-    weight fraction and reads as 6/64; both are used where they belong.
+    weight fraction and counts the same seven, so the two agree.
     """
     n = spec.n_layers or 0
     if n <= 0:
@@ -401,14 +440,20 @@ def _resident_rung(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
 
 
 def _spilled(spec: ModelSpec, flags: ComboFlags) -> float:
-    """Fraction of the model left in system RAM under this plan. Dense counts
-    layers; MoE counts only the expert share of an offloaded layer, since
-    sparse activation makes that far cheaper."""
+    """Fraction of the model's weights left in system RAM under this plan.
+
+    Dense counts the layers the engine actually keeps on the CPU — the same
+    number `_cpu_layers` reports. `ngl` counts the OUTPUT layer, so `-ngl 58` on
+    64 layers is 7/64, not 6/64; an explain line and an offload percentage that
+    disagreed by a layer would both be distrusted. MoE counts only the expert
+    share of an offloaded layer, since sparse activation makes that far cheaper,
+    and `n_cpu_moe` has no output-layer off-by-one to mirror.
+    """
     n = spec.n_layers or 0
     if not n:
         return 0.0
     if spec.moe is None:
-        return max(0, n - min(flags.ngl, n)) / n
+        return min(1.0, ((n + 1) - min(max(flags.ngl, 0), n + 1)) / n)
     return (min(flags.n_cpu_moe, n) / n) * spec.moe.expert_weight_fraction
 
 
@@ -525,12 +570,25 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     # is resident too, and until now was budgeted as zero.
     swa_mb = swa_kv_bytes(spec, k, v, ctx) / 2**20
     kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20 + swa_mb
+    # A hybrid's recurrent state is allocated PER SEQUENCE, and the launch runs
+    # LAUNCH_PARALLEL sequences. --kv-unified keeps the KV pool at ctx, so only
+    # this term multiplies. Zero for every dense model; a hybrid whose header
+    # carried no ssm.* geometry is charged 0 and marked unknown, not read as
+    # dense.
+    rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
+    if rs_mb:
+        rs_txt = f"rs={rs_mb:.0f}MB "
+    elif recurrent_state_unknown(spec):
+        rs_txt = "rs=unknown "
+    else:
+        rs_txt = ""
     explain.append(f"{gguf.quant}@ctx{ctx} kv={k}: file={file_mb:.0f}MB kv={kv_mb:.0f}MB "
                    + (f"(incl. {swa_mb:.0f}MB windowed) " if swa_mb else "")
                    + (f"mmproj={mm_mb:.0f}MB " if mm_mb else "")
+                   + rs_txt
                    + f"vs vram={usable_vram:.0f}MB ram={usable_ram:.0f}MB")
     if spec.moe is None:
-        if file_mb + mm_mb + kv_mb <= usable_vram:
+        if file_mb + mm_mb + kv_mb + rs_mb <= usable_vram:
             return ComboFlags(ctx=ctx, cache_type_k=k, cache_type_v=v)
         if strict:
             return None            # try the next cache type before offloading
@@ -541,7 +599,7 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         if spec.n_layers <= 0:
             return None
         per_layer = file_mb / spec.n_layers
-        gpu_room = usable_vram - mm_mb - kv_mb
+        gpu_room = usable_vram - mm_mb - kv_mb - rs_mb
         n_gpu = int(gpu_room // per_layer) if per_layer else 0
         if n_gpu <= 0:
             return None                      # not even one layer + kv fits
@@ -552,7 +610,7 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         explain.append(f"dense partial offload: {n_gpu}/{spec.n_layers} layers "
                        f"on GPU ({spilled:.0f}MB to RAM)")
         return ComboFlags(ctx=ctx, ngl=n_gpu, cache_type_k=k, cache_type_v=v)
-    if strict and file_mb + mm_mb + kv_mb > usable_vram:
+    if strict and file_mb + mm_mb + kv_mb + rs_mb > usable_vram:
         return None                # ditto for MoE expert offload
     # AUDIT F06-1: a MoE header that omits block_count reports n_layers = 0, and
     # this divide ran before the `if need_off` test, so even a fully-resident
@@ -562,7 +620,7 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         return None
     expert_mb = file_mb * spec.moe.expert_weight_fraction
     per_layer = expert_mb / spec.n_layers
-    need_off = max(0.0, file_mb + mm_mb + kv_mb - usable_vram)
+    need_off = max(0.0, file_mb + mm_mb + kv_mb + rs_mb - usable_vram)
     n_off = math.ceil(need_off / per_layer) if need_off else 0
     if n_off <= spec.n_layers and n_off * per_layer <= usable_ram:
         return ComboFlags(ctx=ctx, n_cpu_moe=n_off, cache_type_k=k, cache_type_v=v)
@@ -759,15 +817,10 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
         # VRAM. The old file-size guess called a quant "gpu" while the very
         # same verdict carried ngl=56 of 65 layers: it ignored the KV cache,
         # which is precisely what a big context window spends VRAM on.
-        spill = 0.0
-        if spec.moe is None:
-            if spec.n_layers > 0 and flags.ngl < spec.n_layers:
-                spill = (spec.n_layers - max(0, flags.ngl)) / spec.n_layers
-        elif spec.n_layers > 0 and flags.n_cpu_moe > 0:
-            # only the EXPERT weights of those layers leave the GPU, and expert
-            # activation is sparse, so the same fraction costs far less here
-            spill = (min(flags.n_cpu_moe, spec.n_layers) / spec.n_layers
-                     * spec.moe.expert_weight_fraction)
+        # ONE implementation, `_spilled`, deliberately: a duplicate here read
+        # 6/64 where `_cpu_layers` said 7, so the page and the fit could flip
+        # opposite sides of the 0.15 "light" boundary for the same plan.
+        spill = _spilled(spec, flags)
         speed = "gpu" if spill <= 0.001 else ("light" if spill <= 0.15
                                               else "offload")
         # The explorer pins the requested type on purpose, so a spill here is
@@ -819,8 +872,7 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
 # `ngl` counts the OUTPUT layer (llama-model.cpp:
 # `i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)`, output placed by the
 # same rule), so -ngl 58 leaves layers 0-6 — SEVEN — on the CPU, not six.
-# `_spilled` reports the WEIGHT fraction (6/64); the two are different numbers
-# and neither is the other.
+# `_spilled` reports the same seven as the weight fraction, 7/64.
 #
 # The cost is a straight line, not a context-sized cliff:
 #     ms/token ~= 0.28 x GPU layers + 9.18 x CPU layers   (R^2 0.99992)
@@ -837,11 +889,12 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
 # is not what costs the time.
 #
 # 262144 FITS FULLY on this card with a smaller cache: q8_0/q8_0 is 8704 MB of
-# KV (15576 MB total against a 14954 MB budget, so it spills 7 layers), while
-# q5_1/q5_1 is 6144 MB (13016 MB total, 1938 MB of headroom) and keeps every
-# layer on the GPU. A pinned q8_0 policy is what turns a fully-resident 262K
-# plan into a 7-layer spill (~4x slower); `fit_for_launch` now treats the
-# requested type as a CEILING so that cannot happen silently.
+# KV (15576 MB total, plus 299 MB of recurrent state at --parallel 2, against a
+# 14954 MB budget, so it spills 10 layers), while q5_1/q5_1 is 6144 MB (13315 MB
+# total, 1639 MB of headroom) and keeps every layer on the GPU. A pinned q8_0
+# policy is what turns a fully-resident 262K plan into a 10-layer spill (~4x
+# slower); `fit_for_launch` now treats the requested type as a CEILING so that
+# cannot happen silently.
 #
 # The user selects this policy (Models page -> Growth policy), so it is not
 # forced — but the dropdown prices it as "more context" and never as "4x
