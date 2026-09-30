@@ -4,6 +4,8 @@ Every test here calls the REAL guard / decision function on command TEXT or on a
 synthetic request object. Nothing dangerous is ever handed to something that
 would execute it (safety rule 7), and no test performs network I/O.
 """
+import os
+
 import pytest
 
 from rigma import tools
@@ -117,6 +119,164 @@ def test_move_files_to_an_absolute_destination_is_still_a_write(home):
                          {**base, "allow_absolute_writes": True})
     assert out.startswith("moved 1 file(s)"), out
     assert (dest / "a.txt").is_file()
+
+    # OD-2: an allowlisted root is the SECOND route — it needs no blanket
+    # grant, and it is what lets the owner keep writing to the folders they
+    # already work in while `allow_absolute_writes` stays off.
+    allowed = home / "allowed"
+    allowed.mkdir()
+    (ws / "b.txt").write_text("y", encoding="utf-8")
+    out = tools.run_tool("move_files",
+                         {"paths": [str(ws / "b.txt")], "dest": str(allowed)},
+                         {**base, "write_allowlist": [str(allowed)]})
+    assert out.startswith("moved 1 file(s)"), out
+    assert (allowed / "b.txt").is_file()
+
+
+def test_a_destination_outside_every_allowlisted_root_is_refused(home):
+    """OD-2: the allowlist is a boundary, not a second blanket grant — a
+    destination that is in NO root still gets the existing refusal and creates
+    nothing."""
+    ws = home / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    root = home / "drop"
+    root.mkdir()
+    dest = home / "elsewhere"
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")], "dest": str(dest)},
+                         {"workspace": str(ws), "allow_code": True,
+                          "write_allowlist": [str(root)]})
+    assert out.startswith("error"), out
+    assert "outside the workspace" in out
+    assert not dest.exists()          # nothing was created
+
+
+def test_confined_refuses_an_allowlisted_root_through_both_routes(home):
+    """OD-2: `confined` is absolute-destination-free by policy, so neither the
+    allowlist NOR the blanket grant may reach it."""
+    ws = home / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    root = home / "drop"
+    root.mkdir()
+    base = {"workspace": str(ws), "allow_code": True, "profile": "confined",
+            "write_allowlist": [str(root)]}
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")], "dest": str(root)},
+                         base)
+    assert out.startswith("error"), out
+    assert not (root / "a.txt").exists()
+
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")], "dest": str(root)},
+                         {**base, "allow_absolute_writes": True})
+    assert out.startswith("error"), out
+    assert not (root / "a.txt").exists()
+
+
+def test_an_allowlisted_root_does_not_admit_a_sibling_sharing_its_prefix(home):
+    """A string-prefix test would let `C:\\ws2` through a `C:\\ws` root; the
+    containment is `is_relative_to`, so it must not."""
+    ws = home / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    sibling = home / "ws2"          # shares the string prefix "ws"
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")], "dest": str(sibling)},
+                         {"workspace": str(ws), "allow_code": True,
+                          "write_allowlist": [str(home / "ws")]})
+    assert out.startswith("error"), out
+    assert "outside the workspace" in out
+    assert not sibling.exists()
+
+
+def test_an_allowlisted_root_does_not_admit_a_dotdot_traversal(home):
+    """`<root>/../escaped` RESOLVES out of the root, and resolution is what is
+    tested — a literal `startswith` on the raw string would admit it."""
+    ws = home / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    root = home / "drop"
+    root.mkdir()
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")],
+                          "dest": str(root / ".." / "escaped")},
+                         {"workspace": str(ws), "allow_code": True,
+                          "write_allowlist": [str(root)]})
+    assert out.startswith("error"), out
+    assert "outside the workspace" in out
+    assert not (home / "escaped").exists()
+
+
+def test_a_relative_destination_that_resolves_outside_is_refused(home):
+    """The workspace-relative route must not be a way around the allowlist."""
+    ws = home / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    root = home / "drop"
+    root.mkdir()
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")], "dest": "../escaped"},
+                         {"workspace": str(ws), "allow_code": True,
+                          "write_allowlist": [str(root)]})
+    assert out.startswith("error"), out
+    assert "outside the workspace" in out
+    assert not (home / "escaped").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="case-insensitive path containment is a Windows property")
+def test_a_case_difference_is_treated_as_inside_on_windows(home):
+    """Windows is case-insensitive, so a different-case spelling of a root is
+    the SAME folder and must be admitted rather than refused."""
+    ws = home / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    root = home / "DropBox"
+    root.mkdir()
+    dest = str(root).upper()        # a different case spelling of the SAME dir
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")], "dest": dest},
+                         {"workspace": str(ws), "allow_code": True,
+                          "write_allowlist": [str(root)]})
+    assert out.startswith("copied 1 file(s)"), out
+    assert (root / "a.txt").is_file()
+
+
+def test_a_relative_or_unparseable_allowlist_entry_is_ignored(home):
+    """The allowlist is configuration: a bad entry must neither crash the
+    tool nor accidentally grant anything."""
+    ws = home / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    dest = home / "elsewhere"
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")], "dest": str(dest)},
+                         {"workspace": str(ws), "allow_code": True,
+                          "write_allowlist": ["drop", "", None, 7, "..\\x"]})
+    assert out.startswith("error"), out
+    assert "outside the workspace" in out
+    assert not dest.exists()
+
+
+def test_the_credential_denylist_still_runs_on_an_allowlisted_destination(home):
+    """OD-2: the grant/allowlist changes WHERE a write may land, never whether
+    the credential denylist applies to the final path."""
+    ws = home / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    root = home / "drop"
+    root.mkdir()
+    dest = root / ".ssh" / "keys"
+    out = tools.run_tool("copy_files",
+                         {"paths": [str(ws / "a.txt")], "dest": str(dest)},
+                         {"workspace": str(ws), "allow_code": True,
+                          "write_allowlist": [str(root)]})
+    assert out.startswith("error"), out
+    assert "credential" in out.lower()
+    assert not dest.exists()
 
 
 def test_an_outbound_post_with_a_body_needs_a_grant(monkeypatch):

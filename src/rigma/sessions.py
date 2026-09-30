@@ -37,8 +37,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
+import sqlite3
 import time
 from pathlib import Path
 
@@ -103,6 +105,15 @@ MUTABLE_FIELDS = ("title", "system_prompt", "use_rag", "messages",
                   # one are different risks, and a user who granted one did not
                   # grant the other.
                   "allow_absolute_writes",
+                  # OD-2 (R3-10): the ABSOLUTE WRITE ROOTS a `copy_files`/
+                  # `move_files` destination may land in without the blanket
+                  # grant above. The owner accepted option 1 of OD-2 — restrict
+                  # the destination to the workspace plus an allowlist seeded
+                  # from the folders they already work in — because a single
+                  # blanket switch cannot express "these folders are fine, the
+                  # Startup folder is not". A LIST, so it is typed `list` below
+                  # and never read through the boolean coercion table.
+                  "write_allowlist",
                   # R5-PERSIST: the agent's own durable state — its goal, its todo
                   # list, whether it is in plan mode. The backend reports these as
                   # SSE events, and the UI drew them from the LIVE TURN only, so
@@ -195,6 +206,11 @@ _FIELD_TYPES: dict[str, type] = {
     "allow_absolute_reads": bool, "allow_outbound_post": bool,
     # R3-TOOL-4: bool like its siblings, so the quoted "false" cannot grant it.
     "allow_absolute_writes": bool,
+    # OD-2: a LIST of path strings, like `messages`/`archive`/`pending_nudges`
+    # — NOT a bool, so it must not join the coercion table above. A string
+    # where a list belongs is refused by `validate_field_types`, and
+    # `_write_path` ignores any entry that is not an absolute path.
+    "write_allowlist": list,
     # int, not bool: `build_messages` does int(...) on the depth and
     # `_round_cap` does int(...) on the cap, so a string that reached either
     # raised. True is deliberately NOT accepted (isinstance(True, int) is True,
@@ -320,6 +336,13 @@ _SESSION_DEFAULTS = {"title": "New chat", "system_prompt": "",
                      # above — a grant a surface cannot see is one it cannot
                      # offer to change.
                      "allow_absolute_writes": False,
+                     # OD-2: the configured absolute write roots for
+                     # copy_files/move_files. `[]` is today's behaviour — an
+                     # absolute destination then needs the blanket grant.
+                     # `create()` seeds it from the folders the owner already
+                     # works in; a chat that predates the field loads with `[]`
+                     # rather than KeyError-ing a subscripting reader.
+                     "write_allowlist": [],
                      # AUDIT 10-9: the schema version this document was written
                      # at. Stamped by save(); a body that predates the key is
                      # what the max_tool_rounds migration below keys on.
@@ -390,12 +413,105 @@ def _import_legacy() -> None:
         pass                      # import is a nicety; the db still works
 
 
-def create(title: str = "New chat", system_prompt: str = "") -> dict:
+def _store_workspaces(base: Path) -> list[str]:
+    """The `workspace` of every session in the store under `base`.
+
+    OD-2: read through SQLite's JSON1 extractor so the message BODIES never
+    leave the database — the seed is PATHS, never prose (standing rule 3). A
+    store that does not exist, has no JSON1, or holds a body that is not JSON
+    yields nothing: the seed is an optimisation, and failing to build it must
+    never fail a create.
+    """
+    db_file = base / "rigma.db"
+    if not db_file.is_file():
+        return []
+    try:
+        con = sqlite3.connect(f"{db_file.resolve().as_uri()}?mode=ro", uri=True)
+    except (sqlite3.Error, ValueError):
+        return []
+    try:
+        rows = con.execute(
+            "SELECT json_extract(body, '$.workspace') FROM sessions "
+            "ORDER BY rowid").fetchall()
+    except sqlite3.Error:
+        return []          # no JSON1 / no table: no extra roots (fail closed)
+    finally:
+        con.close()
+    return [str(ws).strip() for (ws,) in rows if str(ws or "").strip()]
+
+
+def _rag_source_folders(base: Path) -> list[str]:
+    """The configured RAG source FOLDERS under `base`.
+
+    The same `sources.json` `rag.load_sources()` reads, with the same "not a
+    list of strings = no sources" guard. Only an entry that resolves to a
+    DIRECTORY can be a write root, so a file or glob source is skipped — the
+    allowlist is a set of folders, not a set of patterns.
+    """
+    try:
+        data = json.loads((base / "rag" / "sources.json").read_text("utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+        return []
+    out = []
+    for s in data:
+        try:
+            if Path(s).is_dir():
+                out.append(s)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def default_write_allowlist(home=None) -> list[str]:
+    """OD-2: the absolute write roots a NEW session starts with.
+
+    The owner's EXISTING working folders, used as metadata only: the
+    `workspace` of every session already in the store, plus the folders
+    registered as RAG sources (what `rag.load_sources()` returns for the same
+    home). Nothing is opened or read — only path strings.
+
+    Seeding from what the owner already uses is the point of the accepted
+    option: an allowlist that defaulted to `[]` would refuse every absolute
+    destination the moment `allow_absolute_writes` is off, which is a
+    regression rather than a confinement. An EMPTY store and no RAG sources
+    therefore returns `[]` — exactly today's behaviour.
+
+    Entries are resolved and deduped (case-insensitively on Windows); a
+    non-absolute or unparseable entry is ignored, never raised.
+    """
+    base = Path(home).expanduser() if home is not None else rigma_home()
+    roots: list[str] = []
+    seen: set[str] = set()
+    for raw in _store_workspaces(base) + _rag_source_folders(base):
+        try:
+            p = Path(str(raw)).resolve()
+        except (OSError, ValueError):
+            continue
+        if not p.is_absolute():
+            continue
+        key = os.path.normcase(str(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(str(p))
+    return roots
+
+
+def create(title: str = "New chat", system_prompt: str = "",
+           *, write_allowlist: list[str] | None = None) -> dict:
     now = time.time()
     session = {**json.loads(json.dumps(_SESSION_DEFAULTS)),
                "id": secrets.token_hex(6), "title": title,
                "system_prompt": system_prompt,
                "created_at": now, "updated_at": now}
+    # OD-2: a session created WITHOUT an explicit allowlist gets the seed —
+    # the folders the owner already works in. An explicit list, including an
+    # empty one, is honoured as given; an empty store seeds `[]`.
+    session["write_allowlist"] = (default_write_allowlist()
+                                  if write_allowlist is None
+                                  else [str(x) for x in write_allowlist])
     save(session)
     return session
 
