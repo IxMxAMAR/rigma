@@ -107,6 +107,35 @@ def save(patch: dict) -> dict:
     return cur
 
 
+def replace(clean: dict) -> dict:
+    """Write EXACTLY these settings: every key the caller omits goes back to its
+    default. Returns the whole settings dict.
+
+    OD-15 (option 1): `save` is a MERGE and must stay one — the settings UI sends
+    one key and means "change this one". A restore sends a whole backup document
+    and means "the store IS this", so merging lets a key created after the backup
+    survive the restore and the store never comes back to the file's state. This
+    is that write. There is no invariant/server-managed key to preserve: the only
+    setting today is `idle_unload_minutes`, pure user intent whose default (0.0,
+    never unload) is safe to fall back to. If a server-managed key is ever added
+    to DEFAULTS it must be re-derived here rather than read from `clean`.
+
+    Raises ValueError with a client-facing message, like `save`.
+    """
+    if not isinstance(clean, dict):
+        raise ValueError("settings: must be an object")
+    # An empty patch is legal here and means "all defaults"; validate() would
+    # refuse it with "send at least one setting", which is the merge caller's
+    # rule, not a restore's.
+    clean, err = validate(clean) if clean else ({}, "")
+    if err:
+        raise ValueError(err)
+    out = dict(DEFAULTS)
+    out.update(clean)
+    atomic_write_json(settings_path(), out, indent=2)
+    return out
+
+
 def idle_unload_minutes() -> float:
     """The EFFECTIVE idle timeout in minutes (0 = off).
 
