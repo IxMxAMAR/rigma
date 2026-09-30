@@ -221,6 +221,34 @@ def test_replacing_the_binary_invalidates_the_cache(tmp_path):
     assert engine_build.cached_build(exe, popen=fake).build == 10709
 
 
+def test_a_same_size_swap_inside_one_second_is_detected(tmp_path):
+    """The memo was keyed on `int(mtime)`, so a same-size replacement inside the
+    same whole second served the OLD build's identity: the file was never
+    re-read. That identity is what keys the KV cache and the calibration
+    provenance, so the stale answer is not cosmetic. The nanosecond part of the
+    mtime is what tells the two writes apart."""
+    import os
+    exe = _exe(tmp_path)
+    state = {"modern": False}
+
+    def fake(*a, **k):
+        return subprocess.CompletedProcess(a[0], 0, "",
+                                           MODERN if state["modern"] else LEGACY)
+
+    engine_build._BUILD_CACHE.clear()
+    base = 1_700_000_000_000_000_000          # whole second 1700000000
+    exe.write_bytes(b"x")
+    os.utime(exe, ns=(base, base))
+    assert engine_build.cached_build(exe, popen=fake).build == 9867
+    # same path, same SIZE, same whole second: only nanoseconds differ
+    state["modern"] = True
+    exe.write_bytes(b"y")
+    os.utime(exe, ns=(base + 100_000_000, base + 100_000_000))
+    assert exe.stat().st_size == 1, "the test must not change the size"
+    assert int(exe.stat().st_mtime) == 1_700_000_000, "nor the whole second"
+    assert engine_build.cached_build(exe, popen=fake).build == 10709
+
+
 def test_an_unreadable_build_is_not_cached(tmp_path):
     """A transient failure must not freeze 'unknown' for the life of the process."""
     exe = _exe(tmp_path)
