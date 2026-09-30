@@ -335,6 +335,12 @@ class AcpClient:
             # promptly, which is the normal case.
             try:
                 proc.wait(timeout=min(2.0, timeout))
+                # DR4. The leader exited on its own, but a DETACHED child's
+                # group outlives it: mcode's subagents inherit that group, and a
+                # leader that exits on stdin EOF does not reap them. Skipping
+                # `_signal` just because the wait succeeded is exactly the orphan
+                # B1b set out to fix.
+                self._reap_detached_group()
             except Exception:
                 # SIGTERM to the GROUP on POSIX (see `_signal`); on Windows the
                 # whole TREE via `taskkill /T`, because the process Rigma holds
@@ -349,6 +355,33 @@ class AcpClient:
         # Any waiter still blocked must learn the transport is gone rather than
         # wait out its full timeout.
         self._fail_all_pending("the mcode acp process ended")
+
+    def _reap_detached_group(self) -> None:
+        """Signal the group of a child that exited on its own (DR4).
+
+        The graceful path used to end at the successful `proc.wait`, on the
+        assumption that a child which exited took its subagents with it. It did
+        not: a DETACHED leader's group survives the leader, and the subagents
+        that inherited it are the ones holding the inherited stdout/stderr pipe.
+
+        POSIX-only, and only when the child was actually detached. On Windows
+        there is no group to reach once the `mcode.cmd` shim — the process Rigma
+        holds — has been reaped, and `taskkill /T` on a reaped pid is the
+        pid-reuse hazard DR9 records. A non-detached child shares RIGMA's group,
+        where there is nothing of its own to signal.
+
+        SIGKILL rather than SIGTERM: the leader is already gone, so nothing left
+        in the group can be shut down gracefully BY the leader; a process still
+        there is an orphan holding the pipe."""
+        if _WINDOWS:
+            return
+        try:
+            from . import harness as _harness
+        except Exception:
+            return
+        if not getattr(_harness, "_DETACH_CHILDREN", False):
+            return
+        self._signal(getattr(signal, "SIGKILL", 9))
 
     def __enter__(self):
         self.start()

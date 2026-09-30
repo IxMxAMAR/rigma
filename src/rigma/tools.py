@@ -4340,25 +4340,58 @@ def _kill_tree(pid: int, proc=None, *, timeout: float = 3.0) -> bool:
 def _signal_tree(pid: int, sig: int) -> None:
     """Signal `pid`'s process group — never RIGMA's own.
 
-    `getpgid` raises `ProcessLookupError` when the child is already reaped;
-    there is then nothing left to signal, which is not an error. When the target
-    shares our group (a caller that did not detach its child), signal the single
-    pid instead: `killpg` on our own group would kill the server too."""
-    try:
-        target = os.getpgid(pid)
-    except ProcessLookupError:
-        return
+    THE LEADER'S DEATH DOES NOT EMPTY ITS GROUP (DR4). A child spawned with
+    `start_new_session` LEADS its own group, so its pgid == its pid, and that
+    group outlives the leader: mcode's subagents inherit it, and a leader that
+    exits on stdin EOF does not reap them. `os.getpgid(pid)` raises
+    `ProcessLookupError` once the leader is reaped, and the old code treated
+    that as "nothing left to signal" and returned — which is exactly how the
+    orphan B1b set out to fix survived a graceful exit. The pid is therefore
+    used as the group when the lookup fails, and `ProcessLookupError` from the
+    signal itself (the group is genuinely empty) is not an error.
+
+    The guard is kept: a caller that did NOT detach its child left it in RIGMA's
+    own group, and `killpg` there would take the server down with the child. The
+    target's group is compared with ours first and a shared group falls back to
+    signalling the single pid.
+
+    The brief's rule was "always `killpg(pid, sig)` when `pid != os.getpgid(0)`".
+    The `getpgid(pid)` read is kept for the case it still answers (a child in
+    some other, non-leader group), where `killpg(pid)` would target the wrong
+    group; the fallback to `pid` covers the reaped leader, which is the case
+    that matters here."""
     try:
         ours = os.getpgid(0)
     except OSError:
         # Cannot prove the groups differ: signal only the pid rather than risk
         # taking our own group down.
-        os.kill(pid, sig)
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
         return
+    if pid == ours:
+        # The child was NOT detached: its group is ours. Never killpg it.
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        return
+    try:
+        target = os.getpgid(pid)
+    except ProcessLookupError:
+        # The leader is reaped; a detached child's group is the pid itself.
+        target = pid
     if target == ours:
-        os.kill(pid, sig)
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
     else:
-        os.killpg(target, sig)
+        try:
+            os.killpg(target, sig)
+        except ProcessLookupError:
+            pass
 
 
 def _pid_alive(pid: int) -> bool:

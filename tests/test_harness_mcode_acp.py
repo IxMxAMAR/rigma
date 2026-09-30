@@ -21,6 +21,7 @@ directly, because "refused" and "never asked" must never be conflated again.
 
 from __future__ import annotations
 
+import signal
 import subprocess
 import sys
 import threading
@@ -365,6 +366,84 @@ def test_the_windows_stop_falls_back_to_the_shim_when_the_tree_kill_fails(
     assert tree_attempts == [999_999, 999_999], tree_attempts
     assert calls.count("terminate") == 1, calls
     assert calls.count("kill") == 1, calls
+
+
+def test_a_posix_acp_stop_reaches_the_group_after_a_graceful_exit(monkeypatch):
+    """DR4: a leader that exits on stdin EOF does not empty its own group.
+
+    The graceful path used to end at the successful `proc.wait`, so `_signal`
+    never ran and the subagents that inherited the detached group survived
+    holding the pipe. `tools._signal_tree` is stubbed here, so what is asserted
+    is the CALL SHAPE after a successful wait; the real `killpg` is UNVERIFIED
+    on this Windows host.
+    """
+    calls = []
+    monkeypatch.setattr(acp, "_WINDOWS", False)
+    monkeypatch.setattr(_harness, "_DETACH_CHILDREN", True)
+    monkeypatch.setattr(tools, "_signal_tree",
+                        lambda pid, sig: calls.append((pid, sig)))
+
+    class _Proc:
+        pid = 4242
+        stdin = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    c = acp.AcpClient(["mcode"])
+    c.proc = _Proc()
+    c.stop()
+    assert calls == [(4242, getattr(signal, "SIGKILL", 9))], calls
+
+
+def test_a_non_detached_acp_stop_does_not_killpg_rigmas_group(monkeypatch):
+    """The DR4 group signal must be skipped when the child was NOT detached.
+
+    A non-detached child shares RIGMA's group; there is nothing of its own to
+    signal, and reaching for the pid's group could only hit ours.
+    """
+    calls = []
+    monkeypatch.setattr(acp, "_WINDOWS", False)
+    monkeypatch.setattr(_harness, "_DETACH_CHILDREN", False)
+    monkeypatch.setattr(tools, "_signal_tree",
+                        lambda pid, sig: calls.append((pid, sig)))
+
+    class _Proc:
+        pid = 4242
+        stdin = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    c = acp.AcpClient(["mcode"])
+    c.proc = _Proc()
+    c.stop()
+    assert calls == [], calls
+
+
+def test_a_windows_acp_stop_does_not_taskkill_a_reaped_shim(monkeypatch):
+    """On Windows the graceful path must stop at the wait.
+
+    Once the `mcode.cmd` shim has been reaped there is no group to reach, and
+    `taskkill /T` on a reaped pid is the pid-reuse hazard DR9 records — so no
+    tree kill is issued after a successful graceful wait.
+    """
+    kills: list[list[str]] = []
+    monkeypatch.setattr(acp, "_WINDOWS", True)
+    monkeypatch.setattr(tools.subprocess, "run",
+                        lambda cmd, **kw: kills.append(cmd))
+
+    class _Proc:
+        pid = 999_999
+        stdin = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    c = acp.AcpClient(["mcode"])
+    c.proc = _Proc()
+    c.stop()
+    assert kills == [], kills
 
 
 # --- streaming, which `exec` can only batch --------------------------------
