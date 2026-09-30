@@ -429,16 +429,65 @@ def test_kill_tree_killpgs_a_detached_childs_group(monkeypatch):
     assert killed == [], killed
 
 
-def test_signal_tree_treats_a_reaped_target_as_nothing_to_signal(monkeypatch):
-    """`getpgid` raising ProcessLookupError is "already gone", not a crash."""
+def test_signal_tree_still_reaches_a_reaped_leaders_group(monkeypatch):
+    """DR4: a reaped leader does NOT mean an empty group.
+
+    A child spawned with `start_new_session` LEADS its group, so its pgid == its
+    pid and the group outlives the leader — which is where mcode's subagents
+    live. `getpgid(pid)` raises `ProcessLookupError` once the leader is reaped;
+    the old code read that as "nothing left to signal" and returned, which is
+    exactly how the orphans B1b exists to kill survived a graceful exit. The pid
+    IS the group, and it must be signalled.
+    """
+    killed, groups = [], []
+
     def gone(pid):
+        if pid == 0:
+            return 100              # Rigma's own group
         raise ProcessLookupError(pid)
 
     _stub_posix(monkeypatch, getpgid=gone,
                 kill=lambda *a: pytest.fail("kill on a reaped pid"),
-                killpg=lambda *a: pytest.fail("killpg on a reaped pid"))
+                killpg=lambda pgid, sig: groups.append(pgid))
+
+    tools._signal_tree(4242, getattr(signal, "SIGKILL", 9))
+    assert groups == [4242], groups
+    assert killed == [], killed
+
+
+def test_signal_tree_ignores_a_group_that_is_already_gone(monkeypatch):
+    """A `killpg` that finds no group is the empty case, not an error."""
+    def gone(pid):
+        if pid == 0:
+            return 100
+        raise ProcessLookupError(pid)
+
+    def no_group(pgid, sig):
+        raise ProcessLookupError(pgid)
+
+    _stub_posix(monkeypatch, getpgid=gone, kill=lambda *a: None,
+                killpg=no_group)
 
     tools._signal_tree(4242, getattr(signal, "SIGKILL", 9))   # must not raise
+
+
+def test_signal_tree_signals_only_the_pid_when_our_group_is_unknown(monkeypatch):
+    """The never-take-Rigma-down guard must survive the DR4 change.
+
+    If `getpgid(0)` itself fails there is no way to prove the target's group is
+    not ours, so only the single pid may be signalled — `killpg` is refused.
+    """
+    killed = []
+
+    def unknown(pid):
+        raise OSError("getpgid unavailable")
+
+    _stub_posix(monkeypatch, getpgid=unknown,
+                kill=lambda pid, sig: killed.append(pid),
+                killpg=lambda *a: pytest.fail("killpg without knowing our group"))
+
+    tools._signal_tree(4242, getattr(signal, "SIGKILL", 9))
+    assert killed == [4242], killed
 
 
 def test_kill_job_admits_a_kill_it_could_not_confirm(ctx, monkeypatch):
