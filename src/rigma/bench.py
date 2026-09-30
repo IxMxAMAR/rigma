@@ -718,36 +718,51 @@ def _carries_quality_env_lever(flags: dict | None) -> bool:
     return bool(_quality_env_levers_in((flags or {}).get("env")))
 
 
+def _trial_flags(plan_flags, override: dict):
+    """The flags ONE trial of a sweep actually launches with. The single source.
+
+    W13B-1. `run_sweep` and the trial guards below (`_effective_env`,
+    `_effective_flags`) each used to spell this construction out for themselves.
+    They agreed, but nothing kept them agreeing: a guard that reads a *different*
+    flag set from the one the child is launched with is worse than no guard,
+    because it reports on a trial that never ran. Every path that needs "the
+    flags this trial will use" now goes through here, and
+    `test_the_sweep_and_its_guards_build_a_trial_the_same_way` pins it.
+
+    The semantics are pydantic's, not a merge: `model_copy(update=override)`
+    REPLACES a whole field, so an override naming `env` replaces the plan's
+    entire env dict rather than merging into it.
+    """
+    return plan_flags.model_copy(update=override)
+
+
 def _effective_env(plan_flags, override: dict) -> dict:
     """The child environment a trial ACTUALLY runs with.
 
-    `run_sweep` builds each trial as `plan.flags.model_copy(update=override)`,
-    so an override that names `env` REPLACES the plan's whole env dict rather
-    than merging into it; `runtime.launch_server` then merges the result over
+    An override that names `env` REPLACES the plan's whole env dict rather than
+    merging into it; `runtime.launch_server` then merges the result over
     `os.environ`. The trial gate must ask about THIS dict, not the override
     alone: a lever already on `plan.flags.env` — e.g. one merged from a
     `calibration.json` entry by `resolve._apply_calibration` — is invisible to a
     check of the override, so on a tools-capable model the sweep would launch
     every trial with rotation off while believing it had dropped the axis.
     """
-    return getattr(plan_flags.model_copy(update=override), "env", None) or {}
+    return getattr(_trial_flags(plan_flags, override), "env", None) or {}
 
 
 def _effective_flags(plan_flags, override: dict):
     """The flags a trial ACTUALLY runs with.
 
-    DR3-2: `run_sweep` builds every trial as
-    `plan.flags.model_copy(update=override)`, so a guard that inspects the
-    OVERRIDE alone is blind to a value the PLAN already carries. That matters
-    for the KV cache type: `cache_type_k`/`cache_type_v` are in
-    `resolve._CALIBRATION_PLACEMENT_KEYS`, so a calibration row (written when
-    the slug was not yet known to be tools-capable, hand-edited, or written by
-    an older build) can put q4_0 on the plan — and then every trial of a
-    tools-capable model would run the very cache the guard exists to avoid.
-    The same asymmetry `_effective_env` closes for the rotation lever, one
-    lever over.
+    DR3-2: a guard that inspects the OVERRIDE alone is blind to a value the PLAN
+    already carries. That matters for the KV cache type:
+    `cache_type_k`/`cache_type_v` are in `resolve._CALIBRATION_PLACEMENT_KEYS`,
+    so a calibration row (written when the slug was not yet known to be
+    tools-capable, hand-edited, or written by an older build) can put q4_0 on the
+    plan — and then every trial of a tools-capable model would run the very cache
+    the guard exists to avoid. The same asymmetry `_effective_env` closes for the
+    rotation lever, one lever over.
     """
-    return plan_flags.model_copy(update=override)
+    return _trial_flags(plan_flags, override)
 
 
 def _q4_kv(flags) -> bool:
@@ -954,7 +969,9 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
         configs = kept
     rows: list[dict] = []
     for label, override in configs:
-        flags = plan.flags.model_copy(update=override)
+        # W13B-1: the SAME construction the guards above read. Do not inline
+        # `plan.flags.model_copy(update=override)` here again.
+        flags = _trial_flags(plan.flags, override)
         trial = plan.model_copy(update={"flags": flags})
         if progress:
             progress(label)
