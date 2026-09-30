@@ -51,6 +51,13 @@ const SPEED: Record<string, { dot: string; text: string; label: string; hint: st
  *  doubling was missed by 46MB, or that 888MB of it went to a vision projector
  *  you may not want. */
 function budgetHint(fit?: QuantRow["fit"]): string {
+  // A16: checked FIRST, because a broken fit has no budget and would otherwise
+  // fall through to the "does not fit this machine" sentence below — a verdict
+  // nobody computed.
+  if (fit?.error) {
+    return `the fit could not be computed — ${fit.error}. This is NOT a verdict `
+      + "that the model does not fit this machine.";
+  }
   const b = fit?.budget;
   if (!b) {
     return fit?.ok ? "fits this machine" : "does not fit this machine";
@@ -84,9 +91,31 @@ function CtxCell({ fit }: { fit?: QuantRow["fit"] }) {
 }
 
 /** Where the weights end up. Driven by the resolver's own plan (ngl /
- *  n_cpu_moe), so it cannot claim "gpu" for a quant it decided to offload. */
-function RunsCell({ fit }: { fit?: QuantRow["fit"] }) {
+ *  n_cpu_moe), so it cannot claim "gpu" for a quant it decided to offload.
+ *
+ *  A16: THREE CASES, and this cell has to tell them apart, because the payload
+ *  gives them the SAME `ok`/`speed`. A quant the resolver refused is
+ *  `{ok:false, speed:"no"}`; a fit whose arithmetic threw carries `error` in
+ *  that identical shape; a machine with no profile at all is `{}`. Drawing the
+ *  broken one as "too big" told the user their machine cannot run a model
+ *  nobody had actually measured — the page keyed on `ok`/`speed` alone, and
+ *  A16 put the distinction in the payload without anything reading it.
+ *
+ *  Exported so a render test can read the markup directly. */
+export function RunsCell({ fit }: { fit?: QuantRow["fit"] }) {
   if (!fit || fit.speed === undefined) return <span className="w-[66px] shrink-0" />;
+  if (fit.error) {
+    return (
+      <span
+        className="w-[66px] shrink-0 flex items-center gap-1 font-mono text-[11px] whitespace-nowrap"
+        title={`the fit could not be computed (${fit.error}) — this row says ` +
+               "nothing about whether the model fits this machine"}
+      >
+        <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-amber/70" />
+        <span className="text-amber">fit error</span>
+      </span>
+    );
+  }
   const s = SPEED[fit.speed] ?? SPEED.no;
   const off = fit.offload_pct ?? 0;
   return (
@@ -284,7 +313,7 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
           the "best here" badge pushed the action button clean outside the card
           (owner, 2026-08-23). A truncated name is the right thing to lose. */}
       <span className={`font-mono text-[12.5px] w-24 shrink-0 truncate ${
-        q.fit?.ok === false ? "text-muted" : ""}`} title={q.file}>
+        q.fit?.ok === false && !q.fit.error ? "text-muted" : ""}`} title={q.file}>
         {q.quant}
       </span>
       <span className="font-mono text-[12px] text-muted w-[52px] shrink-0 text-right">{gb(q.bytes)}</span>
