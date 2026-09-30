@@ -1072,10 +1072,31 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
         return _apply(plan)
     if plan.backend == "cpu":
         return plan   # nothing worth measuring on CPU
-    run_sweep(plan, exe, model_path, port=port,
-              configs=quick_configs(plan.flags, plan.flags.n_cpu_moe > 0,
-                                    caps=_capabilities(plan.model_slug)),
-              extra_args=extra_args, progress=progress, mark_calibrated=True)
+    rows = run_sweep(plan, exe, model_path, port=port,
+                     configs=quick_configs(plan.flags, plan.flags.n_cpu_moe > 0,
+                                           caps=_capabilities(plan.model_slug)),
+                     extra_args=extra_args, progress=progress,
+                     mark_calibrated=True)
+    if not rows:
+        # W15A-n2. `run_sweep` measured NOTHING: on a tools-capable model whose
+        # plan already carries q4_0 every quick config is dropped before it can
+        # launch (see the guard in `run_sweep`), so it crowns no winner, writes
+        # no entry, and the docstring's "cached forever after" was never
+        # reached — every later load re-entered the sweep and re-fired the
+        # warning. Record the DECISION here so the next load is a cache hit.
+        #
+        # This is honest, not an overloaded field. `calibrated` means "the
+        # one-time first-load tune has run" (see `save_calibration`), and it did
+        # run: it dropped every trial. No `flags` is written, so no reader can
+        # mistake this for a measured placement — `resolve._apply_calibration`
+        # (entry.get("flags")), `_apply` below and
+        # `server_ops._measured_placement` all gate on `flags` — and `measured`
+        # stays empty, so the throughput/expectation readers
+        # (`serve._throughput`, `server_ops.expected_tg`) report "no number"
+        # rather than a zero that looks measured.
+        save_calibration(key, {}, flags=None, calibrated=True,
+                         ctx=plan.flags.ctx, backend=plan.backend,
+                         identity=ident)
     return _apply(plan)
 
 
