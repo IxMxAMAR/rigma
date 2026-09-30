@@ -119,8 +119,9 @@ def findings(log_text: str, *, expected_vram_mb: float | None = None
     A17/S2 is wired in here rather than behind a second endpoint: the engine's
     own load accounting is one more thing the engine said once and never
     repeated. The split verdict is derived from the load the engine itself
-    reported (ngl, layer count, expert placement, backend), so this needs no
-    plan at the call site — and a HEALTHY load adds no finding at all.
+    reported (ngl, layer count, expert placement, backend, and the device count
+    from the load's own device labels), so this needs no plan at the call site —
+    and a HEALTHY load adds no finding at all.
 
     `expected_vram_mb` is optional and is the plan's own prediction
     (`memtruth.planned_mb(plan)`, i.e. weights + KV for the same ctx / cache /
@@ -229,10 +230,34 @@ def findings(log_text: str, *, expected_vram_mb: float | None = None
 #     `tensor 'token_embd.weight' (pq2_0) ... cannot be used with preferred
 #     buffer type ROCm_Host, using CPU instead`.
 #
-# Therefore a dense model with ANY GPU layers is 2: one CPU run (the token
-# embedding, contiguous with the first CPU layers under a partial offload) and
-# one GPU run. That is why an all-GPU load and a contiguous dense partial
-# offload share the same baseline. `ngl = 0` is 1.
+# Therefore a dense model with ANY GPU layers on ONE device is 2: one CPU run
+# (the token embedding, contiguous with the first CPU layers under a partial
+# offload) and one GPU run. That is why an all-GPU load and a contiguous dense
+# partial offload share the same baseline. `ngl = 0` is 1.
+#
+# The DEVICE COUNT widens that baseline (A17e). The scheduler starts a new run
+# whenever the node's backend differs from the current run's, and the layers a
+# `--tensor-split` assigns to a device are a contiguous range, so a dense load
+# placed across D devices is 1 + D runs: the CPU embedding run, then one run per
+# device (CPU -> ROCm0 -> ROCm1 = 3). D is taken from the load's own distinct
+# DEVICE labels (`ROCm0`, `ROCm1`, `CUDA0`, ...); `CPU_Mapped` and every
+# `<device>_Host` staging buffer are host RAM, not devices. A load that reports
+# GPU layers but names no device has an UNKNOWN device count, and the verdict is
+# "not comparable" — the same rule as the MoE case below, never a single-device
+# guess that would flag a two-device load on every launch.
+#
+# CIRCULARITY, stated precisely. Taking D from the log means the expectation
+# moves with the log being judged. The failure this detector exists for is still
+# caught: a silent per-op CPU fallback (the fused attention node -> CPU) does
+# not remove or rename a device label, so D is unchanged and the split count
+# rises above 1 + D. What is NOT visible is a device that silently DROPS OUT of
+# the load — a plan for two devices where one fails to initialise and its layers
+# are re-placed on the survivor: the surviving label set is smaller, the
+# expectation shrinks with it, and the load reads "ok". Seeing that needs the
+# plan's device list, which neither `ComboFlags` nor `RunPlan` carries
+# (`--tensor-split` is only a known-flag entry, `engines.py:109`, never emitted)
+# and which `/api/server/findings` does not have. It is recorded as a residual,
+# not guessed.
 #
 # `offloaded N/M` is `std::min(n_gpu_layers, max_offloadable_layers)` over
 # `max_backend_supported_layers = n_layer_all + 1` — the denominator COUNTS THE
@@ -344,6 +369,31 @@ def _backend_of(load: dict) -> str:
     return ""
 
 
+def device_labels(load: dict) -> list[str]:
+    """The distinct DEVICE labels the load's own buffers name, sorted.
+
+    A17e: the scheduler cuts one run per device, so the device count has to
+    come from somewhere. The plan does not carry it — `ComboFlags`/`RunPlan`
+    have no tensor split and `--tensor-split` is only a known-flag entry
+    (`engines.py:109`), never emitted — and the `/api/server/findings` surface
+    is given log text alone. The load's buffer labels are therefore the only
+    source available here.
+
+    Host buffers (`CPU`, `CPU_Mapped`, any `*_Host`) are not devices. A label
+    counts once however many buffers carry it, and it counts even when
+    `_DEVICE_FAMILIES` does not recognize its family: the question is how many
+    separate device segments the engine reported, and an unknown-family label
+    is still a device.
+
+    Circularity is inherent to reading this from the log (see the module
+    comment): the expectation moves with the labels. A per-op CPU fallback is
+    still caught — it leaves the labels alone and raises the split count — but
+    a whole device silently dropping out of the load is not.
+    """
+    labels = {b["label"] for key in _BUFFER_KEYS for b in load.get(key, [])}
+    return sorted(label for label in labels if not _is_host_buffer(label))
+
+
 def parse_loads(log_text: str) -> list[dict]:
     """Every model load in the log, in order.
 
@@ -432,10 +482,11 @@ def _sum_buffers(load: dict, *, host: bool) -> float:
 # The split expectation comes from the PLAN, never from a constant
 # ---------------------------------------------------------------------------
 
-# The two counts a DENSE plan can produce (see the provenance block at the top
-# of this section for the engine lines behind them).
+# The split count for a DENSE plan is `_SPLITS_CPU_ONLY + n_devices` (see the
+# provenance block at the top of this section for the engine lines behind it):
+# one CPU run for the token embedding, then one run per device. A single device
+# is the 2 this machine's own log prints; two devices are 3.
 _SPLITS_CPU_ONLY = 1        # one CPU run: embedding and every layer
-_SPLITS_DENSE_ANY_GPU = 2   # one CPU run (embedding) + one GPU run
 
 
 def plan_fields_from_load(load: dict) -> dict:
@@ -462,7 +513,8 @@ def plan_fields_from_load(load: dict) -> dict:
 
 
 def expected_splits(*, ngl, n_layers, n_cpu_moe=None,
-                    backend: str = "") -> int | None:
+                    backend: str = "", n_devices: int | None = None
+                    ) -> int | None:
     """The `graph splits` count a PLAN should produce, or None.
 
     None means **NOT COMPARABLE**: the plan's own fields do not determine the
@@ -471,11 +523,17 @@ def expected_splits(*, ngl, n_layers, n_cpu_moe=None,
       * `ngl == 0`, or a CPU-only backend: everything — the token embedding
         included — runs on the CPU, so the graph is one CPU run => 1 split.
       * a DENSE model with any GPU layers: the input embedding is always on the
-        CPU and the offloaded layers form one contiguous GPU run after it =>
-        2 splits. The SAME 2 for an all-GPU load and for a contiguous partial
-        offload (`ngl` below the layer count), which is why the healthy baseline
-        is 2 and a constant 1 flagged this machine's own healthy load on every
-        launch.
+        CPU and the offloaded layers form one contiguous GPU run PER DEVICE
+        after it => 1 + `n_devices` splits. One device is the same 2 as before
+        (the healthy baseline this machine's log prints), and the SAME 2 for an
+        all-GPU load and a contiguous partial offload (`ngl` below the layer
+        count), which is why a constant 1 flagged this machine's own healthy
+        load on every launch.
+      * `n_devices is None` or `< 1`: the number of devices the load actually
+        used is unknown, and `ngl` alone does not determine the number of runs
+        => not comparable (A17e). This is the same rule as the MoE case: a plan
+        field that does not determine the count yields no verdict, never a
+        single-device guess.
       * `n_cpu_moe > 0`: expert weights on the CPU inside otherwise-GPU layers
         force a new split per affected layer, so the count is a function of the
         model's expert geometry rather than of `ngl` => not comparable.
@@ -497,12 +555,26 @@ def expected_splits(*, ngl, n_layers, n_cpu_moe=None,
         return _SPLITS_CPU_ONLY
     if n_cpu_moe is None or int(n_cpu_moe) > 0:
         return None
-    return _SPLITS_DENSE_ANY_GPU
+    if n_devices is None or int(n_devices) < 1:
+        return None
+    return _SPLITS_CPU_ONLY + int(n_devices)
 
 
 def expected_splits_for_load(load: dict) -> int | None:
-    """`expected_splits` for a parsed load; None when it cannot be derived."""
-    return expected_splits(**plan_fields_from_load(load))
+    """`expected_splits` for a parsed load; None when it cannot be derived.
+
+    The device count is the load's own distinct device labels (`device_labels`).
+    A load that reports GPU layers but names no device — a truncated tail, or a
+    label this parser does not recognize as a device — has an UNKNOWN device
+    count, so it is NOT COMPARABLE rather than the single-device 2 that would
+    flag its `graph splits` line on every launch.
+    """
+    fields = plan_fields_from_load(load)
+    devices = device_labels(load)
+    ngl = fields["ngl"]
+    if ngl is not None and int(ngl) > 0 and not devices:
+        return None
+    return expected_splits(**fields, n_devices=len(devices))
 
 
 def _split_why_not_comparable(load: dict) -> str:
@@ -519,6 +591,11 @@ def _split_why_not_comparable(load: dict) -> str:
                 % load.get("n_expert"))
     if fields["ngl"] is None:
         return "the log does not report the offloaded layer count"
+    if int(fields["ngl"]) > 0 and not device_labels(load):
+        return ("the log reports %d layers offloaded to a GPU but names no "
+                "device buffer (no ROCm0 / CUDA0 / ... line), so the number of "
+                "devices — and therefore of GPU runs — is unknown"
+                % fields["ngl"])
     return "the plan's placement does not determine a split count"
 
 
@@ -536,20 +613,35 @@ def _split_sentence(load: dict, splits, expected, verdict: str) -> str:
                 "CPU attention fallback adds about two splits per attention "
                 "layer (GPU -> CPU -> GPU), so a count this far above the "
                 "baseline is the signature to look for." % (
-                    splits, expected, _expected_splits_words(load)))
+                    splits, expected, _expected_splits_words(load, expected)))
     return "graph splits = %d, matching the %d the plan expects." % (splits,
                                                                     expected)
 
 
-def _expected_splits_words(load: dict) -> str:
-    """How to describe the expected count in a sentence."""
-    fields = plan_fields_from_load(load)
-    ngl, n = fields["ngl"], fields["n_layers"]
-    if ngl == 0 or (fields["backend"] or "").lower() == "cpu":
-        return "a CPU-only load"
-    if n and ngl is not None and ngl >= n + 1:
-        return "an all-GPU dense load"
-    return "a dense partial offload (%s of %s layers on the GPU)" % (ngl, n)
+def _expected_splits_words(load: dict, expected) -> str:
+    """How to describe the expected count in a sentence.
+
+    The words follow `expected` (the caller's number), not a fresh derivation
+    from the load: an explicit `expected_splits` override must not produce a
+    parenthetical that contradicts the number beside it (verifier nit on
+    `_split_sentence`, where `expected_splits=1` on an all-GPU load read
+    "ABOVE the 1 ... (an all-GPU dense load)"). When the load's own derivation
+    agrees with `expected`, its placement is named for context; when it does
+    not, the number is named on its own.
+    """
+    if expected == _SPLITS_CPU_ONLY:
+        return "a CPU-only plan"
+    n_devices = len(device_labels(load))
+    if n_devices >= 1 and expected == _SPLITS_CPU_ONLY + n_devices:
+        fields = plan_fields_from_load(load)
+        ngl, n = fields["ngl"], fields["n_layers"]
+        if n_devices > 1:
+            return ("a dense load across %d devices (CPU embedding + %d GPU "
+                    "runs)" % (n_devices, n_devices))
+        if n and ngl is not None and ngl >= n + 1:
+            return "an all-GPU dense load"
+        return "a dense partial offload (%s of %s layers on the GPU)" % (ngl, n)
+    return "a plan expecting %d backend runs" % expected
 
 
 # The same slack `memtruth.compare` uses for the same two quantities: below it
@@ -562,11 +654,12 @@ _VRAM_SLACK_PCT = 0.15
 _PLAN_DIVERGENCE_MESSAGE = (
     "The engine's own load accounting does not match the plan. `graph splits` "
     "is the number of backend runs the scheduler cut the graph into; a dense "
-    "load with any GPU layers should be 2 (the token embedding always stays on "
-    "the CPU, llama.cpp llama-model.cpp), so a much higher count means "
-    "operations ran on a backend the plan did not assume — most often a silent "
-    "CPU attention fallback, which adds about two splits per attention layer "
-    "and costs speed on every token without printing an error."
+    "load with any GPU layers is one CPU run (the token embedding always stays "
+    "on the CPU, llama.cpp llama-model.cpp) plus one run per device, so a "
+    "count above that means operations ran on a backend the plan did not "
+    "assume — most often a silent CPU attention fallback, which adds about two "
+    "splits per attention layer and costs speed on every token without "
+    "printing an error."
 )
 
 
@@ -618,10 +711,12 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
     `vram_verdict == "not_comparable"`, never a wrong number.
 
     `expected_splits` is derived from the load's own plan fields
-    (`expected_splits_for_load`: ngl, layer count, expert placement, backend)
-    when not given, so the healthy all-GPU/partial dense load expects 2, not 1.
-    A caller may override it; None means "not comparable" and is what the MoE
-    and unknown-layer-count cases produce.
+    (`expected_splits_for_load`: ngl, layer count, expert placement, backend,
+    and the DEVICE COUNT from the load's distinct device labels) when not given,
+    so a healthy dense load on one device expects 2 and on two devices expects
+    3 — never a single-device constant. A caller may override it; None means
+    "not comparable" and is what the MoE, unknown-layer-count and
+    unknown-device-count cases produce.
 
     Three outcomes per axis, kept distinct:
       * "ok"              — within the plan's expectation (VRAM within the same
