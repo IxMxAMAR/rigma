@@ -176,18 +176,40 @@ def _owner_is_alive(pid: int, started_at) -> bool:
     A pid ALONE is not enough: pids are recycled, and a live process that merely
     inherited the number must not make a dead owner look alive — the same
     distinction `state._is_recorded_process` draws for the engine pid.
+
+    The safe direction for a LOCK is the one the termination path takes, not the
+    driver path: an identity that cannot be READ must not make a live owner's
+    lock stealable. Stealing a live owner's lock is precisely the failure the
+    lock exists to prevent — two concurrent FULL suites, REC-1's shared fixed
+    port and 72 orphaned fake_acp_server processes. Refusing to steal from a
+    LIVE pid at worst makes the next run wait for that process to exit (its own
+    finalizer then releases the lock); it cannot wedge forever, because a pid
+    that is actually gone fails the psutil call below and is taken over.
+
+    `started_at == 0.0` is not hypothetical: `_acquire_suite_lock` writes exactly
+    that when psutil cannot read its OWN create time, so treating it as dead made
+    the lock written after a psutil failure immediately stealable. SUITELOCK-n1.
     """
     if pid <= 0:
         return False
     try:
         import psutil
-        return abs(float(psutil.Process(pid).create_time()) - float(started_at)) < 1.0
+        owner_created = float(psutil.Process(pid).create_time())
     except Exception:
-        # Unreadable identity counts as NOT ours, so a lock we cannot attribute
-        # is taken over rather than wedging the suite forever. The cost of being
-        # wrong here is one more concurrent run; the cost of the other direction
-        # is a suite nobody can start.
+        # The pid is gone (or unreadable): no live owner to protect, so a
+        # leftover lock from a killed/crashed run is taken over.
         return False
+    try:
+        recorded = float(started_at)
+    except (TypeError, ValueError):
+        # A record with no usable create time at all (missing/None/garbage) is
+        # not an identity we can attribute; take it over, as before.
+        return False
+    if recorded <= 0.0:
+        # 0.0 means "the owner could not read its own create time", not "the
+        # owner is gone". The pid IS live, so do not steal its lock.
+        return True
+    return abs(owner_created - recorded) < 1.0
 
 
 def _acquire_suite_lock(path: Path):
