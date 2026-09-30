@@ -438,3 +438,26 @@ def test_a_long_relative_image_in_the_state_dir_is_refused(tmp_path, monkeypatch
                           "has_vision": True})
     assert out.startswith("error"), out
     assert "state" in out.lower(), out
+
+
+# --- ODR-1b: the FILE a copy/move creates is checked, not only its folder -----
+
+@pytest.mark.parametrize("name", [".bashrc", ".gitconfig", ".profile"])
+@pytest.mark.parametrize("tool", ["copy_files", "move_files"])
+def test_a_crafted_rc_file_cannot_be_copied_or_moved_into_the_home(home, tool, name):
+    # The destination FOLDER is the home workspace itself, which is allowed; the
+    # file it would create is the persistence location.
+    staged = home / "x" / name
+    staged.parent.mkdir()
+    staged.write_text("payload", encoding="utf-8")
+    out = tools.run_tool(tool, {"paths": [f"x/{name}"], "dest": "."}, _ctx())
+    _refused(out)
+    assert not (home / name).exists()
+    assert staged.is_file()                    # a refused move leaves the source
+
+
+def test_a_path_that_cannot_be_resolved_is_refused(monkeypatch):
+    def unresolvable(self, *a, **k):
+        raise OSError("cannot resolve")
+    monkeypatch.setattr(Path, "resolve", unresolvable)
+    assert "persistence" in tools._persistence_path_reason(Path("anything.txt"))
