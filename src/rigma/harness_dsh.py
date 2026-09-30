@@ -365,12 +365,16 @@ class _Run:
     proc: subprocess.Popen | None = None
     hard: bool = False  # timed out: kill, do not ask nicely
     done: bool = False
-    # Whether the TREE (not just the runner) is known to be gone. `kill_tree`
-    # cannot always reach the Node grandchild — `taskkill /T` is the only thing
-    # that does, and it can be refused — and `proc.kill()` still ends the turn
-    # either way, so without this the timeout message asserts a kill that may
-    # not have happened while the agent keeps holding VRAM.
-    tree_killed: bool | None = None
+    # The outcome of `kill_tree` (a truthy `KillResult` when the tree is
+    # confirmed gone), or `True` when there was nothing running to kill, or
+    # `None` when there was no process to ask. `kill_tree` cannot always reach
+    # the Node grandchild — `taskkill /T` is the only thing that does, and it can
+    # be refused — and the fallback still ends the turn either way, so without
+    # this the timeout message asserts a kill that may not have happened while
+    # the agent keeps holding VRAM. A `KillResult` is bool-compatible, so the
+    # truthiness test below is unchanged; its `attempted` field is what lets the
+    # message tell "not tried" from "tried and not confirmed".
+    tree_killed: _harness.KillResult | bool | None = None
     # R5-STEPTEXT: whether this turn has already put any prose on screen.
     #
     # The `done` handler below treats an empty `done` as "the model call failed",
@@ -501,6 +505,14 @@ def _read_events(state: _Run, timeout: float) -> Iterator[TurnEvent]:
             _stop(state)
             if state.tree_killed:
                 how = "and was killed"
+            elif getattr(state.tree_killed, "attempted", False):
+                # Tried and could not be confirmed. The kill ran, but the
+                # evidence stops at the process Rigma holds, so the grandchild
+                # may have survived it — say exactly that.
+                how = ("— the tree kill was attempted but the DSH agent could "
+                       "not be confirmed dead, so it and any subagents it "
+                       "started may STILL BE RUNNING and holding the model "
+                       "server")
             else:
                 how = ("— but only the runner could be signalled, so the DSH "
                        "agent and any subagents it started may STILL BE "
@@ -717,6 +729,9 @@ def _spawn(pkey: str, key: tuple, env: dict) -> "_Live":
         errors="replace",
         bufsize=1,
         env=env,
+        # Detached on POSIX so `kill_tree`'s killpg reaches this runner's group
+        # and NOT Rigma's own (which a non-detached child would share).
+        **_harness._detached_kwargs(),
     )
     _start_readers(run)
     live = _Live(run.proc, run, key)

@@ -18,6 +18,7 @@ it was not":
 The exec-profile tests are driven off the registry rather than a list of tool
 names, so a NEW execution tool is covered the day it is registered.
 """
+import signal
 import sys
 import time
 
@@ -376,6 +377,68 @@ def test_kill_tree_reports_whether_the_process_is_actually_gone(ctx):
     finally:
         if proc.poll() is None:
             tools._kill_tree(proc.pid, proc)
+
+
+class _DeadProc:
+    """A process stub whose `wait` succeeds: `_kill_tree` confirms it is gone.
+    No process is spawned and no signal is sent."""
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _stub_posix(monkeypatch, *, getpgid, kill, killpg):
+    """Put `_kill_tree` on its POSIX branch with the os primitives stubbed.
+
+    `os.getpgid`/`os.killpg` do not exist on Windows, so `raising=False` adds
+    them for the test and removes them afterwards; nothing is ever signalled.
+    """
+    monkeypatch.setattr(tools.sys, "platform", "linux")
+    monkeypatch.setattr(tools.os, "getpgid", getpgid, raising=False)
+    monkeypatch.setattr(tools.os, "kill", kill, raising=False)
+    monkeypatch.setattr(tools.os, "killpg", killpg, raising=False)
+
+
+def test_kill_tree_never_killpgs_rigmas_own_process_group(monkeypatch):
+    """A non-detached child shares our group; `killpg` there would kill Rigma.
+
+    `getpgid` is stubbed to return the SAME group for the child and for pid 0,
+    which is what a child spawned without `start_new_session` looks like. The
+    only safe move is to signal the single pid.
+    """
+    killed, groups = [], []
+    _stub_posix(monkeypatch, getpgid=lambda pid: 777,
+                kill=lambda pid, sig: killed.append(pid),
+                killpg=lambda pgid, sig: groups.append(pgid))
+
+    assert tools._kill_tree(4242, _DeadProc()) is True
+    assert groups == [], groups
+    assert killed == [4242], killed
+
+
+def test_kill_tree_killpgs_a_detached_childs_group(monkeypatch):
+    """A detached child has its own group, so the whole tree is reached."""
+    killed, groups = [], []
+    _stub_posix(monkeypatch,
+                getpgid=lambda pid: 4242 if pid == 4242 else 100,
+                kill=lambda pid, sig: killed.append(pid),
+                killpg=lambda pgid, sig: groups.append(pgid))
+
+    assert tools._kill_tree(4242, _DeadProc()) is True
+    assert groups == [4242], groups
+    assert killed == [], killed
+
+
+def test_signal_tree_treats_a_reaped_target_as_nothing_to_signal(monkeypatch):
+    """`getpgid` raising ProcessLookupError is "already gone", not a crash."""
+    def gone(pid):
+        raise ProcessLookupError(pid)
+
+    _stub_posix(monkeypatch, getpgid=gone,
+                kill=lambda *a: pytest.fail("kill on a reaped pid"),
+                killpg=lambda *a: pytest.fail("killpg on a reaped pid"))
+
+    tools._signal_tree(4242, getattr(signal, "SIGKILL", 9))   # must not raise
 
 
 def test_kill_job_admits_a_kill_it_could_not_confirm(ctx, monkeypatch):

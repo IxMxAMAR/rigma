@@ -31,7 +31,6 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
-import subprocess
 from dataclasses import dataclass
 from typing import Callable
 
@@ -590,8 +589,48 @@ def resolve(name: str | None, *, port: int | None = None) -> Harness:
 _ADAPTERS = {DSH: "harness_dsh", MCODE: "harness_mcode"}
 
 
-def kill_tree(proc) -> bool:
-    """Kill a backend process AND everything it started. True when it worked.
+# POSIX children must be detached so `kill_tree`'s killpg reaches THEIR group,
+# not Rigma's own. A module constant rather than a fresh `os.name` read, so a
+# test can flip the platform decision without patching `os.name` — which
+# `pathlib` reads to choose WindowsPath vs PosixPath, and which would make
+# unrelated code explode on a Windows host.
+_DETACH_CHILDREN = os.name != "nt"
+
+
+def _detached_kwargs() -> dict:
+    """Popen kwargs that put a harness child in its OWN process group on POSIX.
+
+    `kill_tree` reaches a tree with `killpg` on POSIX, so a child left in
+    RIGMA'S own process group would make a stop take the server down with it.
+    Every adapter that can end up in `kill_tree`'s path must spawn detached; this
+    is the same idiom as `tools._launch_killable`. Windows needs nothing here —
+    `tools._kill_tree` uses `taskkill /T` there, and the native job launcher
+    already sets CREATE_NEW_PROCESS_GROUP.
+    """
+    return {"start_new_session": True} if _DETACH_CHILDREN else {}
+
+
+@dataclass(frozen=True)
+class KillResult:
+    """What `kill_tree` established, not just what it tried.
+
+    Truthy exactly when the tree is confirmed gone, so every caller that treated
+    the old return as a bool keeps its meaning (`if result:` still works);
+    `attempted` and `confirmed` are the extra facts the DSH timeout message needs
+    to stay honest. The fields are added, not renamed: `ok` is the same boolean
+    the function always returned.
+    """
+
+    ok: bool = False
+    attempted: bool = False
+    confirmed: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def kill_tree(proc) -> KillResult:
+    """Kill a backend process AND everything it started.
 
     An adapter is handed a `.cmd` shim on Windows, so the process Rigma holds is
     a SHELL whose real work is a grandchild. Killing only the shell leaves the
@@ -603,29 +642,39 @@ def kill_tree(proc) -> bool:
     Killing the tree is also what stops an agent's SUBAGENTS. The arm spawns
     child agents of its own, and a stop that leaves them running is not a stop.
 
-    Returns whether the TREE is known to be gone, because the failure is
-    otherwise invisible: `proc.kill()` below still takes the direct child, so
-    the turn ends normally while the grandchild keeps running against the model
-    server and holding VRAM. A caller that reports "was killed" without asking
-    is reporting something it did not do.
+    The kill is delegated to `tools._kill_tree`, the ONE tree-kill in this
+    codebase (AUDIT F35). It uses `killpg` on POSIX, where `proc.kill()` reaches
+    only the direct child, and on Windows it polls the process rather than
+    trusting `taskkill`'s exit code — which is 0 even when the tree walk misses a
+    re-parented grandchild. Calling `taskkill` here AND inside that helper (as an
+    earlier revision did) ran the kill twice; this function runs it once.
+
+    `ok`/`confirmed` mean the process Rigma holds is confirmed dead on EITHER
+    platform — the strongest evidence available, and the honest limit of it. The
+    old body hardcoded `ok = False` off Windows, so a tree that HAD died was
+    reported as "could not be confirmed dead" on every Linux/macOS timeout, while
+    on Windows a taskkill exit code of 0 was reported as a tree kill it never
+    verified. Both are corrected here.
     """
-    if os.name == "nt":
-        try:
-            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                  capture_output=True, timeout=20)
-            ok = getattr(done, "returncode", 0) == 0
-        except (OSError, subprocess.TimeoutExpired):
-            ok = False              # fall through: proc.kill still gets the shell
-    else:
-        # POSIX: there is no job object here, so `proc.kill()` reaches only the
-        # direct child. Reported as unknown rather than as success — a claim of
-        # a tree kill this branch cannot make is the bug this return exists for.
-        ok = False
+    attempted = False
+    confirmed = False
+    pid = int(getattr(proc, "pid", 0) or 0)
     try:
-        proc.kill()
-    except OSError:
-        pass
-    return ok
+        from . import tools as _tools
+        attempted = True
+        confirmed = bool(_tools._kill_tree(pid, proc))
+    except Exception:
+        # `_kill_tree` is not supposed to raise; if it does, the direct child is
+        # still ours to take, and `poll` is the only confirmation left.
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            confirmed = proc.poll() is not None
+        except Exception:
+            confirmed = False
+    return KillResult(ok=confirmed, attempted=attempted, confirmed=confirmed)
 
 
 def adapter(name: str):
