@@ -88,3 +88,203 @@ def _never_touch_the_real_rigma_home(tmp_path_factory):
     the whole session to a throwaway home; tests that monkeypatch their own
     RIGMA_HOME still override this per-test."""
     os.environ["RIGMA_HOME"] = str(tmp_path_factory.mktemp("rigma-home"))
+
+
+# --- one FULL suite at a time (REC-1 / OD-16) --------------------------------
+#
+# WHAT WENT WRONG. Twice, two full `pytest` runs overlapped and both froze —
+# not slow, *stopped*, 0 CPU over 25 s — each blocked on an established loopback
+# socket, with 72 orphaned `fake_acp_server.py` processes left behind. The shared
+# resource was a fixed TCP port (`tests/test_bench.py` bound 11598 literally; it
+# was the only literal bind in the suite) and that is fixed at 43e63de, but
+# nothing then *stopped* two full runs from starting, and this program's own
+# "at most three pytest processes" rule permits it.
+#
+# SO: a run that collects the WHOLE suite takes an exclusive lock, and a second
+# full run exits immediately with a sentence that names the failure and the way
+# out. A run of specific FILES is deliberately not locked — verifiers run
+# different files concurrently all the time, and blocking that would break the
+# workflow this guard exists to protect.
+#
+# The lock lives in the system temp dir, keyed by the tests directory, so it is
+# per-checkout and never dirties the repo. Its owner is a pid PLUS the pid's
+# create time, for the same reason `state._is_recorded_process` records both: a
+# recycled pid must not make a dead owner look alive and wedge every later run.
+#
+# WHICH RUNS ARE FULL is decided from pytest's OWN parsed positional list
+# (`config.args`), NOT by hand-parsing argv. Probed with a throwaway
+# `pytest_configure` plugin on pytest 9.1.1: for `pytest -m "not hardware"` — how
+# the full suite is actually invoked — `invocation_params.args` is
+# `('-m', 'not hardware')`, so the marker's VALUE arrives as a bare token that
+# looks positional, while `config.args` is `[<rootdir>]`. Filtering `-`-prefixed
+# tokens out of the raw argv therefore leaves `['not hardware']`, which is not
+# the tests dir, and the full run is misclassified as targeted — the guard would
+# never lock the very run it exists for. `config.args` held no options for any
+# form probed (no path, `tests`, `tests/`, the absolute tests dir, a named file,
+# each with `-m "not hardware"`, `-q`, `-o addopts=`, `-k`, `--lf`).
+
+
+def _tests_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _full_suite_run(config, tests_dir=None) -> bool:
+    """Does this invocation collect the whole suite (as opposed to named files)?
+
+    True when no path was given — pytest's parsed `config.args` is then
+    `[<rootdir>]` — or when a given path IS the tests directory (or the repo
+    root, which contains it). A path that names a file, or a subdirectory of
+    `tests`, is a targeted run and is never locked.
+
+    `tests_dir` is injectable so the end-to-end test can point the same rule at
+    a throwaway checkout instead of the real one.
+    """
+    tests_dir = Path(tests_dir).resolve() if tests_dir else _tests_dir()
+    root_dir = tests_dir.parent
+    try:
+        given = list(config.args or ())
+    except AttributeError:
+        given = []
+    if not given:
+        # No parsed positionals at all: pytest would collect the rootdir.
+        return True
+    for a in given:
+        try:
+            resolved = Path(str(a)).resolve()
+        except OSError:
+            continue
+        if resolved == tests_dir or resolved == root_dir:
+            return True
+    return False
+
+
+def _lock_path_for(tests_dir) -> Path:
+    """A per-checkout lock file in the temp dir, not in the repo."""
+    import hashlib
+    import tempfile
+    key = hashlib.sha1(str(Path(tests_dir).resolve()).encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"rigma-full-suite-{key}.lock"
+
+
+def _lock_path() -> Path:
+    return _lock_path_for(_tests_dir())
+
+
+def _owner_is_alive(pid: int, started_at) -> bool:
+    """Is the recorded owner still the process that took the lock?
+
+    A pid ALONE is not enough: pids are recycled, and a live process that merely
+    inherited the number must not make a dead owner look alive — the same
+    distinction `state._is_recorded_process` draws for the engine pid.
+    """
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+        return abs(float(psutil.Process(pid).create_time()) - float(started_at)) < 1.0
+    except Exception:
+        # Unreadable identity counts as NOT ours, so a lock we cannot attribute
+        # is taken over rather than wedging the suite forever. The cost of being
+        # wrong here is one more concurrent run; the cost of the other direction
+        # is a suite nobody can start.
+        return False
+
+
+def _acquire_suite_lock(path: Path):
+    """Take `path`, or report the live holder.
+
+    Returns `(path, None)` on success and `(None, holder)` when another live
+    full suite owns it. A lock whose owner is gone, whose owner is a recycled
+    pid, or whose contents cannot be read is removed and taken over — a power
+    cut must not leave the suite unstartable.
+    """
+    for _ in range(2):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            holder = None
+            try:
+                holder = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                holder = None
+            if holder and _owner_is_alive(int(holder.get("pid") or 0),
+                                          holder.get("started_at")):
+                return None, holder
+            try:
+                path.unlink()
+            except OSError:
+                return None, holder
+            continue
+        import psutil
+        try:
+            started = float(psutil.Process(os.getpid()).create_time())
+        except Exception:
+            started = 0.0
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "started_at": started}, f)
+        return path, None
+    return None, None
+
+
+def _release_suite_lock(path: Path) -> None:
+    """Drop the lock — but only while it is still OURS.
+
+    If our record was taken over while we ran (an unreadable record, a failed
+    identity check), the new owner's file must not be deleted out from under
+    it. A lock we cannot read is left alone; a dead owner's leftover is taken
+    over by the next run's `_acquire_suite_lock` anyway."""
+    try:
+        holder = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if int(holder.get("pid") or 0) != os.getpid():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+_SUITE_LOCK_RETURNCODE = 4
+_SUITE_LOCK_REFUSAL = (
+    "another FULL test suite is already running{who}. Two full runs at once is "
+    "the failure recorded as REC-1: they shared a fixed port and froze, leaving "
+    "72 orphaned fake_acp_server processes. Wait for it to finish, or run just "
+    "the files you need — targeted runs are not locked."
+)
+
+
+def _lock_refusal_message(holder) -> str:
+    who = ""
+    if holder:
+        who = (f" (held by pid {holder.get('pid')}, "
+               f"started {holder.get('started_at')})")
+    return _SUITE_LOCK_REFUSAL.format(who=who)
+
+
+def _enter_suite_lock(config, tests_dir=None):
+    """Return the lock this run must hold, or `None` for a targeted run.
+
+    Raises `pytest.exit` (with the REC-1 sentence) when a second FULL run finds
+    a live owner. Extracted from the fixture so the end-to-end test can drive
+    the exact same decision, message and lock against a throwaway checkout.
+    """
+    if not _full_suite_run(config, tests_dir):
+        return None
+    path, holder = _acquire_suite_lock(
+        _lock_path_for(tests_dir) if tests_dir else _lock_path())
+    if path is None:
+        pytest.exit(_lock_refusal_message(holder),
+                    returncode=_SUITE_LOCK_RETURNCODE)
+    return path
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _one_full_suite_at_a_time(request):
+    """Refuse to start a second FULL suite; let targeted runs through."""
+    path = _enter_suite_lock(request.config)
+    try:
+        yield
+    finally:
+        if path is not None:
+            _release_suite_lock(path)
