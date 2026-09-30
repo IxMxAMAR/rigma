@@ -149,6 +149,83 @@ describe("foldApproval: an elicitation is not a permission", () => {
   });
 });
 
+// OD-12 / B4b-expiry. After `QUESTION_WAIT_SECS` the server declines the
+// question, but until this fix it emitted no `approval/decided`, so the row
+// stayed `awaiting` and the form stayed clickable after the question was
+// already over — a late click hit the route's 409. The server now says so on
+// the decided channel with `decision: "expired"` (and no `outcome`), and the
+// fold must make the row terminal so a click is IMPOSSIBLE, not merely
+// error-handled. The client never reads a clock: only the server can say the
+// window closed, which is the whole point of OD-12's option 1.
+describe("OD-12: an expired question folds to a terminal row", () => {
+  const question = (over: Record<string, unknown> = {}) => ({
+    event: "approval/asked",
+    data: {
+      id: "q-abc",
+      kind: "question",
+      question: "Which directory?",
+      schema: { type: "object", properties: { path: { type: "string" } } },
+      awaiting: true,
+      ...over,
+    },
+  });
+  // The exact wire shape the server half emits on expiry.
+  const expired = (id: string) => ({
+    event: "approval/decided",
+    data: { id, decision: "expired" },
+  });
+
+  it("carries the expiry onto its own ask as a decided outcome", () => {
+    let g = foldApproval(EMPTY_GOVERNANCE, question());
+    expect(g.approvals[0].outcome).toBe("");
+    g = foldApproval(g, expired("q-abc"));
+    // One row, not two — the decision folds onto its question.
+    expect(g.approvals).toHaveLength(1);
+    expect(isQuestion(g.approvals[0])).toBe(true);
+    // A non-empty outcome is what disables the row: the form is gated on
+    // `awaiting && !outcome`, so this is the terminal state.
+    expect(g.approvals[0].outcome).toBe("expired");
+  });
+
+  it("keys the expiry on the request id, never on the row it happens to sit beside", () => {
+    let g = foldApproval(EMPTY_GOVERNANCE, question({ id: "q-abc" }));
+    g = foldApproval(g, question({ id: "q-def", question: "And which file?" }));
+    // A decision for a DIFFERENT id must not expire the first question.
+    g = foldApproval(g, expired("q-def"));
+    expect(g.approvals.map((a) => [a.id, a.outcome])).toEqual([
+      ["q-abc", ""],
+      ["q-def", "expired"],
+    ]);
+    // The untouched question is still answerable.
+    expect(g.approvals[0].awaiting).toBe(true);
+  });
+
+  it("keeps an orphaned expiry rather than discarding it", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, expired("q-gone"));
+    expect(g.approvals).toHaveLength(1);
+    expect(g.approvals[0]).toMatchObject({
+      kind: "decided", id: "q-gone", outcome: "expired",
+    });
+  });
+
+  it("does not disturb a real allow/refuse decision", () => {
+    let g = foldApproval(EMPTY_GOVERNANCE, question());
+    g = foldApproval(g, { event: "approval/decided", data: { id: "q-abc", outcome: "allowed-once" } });
+    expect(g.approvals[0].outcome).toBe("allowed-once");
+  });
+
+  it("prefers a real outcome over the expiry word if both are somehow present", () => {
+    // `outcome` is the decided channel's own verdict field; `decision` is only
+    // consulted when it is absent, so a real verdict can never be masked.
+    let g = foldApproval(EMPTY_GOVERNANCE, question());
+    g = foldApproval(g, {
+      event: "approval/decided",
+      data: { id: "q-abc", outcome: "rejected", decision: "expired" },
+    });
+    expect(g.approvals[0].outcome).toBe("rejected");
+  });
+});
+
 describe("the elicitation form the schema describes", () => {
   it("reads the schema's own property names and titles", () => {
     const fields = questionFields({
@@ -225,6 +302,12 @@ describe("outcomeLabel", () => {
     expect(outcomeLabel("unavailable")).toContain("not permitted");
   });
 
+  // OD-12: the word the server sends when a question's window closed unanswered.
+  it("says a question expired rather than showing a bare identifier", () => {
+    expect(outcomeLabel("expired")).toContain("expired");
+    expect(outcomeLabel("expired")).toContain("no answer");
+  });
+
   it("shows an unknown outcome rather than hiding it", () => {
     expect(outcomeLabel("new-verdict")).toBe("new-verdict");
   });
@@ -235,6 +318,8 @@ describe("outcomeTone", () => {
     expect(outcomeTone("allowed-once")).toContain("amber");
     expect(outcomeTone("rejected")).toContain("red");
     expect(outcomeTone("unavailable")).toContain("red");
+    // OD-12: same fail-closed family as `unavailable` — nobody answered.
+    expect(outcomeTone("expired")).toContain("red");
   });
 });
 

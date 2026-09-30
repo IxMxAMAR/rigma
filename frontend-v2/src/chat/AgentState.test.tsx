@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import AgentState from "./AgentState";
-import { EMPTY_GOVERNANCE } from "./governance";
+import { EMPTY_GOVERNANCE, foldApproval, type Governance } from "./governance";
 
 // W5F1a. The wave-1 fix B6b made ACP's `usage_update.cost` render, but only the
 // PURE formatter (`costLine`, `usageLine`) had an assertion: deleting the
@@ -100,6 +100,104 @@ describe("an advertised ACP command", () => {
       />,
     );
     expect(markup).toContain("no name at all");
+    expect(markup).not.toContain("<button");
+  });
+});
+
+// OD-12 / B4b-expiry. The server declines a question after its window and now
+// says so on the decided channel (`decision: "expired"`). The ROW must become
+// terminal: no form, no Submit, no Allow/Refuse — a late click must be
+// impossible rather than answered with the route's 409. These render the REAL
+// component and read its markup, so deleting the expiry fold (or the disabled
+// rendering) fails here.
+function renderGovernance(
+  gov: Governance,
+  onAnswer?: (id: string, allow: boolean,
+              answer?: Record<string, unknown>) => void,
+): string {
+  return renderToStaticMarkup(
+    <AgentState
+      goal={null}
+      todos={[]}
+      planMode={false}
+      subagents={[]}
+      usage={null}
+      governance={gov}
+      onAnswerApproval={onAnswer}
+    />,
+  ).replace(/<!-- -->/g, "");
+}
+
+/** The question `serve.py`'s `_answer_question` publishes, folded as the store does. */
+function askedQuestion(over: Record<string, unknown> = {}): Governance {
+  return foldApproval(EMPTY_GOVERNANCE, {
+    event: "approval/asked",
+    data: {
+      id: "q-abc",
+      kind: "question",
+      question: "Which directory?",
+      schema: { type: "object", properties: { path: { type: "string" } } },
+      reason: "mcode is asking a question; this turn is waiting for your answer",
+      awaiting: true,
+      ...over,
+    },
+  });
+}
+
+describe("OD-12: an expired question has no clickable control", () => {
+  it("renders a live question as a form with a Submit button", () => {
+    const markup = renderGovernance(askedQuestion(), () => {});
+    expect(markup).toContain("Which directory?");
+    expect(markup).toContain("send answer");
+    expect(markup).toContain("<button");
+  });
+
+  it("folds `decision: \"expired\"` to a disabled, expired row with no control", () => {
+    let g = askedQuestion();
+    g = foldApproval(g, {
+      event: "approval/decided",
+      data: { id: "q-abc", decision: "expired" },
+    });
+    const markup = renderGovernance(g, () => {});
+    // The row says what happened, in the panel's own decided vocabulary.
+    expect(markup).toContain("expired");
+    expect(markup).toContain("no answer");
+    // The question is still the record, but nothing can be clicked.
+    expect(markup).toContain("Which directory?");
+    expect(markup).not.toContain("<button");
+    expect(markup).not.toContain("send answer");
+    expect(markup).not.toContain("allow once");
+    expect(markup).not.toContain("refuse");
+  });
+
+  it("keys the expiry on the request id, so another question stays answerable", () => {
+    let g = askedQuestion({ id: "q-abc" });
+    g = foldApproval(g, {
+      event: "approval/asked",
+      data: { id: "q-def", kind: "question", question: "And which file?", awaiting: true },
+    });
+    g = foldApproval(g, {
+      event: "approval/decided",
+      data: { id: "q-def", decision: "expired" },
+    });
+    const markup = renderGovernance(g, () => {});
+    // q-def is terminal; q-abc's form is untouched and still has its Submit.
+    expect(markup).toContain("expired");
+    expect(markup).toContain("send answer");
+  });
+
+  it("still renders a real allow/refuse decision as before", () => {
+    let g = foldApproval(EMPTY_GOVERNANCE, {
+      event: "approval/asked",
+      data: { id: "call_1", toolName: "bash", awaiting: true },
+    });
+    g = foldApproval(g, {
+      event: "approval/decided",
+      data: { id: "call_1", outcome: "rejected" },
+    });
+    const markup = renderGovernance(g, () => {});
+    expect(markup).toContain("rejected");
+    expect(markup).not.toContain("expired");
     expect(markup).not.toContain("<button");
   });
 });
