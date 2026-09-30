@@ -1405,7 +1405,7 @@ def _restore_snapshot(path, data: bytes | None) -> None:
     """Put `data` back at `path`, or remove a file that was not there.
 
     `atomic_write_bytes`, not `atomic_write_text`: the bytes must come back
-    EXACTLY as they were (see that helper on the CRLF trap)."""
+    EXACTLY as they were (see that helper on the line-ending trap)."""
     if data is None:
         try:
             path.unlink()
@@ -1418,12 +1418,19 @@ def _restore_snapshot(path, data: bytes | None) -> None:
 def _rollback_stores(prior: list) -> list[str]:
     """Replay an undo log. Returns the labels whose write-back itself failed —
     the rollback is best-effort, because the same full disk that failed the
-    restore can fail the restore OF the old bytes."""
+    restore can fail the restore OF the old bytes.
+
+    A11 nit: the catch is `Exception`, not `OSError`. A write-back can fail with
+    something that is not an OSError — a validation error, a TypeError from a
+    malformed snapshot — and catching only OSError let that escape and SKIP every
+    remaining file, turning one bad write-back into a half-applied store. The
+    remaining files are attempted either way; the failure is reported, not raised.
+    """
     failed: list[str] = []
     for label, path, data in reversed(prior):
         try:
             _restore_snapshot(path, data)
-        except OSError:
+        except Exception:
             failed.append(label)
     return failed
 
@@ -6410,14 +6417,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": "budget_hours: must be greater than 0"},
                 status_code=400)
         # A7: an unrecognised `profile` used to be silently coerced to "all" —
-        # the profile that grants the full network and delete surface — both
-        # here (`run_profile=... if ... else "all"`) and again in
-        # `runs.create`. So a typo, or a client that sent "read-only", started
-        # the MOST permissive run and was told nothing. The default when the
-        # field is ABSENT is still "all" (the owner's OD-1 choice, unchanged);
-        # a value that is PRESENT must be one of `runs.PROFILES`. The type is
-        # checked first: `[] in PROFILES` raises TypeError, it does not answer
-        # False, so an unhashable value would be a 500 rather than this 400.
+        # the profile that grants the full network and delete surface — at both
+        # this route and `runs.create`, so a typo, or a client that sent
+        # "read-only", started the MOST permissive run and was told nothing. The
+        # default when the field is ABSENT is still "all" (the owner's OD-1
+        # choice, unchanged); a value that is PRESENT must be one of
+        # `runs.PROFILES`. The type is checked first: `[] in PROFILES` raises
+        # TypeError, it does not answer False, so an unhashable value would be a
+        # 500 rather than this 400. `runs.create` keeps its own coercion for the
+        # callers that never pass through this route (a macro, an internal run);
+        # here the 400 above makes any else-branch dead, so the value is passed
+        # through unchanged (A7 nit 1).
         profile = (body or {}).get("profile", "all")
         if not isinstance(profile, str) or profile not in _runs.PROFILES:
             return JSONResponse(
@@ -6485,7 +6495,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     effort=effort, one_action=True,
                     confirm_exec=confirm_exec,   # R3-4: explicit, default off
                     params={**RUN_PARAMS, **(sess.get("params") or {})},
-                    run_profile=profile if profile in _runs.PROFILES else "all")
+                    run_profile=profile)
         # AUDIT 03-2: the token budget was dead — `token_cap` could not be set
         # through the API and `tokens_used` was never written, so
         # budget_exceeded's token clause could never bind. Parse the cap here
