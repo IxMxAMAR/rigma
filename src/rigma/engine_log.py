@@ -301,7 +301,11 @@ def _unknown_plan(expected_vram_mb, expected_splits: int) -> dict:
         "divergence_pct": None,
         "graph_splits": None,
         "expected_splits": expected_splits,
-        "unexpected_splits": False,
+        # S2b: None, not False. This is an UNKNOWN load, so "are the splits
+        # unexpected" has no answer; False would read as "no split problem" to a
+        # caller looking at this key alone (the `known` flag is the intended
+        # guard, but a key must not lie on its own).
+        "unexpected_splits": None,
         "detail": ("no buffer lines in the engine log: what the engine "
                    "allocated is UNKNOWN, not zero — a silent 0 would read as "
                    "'it fits'."),
@@ -327,7 +331,8 @@ def compare_plan(parsed, expected_vram_mb: float,
     backend, so some operations ran somewhere the plan did not assume and the
     charge was computed against a graph the engine did not build. (Reasoning
     from llama.cpp's scheduler semantics, not measured in this run —
-    PREDICTION.)
+    PREDICTION.) It is None when the load is unknown, and False only when the
+    log reported splits at or below the expectation.
 
     `parsed` may be one load from `parse_loads` or the whole list (the last
     entry is used). When nothing was parsed the result is explicitly
