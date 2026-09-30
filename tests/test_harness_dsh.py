@@ -539,6 +539,28 @@ def _tree_proc(*, wait_ok: bool = True):
     return FakeProc()
 
 
+def _exited_proc():
+    """A runner stub that has ALREADY exited: `_stop` must not assume the tree
+    went with it (DR4). Never spawned, never signalled."""
+    class FakeProc:
+        pid = 4242
+        stdin = stdout = stderr = None
+
+        def kill(self):
+            pass
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0        # the runner is gone; the grandchild may not be
+
+    return FakeProc()
+
+
 def _posix_kill_tree(monkeypatch):
     """Put `tools._kill_tree` on its real POSIX branch with no real process.
 
@@ -551,6 +573,45 @@ def _posix_kill_tree(monkeypatch):
     monkeypatch.setattr(tools.os, "getpgid", lambda pid: 9000 + pid, raising=False)
     monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: None, raising=False)
     monkeypatch.setattr(tools.os, "kill", lambda pid, sig: None)
+
+
+def test_a_posix_stop_still_reaches_the_group_after_the_runner_exited(monkeypatch):
+    """DR4: a runner that already exited does not mean its tree is gone.
+
+    The process Rigma holds is `python -m rigma._dsh_runner`; the dsh CLI is a
+    Node GRANDCHILD in the runner's detached group. `_stop` recorded
+    `tree_killed = True` "by definition" when the runner had exited, although
+    the grandchild may still be alive holding VRAM. On POSIX the group is
+    reachable through the reaped leader's pid, so the tree kill must still be
+    attempted. `tools._kill_tree` is stubbed, so this asserts the attempt, not a
+    real killpg (UNVERIFIED on this Windows host).
+    """
+    killed = []
+    monkeypatch.setattr(harness_dsh._harness, "_DETACH_CHILDREN", True)
+    monkeypatch.setattr(tools, "_kill_tree",
+                        lambda pid, proc=None, **k: killed.append(pid) or True)
+
+    run = harness_dsh._Run(proc=_exited_proc(), hard=True)
+    harness_dsh._stop(run)
+
+    assert killed == [4242], killed
+    assert run.tree_killed and run.tree_killed.confirmed
+
+
+def test_a_windows_stop_does_not_taskkill_an_exited_runners_pid(monkeypatch):
+    """On Windows there is no group to reach once the runner is reaped, and
+    `taskkill /T` on a reaped pid is the pid-reuse hazard DR9 records. The
+    assumption that the tree died with the runner stays there."""
+    killed = []
+    monkeypatch.setattr(harness_dsh._harness, "_DETACH_CHILDREN", False)
+    monkeypatch.setattr(tools, "_kill_tree",
+                        lambda pid, proc=None, **k: killed.append(pid) or True)
+
+    run = harness_dsh._Run(proc=_exited_proc(), hard=True)
+    harness_dsh._stop(run)
+
+    assert killed == [], killed
+    assert run.tree_killed is True
 
 
 def test_a_failed_tree_kill_is_reported_not_assumed(monkeypatch):

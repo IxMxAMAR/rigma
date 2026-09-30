@@ -605,6 +605,16 @@ def _stop(state: _Run) -> None:
                 # grandchild is still out there and the message must not claim
                 # otherwise.
                 state.tree_killed = _harness.kill_tree(proc)
+            elif _harness._DETACH_CHILDREN:
+                # DR4. The runner exited, but on POSIX its DETACHED group can
+                # still hold the Node grandchild: the leader's death does not
+                # reap its group, and `_kill_tree`'s killpg reaches it because a
+                # detached child's pgid IS its pid. Assuming the tree died with
+                # the runner is exactly the orphan B1b exists to prevent. On
+                # Windows there is no group to reach and `taskkill /T` on a
+                # reaped pid is the pid-reuse hazard DR9 records, so the
+                # assumption stays there.
+                state.tree_killed = _harness.kill_tree(proc)
             else:
                 # Nothing was running to kill, so the tree is gone by definition.
                 # Recorded as True rather than left None: `None` has to keep

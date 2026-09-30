@@ -52,6 +52,12 @@ _FRAME_MAX = 8_000_000
 # with `protocolVersion: 1` and accepts 1.
 PROTOCOL_VERSION = 1
 
+# Which stop path `_signal`/`stop` take. A module constant rather than a fresh
+# `sys.platform` read, so a test can exercise the POSIX branch on a Windows host
+# (and vice versa) without patching `sys.platform` globally, which other library
+# code reads. Same idiom as `harness._DETACH_CHILDREN`.
+_WINDOWS = sys.platform == "win32"
+
 # mcode's own extension surface, as advertised in
 # `_meta["minimax-code/extensions"]` on `initialize`. Recorded rather than
 # hardcoded into calls so a version that drops or renames one is visible instead
@@ -261,14 +267,30 @@ class AcpClient:
         what happens if detachment is off, so this degrades to the old
         behaviour rather than killing the server).
 
-        Windows is deliberately byte-for-byte the old path: `terminate()` for
-        SIGTERM, `kill()` for SIGKILL. There is no `killpg` there — the
-        codebase's tree kill uses `taskkill /T` instead — so nothing changes.
+        WINDOWS IS A TREE KILL, NOT A SINGLE PROCESS (DR2). The process Rigma
+        holds there is the `mcode.cmd` SHIM (`shutil.which("mcode")`;
+        `harness_mcode.py` says so itself), and the agent plus every subagent it
+        spawned are its DESCENDANTS. `terminate()`/`kill()` reach only cmd.exe,
+        so a cancelled turn whose shim did not exit on stdin EOF left the node
+        agent running against the workspace and the engine with nobody holding
+        it. `tools._kill_tree` is the codebase's one tree kill (`taskkill /F
+        /T`), and it has to run BEFORE the shim dies or the walk loses its root.
+        It cannot reach RIGMA's own tree: `taskkill /T` walks DOWNWARD through
+        ParentProcessId, and Rigma is the shim's parent, not its child. The old
+        terminate/kill pair is kept as the fallback for a tree kill that could
+        not be confirmed, so a refused `taskkill` is no worse than before.
         """
         proc = self.proc
         if proc is None:
             return
-        if sys.platform == "win32":
+        if _WINDOWS:
+            try:
+                from . import tools as _tools
+
+                if _tools._kill_tree(proc.pid, proc):
+                    return
+            except Exception:
+                pass
             try:
                 if sig == getattr(signal, "SIGKILL", 9):
                     proc.kill()
@@ -313,18 +335,53 @@ class AcpClient:
             # promptly, which is the normal case.
             try:
                 proc.wait(timeout=min(2.0, timeout))
+                # DR4. The leader exited on its own, but a DETACHED child's
+                # group outlives it: mcode's subagents inherit that group, and a
+                # leader that exits on stdin EOF does not reap them. Skipping
+                # `_signal` just because the wait succeeded is exactly the orphan
+                # B1b set out to fix.
+                self._reap_detached_group()
             except Exception:
-                # SIGTERM to the GROUP on POSIX (see `_signal`), the child alone
-                # on Windows — where this is exactly the old `terminate()`.
+                # SIGTERM to the GROUP on POSIX (see `_signal`); on Windows the
+                # whole TREE via `taskkill /T`, because the process Rigma holds
+                # there is only the `mcode.cmd` shim (DR2).
                 self._signal(getattr(signal, "SIGTERM", 15))
                 proc.wait(timeout=timeout)
         except Exception:
             # The escalation. On POSIX this is SIGKILL to the group, so a
-            # subagent that ignored SIGTERM is not left holding the pipe.
+            # subagent that ignored SIGTERM is not left holding the pipe; on
+            # Windows it is the same tree kill again.
             self._signal(getattr(signal, "SIGKILL", 9))
         # Any waiter still blocked must learn the transport is gone rather than
         # wait out its full timeout.
         self._fail_all_pending("the mcode acp process ended")
+
+    def _reap_detached_group(self) -> None:
+        """Signal the group of a child that exited on its own (DR4).
+
+        The graceful path used to end at the successful `proc.wait`, on the
+        assumption that a child which exited took its subagents with it. It did
+        not: a DETACHED leader's group survives the leader, and the subagents
+        that inherited it are the ones holding the inherited stdout/stderr pipe.
+
+        POSIX-only, and only when the child was actually detached. On Windows
+        there is no group to reach once the `mcode.cmd` shim — the process Rigma
+        holds — has been reaped, and `taskkill /T` on a reaped pid is the
+        pid-reuse hazard DR9 records. A non-detached child shares RIGMA's group,
+        where there is nothing of its own to signal.
+
+        SIGKILL rather than SIGTERM: the leader is already gone, so nothing left
+        in the group can be shut down gracefully BY the leader; a process still
+        there is an orphan holding the pipe."""
+        if _WINDOWS:
+            return
+        try:
+            from . import harness as _harness
+        except Exception:
+            return
+        if not getattr(_harness, "_DETACH_CHILDREN", False):
+            return
+        self._signal(getattr(signal, "SIGKILL", 9))
 
     def __enter__(self):
         self.start()
