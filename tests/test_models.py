@@ -126,3 +126,45 @@ def test_spec_decode_and_cache_reuse_args():
                     backend="vulkan", flags=ComboFlags(ctx=1024), origin="t")
     a2 = plain.server_args("m.gguf", 1)
     assert "--spec-type" not in a2 and "--cache-reuse" in a2
+
+
+def test_server_args_answers_to_the_slug_name():
+    """B7: llama-server ids the model by its gguf PATH, so an OpenAI-compatible
+    client configured with the slug — the name Rigma itself writes into its
+    harness configs — asks for a name the server does not answer to. `--alias`
+    adds it. Flag verified at both pins: common/arg.cpp `{"-a", "--alias"},
+    "STRING"`."""
+    plan = RunPlan(model_slug="qwen3.6-35b-a3b",
+                   gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                   backend="vulkan", flags=ComboFlags(ctx=4096), origin="t")
+    args = plan.server_args("m.gguf", 1)
+    assert args[args.index("--alias") + 1] == "qwen3.6-35b-a3b"
+    # an explicit alias still wins, for a plan served under another name
+    named = RunPlan(model_slug="slug", gguf=plan.gguf, backend="vulkan",
+                    flags=ComboFlags(ctx=4096, alias="rigma"), origin="t")
+    nargs = named.server_args("m.gguf", 1)
+    assert nargs[nargs.index("--alias") + 1] == "rigma"
+
+
+def test_server_args_pins_the_deepseek_reasoning_format():
+    """B7: `--reasoning-format deepseek` keeps thought tags in
+    `message.reasoning_content` (streaming deltas included) instead of leaking
+    them into `message.content`. Both pins already compile that default in
+    (common/common.h: `reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK`),
+    so this pins the wire contract against the help text's "auto" and the
+    LLAMA_ARG_THINK env rather than changing today's output."""
+    plan = RunPlan(model_slug="m",
+                   gguf=GgufFile(repo="r", file="f", bytes=1, quant="Q4"),
+                   backend="vulkan", flags=ComboFlags(ctx=4096), origin="t")
+    args = plan.server_args("m.gguf", 1)
+    assert args[args.index("--reasoning-format") + 1] == "deepseek"
+    # an explicit plan value wins, and a typo never reaches the engine
+    other = RunPlan(model_slug="m", gguf=plan.gguf, backend="vulkan",
+                    flags=ComboFlags(ctx=4096, reasoning_format="none"),
+                    origin="t")
+    oargs = other.server_args("m.gguf", 1)
+    assert oargs[oargs.index("--reasoning-format") + 1] == "none"
+    import pytest as _p
+    from pydantic import ValidationError
+    with _p.raises(ValidationError, match="reasoning_format"):
+        ComboFlags(ctx=4096, reasoning_format="deepseek-legacy ")
