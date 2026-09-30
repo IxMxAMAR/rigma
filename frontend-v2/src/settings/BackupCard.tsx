@@ -4,23 +4,33 @@
 // document with settings, the user's methods and memory — so it is an `<a>`,
 // not a fetch.
 //
-// `POST /api/restore` REPLACES THE WHOLE STORE — memory, settings and methods
-// (OD-15 option 1). The route (`serve.py::_apply_restore`) replaces the memory
-// store outright, writes the settings with `app_settings.replace` (defaults
-// overlaid with the document's keys, so a key the document omits goes back to
-// its default), and deletes every user method the document does not name. That
-// is the reason this card is two steps and not one: choosing a file only parses
-// it and shows what it contains, and the replace button stays disabled until the
-// user has ticked a confirmation that says the whole store is replaced. A single
-// click that rewrites the whole store is not a control this UI may draw.
+// `POST /api/restore` REPLACES the memory, settings and methods on this
+// machine (OD-15 option 1). The route (`serve.py::_apply_restore`) replaces
+// the memory store outright, writes the settings with `app_settings.replace`
+// (defaults overlaid with the document's keys, so a key the document omits
+// goes back to its default), and deletes every user method the document does
+// not name. It does NOT touch sessions, RAG sources/index, method drafts,
+// macro trust, models or calibration — so the copy names those three sections
+// and says chats and documents are kept, rather than claiming "the whole
+// store". That is the reason this card is two steps and not one: choosing a
+// file only parses it and shows what it contains, and the replace button stays
+// disabled until the user has ticked a confirmation that names what is
+// replaced. A single click that rewrites the store is not a control this UI
+// may draw.
 //
 // The route is all-or-nothing (A11): it validates the whole document, then
 // applies it under one lock and rolls back on failure. So the only errors here
 // are the server's own, and they are rendered verbatim.
+//
+// ODR-7: the number and ids of the methods a restore deleted are only knowable
+// after the POST, from the response's additive `deleted` list, so the result
+// line renders it — and says the server did not report it when the field is
+// absent, rather than claiming zero.
 import { useRef, useState } from "react";
 
 import {
   BACKUP_URL,
+  deletedLine,
   parseBackup,
   postRestore,
   restoreSummary,
@@ -28,9 +38,9 @@ import {
 } from "../lib/backup";
 
 /** The confirmation step, pure props so the sentence a user must read before
- *  rewriting the whole store is assertable without a store. No success line
- *  here: on success `replace()` clears `pending` (which unmounts this panel)
- *  before it sets `done`, so the card renders the result. */
+ *  rewriting memory, settings and methods is assertable without a store. No
+ *  success line here: on success `replace()` clears `pending` (which unmounts
+ *  this panel) before it sets `done`, so the card renders the result. */
 export function RestoreConfirm({
   summary, confirmed, busy, error, onConfirm, onReplace, onCancel,
 }: {
@@ -45,21 +55,21 @@ export function RestoreConfirm({
   return (
     <div className="rounded-md bg-canvas/60 px-3 py-2.5 mt-2 flex flex-col gap-2">
       <p className="text-[12.5px] text-amber font-semibold">
-        This replaces the whole store on this machine.
+        This replaces the memory, settings and methods on this machine.
       </p>
       <p className="text-[12.5px] text-secondary">
-        Restoring replaces the whole store: your memory becomes the file's
-        memory rows, settings become the file's settings (a key the file omits
-        goes back to its default), and methods the file does not name are
-        deleted. Anything not in the file is gone. The file carries:{" "}
-        <span className="font-mono">{summary}</span>.
+        Restoring replaces the memory, settings and methods; chats and
+        documents are kept. Your memory becomes the file's memory rows,
+        settings become the file's settings (a key the file omits goes back to
+        its default), and methods the file does not name are deleted. The file
+        carries: <span className="font-mono">{summary}</span>.
       </p>
       <label className="flex items-center gap-2 text-[12.5px] text-secondary">
         <input type="checkbox" className="accent-amber" checked={confirmed}
                disabled={busy}
-               aria-label="Confirm replacing the whole store"
+               aria-label="Confirm replacing memory, settings and methods"
                onChange={(e) => onConfirm(e.target.checked)} />
-        I understand — replace the whole store
+        I understand — replace memory, settings and methods
       </label>
       {error !== null && (
         <div role="alert" className="text-red font-mono text-[11.5px] break-words">
@@ -73,7 +83,7 @@ export function RestoreConfirm({
           onClick={onReplace}
           className="rounded-md bg-red/15 text-red px-3 py-1 text-[13px] font-semibold disabled:opacity-40"
         >
-          {busy ? "restoring…" : "replace the whole store"}
+          {busy ? "restoring…" : "replace memory, settings and methods"}
         </button>
         <button
           type="button"
@@ -125,7 +135,7 @@ export default function BackupCard() {
     setPending(null);
     setConfirmed(false);
     setDone(`restored ${r.methods} method(s); memory rows ${r.memory.before} `
-      + `→ ${r.memory.after}`);
+      + `→ ${r.memory.after}; ${deletedLine(r.deleted)}`);
   };
 
   return (
@@ -135,9 +145,9 @@ export default function BackupCard() {
       </h3>
       <p className="text-[13px] text-secondary mb-3">
         One versioned JSON file with your settings, your methods and memory —
-        for moving to another machine. Restoring REPLACES the whole store:
-        memory, settings and methods all come from the file, and anything not in
-        the file is gone.
+        for moving to another machine. Restoring replaces the memory, settings
+        and methods; chats and documents are kept. A method the file does not
+        name is deleted.
       </p>
       <div className="flex items-center gap-2 flex-wrap">
         <a
