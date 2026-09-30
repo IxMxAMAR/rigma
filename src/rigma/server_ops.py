@@ -507,6 +507,13 @@ def planned_vram_mb(state: dict, registry=None) -> float | None:
     the plan itself left in system RAM. It is therefore comparable to
     `compare_plan`'s device-buffer `actual` without the DR2-1 suppression.
 
+    DR21R-n1: the engine's DEVICE figure also carries its compute/reserve
+    scratch, which `memtruth.planned_mb` excludes by design. The plan's own
+    charge for that term (`resolve.compute_buffer_mb`, DR2-3) is added here too,
+    so the two sides are on ONE basis at every spill depth. Without it a deep
+    spill's small expected figure fell below the 512 MiB slack floor and a
+    healthy load reported `plan_divergence`; see `_planned_vram_mb`.
+
     Returns None — never a number — whenever an input is missing: no model, no
     quant, no ctx, an unknown model/quant, an invalid cache type, OR no recorded
     placement. A whole-file prediction with no recorded placement would be a
@@ -575,7 +582,7 @@ def _planned_vram_mb(state: dict, registry) -> float | None:
     from . import memtruth
     from .models import ComboFlags, RunPlan
     from .registry import Registry
-    from .resolve import _spilled
+    from .resolve import _spilled, compute_buffer_mb, launch_ubatch
     slug = str(state.get("model") or "")
     quant = str(state.get("quant") or "")
     ctx = int(state.get("ctx") or 0)
@@ -610,7 +617,26 @@ def _planned_vram_mb(state: dict, registry) -> float | None:
         # implementation the page and the fit already share). Subtract that share
         # so the figure is the DEVICE-side one `compare_plan` measures against.
         whole_weights_mb = gguf.bytes / 2**20
-        return whole_plus_kv - whole_weights_mb * _spilled(spec, flags)
+        device_side_mb = whole_plus_kv - whole_weights_mb * _spilled(spec, flags)
+        # DR21R-n1: the engine's device figure is `device model + KV + RS +
+        # device compute` (engine_log.compare_plan), and `memtruth.planned_mb`
+        # deliberately leaves the compute term out so the FIT comparison can see
+        # an under-count. The VRAM axis needs BOTH sides on the SAME basis, and
+        # the plan already knows its own charge for that term: DR2-3's
+        # `resolve.compute_buffer_mb`, the exact function `_budgets` reserves
+        # against. Add it here, uniformly — at every spill depth including fully
+        # resident — because otherwise the gap is left to the 15% / 512 MiB
+        # slack, and a DEEP spill's small expected figure cannot absorb it: a
+        # healthy load would report `plan_divergence`, the same
+        # false-positive-on-a-healthy-load class DR2-1 was fixed for. Scoping
+        # this to `_spilled > 0` would only move the window to the resident case
+        # (a small model at a large `-ub`).
+        #
+        # The ubatch is the SPEC's own launch default (`launch_ubatch`), which is
+        # the one `resolve` / `fit_for_launch` priced. state.json records no
+        # per-launch `-ub` override, so the spec default is the plan's own
+        # assumption and the only honest source here.
+        return device_side_mb + float(compute_buffer_mb(launch_ubatch(spec)))
     except Exception:
         # A state written by a hand edit, or a registry that predates the model,
         # is "no prediction", never an error on a read route.
