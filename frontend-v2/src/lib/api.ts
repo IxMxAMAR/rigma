@@ -77,9 +77,17 @@ export interface Session {
  *  `initialize`, `session/prompt`, `shutdown` — so a DSH approval is display-only and
  *  this call never applies to it. The server refuses with 409 when the chat is not
  *  waiting, or when `requestId` names a request that is no longer the one in flight,
- *  so a caller must surface that rather than assume the decision was applied. */
+ *  so a caller must surface that rather than assume the decision was applied.
+ *
+ *  B4: the SAME route answers an elicitation, and the payloads are mutually
+ *  exclusive — `allow` is a permission's boolean, `answer` is a question's content
+ *  object. The route validates exactly one and checks it against the slot's own
+ *  `kind`, so a question can never be granted and a permission can never be
+ *  "answered" with an object. */
 export interface ApprovalAnswer {
-  allow: boolean;
+  allow?: boolean;
+  /** B4: the elicitation answer — keys are the `requestedSchema`'s property names. */
+  answer?: Record<string, unknown>;
   /** Quotes the request being answered, so a stale card cannot decide a different
    *  question than the one on screen. */
   requestId?: string;
@@ -215,7 +223,8 @@ export const api = {
    *  forever and the TRANSPORT wedges — which is why the turn says it is waiting
    *  rather than silently proceeding. */
   answerApproval: (id: string, answer: ApprovalAnswer) =>
-    j<{ ok: boolean; requestId?: string; allow?: boolean }>(
+    j<{ ok: boolean; requestId?: string; allow?: boolean;
+        answer?: Record<string, unknown> }>(
       "POST", `/api/sessions/${id}/approval`, answer),
   /** Perform ONE operation on this chat's mcode control plane.
    *

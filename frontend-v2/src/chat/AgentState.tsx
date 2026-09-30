@@ -33,12 +33,14 @@ import type {
 // DURABLE copy of a run is stored in the same shape the live one is drawn from.
 import type { WorkflowAgent, WorkflowRun } from "../lib/api";
 import {
+  isQuestion,
   outcomeLabel,
   outcomeTone,
   sandboxLabel,
   sandboxTone,
   type Governance,
 } from "./governance";
+import QuestionForm from "./QuestionForm";
 import {
   QUEUE_ACTIONS,
   configOptionValues,
@@ -223,8 +225,15 @@ function GovernanceBlock({ gov, onAnswer }: {
   gov: Governance;
   /** R6-ACP-APPROVE: answer a request that is BLOCKING a turn, or absent when there
    *  is nothing that can be answered — the durable panel passes none, because a
-   *  permission request does not outlive the turn that is waiting on it. */
-  onAnswer?: (requestId: string, allow: boolean) => void;
+   *  permission request does not outlive the turn that is waiting on it.
+   *
+   *  B4: a QUESTION is answered through the same handler, with `answer` instead of
+   *  `allow`. The server accepts exactly one of the two on the one route, and the
+   *  slot's own `kind` refuses the wrong one, so the two shapes cannot be
+   *  confused — passing `false` for `allow` alongside an `answer` is the
+   *  permission half being explicitly unused, not a denial. */
+  onAnswer?: (requestId: string, allow: boolean,
+              answer?: Record<string, unknown>) => void;
 }) {
   const hasTrail = gov.approvals.length > 0;
   if (!hasTrail && !gov.sandbox && !gov.preset) return null;
@@ -292,7 +301,7 @@ function GovernanceBlock({ gov, onAnswer }: {
                     Both buttons are always shown rather than a single toggle: the
                     default is neither, so a click is an explicit decision in one
                     direction, and a stray click cannot grant. */}
-                {a.awaiting && !a.outcome && onAnswer && (
+                {a.awaiting && !a.outcome && onAnswer && !isQuestion(a) && (
                   <span className="flex items-center gap-1.5 mt-1">
                     <button
                       type="button"
@@ -314,6 +323,29 @@ function GovernanceBlock({ gov, onAnswer }: {
                       — the turn is waiting on this
                     </span>
                   </span>
+                )}
+                {/* B4b: a question is NOT an approval. The server puts mcode's
+                    `ask_user` on this same channel with `kind: "question"`, and
+                    before this branch the row fell through to the Allow-once/
+                    Refuse card above — whose buttons POST `{allow}`, which the
+                    route answers with 409 for a question. The controls were dead
+                    and the turn stayed blocked until the 5 s decline. The form
+                    submits the shape the route actually accepts. */}
+                {isQuestion(a) && (
+                  a.awaiting && !a.outcome && onAnswer ? (
+                    <QuestionForm
+                      question={a.question}
+                      schema={a.schema}
+                      onSubmit={(answer) => onAnswer(a.id, false, answer)}
+                    />
+                  ) : (
+                    /* No live turn to answer from — the durable panel, or a
+                       question that already timed out. The question itself is
+                       still the record, so it is shown as text. */
+                    <span className="block text-secondary break-words">
+                      {a.question || "the backend asked a question"}
+                    </span>
+                  )
                 )}
               </span>
             </li>
@@ -765,8 +797,11 @@ export default function AgentState({
    *  the ACP props are — the durable panel and older call sites have none. */
   workflow?: WorkflowRun[];
   /** R6-ACP-APPROVE: answers a permission request that is BLOCKING the turn. Absent
-   *  on the DURABLE panel, which has no live turn to unblock. */
-  onAnswerApproval?: (requestId: string, allow: boolean) => void;
+   *  on the DURABLE panel, which has no live turn to unblock.
+   *
+   *  B4: the same handler answers a QUESTION, with `answer` instead of `allow`. */
+  onAnswerApproval?: (requestId: string, allow: boolean,
+                      answer?: Record<string, unknown>) => void;
   /** R6-ACP-CONTROL-ROW: a per-row control action (steer or drop a queued message,
    *  stop a delegated child). Passed ONLY by the live turn — a durable turn's queue and
    *  delegation tree are history, and a control there would act on a session that may be

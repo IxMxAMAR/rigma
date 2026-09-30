@@ -3,8 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   EMPTY_GOVERNANCE,
   foldApproval,
+  isQuestion,
   outcomeLabel,
   outcomeTone,
+  questionAnswer,
+  questionFields,
+  questionReady,
   sandboxLabel,
   sandboxTone,
 } from "./governance";
@@ -98,6 +102,114 @@ describe("foldApproval", () => {
     const snapshot = JSON.parse(JSON.stringify(before));
     foldApproval(before, decided("a1", "rejected"));
     expect(before).toEqual(snapshot);
+  });
+});
+
+// B4. mcode's `ask_user` reaches the UI on the SAME `approval/asked` channel as a
+// permission request, distinguished only by `data.kind`. `foldApproval` ignored it,
+// so the row fell through to the Allow-once/Refuse card — whose POST the route
+// answers 409 — and the turn stayed blocked until the 5 s decline.
+describe("foldApproval: an elicitation is not a permission", () => {
+  const question = (over: Record<string, unknown> = {}) => ({
+    event: "approval/asked",
+    data: {
+      id: "q-abc",
+      kind: "question",
+      question: "Which directory?",
+      schema: { type: "object", properties: { path: { type: "string" } } },
+      reason: "mcode is asking a question; this turn is waiting for your answer",
+      awaiting: true,
+      ...over,
+    },
+  });
+
+  it("carries kind, question and schema, not only the permission fields", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, question());
+    expect(g.approvals).toHaveLength(1);
+    expect(isQuestion(g.approvals[0])).toBe(true);
+    expect(g.approvals[0].question).toBe("Which directory?");
+    expect(g.approvals[0].schema).toEqual({
+      type: "object", properties: { path: { type: "string" } },
+    });
+    expect(g.approvals[0].awaiting).toBe(true);
+  });
+
+  it("does not call a permission request a question", () => {
+    const g = foldApproval(EMPTY_GOVERNANCE, ask("call_1", "bash"));
+    expect(isQuestion(g.approvals[0])).toBe(false);
+    expect(g.approvals[0].question).toBe("");
+    expect(g.approvals[0].schema).toEqual({});
+  });
+
+  it("treats a malformed schema as no form rather than crashing the fold", () => {
+    for (const schema of [null, "nope", 7, []]) {
+      const g = foldApproval(EMPTY_GOVERNANCE, question({ schema }));
+      expect(g.approvals[0].schema).toEqual({});
+    }
+  });
+});
+
+describe("the elicitation form the schema describes", () => {
+  it("reads the schema's own property names and titles", () => {
+    const fields = questionFields({
+      type: "object",
+      required: ["path"],
+      properties: {
+        path: { type: "string", title: "Directory", description: "where to look" },
+        deep: { type: "boolean" },
+        mode: { enum: ["fast", "careful"] },
+      },
+    });
+    expect(fields.map((f) => f.name)).toEqual(["path", "deep", "mode"]);
+    expect(fields[0]).toMatchObject({
+      label: "Directory", kind: "text", required: true, description: "where to look",
+    });
+    expect(fields[1].kind).toBe("boolean");
+    expect(fields[2].kind).toBe("choice");
+    expect(fields[2].choices).toEqual(["fast", "careful"]);
+  });
+
+  it("reads a closed set spelled as oneOf as well as enum", () => {
+    const fields = questionFields({
+      properties: { mode: { oneOf: [{ const: "a" }, { const: "b" }] } },
+    });
+    expect(fields[0].kind).toBe("choice");
+    expect(fields[0].choices).toEqual(["a", "b"]);
+  });
+
+  it("invents no field when the server sent no schema", () => {
+    for (const s of [null, {}, "nope", { properties: null }, { properties: [] }]) {
+      expect(questionFields(s)).toEqual([]);
+    }
+  });
+
+  it("builds the answer object the route expects, with no blank keys", () => {
+    const fields = questionFields({
+      required: ["path"],
+      properties: {
+        path: { type: "string" },
+        deep: { type: "boolean" },
+        note: { type: "string" },
+      },
+    });
+    expect(questionAnswer(fields, { path: "  C:/work ", deep: true }))
+      .toEqual({ path: "C:/work", deep: true });
+    // A checkbox is a definite answer; a blank optional text is absent.
+    expect(questionAnswer(fields, { path: "x", deep: false }))
+      .toEqual({ path: "x", deep: false });
+    expect(questionAnswer(fields, { deep: false })).toEqual({ deep: false });
+  });
+
+  it("blocks submit only on a required field that is empty", () => {
+    const fields = questionFields({
+      required: ["path"],
+      properties: { path: { type: "string" }, note: { type: "string" } },
+    });
+    expect(questionReady(fields, {})).toBe(false);
+    expect(questionReady(fields, { note: "hi" })).toBe(false);
+    expect(questionReady(fields, { path: "C:/work" })).toBe(true);
+    // No fields at all is ready: the answer is legitimately empty.
+    expect(questionReady([], {})).toBe(true);
   });
 });
 
