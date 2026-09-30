@@ -1743,6 +1743,85 @@ class _RestoreFailed(RuntimeError):
     """
 
 
+# --- ODR-4: the on-disk restore-undo journal ---------------------------------
+# The in-memory undo log above dies with the process. A kill/console close
+# between the stale-method deletes and memory's `os.replace` left a mixed store
+# that nothing could repair, and methods created after the backup were in
+# neither the backup nor any on-disk copy. So the SAME prior bytes are also
+# journaled to `~/.rigma/restore-undo/` BEFORE the apply begins, and a boot step
+# replays (rolls back) and clears the journal. This is STATE, read only by the
+# boot step: no route returns it and no model-facing tool can read it (the
+# state-dir denylist already covers `rigma_home()`).
+_RESTORE_UNDO_VERSION = 1
+
+
+def _restore_undo_dir() -> Path:
+    """The journal directory under the REAL `rigma_home()` (env-overridable in
+    tests, like every other store)."""
+    return runtime.rigma_home() / "restore-undo"
+
+
+def _write_restore_undo(prior: list) -> None:
+    """Persist the undo log before the apply, so a crash can be recovered.
+
+    Data files first, then the manifest ATOMICALLY. A crash while journaling
+    therefore leaves either no manifest (nothing was applied yet, so the boot
+    step correctly does nothing) or a complete one. The manifest is written
+    last on purpose: it is the commit record.
+    """
+    d = _restore_undo_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for i, (label, path, data) in enumerate(prior):
+        name = f"{i:04d}.bin"
+        if data is not None:
+            atomic_write_bytes(d / name, data)
+        entries.append({"label": str(label), "path": str(path),
+                        "existed": data is not None, "file": name})
+    atomic_write_json(d / "manifest.json",
+                      {"version": _RESTORE_UNDO_VERSION, "entries": entries})
+
+
+def _clear_restore_undo() -> None:
+    """Drop the journal. The whole directory goes: a stale data file is litter
+    that the next boot must not mistake for an unfinished restore."""
+    shutil.rmtree(_restore_undo_dir(), ignore_errors=True)
+
+
+def _replay_restore_undo() -> None:
+    """Boot step: roll back an interrupted restore, then clear the journal.
+
+    Best-effort and it never raises — a recovery that cannot write must not
+    stop the server from booting. If any write-back fails the journal is KEPT
+    for the next boot rather than deleted, so the undo is not thrown away.
+    Entries are replayed in reverse, mirroring `_rollback_stores`.
+    """
+    d = _restore_undo_dir()
+    try:
+        manifest = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return
+    entries = manifest.get("entries") if isinstance(manifest, dict) else None
+    if not isinstance(entries, list):
+        return
+    ok = True
+    for e in reversed(entries):
+        try:
+            path = Path(str(e["path"]))
+            if e.get("existed"):
+                atomic_write_bytes(path, (d / str(e["file"])).read_bytes())
+            else:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            ok = False
+            _log.exception("restore-undo: could not roll back %s", e.get("path"))
+    if ok:
+        _clear_restore_undo()
+
+
 def _apply_restore(store, targets, patch, normalized, rows):
     """Apply every section of a restore, rolling back on failure.
 
@@ -1803,6 +1882,13 @@ def _apply_restore(store, targets, patch, normalized, rows):
             prior = _snapshot_stores(targets)
         except OSError as e:
             raise _RestoreFailed(f"restore failed at staging: {e}") from e
+        # ODR-4: journal the undo log to disk BEFORE the first write. A kill
+        # from here on is recoverable by `_replay_restore_undo` at the next
+        # boot; without this the prior bytes lived only in `prior`.
+        try:
+            _write_restore_undo(prior)
+        except OSError as e:
+            raise _RestoreFailed(f"restore failed at staging: {e}") from e
         try:
             # Always write, even for `settings: {}`: a true replace means the
             # keys the document omits are reset, and a merge-save of nothing
@@ -1861,11 +1947,19 @@ def _apply_restore(store, targets, patch, normalized, rows):
             undo = prior if e.stage == "memory" else [
                 entry for entry in prior if entry[0] != "memory"]
             failed = _rollback_stores(undo)
+            # ODR-4: the in-memory rollback ran. If it fully succeeded the
+            # on-disk journal is spent, so drop it; if it failed, KEEP it for
+            # the boot step to retry rather than discard the only copy of the
+            # prior bytes.
+            if not failed:
+                _clear_restore_undo()
             detail = f"restore failed at {e.stage}: {e}"
             if failed:
                 detail += ("; rollback of " + ", ".join(failed)
                            + " failed — the store may be left part-applied")
             raise _RestoreFailed(detail) from e
+    # ODR-4: the apply committed, so the journal is spent.
+    _clear_restore_undo()
     # ODR-7: the caller's response names the ids the restore actually deleted,
     # so the confirmation can say what it removed instead of only what it wrote.
     return before, after, stale_ids
@@ -1887,6 +1981,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # never reconcile a run that is actually being driven (empty at boot).
         _reconcile_orphaned_runs(
             driven_ids={rid for rid, t in _run_tasks.items() if not t.done()})
+        # ODR-4: an interrupted restore left an on-disk undo journal. Roll it
+        # back before any store is read, or the boot sees a mixed store.
+        _replay_restore_undo()
         if os.environ.get("RIGMA_MEMORY") != "0":
             # 14-10: the embedding model load must never land inside a turn
             await _warm_memory_embedder()
