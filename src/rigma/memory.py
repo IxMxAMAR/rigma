@@ -337,6 +337,21 @@ class MemoryStore:
                         self._flock.release()
         return _held()
 
+    def locked(self):
+        """Hold the store lock across a MULTI-STEP region, not one write.
+
+        A11c: `/api/restore` snapshots the store's bytes, replaces it, and may
+        put the snapshot back — three steps that must not interleave with a
+        writer, or a memory committed in between is silently reverted by the
+        write-back. `_xlock` is re-entrant within ONE thread (the RLock plus the
+        depth counter), so a caller holding this may still call `restore`,
+        `add`, `_write_all` on the same thread. It is NOT re-entrant across
+        threads: the whole region must run in the thread that takes it, or the
+        inner call blocks on a lock its own caller owns. Public because the
+        route, not the store, owns the region.
+        """
+        return self._xlock()
+
     def all(self) -> list[dict]:
         """Every memory. A corrupt line is skipped, never raised — a run must
         not fail because memory failed."""

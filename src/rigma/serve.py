@@ -1514,6 +1514,80 @@ def _rollback_stores(prior: list) -> list[str]:
     return failed
 
 
+class _RestoreFailed(RuntimeError):
+    """The apply region failed. `str(e)` is the client-facing detail.
+
+    Distinct from `_RestoreStageError` so `_apply_restore` can raise the
+    FINISHED message (stage named, rollback outcome appended) and the route
+    only has to answer it.
+    """
+
+
+def _apply_restore(store, targets, patch, normalized, rows):
+    """Apply every section of a restore, rolling back on failure.
+
+    A11c: the WHOLE snapshot -> apply -> rollback region runs under
+    `store.locked()`, because the route used to snapshot and roll back the
+    memory section outside any lock — only the apply write took `_xlock` — so a
+    memory committed between the snapshot and the rollback was silently
+    reverted by the rollback.
+
+    It runs in ONE worker thread on purpose. `_xlock` is re-entrant within a
+    thread, so the nested `_xlock` inside `store.restore`/`_write_all`
+    re-enters; had the caller held the lock on the event-loop thread while
+    this ran in a worker, the worker's `restore` would block on a lock its own
+    caller owns — a deadlock. Hence the region is restructured into one thread
+    rather than the lock simply being added.
+
+    `_snapshot_stores` is inside the lock too: its memory entry is the bytes
+    the rollback writes back, so it must be the bytes as of the region's start.
+    """
+    from . import app_settings
+    from . import methods as _methods
+    with store.locked():
+        try:
+            prior = _snapshot_stores(targets)
+        except OSError as e:
+            raise _RestoreFailed(f"restore failed at staging: {e}") from e
+        try:
+            if patch:
+                try:
+                    app_settings.save(patch)
+                except Exception as e:
+                    raise _RestoreStageError("settings", str(e)) from e
+            for full in normalized:
+                try:
+                    _, errs = _methods.save_user(full)
+                except Exception as e:
+                    raise _RestoreStageError(
+                        "methods", f"method {full.get('id')}: {e}") from e
+                if errs:      # validated above, so this is a disk/permission fault
+                    raise _RestoreStageError(
+                        "methods", f"method {full.get('id')}: "
+                                   + "; ".join(errs))
+            before = len(store.all())
+            try:
+                after = store.restore(rows)
+            except Exception as e:
+                raise _RestoreStageError("memory", str(e)) from e
+        except _RestoreStageError as e:
+            # A11c: memory is the LAST write, so a failure in an earlier section
+            # leaves the store untouched and there is nothing to put back. The
+            # old rollback reverted it anyway — replaying an up-front snapshot of
+            # a file no writer had touched — which is how a memory committed
+            # during the region was destroyed even before the lock was added.
+            # Only a failure IN the memory stage can have changed the store.
+            undo = prior if e.stage == "memory" else [
+                entry for entry in prior if entry[0] != "memory"]
+            failed = _rollback_stores(undo)
+            detail = f"restore failed at {e.stage}: {e}"
+            if failed:
+                detail += ("; rollback of " + ", ".join(failed)
+                           + " failed — the store may be left part-applied")
+            raise _RestoreFailed(detail) from e
+    return before, after
+
+
 def build_app(upstream_port: int, default_prompt: str | None = None,
               registry=None) -> FastAPI:
 
@@ -6829,6 +6903,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # is reported in the error rather than hidden. A process crash mid-apply
         # would still leave a partial store; no scheme without a journal survives
         # that, and the journal is not worth a new format here.
+        #
+        # A11c: the region below runs in ONE worker thread and holds the memory
+        # store's `_xlock` for its whole length — see `_apply_restore`. The
+        # snapshot and the rollback used to run outside any lock, so a memory
+        # committed between them was reverted by the rollback.
         store = _memory_store()
         targets: list[tuple[str, object]] = []
         if patch:
@@ -6838,39 +6917,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             _methods._method_file(full["id"])))
         targets.append(("memory", store.path))
         try:
-            prior = await asyncio.to_thread(_snapshot_stores, targets)
-        except OSError as e:
-            return JSONResponse(
-                {"error": f"restore failed at staging: {e}"}, status_code=500)
-
-        try:
-            if patch:
-                try:
-                    await asyncio.to_thread(app_settings.save, patch)
-                except Exception as e:
-                    raise _RestoreStageError("settings", str(e)) from e
-            for full in normalized:
-                try:
-                    _, errs = await asyncio.to_thread(_methods.save_user, full)
-                except Exception as e:
-                    raise _RestoreStageError(
-                        "methods", f"method {full.get('id')}: {e}") from e
-                if errs:      # validated above, so this is a disk/permission fault
-                    raise _RestoreStageError(
-                        "methods", f"method {full.get('id')}: "
-                                   + "; ".join(errs))
-            before = len(store.all())
-            try:
-                after = await asyncio.to_thread(store.restore, rows)
-            except Exception as e:
-                raise _RestoreStageError("memory", str(e)) from e
-        except _RestoreStageError as e:
-            failed = await asyncio.to_thread(_rollback_stores, prior)
-            detail = f"restore failed at {e.stage}: {e}"
-            if failed:
-                detail += ("; rollback of " + ", ".join(failed)
-                           + " failed — the store may be left part-applied")
-            return JSONResponse({"error": detail}, status_code=500)
+            before, after = await asyncio.to_thread(
+                _apply_restore, store, targets, patch, normalized, rows)
+        except _RestoreFailed as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
         return {"restored": True, "version": BACKUP_VERSION,
                 "methods": len(normalized),
                 "memory": {"before": before, "after": after},

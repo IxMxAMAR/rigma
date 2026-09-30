@@ -948,8 +948,14 @@ def plan(use_case: str = typer.Option("general", "--use-case"),
          verify: bool = typer.Option(
              False, "--verify",
              help="Ask the engine itself what the plan will use, instead of "
-                  "trusting Rigma's arithmetic")):
+                  "trusting Rigma's arithmetic"),
+         refuse: bool = typer.Option(
+             False, "--refuse",
+             help="With --verify, exit non-zero when the engine cannot load "
+                  "the model or the plan provably does not fit, instead of "
+                  "only explaining the divergence")):
     """Show what `rigma up` would run, and why."""
+    _require_verify_for_refuse(refuse, verify)
     reg = Registry.load()
     try:
         rp = resolve(_profile(reg), reg, use_case=use_case, model_override=model)
@@ -964,7 +970,36 @@ def plan(use_case: str = typer.Option("general", "--use-case"),
         for line in rp.explain:
             typer.echo(f"  {line}")
     if verify:
-        _verify_plan_or_explain(rp)
+        _verify_plan_or_explain(rp, refuse=refuse)
+
+
+def _require_verify_for_refuse(refuse: bool, verify: bool) -> None:
+    """`--refuse` is the lever on the `--verify` gate, so it needs the gate.
+
+    A5c: the gate's logic was right and tested, but no tree declared the
+    option, so `refuse=True` had no production caller. Adding the option and
+    then letting it sit inert without `--verify` would be the same class of
+    bug a second time: a user who types `--refuse` believes a launch is being
+    gated, and nothing is. Refused as a usage error (exit 2, like typer's own
+    unknown-option), naming the flag that is missing.
+    """
+    if refuse and not verify:
+        typer.echo("--refuse only means something with --verify: it turns the "
+                   "divergence --verify reports into a refusal to launch.")
+        raise typer.Exit(2)
+
+
+class _VerifyRefused(typer.Exit):
+    """`--verify --refuse` said no (A5c).
+
+    A subclass of `typer.Exit` so the CLI still exits 1, but DISTINCT because
+    `typer.Exit` is a `RuntimeError` and `up`'s fallback ladder catches
+    `RuntimeError` to try the next candidate. Left as a bare `typer.Exit`, the
+    refusal was swallowed as a failed launch and the ladder quietly served a
+    smaller model — the opposite of "refuse to launch", and the same
+    silently-serve-something-else failure R3-ENG-3 fixed. A refusal is a
+    decision, not a fallback.
+    """
 
 
 def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
@@ -978,6 +1013,11 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
     It never blocks a launch: a disagreement is worth telling the user about, but
     the two numbers are not the same quantity, and refusing to start on a
     modelling difference would be worse than starting.
+
+    `refuse=True` is the caller opting into a block — the `--refuse` lever
+    (A5c) on the `--verify` gate. It fires only on evidence that is the
+    engine's own: a file the engine refuses to load, or a plan that provably
+    does not fit. A model-side note is still shown and still never refuses.
     """
     from . import hangar, memtruth
     from pathlib import Path
@@ -1006,7 +1046,7 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
     if _compat_note:
         typer.echo(_compat_note)
         if refuse and _compat_note_refuses(_compat_note):
-            raise typer.Exit(1)
+            raise _VerifyRefused(1)
     res, disagree = memtruth.verify_plan(
         rp, str(model_path), server_exe,
         os_free_probe=_adapter_vram_used_mb)
@@ -1032,7 +1072,7 @@ def _verify_plan_or_explain(rp, *, refuse: bool = False) -> None:
     if not res.ok and res.reason and not res.reason.startswith("the engine reports"):
         typer.echo(f"         {res.reason}")
     if refuse and not res.ok:
-        raise typer.Exit(1)
+        raise _VerifyRefused(1)
 
 
 # `_engine_type_count` returns this when the engine could not be asked at all: no
@@ -2112,6 +2152,10 @@ def up(use_case: str = typer.Option("general", "--use-case"),
            False, "--verify",
            help="Before launching, ask the engine what the plan will actually "
                 "use and compare it with Rigma's own estimate"),
+       refuse: bool = typer.Option(
+           False, "--refuse",
+           help="With --verify, refuse to launch when the engine cannot load "
+                "the model or the plan provably does not fit"),
        port: int = typer.Option(11500, "--port"),
        no_browser: bool = typer.Option(False, "--no-browser"),
        ctx: int = typer.Option(None, "--ctx",
@@ -2171,6 +2215,10 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     if not 1 <= port <= 65535:
         typer.echo(f"--port {port} is not a usable port number (1-65535).")
         raise typer.Exit(2)
+
+    # A5c: the refuse lever is checked HERE, before any download or probe, so a
+    # `--refuse` that cannot do anything fails fast rather than after work.
+    _require_verify_for_refuse(refuse, verify)
 
     # R3-VLLM-4: THE ENGINE RUNTIME IS CHOSEN HERE, and refused rather than
     # fallen back from.
@@ -2541,11 +2589,17 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             # blocking: it reports, and only a plan that provably does not fit is
             # worth refusing, which the caller opts into with --verify.
             if verify:
-                _verify_plan_or_explain(cand)
+                _verify_plan_or_explain(cand, refuse=refuse)
             sp = runtime.launch_server(exe, cand, model_path, port=port - 1,
                                        extra_args=extra or None)
             rp = cand
             break
+        except _VerifyRefused:
+            # A5c: `--verify --refuse` said no. `typer.Exit` is a RuntimeError,
+            # so without this clause the ladder below would read the refusal as
+            # a failed launch and quietly serve the NEXT model — the opposite of
+            # what was asked. A refusal is a decision, not a fallback.
+            raise
         except RuntimeError as e:
             typer.echo(str(e).splitlines()[0])
             if i + 1 < len(candidates):
