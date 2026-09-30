@@ -4,11 +4,14 @@
 // document with settings, the user's methods and memory — so it is an `<a>`,
 // not a fetch.
 //
-// `POST /api/restore` REPLACES THE WHOLE STORE. That is the reason this card is
-// two steps and not one: choosing a file only parses it and shows what it
-// contains, and the replace button stays disabled until the user has ticked a
-// confirmation that names the three stores. A single click that overwrites the
-// owner's settings, methods and memory is not a control this UI may draw.
+// `POST /api/restore` REPLACES MEMORY and MERGES settings and methods. The
+// route (`serve.py::_apply_restore`) writes the file's settings over the stored
+// ones key by key, saves each file method by id (an existing id is overwritten,
+// no method is deleted), and replaces the memory store outright. That is the
+// reason this card is two steps and not one: choosing a file only parses it and
+// shows what it contains, and the replace button stays disabled until the user
+// has ticked a confirmation that says which store is replaced and which is
+// merged. A single click that rewrites memory is not a control this UI may draw.
 //
 // The route is all-or-nothing (A11): it validates the whole document, then
 // applies it under one lock and rolls back on failure. So the only errors here
@@ -24,7 +27,7 @@ import {
 } from "../lib/backup";
 
 /** The confirmation step, pure props so the sentence a user must read before
- *  overwriting everything is assertable without a store. */
+ *  rewriting memory is assertable without a store. */
 export function RestoreConfirm({
   summary, confirmed, busy, error, done, onConfirm, onReplace, onCancel,
 }: {
@@ -40,19 +43,20 @@ export function RestoreConfirm({
   return (
     <div className="rounded-md bg-canvas/60 px-3 py-2.5 mt-2 flex flex-col gap-2">
       <p className="text-[12.5px] text-amber font-semibold">
-        This replaces the whole store on this machine.
+        This replaces all memory on this machine.
       </p>
       <p className="text-[12.5px] text-secondary">
-        Restoring overwrites your settings, every user method and all memory
-        with what is in this file: <span className="font-mono">{summary}</span>.
-        Anything not in the file is gone.
+        Restoring replaces your memory with the file's memory rows, and
+        overwrites the stored settings and methods the file names — everything
+        else is kept. The file carries:{" "}
+        <span className="font-mono">{summary}</span>.
       </p>
       <label className="flex items-center gap-2 text-[12.5px] text-secondary">
         <input type="checkbox" className="accent-amber" checked={confirmed}
                disabled={busy}
-               aria-label="Confirm replacing the whole store"
+               aria-label="Confirm replacing all memory"
                onChange={(e) => onConfirm(e.target.checked)} />
-        I understand — replace settings, methods and memory
+        I understand — replace memory, merge settings and methods
       </label>
       {error !== null && (
         <div role="alert" className="text-red font-mono text-[11.5px] break-words">
@@ -69,7 +73,7 @@ export function RestoreConfirm({
           onClick={onReplace}
           className="rounded-md bg-red/15 text-red px-3 py-1 text-[13px] font-semibold disabled:opacity-40"
         >
-          {busy ? "restoring…" : "replace the whole store"}
+          {busy ? "restoring…" : "replace memory and merge the rest"}
         </button>
         <button
           type="button"
