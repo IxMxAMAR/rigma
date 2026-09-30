@@ -615,6 +615,22 @@ def _engine_has_vision(registry=None) -> bool:
         return False
 
 
+def _model_last_used() -> dict:
+    """The `last_used` map from stats.json — {model slug: epoch seconds}.
+
+    D2: the nearest honest first-load signal. Usage stats are best-effort (the
+    turn loop swallows their write failures), so a missing or unreadable file
+    means "no evidence", never an error on a read-only route.
+    """
+    try:
+        f = st.rigma_home() / "stats.json"
+        data = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+        last = data.get("last_used") if isinstance(data, dict) else None
+        return last if isinstance(last, dict) else {}
+    except Exception:
+        return {}
+
+
 def _load_run_for_loop(runs_mod, run_id: str):
     """`(run, readable)` for the run loop.
 
@@ -4773,7 +4789,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def models_set_defaults(slug: str, body: dict):
         """Pin how this model comes up. Send only the fields you mean to set;
         send null to clear one."""
-        allowed = {"quant", "ctx", "kv", "vision", "spec_type", "spec_n_max"}
+        # D2: `backend` belongs here — `LaunchDefaults` stores it and the
+        # launcher consumes it, so leaving it out of the allowlist made a
+        # per-model compute backend silently unsettable over HTTP.
+        allowed = {"quant", "ctx", "kv", "vision", "spec_type", "spec_n_max",
+                   "backend"}
         fields = {k: v for k, v in (body or {}).items() if k in allowed}
         if not fields:
             return JSONResponse(
@@ -4795,6 +4815,35 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             registry.models[slug] = spec
         return {"slug": slug,
                 "launch": spec.launch.model_dump() if spec.launch else None}
+
+    @app.get("/api/models/{slug}/defaults")
+    async def models_get_defaults(slug: str):
+        """How this model comes up, and whether it ever has.
+
+        D2: the only defaults route was a POST, so a dialog could WRITE a
+        default but had no way to show what was already pinned (the GET answered
+        405). `first_load` is the honest first-load signal: `last_used` is
+        written per completed turn, so the flag says "nothing is pinned AND this
+        model has never finished a turn" — the evidence, with `last_used`
+        beside it so the caller can apply its own rule.
+        """
+        from .registry import Registry
+        reg = registry if registry is not None else await asyncio.to_thread(
+            Registry.load)
+        spec = reg.models.get(slug)
+        if spec is None:
+            return JSONResponse({"error": f"unknown model: {slug}"},
+                                status_code=404)
+        last_used = await asyncio.to_thread(_model_last_used)
+        stamp = last_used.get(slug)
+        return {"slug": slug,
+                "launch": spec.launch.model_dump() if spec.launch else None,
+                # a registry model's launch settings are hand-authored and the
+                # POST refuses to overwrite them (owner decision) — the UI
+                # disables Save and says why
+                "custom": spec.custom,
+                "last_used": stamp,
+                "first_load": spec.launch is None and stamp is None}
 
     @app.post("/api/models/{slug}/reprobe")
     async def models_reprobe(slug: str):

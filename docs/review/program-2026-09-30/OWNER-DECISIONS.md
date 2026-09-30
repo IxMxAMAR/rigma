@@ -246,3 +246,31 @@ fallback spelling, not a feature.
 
 **If nothing is decided:** nothing changes; Rigma reaches mcode sessions only through `session/new` and
 `session/resume`. This is not a blocker.
+
+---
+
+## OD-10 — Should a shipped registry model be allowed to store launch defaults? (D2)
+
+**State today:** `hangar.set_launch_defaults` refuses any spec whose `custom` is False
+(`hangar.py:1123-1125`): "its launch settings are hand-authored and are not overwritten here". The D2
+backend work did **not** change that — it added the missing GET, accepted `backend`, and made `null`
+clear a field. So the new first-load dialog can read a registry model's defaults and shows `custom:
+false`, but its Save is refused with 400.
+
+**Options**
+1. Keep the refusal. A shipped spec's launch settings are the program's evidence-backed choice; the
+   dialog disables Save for `custom:false` and says why. A user who wants different numbers edits the
+   model's file or installs their own copy.
+2. Allow defaults for registry models too, stored in the user's custom overlay rather than in the
+   shipped file. Consistent ("my machine, my launch"), but it introduces a second place a spec can be
+   overridden, and a shipped spec can then disagree with what actually launched — the class of bug
+   `list_models`' "running" row and the fit math already have to be careful about.
+3. Allow it only for the shipped models whose settings are NOT evidence-backed (none are marked as
+   such today, so this needs new metadata).
+
+**Recommendation: option 1.** It is the status quo, it is what the recon recommended, and the cost is
+one disabled button with a reason. Option 2 is a real product change and should be its own item with
+its own merge/precedence rules.
+
+**If nothing is decided:** the refusal stands and the dialog explains it. Not a blocker.
+
