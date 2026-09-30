@@ -933,10 +933,14 @@ export const useChat = create<ChatState>((set, get) => ({
       const s = await api.getSession(id);
       // Ownership guard, the same one every terminal write follows (AUDIT F1):
       // a transcript that arrived while the user moved on must not paint the
-      // chat now on screen.
+      // chat now on screen. The second half is the same rule for a LIVE turn: a
+      // stream this tab owns is authoritative for its own chat, and the server's
+      // durable copy carries the mid-turn checkpoint as a message — replacing
+      // `messages` under it would draw that reply twice.
       set((st) => ({
         remoteStreaming: { ...st.remoteStreaming, [id]: s.streaming === true },
-        ...(st.currentId === id ? { messages: s.messages } : {}),
+        ...(st.currentId === id && !st.streams[id]
+          ? { messages: s.messages } : {}),
       }));
     } catch {
       // A poll that failed is not worth a banner; the next tick retries.
