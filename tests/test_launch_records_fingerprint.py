@@ -19,6 +19,7 @@ call is worse than no guard.
 from __future__ import annotations
 
 import ast
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -224,8 +225,70 @@ def test_a_refused_restore_is_reported_and_still_keys_the_unload_save(
     assert seen["calls"] == ["restore"]
     assert "engine refused the restore (500)" in res.output, res.output
     assert "re-prefilled from zero" in res.output, res.output
-    # the same note is on the plan's own explain surface
-    assert any("re-prefilled from zero" in w for w in seen["plan"].explain)
+    # A8b-n2: the note is deliberately NOT appended to `rp.explain`. The explain
+    # loop at the top of `up` has already run by the time the engine is up,
+    # nothing after this reads `rp.explain`, and `write_state` does not persist
+    # it — so the old append was dead code that only looked like a report. The
+    # user-facing half is the echo; the diagnostic half is the WARNING (below).
+    assert not any("re-prefilled from zero" in w for w in seen["plan"].explain)
     assert seen["state"]["kv_fp"] == _FP, (
         "clearing kv_fp would skip the unload save, leave the unreadable file "
         "in place forever, and re-prefill on every later restart")
+
+
+def test_a_refused_restore_is_logged_at_warning_with_the_reason(
+        tmp_path, monkeypatch, caplog):
+    """A8b-n1. A8's stated motivation was "no trace to diagnose"; the server
+    path logs a refusal at WARNING (server_ops.perform_switch) and the CLI path
+    did not, so the launch a CLI user actually runs was the one refusal with no
+    trace anywhere. The log line must carry the engine's reason."""
+    seen = _up_world(tmp_path, monkeypatch, _FP)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / f"kv-{_FP}.bin").write_bytes(b"a saved cache")
+    seen["refuse"] = "engine refused the restore (500)"
+    with caplog.at_level(logging.WARNING, logger="rigma.cli"):
+        res = _run_up()
+    assert res.exit_code == 0, res.output
+    hits = [r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "kv-cache restore failed" in r.getMessage()]
+    assert hits, caplog.text
+    assert "engine refused the restore (500)" in hits[0].getMessage(), caplog.text
+
+
+def test_a_refused_restore_prints_its_note_exactly_once(tmp_path, monkeypatch):
+    """The note is the user-facing half. It must be visible and appear exactly
+    once: a fix that handed the note to the logger as well, or that echoed it
+    after the explain loop had already printed it, would put the same paragraph
+    on the terminal — and in the detached log — twice."""
+    seen = _up_world(tmp_path, monkeypatch, _FP)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / f"kv-{_FP}.bin").write_bytes(b"a saved cache")
+    seen["refuse"] = "engine refused the restore (500)"
+    res = _run_up()
+    assert res.exit_code == 0, res.output
+    emitted = res.output + res.stderr
+    assert emitted.count("would not load") == 1, emitted
+
+
+def test_a_successful_restore_logs_no_warning_and_prints_no_note(
+        tmp_path, monkeypatch, caplog):
+    """Negative control. A slot that loads is the ordinary case; warning about
+    it would put a four-minute notice on every warm launch, and echoing a note
+    would tell the user a cache failed to load when it did not."""
+    seen = _up_world(tmp_path, monkeypatch, _FP)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / f"kv-{_FP}.bin").write_bytes(b"a saved cache")
+    seen["refuse"] = None
+    with caplog.at_level(logging.WARNING, logger="rigma.cli"):
+        res = _run_up()
+    assert res.exit_code == 0, res.output
+    assert seen["calls"] == ["restore"]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], \
+        caplog.text
+    assert "would not load" not in res.output
+    assert "re-prefilled from zero" not in res.output
+    assert seen["state"]["kv_fp"] == _FP
