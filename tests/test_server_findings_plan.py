@@ -49,6 +49,14 @@ MOE_CTX = 16384
 RESIDENT = {"ngl": 99, "n_cpu_moe": 0}
 MOE_12 = {"ngl": 99, "n_cpu_moe": 12}
 
+# DR21R-n1: a DEEP dense spill — a small DEVICE weight term, so the 15% slack is
+# under the 512 MiB floor and the engine's compute buffer alone used to exceed
+# the whole slack. `SPILL_CTX` keeps the KV term modest too, so the pre-fix
+# expected figure really is small.
+SPILL_NGL = 5
+SPILL_CTX = 8192
+SPILL_COMPUTE_MB = 600.0
+
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
@@ -111,7 +119,19 @@ def _divergent_log(expected_mb: float = 40000.0) -> str:
 # The helper: the plan's own prediction, or None.
 # ---------------------------------------------------------------------------
 
-def test_planned_vram_mb_is_the_plans_own_weights_plus_kv():
+def test_planned_vram_mb_is_the_plans_own_weights_kv_and_compute_charge():
+    """DR21R-n1: the DEVICE figure is weights + KV + the plan's own compute
+    charge.
+
+    `memtruth.planned_mb` deliberately omits the compute term — the FIT
+    comparison needs to SEE an under-count — but the VRAM axis compares against
+    the engine's device buffers, which INCLUDE it. So `planned_vram_mb` adds
+    DR2-3's `resolve.compute_buffer_mb` and the two sides share one basis at
+    every spill depth (before this, a deep spill's small expected figure fell
+    below the 512 MiB slack floor and a healthy load reported
+    `plan_divergence`)."""
+    from rigma.resolve import compute_buffer_mb, launch_ubatch
+
     got = server_ops.planned_vram_mb(_state())
 
     spec = Registry.load().models[SLUG]
@@ -119,9 +139,11 @@ def test_planned_vram_mb_is_the_plans_own_weights_plus_kv():
     plan = RunPlan(model_slug=SLUG, gguf=gguf, backend="rocm",
                    flags=ComboFlags(ctx=CTX, cache_type_k="f16",
                                     cache_type_v="f16"), origin="state")
-    assert got == pytest.approx(memtruth.planned_mb(plan))
-    # weights + KV, NOT the bare file size: the engine's actual includes the KV
-    # cache, so a file size alone would read as a divergence that is only it.
+    compute = compute_buffer_mb(launch_ubatch(spec))
+    assert got == pytest.approx(memtruth.planned_mb(plan) + compute)
+    # weights + KV + compute, NOT the bare file size: the engine's actual
+    # includes the KV cache and its own compute scratch, so a file size alone
+    # would read as a divergence that is only them.
     assert got > gguf.bytes / 2**20 + 1000
 
 
@@ -162,17 +184,21 @@ def test_planned_vram_mb_takes_its_kv_from_the_registry_it_was_handed(home):
 
     got = server_ops.planned_vram_mb(_state(), custom)
 
-    from rigma.resolve import kv_bytes_per_token, swa_kv_bytes
+    from rigma.resolve import (compute_buffer_mb, kv_bytes_per_token,
+                               launch_ubatch, swa_kv_bytes)
     gguf = next(g for g in changed.ggufs if g.quant == QUANT)
     want_kv = (CTX * kv_bytes_per_token(changed, "f16", "f16")
                + swa_kv_bytes(changed, "f16", "f16", CTX)) / 2**20
     global_kv = (CTX * kv_bytes_per_token(spec, "f16", "f16")
                  + swa_kv_bytes(spec, "f16", "f16", CTX)) / 2**20
+    # DR21R-n1: the compute charge follows the same registry's spec (the launch
+    # ubatch is spec data), so it is the caller's registry on both sides too.
+    compute = compute_buffer_mb(launch_ubatch(changed))
 
     # BOTH terms follow the registry the caller handed...
-    assert got == pytest.approx(gguf.bytes / 2**20 + want_kv)
+    assert got == pytest.approx(gguf.bytes / 2**20 + want_kv + compute)
     # ...and the KV term is NOT the process-global one (the pre-fix chimera).
-    assert got != pytest.approx(gguf.bytes / 2**20 + global_kv)
+    assert got != pytest.approx(gguf.bytes / 2**20 + global_kv + compute)
 
 
 def test_the_memo_does_not_serve_one_registrys_prediction_for_another(home):
@@ -375,3 +401,182 @@ def test_a_recorded_placement_compares_the_device_figure_directly(home):
     r3 = engine_log.compare_plan(load, None)
     assert r3["vram_verdict"] == "not_comparable"
     assert r3["vram_why"] == "no_prediction"
+
+
+# ---------------------------------------------------------------------------
+# DR21R-n1: the two sides must share ONE basis at EVERY spill depth.
+#
+# The engine's device figure is `device model + KV + RS + device compute`
+# (`compare_plan`); `memtruth.planned_mb` deliberately leaves the compute term
+# out, so the plan side used to be short by the engine's own compute buffer. A
+# 512 MiB slack floor absorbed that for a large (resident) plan, but a DEEP
+# spill's device prediction is small — the 15% term is under the floor — so a
+# compute buffer larger than 512 MiB made a HEALTHY load report
+# `plan_divergence`: the same class DR2-1 was fixed for. The plan's own charge
+# for that term (DR2-3's `resolve.compute_buffer_mb`) is now on the plan side at
+# every depth, so BOTH directions hold: healthy -> no finding, wrong -> finding.
+# ---------------------------------------------------------------------------
+
+def _spill_state() -> dict:
+    return {"model": SLUG, "quant": QUANT, "ctx": SPILL_CTX, "kv_cache": "f16",
+            "backend": "rocm", "placement": {"ngl": SPILL_NGL, "n_cpu_moe": 0}}
+
+
+def _spill_flags() -> ComboFlags:
+    return ComboFlags(ctx=SPILL_CTX, cache_type_k="f16", cache_type_v="f16",
+                      ngl=SPILL_NGL, n_cpu_moe=0)
+
+
+def _plan_terms(flags: ComboFlags):
+    """(whole MiB, device weights MiB, KV MiB) for `flags`.
+
+    Built from the plan's OWN arithmetic (`_spilled`, `memtruth.planned_mb`), so
+    the "healthy" log below is a load that MATCHES the plan — not a round number
+    that happens to fit."""
+    from rigma.resolve import _spilled
+    spec = Registry.load().models[SLUG]
+    gguf = next(g for g in spec.ggufs if g.quant == QUANT)
+    whole = gguf.bytes / 2**20
+    plan = RunPlan(model_slug=SLUG, gguf=gguf, backend="rocm", flags=flags,
+                   origin="test")
+    kv = memtruth.planned_mb(plan, spec) - whole
+    return whole, whole * (1.0 - _spilled(spec, flags)), kv
+
+
+def _load_log(device_model_mb: float, kv_mb: float, *, ngl: int,
+              compute_mb: float = SPILL_COMPUTE_MB) -> str:
+    """A one-device load with an explicit `offloaded ngl/N` and compute buffer."""
+    offloadable = Registry.load().models[SLUG].n_layers + 1
+    return (
+        "0.00.1 I print_info: n_expert              = 0\n"
+        f"0.00.2 I load_tensors: offloaded {ngl}/{offloadable} layers to GPU\n"
+        "0.00.3 I load_tensors:        ROCm0 model buffer size = "
+        f"{device_model_mb:.2f} MiB\n"
+        "0.00.4 I llama_kv_cache:      ROCm0 KV buffer size = "
+        f"{kv_mb:.2f} MiB\n"
+        "0.00.5 I sched_reserve:      ROCm0 compute buffer size = "
+        f"{compute_mb:.2f} MiB\n"
+        "0.00.6 I sched_reserve: graph splits = 2\n"
+    )
+
+
+def test_a_deep_spill_with_a_compute_buffer_larger_than_the_old_slack_is_healthy(
+        home):
+    """Direction 1: the verifier's shape is HEALTHY and must add no finding.
+
+    The device prediction is small (the 15% slack is under the 512 MiB floor),
+    and the engine's compute buffer is 600 MiB — larger than the WHOLE old
+    slack. Before the fix that alone reported `plan_divergence`."""
+    _whole, dev_w, kv = _plan_terms(_spill_flags())
+    expected = server_ops.planned_vram_mb(_spill_state())
+
+    _write_log(home, _load_log(dev_w, kv, ngl=SPILL_NGL))
+    st.write_state(SLUG, QUANT, 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="rocm", ctx=SPILL_CTX,
+                   kv_cache="f16", placement={"ngl": SPILL_NGL, "n_cpu_moe": 0})
+
+    load = engine_log.parse_load(_load_log(dev_w, kv, ngl=SPILL_NGL))
+    r = engine_log.compare_plan(load, expected,
+                                expected_placement={"ngl": SPILL_NGL,
+                                                    "n_cpu_moe": 0})
+    assert r["vram_verdict"] == "ok", r["detail"]
+    assert r["vram_why"] is None
+    assert abs(r["divergence_mb"]) < 512.0
+
+    # The fix must be what closes the gap, not a coincidence: the plan's own
+    # charge is 150 MiB, the engine's buffer 600, and 600 > 512 > 600 - 150.
+    assert expected - (dev_w + kv) == pytest.approx(150.0)
+    assert SPILL_COMPUTE_MB > 512.0
+    assert SPILL_COMPUTE_MB - (expected - dev_w - kv) < 512.0
+
+    resp = _client(home).get("/api/server/findings")
+    assert resp.status_code == 200
+    assert resp.json()["findings"] == []
+
+
+def test_a_deep_spill_with_genuinely_wrong_vram_still_fires(home):
+    """Direction 2: the SAME shape with the device model buffer 6000 MiB above
+    the plan still fires, so the healthy case was not bought by widening the
+    slack."""
+    _whole, dev_w, kv = _plan_terms(_spill_flags())
+    _write_log(home, _load_log(dev_w + 6000.0, kv, ngl=SPILL_NGL))
+    st.write_state(SLUG, QUANT, 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="rocm", ctx=SPILL_CTX,
+                   kv_cache="f16", placement={"ngl": SPILL_NGL, "n_cpu_moe": 0})
+
+    resp = _client(home).get("/api/server/findings")
+    assert resp.status_code == 200
+    ids = [f["id"] for f in resp.json()["findings"]]
+    assert ids == ["plan_divergence"], ids
+
+
+def test_a_fully_resident_load_with_a_large_compute_buffer_is_also_healthy(home):
+    """The same window at spill depth 0 — why the charge is added at EVERY
+    depth, not only when `_spilled > 0`.
+
+    qwen3-0.6b fully resident at ctx 8192 predicts ~1.5 GiB, so the 15% slack is
+    under the floor and a 600 MiB compute buffer alone exceeded the whole slack.
+    Scoping the fix to spills would have left this false positive reachable."""
+    from rigma.resolve import _spilled
+    flags = ComboFlags(ctx=SPILL_CTX, cache_type_k="f16", cache_type_v="f16",
+                       ngl=99, n_cpu_moe=0)
+    whole, dev_w, kv = _plan_terms(flags)
+    assert _spilled(Registry.load().models[SLUG], flags) == 0.0
+    assert dev_w == pytest.approx(whole)
+
+    _write_log(home, _load_log(whole, kv, ngl=29))
+    st.write_state(SLUG, QUANT, 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="rocm", ctx=SPILL_CTX,
+                   kv_cache="f16", placement=dict(RESIDENT))
+
+    resp = _client(home).get("/api/server/findings")
+    assert resp.status_code == 200
+    assert resp.json()["findings"] == []
+
+
+@pytest.mark.parametrize("ngl", [1, 5, 14, 27, 29])
+def test_both_directions_hold_at_every_spill_depth(home, ngl):
+    """The invariant, swept from a total offload (ngl=1) to fully resident
+    (ngl=29): a load that MATCHES the plan is `ok`, and the same load with the
+    device model buffer 6000 MiB above the plan still `diverges`. The 600 MiB
+    compute buffer is present in both, so a healthy load is never the one that
+    fires."""
+    flags = ComboFlags(ctx=SPILL_CTX, cache_type_k="f16", cache_type_v="f16",
+                       ngl=ngl, n_cpu_moe=0)
+    _whole, dev_w, kv = _plan_terms(flags)
+    placement = {"ngl": ngl, "n_cpu_moe": 0}
+    state = {"model": SLUG, "quant": QUANT, "ctx": SPILL_CTX,
+             "kv_cache": "f16", "backend": "rocm", "placement": placement}
+    expected = server_ops.planned_vram_mb(state)
+
+    healthy = engine_log.compare_plan(
+        engine_log.parse_load(_load_log(dev_w, kv, ngl=ngl)), expected,
+        expected_placement=placement)
+    assert healthy["vram_verdict"] == "ok", (ngl, healthy["detail"])
+    assert abs(healthy["divergence_mb"]) < 512.0
+
+    wrong = engine_log.compare_plan(
+        engine_log.parse_load(_load_log(dev_w + 6000.0, kv, ngl=ngl)),
+        expected, expected_placement=placement)
+    assert wrong["vram_verdict"] == "diverges", (ngl, wrong["detail"])
+
+
+def test_a_device_resident_load_is_judged_exactly_as_before(home):
+    """Direction 3: the device-resident path is UNCHANGED.
+
+    The engine's own figures are byte-identical and the verdict is the same
+    (`diverges` against `_divergent_log`'s 80000 MiB device model buffer). The
+    plan-side figure gains the plan's own compute charge — the deliberate basis
+    change, pinned by
+    `test_planned_vram_mb_is_the_plans_own_weights_kv_and_compute_charge` — and
+    nothing else moves."""
+    load = engine_log.parse_load(_divergent_log())
+    r = engine_log.compare_plan(load, server_ops.planned_vram_mb(_state()),
+                                expected_placement=dict(RESIDENT))
+
+    assert r["actual_vram_mb"] == pytest.approx(80110.0)
+    assert r["host_ram_mb"] == 0.0
+    assert r["graph_splits"] == 2
+    assert r["vram_verdict"] == "diverges"
+    assert r["vram_why"] is None
+    assert r["diverges"] is True

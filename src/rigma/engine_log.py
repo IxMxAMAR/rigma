@@ -898,6 +898,15 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
     that was scaled with it. Pass None for a whole-file figure; the residency
     gate then still protects it.
 
+    DR21R-n1: the two sides must also carry the SAME terms. `actual` sums the
+    device model + KV + RS + device compute buffers, while `memtruth.planned_mb`
+    leaves the compute term out; `server_ops.planned_vram_mb` therefore adds the
+    plan's own compute/reserve charge (DR2-3's `resolve.compute_buffer_mb`) to
+    the figure it passes with a placement. This axis does not re-add it — it
+    cannot know whether the caller already did — so a caller that passes a bare
+    `memtruth.planned_mb` with a placement will still see the compute gap against
+    the slack.
+
     `expected_splits` is derived from the load's own plan fields
     (`expected_splits_for_load`: ngl, layer count, expert placement, backend,
     and the DEVICE COUNT from the load's distinct device labels) when not given,
@@ -1007,9 +1016,11 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
         if expected_placement is not None:
             detail += ("The plan recorded its device-side placement "
                        "(ngl=%s, n_cpu_moe=%s), so this prediction is already "
-                       "the plan's DEVICE figure. " % (
-                           expected_placement.get("ngl"),
-                           expected_placement.get("n_cpu_moe")))
+                       "the plan's DEVICE figure: the device weights plus the KV "
+                       "cache plus the plan's own compute/reserve charge "
+                       "(DR21R-n1), the same terms the engine's figure sums. "
+                       % (expected_placement.get("ngl"),
+                          expected_placement.get("n_cpu_moe")))
         detail += ("The plan's own prediction for the same ctx / cache / slots "
                    "was %.2f MiB; divergence %+.2f MiB (%+.1f%%), %s. " % (
                        expected_vram_mb, divergence, pct,
