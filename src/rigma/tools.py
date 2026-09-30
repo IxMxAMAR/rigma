@@ -2015,7 +2015,9 @@ def _persistence_path_reason(p: Path, ctx: dict | None = None) -> str:
     try:
         rp = Path(_unlong(p)).resolve()
     except (OSError, ValueError, RuntimeError):
-        return ""
+        # A path that cannot be resolved cannot be checked, so it is refused.
+        return ("that path cannot be resolved, so it cannot be checked "
+                "against the persistence denylist")
     rp = _strip_trailing_dots(_local_unc_to_drive(rp))
     anchors = _persistence_anchors()
     if (_persistence_hit(rp, _PERSISTENCE_DIR_SHAPES, anchors, subdirs=True)
@@ -3995,6 +3997,9 @@ def _do_transfer(args, ctx, move: bool):
     for src in srcs:
         try:
             target = _free_name(dest, src.name)
+            # ODR-1b: `_write_path` vetted the FOLDER; the file shapes
+            # (`.bashrc`, `.gitconfig`, ...) are only visible on the file itself.
+            _refuse_persistence_write(target, ctx)
             if target.name != src.name:
                 renamed += 1
             if move:
@@ -4002,7 +4007,7 @@ def _do_transfer(args, ctx, move: bool):
             else:
                 shutil.copy2(str(src), str(target))
             done.append(target.name)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             errs.append(f"{src.name}: {e}")
     note = ""
     if renamed:
