@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 
@@ -9,6 +10,8 @@ import psutil
 from .atomicio import atomic_write_json
 from .models import CACHE_BYTES
 from .runtime import rigma_home
+
+_log = logging.getLogger(__name__)
 
 
 def ram_snapshot() -> dict:
@@ -811,13 +814,49 @@ def perform_switch(model: str, registry=None, profile=None,
     # Bring back the prompt cache if one was saved under EXACTLY this
     # configuration. A 120K window costs about four minutes of prefill to
     # rebuild and a couple of seconds to read off disk.
+    #
+    # A8 (docs/review/findings-r3 row 7): the result used to be discarded —
+    # `kvcache.restore(...)` under `except Exception: pass`. That `except` never
+    # saw the ordinary failure, because `restore` does not raise when the engine
+    # refuses a slot load: it RETURNS `(False, reason)`. So the reason was lost
+    # and the user paid the four minutes with nothing said and no trace to
+    # diagnose. Both halves are fixed here: the reason is logged, and it is
+    # surfaced on the launch output (`notice`, the channel `step_down_notice`
+    # already uses, which `/api/server/switch` returns as JSON) and in the plan's
+    # own explanation.
+    #
+    # `kv_fp` is still written when the restore fails, deliberately, and that is
+    # a correction to the finding's proposed remedy. `kv_fp` is not a claim that
+    # a restore happened: it is the key this engine's cache is SAVED under at
+    # unload (`perform_unload`) and the name prefix snapshots are filed under
+    # (`serve._prefix_ctx`). Withholding it would skip the unload save, leaving
+    # an unreadable kv-<fp>.bin in place forever — every later launch would fail
+    # the same restore, write no fingerprint, and skip the save again, which is
+    # precisely the repeated silent re-prefill the finding describes. Keeping
+    # the key is what lets the unload overwrite the bad file with the live slot.
+    # Nothing anywhere reads a recorded `kv_fp` to decide that the slot is warm
+    # and skip prefill, so the recorded value cannot cause the cold start; the
+    # silence could.
     from . import kvcache
     kv_fp = kvcache.launch_fingerprint(rp, exe)
+    kv_err: str | None = None
     try:
-        kvcache.restore(int(s["public_port"]) - 1,
-                        runtime.rigma_home() / "sessions", kv_fp)
-    except Exception:
-        pass          # a cache that will not load is a slow start, not a fault
+        _restored, kv_err = kvcache.restore(int(s["public_port"]) - 1,
+                                           runtime.rigma_home() / "sessions",
+                                           kv_fp)
+    except Exception as e:          # restore() reports, it does not raise
+        kv_err = str(e)[:200]
+    if kv_err:
+        # "about four minutes" is the measurement in kvcache's module docstring
+        # (120K window, ~560 t/s prefill on this machine), not a new claim.
+        cold = (f"the saved prompt cache for this exact configuration would not "
+                f"load ({kv_err}) — this conversation will be re-prefilled from "
+                f"zero, about four minutes on a 120K window. The cache is "
+                f"rewritten when the model is next unloaded.")
+        _log.warning("kv-cache restore failed for %s [%s]: %s — re-prefilling "
+                     "from zero", rp.model_slug, kv_fp, kv_err)
+        rp.explain.append(cold)
+        notice = f"{notice}\n{cold}" if notice else cold
     st.write_state(rp.model_slug, rp.gguf.quant, int(s["public_port"]),
                    engine_pid=sp.proc.pid,
                    ui_pid=int(s.get("ui_pid", os.getpid())),
