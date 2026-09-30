@@ -211,7 +211,6 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
     if n_tensors > 1_000_000:
         raise GgufParseError("implausible tensor count")
     for _ in range(n_tensors):
-        n = 0
         try:
             name = _read_str(f)
             n_dims = _read(f, "<I", 4)
