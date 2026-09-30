@@ -356,21 +356,45 @@ def _one_line(value: object) -> str:
     return " ".join(str(value).split())
 
 
+# One progress line, never a paragraph. The bound applies to the WHOLE notice
+# text, after whitespace collapse, so a prefix cannot push the total over it —
+# the projector-failure message used to cap only its detail and then prepend
+# ~40 characters, which could reach ~240.
+_NOTICE_MAX = 200
+
+
+def _notice_line(*parts: object) -> str:
+    """The one path every notice text takes: collapsed, then capped.
+
+    Centralised so the bound cannot be applied to a fragment instead of the
+    finished string. Two inputs are deliberately NOT from an allow-list and
+    reach a notice only because naming them is the point: the raw event `type`
+    (an unknown event is named so it can be recognised) and, on the failure
+    path, the exception's own type name and message. All of them go through the
+    same collapse-and-cap as everything else, so none can add a line or exceed
+    `_NOTICE_MAX` — including the exception message, which is the one place a
+    §0.3 prose leak could ride in.
+    """
+    return _one_line(" ".join(str(p) for p in parts))[:_NOTICE_MAX]
+
+
 def _unknown_notice_text(kind: str, data: dict) -> str:
     """One line naming an unknown event type and the ids it actually carries.
 
     Only the fields in `_UNKNOWN_NOTICE_FIELDS` are considered, and only scalar
     values: a notice is rendered live as a progress line, so a payload dump would
-    be both noise and a §0.3 leak. Whitespace is collapsed so the result is one
-    line, and it is truncated to 200 characters — the same bound `_notice_text`
-    uses — so one absurd value cannot own the line.
+    be both noise and a §0.3 leak. The event `type` is the ONE value here that is
+    not from that allow-list, and it is named on purpose — an unknown event that
+    could not say which type it was would be the silent drop this replaces. It
+    goes through `_notice_line` with everything else, so it is collapsed to one
+    line and the finished string is capped at 200 characters.
     """
-    parts = [f"session.event {_one_line(kind)}"]
+    parts: list[object] = ["session.event", kind]
     for key in _UNKNOWN_NOTICE_FIELDS:
         value = data.get(key)
         if isinstance(value, (str, int, float, bool)) and str(value):
-            parts.append(f"{key}={_one_line(value)}")
-    return " ".join(parts)[:200]
+            parts.append(f"{key}={value}")
+    return _notice_line(*parts)
 
 
 def _warn_unknown_once(kind: str) -> None:
@@ -396,19 +420,22 @@ def _notice_text(notification) -> str | None:
     Structured facts do NOT come through here; they come through `_project`,
     which is why this stays deliberately lossy.
     """
-    method = str(getattr(notification, "method", "") or "notification")
+    method = _one_line(getattr(notification, "method", "") or "notification")
     detail = ""
     payload = getattr(notification, "payload", None)
     if isinstance(payload, dict):
         event = payload.get("event")
         if isinstance(event, dict):
-            detail = str(event.get("type") or "")
+            # The raw event `type` is the only non-allow-listed field this notice
+            # can carry, and naming it is the point; `_notice_line` collapses and
+            # caps it with the rest, so a type carrying prose cannot add a line.
+            detail = _one_line(event.get("type") or "")
         elif payload.get("status"):
-            detail = str(payload.get("status"))
+            detail = _one_line(payload.get("status"))
     blob = f"{method} {detail}".lower()
     if not any(word in blob for word in _NOTICE_WORTHY):
         return None
-    return f"{method} {detail}".strip()[:200]
+    return _notice_line(method, detail)
 
 
 def _forward(notification, streamed: "_Streamed | None" = None) -> None:
@@ -426,9 +453,14 @@ def _forward(notification, streamed: "_Streamed | None" = None) -> None:
         method = str(getattr(notification, "method", "") or "notification")
         _log.warning("dsh: projector failed for %s: %s: %s",
                      method, type(exc).__name__, exc)
-        detail = f"{type(exc).__name__}: {exc}"[:200]
+        # The WHOLE line goes through `_notice_line`, not just the detail: the
+        # old shape capped `f"{type(exc).__name__}: {exc}"` at 200 and then
+        # prepended a ~40-character prefix, so the finished notice could reach
+        # ~240 — and an exception message can carry arbitrary prose, which is
+        # the one place §0.3's no-owner-prose rule could leak.
         events = [{"type": "notice",
-                   "text": f"session.event could not be projected: {detail}"}]
+                   "text": _notice_line("session.event could not be projected:",
+                                        f"{type(exc).__name__}: {exc}")}]
     try:
         for ev in events:
             _emit(ev)
