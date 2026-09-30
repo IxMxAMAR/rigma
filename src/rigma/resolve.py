@@ -5,8 +5,9 @@ import re
 
 from pydantic import ValidationError
 
-from .models import (CACHE_BYTES, LAUNCH_PARALLEL, CachePolicy, ComboFlags,
-                     GgufFile, HardwareProfile, ModelSpec, RunPlan)
+from .models import (CACHE_BYTES, ENGINE_DEFAULT_UBATCH, LAUNCH_PARALLEL,
+                     CachePolicy, ComboFlags, GgufFile, HardwareProfile,
+                     ModelSpec, RunPlan)
 from .registry import Registry
 
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
@@ -26,6 +27,61 @@ RAM_RESERVE_MB = 2048
 # Still ~2x the largest observation. MoE and larger batches allocate more, which
 # is what the margin is for.
 COMPUTE_BUFFER_MB = 150
+
+
+def compute_buffer_mb(ubatch: int = 0) -> float:
+    """llama.cpp's scratch allocation for a physical batch of `ubatch`, in MB.
+
+    COMPUTE_BUFFER_MB above is the figure MEASURED at ubatch 512 (the engine's
+    own default), and llama.cpp sizes its compute buffer by the PHYSICAL batch:
+    the KQ/KQV and matmul scratch scale with `n_ubatch`, not with the logical
+    `n_batch`. So a requested ubatch is charged proportionally — the sweep's
+    16384/2048, the config this lever exists to reach, costs 150 * 2048/512 =
+    600 MB rather than the 512-token figure, which is the difference between a
+    plan that fits and one that pages. Independent corroboration of the
+    direction (not of the constant): "the compute buffer ... scales with -ub
+    and is essentially independent of -b" — multigrid.ai/learn/
+    llamacpp-batch-ubatch.
+
+    PREDICTION, not a measurement: the scaling is linear from the one measured
+    point. The constant is already ~2x the largest observation at 512 (37-81
+    MiB) precisely so the margin absorbs the fixed and nonlinear terms, and a
+    larger ubatch moves all of them in the same direction.
+
+    Below 512 the constant is a FLOOR, not a proportional cut: there is no
+    measurement under 512, and shrinking the reserve on an unmeasured
+    extrapolation would make the fit optimistic in the unsafe direction (the
+    launch OOM this whole module exists to prevent).
+
+    0 = no opinion = the engine default, so a plan with no override is
+    byte-identical to before this lever existed.
+    """
+    if ubatch <= ENGINE_DEFAULT_UBATCH:
+        return float(COMPUTE_BUFFER_MB)
+    return COMPUTE_BUFFER_MB * ubatch / ENGINE_DEFAULT_UBATCH
+
+
+def launch_ubatch(spec: ModelSpec) -> int:
+    """The `-ub` this model will actually launch with (0 = engine default).
+
+    The launch default IS the request — there is no other route into `-ub` —
+    so the fit reads it from the spec rather than being told separately by each
+    caller, which is what keeps `resolve`, `fit_for_launch` and the Models-page
+    explorer pricing the same launch."""
+    launch = getattr(spec, "launch", None)
+    if launch is None:
+        return 0
+    return max(0, int(getattr(launch, "ubatch", 0) or 0))
+
+
+def launch_ngl(spec: ModelSpec) -> int:
+    """The requested `-ngl` cap, or -1 when the model has no opinion."""
+    launch = getattr(spec, "launch", None)
+    if launch is None:
+        return -1
+    return int(getattr(launch, "ngl", -1))
+
+
 # CACHE_BYTES lives in models.py: the fit math here and ComboFlags' K/V
 # normalisation must read ONE table, and the validators that reject an unknown
 # cache type live next to it. Re-exported here because this module is where the
@@ -332,7 +388,8 @@ def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int,
 
 
 def _budgets(profile: HardwareProfile,
-             other_vram_mb: float | None = None) -> tuple[float, float]:
+             other_vram_mb: float | None = None,
+             ubatch: int = 0) -> tuple[float, float]:
     """Usable VRAM and RAM for a plan.
 
     `other_vram_mb` is what the desktop is measured to be holding. Without it
@@ -345,6 +402,10 @@ def _budgets(profile: HardwareProfile,
     The constant stays a FLOOR. A measurement may only make the budget
     smaller, never larger: it is a snapshot, the user can open something a
     second later, and being optimistic here is what caused the bug.
+
+    `ubatch` is the model's requested physical batch (0 = engine default). It
+    only moves the COMPUTE term — `compute_buffer_mb` — because that is the one
+    part of the reserve llama.cpp sizes from it.
     """
     # llama.cpp splits tensors across all GPUs, so budget the SUM of their
     # VRAM (reserving per-card overhead), not just the primary
@@ -358,14 +419,21 @@ def _budgets(profile: HardwareProfile,
                 else other_vram_mb) or 0.0
     if measured >= total_vram:
         measured = 0.0
-    reserve = max(floor, measured) + COMPUTE_BUFFER_MB
+    reserve = max(floor, measured) + compute_buffer_mb(ubatch)
     vram = total_vram - reserve
     return max(vram, 0), max(profile.ram_free_mb - RAM_RESERVE_MB, 0)
 
 
 def fit_gguf(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
-             ctx: int, explain: list[str], backend: str = "") -> ComboFlags | None:
-    usable_vram, usable_ram = _budgets(profile)
+             ctx: int, explain: list[str], backend: str = "",
+             ubatch: int | None = None) -> ComboFlags | None:
+    # The physical batch the launch will use, unless the caller is pricing a
+    # different one. None = read the model's own launch default (the only route
+    # into -ub), so `resolve`, `fit_for_launch` and `quant_verdicts` all price
+    # the same launch; an explicit value exists for callers comparing ubatches.
+    if ubatch is None:
+        ubatch = launch_ubatch(spec)
+    usable_vram, usable_ram = _budgets(profile, ubatch=ubatch)
     # Two passes, and the order matters: try EVERY cache type fully on the GPU
     # before letting any of them spill weights to RAM. Quantising the cache
     # costs ~8.5 effective bits; pushing layers (or experts) to system RAM costs
@@ -646,6 +714,93 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     return None
 
 
+def _apply_launch_ngl(spec: ModelSpec, flags: ComboFlags, allowed: int,
+                      ctx: int, cache_type: str,
+                      explain: list[str]) -> ComboFlags:
+    """Fold a requested `-ngl` into a fitted plan: CLAMP DOWN, with a note.
+
+    The request is a CAP, never a pin. Putting MORE layers on the GPU than the
+    fit allows is the exact overcommit the fit exists to prevent (Windows/WDDM
+    accepts the allocation and pages it, so the launch "succeeds" and runs at
+    PCIe speed with nothing printed), so it is clamped to what fits. Asking for
+    FEWER layers is honoured as-is: that direction only frees VRAM.
+
+    Refusing instead was considered and rejected. The value is stored per model
+    and outlives the machine state it was chosen in; a stored `ngl: 63` that
+    stops fitting because a browser opened would then make the model
+    UNLAUNCHABLE, where every other memory lever here degrades (the cache ladder
+    steps down, `_grow_ctx` stops growing, the dense fit spills layers). Clamping
+    is the same policy, and `allowed` is the fit's own number, so the plan and
+    the argv cannot disagree about the placement.
+
+    `allowed` is the fit's raw ngl (99 = "all"). The note is emitted only when
+    there IS a request, so a plan with no override stays byte-identical.
+    """
+    want = launch_ngl(spec)
+    if want < 0 or flags is None:
+        return flags
+    used = min(want, allowed)
+    if used < want:
+        explain.append(
+            f"launch default ngl {want} exceeds what fits at ctx {ctx:,} "
+            f"({cache_type}): using {used}")
+    else:
+        explain.append(f"launch default ngl {want} (the fit allows {allowed})")
+    return flags.model_copy(update={"ngl": used})
+
+
+def _with_launch_defaults(plan: RunPlan, spec: ModelSpec | None,
+                          profile: HardwareProfile) -> RunPlan:
+    """Fold a model's stored launch defaults into a resolved plan.
+
+    `batch`/`ubatch` are copied straight on: they are a request, not a
+    placement, and nothing in the fit can contradict them (the pair was checked
+    launchable when it was stored, and `ComboFlags` re-checks it). `ngl` is a
+    CAP and is priced against the fit at THIS plan's ctx and cache, so the plan
+    says what it actually used rather than what was asked for.
+
+    The raw fit is obtained by neutralising only the request (`ngl` -1) on a
+    copy of the spec: `fit_for_launch` would itself clamp, and clamping twice
+    would report the clamped number as "what the fit allows". The copy keeps
+    `ubatch`, so the compute buffer charged here is the one that will launch.
+    """
+    if spec is None:
+        return plan
+    launch = getattr(spec, "launch", None)
+    if launch is None:
+        return plan
+    upd = {}
+    if launch.batch > 0:
+        upd["batch"] = launch.batch
+    if launch.ubatch > 0:
+        upd["ubatch"] = launch.ubatch
+    if upd:
+        plan.flags = plan.flags.model_copy(update=upd)
+    want = launch_ngl(spec)
+    if want < 0:
+        return plan
+    bare = spec.model_copy(update={
+        "launch": launch.model_copy(update={"ngl": -1})})
+    # Price the vision setting that will actually launch: a model pinned
+    # text-only frees the projector, which is worth GPU layers, and pricing the
+    # projector anyway would report a smaller cap than the launch will use.
+    allowed, _ = fit_for_launch(
+        bare, plan.gguf, profile, plan.flags.ctx,
+        kv=plan.flags.cache_type_k, vision=(True if launch.vision is None
+                                            else launch.vision),
+        spec_type=plan.flags.spec_type,
+        n_max=plan.flags.spec_n_max, backend=plan.backend, explain=[])
+    if allowed is None:
+        plan.explain.append(
+            f"launch default ngl {want} cannot be placed at ctx "
+            f"{plan.flags.ctx:,}; keeping the resolver's ngl {plan.flags.ngl}")
+        return plan
+    plan.flags = _apply_launch_ngl(spec, plan.flags, allowed.ngl,
+                                   plan.flags.ctx, allowed.cache_type_k,
+                                   plan.explain)
+    return plan
+
+
 def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
                    ctx: int, *, kv: str = "", vision: bool = True,
                    spec_type: str = "", n_max: int = 0, backend: str = "",
@@ -676,9 +831,15 @@ def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     keeps the ladder so a too-large cache degrades instead of failing. A stored
     spec that carries the flag anyway is honoured as "no opinion" here.
 
+    A requested `-ngl` (launch default) is applied LAST, as a CAP: clamped down
+    to what the fit allows, never above it. The launch paths re-fit here at a
+    requested ctx, so without this the fit's own ngl would silently overwrite
+    the request — and the request would be what the caller believes is running.
+
     Returns "" for the second value when the requested type was used as-is, or
     the requested type when the fit stepped down from it.
     """
+    expl = explain if explain is not None else []
     fit = with_launch_overheads(spec, vision=vision, ctx=ctx,
                                 spec_type=spec_type, n_max=n_max)
     if kv:
@@ -688,8 +849,10 @@ def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         fit = fit.model_copy(update={
             "cache_type_policy": fit.cache_type_policy.model_copy(
                 update={"pinned": False})})
-    flags = fit_gguf(fit, gguf, profile, ctx,
-                     explain if explain is not None else [], backend=backend)
+    flags = fit_gguf(fit, gguf, profile, ctx, expl, backend=backend)
+    if flags is not None:
+        flags = _apply_launch_ngl(spec, flags, flags.ngl, ctx,
+                                  flags.cache_type_k, expl)
     stepped = kv if (kv and flags is not None
                      and flags.cache_type_k != kv) else ""
     return flags, stepped
@@ -806,7 +969,10 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
     # fused differ per backend and the page is one click from a launch. Default
     # to the one a launch would pick.
     be = backend or _backend(profile)
-    usable_vram, _ = _budgets(profile)
+    # Price the SAME physical batch the fit below will price, or the row's
+    # "headroom / OVER by" arithmetic would describe a launch this model is not
+    # going to run (the A2b/A2d failure mode, one term over).
+    usable_vram, _ = _budgets(profile, ubatch=launch_ubatch(spec))
     mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
     out = []
     # AUDIT F21: docs/audit-2026-09-04-full.md — the probe ladder is capped by
@@ -856,7 +1022,8 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
                     f"{flags.cache_type_k}")
         if spec.cache_type_policy.pinned and spec.moe is None and spill > 0:
             rung = _resident_rung(spec, g, profile, flags.ctx, usable_vram,
-                                  _budgets(profile)[1], be)
+                                  _budgets(profile,
+                                           ubatch=launch_ubatch(spec))[1], be)
             if rung is not None:
                 note = (f"{flags.cache_type_k} spills at ctx {flags.ctx} "
                         f"({_cpu_layers(spec, flags)} of {spec.n_layers} layers "
@@ -1111,7 +1278,7 @@ def _combo_rejection(combo, spec: ModelSpec, gguf: GgufFile,
     desktop `rigma sweep` benchmarked an over-budget config and could crown a
     winner picked by paging noise.
     """
-    usable_vram, usable_ram = _budgets(profile)
+    usable_vram, usable_ram = _budgets(profile, ubatch=launch_ubatch(spec))
     if combo.budget is not None:
         if usable_vram < combo.budget.vram_mb * (1 - _COMBO_BUDGET_SLACK):
             return (f"verified at {combo.budget.vram_mb}MB usable VRAM; this "
@@ -1181,12 +1348,17 @@ def resolve(profile: HardwareProfile, registry: Registry,
                       "packaged one disagree)")
             why = _combo_rejection(combo, spec, gguf, profile)
             if not why:
-                return _apply_calibration(RunPlan(
+                plan = RunPlan(
                     model_slug=combo.model, gguf=gguf, backend=combo.backend,
                     flags=combo.flags, origin=f"{kind}:{rel}",
                     explain=([f"registry match: {rel}"]
-                             + _tier_note(rel, profile) + combo.sources)),
-                    profile)
+                             + _tier_note(rel, profile) + combo.sources))
+                # A model's stored launch defaults apply on the combo path too:
+                # `rigma up` with no --model lands here, and a stored ubatch/ngl
+                # that only worked through the calculator would be a default
+                # that applies to some launches and not others.
+                return _apply_calibration(
+                    _with_launch_defaults(plan, spec, profile), profile)
             rejected = [f"registry {kind} '{rel}' NOT used: {why}",
                         "falling back to the fit calculator"]
     if model_override:
@@ -1201,13 +1373,17 @@ def resolve(profile: HardwareProfile, registry: Registry,
     if plan:
         if rejected:
             plan.explain = rejected + list(plan.explain)
+        plan = _with_launch_defaults(plan, registry.models.get(plan.model_slug),
+                                     profile)
         return _apply_calibration(plan, profile)
     # absolute floor: smallest model, smallest quant, CPU
     have_ggufs = [m for m in registry.models.values() if m.ggufs]
     if not have_ggufs:
         raise ResolveError("no model in the registry has a gguf to run")
     spec = min(have_ggufs, key=lambda m: m.ggufs[-1].bytes)
-    return _apply_calibration(RunPlan(
+    plan = RunPlan(
         model_slug=spec.slug, gguf=spec.ggufs[-1], backend="cpu",
         flags=ComboFlags(ctx=_ctx_floor(spec), ngl=0), origin="calculator",
-        explain=rejected + ["floor: nothing larger fits"]), profile)
+        explain=rejected + ["floor: nothing larger fits"])
+    return _apply_calibration(_with_launch_defaults(plan, spec, profile),
+                              profile)
