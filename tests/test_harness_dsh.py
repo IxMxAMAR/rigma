@@ -9,16 +9,17 @@ exception — the caller is a tool.
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 import textwrap
 import threading
 import time
-import types
 from pathlib import Path
 
 import pytest
 
 from rigma import harness_dsh
+from rigma import tools
 
 
 @pytest.fixture(autouse=True)
@@ -515,16 +516,8 @@ def test_a_timeout_is_still_an_error_not_a_stop(monkeypatch, tmp_path):
     assert "timed out" in events[-1].text
 
 
-def test_a_failed_tree_kill_is_reported_not_assumed(monkeypatch):
-    """`kill_tree` swallows its own failure, so "was killed" could be a claim
-    about something that did not happen.
-
-    `taskkill /T` is the only thing that reaches the Node grandchild — and it is
-    the one call this environment refuses outright. When it fails, `proc.kill()`
-    still takes the Python runner, so the turn ends and the message used to say
-    the agent was killed while the agent is in fact still running against the
-    model server, holding VRAM. The user's only signal is that message.
-    """
+def _tree_proc():
+    """A process stub for `kill_tree`: never spawned, never left behind."""
     class FakeProc:
         pid = 4242
         stdin = stdout = stderr = None
@@ -539,48 +532,121 @@ def test_a_failed_tree_kill_is_reported_not_assumed(monkeypatch):
             return 0
 
         def poll(self):
-            return None         # still running, so the tree kill is attempted
+            return None     # `_stop` must take the kill path; `_kill_tree` is stubbed
 
-    monkeypatch.setattr(harness_dsh._harness.os, "name", "nt")
-    monkeypatch.setattr(harness_dsh._harness.subprocess, "run",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
-    assert harness_dsh._harness.kill_tree(FakeProc()) is False
+    return FakeProc()
+
+
+def test_a_failed_tree_kill_is_reported_not_assumed(monkeypatch):
+    """`kill_tree` reports what it could CONFIRM, not what it attempted.
+
+    `_kill_tree` is the only thing that reaches the Node grandchild, and it can
+    come back unconfirmed — `taskkill /T` is refused here, and the Python runner
+    dying says nothing about the grandchild it left. `proc.kill()` still ends the
+    turn either way, so the message used to say the agent was killed while it was
+    in fact still running against the model server, holding VRAM. The user's only
+    signal is that message.
+    """
+    monkeypatch.setattr(tools, "_kill_tree", lambda *a, **k: False)
+    result = harness_dsh._harness.kill_tree(_tree_proc())
+    assert result.ok is False
+    assert result.attempted is True
 
     # and the turn that timed out says so, rather than claiming a kill
-    run = harness_dsh._Run(proc=FakeProc(), hard=True)
+    run = harness_dsh._Run(proc=_tree_proc(), hard=True)
     events = list(harness_dsh._read_events(run, 0.0))
     assert events[-1].kind == "error"
     assert "STILL BE RUNNING" in events[-1].text, events[-1].text
+    assert "could not be confirmed dead" in events[-1].text
     assert "and was killed" not in events[-1].text
 
 
 def test_a_tree_kill_that_worked_says_nothing_extra(monkeypatch):
     """The warning must not become noise on the path that works."""
-    class FakeProc:
-        pid = 4242
-        stdin = stdout = stderr = None
+    monkeypatch.setattr(tools, "_kill_tree", lambda *a, **k: True)
+    result = harness_dsh._harness.kill_tree(_tree_proc())
+    assert result.ok is True
+    assert result.confirmed is True
 
-        def kill(self):
-            pass
-
-        def terminate(self):
-            pass
-
-        def wait(self, timeout=None):
-            return 0
-
-        def poll(self):
-            return None         # still running: the kill path is what is under test
-
-    monkeypatch.setattr(harness_dsh._harness.os, "name", "nt")
-    monkeypatch.setattr(harness_dsh._harness.subprocess, "run",
-                        lambda *a, **k: types.SimpleNamespace(returncode=0))
-    assert harness_dsh._harness.kill_tree(FakeProc()) is True
-
-    run = harness_dsh._Run(proc=FakeProc(), hard=True)
+    run = harness_dsh._Run(proc=_tree_proc(), hard=True)
     events = list(harness_dsh._read_events(run, 0.0))
     assert events[-1].kind == "error"
     assert "and was killed" in events[-1].text
+    assert "STILL BE RUNNING" not in events[-1].text
+    assert "could not be confirmed dead" not in events[-1].text
+
+
+def test_a_posix_tree_kill_reports_the_death_it_confirmed(monkeypatch):
+    """POSIX + already-dead → ok True.
+
+    The old body hardcoded `ok = False` off Windows, so a tree that HAD died was
+    reported as unconfirmed on every Linux/macOS timeout.
+    """
+    calls = []
+    monkeypatch.setattr(harness_dsh._harness.os, "name", "posix")
+    monkeypatch.setattr(tools, "_kill_tree",
+                        lambda pid, proc=None, **kw: calls.append(pid) or True)
+
+    result = harness_dsh._harness.kill_tree(_tree_proc())
+
+    assert result.ok is True
+    assert result.attempted is True
+    assert result.confirmed is True
+    assert calls == [4242], calls
+
+
+def test_a_posix_tree_kill_reports_a_death_it_could_not_confirm(monkeypatch):
+    """POSIX + still-alive-after-kill → ok False and attempted True."""
+    calls = []
+    monkeypatch.setattr(harness_dsh._harness.os, "name", "posix")
+    monkeypatch.setattr(tools, "_kill_tree",
+                        lambda pid, proc=None, **kw: calls.append(pid) or False)
+
+    result = harness_dsh._harness.kill_tree(_tree_proc())
+
+    assert result.ok is False
+    assert result.attempted is True
+    assert result.confirmed is False
+    assert calls == [4242], calls
+
+
+def test_the_tree_kill_is_delegated_exactly_once(monkeypatch):
+    """One delegation is the contract (AUDIT F35).
+
+    An earlier revision ran `taskkill` here AND inside `tools._kill_tree`, so the
+    kill happened twice. `kill_tree` must not spawn a killer of its own.
+    """
+    calls = []
+    monkeypatch.setattr(harness_dsh._harness.os, "name", "nt")
+    monkeypatch.setattr(tools, "_kill_tree",
+                        lambda pid, proc=None, **kw: calls.append(pid) or True)
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("kill_tree spawned its own killer")))
+
+    result = harness_dsh._harness.kill_tree(_tree_proc())
+
+    assert calls == [4242], calls
+    assert result.ok is True
+
+
+def test_a_confirmed_dead_tree_is_not_reported_as_a_failure(monkeypatch):
+    """The timeout message must not claim the agent may still be running when the
+    kill was confirmed.
+
+    On POSIX the old body returned `ok = False` unconditionally, so every
+    Linux/macOS timeout claimed the agent might still be holding VRAM even when
+    the process was already gone. The message is the only signal the owner gets.
+    """
+    monkeypatch.setattr(harness_dsh._harness.os, "name", "posix")
+    monkeypatch.setattr(tools, "_kill_tree", lambda *a, **k: True)
+
+    run = harness_dsh._Run(proc=_tree_proc(), hard=True)
+    events = list(harness_dsh._read_events(run, 0.0))
+
+    assert events[-1].kind == "error"
+    assert "and was killed" in events[-1].text, events[-1].text
+    assert "could not be confirmed dead" not in events[-1].text
     assert "STILL BE RUNNING" not in events[-1].text
 
 
