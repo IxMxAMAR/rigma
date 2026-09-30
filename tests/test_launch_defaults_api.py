@@ -172,3 +172,43 @@ def test_a_bad_kv_is_still_refused(client):
     c, slug = client
     r = c.post(f"/api/models/{slug}/defaults", json={"kv": "q3_k"})
     assert r.status_code == 400 and "kv must be one of" in r.json()["error"]
+
+
+def test_the_post_accepts_batch_ubatch_and_ngl(client):
+    """C10: Rigma could already emit -b/-ub/-ngl, but no caller could ask for
+    them, so they were unreachable from the UI. They must persist and read back
+    on the surface the UI already loads."""
+    c, slug = client
+    r = c.post(f"/api/models/{slug}/defaults",
+               json={"batch": 16384, "ubatch": 2048, "ngl": 40})
+    assert r.status_code == 200, r.text
+    launch = r.json()["launch"]
+    assert (launch["batch"], launch["ubatch"], launch["ngl"]) == (16384, 2048,
+                                                                  40)
+    assert c.get(f"/api/models/{slug}/defaults").json()["launch"] == launch
+    row = {m["slug"]: m for m in c.get("/api/models").json()["models"]}[slug]
+    assert row["launch"]["ngl"] == 40
+    # `ngl: 0` is a real request (every layer on the CPU), not "clear it"
+    r = c.post(f"/api/models/{slug}/defaults", json={"ngl": 0})
+    assert r.status_code == 200, r.text
+    assert r.json()["launch"]["ngl"] == 0
+    # …while null clears it back to "no opinion"
+    r = c.post(f"/api/models/{slug}/defaults", json={"ngl": None})
+    assert r.status_code == 200, r.text
+    assert r.json()["launch"]["ngl"] == -1
+
+
+def test_an_illegal_batch_pair_is_a_400_not_a_500(client):
+    """llama.cpp refuses to start with `-ub` > `-b`, so the pair is refused at
+    write time with a reason. The engine default batch (2048) applies when
+    `batch` is unset, so a lone `ubatch: 4096` is refused too — and neither may
+    surface as an uncaught pydantic ValidationError (a 500)."""
+    c, slug = client
+    r = c.post(f"/api/models/{slug}/defaults",
+               json={"batch": 4096, "ubatch": 8192})
+    assert r.status_code == 400, r.text
+    assert "ubatch 8192 exceeds batch 4096" in r.json()["error"]
+    r = c.post(f"/api/models/{slug}/defaults", json={"ubatch": 4096})
+    assert r.status_code == 400, r.text
+    assert "engine default" in r.json()["error"]
+    assert c.get(f"/api/models/{slug}/defaults").json()["launch"] is None

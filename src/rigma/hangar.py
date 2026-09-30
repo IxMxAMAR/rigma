@@ -14,6 +14,8 @@ import shutil
 import threading
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from .atomicio import atomic_write_json, atomic_write_text
 from .gguf_meta import GgufParseError, inspect_gguf
 from .models import GgufFile, ModelSpec, MoESpec
@@ -1149,11 +1151,20 @@ def set_launch_defaults(slug: str, registry=None, **fields) -> ModelSpec:
             # which the HTTP route does not catch (it catches HangarError), so
             # the documented way to remove a default answered 500 for six
             # fields out of seven. Map None to the field's own declared default:
-            # "" / 0 for the sentinels, and None for `vision`, whose unset value
-            # really is None because it is tri-state.
+            # "" / 0 for the sentinels, None for `vision`, whose unset value
+            # really is None because it is tri-state, and -1 for `ngl`.
             value = LaunchDefaults.model_fields[key].get_default()
         current[key] = value
-    launch = LaunchDefaults(**current)
+    try:
+        launch = LaunchDefaults(**current)
+    except ValidationError as e:
+        # C10: `batch`/`ubatch` are cross-checked (ubatch > batch is refused by
+        # the engine), so a bad pair is a user error with a user-facing reason —
+        # the same 400 as every other bad launch setting, not a 500. Before the
+        # check existed there was nothing here that could fail validation; now
+        # there is, and the route catches HangarError only.
+        raise HangarError("; ".join(
+            str(err.get("msg", err)) for err in e.errors())) from None
     # Everything cleared means no opinion at all; store None rather than an
     # empty object, so a spec that pins nothing reads as pinning nothing.
     updated = spec.model_copy(update={
