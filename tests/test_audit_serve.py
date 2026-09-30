@@ -7,6 +7,7 @@ next streamed turn emits, and `Engine.aux` what a non-streaming call (the
 summarizer, the titler, the delegate helper) answers with.
 """
 import json
+import logging
 import os
 import re
 import threading
@@ -542,6 +543,42 @@ def test_a_finished_turn_leaves_no_partial_behind(home, engine):
     assert not [m for m in msgs if m.get("partial")]
     assert msgs[-1]["content"] == "all done"
     assert len([m for m in msgs if m.get("role") == "assistant"]) == 1
+
+
+def test_a_turn_that_cannot_be_saved_is_not_reported_as_saved(
+        home, engine, monkeypatch, caplog):
+    """A1: if every persist attempt loses the CAS race, the finished reply is
+    not in the store. `alive` started True and was only ever assigned on
+    SUCCESS, so exhaustion left it True and the turn was treated as saved —
+    silently, with the reply living only in whatever partial happened to have
+    been checkpointed. It has to say so, and leave the words behind."""
+    _running()
+    Engine.script = [_say("the whole reply")]
+    real = sessions.reload_and_extend
+
+    def _always_stale(sid, messages, since, **kw):
+        m = real(sid, messages, since, **kw)
+        if m is not None:
+            m[sessions.REV_KEY] = -1      # every save() now loses the CAS
+        return m
+
+    monkeypatch.setattr(sessions, "reload_and_extend", _always_stale)
+    c = _client(engine.port)
+    sid = _seed(c, 2)
+    with caplog.at_level(logging.ERROR, logger="rigma.serve"):
+        r = c.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    # surfaced to the user, not swallowed
+    assert "event: notice" in r.text
+    assert "could not be saved" in r.text
+    # ...and logged, with the reason
+    assert "could not save" in caplog.text
+    msgs = sessions.load(sid)["messages"]
+    # never recorded as a finished turn...
+    assert not [m for m in msgs
+                if m.get("role") == "assistant" and not m.get("partial")]
+    # ...but left un-final, so the checkpoint path kept the words
+    kept = [m for m in msgs if m.get("partial")]
+    assert kept and kept[0]["content"] == "the whole reply"
 
 
 def test_a_partial_never_reaches_the_model(home, engine):
