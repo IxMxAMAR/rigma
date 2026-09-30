@@ -345,11 +345,36 @@ class AcpClient:
         slot["event"].set()
 
     def _handle_notification(self, frame: dict) -> None:
+        method = str(frame.get("method") or "")
+        params = frame.get("params") or {}
+        # RECORD BEFORE THE SINK RUNS. The sink mirrors the client's state, so the
+        # state has to be current by the time it is asked. `current_mode_update` is
+        # the only session fact the server pushes that this client already records
+        # elsewhere (in `self.modes`, from `session/new`/`session/resume`), and a
+        # recorded id that never moves would leave `current_mode()` — and the
+        # mirrored modes payload — frozen at the handshake's value.
+        self._record_notification_state(method, params)
         try:
-            self._on_event({"method": frame.get("method"),
-                            "params": frame.get("params") or {}})
+            self._on_event({"method": method, "params": params})
         except Exception:
             pass
+
+    def _record_notification_state(self, method: str, params: dict) -> None:
+        """Keep the client's own view of the session in step with the server's.
+
+        Only facts this client ALREADY stores belong here, so there is one recorded
+        copy rather than two. `current_mode_update` carries the current id alone: the
+        available list came from the handshake and is not re-sent, so the id is merged
+        into the recorded `modes` object rather than replacing it. The variant is
+        detected by the module's own `_is_current_mode_update`, so the client and the
+        turn path cannot disagree about the name.
+        """
+        if not _is_current_mode_update({"method": method, "params": params}):
+            return
+        update = params.get("update") if isinstance(params, dict) else {}
+        mode = str((update or {}).get("currentModeId") or "")
+        if mode:
+            self.modes = {**(self.modes or {}), "currentModeId": mode}
 
     def _decline(self, method: str, params: dict) -> Any:
         """The protocol's own refusal for a request this client cannot serve.
@@ -1072,6 +1097,58 @@ def probe_surface(argv: list[str], *, cwd: str = "", env: dict | None = None,
     return out
 
 
+# --- the session's advertised modes -------------------------------------------
+#
+# WHY THIS EXISTS. `mode_set` is reachable over HTTP and had no UI for one reason: the
+# valid `modeId`s arrive in `session/new`'s `modes.availableModes`, and Rigma never put
+# them on the wire. The only place they appeared was `probe_surface`, which nothing in
+# the product calls. Hardcoding `plan`/`default` was rejected, correctly — a control
+# whose values stop matching the server on the next mcode version is worse than none.
+#
+# The client already RECORDS the server's answer (`self.modes`, kept current by
+# `current_mode_update`); the payload below translates it and the turn path MIRRORS it
+# on the same `acp_config` event the panel draws for the session's `configOptions`. One
+# channel, two fields: a consumer replaces only the field it was sent, so a
+# `config_option_update` (configOptions only) cannot blank the modes, and a mode change
+# cannot blank the options.
+
+def acp_modes_payload(modes: object) -> dict:
+    """The session's advertised mode list, in a shape a consumer can draw.
+
+    THE VALUE IS THE SERVER'S, NEVER A CONSTANT. `session/new` and `session/resume`
+    answer with `modes: {currentModeId, availableModes: [{id, name, description}]}`;
+    this translates that record and adds nothing to it.
+
+    `known` is the difference between "the session advertised an (empty) list" and "no
+    list was advertised at all". An absent list comes out as `availableModes: []` with
+    `known: False` — an explicit unknown, not the fabricated `plan`/`default` pair and
+    not an omission a consumer would have to read as "no modes".
+    """
+    raw = modes if isinstance(modes, dict) else {}
+    listed = raw.get("availableModes")
+    available = ([m for m in listed if isinstance(m, dict)]
+                 if isinstance(listed, list) else [])
+    return {
+        "availableModes": available,
+        "currentModeId": str(raw.get("currentModeId") or ""),
+        "known": isinstance(listed, list),
+    }
+
+
+def _is_current_mode_update(notification: dict) -> bool:
+    """Whether this notification is a `current_mode_update` `session/update`.
+
+    Kept beside the payload so the detector, the client's recorder and the mapper's own
+    arm cannot disagree about the variant name.
+    """
+    if str(notification.get("method") or "") != "session/update":
+        return False
+    params = notification.get("params")
+    update = params.get("update") if isinstance(params, dict) else None
+    return (isinstance(update, dict)
+            and str(update.get("sessionUpdate") or "") == "current_mode_update")
+
+
 # --- driving a chat turn over ACP ---------------------------------------------
 #
 # WHY THIS IS THE POINT OF THE WHOLE MODULE. Everything above is transport. A
@@ -1186,12 +1263,15 @@ _CONTROL_OPS: dict[str, tuple[str, tuple[str, ...]]] = {
     # context key, which is what let a request body redirect the operation to another
     # session. The session id comes from the chat row, so nothing is required here.
     "delegation_stop": ("stop this session's delegated work", ()),
-    # REACHABLE OVER HTTP, NO UI CONTROL YET, and the reason is a missing input rather
-    # than an omission: the valid `modeId`s arrive in `session/new`'s response
-    # (`availableModes`), which Rigma does not store. `config_set` can be a dropdown
-    # because the server re-sends its option list on every `config_option_update`; this
-    # one has nothing to read. Hardcoding `plan`/`default` was rejected — it would be a
-    # control that silently stops matching the server on the next mcode version.
+    # REACHABLE OVER HTTP, NO UI CONTROL YET. The blocker recorded here used to be a
+    # missing INPUT: the valid `modeId`s arrive in `session/new`'s response
+    # (`availableModes`) and Rigma did not store them, so there was nothing to build a
+    # closed-set control from — and hardcoding `plan`/`default` was rejected, correctly,
+    # because it would silently stop matching the server on the next mcode version. The
+    # adapter half is now DONE: the session's real list is recorded by `AcpClient` and
+    # mirrored on the `acp_config` event (`acp_modes_payload`) at every handshake and on
+    # every `current_mode_update`. What remains is the frontend control that reads it and
+    # calls this operation; there is no server-side work left.
     "mode_set":       ("change the mode (plan/default)", ("modeId",)),
     "config_set":     ("change a configOption (model, permissionMode)",
                        ("optionId", "value")),
@@ -1411,9 +1491,36 @@ def drive_turn_acp(prompt: str, *, exe: str = "", base_url: str = "",
     finished = _threading.Event()
     outcome: dict = {}
 
+    def _settings_event() -> "TurnEvent":
+        """The session's advertised settings as of NOW: `configOptions` and `modes`.
+
+        ONE EVENT, TWO FIELDS. `acp_config` is the channel the panel already draws the
+        session's `configOptions` from, and the modes are the same kind of fact — what
+        the session itself said it accepts. A second event name would be a second
+        channel for one concept; a field the consumer did not receive is left alone, so
+        the two never blank each other.
+
+        Sent unconditionally, including when there is nothing to report: an omitted
+        event would leave the PREVIOUS session's modes on screen, stale settings
+        presented as current. The modes come from `acp_modes_payload`, so an absent list
+        is an explicit `known: False` rather than a fabricated default.
+        """
+        opts = getattr(client, "config_options", None)
+        return TurnEvent("state", event="acp_config", data={
+            "configOptions": opts if isinstance(opts, list) else [],
+            "modes": acp_modes_payload(getattr(client, "modes", None)),
+        })
+
     def _on_event(notification: dict) -> None:
         for ev in map_acp_update(notification):
             events.put(ev)
+        # A mode change mid-session is a session-settings change, and
+        # `map_acp_update` only reports the plan-mode BOOLEAN from it. Re-mirror the
+        # whole settings snapshot so the modes a consumer draws are the session's
+        # current truth rather than the handshake's. The client has already RECORDED
+        # the new id by the time this sink runs (`_handle_notification` records first).
+        if _is_current_mode_update(notification):
+            events.put(_settings_event())
 
     def _on_request(method: str, params: dict):
         """Answer a server-initiated request.
@@ -1507,23 +1614,21 @@ def drive_turn_acp(prompt: str, *, exe: str = "", base_url: str = "",
                 client.session_new(cwd or "", timeout=min(timeout, 60.0))
             if state is not None:
                 state["session_id"] = client.session_id
-            # THE HANDSHAKE'S OWN OPTION LIST, FORWARDED.
+            # THE HANDSHAKE'S OWN SETTINGS, FORWARDED.
             #
-            # `session_new`/`session_resume` already answered with `configOptions`, and
-            # `AcpClient` stored them — but the only thing that could put them on the wire
-            # as an `acp_config` event was a `config_option_update` NOTIFICATION. So the
-            # panel's session-settings block, which is gated on the list being non-empty,
-            # rendered nothing at all on a server that does not push an update, and the
-            # values were stale on any server that does.
+            # `session_new`/`session_resume` already answered with `configOptions` AND
+            # `modes`, and `AcpClient` stored both — but the only thing that could put
+            # `configOptions` on the wire as an `acp_config` event was a
+            # `config_option_update` NOTIFICATION, and the modes had no path at all. So
+            # the panel's session-settings block, gated on the option list being
+            # non-empty, rendered nothing on a server that does not push an update, and
+            # the valid `modeId`s for `mode_set` never reached a consumer.
             #
-            # This is the server's current truth as of this turn, which is exactly what the
-            # panel should draw. Sent unconditionally, including when the list is empty, so
-            # a session with no configOptions says so rather than leaving the previous
-            # turn's list on screen.
-            opts = getattr(client, "config_options", None)
-            events.put(TurnEvent("state", event="acp_config",
-                                 data={"configOptions": opts
-                                       if isinstance(opts, list) else []}))
+            # This is the server's current truth as of this turn, which is exactly what
+            # the panel should draw. Sent unconditionally, including when the lists are
+            # empty, so a session with no options or no advertised modes says so rather
+            # than leaving the previous turn's values on screen.
+            events.put(_settings_event())
             # The permission policy is set through the protocol, which is how a
             # session changes it mid-flight — something `exec` cannot do at all.
             try:
