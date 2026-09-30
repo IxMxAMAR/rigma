@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 from . import method_schema as ms
+from . import writelock
 from .atomicio import atomic_write_text
 from .runtime import rigma_home
 
@@ -606,19 +607,25 @@ def save_user(doc: dict) -> tuple[dict | None, list[str]]:
     # method file that `user_methods()` then skips — the prior bytes existed
     # only in RAM. Temp-beside-target + `os.replace`, the same writer the store
     # uses, so the file is either the old one or the new one, never half of it.
-    atomic_write_text(_method_file(full["id"]), json.dumps(full, indent=2))
+    # ODR-8: WRITER_LOCK, so the restore cannot delete this file in the window
+    # between the caller being told "saved" and the bytes landing.
+    with writelock.WRITER_LOCK:
+        atomic_write_text(_method_file(full["id"]), json.dumps(full, indent=2))
     return full, []
 
 
 def delete_user(method_id: str) -> bool:
-    try:
-        f = _method_file(method_id)
-    except MethodIdError:
-        return False                # same answer as "no such user method"
-    if not f.is_file():
-        return False
-    f.unlink()
-    return True
+    # ODR-8: same lock as save_user, so a delete and a save cannot interleave
+    # with each other or with a restore's deletion set.
+    with writelock.WRITER_LOCK:
+        try:
+            f = _method_file(method_id)
+        except MethodIdError:
+            return False                # same answer as "no such user method"
+        if not f.is_file():
+            return False
+        f.unlink()
+        return True
 
 
 def apply_to_session(session: dict, method_id: str) -> dict | None:
