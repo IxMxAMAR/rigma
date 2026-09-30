@@ -162,3 +162,26 @@ superseded), and checkpoint 28 §2.1 (says DSH bridges 15 state events; the tree
 | G3 | A streaming tool-call rescue translator | gated on an observed leak; upstream's fix is `--reasoning-format deepseek` (B7), so do B7 first. |
 | G4 | Raising `COMPUTE_BUFFER_MB` back to 400 | would double-count the draft head's buffers (`resolve.py:14-28`). E2 instead. |
 | G5 | "22 open LOW findings" from `RESUME` §11 | contradicted by that document's own §8c; the tree shows them fixed. |
+
+## Follow-ups opened by the verifiers (wave 1+2)
+
+These were found by the independent verifiers, not by the implementers. Each is a real, recorded
+gap that was left out deliberately to keep the landed commit coherent — none of them invalidates a
+merged item. Ordered by severity.
+
+| id | follow-up | where | why it was not in the landed commit |
+|---|---|---|---|
+| A2b | `_budget_rows` (display only) still omits the RS term, so an explorer budget row can read "fits" while the fit offloads a layer | `resolve.py` | display-only; the fit itself is correct. The explorer's `offload_pct` was fixed (A3) but the budget table was not. |
+| A2c | `memtruth.py:474` still hard-codes `["--parallel","2"]` instead of `models.LAUNCH_PARALLEL` | `memtruth.py:474` | one line; the plan and the argv agree today (both 2), but the memory oracle would verify a different plan if the constant ever changed. |
+| A2d | A pure-Mamba header, a header carrying an explicit `{arch}.attention.recurrent_layers` array, or a partial `ssm.*` geometry derives `recurrent_layers=0` (or charges `S` only) and gets no `rs=unknown` note | `gguf_meta.py`, `resolve.py` | needs a real header of that shape to test; flagged UNVERIFIED. Silent-zero is the failure mode to close. |
+| A13b | For a **registered** engine (`engine_binary_for` prefers one at an arbitrary path; this machine has `prism-b10743-vulkan` and `prism-b10743-hip`) the fingerprint records the path but the version of the *pin*, so an in-place swap still evades it | `kvcache.py`, `server_ops.py` | the brief required "the same source the rest of the code uses"; measuring the launched `exe` (which `launch_fingerprint` already receives) is a wider change. |
+| A4b | Inherited from base `7771ed3`, not from A4: a run of `?` collapses to one `[^/]`, so `??` matches one character instead of two | `tools.py` `_glob_re` | a real semantic regression against pre-R3-16; the A4 DP matcher faithfully reproduces it. Fix separately, with a fuzz test. |
+| B2b | Every formerly-quiet DSH event type now surfaces as a notice, including bookkeeping that checkpoint 28 §2.1 called noise | `_dsh_runner.py`, UI | B2 mandates "an explicit notice, not a silent drop"; a compact/quiet rendering for bookkeeping types is a UX judgement worth making explicitly. |
+| D1c | The default benchmark prompt changed size (2304 → 2048 words at a 2048 budget, −11.1 %) | `bench.py` | needed to make the text varied; recorded so existing calibration entries are not silently treated as comparable. |
+| D1b | `depth > ctx` is not clamped or warned about | `bench.py`, `cli.py` | the user asked for that depth explicitly; clamping would be a product decision. |
+| A5b | Retained false negative: a `Q2_0`=42 file on the pinned `b9867` is still not warned about, because the model-side check short-circuits before the engine is asked | `cli.py` | base behaviour, kept so that no `--verify --refuse` outcome moves. Changing it is an owner decision. |
+| S2b | `engine_log._unknown_plan` returns `unexpected_splits=False` where `None` is meant; and `found=True` with zero buffer lines has no test | `engine_log.py:304-307` | harmless while `known=False` guards it, but a caller reading that key alone sees "no split problem". |
+| A13c | `cli.py:1840` still says "a hash of THIRTEEN launch fields"; the tuple is now 14 | `cli.py:1840` | a comment; fixed in the test file but missed here. |
+| S2c | `tests/test_engine_log_memory.py:14` says the real log "is 5 MB"; it is 357,442 bytes | test docstring | a comment. |
+| A7b | `mcp_server.offered(prof=...)` has the same unknown-profile hole as A7 — no check that the value is one of the allowed set | `mcp_server.py` | a different file from A7's route; found by the implementer while grepping for profile readers. |
+| A11b | `/api/restore`'s rollback is best-effort, and a crash mid-apply can still leave a partial store | `serve.py` | an all-or-nothing guarantee across a crash needs a journal and a recovery step on start, not an undo log; both limits are stated in the commit message and the 500 body. |

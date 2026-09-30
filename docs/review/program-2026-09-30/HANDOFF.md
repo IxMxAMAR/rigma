@@ -29,8 +29,20 @@ rather than remembered (run it from your worktree root — it sets `PYTHONPATH` 
 `src` and uses the owner's venv):
 
 ```powershell
-pwsh -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_foo.py -q
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_foo.py -q -m "not hardware"
 ```
+
+**Semaphore note (fixed 2026-09-30):** the script now has **no `param()` block** and reads `$args`.
+It had one, and `powershell.exe -File` then bound `-m` as a *parameter name*, so every run that
+passed `-m "not hardware"` died with *"A parameter cannot be found that matches parameter name 'm'"*
+— i.e. the §0.1 marker was silently unpassable. The script now also **appends `-m "not hardware"`
+itself when the caller did not pass a marker**, so a hardware test cannot be run by forgetting the
+flag. `addopts` in `pyproject.toml` is only `-q`; it does **not** exclude hardware.
+
+**Environment note (verified 2026-09-30):** `pwsh` (PowerShell 7) is **not installed** on this host —
+only Windows PowerShell 5.1, and `powershell -File` needs `-NoProfile -ExecutionPolicy Bypass`.
+Use the invocation above, not `pwsh -File`. (The Head Agent's own `pwsh` tool works because the
+harness invokes it directly; a subagent shell does not have it on PATH.)
 
 Worktrees: `git worktree add .scratch/wt-<name> -b impl/<name> review/deep-audit-2026-09-22`. Merge
 serially into the integration branch from the main tree. No links or junctions; never
@@ -71,13 +83,23 @@ _(updated at every wave boundary — see `STATUS.md` for the per-item table)_
 
 | wave | commits | items |
 |---|---|---|
-| 0 | — | recon + backlog only; no source change |
-| 1 | _in flight_ | A1, A2, A3, A17/S2, A4, B1, A5, A6 |
+| 0 | `d8f84ab` | recon + backlog + program docs only; no source change |
+| 1 | `e605134` `cb4d221` `a56c0e0` `5b9f149` `dee1c43` `854bcaf` | A1, A17/S2, A4, A2, A3, A13, A5, A6 — all merged, each independently verified (new test observed failing on the unmodified base, then passing) |
+| 2 | _in flight_ | B2 (verifying), D1 (verifying) |
+| 3 | _in flight_ | A8, A14, A15, B7, A7, A11 |
+| 1 | _sent back_ | B1 — the verifier rejected the merge: delegating to `tools._kill_tree` would `killpg` Rigma's own process group on POSIX because the harness children are not detached |
+
+Integration head after the wave-1 merges: **`854bcaf`**.
 
 ## What is in flight
 
-Wave 1 implementers, one per item, each in its own worktree on `impl/w1a`…`impl/w1f`. See
-`STATUS.md` for live state and `.scratch/orchestrator/impl-w1*.md` for their reports.
+Wave 3 implementers, one per item, each in its own worktree on `impl/w3a`…`impl/w3c` plus
+`impl/w2d`. See `STATUS.md` for live state, `.scratch/orchestrator/impl-*.md` for implementer
+reports and `.scratch/orchestrator/verify-*.md` for verifier verdicts.
+
+**Verifier follow-ups that are NOT yet fixed** are listed in `BACKLOG.md` under *"Follow-ups opened
+by the verifiers (wave 1+2)"* — read that table before starting new work; several are one-liners
+(`A2c`, `A13c`, `S2b`, `S2c`) and are good first items for a new session.
 
 ## What is waiting on the GPU (`NEEDS-GPU`)
 
