@@ -29,6 +29,17 @@ At ~15:55 UTC the PC shut down mid-run. On recovery: `git status` clean, `git fs
 **Nothing was lost** because every implementer commits on its own `impl/*` branch. The lesson the
 orchestrator passed on: **commit `HANDOFF.md` at EVERY wave boundary**, not just at the end.
 
+**The resume also changed the delegation budget — read this before planning a wave.** After the
+restart, both `subagent` and `subagent_fork` fail with
+`SubagentDepthError: subagent depth 2 exceeds maxDepth 1`: the resumed session is itself depth 1, so
+it has **no room for children**. Every wave up to 14 ran the implementer/verifier split; from the
+resume on, the Head Agent had to do the verification in-head. **If you are a resumed session, check
+this before writing a wave plan** — one throwaway `subagent` call tells you. When it is blocked, the
+substitute that keeps the discipline honest is: run the verifier's *checks* yourself (the 30-run
+flake loop, the delete-the-line proof, the route-level probe), write the verdict block yourself, and
+**say in the block that the independent agent step was impossible**, so the next session knows the
+verdict is single-sourced.
+
 ## How to run anything
 
 ```powershell
@@ -174,10 +185,11 @@ _(see `STATUS.md` for the per-item table with outcomes and verifier corrections)
 | 11 | `703abdc` `ed52928` `c4d3541` + frontend wave 4 fix | the **C11 fix** (rejected once), DR1/DR8/DR3, DR2/DR4/DR5/DR6, and the frontend restore-copy falsehood |
 | 12 | `a903474` `81db56f` + frontend wave 5 + `f038121` | DR7, DR2-3/C11-read/C10-nits/C10-cli, and the frontend wave 5 (with its one FAILED commit fixed) |
 | 13 | `5241a44` `866bf7b` | **DR2-1/DR2-2/DR1-residual** (the deep-review-2 regression), W13-B (the effective env + case-insensitivity) |
-| 14 | `5b4bcd5` `5806031` `009730d` `02785bf` `7b0db3b` `cefd6fd` `97da7b5` | OD-13's remote stop, the A2d-budget UI, the 400 provenance + prefix strip, the frontend nits |
+| 14 | `5b4bcd5` `5806031` `009730d` `02785bf` `7b0db3b` `cefd6fd` `97da7b5` `f6a0874` | OD-13's remote stop, the A2d-budget UI, the 400 provenance + prefix strip, the frontend nits, and W14-E (the **flaky** pause test — Head Agent's own 30/30 — the `serve.py` provenance comment, and the registry-combo env gate) |
 
-Integration head at this hand-off: **`97da7b5`**. `STATUS.md` carries the per-item table and the note
-on the metadata-only author rewrite (with the old→new hash mapping for every pre-rewrite commit).
+Integration head at this hand-off: **`f6a0874`** (plus the docs commits that follow it). `STATUS.md`
+carries the per-item table and the note on the metadata-only author rewrite (with the old→new hash
+mapping for every pre-rewrite commit).
 
 **A18 is the one that mattered most** and it was found by the full suite, not by reading: the run
 loop's *first* `_runs.load` was unguarded, so a transient unreadable `run.json` raised
@@ -190,33 +202,34 @@ could not see) were fixed in waves 11 and 13.
 
 ## What is in flight / what to do next
 
-`BACKLOG.md`'s follow-up tables are the work queue — read them before starting anything. At this
-hand-off, **`impl/w14e`** (the flaky `test_phase4_lifecycle` pause test, `serve.py:5092`'s stale
-comment, and the registry-combo env bypass) is committed and **being verified**. Everything else in
-waves 0–14 is merged and verified.
+**Nothing is in flight.** Waves 0–14 are merged. Every item in `deep-review-1.md` (DR1–DR9) and
+`deep-review-2.md` (DR2-1…DR2-6) is fixed except **DR9** (which is `OD-14`, an owner decision) and
+the residuals recorded below. `BACKLOG.md`'s follow-up tables are the work queue — read them before
+starting anything.
 
 The highest-value open items, in the program's ranking (what can make something else fail > the
 harness seam > missing levers > UI/UX polish):
 
-1. **A flaky test is a bug.** `tests/test_phase4_lifecycle.py::test_a_pause_does_not_burn_the_clock`
-   failed **~1 run in 10** (proved pre-existing at base `81db56f` by 20 runs). `impl/w14e` fixes it
-   as a test race (the test released the held engine turn before injecting the pause state, so a loop
-   not yet past its first pause check stalled at iteration 0) and reports **30/30**. Verify it.
-2. **DR2-1-residual** — the DR2-1 fix suppresses the VRAM axis for any non-device-resident load, so
+1. **DR2-1-residual** — the DR2-1 fix suppresses the VRAM axis for any non-device-resident load, so
    **MoE is now blind on both the split axis and the VRAM axis**. Honest, but a real loss; restoring
    it needs the plan to persist its device-side placement (a `state.json` schema change).
-3. **W13B-1/W13B-2** — `bench._effective_env` duplicates `run_sweep`'s construction with no test
-   pinning them together; and a registry `Combo.flags` carrying `env` bypassed the merge gate
-   (`resolve.py:1445-1446`) — `impl/w14e` fixes the second.
-4. **W5F5B-N3** — the context floor `2048` is a bare literal in five places
-   (`server_ops.py:754`, `serve.py:4731`, `hangar.py:347` (now named), `resolve.py`'s ladder, and the
-   frontend's `CTX_FLOOR`) plus the legacy `data/ui/panels.js`. Unify in one wave.
-5. **B4b-schema / OD-12** — the question form's nested objects/arrays and `default`, and whether a
+2. **W13B-1** — `bench._effective_env` duplicates `run_sweep`'s construction with no test pinning
+   them together, so a future edit to either silently desyncs the gate from the child it gates. A
+   shared `_trial_flags(plan, override)` makes it structurally impossible.
+3. **W5F5B-N3** — the context floor `2048` is still a bare literal at `server_ops.py:754`,
+   `serve.py:4731-4732`, `resolve.py:1072` and the frontend's `CTX_FLOOR` (the `hangar.py` and
+   legacy-panel sites are named). Unify in one wave.
+4. **B4b-schema / OD-12** — the question form's nested objects/arrays and `default`, and whether a
    timed-out question should emit a server-side expiry event (`QUESTION_WAIT_SECS = 5.0`).
-6. **`OWNER-DECISIONS.md`** — now **OD-1…OD-15**. Each has options, evidence and a recommendation.
+5. **`OWNER-DECISIONS.md`** — now **OD-1…OD-15**. Each has options, evidence and a recommendation.
    OD-15 is the newest: `/api/restore` replaces memory but **merges** settings and methods, so
    "restore a backup" does not reproduce the file's state (the card now says so; the deeper question
-   is whether the route should truly replace).
+   is whether the route should truly replace). **OD-13 was implemented** because its recorded
+   recommendation was option 1.
+6. **A third deep review.** Both previous ones found real defects inside already-verified fixes, and
+   the marginal cost is one read-only agent. `deep-review-2.md` reviewed the diff since
+   `deep-review-1.md`; the next one should cover waves 11–14 (which have not had that treatment).
+   Its method is rule 13: *name one realistic state the test does NOT put the code in.*
 
 ## What is waiting on the GPU (`NEEDS-GPU`)
 
