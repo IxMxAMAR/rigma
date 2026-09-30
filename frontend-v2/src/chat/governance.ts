@@ -488,12 +488,27 @@ export function questionRefusal(message: string, status?: number): string {
 
 /** `allowed-once` reads as permission granted; the other three do not. */export function outcomeTone(outcome: string): string {
   if (outcome === "allowed-once") return "text-amber";
+  // OD12-n1: `answered` is a question the user DID answer — the turn got what it
+  // was waiting for. It is a verdict in favour, not a refusal, and must not sit
+  // in the muted default beside `cancelled`.
+  if (outcome === "answered") return "text-moss";
   // `expired` is the same fail-closed family as `unavailable`: nobody answered,
   // so the question was NOT answered and the turn went on without one. It must
   // not read as a neutral `cancelled`, which was a decision the user made.
   if (outcome === "rejected" || outcome === "unavailable"
       || outcome === "expired") return "text-red";
   return "text-muted";
+}
+
+/** The glyph for a decision: a tick only for a verdict IN FAVOUR.
+ *
+ *  OD12-n1: the question channel's own two verdicts are `answered` and
+ *  `expired`. `expired` belongs with the refusals; `answered` belongs with
+ *  `allowed-once` — drawing it as ✕ said the question had failed when it had
+ *  succeeded. An empty outcome is `?`: nothing has been decided yet. */
+export function outcomeGlyph(outcome: string): string {
+  if (!outcome) return "?";
+  return outcome === "allowed-once" || outcome === "answered" ? "✓" : "✕";
 }
 
 /** A decision in words, so `allowed-once` is not shown as a bare identifier. */
@@ -509,6 +524,8 @@ export function outcomeLabel(outcome: string): string {
     // no answer. "expired" alone reads like a cache miss; the row must say that
     // nobody answered in time and the turn went on without one.
     case "expired": return "expired — no answer in time";
+    // OD12-n1: the server's other question verdict — the answer BEAT the window.
+    case "answered": return "answered";
     default: return outcome;
   }
 }

@@ -4,6 +4,7 @@ import {
   EMPTY_GOVERNANCE,
   foldApproval,
   isQuestion,
+  outcomeGlyph,
   outcomeLabel,
   outcomeTone,
   questionAnswer,
@@ -487,6 +488,11 @@ describe("outcomeLabel", () => {
     expect(outcomeLabel("expired")).toContain("no answer");
   });
 
+  // OD12-n1: the server's OTHER question verdict — the answer beat the window.
+  it("names an answered question", () => {
+    expect(outcomeLabel("answered")).toBe("answered");
+  });
+
   it("shows an unknown outcome rather than hiding it", () => {
     expect(outcomeLabel("new-verdict")).toBe("new-verdict");
   });
@@ -499,6 +505,26 @@ describe("outcomeTone", () => {
     expect(outcomeTone("unavailable")).toContain("red");
     // OD-12: same fail-closed family as `unavailable` — nobody answered.
     expect(outcomeTone("expired")).toContain("red");
+  });
+
+  // OD12-n1: the answer beat the window, so this is a verdict in favour.
+  it("marks an answered question as success, not as the muted default", () => {
+    expect(outcomeTone("answered")).toContain("moss");
+  });
+});
+
+// OD12-n1, folded into this wave by the OD-12 merge (17bfbe8). The question
+// channel has its own two verdicts, and only `expired` is a failure: the glyph
+// used to be "✓ only for allowed-once, ✕ for everything else", so an ANSWERED
+// question was drawn with the failure cross.
+describe("outcomeGlyph", () => {
+  it("ticks a verdict in favour, and only that", () => {
+    expect(outcomeGlyph("allowed-once")).toBe("✓");
+    expect(outcomeGlyph("answered")).toBe("✓");
+    expect(outcomeGlyph("expired")).toBe("✕");
+    expect(outcomeGlyph("rejected")).toBe("✕");
+    // Nothing decided yet is not a verdict in either direction.
+    expect(outcomeGlyph("")).toBe("?");
   });
 });
 
