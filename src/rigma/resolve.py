@@ -24,41 +24,62 @@ RAM_RESERVE_MB = 2048
 # real residency — a 32K MTP plan that measured 14,298 MiB was refused against
 # a budget that had 360 MiB of imaginary scratch in it.
 #
-# Still ~2x the largest observation. MoE and larger batches allocate more, which
-# is what the margin is for.
+# DR2-3: this is a FLOOR for the measured point, NOT "~2x the largest
+# observation at 512". The only `sched_reserve ... compute buffer size` line
+# this repository has for a real load at ubatch 512 is 410.28 MiB
+# (`.scratch/prism-v.log:4669`, second load, `n_ubatch = 512` at :4499; the
+# fitting pass at :2337 reads 400.28), so 150 was BELOW the engine's own number,
+# not above it. The 37-81 rungs are an older differencing with no log in this
+# tree. At or below the measured point the constant still stands untouched;
+# above it, MEASURED_COMPUTE_BUFFER_MB governs.
 COMPUTE_BUFFER_MB = 150
+
+# The engine's OWN compute-buffer allocation at the engine's default physical
+# batch, from this repository's real load log: `.scratch/prism-v.log:4669`
+# `sched_reserve: ROCm0 compute buffer size = 410.28 MiB`, for the load whose
+# `n_ubatch = 512` is logged at :4499. That segment carries no draft/speculation
+# lines, so it is the non-draft compute buffer; `draft_cache_mb` charges the
+# draft head separately, and scaling this base therefore does not re-introduce
+# the double count the 150 was cut for. Used ONLY above
+# ENGINE_DEFAULT_UBATCH — at or below it COMPUTE_BUFFER_MB stands unchanged, so
+# every existing plan stays byte-identical.
+MEASURED_COMPUTE_BUFFER_MB = 410.28
 
 
 def compute_buffer_mb(ubatch: int = 0) -> float:
     """llama.cpp's scratch allocation for a physical batch of `ubatch`, in MB.
 
-    COMPUTE_BUFFER_MB above is the figure MEASURED at ubatch 512 (the engine's
-    own default), and llama.cpp sizes its compute buffer by the PHYSICAL batch:
-    the KQ/KQV and matmul scratch scale with `n_ubatch`, not with the logical
-    `n_batch`. So a requested ubatch is charged proportionally — the sweep's
-    16384/2048, the config this lever exists to reach, costs 150 * 2048/512 =
-    600 MB rather than the 512-token figure, which is the difference between a
-    plan that fits and one that pages. Independent corroboration of the
-    direction (not of the constant): "the compute buffer ... scales with -ub
-    and is essentially independent of -b" — multigrid.ai/learn/
-    llamacpp-batch-ubatch.
+    At or below the engine's default 512 the answer is COMPUTE_BUFFER_MB
+    exactly, unchanged: there is no measurement under 512, and shrinking the
+    reserve on an unmeasured extrapolation would make the fit optimistic in the
+    unsafe direction (the launch OOM this whole module exists to prevent).
 
-    PREDICTION, not a measurement: the scaling is linear from the one measured
-    point. The constant is already ~2x the largest observation at 512 (37-81
-    MiB) precisely so the margin absorbs the fixed and nonlinear terms, and a
-    larger ubatch moves all of them in the same direction.
+    Above 512 the base is the engine's own line for this machine,
+    MEASURED_COMPUTE_BUFFER_MB = 410.28 MiB at ubatch 512. llama.cpp sizes its
+    compute buffer by the PHYSICAL batch — the KQ/KQV and matmul scratch scale
+    with `n_ubatch`, not the logical `n_batch` (independent corroboration of the
+    direction, not the constant: "the compute buffer ... scales with -ub and is
+    essentially independent of -b" — multigrid.ai/learn/llamacpp-batch-ubatch)
+    — so a requested ubatch is charged proportionally.
 
-    Below 512 the constant is a FLOOR, not a proportional cut: there is no
-    measurement under 512, and shrinking the reserve on an unmeasured
-    extrapolation would make the fit optimistic in the unsafe direction (the
-    launch OOM this whole module exists to prevent).
+    DR2-3: the previous base of 150 charged 600 MiB at ubatch 2048 where this
+    same machine's own data point implies ~1641 MiB, i.e. it UNDER-reserved by
+    ~1 GB on the single lever whose stated purpose is that the fit still rules.
+    The C10 verifier called that direction "safe"; the engine's own log says
+    otherwise, and the engine's own log wins: an under-reserve is exactly the
+    silent WDDM paging the fit exists to prevent.
+
+    PREDICTION, not a measurement: the scaling above 512 is linear from that one
+    measured point, and the compute buffer also depends on ctx and graph shape.
+    There is a deliberate STEP at 512 (150 -> 411 MiB) — the safe direction, and
+    the acceptance rule is "nothing changes at or below 512".
 
     0 = no opinion = the engine default, so a plan with no override is
     byte-identical to before this lever existed.
     """
     if ubatch <= ENGINE_DEFAULT_UBATCH:
         return float(COMPUTE_BUFFER_MB)
-    return COMPUTE_BUFFER_MB * ubatch / ENGINE_DEFAULT_UBATCH
+    return MEASURED_COMPUTE_BUFFER_MB * ubatch / ENGINE_DEFAULT_UBATCH
 
 
 def launch_ubatch(spec: ModelSpec) -> int:
@@ -139,6 +160,48 @@ def _desktop_vram_mb(profile: HardwareProfile | None) -> float | None:
         return None
 
 
+# C10-nits N2: the placement keys a calibration row may move. Reported by
+# `_apply_calibration` so an explicit stored value it overrode is visible in
+# `explain` rather than silently contradicted by an earlier fit note.
+_CALIBRATION_PLACEMENT_KEYS = ("ngl", "n_cpu_moe", "cache_type_k",
+                               "cache_type_v", "spec_type", "batch", "ubatch")
+
+
+def _without_quality_env_levers(flags: dict) -> tuple[dict, list[str]]:
+    """`flags` with any quality-degrading engine env lever removed, and their names.
+
+    C11-read: C11 closed the WRITE path — `bench.crowned_row` no longer crowns a
+    trial that turns off a quality-preserving engine default, so `run_sweep`
+    cannot persist one. But a `calibration.json` written BEFORE that fix, or
+    hand-edited, is still merged by `_apply_calibration` and reaches the child's
+    environment on every later launch. A sweep scores tokens/sec only, so the
+    read path must refuse the same lever the write path refuses to crown.
+
+    `bench._QUALITY_ENV_LEVERS` is the ONE list of such levers (the C11 verifier
+    found `LLAMA_ATTN_ROT_DISABLE` applied end to end), and this reuses it
+    rather than inventing a second one. The rest of the row is kept: only the
+    quality lever is dropped, so a corrupt/hostile key cannot disable the gate
+    by riding in with a legitimate one.
+    """
+    from .bench import _QUALITY_ENV_LEVERS
+    if not isinstance(flags, dict):
+        # A hand-edited row can be a list/string. Leave it alone so the merge's
+        # existing TypeError handler keeps reporting "flags is not an object"
+        # rather than this helper raising AttributeError first.
+        return flags, []
+    env = flags.get("env")
+    if not isinstance(env, dict):
+        return flags, []
+    dropped = [name for name in _QUALITY_ENV_LEVERS if name in env]
+    if not dropped:
+        return flags, []
+    cleaned = {k: v for k, v in flags.items() if k != "env"}
+    rest = {k: v for k, v in env.items() if k not in _QUALITY_ENV_LEVERS}
+    if rest:
+        cleaned["env"] = rest
+    return cleaned, dropped
+
+
 def _apply_calibration(plan: RunPlan,
                        profile: HardwareProfile | None = None) -> RunPlan:
     from .bench import calibration_entry, calibration_stale, current_identity, load_calibration
@@ -163,6 +226,10 @@ def _apply_calibration(plan: RunPlan,
         if reason:
             plan.explain.append(f"calibration override skipped: {reason}")
             return plan
+        # C11-read: re-gate the quality-degrading env levers at MERGE time too.
+        # The write path (bench.crowned_row) cannot crown one, but a row
+        # written before that fix — or hand-edited — is still applied here.
+        stored, dropped = _without_quality_env_levers(entry["flags"])
         # AUDIT F06-4: model_copy(update=...) does not validate, so a stored
         # entry replayed the flash_attn enum, the spec_type whitelist, the
         # cache-type table and _symmetric_kv straight onto the plan — `-fa
@@ -172,9 +239,10 @@ def _apply_calibration(plan: RunPlan,
         # validate the merge and keep the fresh plan when it fails.
         # All-or-nothing on purpose: a half-applied placement is not a
         # placement anyone measured.
+        before = plan.flags
         try:
             merged = ComboFlags.model_validate(
-                {**plan.flags.model_dump(), **entry["flags"]})
+                {**plan.flags.model_dump(), **stored})
         except ValidationError as exc:
             plan.explain.append(
                 f"calibration override ignored: {exc.error_count()} invalid "
@@ -186,8 +254,29 @@ def _apply_calibration(plan: RunPlan,
             return plan
         plan.flags = merged
         plan.origin += "+calibrated"
-        plan.explain.append(f"calibration override applied: {entry['flags']} "
+        plan.explain.append(f"calibration override applied: {stored} "
                             f"(measured {entry.get('date', '?')})")
+        # C10-nits N2: a measured placement silently beat an explicit stored
+        # `ngl` (and could leave the fit's own note, "launch default ngl 40 (the
+        # fit allows 59)", standing while the plan carried the measured 63).
+        # Name every placement key the measurement moved, so the override is
+        # visible and the earlier fit note is plainly superseded. The
+        # measurement WINS rather than being clamped: it came from a stopwatch
+        # on this machine (AUDIT F17), and the merge above is all-or-nothing.
+        moved = [f"{k} {getattr(before, k)} -> {getattr(merged, k)}"
+                 for k in _CALIBRATION_PLACEMENT_KEYS
+                 if getattr(before, k) != getattr(merged, k)]
+        if moved:
+            plan.explain.append(
+                "calibration override changed " + "; ".join(moved)
+                + " (a measured placement wins over the fit and any launch "
+                  "default; an earlier note about those values is superseded)")
+        if dropped:
+            plan.explain.append(
+                "calibration override dropped quality-degrading env lever(s) "
+                + ", ".join(dropped) + ": a sweep scores speed only, and the "
+                "engine turns the quality-preserving default ON for a reason "
+                "(see bench._QUALITY_ENV_LEVERS)")
     return plan
 
 
