@@ -3192,6 +3192,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # field missing here would make the UI control a no-op.
                     "allow_absolute_writes": bool(
                         s.get("allow_absolute_writes")),
+                    # OD-2: the absolute write roots that need no blanket
+                    # grant. A ctx that omitted it would make every allowlisted
+                    # destination fail, so it is named here like the grants.
+                    "write_allowlist": list(s.get("write_allowlist") or []),
                     "workspace": s.get("workspace") or str(_Path.home()),
                     "has_vision": has_vision,
                     "run_id": run_id, "profile": run_profile,
@@ -3265,6 +3269,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             "allow_absolute_reads": False,
                             "allow_outbound_post": False,
                             "allow_absolute_writes": False,
+                            # OD-2: the delegate is a narrowed ctx — it keeps
+                            # NONE of the session's write roots, exactly like
+                            # the grants above.
+                            "write_allowlist": [],
                             "method_draft_id": "", "_reads": {}}
                 q = question + (f"\n(Focus on: {path})" if path else "")
                 msgs = [{"role": "system", "content":
@@ -7487,6 +7495,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     session.get("allow_outbound_post")),
                 "allow_absolute_writes": bool(
                     session.get("allow_absolute_writes")),
+                # OD-2: a macro step's ctx must carry the session's write
+                # roots too, or a macro copy/move to an allowlisted folder
+                # would fail where the same call in a chat succeeds.
+                "write_allowlist": list(
+                    session.get("write_allowlist") or []),
                 "workspace": session.get("workspace") or "",
                 "session_id": session.get("id", "")}
 
