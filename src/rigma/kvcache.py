@@ -194,10 +194,9 @@ def launched_engine_identity(rp, exe) -> str:
     old build was restored under the new one. The path is not the build.
 
     `launch_fingerprint` already receives the exe that will actually run, so the
-    identity is measured from THAT file. Falls back to `engine_identity(backend)`
-    when the file cannot be measured, which is exactly the value the pinned path
-    used before this existed — an unreadable binary is "what the rest of the code
-    would have said", never a guess.
+    identity is measured from THAT file. When the file cannot be measured the
+    identity is still the file's — see `_unmeasured_engine_identity` (DR7); it is
+    never a guess and never silently the pin's.
     """
     from . import engine_build
     try:
@@ -206,7 +205,39 @@ def launched_engine_identity(rp, exe) -> str:
             return got.identity
     except Exception:
         pass
-    return engine_identity(getattr(rp, "backend", ""))
+    return _unmeasured_engine_identity(rp, exe)
+
+
+def _unmeasured_engine_identity(rp, exe) -> str:
+    """The identity of a binary whose own `--version` could not be read (DR7).
+
+    A13b made the identity the binary that will run, but only while that binary
+    could be measured. `--version` can time out or fail on a perfectly good file
+    (a slow cold read, an antivirus scan, a missing runtime), and the fallback
+    was `engine_identity(backend)` — the PIN directory's identity. A REGISTERED
+    engine swapped in place for another unmeasurable build then hashed to the
+    same `(path, pin identity)`, so the old build's KV cache was restored under
+    the new one. That is A13b one measurement failure later.
+
+    `engine_build._file_key` is the (path, size, nanosecond mtime) key the build
+    memo is already built on (A13d), so folding its size and mtime in is the
+    same notion of "this file" the rest of the code trusts. The path is left
+    out on purpose: the fingerprint's `engine` field already carries it, and the
+    path cannot distinguish two builds at one path — which is the whole defect.
+
+    A pinned launch is untouched while its `--version` answers (that path
+    returns `got.identity` above, byte-identical to the pre-A13b expression).
+    When the pin ITSELF cannot be measured the value changes from the manifest
+    string to manifest+file:<size>:<mtime_ns> — but that is not an orphaning
+    storm: a normal pin launch recorded the MEASURED identity, so a cache keyed
+    on the manifest string could never have matched it anyway. The file key is
+    stable for an unchanged file, so caches still match across restarts; only a
+    replacement of the file invalidates, which is the point.
+    """
+    from . import engine_build
+    base = engine_identity(getattr(rp, "backend", ""))
+    _path, size, mtime_ns = engine_build._file_key(Path(exe))
+    return f"{base}+file:{size}:{mtime_ns}"
 
 
 def launch_fingerprint(rp, exe) -> str:
