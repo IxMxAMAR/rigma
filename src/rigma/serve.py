@@ -746,7 +746,42 @@ def _preserve_unreadable_run(src: Path) -> Path | None:
     return None
 
 
-def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
+def _read_run_bytes(runs_mod, run_id: str):
+    """`(parsed, may_replace)` from a DIRECT read of this run's `run.json`.
+
+    DR1. `runs.load` collapses two different failures into `None`: the bytes
+    could not be READ (a transient sharing violation against `_atomic_write`'s
+    replace, gone in milliseconds) and the bytes were read but do not PARSE.
+    Only the second is evidence that the file on disk is bad. The release path
+    treated both as "unusable" and replaced whatever was there with a 4-field
+    stub, so a lock that cleared a moment later left a GOOD record overwritten:
+    `session_id`, `mission`, `spec`, `deadline` and every counter gone, and
+    `restart_run` answering 409 "the run's chat session was deleted" for good.
+
+    `may_replace` is False ONLY when the read itself raised — the bytes may be a
+    perfectly good record and must be left alone. A missing file is True: there
+    is nothing to lose and a terminal record is an improvement. Bytes that were
+    read and do not parse are True too: the file is genuinely unusable, so a
+    minimal terminal record plus a copy-aside is the best available answer.
+    """
+    try:
+        path = runs_mod.run_dir(run_id) / "run.json"
+    except Exception:
+        return None, False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, True
+    except Exception:
+        return None, False
+    try:
+        return json.loads(text), True
+    except Exception:
+        return None, True
+
+
+def _release_unreadable_run(runs_mod, run_id: str,
+                            reason: str) -> dict | None:
     """Release the one-run slot for a run whose state cannot be read.
 
     A18 / R3-RUN-5. `runs.load` returns None for BOTH "the file is gone" and "I
@@ -764,11 +799,16 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
     single test both this and `_load_run_for_loop` use.
 
     So the slot is released explicitly: a terminal status for the id we were
-    asked to drive, then the active pointer dropped when it points here. The
-    record written is minimal when the real one could not be read, so whatever
-    is on disk is copied aside first (see `_preserve_unreadable_run`) — a release
-    must be recoverable, not destructive. The run's mission and transcript
-    survive on its session, so `restart` still reattaches meaningfully.
+    asked to drive, then the active pointer dropped when it points here. A
+    minimal record is written only when the bytes on disk were READ and cannot
+    be used, and whatever was there is copied aside first (see
+    `_preserve_unreadable_run`) — a release must be recoverable, not
+    destructive. When the READ itself fails the file is left exactly as it is:
+    it may be a good record a transient lock hid from us, and a backup nobody
+    reads back is not recovery. `restart` then reattaches from the real record.
+
+    Returns the record it released, when it could recover one, so the caller can
+    still run the end-of-run cleanup for that run's session (DR8).
 
     A18d(3): when `run.json` is unreadable AND unwritable the terminal status
     cannot land, so it keeps saying `running` on disk even though the slot IS
@@ -781,21 +821,37 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
         run = runs_mod.load(run_id)      # the lock may have cleared by now
     except Exception:
         run = None
-    if not _run_is_drivable(run):
+    if not _run_is_drivable(run) or run.get("id") != run_id:
         # A18c: a readable-but-unusable record (`{}`, `[]`, a null/empty
         # session_id) cannot be handed to `set_status` — it has no id to write
         # to — so it takes the same minimal-record path as an unreadable file.
+        # DR1: a record whose `id` is NOT ours is discarded for the same reason
+        # `set_status` writes through `run["id"]` — releasing A must never write
+        # into B's run directory.
         run = None
     if run is None:
-        try:
-            src = runs_mod.run_dir(run_id) / "run.json"
-            if src.exists():
-                _preserve_unreadable_run(src)
-        except Exception:
-            _log.warning("run %s: could not inspect run.json to back it up",
-                         run_id, exc_info=True)
-        run = {"id": run_id}
-    if run.get("status") not in runs_mod.TERMINAL:
+        parsed, may_replace = _read_run_bytes(runs_mod, run_id)
+        if _run_is_drivable(parsed) and parsed.get("id") == run_id:
+            # DR1: the load failed but the file reads fine now — the lock has
+            # cleared. Use the REAL record, so the terminal status keeps
+            # session_id, mission, spec and the counters and `restart_run` still
+            # reattaches instead of 409-ing on a missing session.
+            run = parsed
+        elif may_replace:
+            # The bytes were READ and do not parse (or there are none): the file
+            # is genuinely unusable, so a minimal terminal record is an
+            # improvement — but keep a copy of whatever was there first.
+            try:
+                src = runs_mod.run_dir(run_id) / "run.json"
+                if src.exists():
+                    _preserve_unreadable_run(src)
+            except Exception:
+                _log.warning("run %s: could not inspect run.json to back it up",
+                             run_id, exc_info=True)
+            run = {"id": run_id}
+        # else: the READ itself failed. `run.json` is left alone — overwriting
+        # it is the data loss DR1 is about, and only the slot is released below.
+    if run is not None and run.get("status") not in runs_mod.TERMINAL:
         try:
             runs_mod.set_status(run, "interrupted", reason)
         except Exception:
@@ -806,6 +862,7 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
     # The pointer is read directly, by id: `runs.active()` returns None for an
     # unreadable run, and clearing unconditionally could free a DIFFERENT run's
     # slot — a new run may have started since this one wedged.
+    raw = None
     try:
         raw = json.loads(runs_mod._active_path().read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -817,6 +874,7 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
             runs_mod.clear_active()
         except Exception:
             _log.exception("run %s: could not release the active slot", run_id)
+    return run
 
 
 def _patch_session(sid: str, body: dict) -> dict | None:
