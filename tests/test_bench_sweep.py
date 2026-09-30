@@ -582,6 +582,84 @@ def test_a_tools_capable_sweep_drops_the_axis_even_when_it_is_the_fastest(
     assert bench.load_calibration() == {}
 
 
+def test_a_tools_capable_sweep_drops_a_lever_the_plan_already_carries(
+        monkeypatch, tmp_path):
+    """The trial gate must read the EFFECTIVE child environment, not the
+    per-trial override.
+
+    A plan that already carries the lever on `plan.flags.env` — the state
+    `rigma sweep` reaches when a `calibration.json` entry is merged by
+    `resolve._apply_calibration` — launched EVERY trial with it while the gate,
+    looking only at the override, believed the axis had been dropped. The saved
+    flags are still the override, so this contaminates the measurement rather
+    than reopening the write path; the point is that the guard's stated intent
+    ("does not trial it on a tools-capable model") is not met in that state.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+    launched = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(exe, plan, model_path, **k):
+        launched.append(dict(plan.flags.env))
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    plan = _plan(env={"LLAMA_ATTN_ROT_DISABLE": "1"})
+    rows = bench.run_sweep(plan, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601,
+                           configs=[("baseline", {}),
+                                    ("kv-q8", {"cache_type_k": "q8_0",
+                                               "cache_type_v": "q8_0"}),
+                                    ("coopmat-off",
+                                     {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}})])
+    # No launched trial may inherit the lever: the two that would have (their
+    # override names no env of its own) are dropped before they cost a load.
+    assert all("LLAMA_ATTN_ROT_DISABLE" not in env for env in launched)
+    assert [r["label"] for r in rows] == ["coopmat-off"]
+    # ...and the survivor does so because its OWN env REPLACES the plan's
+    # (`model_copy(update=...)`), so it genuinely runs lever-free. It is then
+    # crowned and persisted — with the coopmat toggle, never the lever.
+    assert launched == [{"GGML_VK_DISABLE_COOPMAT": "1"}]
+    assert _only_entry()["flags"] == {
+        "env": {"GGML_VK_DISABLE_COOPMAT": "1"}}
+
+
+def test_a_plan_carrying_an_unrelated_env_var_is_still_trialled(
+        monkeypatch, tmp_path):
+    """The effective-env gate must refuse only a quality lever.
+
+    A plan that carries some OTHER engine env var (a driver toggle, say) must
+    still be trialled normally — the fix must not turn any pre-existing
+    `plan.flags.env` into a refusal.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+    launched = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(exe, plan, model_path, **k):
+        launched.append(dict(plan.flags.env))
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    plan = _plan(env={"GGML_VK_DISABLE_COOPMAT": "1"})
+    rows = bench.run_sweep(plan, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601, configs=[("baseline", {})])
+    assert [r["label"] for r in rows] == ["baseline"]
+    assert launched == [{"GGML_VK_DISABLE_COOPMAT": "1"}]
+
+
 def test_a_non_tools_sweep_trials_the_attn_rot_axis_but_does_not_crown_it(
         monkeypatch, tmp_path):
     """C11's lever is not deleted: a non-tools model still MEASURES the axis, so
