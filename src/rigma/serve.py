@@ -4988,8 +4988,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # D2: `backend` belongs here — `LaunchDefaults` stores it and the
         # launcher consumes it, so leaving it out of the allowlist made a
         # per-model compute backend silently unsettable over HTTP.
+        # C10: `batch`/`ubatch`/`ngl` likewise — Rigma could already EMIT
+        # `-b`/`-ub`/`-ngl` but no caller could ask for them, so the owner could
+        # not launch a model at a chosen batch/ubatch/ngl. `ubatch > batch` is
+        # refused by hangar (HangarError -> 400), because llama.cpp will not
+        # start with it.
         allowed = {"quant", "ctx", "kv", "vision", "spec_type", "spec_n_max",
-                   "backend"}
+                   "backend", "batch", "ubatch", "ngl"}
         fields = {k: v for k, v in (body or {}).items() if k in allowed}
         if not fields:
             return JSONResponse(

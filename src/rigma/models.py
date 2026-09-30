@@ -36,6 +36,45 @@ CACHE_BYTES = {
 # KV cache.
 LAUNCH_PARALLEL = 2
 
+# The engine's own defaults for the two batch sizes, in ONE place. `-b`/`-ub`
+# are accepted and emitted by Rigma already (ComboFlags.batch/ubatch), but a
+# launch default that leaves one of them unset still launches at these numbers,
+# so the cross-check below has to compare against them rather than against 0.
+# CONFIRMED at mainline b9867 common/common.h:
+#     int32_t n_batch  = 2048; // logical batch size for prompt processing
+#     int32_t n_ubatch =  512; // physical batch size for prompt processing
+# (https://raw.githubusercontent.com/ggml-org/llama.cpp/b9867/common/common.h)
+ENGINE_DEFAULT_BATCH = 2048
+ENGINE_DEFAULT_UBATCH = 512
+
+
+def batch_pair_error(batch: int, ubatch: int) -> str:
+    """Why this `-b`/`-ub` pair cannot launch, or "" when it can.
+
+    The engine's contract is `n_ubatch <= n_batch` — the physical batch is a
+    slice of the logical one — so Rigma refuses a stored pair that violates it
+    at write time rather than letting the engine die at load. An unset side is
+    compared at the ENGINE default, not at 0: `batch` unset means 2048, so a
+    stored `ubatch: 4096` is still illegal and must not be waved through.
+
+    UNVERIFIED: the exact line where the engine rejects `n_ubatch > n_batch`
+    (it was not fetched). The constraint itself is confirmed by the source
+    defaults above and by two independent secondary sources
+    (multigrid.ai/learn/llamacpp-batch-ubatch; jonathanding.github.io/
+    llm-learning/en/articles/llama-cpp-batch-ubatch, "Key constraint:
+    n_ubatch <= n_batch").
+    """
+    if batch < 0 or ubatch < 0:
+        return ("batch and ubatch must be 0 (no opinion) or a positive size")
+    eff_b = batch or ENGINE_DEFAULT_BATCH
+    eff_ub = ubatch or ENGINE_DEFAULT_UBATCH
+    if eff_ub > eff_b:
+        return (f"ubatch {eff_ub} exceeds batch {eff_b}: llama.cpp refuses to "
+                "start when the physical batch is larger than the logical "
+                "batch" + (" (batch is unset, so the engine default 2048 "
+                           "applies)" if not batch else ""))
+    return ""
+
 
 def _valid_cache_type(v: str) -> str:
     if v not in CACHE_BYTES:
@@ -236,20 +275,46 @@ class LaunchDefaults(BaseModel):
     # Vulkan backend loads them without complaint and then falls back to CPU
     # for every ternary tensor, which reads as a hang rather than an error.
     backend: str = ""
+    # C10: the two batch sizes and the GPU-layer cap were Rigma-PRODUCIBLE
+    # (`ComboFlags.batch`/`ubatch`/`ngl`, and the exhaustive sweep set
+    # 16384/2048) but had no way in from the UI: a caller could not ask for
+    # them, so the owner could not launch at a chosen batch/ubatch/ngl.
+    #
+    # 0 on either batch field = NO OPINION (the engine's 2048 / 512 stand).
+    # `ubatch` is the one that costs memory: llama.cpp sizes its compute buffer
+    # by the physical batch, so `resolve` charges it (see `compute_buffer_mb`).
+    batch: int = 0
+    ubatch: int = 0
+    # A CAP on the resolver's own placement, not a pin: `resolve` and
+    # `fit_for_launch` clamp it down to what actually fits at the chosen
+    # ctx/cache and say so, because the alternative — putting more layers on
+    # the GPU than the budget holds — is the silent paging the fit exists to
+    # prevent. -1 = NO OPINION (the fit decides), NOT 0: `-ngl 0` is a real
+    # request (every layer on the CPU), the same trap `ctx_checkpoints` avoids.
+    ngl: int = -1
+
+    @model_validator(mode="after")
+    def _batch_pair_is_launchable(self) -> LaunchDefaults:
+        why = batch_pair_error(self.batch, self.ubatch)
+        if why:
+            raise ValueError(why)
+        return self
 
     def is_set(self, field: str) -> bool:
-        """Whether this field carries an opinion. `vision` is the odd one: its
-        unset value is None, while everything else uses 0 or ""."""
+        """Whether this field carries an opinion. `vision` and `ngl` are the
+        odd ones: their unset values are None and -1, not 0 or ""."""
         value = getattr(self, field)
         if field == "vision":
             return value is not None
+        if field == "ngl":
+            return value >= 0
         return bool(value)
 
     def as_overrides(self) -> dict:
         """Only the fields that were actually set, for merging over a request."""
         return {f: getattr(self, f) for f in
                 ("quant", "ctx", "kv", "vision", "spec_type", "spec_n_max",
-                 "backend")
+                 "backend", "batch", "ubatch", "ngl")
                 if self.is_set(f)}
 
 
@@ -482,6 +547,18 @@ class ComboFlags(BaseModel):
                 f"reasoning_effort must be one of "
                 f"{', '.join(REASONING_EFFORTS)}, got {v!r}")
         return v
+
+    @model_validator(mode="after")
+    def _batch_pair_is_launchable(self):
+        # The argv carrier too, not just LaunchDefaults: `server_args` writes
+        # `-b`/`-ub` straight from these fields, so a plan that reached here
+        # with `ubatch > batch` (a hand-edited calibration row, a bench config)
+        # must be refused where every other bad flag value already is. An unset
+        # side is compared at the engine default (2048/512), same rule.
+        why = batch_pair_error(self.batch, self.ubatch)
+        if why:
+            raise ValueError(why)
+        return self
 
     @model_validator(mode="after")
     def _symmetric_kv(self):
