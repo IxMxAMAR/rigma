@@ -103,7 +103,8 @@ def _current_run(log_text: str) -> str:
     return text[starts[-1]:] if starts else text
 
 
-def findings(log_text: str) -> list[dict]:
+def findings(log_text: str, *, expected_vram_mb: float | None = None
+             ) -> list[dict]:
     """Significant one-off engine statements found in a log.
 
     Deduplicated: these fire once per load, and a log spanning several restarts
@@ -114,6 +115,19 @@ def findings(log_text: str) -> list[dict]:
     so `count` and `example` describe the engine that is up now whenever the log
     carries a launch marker. A log with no marker at all is scanned whole and no
     current-run claim is made.
+
+    A17/S2 is wired in here rather than behind a second endpoint: the engine's
+    own load accounting is one more thing the engine said once and never
+    repeated. The split verdict is derived from the load the engine itself
+    reported (ngl, layer count, expert placement, backend), so this needs no
+    plan at the call site — and a HEALTHY load adds no finding at all.
+
+    `expected_vram_mb` is optional and is the plan's own prediction
+    (`memtruth.planned_mb(plan)`, i.e. weights + KV for the same ctx / cache /
+    slots). Without it the VRAM axis is reported as NOT COMPARABLE and never
+    raises a finding, because the engine's actual includes the KV cache and a
+    bare file size would read as a divergence that is only the cache. A caller
+    that has the running plan can pass it to make that axis comparable.
     """
     text = _current_run(log_text)
     out = []
@@ -130,6 +144,26 @@ def findings(log_text: str) -> list[dict]:
             "confirmed_here": confirmed,
             # the last occurrence in the CURRENT run (see _current_run)
             "example": hits[-1][:300],
+        })
+
+    # A17/S2: the load accounting. Only a real DIVERGENCE is a finding; a
+    # healthy load and a "not comparable" one both add nothing.
+    r = compare_plan(parse_load(text), expected_vram_mb)
+    if r["known"] and r["diverges"]:
+        # Quote the engine's own line, as the pattern findings do — and quote
+        # the line that belongs to the axis that actually diverged.
+        example = r["detail"][:300]
+        if r["split_verdict"] == "diverges":
+            for line in text.splitlines():
+                if _GRAPH_SPLITS.search(line):
+                    example = line.strip()[:300]
+        out.append({
+            "id": "plan_divergence",
+            "severity": "warn",
+            "message": _PLAN_DIVERGENCE_MESSAGE,
+            "count": 1,
+            "confirmed_here": False,
+            "example": example,
         })
     return out
 
@@ -165,11 +199,78 @@ def findings(log_text: str) -> list[dict]:
 # LAST segment (the engine that is actually up), never the first.
 #
 # Pure text in, plain dicts out: no engine call, no file read, no I/O.
+#
+# ---------------------------------------------------------------------------
+# Why `graph splits = 2` is the HEALTHY baseline, verified from the engine
+# ---------------------------------------------------------------------------
+#
+# The first version of this comparison took `expected_splits = 1` as a constant,
+# which flagged the load above — the healthy one — on every launch. The count
+# comes from the scheduler, not from the number of backends:
+#
+#   * `sched_reserve` prints `n_splits` from `ggml_backend_sched_get_n_splits`:
+#     `LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);`
+#     — ggml-org/llama.cpp b9867 src/llama-context.cpp:626,637,672-676;
+#       PrismML-Eng/llama.cpp 87268f77 src/llama-context.cpp:765,776,811-815.
+#     `n_splits` is `sched->n_splits` (ggml/src/ggml-backend.cpp:1923-1925 at
+#     b9867; :1995-1997 at 87268f77).
+#   * `ggml_backend_sched_split_graph` starts a NEW split whenever the current
+#     node's assigned backend differs from the current split's:
+#       `if (node_backend_id != cur_backend_id || need_new_split) { ... }`
+#     — b9867 ggml/src/ggml-backend.cpp:1303-1317;
+#       87268f77 ggml/src/ggml-backend.cpp:1344-1358.
+#     So the count is the number of maximal SAME-BACKEND RUNS, not the number of
+#     backends. One backend is one split, not zero.
+#   * the INPUT layer is always placed on the CPU —
+#     "there is very little benefit to offloading the input layer, so always
+#     keep it on the CPU", `pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };`
+#     — b9867 src/llama-model.cpp:1296-1298; 87268f77 src/llama-model.cpp:1632-1634.
+#     prism-v.log:4482 shows it for this very model:
+#     `tensor 'token_embd.weight' (pq2_0) ... cannot be used with preferred
+#     buffer type ROCm_Host, using CPU instead`.
+#
+# Therefore a dense model with ANY GPU layers is 2: one CPU run (the token
+# embedding, contiguous with the first CPU layers under a partial offload) and
+# one GPU run. That is why an all-GPU load and a contiguous dense partial
+# offload share the same baseline. `ngl = 0` is 1.
+#
+# `offloaded N/M` is `std::min(n_gpu_layers, max_offloadable_layers)` over
+# `max_backend_supported_layers = n_layer_all + 1` — the denominator COUNTS THE
+# OUTPUT LAYER, so the model's layer count is M - 1
+# (b9867 src/llama-model.cpp:1600-1603; 87268f77 src/llama-model.cpp:1941-1944).
+#
+# MoE expert offload is the case that must NOT be judged by this baseline:
+# `--n-cpu-moe N` keeps the expert weights of the first N layers on the CPU
+# (`llm_ffn_exps_block_regex(i)` -> `ggml_backend_cpu_buffer_type()`,
+# 87268f77 common/arg.cpp:2755-2769), and a WEIGHT tensor on a different,
+# incompatible backend forces a new split even when the op itself is on the GPU
+# ("check if a weight is on a different and incompatible backend / by starting a
+# new split, the memory of the previously offloaded weights can be reused",
+# b9867 ggml/src/ggml-backend.cpp:1280-1287; 87268f77 :1321-1328). The expert
+# weights are marked as weights for exactly this purpose
+# (87268f77 src/llama-model.cpp:1919-1923). So the count depends on the model's
+# expert geometry, which the plan's `ngl` does not carry — hence
+# "not comparable", never a finding.
 
 # A new load starts at this marker. The neighbouring lines "offloading output
 # layer to GPU" and "offloading 63 repeating layers to GPU" also contain
 # "offload" but not the `offloaded N/M` shape, so they are not boundaries.
 _LOAD_MARKER = re.compile(r"offloaded\s+(\d+)/(\d+)\s+layers to GPU")
+
+# `print_info: n_expert = 0` is printed once per process in the hparams dump
+# that PRECEDES `offloaded N/M` (prism-v.log:141 for the fitting pass, :2466 for
+# the load that is up). It is what separates a dense model from a MoE, and the
+# expert count is what decides whether a split verdict is even possible. The
+# regex cannot match the neighbouring `n_expert_used = N` / `n_expert_groups`
+# lines: `n_expert` there is followed by `_`, not by whitespace and `=`.
+_N_EXPERT = re.compile(r"n_expert\s*=\s*(\d+)")
+
+# Device families the engine names in a buffer label (`ROCm0`, `CUDA0`,
+# `Vulkan0`, `Metal`, `SYCL0`). Used to name the plan's backend from the log.
+_DEVICE_FAMILIES = (
+    ("ROCm", "rocm"), ("CUDA", "cuda"), ("Vulkan", "vulkan"),
+    ("Metal", "metal"), ("SYCL", "sycl"),
+)
 
 # One buffer line. The label is a single token — `CPU`, `CPU_Mapped`, `ROCm0`,
 # `ROCm_Host`, `CUDA0`, `Vulkan0`, `Metal`, ... The kind is one of the four the
@@ -214,6 +315,8 @@ def _empty_load() -> dict:
         "found": False,
         "offloaded": None,          # "65/65" as printed
         "offloaded_layers": None,   # (65, 65) for arithmetic
+        "n_expert": None,           # None = the hparams line was not in the text
+        "backend": None,            # "rocm" / "cuda" / ... / "cpu" / None
         "model_buffers": [],        # [{"label", "mb", "host"}, ...]
         "kv_buffers": [],
         "rs_buffers": [],
@@ -221,6 +324,24 @@ def _empty_load() -> dict:
         "n_seq_max": None,
         "graph_splits": None,
     }
+
+
+def _backend_of(load: dict) -> str:
+    """The backend the load's buffer labels name, or "" when none does.
+
+    The device labels the engine prints are the plan's backend in the log:
+    `ROCm0 model buffer size` means the weights were placed on a ROCm device.
+    A load whose only buffers are `CPU` / `CPU_Mapped` ran on the CPU; a load
+    with no buffer lines at all has no answer (""), which is not "cpu".
+    """
+    labels = [b["label"] for key in _BUFFER_KEYS for b in load.get(key, [])]
+    for label in labels:
+        for token, name in _DEVICE_FAMILIES:
+            if label.startswith(token):
+                return name
+    if labels and all(_is_host_buffer(label) for label in labels):
+        return "cpu"
+    return ""
 
 
 def parse_loads(log_text: str) -> list[dict]:
@@ -231,13 +352,25 @@ def parse_loads(log_text: str) -> list[dict]:
     covering a fitting pass and the real load yields two entries — the last is
     the engine that is up now.
 
+    The model's `n_expert` is printed BEFORE the `offloaded` marker (the hparams
+    dump comes first), so it is carried forward as a pending value and attached
+    to the next load, then cleared — a load whose own hparams dump is missing
+    from the text gets `n_expert is None` (unknown), never the previous model's
+    count.
+
     A log tail that starts after the marker (no `offloaded` line but buffer
     lines present) still yields one entry, so the data is not dropped.
     """
     loads: list[dict] = []
     cur: dict | None = None
+    pending_experts: int | None = None
 
     for line in (log_text or "").splitlines():
+        m = _N_EXPERT.search(line)
+        if m:
+            pending_experts = int(m.group(1))
+            continue
+
         marker = _LOAD_MARKER.search(line)
         if marker:
             cur = _empty_load()
@@ -245,6 +378,8 @@ def parse_loads(log_text: str) -> list[dict]:
             cur["offloaded"] = f"{marker.group(1)}/{marker.group(2)}"
             cur["offloaded_layers"] = (int(marker.group(1)),
                                        int(marker.group(2)))
+            cur["n_expert"] = pending_experts
+            pending_experts = None
             loads.append(cur)
             continue
 
@@ -272,6 +407,8 @@ def parse_loads(log_text: str) -> list[dict]:
         if m:
             cur["graph_splits"] = int(m.group(1))
 
+    for load in loads:
+        load["backend"] = _backend_of(load)
     return loads
 
 
@@ -291,7 +428,149 @@ def _sum_buffers(load: dict, *, host: bool) -> float:
                for b in load.get(key, []) if b["host"] is host)
 
 
-def _unknown_plan(expected_vram_mb, expected_splits: int) -> dict:
+# ---------------------------------------------------------------------------
+# The split expectation comes from the PLAN, never from a constant
+# ---------------------------------------------------------------------------
+
+# The two counts a DENSE plan can produce (see the provenance block at the top
+# of this section for the engine lines behind them).
+_SPLITS_CPU_ONLY = 1        # one CPU run: embedding and every layer
+_SPLITS_DENSE_ANY_GPU = 2   # one CPU run (embedding) + one GPU run
+
+
+def plan_fields_from_load(load: dict) -> dict:
+    """The plan fields the LOAD LOG itself reports.
+
+    `ngl` and the layer count come from `offloaded N/M`: M counts the output
+    layer (llama-model.cpp: `max_backend_supported_layers = n_layer_all + 1`),
+    so the model has M - 1 layers and the engine placed N of them.
+
+    `n_cpu_moe` is the one plan field the log does NOT report. `n_expert == 0`
+    proves there are no experts to place, so it is 0; anything else leaves the
+    expert placement UNKNOWN and is reported as None — a MoE whose experts are
+    all resident cannot be told from one that offloaded them, and guessing 0
+    is exactly the cry-wolf the guidance forbids.
+    """
+    layers = load.get("offloaded_layers")
+    n_expert = load.get("n_expert")
+    return {
+        "ngl": layers[0] if layers else None,
+        "n_layers": (layers[1] - 1) if layers else None,
+        "n_cpu_moe": 0 if n_expert == 0 else None,
+        "backend": load.get("backend") or "",
+    }
+
+
+def expected_splits(*, ngl, n_layers, n_cpu_moe=None,
+                    backend: str = "") -> int | None:
+    """The `graph splits` count a PLAN should produce, or None.
+
+    None means **NOT COMPARABLE**: the plan's own fields do not determine the
+    count, so no verdict may be given and no finding may be raised.
+
+      * `ngl == 0`, or a CPU-only backend: everything — the token embedding
+        included — runs on the CPU, so the graph is one CPU run => 1 split.
+      * a DENSE model with any GPU layers: the input embedding is always on the
+        CPU and the offloaded layers form one contiguous GPU run after it =>
+        2 splits. The SAME 2 for an all-GPU load and for a contiguous partial
+        offload (`ngl` below the layer count), which is why the healthy baseline
+        is 2 and a constant 1 flagged this machine's own healthy load on every
+        launch.
+      * `n_cpu_moe > 0`: expert weights on the CPU inside otherwise-GPU layers
+        force a new split per affected layer, so the count is a function of the
+        model's expert geometry rather than of `ngl` => not comparable.
+      * `n_cpu_moe is None`: the expert placement is unknown (a MoE whose
+        `--n-cpu-moe` the log does not report) => not comparable.
+      * no layer count (a log tail, or a header without `block_count`):
+        not comparable.
+
+    A count ABOVE the expectation is the signal worth surfacing: a silent CPU
+    attention fallback moves the fused attention node to the CPU while the rest
+    of the layer stays on the GPU, i.e. GPU -> CPU -> GPU, roughly two extra
+    splits per attention layer, and the engine prints no error.
+    """
+    if n_layers is None or int(n_layers) <= 0:
+        return None
+    if ngl is None:
+        return None
+    if int(ngl) <= 0 or (backend or "").lower() == "cpu":
+        return _SPLITS_CPU_ONLY
+    if n_cpu_moe is None or int(n_cpu_moe) > 0:
+        return None
+    return _SPLITS_DENSE_ANY_GPU
+
+
+def expected_splits_for_load(load: dict) -> int | None:
+    """`expected_splits` for a parsed load; None when it cannot be derived."""
+    return expected_splits(**plan_fields_from_load(load))
+
+
+def _split_why_not_comparable(load: dict) -> str:
+    """The precise reason a split verdict cannot be given, for the detail text."""
+    fields = plan_fields_from_load(load)
+    if fields["n_layers"] is None:
+        return ("the log does not report how many layers the model has, so the "
+                "plan's layer count is unknown")
+    if fields["n_cpu_moe"] is None:
+        return ("the log reports n_expert = %s, a mixture-of-experts model, and "
+                "never reports how many expert layers were kept on the CPU; "
+                "expert weights on the CPU inside GPU layers force a new split "
+                "per affected layer, so the count depends on n_cpu_moe"
+                % load.get("n_expert"))
+    if fields["ngl"] is None:
+        return "the log does not report the offloaded layer count"
+    return "the plan's placement does not determine a split count"
+
+
+def _split_sentence(load: dict, splits, expected, verdict: str) -> str:
+    """One clause naming the split outcome, with "not comparable" kept distinct."""
+    if splits is None:
+        return ("the log did not report graph splits, so the backend assignment "
+                "is NOT COMPARABLE to the plan.")
+    if verdict == "not_comparable":
+        return ("graph splits = %d, but this is NOT COMPARABLE to the plan: "
+                "%s." % (splits, _split_why_not_comparable(load)))
+    if verdict == "diverges":
+        return ("graph splits = %d, ABOVE the %d the plan expects (%s): some "
+                "operations ran on a backend the plan did not assume. A silent "
+                "CPU attention fallback adds about two splits per attention "
+                "layer (GPU -> CPU -> GPU), so a count this far above the "
+                "baseline is the signature to look for." % (
+                    splits, expected, _expected_splits_words(load)))
+    return "graph splits = %d, matching the %d the plan expects." % (splits,
+                                                                    expected)
+
+
+def _expected_splits_words(load: dict) -> str:
+    """How to describe the expected count in a sentence."""
+    fields = plan_fields_from_load(load)
+    ngl, n = fields["ngl"], fields["n_layers"]
+    if ngl == 0 or (fields["backend"] or "").lower() == "cpu":
+        return "a CPU-only load"
+    if n and ngl is not None and ngl >= n + 1:
+        return "an all-GPU dense load"
+    return "a dense partial offload (%s of %s layers on the GPU)" % (ngl, n)
+
+
+# The same slack `memtruth.compare` uses for the same two quantities: below it
+# the difference is terms Rigma deliberately does not model (the compute buffer,
+# page alignment), so flagging it would be noise. 15% or 512 MiB, whichever is
+# larger.
+_VRAM_SLACK_MB = 512.0
+_VRAM_SLACK_PCT = 0.15
+
+_PLAN_DIVERGENCE_MESSAGE = (
+    "The engine's own load accounting does not match the plan. `graph splits` "
+    "is the number of backend runs the scheduler cut the graph into; a dense "
+    "load with any GPU layers should be 2 (the token embedding always stays on "
+    "the CPU, llama.cpp llama-model.cpp), so a much higher count means "
+    "operations ran on a backend the plan did not assume — most often a silent "
+    "CPU attention fallback, which adds about two splits per attention layer "
+    "and costs speed on every token without printing an error."
+)
+
+
+def _unknown_plan(expected_vram_mb, expected_splits) -> dict:
     return {
         "known": False,
         "actual_vram_mb": None,
@@ -306,14 +585,17 @@ def _unknown_plan(expected_vram_mb, expected_splits: int) -> dict:
         # caller looking at this key alone (the `known` flag is the intended
         # guard, but a key must not lie on its own).
         "unexpected_splits": None,
+        "split_verdict": "not_comparable",
+        "vram_verdict": "not_comparable",
+        "diverges": None,       # no verdict, not "no problem"
         "detail": ("no buffer lines in the engine log: what the engine "
                    "allocated is UNKNOWN, not zero — a silent 0 would read as "
                    "'it fits'."),
     }
 
 
-def compare_plan(parsed, expected_vram_mb: float,
-                 expected_splits: int = 1) -> dict:
+def compare_plan(parsed, expected_vram_mb: float | None = None,
+                 expected_splits: int | None = None) -> dict:
     """What the engine allocated vs what the plan charged it for.
 
     `actual_vram_mb` sums the DEVICE buffers only:
@@ -326,13 +608,33 @@ def compare_plan(parsed, expected_vram_mb: float,
     are reported separately as `host_ram_mb`; counting them as VRAM would
     overstate the overrun and could turn a real one into a false alarm.
 
-    `unexpected_splits` is True when the log's `graph splits` exceeds
-    `expected_splits`: the scheduler split the graph across more than one
-    backend, so some operations ran somewhere the plan did not assume and the
-    charge was computed against a graph the engine did not build. (Reasoning
-    from llama.cpp's scheduler semantics, not measured in this run —
-    PREDICTION.) It is None when the load is unknown, and False only when the
-    log reported splits at or below the expectation.
+    `expected_vram_mb` must be the PLAN'S OWN PREDICTION for the same ctx,
+    cache type and slot count — `memtruth.planned_mb(plan)` (the weights plus
+    the KV cache the resolver computed) — NEVER a bare file size. The engine's
+    actual includes the KV cache, so a file size alone reports the cache as a
+    divergence: on this machine's real log that is a +35% "overrun" that is
+    entirely the 2,176 MiB KV at ctx 65536. Pass None when no plan-side
+    prediction is available at this point; the VRAM axis is then
+    `vram_verdict == "not_comparable"`, never a wrong number.
+
+    `expected_splits` is derived from the load's own plan fields
+    (`expected_splits_for_load`: ngl, layer count, expert placement, backend)
+    when not given, so the healthy all-GPU/partial dense load expects 2, not 1.
+    A caller may override it; None means "not comparable" and is what the MoE
+    and unknown-layer-count cases produce.
+
+    Three outcomes per axis, kept distinct:
+      * "ok"              — within the plan's expectation (VRAM within the same
+                            15% / 512 MiB slack `memtruth.compare` uses; splits
+                            at or below the derived count);
+      * "diverges"        — splits ABOVE the expectation, or VRAM outside the
+                            slack;
+      * "not_comparable"  — no basis for a verdict, so none is given.
+
+    `unexpected_splits` stays for callers that only want the split verdict:
+    True for "diverges", False for "ok", None for "not_comparable". `diverges`
+    is the overall flag (either axis diverges) and is None, not False, on an
+    unknown load.
 
     `parsed` may be one load from `parse_loads` or the whole list (the last
     entry is used). When nothing was parsed the result is explicitly
@@ -348,26 +650,45 @@ def compare_plan(parsed, expected_vram_mb: float,
 
     actual = _sum_buffers(parsed, host=False)
     host_ram = _sum_buffers(parsed, host=True)
-    divergence = actual - expected_vram_mb
-    pct = (divergence / expected_vram_mb * 100.0) if expected_vram_mb else None
-    splits = parsed.get("graph_splits")
-    unexpected = splits is not None and splits > expected_splits
 
-    if splits is None:
-        why = "the log did not report graph splits; backend assignment unknown."
-    elif unexpected:
-        why = ("graph splits = %d > %d: some operations were assigned to a "
-               "different backend than the plan assumed." % (splits,
-                                                             expected_splits))
+    # --- VRAM axis ---------------------------------------------------------
+    if not expected_vram_mb or expected_vram_mb <= 0:
+        vram_verdict = "not_comparable"
+        divergence = None
+        pct = None
     else:
-        why = "graph splits = %d, matching the plan." % splits
+        divergence = actual - expected_vram_mb
+        pct = divergence / expected_vram_mb * 100.0
+        slack = max(_VRAM_SLACK_MB, expected_vram_mb * _VRAM_SLACK_PCT)
+        vram_verdict = "ok" if abs(divergence) <= slack else "diverges"
 
-    detail = (
-        "engine allocated %.2f MiB of device VRAM (device model + KV + RS + "
-        "device compute); host RAM %.2f MiB excluded. Plan charged %.2f MiB; "
-        "divergence %+.2f MiB (%s). %s" % (
-            actual, host_ram, expected_vram_mb, divergence,
-            "n/a" if pct is None else "%+.1f%%" % pct, why))
+    # --- split axis --------------------------------------------------------
+    if expected_splits is None:
+        expected_splits = expected_splits_for_load(parsed)
+    splits = parsed.get("graph_splits")
+    if expected_splits is None or splits is None:
+        split_verdict = "not_comparable"
+        unexpected = None
+    else:
+        unexpected = splits > expected_splits
+        split_verdict = "diverges" if unexpected else "ok"
+
+    detail = ("engine allocated %.2f MiB of device VRAM (device model + KV + RS "
+              "+ device compute); host RAM %.2f MiB excluded. " % (actual,
+                                                                   host_ram))
+    if vram_verdict == "not_comparable":
+        detail += ("The VRAM comparison is NOT COMPARABLE: no plan-side "
+                   "prediction was supplied for this ctx / cache / slot count, "
+                   "and the engine's figure includes the KV cache, so a bare "
+                   "file size would read as a divergence that is only the "
+                   "cache. ")
+    else:
+        detail += ("The plan's own prediction for the same ctx / cache / slots "
+                   "was %.2f MiB; divergence %+.2f MiB (%+.1f%%), %s. " % (
+                       expected_vram_mb, divergence, pct,
+                       "matching the plan" if vram_verdict == "ok"
+                       else "DIVERGES from the plan"))
+    detail += _split_sentence(parsed, splits, expected_splits, split_verdict)
 
     return {
         "known": True,
@@ -379,5 +700,9 @@ def compare_plan(parsed, expected_vram_mb: float,
         "graph_splits": splits,
         "expected_splits": expected_splits,
         "unexpected_splits": unexpected,
+        "split_verdict": split_verdict,
+        "vram_verdict": vram_verdict,
+        "diverges": (vram_verdict == "diverges"
+                     or split_verdict == "diverges"),
         "detail": detail,
     }

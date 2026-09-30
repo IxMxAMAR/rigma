@@ -14,6 +14,14 @@ any) occurrence reports zeros and reads as "it fits".
 These are trimmed copies embedded here on purpose: the real file is 357,442
 bytes (~350 KiB) and reading it at test time would couple a unit test to a
 scratch artifact.
+
+A17's FIRST version asserted that this real load was "unexpected" because
+`compare_plan` took `expected_splits = 1` as a constant. That fixture IS the
+healthy case — `offloaded 65/65 layers to GPU`, flash attention fused,
+`graph splits = 2` — so the baseline was wrong and every launch would have been
+flagged. The tests below pin the corrected reading: the real fixture is HEALTHY
+(no finding), a synthetic CPU attention fallback is a finding, and a MoE that
+offloads experts reads "not comparable" rather than a finding.
 """
 import pytest
 
@@ -24,8 +32,11 @@ from rigma import engine_log
 # ---------------------------------------------------------------------------
 
 # The fitting pass: prism-v.log:2159-2340. Model buffers are ZERO because this
-# pass only reserves; the real weights land in the second load.
+# pass only reserves; the real weights land in the second load. `n_expert = 0`
+# is prism-v.log:141 — the hparams dump of the same process, printed before the
+# `offloaded` marker.
 FITTING_PASS = (
+    "0.00.521.409 I print_info: n_expert              = 0\n"
     "0.00.529.481 I load_tensors: offloaded 65/65 layers to GPU\n"
     "0.00.529.483 I load_tensors:        ROCm0 model buffer size =     0.00 MiB\n"
     "0.00.529.484 I load_tensors:    ROCm_Host model buffer size =     0.00 MiB\n"
@@ -37,8 +48,11 @@ FITTING_PASS = (
     "0.00.578.710 I sched_reserve: graph splits = 2\n"
 )
 
-# The real load: prism-v.log:4485-4672.
+# The real load: prism-v.log:4485-4672. `n_expert = 0` is prism-v.log:2466, the
+# hparams dump of the SAME process (the second one in the file), which is what
+# makes this a dense model and the split count derivable.
 REAL_LOAD = (
+    "0.00.987.636 I print_info: n_expert              = 0\n"
     "0.01.522.664 I load_tensors: offloading output layer to GPU\n"
     "0.01.522.670 I load_tensors: offloading 63 repeating layers to GPU\n"
     "0.01.522.670 I load_tensors: offloaded 65/65 layers to GPU\n"
@@ -51,6 +65,15 @@ REAL_LOAD = (
     "0.04.417.938 I sched_reserve:  ROCm_Host compute buffer size =    84.28 MiB\n"
     "0.04.417.939 I sched_reserve: graph splits = 2\n"
 )
+
+# The plan's OWN prediction for the real load: the weight file
+# (CPU_Mapped 322.07 + ROCm0 6539.67 = 6861.74 MiB) plus the KV cache the
+# resolver computed for the same ctx (65536), cache type and slot count
+# (2176.00 MiB). These are exactly `memtruth.planned_mb`'s two terms. NOT the
+# file size on its own — the engine's actual includes the KV cache, and
+# comparing against 6861.74 alone reports a +35% "overrun" that is only the
+# cache (see `test_a_bare_file_size_would_report_the_kv_cache_as_a_divergence`).
+PLAN_PREDICTION_MB = 6861.74 + 2176.00        # 9037.74
 
 # A log that never loaded anything: the panel must say UNKNOWN, never 0.
 NO_BUFFERS = (
@@ -72,6 +95,36 @@ OTHER_BACKENDS = (
     "0.00.8 I sched_reserve: graph splits = 1\n"
 )
 
+# SYNTHETIC and pathological: a dense model, every layer "offloaded", but the
+# scheduler cut the graph into a split per attention layer because the fused
+# attention node was not supported on the device and fell back to the CPU
+# SILENTLY. That is roughly 2 extra splits per attention layer
+# (GPU -> CPU -> GPU), so the count is far above the healthy baseline of 2.
+# The engine prints no error for this; the count is the only evidence.
+CPU_ATTENTION_FALLBACK = (
+    "0.00.1 I print_info: n_expert              = 0\n"
+    "0.00.2 I load_tensors: offloaded 65/65 layers to GPU\n"
+    "0.00.3 I load_tensors:        ROCm0 model buffer size =  6539.67 MiB\n"
+    "0.00.4 I llama_kv_cache:      ROCm0 KV buffer size =  2176.00 MiB\n"
+    "0.00.5 I sched_reserve:      ROCm0 compute buffer size =   410.28 MiB\n"
+    "0.00.6 I sched_reserve:  ROCm_Host compute buffer size =    84.28 MiB\n"
+    "0.00.7 I sched_reserve: graph splits = 34\n"
+)
+
+# SYNTHETIC and LEGITIMATE: the owner's 35B MoE with expert weights kept on the
+# CPU inside GPU layers (`--n-cpu-moe`). Many splits are expected here, and the
+# log does not say how many expert layers were kept on the CPU, so the detector
+# must refuse a verdict rather than cry wolf.
+MOE_EXPERT_OFFLOAD = (
+    "0.00.1 I print_info: n_expert              = 256\n"
+    "0.00.2 I print_info: n_expert_used         = 8\n"
+    "0.00.3 I load_tensors: offloaded 49/49 layers to GPU\n"
+    "0.00.4 I load_tensors:        ROCm0 model buffer size = 18000.00 MiB\n"
+    "0.00.5 I load_tensors:           CPU model buffer size =  2000.00 MiB\n"
+    "0.00.6 I sched_reserve:      ROCm0 compute buffer size =   600.00 MiB\n"
+    "0.00.7 I sched_reserve: graph splits = 98\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -85,6 +138,8 @@ def test_real_load_numbers_are_extracted():
     assert load["offloaded_layers"] == (65, 65)
     assert load["n_seq_max"] == 1
     assert load["graph_splits"] == 2
+    assert load["n_expert"] == 0
+    assert load["backend"] == "rocm"
 
     model = {b["label"]: b["mb"] for b in load["model_buffers"]}
     assert model["ROCm0"] == pytest.approx(6539.67)
@@ -137,41 +192,179 @@ def test_other_backend_labels_are_classified_host_vs_device():
         "host"] is True
 
 
+def test_n_expert_attaches_to_the_load_after_it_and_does_not_leak():
+    # The hparams dump precedes the marker, so the value is carried forward; it
+    # must not survive into a later load that has no dump of its own.
+    text = ("0.0 I print_info: n_expert = 4\n"
+            + MOE_EXPERT_OFFLOAD.split("\n", 2)[2])
+    loads = engine_log.parse_loads(text)
+
+    assert loads[-1]["n_expert"] == 4
+    # a tail with no hparams dump is UNKNOWN, never the previous model's count
+    assert engine_log.parse_load(
+        "0.0 I load_tensors: offloaded 65/65 layers to GPU\n"
+        "0.1 I load_tensors: ROCm0 model buffer size = 10.00 MiB\n")["n_expert"] \
+        is None
+
+
+# ---------------------------------------------------------------------------
+# The split expectation comes from the PLAN
+# ---------------------------------------------------------------------------
+
+def test_the_real_loads_plan_fields_come_from_its_own_log():
+    fields = engine_log.plan_fields_from_load(engine_log.parse_load(REAL_LOAD))
+
+    # `offloaded 65/65` counts the output layer, so the model has 65 - 1 = 64
+    # layers and all 65 offload slots are on the GPU.
+    assert fields == {"ngl": 65, "n_layers": 64, "n_cpu_moe": 0,
+                      "backend": "rocm"}
+
+
+def test_a_dense_load_with_any_gpu_layers_expects_two_splits():
+    # all-GPU ...
+    assert engine_log.expected_splits(ngl=65, n_layers=64, n_cpu_moe=0) == 2
+    # ... and a contiguous partial offload (first layers on the CPU) are the
+    # same two runs: the CPU embedding is contiguous with the CPU layers.
+    assert engine_log.expected_splits(ngl=40, n_layers=64, n_cpu_moe=0) == 2
+
+
+def test_a_cpu_only_plan_expects_one_split():
+    assert engine_log.expected_splits(ngl=0, n_layers=64, n_cpu_moe=0) == 1
+    assert engine_log.expected_splits(ngl=64, n_layers=64, n_cpu_moe=0,
+                                      backend="cpu") == 1
+
+
+def test_moe_expert_offload_has_no_derivable_split_count():
+    # n_cpu_moe > 0: expert weights on the CPU inside GPU layers force a new
+    # split per affected layer, so `ngl` does not determine the count.
+    assert engine_log.expected_splits(ngl=49, n_layers=48, n_cpu_moe=12) is None
+    # n_cpu_moe unknown (what the log gives for any MoE): also not comparable.
+    assert engine_log.expected_splits(ngl=49, n_layers=48,
+                                      n_cpu_moe=None) is None
+    # no layer count: nothing to derive from.
+    assert engine_log.expected_splits(ngl=65, n_layers=None,
+                                      n_cpu_moe=0) is None
+
+
+def test_the_old_constant_baseline_of_one_would_flag_the_healthy_load():
+    """The defect, pinned. `expected_splits = 1` (the old default) made the real
+    fixture diverge; the derived baseline does not."""
+    load = engine_log.parse_load(REAL_LOAD)
+
+    old = engine_log.compare_plan(load, PLAN_PREDICTION_MB, expected_splits=1)
+    now = engine_log.compare_plan(load, PLAN_PREDICTION_MB)
+
+    assert old["unexpected_splits"] is True
+    assert now["unexpected_splits"] is False
+
+
 # ---------------------------------------------------------------------------
 # Plan vs reality
 # ---------------------------------------------------------------------------
+
+def test_the_real_load_is_healthy():
+    r = engine_log.compare_plan(engine_log.parse_load(REAL_LOAD),
+                                PLAN_PREDICTION_MB)
+
+    assert r["known"] is True
+    assert r["actual_vram_mb"] == pytest.approx(9275.57)
+    assert r["host_ram_mb"] == pytest.approx(406.35)
+    # graph splits = 2 is the DENSE baseline, not a divergence
+    assert r["graph_splits"] == 2
+    assert r["expected_splits"] == 2
+    assert r["split_verdict"] == "ok"
+    assert r["unexpected_splits"] is False
+    assert r["vram_verdict"] == "ok"
+    assert r["diverges"] is False
+    assert "diverges" not in r["detail"].lower()
+
 
 def test_divergence_is_measured_against_device_vram_only():
     # Device total: 6539.67 + 2176.00 + 149.62 + 410.28 = 9275.57 MiB.
     # Host RAM (CPU_Mapped 322.07 + ROCm_Host 84.28) is NOT VRAM and is
     # excluded; including it would report 9681.92 and overstate the overrun.
-    r = engine_log.compare_plan(engine_log.parse_load(REAL_LOAD), 7000)
+    r = engine_log.compare_plan(engine_log.parse_load(REAL_LOAD),
+                                PLAN_PREDICTION_MB)
 
-    assert r["known"] is True
     assert r["actual_vram_mb"] == pytest.approx(9275.57)
     assert r["host_ram_mb"] == pytest.approx(406.35)
-    assert r["divergence_mb"] == pytest.approx(2275.57)
-    assert r["divergence_pct"] == pytest.approx(32.5081, abs=1e-3)
-    # more than one graph split means some ops were assigned to a backend the
-    # plan did not assume; the plan's charge assumes a single split.
+    # against the plan's OWN prediction the gap is the compute buffer and the
+    # RS buffer minus the host-mapped weights, ~2.6% — not the 32% a bare
+    # budget produced.
+    assert r["divergence_mb"] == pytest.approx(237.83, abs=0.01)
+    assert r["divergence_pct"] == pytest.approx(2.6315, abs=1e-3)
+
+
+def test_a_bare_file_size_would_report_the_kv_cache_as_a_divergence():
+    """GUIDANCE entry 5, pinned as a test.
+
+    The engine's 9275.57 MiB "actual" includes the KV cache at ctx 65536.
+    Compared against the weight file alone (6861.74 MiB) that reads as a +35%
+    divergence that is entirely the KV cache; against the plan's own prediction
+    for the same ctx / cache / slots it is +2.6%.
+    """
+    load = engine_log.parse_load(REAL_LOAD)
+
+    file_only = engine_log.compare_plan(load, 6861.74)
+    with_plan = engine_log.compare_plan(load, PLAN_PREDICTION_MB)
+
+    assert file_only["divergence_pct"] == pytest.approx(35.178, abs=1e-2)
+    assert file_only["vram_verdict"] == "diverges"
+    assert with_plan["vram_verdict"] == "ok"
+
+
+def test_without_a_plan_prediction_the_vram_axis_is_not_comparable():
+    # The `/api/server/findings` surface has the log but not the plan. Saying
+    # "not comparable" is the honest answer; inventing a number is not.
+    r = engine_log.compare_plan(engine_log.parse_load(REAL_LOAD))
+
+    assert r["vram_verdict"] == "not_comparable"
+    assert r["divergence_mb"] is None
+    assert r["divergence_pct"] is None
+    assert "NOT COMPARABLE" in r["detail"]
+    # ... and the split axis, which the log DOES determine, still has a verdict
+    assert r["split_verdict"] == "ok"
+    assert r["diverges"] is False
+
+
+def test_a_cpu_attention_fallback_diverges():
+    load = engine_log.parse_load(CPU_ATTENTION_FALLBACK)
+
+    r = engine_log.compare_plan(load)
+
+    assert r["graph_splits"] == 34
+    assert r["expected_splits"] == 2
+    assert r["split_verdict"] == "diverges"
     assert r["unexpected_splits"] is True
+    assert r["diverges"] is True
+    assert "CPU attention fallback" in r["detail"]
 
 
-def test_single_graph_split_is_not_unexpected():
+def test_moe_expert_offload_is_not_comparable_not_a_divergence():
+    load = engine_log.parse_load(MOE_EXPERT_OFFLOAD)
+
+    r = engine_log.compare_plan(load)
+
+    assert r["graph_splits"] == 98
+    assert r["expected_splits"] is None
+    assert r["split_verdict"] == "not_comparable"
+    assert r["unexpected_splits"] is None
+    assert r["diverges"] is False
+    assert "NOT COMPARABLE" in r["detail"]
+    assert "n_expert = 256" in r["detail"]
+
+
+def test_fewer_splits_than_expected_is_not_flagged():
+    # The engine doing BETTER than the plan (e.g. the embedding on the device)
+    # is not a defect, and a count below the baseline is not the fallback shape.
     load = engine_log.parse_load(
         REAL_LOAD.replace("graph splits = 2", "graph splits = 1"))
 
-    r = engine_log.compare_plan(load, 7000)
+    r = engine_log.compare_plan(load)
 
     assert r["graph_splits"] == 1
+    assert r["split_verdict"] == "ok"
     assert r["unexpected_splits"] is False
-
-
-def test_expected_splits_argument_raises_the_bar():
-    load = engine_log.parse_load(REAL_LOAD)
-
-    assert engine_log.compare_plan(load, 7000, expected_splits=2)[
-        "unexpected_splits"] is False
 
 
 def test_no_memory_data_is_explicitly_unknown_never_zero():
@@ -187,6 +380,9 @@ def test_no_memory_data_is_explicitly_unknown_never_zero():
     # S2b: an unknown load has no split verdict either — `False` would read as
     # "no split problem" to a caller looking at this key alone.
     assert r["unexpected_splits"] is None
+    assert r["split_verdict"] == "not_comparable"
+    assert r["vram_verdict"] == "not_comparable"
+    assert r["diverges"] is None
 
 
 def test_a_found_load_with_no_buffer_lines_is_unknown_not_zero():
@@ -210,8 +406,38 @@ def test_a_found_load_with_no_buffer_lines_is_unknown_not_zero():
 def test_compare_plan_accepts_the_full_load_list():
     loads = engine_log.parse_loads(FITTING_PASS + REAL_LOAD)
 
-    assert engine_log.compare_plan(loads, 7000)["actual_vram_mb"] == \
-        pytest.approx(9275.57)
+    assert engine_log.compare_plan(loads, PLAN_PREDICTION_MB)[
+        "actual_vram_mb"] == pytest.approx(9275.57)
+
+
+# ---------------------------------------------------------------------------
+# Wiring: /api/server/findings is `engine_log.findings`, so the load
+# accounting must add a finding ONLY when it really diverges.
+# ---------------------------------------------------------------------------
+
+def test_a_healthy_load_yields_no_finding():
+    """The whole point of the fix: the owner's real load is healthy and must
+    produce NO finding on every launch."""
+    assert engine_log.findings(REAL_LOAD) == []
+
+
+def test_a_cpu_attention_fallback_load_yields_a_finding():
+    got = engine_log.findings(CPU_ATTENTION_FALLBACK)
+
+    assert [f["id"] for f in got] == ["plan_divergence"]
+    assert got[0]["severity"] == "warn"
+    assert got[0]["confirmed_here"] is False
+    assert "CPU attention fallback" in got[0]["message"]
+    assert "graph splits = 34" in got[0]["example"]
+
+
+def test_a_moe_expert_offload_load_yields_no_finding():
+    # "not comparable" is not a finding; the owner's 35B MoE must not be flagged.
+    assert engine_log.findings(MOE_EXPERT_OFFLOAD) == []
+
+
+def test_the_real_fitting_pass_and_load_together_yield_no_finding():
+    assert engine_log.findings(FITTING_PASS + REAL_LOAD) == []
 
 
 # ---------------------------------------------------------------------------
