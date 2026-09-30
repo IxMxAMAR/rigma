@@ -2183,6 +2183,19 @@ def up(use_case: str = typer.Option("general", "--use-case"),
        spec: str = typer.Option(None, "--spec",
                                 help="Speculative decoding: none|draft-mtp|"
                                      "ngram-simple|... (engine-supported)"),
+       batch: int = typer.Option(
+           None, "--batch",
+           help="Logical batch (-b) for prompt processing. Unset keeps the "
+                "engine default (2048) or the model's stored value"),
+       ubatch: int = typer.Option(
+           None, "--ubatch",
+           help="Physical batch (-ub). llama.cpp sizes its compute buffer from "
+                "this, so the fit is re-run and the ubatch is charged; unset "
+                "keeps the engine default (512) or the model's stored value"),
+       ngl: int = typer.Option(
+           None, "--ngl",
+           help="GPU layers (-ngl), as a CAP: clamped down to what fits at the "
+                "chosen ctx/cache and reported. -1 = no opinion"),
        detach: bool = typer.Option(False, "--detach", "-d",
                                    help="Run in the background; the terminal "
                                         "returns and Rigma keeps serving"),
@@ -2423,6 +2436,44 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if _upd:
             rp.flags = rp.flags.model_copy(update=_upd)
             rp.origin += "+model-default"
+    # C10-cli: the three levers C10 made storable per model, as a per-invocation
+    # override. They are a REQUEST, not a placement, and they carry the SAME fit
+    # obligations as a stored default: the pair must be launchable (`n_ubatch <=
+    # n_batch`) and the ubatch must reach the FIT, because llama.cpp sizes its
+    # compute buffer from the physical batch. `_cli_spec` below is the spec with
+    # the merged launch defaults, so the re-fit at the end of this function
+    # prices the ubatch that will actually launch — without it the override
+    # would reach the argv but not the arithmetic.
+    _cli_spec = None
+    if batch is not None or ubatch is not None or ngl is not None:
+        from .models import LaunchDefaults
+        _cur = getattr(reg.models[rp.model_slug], "launch", None) \
+            or LaunchDefaults()
+        _merged = _cur.model_copy(update={
+            **({"batch": batch} if batch is not None else {}),
+            **({"ubatch": ubatch} if ubatch is not None else {}),
+            **({"ngl": ngl} if ngl is not None else {}),
+        })
+        try:
+            # model_copy does not validate; re-run the pair/negative validators.
+            _merged = LaunchDefaults.model_validate(_merged.model_dump())
+        except ValueError as e:
+            _errs = getattr(e, "errors", lambda: [])()
+            typer.echo("--batch/--ubatch/--ngl: "
+                       + (_errs[0]["msg"] if _errs else str(e)))
+            raise typer.Exit(2) from None
+        _cli_spec = reg.models[rp.model_slug].model_copy(
+            update={"launch": _merged})
+        _cli_upd = {}
+        if _merged.batch > 0:
+            _cli_upd["batch"] = _merged.batch
+        if _merged.ubatch > 0:
+            _cli_upd["ubatch"] = _merged.ubatch
+        if _merged.ngl >= 0:
+            _cli_upd["ngl"] = _merged.ngl
+        if _cli_upd:
+            rp.flags = rp.flags.model_copy(update=_cli_upd)
+            rp.origin += "+cli-request"
     if ctx is not None:
         native = reg.models[rp.model_slug].native_ctx
         rp.flags = rp.flags.model_copy(update={"ctx": max(1024, min(ctx, native))})
@@ -2497,11 +2548,14 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     # now. --ctx and --spec both move the answer, and running it above them
     # meant `rigma up --spec ...` budgeted a draft cache of the wrong size, or
     # none at all.
-    _spec_r = reg.models.get(rp.model_slug)
+    _spec_r = _cli_spec or reg.models.get(rp.model_slug)
     if _spec_r is not None:
         from .server_ops import launch_fit_spec as _fit_spec
         _spec2, _differs = _fit_spec(_spec_r, rp.flags, vision=_vision)
-        if _launch is not None or _differs:
+        # A CLI --batch/--ubatch/--ngl is a reason to re-fit even when nothing
+        # else moved: the ubatch must be charged and the ngl clamped against
+        # the fit at THAT physical batch.
+        if _launch is not None or _differs or _cli_spec is not None:
             from .resolve import fit_for_launch as _fit_launch
             from .resolve import step_down_notice as _step_notice
             _fl, _stepped = _fit_launch(
