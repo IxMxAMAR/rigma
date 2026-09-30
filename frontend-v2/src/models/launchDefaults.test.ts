@@ -148,6 +148,26 @@ describe("the fit the dialog must show", () => {
     expect(line).toContain("clamped");
   });
 
+  it("reads a fully-resident fit's ngl 99 as every layer, not 99 of 64", () => {
+    // C1. `ComboFlags.ngl` defaults to 99 (models.py:415) and 99 is the
+    // "all layers" SENTINEL (resolve.py:825; `Fit.ngl`'s own doc says
+    // "99 = all"): the dense branch that fits fully returns `ComboFlags(ctx=…)`
+    // with no `ngl` at all (resolve.py:768). The only committed fit fixture
+    // was the partial 59, so the best case — the model fits entirely — rendered
+    // "the fit places 99 of 64 layers on the GPU".
+    const line = fitAnswer({ ...FIT, ngl: 99, offload_pct: 0 }, 64);
+    expect(line).toContain("places all 64 layers on the GPU");
+    expect(line).not.toContain("99");
+  });
+
+  it("says 'every layer' for the sentinel when the layer count is unknown", () => {
+    // The dialog always passes `nLayers`, but the helper is total: with no
+    // count there is still no literal 99 to print.
+    const line = fitAnswer({ ...FIT, ngl: 99 }, undefined);
+    expect(line).toContain("places every layer on the GPU");
+    expect(line).not.toContain("99");
+  });
+
   it("says nothing at all when there is no verdict to show", () => {
     expect(fitAnswer(undefined, 64)).toBe("");
     expect(fitAnswer({}, 64)).toBe("");

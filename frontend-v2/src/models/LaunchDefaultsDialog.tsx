@@ -120,11 +120,23 @@ export function LaunchDefaultsForm({
   // chosen, instead of letting the resolver do it silently.
   const ctxClampedTo = ctxKnown(nativeCtx) && currentCtx > nativeCtx
     ? nativeCtx : null;
+  // C6: the same launch path FLOORS the value: `want = max(2048, min(int(ctx),
+  // spec.native_ctx))` (server_ops.py:754). A stored value below 2048 is
+  // therefore raised at launch as silently as one above the window is lowered,
+  // so it gets the same kind of note. The select cannot create one (its steps
+  // start at 8K), but the API and a hand-edited spec can store one.
+  const CTX_FLOOR = 2048;
+  const ctxBelowFloor = currentCtx > 0 && currentCtx < CTX_FLOOR
+    ? currentCtx : null;
   const qs = quants.slice();
   if (draft.quant && !qs.includes(draft.quant)) qs.push(draft.quant);
   const changed = defaultsChanged(draft, initial);
   const fitLine = fitAnswer(fit, nLayers);
-  const storedUbatch = Number(draft.ubatch) || 0;
+  // C2: the fit shown is the STORED one (the server priced it before this
+  // draft existed), so the note must name the stored ubatch — `draft.ubatch`
+  // made it say "stored ubatch (8192)" the moment the user typed, while the fit
+  // on screen was still priced at the stored 2048.
+  const storedUbatch = Number(initial?.ubatch) || 0;
 
   return (
     <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center"
@@ -191,6 +203,16 @@ export function LaunchDefaultsForm({
             clear it.
           </p>
         )}
+        {ctxBelowFloor !== null && (
+          // C6: mirrors the above-window note for the other direction. The
+          // launch floors at 2048, so a stored value below it does not run
+          // either — and before this it did so with nothing said.
+          <p role="note" className="text-[11.5px] text-amber pl-28 -mt-1">
+            the current context {currentCtx} is below the launch floor
+            {" "}{CTX_FLOOR}, so a launch raises it to {CTX_FLOOR} — the pinned
+            value is not what runs. Pick {CTX_FLOOR} or higher, or clear it.
+          </p>
+        )}
 
         <label className={row} title="KV cache precision. Halving it roughly doubles the
 context that fits, but cache error is written per token and compounds.">
@@ -230,7 +252,9 @@ context that fits, but cache error is written per token and compounds.">
           below is priced at the stored ubatch
           {storedUbatch ? ` (${storedUbatch})` : " (the engine default 512)"};
           saving a new value re-prices it. A physical batch larger than the
-          logical one is refused by the engine, so the server will answer 400.
+          logical one is refused by the SERVER with a 400 — llama.cpp itself
+          only clamps n_ubatch to n_batch (b9867), so Rigma rejects the pair at
+          write time rather than letting it load.
         </p>
 
         <label className={row} title="A CAP on the fit's own placement (-ngl). Blank = the fit decides. 0 = every layer on the CPU.">

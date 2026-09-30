@@ -158,14 +158,24 @@ export function fitAnswer(
       + "override cannot make it fit.";
   }
   if (fit.ngl === undefined) return "";
-  const of = nLayers ? ` of ${nLayers}` : "";
+  // C1: `ngl` is NOT always a count. `ComboFlags.ngl` defaults to 99
+  // (models.py:415) and that value is the "all layers" SENTINEL, not a number
+  // of layers: the fully-resident dense branch returns `ComboFlags(ctx=…)`
+  // with no `ngl` (resolve.py:768), and `resolve.py:825` reads 99 as "all".
+  // Rendering it literally made the best case — a model that fits entirely on
+  // the GPU — read "99 of 64 layers" (verify-w5f5 C1). The same sentinel is
+  // what `engineApi.Fit.ngl` documents as "99 = all" (engineApi.ts:129).
+  const all = fit.ngl === 99;
+  const placed = all
+    ? (nLayers ? `all ${nLayers} layers` : "every layer")
+    : `${fit.ngl}${nLayers ? ` of ${nLayers}` : ""} layers`;
   const b = fit.budget;
   const vram = b
     ? (b.over_mb > 0
         ? `; ${b.over_mb} MB OVER the ${b.budget_mb} MB budget`
         : `; ${-b.over_mb} MB of headroom under the ${b.budget_mb} MB budget`)
     : "";
-  return `the fit places ${fit.ngl}${of} layers on the GPU ${where}`
+  return `the fit places ${placed} on the GPU ${where}`
     + ` (${fit.offload_pct ?? 0}% of the weights offloaded)${vram}. ngl is the`
     + " fit's output: a lower value is honoured, a higher one is clamped to"
     + " what the fit allows at launch, and the plan says which.";
