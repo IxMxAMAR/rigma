@@ -105,6 +105,7 @@ LLAMACPP_ONLY_FLAGS = (
     "--ctx-checkpoints",
     "--slot-save-path", "--spec-type", "--spec-draft-n-max",
     "--reasoning", "--reasoning-budget", "--reasoning-budget-message",
+    "--reasoning-effort",
     "--mmproj", "--chat-template-file", "--no-mmap", "--tensor-split",
 )
 

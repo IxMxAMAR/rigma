@@ -329,6 +329,16 @@ BUDGET_EXHAUSTED = (
 )
 
 
+# The `--reasoning-effort` levels the engine documents, verbatim from the flag's
+# own help string (PrismML-Eng/llama.cpp 87268f77 common/arg.cpp:3678-3680):
+# "'default' to keep the template default, or a level such as 'minimal', 'low',
+# 'medium', 'high', 'xhigh' or 'max' (default: default)". The handler stores the
+# string into `default_template_kwargs["reasoning_effort"]` with NO validation of
+# its own, so this list is Rigma's guard against a silent typo, not an engine
+# bound. `default` is the sentinel for "no opinion" and is never emitted.
+REASONING_EFFORTS = ("default", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
 class ComboFlags(BaseModel):
     ctx: int
     ngl: int = 99
@@ -343,7 +353,25 @@ class ComboFlags(BaseModel):
     # flag that changed, so it is the only one that gets reverted until it is
     # measured on its own. The runaway-deliberation problem it was meant to
     # solve is real, but it is worth less than 50x the speed.
+    #
+    # -1 HERE IS A REAL ENGINE VALUE, NOT A SENTINEL. mainline b9867
+    # `--reasoning-budget` documents "token budget for thinking: -1 for
+    # unrestricted, 0 for immediate end, N>0 for token budget (default: -1)"
+    # and its handler rejects only `< -1` (common/arg.cpp:3287-3291; the default
+    # is `reasoning_budget_tokens = -1` in common/common.h:284). Rigma's -1 and
+    # the engine's default therefore COINCIDE, which is why `server_args` may
+    # omit the flag for -1 and still mean "unrestricted". Do not read this -1 as
+    # the same kind of thing as `ctx_checkpoints`'s -1 below: that one is
+    # Rigma-only (the engine's own default is 32) and exists solely to mean
+    # "omit". Same glyph, opposite provenance — hence the comment.
     reasoning_budget: int = -1
+    # Launch-level default for the chat template's `reasoning_effort` kwarg.
+    # FORK-ONLY: see `engine_compat.engine_is_prism_fork` and `server_args`. ""
+    # (and the engine's own "default") mean NO OPINION, so the flag is omitted
+    # and the template keeps its default. Rigma still sends a per-request effort
+    # for a session that names one (`serve.py`), and a request kwarg wins over
+    # this server-side default, so the two cannot fight.
+    reasoning_effort: str = ""
     spec_type: str = "none"   # none | draft-mtp | ngram-simple | ... (engine list)
     spec_n_max: int = 3
     batch: int = 0        # -b logical batch (0 = engine default 2048)
@@ -390,6 +418,15 @@ class ComboFlags(BaseModel):
         if v < -1:
             raise ValueError(
                 f"ctx_checkpoints must be -1 (engine default) or >= 0, got {v}")
+        return v
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _known_reasoning_effort(cls, v: str) -> str:
+        if v and v not in REASONING_EFFORTS:
+            raise ValueError(
+                f"reasoning_effort must be one of "
+                f"{', '.join(REASONING_EFFORTS)}, got {v!r}")
         return v
 
     @model_validator(mode="after")
@@ -442,6 +479,21 @@ class RunPlan(BaseModel):
     flags: ComboFlags
     origin: str  # "combo:<path>" | "class:<path>" | "calculator"
     explain: list[str] = Field(default_factory=list)
+    # THE FROZEN ENGINE IDENTITY. True/False once the binary for this plan has
+    # been chosen (`server_ops.engine_binary_for_plan`), None while nobody has
+    # chosen one. `server_args` reads ONLY this: it never re-asks "is this the
+    # fork?" at argv-build time, because the answer depends on the model being on
+    # disk and `ensure_model` can put it there between the choice and the argv.
+    # That mismatch is exactly how a first run launched the pinned mainline
+    # b9867 build with the fork-only `--reasoning-effort` on its command line.
+    #
+    # None means "no engine has been chosen yet" and is treated as NOT the fork:
+    # a plan that never selected an engine (a `--dry-run` preview, a unit test)
+    # omits the fork-only flag. That is the safe direction — the flag's absence
+    # costs nothing on the fork, its presence kills a mainline launch in argparse
+    # — and it means the fork lever can never be emitted from a stale re-ask.
+    # `model_copy` carries it, so calibration/sweep copies keep the decision.
+    engine_is_prism_fork: bool | None = None
 
     def server_args(self, model_path: str, port: int) -> list[str]:
         # --parallel 2 + --kv-unified: one slot for the user's conversation,
@@ -474,6 +526,19 @@ class RunPlan(BaseModel):
             # lost; with it, the budget ends in a conclusion instead of a
             # guillotine.
             args += ["--reasoning-budget-message", BUDGET_EXHAUSTED]
+        # --reasoning-effort is FORK-ONLY (PrismML 87268f77 common/arg.cpp:3678;
+        # mainline b9867 has no such string and llama-server exits in argparse —
+        # `error: invalid argument: --reasoning-effort` — before loading a
+        # weight). Emitted ONLY from the identity frozen onto this plan when the
+        # engine binary was chosen (`engine_is_prism_fork`), never re-derived
+        # here: re-deriving means asking `_registered_engine_for` AFTER
+        # `ensure_model` may have put the model on disk, which can name a
+        # different build than the one that will actually launch. `None`
+        # (nobody chose an engine) is not the fork, so the flag stays off.
+        if (self.flags.reasoning_effort
+                and self.flags.reasoning_effort != "default"
+                and self.engine_is_prism_fork is True):
+            args += ["--reasoning-effort", self.flags.reasoning_effort]
         if self.flags.spec_type and self.flags.spec_type != "none":
             args += ["--spec-type", self.flags.spec_type,
                      "--spec-draft-n-max", str(self.flags.spec_n_max)]

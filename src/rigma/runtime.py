@@ -425,6 +425,23 @@ def server_argv(exe, plan: RunPlan, model_path, port: int,
             "--slot-save-path", str(rigma_home() / "sessions")]
 
 
+def _engine_rejected_flag(tail: str, flag: str) -> bool:
+    """Whether the engine died because argparse did not know `flag`.
+
+    llama.cpp's argument parser throws `error: invalid argument: <arg>` for an
+    option the build was not compiled with (common/arg.cpp, fork 87268f77:824
+    and :1217). That message is the ONLY evidence available without starting the
+    engine a second way, so it is matched conservatively: the flag must be named
+    in the log tail AND the tail must say the argument was rejected.
+    """
+    if flag not in tail:
+        return False
+    low = tail.lower()
+    return any(m in low for m in ("invalid argument", "unknown argument",
+                                  "unrecognised argument", "unrecognized argument",
+                                  "invalid option", "unknown option"))
+
+
 def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
                   timeout: float = 300.0,
                   extra_args: list[str] | None = None) -> ServerProcess:
@@ -442,21 +459,52 @@ def launch_server(exe: Path, plan: RunPlan, model_path: Path, port: int = 11500,
     # proprietary Vulkan driver) — merged over the inherited environment
     if plan.flags.env:
         popen_kw["env"] = {**os.environ, **plan.flags.env}
-    with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
-        proc = subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT,
-                                **popen_kw)
-    sp = ServerProcess(proc, port, log_path)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            break
-        if sp.is_healthy():
-            return sp
-        time.sleep(0.5)
-    code = proc.poll()
-    sp.stop()
-    tail = "".join(log_path.read_text(encoding="utf-8",
-                                      errors="replace").splitlines(True)[-40:])
+    retried_without_effort = False
+    while True:
+        with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
+            proc = subprocess.Popen(argv, stdout=log_f, stderr=subprocess.STDOUT,
+                                    **popen_kw)
+        sp = ServerProcess(proc, port, log_path)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            if sp.is_healthy():
+                if retried_without_effort:
+                    # The engine is up, but NOT with the effort Rigma asked for.
+                    # Record that where a support question will look.
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as log_f:
+                            log_f.write(
+                                "\n[rigma] this engine rejected "
+                                "--reasoning-effort (it predates the flag), so "
+                                "the launch was retried without it; the "
+                                "requested reasoning effort is NOT in effect.\n")
+                    except OSError:
+                        pass
+                return sp
+            time.sleep(0.5)
+        code = proc.poll()
+        sp.stop()
+        tail = "".join(log_path.read_text(encoding="utf-8",
+                                          errors="replace").splitlines(True)[-40:])
+        # A VERSION-BLIND FALSE POSITIVE MUST NOT BE FATAL. `engine_is_prism_fork`
+        # reads the build's declared tensor types, and a PrismML build older than
+        # 87268f77 declares the same private types but predates
+        # `--reasoning-effort`; registration carries no version or commit, so the
+        # age cannot be checked before launch (see
+        # `engine_compat.engine_is_prism_fork`). If the engine names the flag as
+        # the argument it rejected, drop it and retry ONCE: a lost lever beats a
+        # dead launch. The retry cannot loop — the flag is gone from the rebuilt
+        # argv, so the condition is false the second time.
+        if (not retried_without_effort and "--reasoning-effort" in argv
+                and _engine_rejected_flag(tail, "--reasoning-effort")):
+            retried_without_effort = True
+            quiet = plan.model_copy(update={
+                "flags": plan.flags.model_copy(update={"reasoning_effort": ""})})
+            argv = server_argv(exe, quiet, model_path, port, extra_args)
+            continue
+        break
     # A hard crash right after "initializing" means the ENGINE could not build a
     # context for this model — the model/build are incompatible. Saying "failed
     # to become healthy" sends people hunting for VRAM and context settings that
