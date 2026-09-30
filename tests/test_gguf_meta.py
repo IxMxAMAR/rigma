@@ -1,4 +1,5 @@
 """Hangar: GGUF header parsing for custom-model import."""
+import io
 import struct
 
 import pytest
@@ -193,6 +194,32 @@ def test_not_a_gguf_raises(tmp_path):
     p.write_bytes(b"NOPE" + b"\x00" * 64)
     with pytest.raises(GgufParseError):
         read_metadata(p)
+
+
+# --- 06R3-8: the version check was a floor only ------------------------------
+
+def _gguf_version(version: int, kvs=()) -> bytes:
+    return (b"GGUF" + struct.pack("<I", version) + struct.pack("<Q", 0)
+            + struct.pack("<Q", len(kvs)) + b"".join(kvs))
+
+
+def test_the_versions_this_reader_implements_are_accepted():
+    """v2 and v3 share the layout this reader parses; both must still load."""
+    for version in (2, 3):
+        info = inspect_gguf(io.BytesIO(_gguf_version(version, DENSE)))
+        assert info.spec_fields["n_layers"] == 8
+
+
+@pytest.mark.parametrize("version", [0, 1, 4, 5, 100, 2**32 - 1])
+def test_an_unknown_gguf_version_is_refused_by_name(version):
+    """06R3-8: `if version < 2` accepted EVERY later version, so a v4+ header was
+    parsed as if it were v2/v3 and every field was silently wrong. The layouts
+    this module implements are exactly v2 and v3 — both pinned engines define
+    GGUF_VERSION 3 (mainline b9867 ggml/include/gguf.h and
+    gguf-py/gguf/constants.py; PrismML 87268f77 likewise), so v4 is not a newer
+    file this reader understands. Refuse it and say which version it was."""
+    with pytest.raises(GgufParseError, match=rf"version {version}"):
+        read_metadata(io.BytesIO(_gguf_version(version, DENSE)))
 
 
 def test_corrupt_string_length_raises_instead_of_hanging(tmp_path):
