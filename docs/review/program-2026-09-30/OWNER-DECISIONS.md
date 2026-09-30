@@ -389,3 +389,34 @@ one-liner, and the current behaviour is the status quo the owner has been runnin
 is the point: the next session should not rediscover it as a mystery.
 
 **If nothing is decided:** `taskkill /T` keeps walking parent links. No observed incident.
+
+---
+
+## OD-15 — Should `POST /api/restore` truly replace the store, or keep merging? (D4c)
+
+**State today:** the new Backup/Restore card tells the user that restoring *"replaces the whole store…
+anything not in the file is gone"*. An independent TestClient probe measured what the route actually
+does (`_apply_restore`, `serve.py:1552-1572`): **memory is genuinely replaced** (`store.restore(rows)`,
+a whole-file write), but **settings are merged** (`app_settings.save(patch)` does
+`cur = load(); cur.update(clean)`) and **user methods are merged by id** (`methods.save_user(full)`
+per file method — it deletes nothing). Probe: restoring a document with one method, `settings:{}` and
+`memory:[]` left a second method (`keepme`) and the existing `idle_unload_minutes=12` in place.
+
+**Options**
+
+1. **Change the route to truly replace** (delete methods and reset settings not present in the
+   document), so "restore a backup" means what every user expects and what the card promised. **Cost:**
+   it is destructive in a new way — anything created *after* the backup is deleted — so it needs its
+   own confirmation and its own test, and it changes an existing public endpoint's semantics.
+2. **Keep the merge and fix the copy** (done: the card now says memory is replaced and settings and
+   methods are merged). **Cost:** "restore" is then really "restore memory, overlay settings and
+   methods", which is surprising for a backup file and means a user cannot use it to get back to a
+   known state.
+
+**Recommendation: option 1, as its own scoped item** — a backup/restore feature whose restore cannot
+undo a later change is only half a feature, and the merge semantics are an artefact of how the three
+stores are written rather than a decision anyone made. But it is destructive, so it should be done
+deliberately, with its own confirmation wording and a test that a post-backup method really is removed.
+
+**If nothing is decided:** the merge stands and the card tells the truth about it. Not a data-loss
+risk — a feature that does less than its name suggests.
