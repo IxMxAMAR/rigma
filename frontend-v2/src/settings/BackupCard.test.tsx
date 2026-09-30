@@ -5,10 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import BackupCard from "./BackupCard";
 
-// D4c. `/api/restore` replaces MEMORY and MERGES settings and methods, so the
-// requirement is not "there is a button" — it is that the destructive step
-// cannot happen in one click, and that the confirmation NAMES what is replaced
-// and what is only overwritten entry by entry.
+// D4c. `/api/restore` REPLACES the whole store — memory, settings and methods
+// (OD-15 option 1) — so the requirement is not "there is a button": it is that
+// the destructive step cannot happen in one click, that the confirmation NAMES
+// what is replaced, and that it no longer claims anything is merged or kept.
 //
 // These mount the real card: choosing a file shows the confirmation with the
 // document's own counts, the replace button is disabled until the confirmation
@@ -88,32 +88,35 @@ describe("the restore card", () => {
     [...container.querySelectorAll("button")]
       .find((b) => b.textContent === label);
 
-  it("does not claim a restore reproduces the file's state", async () => {
-    // OD-15 (recorded, not decided here): `/api/restore` REPLACES memory and
-    // MERGES settings and methods, so "getting back to a known state" was a
-    // promise the route does not keep. The card must say what it does.
+  it("says a restore replaces the whole store", async () => {
+    // OD-15 option 1 (accepted 2026-09-30): `/api/restore` now truly REPLACES
+    // the store — settings are reset to defaults overlaid with the document's
+    // keys, and user methods the document does not name are deleted. The old
+    // "MERGES settings and methods / everything else is kept" copy described
+    // the merge route and is now false.
     serve(() => reply(200, {}));
     await mount();
-    expect(container.textContent).toContain("MERGES");
-    expect(container.textContent).not.toContain("getting back to a known state");
+    expect(container.textContent).toContain("REPLACES the whole store");
+    expect(container.textContent).toContain("anything not in the file is gone");
+    expect(container.textContent).not.toContain("MERGES");
+    expect(container.textContent).not.toContain("everything else is kept");
   });
 
-  it("names what is replaced and what is merged, and will not replace it in one click", async () => {
+  it("names what is replaced, and will not replace it in one click", async () => {
     serve(() => reply(200, { restored: true, methods: 2,
                              memory: { before: 3, after: 3 } }));
     await mount();
-    expect(byText("replace memory and merge the rest")).toBeUndefined();
+    expect(byText("replace the whole store")).toBeUndefined();
 
     await choose(DOC);
     expect(container.textContent).toContain("1 settings key, 2 methods, 3 memory rows");
-    expect(container.textContent).toContain("replaces all memory");
-    // the two operations are stated separately: memory is replaced, the rest is
-    // merged — the false "anything not in the file is gone" is gone with them
-    expect(container.textContent).toContain("everything else is kept");
-    expect(container.textContent).not.toContain("Anything not in the file is gone");
-    expect(container.textContent).not.toContain("replaces the whole store");
+    expect(container.textContent).toContain("replaces the whole store");
+    // nothing outside the file survives: the false merge claim is gone
+    expect(container.textContent).toContain("anything not in the file is gone");
+    expect(container.textContent).not.toContain("MERGES");
+    expect(container.textContent).not.toContain("everything else is kept");
 
-    const replace = byText("replace memory and merge the rest") as HTMLButtonElement;
+    const replace = byText("replace the whole store") as HTMLButtonElement;
     expect(replace.disabled).toBe(true);       // one click is not enough
 
     await act(async () => {
@@ -130,10 +133,10 @@ describe("the restore card", () => {
     await choose(DOC);
 
     const box = container.querySelector<HTMLInputElement>(
-      '[aria-label="Confirm replacing all memory"]')!;
+      '[aria-label="Confirm replacing the whole store"]')!;
     await act(async () => { box.click(); });
 
-    const replace = byText("replace memory and merge the rest") as HTMLButtonElement;
+    const replace = byText("replace the whole store") as HTMLButtonElement;
     expect(replace.disabled).toBe(false);
     await act(async () => {
       replace.click();
@@ -144,7 +147,7 @@ describe("the restore card", () => {
     // the success line is the CARD's, not the confirmation panel's: `replace()`
     // clears `pending` (unmounting the panel) before it sets `done`, so a `done`
     // prop on the panel could never render
-    expect(byText("replace memory and merge the rest")).toBeUndefined();
+    expect(byText("replace the whole store")).toBeUndefined();
   });
 
   it("shows the server's refusal and keeps the file on screen", async () => {
@@ -155,17 +158,17 @@ describe("the restore card", () => {
     await choose({ ...DOC, rigma_backup: 9 });
 
     const box = container.querySelector<HTMLInputElement>(
-      '[aria-label="Confirm replacing all memory"]')!;
+      '[aria-label="Confirm replacing the whole store"]')!;
     await act(async () => { box.click(); });
     await act(async () => {
-      (byText("replace memory and merge the rest") as HTMLButtonElement).click();
+      (byText("replace the whole store") as HTMLButtonElement).click();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
     expect(container.textContent)
       .toContain("unknown backup version 9; this build restores version 1");
     // the confirmation is still up, so the user can pick another file
-    expect(byText("replace memory and merge the rest")).not.toBeUndefined();
+    expect(byText("replace the whole store")).not.toBeUndefined();
   });
 
   it("refuses a file that is not a backup before anything is sent", async () => {
@@ -173,7 +176,7 @@ describe("the restore card", () => {
     await mount();
     await choose({ hello: "world" });
     expect(container.textContent).toContain("carries no `rigma_backup` version");
-    expect(byText("replace memory and merge the rest")).toBeUndefined();
+    expect(byText("replace the whole store")).toBeUndefined();
     expect(posts).toEqual([]);
   });
 });
