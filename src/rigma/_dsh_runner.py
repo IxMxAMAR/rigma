@@ -17,12 +17,17 @@ turn failed.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 _CLI_REL = ("python", "sdk-runtime", "node_modules", ".bin", "dsh.CMD")
+
+# Diagnostics go to stderr (main() redirects sys.stdout there), never to the event
+# stream. Rigma configures logging at the top level, so this shares its format.
+_log = logging.getLogger(__name__)
 
 # Captured at import: after main() redirects sys.stdout, this is the only handle
 # that still points at the event stream.
@@ -41,6 +46,27 @@ def _emit(obj: dict) -> None:
 # session/title, delivery-accepted…) and forwarding every one buried the reply
 # in noise on a progress line. Tool activity and failures are the signal.
 _NOTICE_WORTHY = ("tool", "error", "fail", "denied", "retry", "timeout")
+
+# The session-event types this process has already warned about. An unknown type
+# is logged ONCE, not once per occurrence: a per-occurrence line would be the
+# noise the old filter existed to prevent, and a silent drop is what item B2
+# removes. Module-level, so "once" means once for the life of this runner process
+# (which spans every turn of one live runtime).
+_WARNED_UNKNOWN_TYPES: set[str] = set()
+
+# The identifying fields an unknown event may contribute to its notice, in the
+# order a person reads them. This is an ALLOW-list on purpose, not a filter over
+# the payload: a notice is a progress line, and §0.3 forbids prose, message bodies
+# or prompt text in one — a payload walk would leak whatever a future event
+# happens to carry. DSH's envelope uses camelCase ids (`sessionId`, `callId`);
+# both spellings are accepted because `tool/call` already accepts either. A field
+# the event does not carry is simply not mentioned; none is invented.
+_UNKNOWN_NOTICE_FIELDS = (
+    "session_id", "sessionId",
+    "command",
+    "status",
+    "call_id", "callId",
+)
 
 # Session-event types Rigma renders as STRUCTURED state rather than as a
 # progress line. These are the capabilities the `sdk-minimal` profile did not
@@ -224,7 +250,11 @@ def _event_and_data(notification) -> tuple[str, dict]:
     event = payload.get("event")
     if not isinstance(event, dict):
         return "", {}
-    kind = str(event.get("type") or "")
+    # A non-string `type` is a malformed event, not an unknown one: naming it
+    # "5" in a notice would dress a broken envelope up as a type nobody knows.
+    kind = event.get("type")
+    if not isinstance(kind, str):
+        return "", {}
     data = event.get("data")
     return kind, data if isinstance(data, dict) else {}
 
@@ -302,14 +332,64 @@ def _project(notification, streamed: "_Streamed | None" = None) -> list[dict]:
             out.append({"type": "state", "event": "usage", "data": usage})
         return out
 
-    # Everything else keeps the old behaviour: a short progress line, and only
-    # when it is one a person watching would want.
+    # An unknown session-event type. This used to be dropped in SILENCE unless
+    # `_notice_text` happened to find one of `_NOTICE_WORTHY`'s six substrings in
+    # the name — which is how `command/run` and `command/done` never reached the
+    # UI, and how a type a newer DSH added could go unseen forever. It is now an
+    # explicit notice in the EXISTING notice shape (one string, no second wire
+    # format) naming the type and the identifying fields the event actually
+    # carries, plus a once-per-type warning so the addition is visible in the log.
+    if kind:
+        _warn_unknown_once(kind)
+        return [{"type": "notice", "text": _unknown_notice_text(kind, data)}]
+
+    # No inner session event: a top-level notification such as `session.status`.
+    # There is no event TYPE to name, so the 51-type vocabulary does not apply and
+    # the old keyword filter still decides — otherwise every turn would emit a
+    # "working" line. (The `subagent.*` pair is handled above.)
     line = _notice_text(notification)
     return [{"type": "notice", "text": line}] if line else []
 
 
+def _one_line(value: object) -> str:
+    """Collapse all whitespace, so a value cannot smuggle a second line in."""
+    return " ".join(str(value).split())
+
+
+def _unknown_notice_text(kind: str, data: dict) -> str:
+    """One line naming an unknown event type and the ids it actually carries.
+
+    Only the fields in `_UNKNOWN_NOTICE_FIELDS` are considered, and only scalar
+    values: a notice is rendered live as a progress line, so a payload dump would
+    be both noise and a §0.3 leak. Whitespace is collapsed so the result is one
+    line, and it is truncated to 200 characters — the same bound `_notice_text`
+    uses — so one absurd value cannot own the line.
+    """
+    parts = [f"session.event {_one_line(kind)}"]
+    for key in _UNKNOWN_NOTICE_FIELDS:
+        value = data.get(key)
+        if isinstance(value, (str, int, float, bool)) and str(value):
+            parts.append(f"{key}={_one_line(value)}")
+    return " ".join(parts)[:200]
+
+
+def _warn_unknown_once(kind: str) -> None:
+    """Warn the first time this process sees an unknown event type."""
+    if kind in _WARNED_UNKNOWN_TYPES:
+        return
+    _WARNED_UNKNOWN_TYPES.add(kind)
+    _log.warning(
+        "dsh: unknown session-event type %r was projected as a notice; "
+        "logged once per type per process", kind)
+
+
 def _notice_text(notification) -> str | None:
     """A one-line summary worth showing, or None when it is internal chatter.
+
+    Reached only for a notification that carries NO well-formed inner session
+    event — a top-level method such as `session.status`, or a malformed envelope.
+    An unknown inner event type goes through `_unknown_notice_text` instead, so it
+    is never dropped.
 
     The parent renders these live, so a whole payload would be both noise and
     potentially enormous — only the method and the inner event type are used.
@@ -329,6 +409,33 @@ def _notice_text(notification) -> str | None:
     if not any(word in blob for word in _NOTICE_WORTHY):
         return None
     return f"{method} {detail}".strip()[:200]
+
+
+def _forward(notification, streamed: "_Streamed | None" = None) -> None:
+    """Project one notification and emit it. Never raises into the SDK callback.
+
+    WHY THIS IS NOT INLINE IN `on_notification`. The projector used to be wrapped
+    in `except: pass`, so a bug in it ate the event with nothing anywhere to say
+    so. Here a projector failure is logged AND turned into a notice naming the
+    failure, so the event cannot vanish; and a failure to write to stdout is
+    logged too, rather than silently killing the turn's progress.
+    """
+    try:
+        events = _project(notification, streamed)
+    except Exception as exc:
+        method = str(getattr(notification, "method", "") or "notification")
+        _log.warning("dsh: projector failed for %s: %s: %s",
+                     method, type(exc).__name__, exc)
+        detail = f"{type(exc).__name__}: {exc}"[:200]
+        events = [{"type": "notice",
+                   "text": f"session.event could not be projected: {detail}"}]
+    try:
+        for ev in events:
+            _emit(ev)
+    except Exception as exc:
+        _log.warning("dsh: could not emit a projected event: %s: %s",
+                     type(exc).__name__, exc)
+
 
 def _cli_for(home: str) -> Path | None:
     path = Path(home).joinpath(*_CLI_REL) if home else None
@@ -489,11 +596,10 @@ def _run_turn(job: dict, live: _Live) -> int:
         streamed = _Streamed()
 
         def on_notification(notification) -> None:
-            try:
-                for ev in _project(notification, streamed):
-                    _emit(ev)
-            except Exception:
-                pass  # a progress line must never break the turn
+            # `_forward` owns the "a progress line must never break the turn"
+            # guarantee now, and turns a projector failure into a visible notice
+            # instead of the old `except: pass`.
+            _forward(notification, streamed)
 
         # The session this runtime already owns, which is what makes the second
         # and later turns continue instead of starting the agent from nothing.
