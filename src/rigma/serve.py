@@ -5423,6 +5423,52 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         task.add_done_callback(ingest_tasks.discard)
         return JSONResponse({"sources": srcs, "indexing": True}, status_code=202)
 
+    @app.post("/api/rag/reindex")
+    async def rag_reindex():
+        """OD-3 option 2: rebuild the whole index, on the owner's explicit click.
+
+        A TRUE rebuild, not an incremental re-ingest: `rag.rebuild_index` stops
+        the recorded sidecar, deletes the index directory, then ingests. That is
+        what evicts rows embedded before the R3-11 credential `exclude` list
+        existed — regenerating the config only changes future ingests.
+
+        NOTHING here runs automatically (no timer, no startup hook). Re-reading
+        the owner's documents is the owner's decision (§0.8), so this route is
+        reachable only by an explicit POST.
+        """
+        from . import rag
+        if ingest_state["busy"]:
+            # Refuse rather than queue. A second rebuild would race the first
+            # one's rmtree/ingest over the same index directory, and two
+            # concurrent ingests into one lancedb path risk corrupting it — so
+            # this is a 409, not a "started anyway".
+            return JSONResponse(
+                {"error": "an index build is already running",
+                 "indexing": True}, status_code=409)
+        if rag.raggity_cmd() is None:
+            # Checked BEFORE starting the task so a missing raggity is a 400
+            # with the install hint, not a 500 or a background error nobody
+            # sees. The same sentence `rag.rebuild_index` raises.
+            return JSONResponse({"error": rag.RAGGITY_MISSING_MSG},
+                                status_code=400)
+        ingest_state["busy"], ingest_state["error"] = True, ""
+
+        async def _reindex():
+            try:
+                await asyncio.to_thread(rag.rebuild_index)
+            except Exception as e:
+                ingest_state["error"] = str(e)
+            finally:
+                ingest_state["busy"] = False
+
+        # Threaded, exactly like the add-source route: the rebuild runs a
+        # blocking raggity subprocess, and this server is single-worker — doing
+        # that on the event loop would stall every streaming turn (F10/F13).
+        task = asyncio.get_running_loop().create_task(_reindex())
+        ingest_tasks.add(task)          # asyncio keeps only a weak ref
+        task.add_done_callback(ingest_tasks.discard)
+        return JSONResponse({"indexing": True}, status_code=202)
+
     # A prompt typed while a reply is still streaming. Held in MEMORY on
     # purpose: the session file is being written by the in-flight turn, so a
     # queue stored there loses the race against that turn's own save — and a
