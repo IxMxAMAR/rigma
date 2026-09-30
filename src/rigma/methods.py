@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 from . import method_schema as ms
+from .atomicio import atomic_write_text
 from .runtime import rigma_home
 
 METHODS: list[dict] = [
@@ -601,8 +602,11 @@ def save_user(doc: dict) -> tuple[dict | None, list[str]]:
     full, errs = validate_user(doc)
     if errs:
         return None, errs
-    _method_file(full["id"]).write_text(json.dumps(full, indent=2),
-                                        encoding="utf-8")
+    # ODR-4: `write_text` truncates in place, so a crash mid-write left a torn
+    # method file that `user_methods()` then skips — the prior bytes existed
+    # only in RAM. Temp-beside-target + `os.replace`, the same writer the store
+    # uses, so the file is either the old one or the new one, never half of it.
+    atomic_write_text(_method_file(full["id"]), json.dumps(full, indent=2))
     return full, []
 
 
