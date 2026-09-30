@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ChatMessage } from "../lib/api";
 import { SessionRail } from "./ChatSurface";
-import { useChat } from "./chatStore";
+import { emptyTurn, useChat } from "./chatStore";
 import Transcript from "./Transcript";
 
 // D3b, the wiring half. `reattach.test.ts` pins the rule; this mounts the REAL
@@ -48,6 +48,9 @@ function seed(messages: ChatMessage[], streaming: boolean) {
     ],
     savedAgent: {},
     lastError: null,
+    // The store is a module singleton: a `streams` entry left by an earlier test
+    // would arm the new no-poll guard and make a later test pass for free.
+    streams: {},
   });
 }
 
@@ -137,5 +140,40 @@ describe("a reloaded chat and its live tail", () => {
     });
     expect(container.querySelector('[role="img"][aria-label^="generating"]'))
       .toBeNull();
+  });
+
+  it("does not poll over a turn this tab already owns", async () => {
+    // The live stream is drawing that reply; the server's durable copy carries
+    // the same checkpoint as a message, so polling would draw the text twice.
+    vi.useFakeTimers();
+    seed([partial()], true);
+    useChat.setState({ streams: { s1: emptyTurn() } });
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      calls.push(String(url));
+      return reply(200, { id: "s1", messages: [], streaming: true });
+    }));
+    await act(async () => {
+      root.render(<Transcript />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it("refreshRemote updates the flag but will not clobber a live turn", async () => {
+    seed([partial()], false);
+    useChat.setState({ streams: { s1: emptyTurn() } });
+    vi.stubGlobal("fetch", vi.fn(async () => reply(200, {
+      id: "s1",
+      messages: [{ role: "assistant", content: "the server's copy" }],
+      streaming: true,
+    })));
+    await act(async () => {
+      await useChat.getState().refreshRemote("s1");
+    });
+    expect(useChat.getState().messages).toEqual([partial()]);
+    expect(useChat.getState().remoteStreaming.s1).toBe(true);
   });
 });

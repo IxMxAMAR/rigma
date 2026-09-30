@@ -566,13 +566,20 @@ export default function Transcript() {
   // turn is noticed within one checkpoint, and it is torn down on a chat switch
   // or unmount — a poll that outlived the chat on screen would write another
   // chat's messages (the ownership guard in `refreshRemote` also refuses).
+  //
+  // NOT while THIS tab owns the turn: `LiveTurn` is already drawing that reply
+  // from the stream, and the server's durable copy carries the same checkpoint as
+  // a message, so polling would render the text twice. The dependency is the
+  // boolean, not the turn — a turn object changes on every token and would
+  // restart the timer constantly, which is a poll that never fires.
+  const live = streaming !== null;
   useEffect(() => {
-    if (!currentId || !remote) return;
+    if (!currentId || !remote || live) return;
     const t = setInterval(() => {
       void useChat.getState().refreshRemote(currentId);
     }, 10000);
     return () => clearInterval(t);
-  }, [currentId, remote]);
+  }, [currentId, remote, live]);
 
   // The sentence for the tail, and whether the chat is live. See `reattach.ts`.
   const tail = liveTail(messages, remote);
