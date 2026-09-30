@@ -329,6 +329,11 @@ def _inspect(f, fallback: str) -> GgufInfo:
     swa_window = _as_int(g("attention.sliding_window", 0) or 0,
                          f"{arch}.attention.sliding_window")
     swa_layers = swa_kv_heads = 0
+    # A2d-kv: positive evidence that a KV cache exists whose WIDTH or LAYER
+    # SPLIT this module cannot derive. The failure mode is the same silent
+    # confidence A2d removed for the recurrent state: `kv_mb` computes to a
+    # confident number — often exactly 0 — with no way to tell it is a guess.
+    kv_geometry_unknown = False
     # How many layers hold a FIXED recurrent state (Mamba/DeltaNet) rather than a
     # growing KV cache. Positive evidence only, from the same attention pattern
     # that decides `full_attn_layers`: a scalar kv count with a hybrid interval,
@@ -344,6 +349,11 @@ def _inspect(f, fallback: str) -> GgufInfo:
                 swa_layers = len(wi)
                 swa_kv_heads = max(_as_int(kv[i], f"{arch}.attention.head_count_kv")
                                    for i in wi)
+                # A2d-kv: the windowed layers are EXCLUDED from the growing
+                # cache, so without a window length their own cache is charged
+                # zero — an under-charge with no note (partial SWA geometry).
+                if swa_window <= 0:
+                    kv_geometry_unknown = True
             if gi:
                 full_attn = len(gi)
                 kv_heads = max(_as_int(kv[i], f"{arch}.attention.head_count_kv")
@@ -368,6 +378,11 @@ def _inspect(f, fallback: str) -> GgufInfo:
             kv_heads = max((_as_int(h, f"{arch}.attention.head_count_kv")
                             for h in kv), default=0)
             recurrent_layers = max(0, n_layers - full_attn)
+            # A2d-kv: a window length with no usable layer pattern leaves the
+            # split (WHICH layers are windowed) underivable, so the second
+            # cache cannot be sized.
+            if swa_window > 0:
+                kv_geometry_unknown = True
     else:
         # A SCALAR kv head count does not mean every layer is full attention.
         # Qwen3.5/3.8 interleave SSM (linear-attention) layers and declare the
@@ -389,6 +404,10 @@ def _inspect(f, fallback: str) -> GgufInfo:
         else:
             full_attn = n_layers
         kv_heads = _as_int(kv, f"{arch}.attention.head_count_kv")
+        # A2d-kv: a window length with no per-layer pattern leaves the split
+        # underivable, exactly as in the table branch above.
+        if swa_window > 0:
+            kv_geometry_unknown = True
     head_dim = _as_int(g("attention.key_length", 0),
                        f"{arch}.attention.key_length") or (
         _as_int(g("embedding_length", 0), f"{arch}.embedding_length") // heads
@@ -429,6 +448,19 @@ def _inspect(f, fallback: str) -> GgufInfo:
     if recurrent_layers > 0 and not all((ssm_state, ssm_inner, ssm_conv,
                                          ssm_groups)):
         rs_geometry_unknown = True
+    # A2d-kv: attention is declared but the growing cache's width derives to
+    # zero — a missing or zero `attention.head_count_kv`, or no head width to
+    # multiply it by. `kv_bytes_per_token` returns 0 and the fit read that as a
+    # measured zero rather than as an absence of evidence.
+    if heads > 0 and (kv_heads <= 0 or head_dim <= 0):
+        kv_geometry_unknown = True
+    # A2d-kv: an explicit `attention.recurrent_layers` array is a layer split
+    # this module does not model (A2d). With a SCALAR kv count the
+    # full-attention layer count behind `kv_mb` is the interval's guess, so the
+    # KV charge is a guess too; with a per-layer kv table the split comes from
+    # the table itself and the declared array does not move it.
+    if declared_recurrent is not None and not isinstance(kv, list):
+        kv_geometry_unknown = True
     fields = {"n_layers": n_layers, "full_attn_layers": full_attn,
               "kv_heads": kv_heads, "head_dim": head_dim,
               "native_ctx": _as_int(g("context_length", 0),
@@ -457,6 +489,11 @@ def _inspect(f, fallback: str) -> GgufInfo:
               # or the buffer could not be derived. The fit reports `rs=unknown`
               # instead of charging a zero it cannot stand behind.
               "rs_geometry_unknown": rs_geometry_unknown,
+              # A2d-kv: the header gives evidence of a KV cache whose width or
+              # layer split could not be derived, so the fit reports
+              # `kv=unknown` instead of charging a confident zero (or a
+              # confident estimate) it cannot stand behind.
+              "kv_geometry_unknown": kv_geometry_unknown,
               "mtp_layers": mtp_layers,
               # the file's own inventory, not the header's claims
               "mtp": tx.has_mtp,
