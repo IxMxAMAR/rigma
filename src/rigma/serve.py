@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import subprocess
 import threading
 from contextlib import asynccontextmanager
 from importlib import resources
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -640,6 +642,29 @@ def _model_last_used() -> dict:
         return {}
 
 
+def _run_is_drivable(run) -> bool:
+    """Can the run loop actually drive this loaded record?
+
+    A18c. `runs.load` is a bare `json.loads`, so a VALID-JSON file that is not
+    the record the loop needs parses fine and is still unusable: `{}` (no
+    `session_id` at all), `[]` (not even a dict), or `{"session_id": null}` /
+    `{"session_id": ""}`. A18 only guarded `load` returning None, so these died
+    at `run["session_id"]` exactly as the unreadable case did — same wedge, same
+    claimed slot, same "run has no driver" 409s.
+
+    "Drivable" is the minimum the loop dereferences before it can do anything: a
+    dict with a non-empty `id` and a non-empty string `session_id`. `id` is
+    required too because every write path (`runs.save`, `set_status`) needs it,
+    and a record without one would only move the wedge to the first save.
+    """
+    if not isinstance(run, dict):
+        return False
+    rid = run.get("id")
+    sid = run.get("session_id")
+    return (isinstance(rid, str) and bool(rid.strip())
+            and isinstance(sid, str) and bool(sid.strip()))
+
+
 def _load_run_for_loop(runs_mod, run_id: str):
     """`(run, readable)` for the run loop.
 
@@ -650,16 +675,21 @@ def _load_run_for_loop(runs_mod, run_id: str):
     violation against the `_atomic_write` replace, which is gone in milliseconds —
     and the caller turns a still-unreadable state into a terminal status.
 
+    A18c: a readable-but-UNUSABLE record (`{}`, `[]`, a null session_id) is
+    "unreadable" for the loop's purposes — it is retried like a failed read and,
+    if it persists, the caller releases the slot instead of the loop dying on the
+    next subscript. `_run_is_drivable` is the test.
+
     `readable` is False only when the run directory exists but its state could not
-    be read. A genuinely deleted run reports (None, True) so the loop stops
-    without inventing a status for a run nobody can see any more.
+    be read (or is not drivable). A genuinely deleted run reports (None, True) so
+    the loop stops without inventing a status for a run nobody can see any more.
     """
     for attempt in range(3):
         try:
             run = runs_mod.load(run_id)
         except Exception:
             run = None
-        if run is not None:
+        if run is not None and _run_is_drivable(run):
             return run, True
         try:
             if not runs_mod.run_dir(run_id).exists():
@@ -669,6 +699,51 @@ def _load_run_for_loop(runs_mod, run_id: str):
         if attempt < 2:
             time.sleep(0.05 * (attempt + 1))
     return None, False
+
+
+# A18d(2): the counter that makes two backups in the same second impossible to
+# collide. Process-wide and monotonic; the pid is in the name too, so two
+# processes releasing at the same instant cannot collide either.
+_UNREADABLE_SEQ = itertools.count(1)
+
+
+def _preserve_unreadable_run(src: Path) -> Path | None:
+    """Copy an unreadable `run.json` aside, returning where, or None.
+
+    A18d(2). The old name was `<ts>` second-granular and guarded by
+    `not dst.exists()`, so two releases inside one second kept only the FIRST
+    backup and silently dropped the second run's bytes. The name now carries the
+    pid and a process-wide counter, so two releases can never name the same file
+    and the guard is gone. It is not "overwrite deliberately": each release gets
+    its own name, so there is nothing to overwrite.
+
+    A18d(1). The copy used to be a bare `except Exception: pass`. `shutil.copy2`
+    can fail on the same transient Windows sharing violation that `_atomic_write`'s
+    `_replace_retrying` survives — so the terminal write would succeed and
+    overwrite the original with NO backup and no trace. A failed copy is now
+    retried briefly (the cause is transient) and then logged at WARNING with the
+    exception. The caller still writes the terminal status: releasing the slot
+    with an honest terminal record matters more than preserving bytes
+    `runs.load` could not parse, and leaving `run.json` saying `running` is the
+    exact failure this path exists to close.
+    """
+    dst = src.with_name(
+        f"run.json.unreadable-{int(time.time())}-{os.getpid()}"
+        f"-{next(_UNREADABLE_SEQ)}")
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            shutil.copy2(src, dst)
+            return dst
+        except FileNotFoundError:
+            return None                     # nothing to preserve
+        except Exception as e:              # noqa: PERF203 — bounded retry
+            last = e
+            time.sleep(0.05 * (attempt + 1))
+    _log.warning(
+        "run: could not copy an unreadable run.json aside after retries (%s) — "
+        "the terminal release will overwrite it with no backup", last)
+    return None
 
 
 def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
@@ -683,32 +758,51 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
     it: pause and inject answered 409 "run has no driver", restart 409 "run is
     running", a new run 409 "a run is already active". Only Stop cleared it.
 
+    A18c: "unreadable" includes a VALID-JSON record that is not drivable — `{}`,
+    `[]`, `{"session_id": null}`. `runs.load` parses those happily, so they
+    reached `run["session_id"]` and wedged identically; `_run_is_drivable` is the
+    single test both this and `_load_run_for_loop` use.
+
     So the slot is released explicitly: a terminal status for the id we were
     asked to drive, then the active pointer dropped when it points here. The
     record written is minimal when the real one could not be read, so whatever
-    is on disk is copied aside first — a release must be recoverable, not
-    destructive. The run's mission and transcript survive on its session, so
-    `restart` still reattaches meaningfully.
+    is on disk is copied aside first (see `_preserve_unreadable_run`) — a release
+    must be recoverable, not destructive. The run's mission and transcript
+    survive on its session, so `restart` still reattaches meaningfully.
+
+    A18d(3): when `run.json` is unreadable AND unwritable the terminal status
+    cannot land, so it keeps saying `running` on disk even though the slot IS
+    released. There is no way to fix that from here — the lock that fails the
+    `os.replace` fails any rename we could try instead — so the failure is logged
+    at ERROR naming that residual rather than a bare "could not write".
     """
     run = None
     try:
         run = runs_mod.load(run_id)      # the lock may have cleared by now
     except Exception:
         run = None
+    if not _run_is_drivable(run):
+        # A18c: a readable-but-unusable record (`{}`, `[]`, a null/empty
+        # session_id) cannot be handed to `set_status` — it has no id to write
+        # to — so it takes the same minimal-record path as an unreadable file.
+        run = None
     if run is None:
         try:
             src = runs_mod.run_dir(run_id) / "run.json"
-            dst = src.with_name(f"run.json.unreadable-{int(time.time())}")
-            if src.exists() and not dst.exists():
-                shutil.copy2(src, dst)
+            if src.exists():
+                _preserve_unreadable_run(src)
         except Exception:
-            pass            # nothing to preserve, or it is locked as well
+            _log.warning("run %s: could not inspect run.json to back it up",
+                         run_id, exc_info=True)
         run = {"id": run_id}
     if run.get("status") not in runs_mod.TERMINAL:
         try:
             runs_mod.set_status(run, "interrupted", reason)
         except Exception:
-            _log.exception("run %s: could not write a terminal status", run_id)
+            _log.exception(
+                "run %s: could not write a terminal status — the slot is "
+                "released, but run.json still says 'running' because the file "
+                "is unreadable AND unwritable", run_id)
     # The pointer is read directly, by id: `runs.active()` returns None for an
     # unreadable run, and clearing unconditionally could free a DIFFERENT run's
     # slot — a new run may have started since this one wedged.
@@ -4329,7 +4423,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # separate call happens to succeed (AUDIT F51).
         try:
             from . import engine_log
-            out["engine_findings"] = engine_log.findings(server_ops.log_text())
+            # A17d: the VRAM axis needs the plan's own weights+KV prediction for
+            # the same ctx / cache / slots, not the log alone — without it
+            # `compare_plan` reports `not_comparable` and the axis is inert.
+            out["engine_findings"] = engine_log.findings(
+                server_ops.log_text(),
+                expected_vram_mb=server_ops.planned_vram_mb(s, registry))
         except OSError as e:
             out["engine_findings"] = []
             out["engine_findings_error"] = f"cannot read the engine log: {e}"
@@ -4474,6 +4573,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         A read failure is a 503, not an empty list: "I could not look" and "I
         found nothing" are different answers and only one is reassuring
         (AUDIT F51).
+
+        A17d: the running plan's own weights+KV prediction is passed so the
+        VRAM axis is comparable. With no engine running there is no plan, so the
+        axis stays `not_comparable` rather than comparing against a bare file
+        size (GUIDANCE 5).
         """
         from . import engine_log, server_ops
         try:
@@ -4482,7 +4586,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse(
                 {"error": f"cannot read the engine log: {e}", "findings": []},
                 status_code=503, headers=_NO_STORE)
-        return {"findings": engine_log.findings(text)}
+        s = st.server_running()
+        expected = server_ops.planned_vram_mb(s, registry) if s else None
+        return {"findings": engine_log.findings(text,
+                                                expected_vram_mb=expected)}
 
     @app.get("/api/server/switch-options")
     async def server_switch_options():
@@ -5641,7 +5748,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     def _memory_store():
         from . import memory as _mem
-        return _mem.MemoryStore(runtime.rigma_home() / "memory" / "memories.jsonl")
+        # A11d: `store_for`, not a fresh `MemoryStore`, so two restores in this
+        # process share the store's RLock and the whole snapshot -> apply ->
+        # rollback region is serialised even when the cross-process file lock
+        # cannot be taken.
+        return _mem.store_for(runtime.rigma_home() / "memory" / "memories.jsonl")
 
     def _score_current_step(run, delta):
         """Discredit/credit memories injected into the run's current step."""

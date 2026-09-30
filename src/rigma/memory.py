@@ -578,6 +578,34 @@ class MemoryStore:
         return len(clean)
 
 
+# A11d: ONE store per path PER PROCESS. `serve._memory_store()` used to build a
+# new `MemoryStore` for every request, so A11c's in-process RLock — the thing
+# that serialises the whole snapshot -> apply -> rollback region — was a
+# different lock for each restore and could not serialise two of them. Only the
+# 10-second cross-process file lock did, and `_FileLock.acquire` gives up after
+# that and lets the caller proceed unsynchronised. Sharing the store makes the
+# RLock the first line of defence again; the file lock stays the second, for
+# other processes.
+#
+# Safe to share: a `MemoryStore` holds no document state — `all()` re-reads the
+# file on every call — so the only shared mutable state is the two locks, which
+# is exactly what must be shared. Keyed by resolved path, so a second
+# `RIGMA_HOME` (every test) gets its own store.
+_STORES: dict[str, MemoryStore] = {}
+_STORES_LOCK = threading.Lock()
+
+
+def store_for(path: str | Path) -> MemoryStore:
+    """The process-wide `MemoryStore` for `path` (A11d). See the note above."""
+    key = str(Path(path).resolve())
+    with _STORES_LOCK:
+        store = _STORES.get(key)
+        if store is None:
+            store = MemoryStore(path)
+            _STORES[key] = store
+        return store
+
+
 # --- embeddings (optional, never load-bearing) -------------------------------
 
 # Providers in preference order. nomic-embed-text-v1.5 is the research pick
