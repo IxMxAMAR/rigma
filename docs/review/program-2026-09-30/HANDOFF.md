@@ -40,6 +40,39 @@ flake loop, the delete-the-line proof, the route-level probe), write the verdict
 **say in the block that the independent agent step was impossible**, so the next session knows the
 verdict is single-sourced.
 
+## THE RULE THAT COST THE MOST: never end the turn while a wave is unfinished
+
+**Ending the turn ENDS THE PROCESS even with an active goal, and that kills every running subagent.**
+On 2026-09-30 a session launched **eight** subagents, ended its turn to wait for them, and the process
+exited: all eight died, nothing was merged, and their work was unrecoverable. The goal being active
+does **not** keep the process alive; `list_agents`/`job_list` do not either.
+
+**Standing rule: stay inside ONE live turn until the wave is finished.** Concretely:
+
+- Never end a turn while any subagent is running or any wave is unfinished.
+- Wait by polling **inside** the turn: `Start-Sleep -Seconds 90` (bounded, `timeoutMs` ~115000) then
+  re-check the artifacts. `Start-Sleep -Seconds 120` hits the command timeout — keep it ≤100 s.
+- The ONLY allowed ends of turn are: (a) after the final record is committed, from the stop-work time;
+  or (b) on a `STOP` file in `.scratch/orchestrator/`.
+- A subagent's result arrives as an in-session notice; you do not need to end the turn to receive it.
+
+**Delegation budget, corrected.** The 15:55 resume was depth 1 and had no room for children. The
+**17:39 session was a fresh top-level session and DID have room** (a throwaway call returned
+`SPAWN-OK`), with an active-child cap of **8**. So: probe once per session; do not assume the resume's
+limit. Note also that this tool instance **refuses** explicit `provider`/`model` params
+(`child model selection is disabled for this tool instance`), so `AGENTS.md`'s explicit-route rule
+cannot be honoured — a plain `subagent` call inherits the session model.
+
+**Two more mechanical hazards learned the hard way.**
+
+- `git commit --amend` in the MAIN tree can clobber a merge commit another agent just made: a
+  frontend agent ran `--amend` while a merge landed, and amended the *merge* (the reflog shows the
+  `reset` that restored it; nothing was lost, but it was luck). **Never `--amend`**; the frontend
+  exception (one agent in the main tree at a time) does not make it safe.
+- A merge that touches a file another agent is editing in the main tree will conflict — resolve it,
+  `ast.parse` the result, `ruff` it, and only then commit; do not `--abort` and lose the branch's
+  work.
+
 ## How to run anything
 
 ```powershell
@@ -188,9 +221,12 @@ _(see `STATUS.md` for the per-item table with outcomes and verifier corrections)
 | 14 | `5b4bcd5` `5806031` `009730d` `02785bf` `7b0db3b` `cefd6fd` `97da7b5` `f6a0874` | OD-13's remote stop, the A2d-budget UI, the 400 provenance + prefix strip, the frontend nits, and W14-E (the **flaky** pause test — Head Agent's own 30/30 — the `serve.py` provenance comment, and the registry-combo env gate) |
 | 15 | `12be5cd` `85abd8a` `8977ea8` | **deep review 3's four findings** — DR3-1 (the launch dialog's native-ctx fallback still took the *running* model's window: DR2-4 surviving one fallback later), DR3-3 (a remote-stop request pinned to an unnameable turn never expired), and `impl/w15a`'s DR3-2 (the sweep's `q4_0` guard read the override, not the effective flags — DR2-6's asymmetry one lever over) + DR3-4 (the boot sweep must not reconcile a run a **different live process** drives) |
 
-Integration head at this hand-off: **`f6a0874`** (plus the docs commits that follow it). `STATUS.md`
-carries the per-item table and the note on the metadata-only author rewrite (with the old→new hash
-mapping for every pre-rewrite commit).
+| 16 | `f51dfe0` `b2f6a14` `e26b6c4` `c373516` `d61dfb7` `c8aac9d` `17bfbe8` `70608d8` `573025a` | **The re-verification wave.** Every single-sourced verdict merged after the 15:55 power cut got a FRESH independent verifier, each with rule 13: w15a DR3-2/DR3-4, REC-1 `43e63de`, w14e, W14-F + DR3-1 + DR3-3, A8b, A2d-kv, the suite lock, OD-12 (both halves), REC-1b, A16c/D1d, DR4-2/DR4-3, B7e/B2c, the ctx floor, B4b-schema. **A2d-kv FAILED its first verification** (the derived `kv_geometry_unknown` clause flagged every pure-Mamba spec) and was fixed at `aa7ed80`, then re-verified PASS. Landed: W16-A, A8b, REC-1/OD-16's suite lock, A2d-kv, REC-1b, A16c/D1d, OD-12 server, A8b nits, DR4-2+DR4-3. |
+| 17 | `ae97585` `f3bd020` `cb92962` `4f477c9` `ea822d4` `175f1bd` `57adf3e` `b6b04dd` + `873b90c` `75960df` | W5F5B-N3 (one owner for the launch floor), B7e+B2c, **DR2-1-residual** (the plan records the placement it used), **test-hard** (three tests that could not have caught the bug they name), **resid** (the ctx floor's raise-to gets its own test; W13B-3 correctly deferred), **OD12-n2+W15A-n2**, **DR21R-n1** (the deep-spill compute-basis mismatch), **regr** (the two regressions the same-hour verifiers caught), and B4b-schema + its required-container fix (frontend, direct on the branch). `impl/ubatch` (`07342df`) merged last. |
+
+Integration head at this hand-off: **`b6b04dd`**, then `impl/ubatch`'s `07342df` and the docs commits
+that follow it. `STATUS.md` carries the per-item table and the note on the metadata-only author
+rewrite (with the old→new hash mapping for every pre-rewrite commit).
 
 **A18 is the one that mattered most** and it was found by the full suite, not by reading: the run
 loop's *first* `_runs.load` was unguarded, so a transient unreadable `run.json` raised
@@ -224,29 +260,37 @@ they were not in the job list). The final suite therefore ran **alongside** them
 clean run. **Never start a second suite while one is running, and check for leaked
 `fake_acp_server.py` children before believing a slow or hung run.**
 
-The highest-value open items, in the program's ranking (what can make something else fail > the
-harness seam > missing levers > UI/UX polish):
+**Every item this list used to carry is now DONE.** It is kept so a new session can see what the
+ranking was and what closed each one:
 
-1. **REC-1** — the suite is not safe to run twice at once and a leaked run cannot be reaped from the
-   shell. One focused diagnosis (run two suites and find the shared resource: a fixed port, a fixed
-   temp path, or a shared `RIGMA_HOME`) would make every future session's acceptance gate trustworthy.
-   This is now the top item because it can make *another* session fail.
-2. **DR2-1-residual** — the DR2-1 fix suppresses the VRAM axis for any non-device-resident load, so
-   **MoE is now blind on both the split axis and the VRAM axis**. Honest, but a real loss; restoring
-   it needs the plan to persist its device-side placement (a `state.json` schema change).
-3. **W13B-1** — `bench._effective_env` duplicates `run_sweep`'s construction with no test pinning
-   them together, so a future edit to either silently desyncs the gate from the child it gates. A
-   shared `_trial_flags(plan, override)` makes it structurally impossible. (W15-A added a second
-   caller, `_effective_flags`, so this is now three call sites.)
-4. **W5F5B-N3** — the context floor `2048` is still a bare literal at `server_ops.py:754`,
-   `serve.py:4731-4732`, `resolve.py:1072` and the frontend's `CTX_FLOOR` (the `hangar.py` and
-   legacy-panel sites are named). Unify in one wave.
-5. **B4b-schema / OD-12** — the question form's nested objects/arrays and `default`, and whether a
-   timed-out question should emit a server-side expiry event (`QUESTION_WAIT_SECS = 5.0`).
-6. **`OWNER-DECISIONS.md`** — now **OD-1…OD-16**. Each has options, evidence and a recommendation.
-   OD-15 is `/api/restore`'s merge-not-replace semantics (the card now says so; the deeper question
-   is whether the route should truly replace). OD-16 is REC-1. **OD-13 was implemented** because its
+1. ~~REC-1~~ **DONE** — `43e63de` (the port REC-1 found) + REC-1b (`f19395c`, the other **five**
+   literal ports `11594`–`11599`) + the full-suite lock (`e26b6c4`, REC-1/OD-16 option 3). A second
+   FULL run now exits **rc 4**; named-file runs are deliberately not locked.
+2. ~~DR2-1-residual~~ **DONE** — `cb92962`: `state.json` carries an additive
+   `placement: {ngl, n_cpu_moe}` and the VRAM axis compares the engine's device figure against the
+   device-side prediction. DR21R-n1 (`57adf3e`) then put the two sides on the SAME basis by adding
+   `resolve.compute_buffer_mb` to the plan-side prediction.
+3. ~~W13B-1~~ **DONE** — `f51dfe0`: `bench._trial_flags` is the single construction, pinned by a test
+   that records each call's CALLER and the flags the child was actually launched with.
+4. ~~W5F5B-N3~~ **DONE** — `ae97585`: `models.MIN_LAUNCH_CTX = 2048` is the single owner
+   (`MIN_NATIVE_CTX` is an alias; `server_ops._raised_launch_ctx` reads it). `resolve.CTX_FLOOR` was
+   renamed `PLAN_CTX_FLOOR` so the 8192 planning floor and the 2048 launch floor are named apart.
+5. ~~B4b-schema / OD-12~~ **DONE** — OD-12's server half at `17bfbe8` (+ `9167aa6`), its UI fold, and
+   B4b-schema at `873b90c`; the required-container defect it left was closed at `75960df`.
+6. **`OWNER-DECISIONS.md`** — now **OD-1…OD-16**. OD-15 is `/api/restore`'s merge-not-replace
+   semantics. OD-16 is REC-1, **now implemented** as option 3. OD-13 was implemented because its
    recorded recommendation was option 1.
+
+The highest-value items STILL OPEN after wave 17:
+
+1. **DR21RN1-n1** — an explicit `rigma up --ubatch N` is not persisted, so the plan-side compute
+   charge uses the spec's ubatch and a healthy override load reports `plan_divergence` (+1491 MiB at
+   N=2048). Being fixed on `impl/ubatch`. **DR21RN1-n2/n3/n4** are its smaller siblings.
+2. **The wave 16–17 verifier nits**, all in `BACKLOG.md`'s wave 16–17 section: TESTHARD-n1..n4,
+   RESID-n1/n2, B4BREQ-n1..n4, CTXFLOOR-n1..n3, OD12N2-n1/n2 and W15AN2-n1 (both fixed on
+   `impl/regr`), W16A-1, REC1B-n1/n2, DR42-n2, DR43-n1/n2, B2C-n1/n2, B7E-n2.
+3. **A fifth deep review.** Every previous one found real defects inside already-verified fixes —
+   including, in wave 16–17, two regressions introduced by fixes merged the same hour.
 7. **A fourth deep review.** All three previous ones found real defects inside already-verified
    fixes, and the marginal cost is one read-only agent. `deep-review-3.md` covered waves 11–14; the
    next one should cover waves 15–16 **and re-verify the Head-Agent-sourced verdicts**, which have

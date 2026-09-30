@@ -317,6 +317,25 @@ Everything below needs a free card and is labelled with what it would settle.
    above): it needs the `llama-kv-mean-center` calibration over a corpus plus a perplexity run. It is
    deliberately **not** wired into Rigma until a number exists.
 
+7. **Is `plan.flags.ubatch` the engine's physical `n_ubatch`?** (`impl/ubatch` @ `07342df`, the
+   DR21RN1-n1 fix.) The plan-side compute charge now uses the `-ub` the launch emitted, read back from
+   `state.json`. Rigma refuses `ubatch > batch` at write time, but **llama.cpp can clamp `n_ubatch` to
+   `n_batch`**, and no engine ran to confirm the two agree. A single real load with `rigma up --ubatch
+   N` for an `N` above and below `batch`, reading the engine's own `n_ubatch`, settles it. If they
+   diverge the charge is wrong in the same false-positive direction the fix closed.
+8. **The compute charge at a second ubatch point** (item 1(d), restated with a reason). `resolve.py`
+   scales `compute_buffer_mb` linearly from the one measured **410.28 MiB at ub 512**. The 150 MiB
+   default charge plus the 512 MiB slack is what keeps a healthy load quiet (DR21RN1-n2), and that
+   arithmetic is a PREDICTION. One load at ubatch 1024 or 2048 turns it into a measurement and says
+   whether the slack is still enough at depth.
+9. **W13B-3's ambient-env lever** (deferred, owner decision). The sweep's quality-lever gate cannot
+   see a lever exported in the process env while `runtime.launch_server` merges `os.environ` into the
+   child; the naive fix keeps **0 of 8** configs, so it was correctly deferred. Deciding whether the
+   sweep should be ambient-aware needs a real sweep with `LLAMA_ATTN_ROT_DISABLE=1` (or another
+   quality lever) exported, on a card, to see whether a crowned config is still representative. It is
+   a **measurement caveat, not a write-path hole** — the override path and the plain launch run under
+   the same exported env.
+
 ## Provenance
 
 Flags and semantics: `PrismML-Eng/llama.cpp` at `87268f77`, `tools/llama-bench/llama-bench.cpp`

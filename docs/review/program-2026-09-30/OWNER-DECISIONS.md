@@ -316,7 +316,14 @@ its own merge/precedence rules.
 
 ## OD-12 — What happens to a question after its 5-second window closes? (B4b)
 
-**State today:** item B4 puts mcode's `ask_user` on the existing permission channel with
+**RESOLVED — option 1 was implemented; no owner decision is outstanding.** The server now emits
+`approval/decided` with `decision: "expired"` when the window closes (`17bfbe8`), and `"answered"`
+when the user does answer (`9167aa6`); the frontend folds the row to a disabled expired state and
+shows an `answered` tick. `863dddd` then fixed a second question overwriting the first's slot, and
+`a3a0db4` restored the per-session scoping the first fix dropped. All independently verified. The
+text below is the original decision record, kept for provenance.
+
+**State today (at the time of the decision):** item B4 puts mcode's `ask_user` on the existing permission channel with
 `kind: "question"` and a 5-second bound (`QUESTION_WAIT_SECS = 5.0`, OD-8). When the window closes
 the server returns a real **decline** — but it emits **no `approval/decided` event**. The frontend
 half (B4b, merged) now draws a real question form; because no decided-event arrives, **the row stays
@@ -424,6 +431,14 @@ risk — a feature that does less than its name suggests.
 ---
 
 ## OD-16 — two full test-suite runs at once deadlock, and the suite leaks its fake ACP servers
+
+**RESOLVED — options 1 and 3 were both taken; no owner decision is outstanding.** The diagnosis is
+complete: **six** literal fake-server TCP ports (`11594`–`11599`) were bound instead of `0`, so two
+concurrent runs shared sockets and each waited out the other's timeouts. `43e63de` closed the port
+REC-1 found, REC-1b (`f19395c`) closed the other five, and the session lock landed at `e26b6c4`
+(option 3: a second FULL suite exits **rc 4** with a clear message; named-file runs are deliberately
+not locked — 94 passed across three files, twice). All independently verified. The text below is the
+original decision record, kept for provenance.
 
 **Found during the power-cut recovery, not by reading code.** Two `pytest tests` runs overlapped
 (the Head Agent's and a verifier's). **Both froze**: each was blocked on an established loopback
