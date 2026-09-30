@@ -106,14 +106,14 @@ describe("the launch-defaults dialog against the real route", () => {
   let root: Root;
   let posts: unknown[];
 
-  function serve(post: () => Response) {
+  function serve(post: () => Response, stored: unknown = STORED) {
     vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
       const u = String(url);
       if (u === "/api/models/m/defaults" && init?.method === "POST") {
         posts.push(JSON.parse(String(init.body)));
         return post();
       }
-      if (u === "/api/models/m/defaults") return reply(200, STORED);
+      if (u === "/api/models/m/defaults") return reply(200, stored);
       if (u.startsWith("/api/models")) return reply(200, { models: [CARD] });
       if (u === "/api/server") {
         return reply(200, {
@@ -225,5 +225,77 @@ describe("the launch-defaults dialog against the real route", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(posts).toEqual([]);
+  });
+
+  // --- DR2-4: never invent a native context --------------------------------
+  //
+  // The state the pre-fix tests never reached: `models()` AND `server()` both
+  // fail, so the dialog cannot know the real window. `nativeCtx` then fell back
+  // to 262144 and a 32K-native model was offered 64K/128K/256K — the value was
+  // stored, and `server_ops.perform_switch` clamped it at the next launch with
+  // nothing said. `modelDefaults()` must still succeed: the dialog is openable.
+
+  it("offers no context step when the model's native window is unknown", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (String(url) === "/api/models/m/defaults") {
+        return reply(200, { ...STORED, launch: null, first_load: true });
+      }
+      throw new Error("down");     // both /api/models and /api/server
+    }));
+    await mount();
+    const sel = container.querySelector<HTMLSelectElement>(
+      '[aria-label="Default context"]');
+    expect(sel, "the context control must still be drawn").not.toBeNull();
+    expect([...sel!.querySelectorAll("option")].map((o) => o.textContent))
+      .toEqual(["model default"]);
+    for (const invented of ["64K", "128K", "256K"]) {
+      expect(container.textContent).not.toContain(invented);
+    }
+    expect(container.textContent).toContain("native context window is unknown");
+    // …and it says WHICH choice it made: no steps, only the resolver's default.
+    expect(container.textContent).toContain('only "model default"');
+  });
+
+  it("keeps a stored context visible when the window is unknown, so it can be cleared", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u === "/api/models/m/defaults" && init?.method === "POST") {
+        posts.push(JSON.parse(String(init.body)));
+        return reply(200, { slug: "m", launch: null });
+      }
+      if (u === "/api/models/m/defaults") return reply(200, STORED);
+      throw new Error("down");
+    }));
+    await mount();
+    const sel = container.querySelector<HTMLSelectElement>(
+      '[aria-label="Default context"]')!;
+    expect([...sel.querySelectorAll("option")].map((o) => o.textContent))
+      .toEqual(["model default", "8K"]);
+    await choose("Default context", "");
+    await clickSave();
+    expect(posts).toEqual([{ ctx: null }]);
+  });
+
+  it("offers no context step above a KNOWN native window", async () => {
+    serve(() => reply(200, {}));
+    await mount();
+    expect(container.textContent).toContain("32K");
+    expect(container.textContent).not.toContain("64K");
+    expect(container.textContent).not.toContain("256K");
+    expect(container.textContent)
+      .not.toContain("native context window is unknown");
+  });
+
+  it("says a stored context above the model's window will be clamped", async () => {
+    // The value is legal to store (the route checks `kv` only) but the launch
+    // path does `min(int(ctx), native_ctx)`. Surface that where the value is
+    // chosen rather than letting the clamp happen silently.
+    serve(() => reply(200, {}), {
+      ...STORED,
+      launch: { ...STORED.launch, ctx: 262144 },
+    });
+    await mount();
+    expect(container.textContent).toContain("262144");
+    expect(container.textContent).toMatch(/clamps it to 32768/);
   });
 });

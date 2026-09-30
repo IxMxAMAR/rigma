@@ -58,7 +58,13 @@ export interface LaunchDefaultsFormProps {
   custom: boolean;
   /** On-disk quants only — a default that cannot be loaded is not a default. */
   quants: string[];
-  nativeCtx: number;
+  /** The model's real native window, or `null` when NEITHER `/api/models` nor
+   *  `/api/server` could say. `null` is not 0 and must not be replaced with a
+   *  plausible-looking ceiling: the pre-DR2-4 fallback was `262144`, so a
+   *  32K-native model was offered 64K/128K/256K, the value was stored, and the
+   *  launcher clamped it silently. An unknown window is "no opinion", not
+   *  "every window". */
+  nativeCtx: number | null;
   hasMmproj: boolean;
   backends: string[];
   /** D2: opened because `first_load` was true, rather than from the Sidecar. */
@@ -71,6 +77,12 @@ export interface LaunchDefaultsFormProps {
   onClose: () => void;
 }
 
+/** `null` — or a non-positive number — is an UNKNOWN window, never a real one.
+ *  Typed as a predicate so the arithmetic below cannot read it as `0`. */
+function ctxKnown(n: number | null): n is number {
+  return n !== null && n > 0;
+}
+
 export function LaunchDefaultsForm({
   slug, draft, initial, custom, quants, nativeCtx, hasMmproj, backends,
   firstLoad, busy, saved, error, onDraft, onSave, onClose,
@@ -80,8 +92,18 @@ export function LaunchDefaultsForm({
   const sel =
     "flex-1 rounded-md bg-surface px-2 py-1 text-[12.5px] outline-none disabled:opacity-40";
 
-  const ctxs = CTX_STEPS.filter((c) => c <= nativeCtx);
+  const ctxs = ctxKnown(nativeCtx) ? CTX_STEPS.filter((c) => c <= nativeCtx) : [];
+  // A STORED value is kept visible so it can be CLEARED; it is not a new offer.
+  // Without this an unknown window would hide the pinned value and the user
+  // could not remove it from here.
   if (draft.ctx && !ctxs.includes(Number(draft.ctx))) ctxs.push(Number(draft.ctx));
+  const storedCtx = Number(draft.ctx) || 0;
+  // The launch path (`server_ops.perform_switch`) does
+  // `want = max(2048, min(int(ctx), spec.native_ctx))` — so a stored value above
+  // the window is CLAMPED, not honoured. Say it here, where the value was
+  // chosen, instead of letting the resolver do it silently.
+  const ctxClampedTo = ctxKnown(nativeCtx) && storedCtx > nativeCtx
+    ? nativeCtx : null;
   const qs = quants.slice();
   if (draft.quant && !qs.includes(draft.quant)) qs.push(draft.quant);
   const changed = defaultsChanged(draft, initial);
@@ -125,6 +147,29 @@ export function LaunchDefaultsForm({
             ))}
           </select>
         </label>
+        {!ctxKnown(nativeCtx) && (
+          // DR2-4: the pre-fix fallback invented 262144, so a 32K model was
+          // offered 64K/128K/256K. An unknown window gets NO steps — only
+          // "model default", which is the resolver's own safe choice — and the
+          // control says so. A stored value stays visible so it can be cleared.
+          <p role="note" className="text-[11.5px] text-amber pl-28 -mt-1">
+            {slug}'s native context window is unknown right now — the models
+            list and the engine both failed to answer. Rigma will not offer a
+            context it cannot justify, so only "model default" (the resolver's
+            own safe choice) is offered here
+            {storedCtx
+              ? `; the stored ${storedCtx} is kept visible so you can clear it`
+              : ""}.
+          </p>
+        )}
+        {ctxClampedTo !== null && (
+          <p role="note" className="text-[11.5px] text-amber pl-28 -mt-1">
+            the stored context {storedCtx} is above {slug}'s native window
+            {" "}{ctxClampedTo}, so a launch clamps it to {ctxClampedTo} — the
+            pinned value is not what runs. Pick {ctxClampedTo} or lower, or
+            clear it.
+          </p>
+        )}
 
         <label className={row} title="KV cache precision. Halving it roughly doubles the
 context that fits, but cache error is written per token and compounds.">
@@ -226,7 +271,9 @@ export default function LaunchDefaultsDialog({
   const [initial, setInitial] = useState<LaunchDefaults | null>(null);
   const [custom, setCustom] = useState(true);
   const [quants, setQuants] = useState<string[]>([]);
-  const [nativeCtx, setNativeCtx] = useState(262144);
+  // `null` = the window is UNKNOWN. It used to default to 262144, which is how
+  // a failed model API turned into an invented native window (DR2-4).
+  const [nativeCtx, setNativeCtx] = useState<number | null>(null);
   const [hasMmproj, setHasMmproj] = useState(false);
   const [backends, setBackends] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -260,7 +307,7 @@ export default function LaunchDefaultsDialog({
         setCustom(md.custom);
         setQuants(card ? card.quants.filter((q) => q.on_disk).map((q) => q.quant)
                        : []);
-        setNativeCtx(card?.native_ctx || srv?.native_ctx || 262144);
+        setNativeCtx(card?.native_ctx || srv?.native_ctx || null);
         setHasMmproj(!!card?.mmproj || srv?.has_mmproj === true);
         setBackends((srv?.backends ?? []).filter((b) => b.buildable)
           .map((b) => b.name));
