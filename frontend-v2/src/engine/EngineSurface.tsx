@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { engineApi, switchNotice, type EngineFinding, type ServerInfo,
          type SwitchOption, type UsageStats } from "../lib/engineApi";
 import { filterLines } from "../lib/logTail";
+import SwitchNote from "../lib/SwitchNote";
 import { tokens, usageRows, sinceLabel } from "../lib/usage";
 
 function uptime(startedAt: number): string {
@@ -163,7 +164,7 @@ export default function EngineSurface() {
           <div className="rounded-md bg-red/10 text-red px-3 py-2 text-[13px]">{err}</div>
         )}
         {note && (
-          <div className="rounded-md bg-surface text-secondary px-3 py-2 text-[13px]">{note}</div>
+          <SwitchNote note={note} />
         )}
 
         {/* What the engine decided at load and never said again. These are the
