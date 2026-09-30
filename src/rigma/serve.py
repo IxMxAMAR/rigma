@@ -746,7 +746,42 @@ def _preserve_unreadable_run(src: Path) -> Path | None:
     return None
 
 
-def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
+def _read_run_bytes(runs_mod, run_id: str):
+    """`(parsed, may_replace)` from a DIRECT read of this run's `run.json`.
+
+    DR1. `runs.load` collapses two different failures into `None`: the bytes
+    could not be READ (a transient sharing violation against `_atomic_write`'s
+    replace, gone in milliseconds) and the bytes were read but do not PARSE.
+    Only the second is evidence that the file on disk is bad. The release path
+    treated both as "unusable" and replaced whatever was there with a 4-field
+    stub, so a lock that cleared a moment later left a GOOD record overwritten:
+    `session_id`, `mission`, `spec`, `deadline` and every counter gone, and
+    `restart_run` answering 409 "the run's chat session was deleted" for good.
+
+    `may_replace` is False ONLY when the read itself raised — the bytes may be a
+    perfectly good record and must be left alone. A missing file is True: there
+    is nothing to lose and a terminal record is an improvement. Bytes that were
+    read and do not parse are True too: the file is genuinely unusable, so a
+    minimal terminal record plus a copy-aside is the best available answer.
+    """
+    try:
+        path = runs_mod.run_dir(run_id) / "run.json"
+    except Exception:
+        return None, False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, True
+    except Exception:
+        return None, False
+    try:
+        return json.loads(text), True
+    except Exception:
+        return None, True
+
+
+def _release_unreadable_run(runs_mod, run_id: str,
+                            reason: str) -> dict | None:
     """Release the one-run slot for a run whose state cannot be read.
 
     A18 / R3-RUN-5. `runs.load` returns None for BOTH "the file is gone" and "I
@@ -764,11 +799,16 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
     single test both this and `_load_run_for_loop` use.
 
     So the slot is released explicitly: a terminal status for the id we were
-    asked to drive, then the active pointer dropped when it points here. The
-    record written is minimal when the real one could not be read, so whatever
-    is on disk is copied aside first (see `_preserve_unreadable_run`) — a release
-    must be recoverable, not destructive. The run's mission and transcript
-    survive on its session, so `restart` still reattaches meaningfully.
+    asked to drive, then the active pointer dropped when it points here. A
+    minimal record is written only when the bytes on disk were READ and cannot
+    be used, and whatever was there is copied aside first (see
+    `_preserve_unreadable_run`) — a release must be recoverable, not
+    destructive. When the READ itself fails the file is left exactly as it is:
+    it may be a good record a transient lock hid from us, and a backup nobody
+    reads back is not recovery. `restart` then reattaches from the real record.
+
+    Returns the record it released, when it could recover one, so the caller can
+    still run the end-of-run cleanup for that run's session (DR8).
 
     A18d(3): when `run.json` is unreadable AND unwritable the terminal status
     cannot land, so it keeps saying `running` on disk even though the slot IS
@@ -781,21 +821,37 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
         run = runs_mod.load(run_id)      # the lock may have cleared by now
     except Exception:
         run = None
-    if not _run_is_drivable(run):
+    if not _run_is_drivable(run) or run.get("id") != run_id:
         # A18c: a readable-but-unusable record (`{}`, `[]`, a null/empty
         # session_id) cannot be handed to `set_status` — it has no id to write
         # to — so it takes the same minimal-record path as an unreadable file.
+        # DR1: a record whose `id` is NOT ours is discarded for the same reason
+        # `set_status` writes through `run["id"]` — releasing A must never write
+        # into B's run directory.
         run = None
     if run is None:
-        try:
-            src = runs_mod.run_dir(run_id) / "run.json"
-            if src.exists():
-                _preserve_unreadable_run(src)
-        except Exception:
-            _log.warning("run %s: could not inspect run.json to back it up",
-                         run_id, exc_info=True)
-        run = {"id": run_id}
-    if run.get("status") not in runs_mod.TERMINAL:
+        parsed, may_replace = _read_run_bytes(runs_mod, run_id)
+        if _run_is_drivable(parsed) and parsed.get("id") == run_id:
+            # DR1: the load failed but the file reads fine now — the lock has
+            # cleared. Use the REAL record, so the terminal status keeps
+            # session_id, mission, spec and the counters and `restart_run` still
+            # reattaches instead of 409-ing on a missing session.
+            run = parsed
+        elif may_replace:
+            # The bytes were READ and do not parse (or there are none): the file
+            # is genuinely unusable, so a minimal terminal record is an
+            # improvement — but keep a copy of whatever was there first.
+            try:
+                src = runs_mod.run_dir(run_id) / "run.json"
+                if src.exists():
+                    _preserve_unreadable_run(src)
+            except Exception:
+                _log.warning("run %s: could not inspect run.json to back it up",
+                             run_id, exc_info=True)
+            run = {"id": run_id}
+        # else: the READ itself failed. `run.json` is left alone — overwriting
+        # it is the data loss DR1 is about, and only the slot is released below.
+    if run is not None and run.get("status") not in runs_mod.TERMINAL:
         try:
             runs_mod.set_status(run, "interrupted", reason)
         except Exception:
@@ -806,17 +862,22 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
     # The pointer is read directly, by id: `runs.active()` returns None for an
     # unreadable run, and clearing unconditionally could free a DIFFERENT run's
     # slot — a new run may have started since this one wedged.
+    raw = None
     try:
         raw = json.loads(runs_mod._active_path().read_text(encoding="utf-8"))
     except FileNotFoundError:
         raw = None
     except Exception:
-        raw = {"id": run_id}    # an unreadable pointer is nobody's claim
+        # DR8: an unreadable pointer is NOT this run's claim. `runs.active()`
+        # returns None for it, so a new run may already have started and own the
+        # slot; clearing here would drop THAT run's claim.
+        raw = None
     if isinstance(raw, dict) and raw.get("id") == run_id:
         try:
             runs_mod.clear_active()
         except Exception:
             _log.exception("run %s: could not release the active slot", run_id)
+    return run
 
 
 def _patch_session(sid: str, body: dict) -> dict | None:
@@ -3296,7 +3357,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # deltas from every round, never reset, so the stored partial matches
         # the screen.
         _ckpt = {"id": f"ck{time.time_ns()}", "at": time.monotonic(),
-                 "live": "", "saved": False, "final": False}
+                 "live": "", "saved": False, "final": False, "unsaved": False}
 
         def _partial_message() -> dict:
             m = {"role": "assistant",
@@ -3305,9 +3366,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                  # UI-only, like every other notice: both transcripts already
                  # render this field, so a recovered reply says what it is
                  # without either frontend changing.
-                 "notice": "_(this reply was interrupted — the text above is "
-                           "what had been generated. Say **continue** to "
-                           "resume it.)_"}
+                 #
+                 # DR3: a turn whose FINISHED reply could not be saved is not an
+                 # interrupted reply — every word is there, and telling the user
+                 # to "say continue" invites them to append to a complete
+                 # answer. The two cases get different words.
+                 "notice": (
+                     "_(this reply could not be saved as a finished turn — the "
+                     "session kept changing underneath it. The text above is "
+                     "what was generated; copy anything you need.)_"
+                     if _ckpt["unsaved"] else
+                     "_(this reply was interrupted — the text above is what had "
+                     "been generated. Say **continue** to resume it.)_")}
             if thinking:
                 m["thinking"] = thinking
             if trace:
@@ -4131,24 +4201,47 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _log.error("session %s: could not save the finished turn "
                                "after 3 attempts: %s", s.get("id"), last_err)
                     _ckpt["final"] = False
+                    # DR3: the reply FINISHED; only its final store write lost.
+                    # The checkpoint below is a partial, so without this it would
+                    # carry the "interrupted — say continue" notice for a
+                    # complete answer.
+                    _ckpt["unsaved"] = True
                     yield _sse({"note": (
                         "_(This reply could not be saved as a finished turn — "
                         "the session kept changing underneath it. What you see "
                         "may not survive a reload; copy anything you need.)_")},
                         event="notice")
-                    await _checkpoint_threaded(force=True)
+                    # DR3: ONE forced attempt used to be the whole fallback, and
+                    # `_write_checkpoint` returns silently on `StaleWriteError`
+                    # — the same contention that just beat three CAS attempts
+                    # beats one more, so a short reply was stored nowhere at all.
+                    # Three attempts, stopping the moment the words are on disk.
+                    for _ in range(3):
+                        await _checkpoint_threaded(force=True)
+                        if _ckpt["saved"]:
+                            break
                 else:
                     _ckpt["saved"], _ckpt["final"] = False, True
-                # Rebuilt AFTER the save so it includes the reply that was just
-                # generated — that is what the slot actually holds now.
-                try:
-                    # AUDIT F13: threaded — see the warm call at the top of the turn
-                    await asyncio.to_thread(
-                        _prefix_snapshot,
-                        sessions.build_messages(s, _default_prompt(), preset),
-                        str(s.get("id") or ""))
-                except Exception:
-                    pass
+                # DR3: everything below assumes `s` IS the store. When the
+                # finished turn could not be saved, `s` is the pre-turn snapshot
+                # plus this turn and the store has moved on — the concurrent
+                # writer whose saves beat the three CAS attempts is exactly the
+                # difference. Auto-compact reads `s` and WRITES from it
+                # (`stored[snapshot_n:]` sliced against an in-memory length that
+                # counts this turn's unsaved reply), which dropped those
+                # messages; the title and prefix writes are the same shape. A
+                # turn that could not be saved does no housekeeping.
+                if saved:
+                    # Rebuilt AFTER the save so it includes the reply that was just
+                    # generated — that is what the slot actually holds now.
+                    try:
+                        # AUDIT F13: threaded — see the warm call at the top
+                        await asyncio.to_thread(
+                            _prefix_snapshot,
+                            sessions.build_messages(s, _default_prompt(), preset),
+                            str(s.get("id") or ""))
+                    except Exception:
+                        pass
                 _bump_stats(timings)
                 # Auto-title once the conversation has a shape (owner request
                 # 2026-07-21: the rail was "Sup bro", "Hello", and three identical
@@ -4156,7 +4249,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # a title the USER typed via rename is never overwritten, and
                 # failure changes nothing — the truncation stays.
                 try:
-                    if (len(s.get("messages", [])) >= 4
+                    if (saved
+                            and len(s.get("messages", [])) >= 4
                             and s.get("title_source") not in ("user", "auto")
                             and not s.get("run_id")):
                         convo = []
@@ -4198,10 +4292,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 except Exception:
                     pass          # titling is never load-bearing
                 # auto-compact when the window is nearly full, so the NEXT turn
-                # starts small (reactive; uses the engine's real prompt_tokens)
+                # starts small (reactive; uses the engine's real prompt_tokens).
+                # DR3: skipped entirely when this turn could not be saved — the
+                # fold slices the STORE with a length taken from `s`, and `s`
+                # counts this turn's unsaved reply, so it dropped the concurrent
+                # writer's messages. The next saved turn re-checks and folds.
                 ptoks = usage.get("prompt_tokens") or 0
                 wctx = compact_budget(s, (st.read_state() or {}).get("ctx", 0))
-                if (s.get("auto_compact", True) and ptoks and wctx
+                if (saved and s.get("auto_compact", True) and ptoks and wctx
                         and ptoks >= AUTO_COMPACT_FRACTION * wctx
                         and len(s.get("messages", [])) > AUTO_COMPACT_KEEP):
                     try:
@@ -5919,19 +6017,35 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # 409 "run is running", a new run 409 "a run is already active". Only
         # Stop cleared it. Found by the full suite under concurrency
         # (test_phase4_lifecycle's restart test), not by reading.
-        run, readable = _load_run_for_loop(_runs, run_id)
-        if not readable:
-            _release_unreadable_run(_runs, run_id, "run state could not be read")
-            return
-        if run is None:
-            return                    # deleted: nothing to drive
-        sid = run["session_id"]
-        try:
-            await _compile_spec(run_id, sid)
-        except Exception:
-            pass                      # never block a run on compilation
+        #
+        # DR8: the first load lives INSIDE the try/finally. Its `return` used to
+        # sit BEFORE it, so a run released here skipped every piece of
+        # end-of-run cleanup: the chat kept `mission`/`run_id` (so it was never
+        # auto-titled again and compacted in masking style), no "RUN
+        # INTERRUPTED" line reached progress.md, and the dead driver task stayed
+        # in `_run_tasks`. `sid` starts empty and is only filled once a record
+        # was actually recovered, so the cleanup never touches a chat it cannot
+        # prove belongs to this run.
         prev_sig = None
+        sid = ""
         try:
+            run, readable = _load_run_for_loop(_runs, run_id)
+            if not readable:
+                # `_release_unreadable_run` returns the record it managed to
+                # recover, so the finally below can still clear THIS run's
+                # session when the file turned out to be readable after all.
+                released = _release_unreadable_run(
+                    _runs, run_id, "run state could not be read")
+                if released:
+                    sid = str(released.get("session_id") or "")
+                return
+            if run is None:
+                return                # deleted: nothing to drive
+            sid = run["session_id"]
+            try:
+                await _compile_spec(run_id, sid)
+            except Exception:
+                pass                  # never block a run on compilation
             while True:
                 # R3-RUN-5: `_runs.load` swallows EVERY exception and returns
                 # None, so "I could not read my own state" was indistinguishable
@@ -6660,7 +6774,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 _runs.set_status(r, "error", f"loop crashed: {str(e)[:200]}")
         finally:
             _run_tasks.pop(run_id, None)
-            s2 = sessions.load(sid)
+            # DR8: `sid` is empty when the first load never recovered a record
+            # (an unreadable state that could not be re-read). There is then no
+            # chat we can prove belongs to this run, so the session cleanup is
+            # skipped rather than guessed at.
+            s2 = sessions.load(sid) if sid else None
             if s2 is not None and s2.get("mission"):
                 # R3-2: the LAST unguarded whole-row save in the run. The chat's
                 # own UI is back on this session the moment the run ends (the
