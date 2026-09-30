@@ -1999,6 +1999,27 @@ def _recall(args, ctx):
 _GREP_MAX_FILES = 2000
 _GREP_MAX_BYTES = 256 << 20          # 256 MB of file content per grep call
 _GREP_MAX_VISITED = 20000            # directory entries examined per grep call
+_GREP_CLIP = 200                     # chars of a matching line that are shown
+_GREP_MAX_MATCHES = 100              # matches before the search stops
+
+# DR6: the glob ReDoS is gone (R3-16), but grep's content `pattern` is still a
+# raw model-supplied regex and `re` cannot be interrupted — a catastrophic
+# pattern holds the GIL for the whole match, which is the "a tool argument stops
+# the server" outcome. MEASURED on this host, `(a+)+$` against `"a"*n + "b"`:
+# n=20 0.04 s, n=24 0.70 s, n=26 3.28 s — a 4x step per two characters, so n=40
+# is ~15 hours. NO LINE CAP CAN BOUND THAT: the output is clipped to 200 chars,
+# so a cap small enough to make 2**cap survivable (about 20) would stop grep
+# from finding anything past the 20th character, while a cap large enough to be
+# useful still allows 2**cap. A wall clock is the only bound that holds, and the
+# only way to enforce one over `re` is to run the search where it can be KILLED:
+# a child interpreter. MEASURED, a SIGINT raised from another thread does not
+# stop a catastrophic match, so an in-process deadline is not an option.
+#
+# The budget scales with the bytes to read so a legitimate large scan is not cut
+# off: a base plus a conservative read+match floor, capped.
+_GREP_REGEX_BUDGET = 5.0             # seconds before any per-byte allowance
+_GREP_BYTES_PER_SEC = 8 << 20        # conservative bytes/second floor
+_GREP_BUDGET_MAX = 60.0              # never wait longer than this
 _WALK_MAX_ENTRIES = 5000             # directory entries examined by find_files
 # R3-TOOL-6: `edit_file` reads the file once to edit it and again for the undo
 # snapshot, so it needs a ceiling at least as tight as `read_file`'s 8 MB. Kept
@@ -2317,6 +2338,104 @@ def _find_files(args, ctx):
     return body
 
 
+# The bounded-search child (DR6). It is started with `sys.executable -c`, NOT
+# `multiprocessing`, so a spawned child can never re-import and re-run whatever
+# `__main__` the server was started from — the failure mode that makes
+# `multiprocessing` unsafe inside a long-lived console-script process on
+# Windows. `sys.argv[1]` is the `src` directory the parent's `rigma` package
+# lives in, so the child imports the SAME code (and therefore the same
+# `_grep_scan`) as the parent even from a worktree.
+_GREP_WORKER = (
+    "import sys, json\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from rigma.tools import _grep_scan\n"
+    "job = json.loads(sys.stdin.read())\n"
+    "sys.stdout.write(json.dumps(_grep_scan(job['files'], job['pattern'], "
+    "job['flags'])))\n"
+)
+
+
+def _grep_scan(files, pattern: str, flags: int) -> list[str]:
+    """The content search itself, in one place so the bounded child and any
+    reader of this module cannot disagree about what a match is.
+
+    `files` is `[(absolute_path, workspace_relative_path)]`; the result is the
+    formatted `file:line: text` lines the tool returns, at most
+    `_GREP_MAX_MATCHES`. This is the function that must run in the child: the
+    `rx.search(line)` in it is the unbounded, uninterruptible call DR6 is about.
+    """
+    rx = re.compile(pattern, flags)
+    out: list[str] = []
+    for abspath, rel in files:
+        try:
+            text = Path(abspath).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if rx.search(line):
+                out.append(f"{rel}:{i}: " + line.strip()[:_GREP_CLIP])
+                if len(out) >= _GREP_MAX_MATCHES:
+                    return out
+    return out
+
+
+def _grep_search_bounded(files, pattern: str, flags: int, budget: float):
+    """Run `_grep_scan` in a child interpreter with a wall-clock deadline.
+
+    Returns `(lines, error)`: `error` is None on success, `"timeout"` when the
+    deadline passed, and a message for anything else. `lines` is None whenever
+    `error` is set.
+
+    The child is detached on POSIX (`start_new_session`) so `_kill_tree`'s
+    killpg reaches only it, exactly as the other harness children are. Nothing
+    is started when there is nothing to search, so the common empty workspace
+    pays no process.
+    """
+    if not files:
+        return [], None
+    src = str(Path(__file__).resolve().parent.parent)
+    kw = {}
+    if sys.platform == "win32":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kw["start_new_session"] = True
+    job = json.dumps({"files": files, "pattern": pattern, "flags": flags})
+    try:
+        p = subprocess.Popen([sys.executable, "-c", _GREP_WORKER, src],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                             errors="replace", **kw)
+    except Exception as e:                      # no child: no unbounded search
+        return None, f"could not start the bounded search: {e}"
+    try:
+        out, err = p.communicate(job, timeout=budget)
+    except subprocess.TimeoutExpired:
+        if not _kill_tree(p.pid, p):
+            # The tree kill could not be confirmed. The worker spawns nothing of
+            # its own, so `Popen.kill()` is still enough for it — leaving it
+            # running would make the "bound" a lie.
+            try:
+                p.kill()
+            except Exception:
+                pass
+        try:
+            p.communicate(timeout=3)
+        except Exception:
+            pass
+        return None, "timeout"
+    if p.returncode != 0:
+        tail = [ln for ln in (err or "").strip().splitlines() if ln.strip()]
+        return None, ("the bounded search failed: "
+                      + (tail[-1] if tail else f"exit {p.returncode}"))
+    try:
+        lines = json.loads(out)
+    except Exception:
+        return None, "the bounded search returned an unreadable result"
+    if not isinstance(lines, list):
+        return None, "the bounded search returned an unexpected result"
+    return lines, None
+
+
 @tool("grep",
       "Search file contents for a regex inside the workspace. Returns matching "
       "lines with file:line (long lines are clipped to 200 chars).",
@@ -2330,16 +2449,20 @@ def _find_files(args, ctx):
       needs="workspace")
 def _grep(args, ctx):
     root = _ws_path(ctx, ".")
+    pattern = str(args.get("pattern", ""))
+    flags = re.IGNORECASE if args.get("ignore_case") else 0
     try:
-        rx = re.compile(str(args.get("pattern", "")),
-                        re.IGNORECASE if args.get("ignore_case") else 0)
+        re.compile(pattern, flags)
     except re.error as e:
         return f"error: bad regex: {e}"
     glob = str(args.get("glob", "") or "**/*")
     rx_glob = _glob_re(glob)
     if isinstance(rx_glob, re.error):        # R3-16: a typo is not a 500
         return f"error: bad glob {glob!r}: {rx_glob}"
-    out, seen = [], 0
+    # The WALK stays here, where its limits and the credential filter already
+    # live; only the regex SEARCH moves to the child (DR6). Collecting the
+    # candidate list first is what lets one bounded child do the whole scan.
+    files: list[tuple[str, str]] = []
     files_read = 0
     bytes_read = 0
     state = {"visited": 0, "truncated": False,
@@ -2356,19 +2479,22 @@ def _grep(args, ctx):
             continue
         files_read += 1
         bytes_read += size
-        try:
-            for i, line in enumerate(p.read_text(encoding="utf-8",
-                                                 errors="ignore").splitlines(), 1):
-                if rx.search(line):
-                    out.append(f"{p.relative_to(root).as_posix()}:{i}: "
-                               + line.strip()[:200])
-                    seen += 1
-                    if seen >= 100:
-                        return ("\n".join(out)
-                                + "\n…(stopped at 100 matches — narrow the "
-                                  "pattern or add a `glob` to see the rest)")
-        except OSError:
-            continue
+        files.append((str(p), p.relative_to(root).as_posix()))
+
+    budget = min(_GREP_BUDGET_MAX,
+                 _GREP_REGEX_BUDGET + bytes_read / _GREP_BYTES_PER_SEC)
+    out, err = _grep_search_bounded(files, pattern, flags, budget)
+    if err == "timeout":
+        return ("error: the pattern did not finish within "
+                f"{budget:.0f}s on the files searched — it looks like "
+                "catastrophic backtracking (nested quantifiers such as "
+                "`(a+)+`); simplify the pattern or narrow it with `glob`")
+    if err is not None:
+        return f"error: {err}"
+    if len(out) >= _GREP_MAX_MATCHES:
+        return ("\n".join(out)
+                + "\n…(stopped at 100 matches — narrow the pattern or add a "
+                  "`glob` to see the rest)")
     if state["truncated"]:
         note = (f"…(searched the first {files_read} files / "
                 f"{bytes_read // (1 << 20)} MB — narrow the pattern or add a "
