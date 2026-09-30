@@ -20,6 +20,7 @@ means a complete one.
 """
 from __future__ import annotations
 
+import logging
 import pathlib
 from types import SimpleNamespace
 
@@ -253,17 +254,25 @@ def test_subagent_lifecycle_is_top_level_and_no_longer_filtered_out():
     assert finished["event"] == "subagent.finished"
 
 
-def test_internal_chatter_is_still_dropped():
-    """The filter existed for a reason: a one-line turn produced fifteen
-    notifications, and forwarding them all buries the reply.
+def test_former_internal_chatter_is_now_an_explicit_notice():
+    """B2: these four used to be dropped in SILENCE, and this test used to assert
+    `== []`. The contract changed, deliberately.
 
-    `session/title` was in this list and is deliberately NOT any more: it is the
-    server's own authoritative title for the chat, Rigma invents its own without
-    ever learning it, and the two can disagree. That is worth a line; the others
-    here are genuinely bookkeeping."""
+    The reason for the old filter is still respected: a one-line turn produced
+    fifteen notifications, so none of these becomes STRUCTURED state and none of
+    them is given a payload. But silence is how `command/run`/`command/done` never
+    reached the UI and how a newer DSH could add a type nobody ever saw. Each one
+    is now the generic notice, naming its type and nothing else.
+
+    `session/title` left this list earlier for its own reason (it is the server's
+    authoritative title, worth a real line); that decision is unchanged.
+    """
     for kind in ("agent/inbox/spliced", "step/start", "request/header",
                  "delivery-accepted"):
-        assert runner._project(_session_event(kind, {})) == [], kind
+        out = runner._project(_session_event(kind, {}))
+        assert len(out) == 1, (kind, out)
+        assert out[0]["type"] == "notice", (kind, out)
+        assert kind in out[0]["text"], (kind, out)
 
 
 def test_a_malformed_notification_produces_nothing_and_does_not_raise():
@@ -1235,3 +1244,177 @@ def test_plan_mode_is_not_mounted_and_why():
     # guard covers the capability rather than one row's id.
     names = {str(r.get("name")) for r in _patch_rows()}
     assert "@deepseek-ai/dsh-plan-mode" not in names
+
+
+# --- B2: an unknown session-event type must not be dropped in silence ---------
+#
+# THE DEFECT. `_project` handled 21 `_STATE_EVENTS` plus `tool/call`,
+# `tool/result`, `assistant/message` and the two top-level `subagent.*`. Anything
+# else fell through to `_notice_text`, which returned `None` unless
+# `method + inner-type` happened to contain one of six substrings
+# (`tool, error, fail, denied, retry, timeout`). So 27 of DSH's 51 session-event
+# types were discarded with no branch, no notice and no log — including
+# `command/run` and `command/done`, where a person watching a turn could not tell
+# that a command had run. This is information loss, not a crash, which is exactly
+# why it went unnoticed.
+#
+# THE FIX. An unknown-but-well-formed inner event is projected as the EXISTING
+# notice shape (one string, no second wire format), naming the type and the
+# identifying fields the event actually carries; the first occurrence of each type
+# is logged once; and a projector that raises yields a notice instead of vanishing
+# into the old `except: pass`.
+#
+# WHAT IS NOT HERE. The state chain's missing `else` (`serve.py:2449-2451`) and
+# the UI rendering of these notices are a later wave, per the item's scope.
+
+# The concrete types the probe confirmed are dropped on the unmodified base
+# (`.scratch/orchestrator/b2-probe-dropped.py`; the 51-type vocabulary is doc 27
+# §1.1). Kept here as the oracle for "unknown" — a type that stops being unknown
+# must be moved into `_STATE_EVENTS` or given its own branch, not left ambiguous.
+DROPPED_ON_BASE = (
+    "step/start", "step/end",
+    "request/header", "request/context",
+    "agent/inbox/spliced",
+    "session/end-seed",
+    "assistant/attempt", "assistant/chunk",
+    "user/message", "system/message",
+    "session-log-deepseek/delivery-accepted",
+    "session/title-llm-request",
+    "web/deepseek-search-llm-request",
+    "hook/invoked", "hook/result",
+    "command/run", "command/done",
+    "model/selection",
+    "agent-preset/selected",
+    "subagent/model-selection-policy",
+    "schedule/change",
+    "feedback/record",
+)
+
+
+def test_every_type_dropped_on_base_now_yields_exactly_one_notice(monkeypatch):
+    """The whole item in one assertion, over the verified drop list."""
+    monkeypatch.setattr(runner, "_WARNED_UNKNOWN_TYPES", set())
+    for kind in DROPPED_ON_BASE:
+        out = _project(_session_event(kind, {}))
+        assert len(out) == 1, (kind, out)
+        assert out[0]["type"] == "notice", (kind, out)
+        assert kind in out[0]["text"], (kind, out)
+
+
+def test_an_unknown_event_names_the_identifying_fields_it_has(monkeypatch):
+    monkeypatch.setattr(runner, "_WARNED_UNKNOWN_TYPES", set())
+    out = _project(_session_event("command/run", {
+        "command": "/compact", "sessionId": "s1", "status": "running",
+        "callId": "c1",
+    }))
+    assert len(out) == 1, out
+    text = out[0]["text"]
+    assert "command/run" in text
+    assert "command=/compact" in text
+    assert "sessionId=s1" in text
+    assert "status=running" in text
+    assert "callId=c1" in text
+
+
+def test_the_notice_never_invents_a_field_the_event_lacks(monkeypatch):
+    monkeypatch.setattr(runner, "_WARNED_UNKNOWN_TYPES", set())
+    text = _project(_session_event("command/done", {"status": "ok"}))[0]["text"]
+    assert "command/done" in text and "status=ok" in text
+    assert "command=" not in text, text
+    assert "sessionId=" not in text, text
+    assert "callId=" not in text, text
+
+
+def test_an_unknown_notice_never_carries_message_content(monkeypatch):
+    """§0.3: a type name, an id and a status only — never prose.
+
+    The allow-list is the mechanism, so this pins that a payload full of content
+    cannot leak through it.
+    """
+    monkeypatch.setattr(runner, "_WARNED_UNKNOWN_TYPES", set())
+    text = _project(_session_event("command/run", {
+        "command": "/compact",
+        "text": "SECRET PROSE",
+        "message": {"content": [{"type": "text", "text": "SECRET PROSE"}]},
+        "prompt": "SECRET PROSE",
+    }))[0]["text"]
+    assert "SECRET" not in text, text
+    assert "command=/compact" in text
+
+
+def test_an_unknown_notice_is_one_line(monkeypatch):
+    """A value with a newline in it must not turn one notice into two."""
+    monkeypatch.setattr(runner, "_WARNED_UNKNOWN_TYPES", set())
+    text = _project(_session_event("command/run", {
+        "command": "/goal\nship\tit",
+    }))[0]["text"]
+    assert "\n" not in text and "\r" not in text and "\t" not in text, repr(text)
+    assert "command=/goal ship it" in text
+
+
+def test_the_first_occurrence_of_an_unknown_type_is_logged_once(monkeypatch, caplog):
+    """Several occurrences, one line — the log is a discovery aid, not a stream."""
+    monkeypatch.setattr(runner, "_WARNED_UNKNOWN_TYPES", set())
+    with caplog.at_level(logging.WARNING, logger="rigma._dsh_runner"):
+        for _ in range(3):
+            _project(_session_event("command/run", {"command": "/x"}))
+    hits = [r for r in caplog.records if "command/run" in r.getMessage()]
+    assert len(hits) == 1, [r.getMessage() for r in caplog.records]
+    assert hits[0].levelno == logging.WARNING
+
+
+def test_a_different_unknown_type_gets_its_own_log_line(monkeypatch, caplog):
+    monkeypatch.setattr(runner, "_WARNED_UNKNOWN_TYPES", set())
+    with caplog.at_level(logging.WARNING, logger="rigma._dsh_runner"):
+        _project(_session_event("command/run", {}))
+        _project(_session_event("model/selection", {}))
+    seen = {r.getMessage().split("'")[1] for r in caplog.records
+            if "'" in r.getMessage()}
+    assert {"command/run", "model/selection"} <= seen, seen
+
+
+def test_handled_types_project_exactly_as_before():
+    """The oracle for "nothing else moved": 2-3 handled shapes, pinned exactly."""
+    assert _project(_session_event("goal/change", {"operation": "create"})) == [
+        {"type": "state", "event": "goal/change", "data": {"operation": "create"}}]
+    assert _project(_session_event("tool/call",
+                                   {"name": "read", "callId": "c1"})) == [
+        {"type": "tool", "name": "read", "id": "c1"}]
+    assert _project(_session_event("assistant/message",
+                                   {"usage": {"input": 5}})) == [
+        {"type": "state", "event": "usage", "data": {"input": 5}}]
+
+
+def test_a_top_level_notification_without_an_event_type_is_unchanged():
+    """`session.status` has no inner event TYPE to name, so the 51-type vocabulary
+    does not apply and the old keyword filter still decides. Otherwise every turn
+    would emit a "working" notice."""
+    assert _project(_notif("session.status", {"status": "working"})) == []
+    assert _project(_notif("session.status", {"status": "failed"})) == [
+        {"type": "notice", "text": "session.status failed"}]
+
+
+def test_a_projector_that_raises_yields_a_notice_and_does_not_propagate(
+        monkeypatch, caplog):
+    """`except: pass` meant a projector bug ate the event invisibly."""
+    sent: list[dict] = []
+    monkeypatch.setattr(runner, "_emit", sent.append)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("projector bug")
+
+    monkeypatch.setattr(runner, "_project", _boom)
+    with caplog.at_level(logging.WARNING, logger="rigma._dsh_runner"):
+        runner._forward(_notif("session.event", {"event": {"type": "command/run"}}))
+    assert len(sent) == 1, sent
+    assert sent[0]["type"] == "notice", sent
+    assert "could not be projected" in sent[0]["text"], sent
+    assert any("projector" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_forward_emits_what_the_projector_returns(monkeypatch):
+    sent: list[dict] = []
+    monkeypatch.setattr(runner, "_emit", sent.append)
+    runner._forward(_session_event("goal/change", {"operation": "create"}))
+    assert sent == [{"type": "state", "event": "goal/change",
+                     "data": {"operation": "create"}}]
