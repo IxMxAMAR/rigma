@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { parseBackup, postRestore, restoreSummary } from "./backup";
+import { deletedLine, parseBackup, postRestore, restoreSummary } from "./backup";
 
 // D4c. `/api/restore` replaces the whole store — memory, settings and methods
 // (OD-15 option 1), so the two facts this module must get right are: what the
@@ -73,7 +73,50 @@ describe("postRestore", () => {
     expect(seen[0].url).toBe("/api/restore");
     expect(seen[0].init.method).toBe("POST");
     expect(JSON.parse(String(seen[0].init.body))).toEqual(DOC);
-    expect(r).toEqual({ ok: true, methods: 2, memory: { before: 3, after: 3 } });
+    expect(r).toEqual({
+      ok: true, methods: 2, memory: { before: 3, after: 3 }, deleted: null,
+    });
+  });
+
+  it("reads the additive deleted list, and null when it is absent", async () => {
+    // ODR-7: `deleted: [<method ids>]` is additive. An older server omits it,
+    // and "absent" must stay distinct from "empty" all the way to the card.
+    const reply = (body: unknown) =>
+      new Response(JSON.stringify(body),
+        { status: 200, headers: { "content-type": "application/json" } });
+
+    vi.stubGlobal("fetch", vi.fn(async () => reply({
+      restored: true, methods: 2, memory: { before: 3, after: 3 },
+      deleted: ["old-a", "old-b"],
+    })));
+    expect(await postRestore(DOC)).toMatchObject({
+      ok: true, deleted: ["old-a", "old-b"],
+    });
+
+    vi.stubGlobal("fetch", vi.fn(async () => reply({
+      restored: true, methods: 2, memory: { before: 3, after: 3 }, deleted: [],
+    })));
+    expect(await postRestore(DOC)).toMatchObject({ ok: true, deleted: [] });
+
+    vi.stubGlobal("fetch", vi.fn(async () => reply({
+      restored: true, methods: 2, memory: { before: 3, after: 3 },
+    })));
+    expect(await postRestore(DOC)).toMatchObject({ ok: true, deleted: null });
+
+    // a malformed field is "not said", never a fabricated zero
+    vi.stubGlobal("fetch", vi.fn(async () => reply({
+      restored: true, methods: 2, memory: { before: 3, after: 3 },
+      deleted: "old-a",
+    })));
+    expect(await postRestore(DOC)).toMatchObject({ ok: true, deleted: null });
+  });
+
+  it("renders deleted ids, the empty list, and the absent field distinctly", () => {
+    expect(deletedLine(["a", "b"])).toBe("deleted 2 methods: a, b");
+    expect(deletedLine(["a"])).toBe("deleted 1 method: a");
+    expect(deletedLine([])).toBe("nothing was deleted");
+    expect(deletedLine(null))
+      .toBe("the server did not report which methods were deleted");
   });
 
   it("keeps the server's refusal sentence verbatim", async () => {

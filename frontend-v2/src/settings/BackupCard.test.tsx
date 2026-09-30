@@ -5,10 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import BackupCard from "./BackupCard";
 
-// D4c. `/api/restore` REPLACES the whole store — memory, settings and methods
-// (OD-15 option 1) — so the requirement is not "there is a button": it is that
+// D4c. `/api/restore` replaces memory, settings and methods (OD-15 option 1) —
+// and nothing else — so the requirement is not "there is a button": it is that
 // the destructive step cannot happen in one click, that the confirmation NAMES
-// what is replaced, and that it no longer claims anything is merged or kept.
+// what is replaced AND what is kept, and that it no longer claims anything is
+// merged, kept or that "anything not in the file is gone".
+//
+// ODR-7: the confirmation cannot know how many methods will be deleted (that
+// is only knowable from the route's post-restore `deleted` list), so the
+// RESULT line must report the count and the ids, "nothing was deleted" for an
+// empty list, and "the server did not report it" when an older server omits
+// the field.
 //
 // These mount the real card: choosing a file shows the confirmation with the
 // document's own counts, the replace button is disabled until the confirmation
@@ -88,16 +95,20 @@ describe("the restore card", () => {
     [...container.querySelectorAll("button")]
       .find((b) => b.textContent === label);
 
-  it("says a restore replaces the whole store", async () => {
+  it("says a restore replaces memory, settings and methods, and keeps chats and documents", async () => {
     // OD-15 option 1 (accepted 2026-09-30): `/api/restore` now truly REPLACES
-    // the store — settings are reset to defaults overlaid with the document's
-    // keys, and user methods the document does not name are deleted. The old
-    // "MERGES settings and methods / everything else is kept" copy described
-    // the merge route and is now false.
+    // those three sections — settings are reset to defaults overlaid with the
+    // document's keys, and user methods the document does not name are deleted.
+    // ODR-7: sessions, RAG sources/index, drafts, macro trust, models and
+    // calibration are untouched, so the card must not say "the whole store" or
+    // "anything not in the file is gone".
     serve(() => reply(200, {}));
     await mount();
-    expect(container.textContent).toContain("REPLACES the whole store");
-    expect(container.textContent).toContain("anything not in the file is gone");
+    expect(container.textContent)
+      .toContain("replaces the memory, settings and methods");
+    expect(container.textContent).toContain("chats and documents are kept");
+    expect(container.textContent).not.toContain("whole store");
+    expect(container.textContent).not.toContain("anything not in the file is gone");
     expect(container.textContent).not.toContain("MERGES");
     expect(container.textContent).not.toContain("everything else is kept");
   });
@@ -106,17 +117,22 @@ describe("the restore card", () => {
     serve(() => reply(200, { restored: true, methods: 2,
                              memory: { before: 3, after: 3 } }));
     await mount();
-    expect(byText("replace the whole store")).toBeUndefined();
+    expect(byText("replace memory, settings and methods")).toBeUndefined();
 
     await choose(DOC);
     expect(container.textContent).toContain("1 settings key, 2 methods, 3 memory rows");
-    expect(container.textContent).toContain("replaces the whole store");
-    // nothing outside the file survives: the false merge claim is gone
-    expect(container.textContent).toContain("anything not in the file is gone");
+    expect(container.textContent)
+      .toContain("replaces the memory, settings and methods");
+    expect(container.textContent).toContain("chats and documents are kept");
+    // ODR-7: the overclaim is gone — nothing outside those three sections is
+    // claimed to be deleted.
+    expect(container.textContent).not.toContain("whole store");
+    expect(container.textContent).not.toContain("anything not in the file is gone");
     expect(container.textContent).not.toContain("MERGES");
     expect(container.textContent).not.toContain("everything else is kept");
 
-    const replace = byText("replace the whole store") as HTMLButtonElement;
+    const replace =
+      byText("replace memory, settings and methods") as HTMLButtonElement;
     expect(replace.disabled).toBe(true);       // one click is not enough
 
     await act(async () => {
@@ -133,10 +149,11 @@ describe("the restore card", () => {
     await choose(DOC);
 
     const box = container.querySelector<HTMLInputElement>(
-      '[aria-label="Confirm replacing the whole store"]')!;
+      '[aria-label="Confirm replacing memory, settings and methods"]')!;
     await act(async () => { box.click(); });
 
-    const replace = byText("replace the whole store") as HTMLButtonElement;
+    const replace =
+      byText("replace memory, settings and methods") as HTMLButtonElement;
     expect(replace.disabled).toBe(false);
     await act(async () => {
       replace.click();
@@ -147,7 +164,70 @@ describe("the restore card", () => {
     // the success line is the CARD's, not the confirmation panel's: `replace()`
     // clears `pending` (unmounting the panel) before it sets `done`, so a `done`
     // prop on the panel could never render
-    expect(byText("replace the whole store")).toBeUndefined();
+    expect(byText("replace memory, settings and methods")).toBeUndefined();
+  });
+
+  it("shows the ids of the methods the restore deleted", async () => {
+    // ODR-7: the route answers `deleted: [<ids>]` additively. The card must
+    // surface the count and the ids, not a silent "restored 2 method(s)".
+    serve(() => reply(200, { restored: true, methods: 2,
+                             memory: { before: 3, after: 3 },
+                             deleted: ["old-a", "old-b"] }));
+    await mount();
+    await choose(DOC);
+
+    const box = container.querySelector<HTMLInputElement>(
+      '[aria-label="Confirm replacing memory, settings and methods"]')!;
+    await act(async () => { box.click(); });
+    await act(async () => {
+      (byText("replace memory, settings and methods") as HTMLButtonElement)
+        .click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.textContent).toContain("deleted 2 methods: old-a, old-b");
+  });
+
+  it("says nothing was deleted for an empty deleted list", async () => {
+    serve(() => reply(200, { restored: true, methods: 2,
+                             memory: { before: 3, after: 3 }, deleted: [] }));
+    await mount();
+    await choose(DOC);
+
+    const box = container.querySelector<HTMLInputElement>(
+      '[aria-label="Confirm replacing memory, settings and methods"]')!;
+    await act(async () => { box.click(); });
+    await act(async () => {
+      (byText("replace memory, settings and methods") as HTMLButtonElement)
+        .click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.textContent).toContain("nothing was deleted");
+    expect(container.textContent)
+      .not.toContain("the server did not report");
+  });
+
+  it("says the server did not report deleted ids when the field is absent", async () => {
+    // An older server omits `deleted` entirely. That is NOT "0 deleted", so the
+    // card must say so rather than inventing a zero.
+    serve(() => reply(200, { restored: true, methods: 2,
+                             memory: { before: 3, after: 3 } }));
+    await mount();
+    await choose(DOC);
+
+    const box = container.querySelector<HTMLInputElement>(
+      '[aria-label="Confirm replacing memory, settings and methods"]')!;
+    await act(async () => { box.click(); });
+    await act(async () => {
+      (byText("replace memory, settings and methods") as HTMLButtonElement)
+        .click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.textContent)
+      .toContain("the server did not report which methods were deleted");
+    expect(container.textContent).not.toContain("nothing was deleted");
   });
 
   it("shows the server's refusal and keeps the file on screen", async () => {
@@ -158,17 +238,18 @@ describe("the restore card", () => {
     await choose({ ...DOC, rigma_backup: 9 });
 
     const box = container.querySelector<HTMLInputElement>(
-      '[aria-label="Confirm replacing the whole store"]')!;
+      '[aria-label="Confirm replacing memory, settings and methods"]')!;
     await act(async () => { box.click(); });
     await act(async () => {
-      (byText("replace the whole store") as HTMLButtonElement).click();
+      (byText("replace memory, settings and methods") as HTMLButtonElement)
+        .click();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
     expect(container.textContent)
       .toContain("unknown backup version 9; this build restores version 1");
     // the confirmation is still up, so the user can pick another file
-    expect(byText("replace the whole store")).not.toBeUndefined();
+    expect(byText("replace memory, settings and methods")).not.toBeUndefined();
   });
 
   it("refuses a file that is not a backup before anything is sent", async () => {
@@ -176,7 +257,7 @@ describe("the restore card", () => {
     await mount();
     await choose({ hello: "world" });
     expect(container.textContent).toContain("carries no `rigma_backup` version");
-    expect(byText("replace the whole store")).toBeUndefined();
+    expect(byText("replace memory, settings and methods")).toBeUndefined();
     expect(posts).toEqual([]);
   });
 });
