@@ -3865,6 +3865,15 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
                       "disabled for this chat — enable 'read outside the "
                       "workspace' on the session, or pass a path relative to "
                       "the workspace"), ""
+    # ODR-6: resolve BEFORE the denylist below. It was applied to the UNRESOLVED
+    # path, so `C:\Users\amren\x\..\.rigma\<f>.png` spelled no denied directory
+    # while the OS opened the one inside it, and `Google\x\..\Chrome\` walked
+    # past the browser-profile regex; an 8.3 short name or a junction hides the
+    # real target the same way. `_read_path` resolves first for exactly this
+    # reason — a denylist is only as good as the path it is shown. `_unlong`
+    # keeps the workspace/allowlist containment tests comparing like with like
+    # (see `_long_path`), and the prefix is put back last.
+    p = _long_path(_unlong(p).resolve())
     note = ""
     # _stat_ok, not p.is_file(): on an unstatable path (locked/offline drive)
     # is_file() RAISES, and that raw OS error replaced this tool's own
@@ -3897,7 +3906,12 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
     # one read the 13-2 fix did not cover — the grant is irrelevant to it, and
     # the two image modes disagreed with `view_images(folder=…)`, which goes
     # through `_read_path` and refuses.
-    denied = _credential_path_reason(p, ctx)
+    #
+    # ODR-6: `_unlong`, because the denylist's state-dir test is
+    # `p.is_relative_to(rigma_home())` and `\\?\C:\...` is not relative to the
+    # unprefixed root — a >=260-char path under the state dir would otherwise
+    # slip through even now that the path is resolved first.
+    denied = _credential_path_reason(_unlong(p), ctx)
     if denied:
         return None, f"refusing to read {p} — {denied}", ""
     if p.suffix.lower() not in _IMAGE_EXTS:

@@ -184,6 +184,26 @@ def test_move_files_gates_the_source_parent_as_a_write(home):
     assert not (docs / "thesis.docx").exists()
 
 
+def test_an_obfuscated_path_into_the_state_dir_is_refused(home):
+    """ODR-6: `_resolve_image` ran the denylist on the UNRESOLVED path.
+
+    `x\\..\\rigma-home\\...` spells no denied directory, yet the OS opens the
+    file inside it. The workspace here CONTAINS the state dir (the product's
+    default workspace is the home dir), so the read grant is not involved —
+    only the denylist can refuse it, and it must see the resolved path.
+    """
+    from rigma.runtime import rigma_home
+    secret = rigma_home() / "secret"
+    secret.mkdir(parents=True, exist_ok=True)
+    (secret / "x.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    obfuscated = home / "x" / ".." / "rigma-home" / "secret" / "x.png"
+    out = tools.run_tool("view_image", {"path": str(obfuscated)},
+                         {"workspace": str(home), "has_vision": True})
+    assert out.startswith("error"), out
+    assert "state" in out.lower(), out
+    assert tools.IMAGE_SENTINEL not in out
+
+
 def test_a_destination_outside_every_allowlisted_root_is_refused(home):
     """OD-2: the allowlist is a boundary, not a second blanket grant — a
     destination that is in NO root still gets the existing refusal and creates
