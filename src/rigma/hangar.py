@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from .atomicio import atomic_write_json, atomic_write_text
 from .gguf_meta import GgufParseError, inspect_gguf
-from .models import GgufFile, ModelSpec, MoESpec
+from .models import GgufFile, MIN_LAUNCH_CTX, ModelSpec, MoESpec
 from .runtime import rigma_home
 
 _log = logging.getLogger(__name__)
@@ -68,16 +68,16 @@ DOWNLOAD_ATTEMPTS = 6   # multi-GB pulls WILL drop; resume and retry
 PULL_FREE_MARGIN_BYTES = 2 * 2**30
 
 # The floor a probed context window is raised to: a gguf whose header omits
-# `context_length` (or reports a tiny one) still gets a usable window. The SAME
-# 2048 launch floor is written out again at `server_ops.py:754`
-# (`max(2048, min(int(ctx), native))`), `serve.py:4731` (the "ctx must be at
-# least 2048" route guard) and the frontend's `CTX_FLOOR`
-# (`frontend-v2/src/models/LaunchDefaultsDialog.tsx`). Named here so THIS site
-# cannot drift; unifying the other three is a later wave's change. Note that
-# `resolve._ctx_floor` is a DIFFERENT floor — `CTX_FLOOR = 8192`
-# (`resolve.py:111`, used at `:297`); the 2048 in `resolve.py:1072` is the
-# `quant_verdicts` probe ladder, not this floor.
-MIN_NATIVE_CTX = 2048
+# `context_length` (or reports a tiny one) still gets a usable window. It is
+# the SAME minimum-usable-context value the launch itself floors at, so it is
+# an ALIAS of `models.MIN_LAUNCH_CTX` rather than a second 2048 — this site
+# cannot drift from the relaunch raise-to (`server_ops.perform_switch`), the
+# `/api/server/ctx` preflight guard, or the bottom rung of the
+# `resolve.quant_verdicts` ladder (W5F5B-N3). The name is kept because it says
+# what THIS site does with the value: floor the probed window.
+# NOT `resolve.PLAN_CTX_FLOOR` (8192), which is a different quantity — the
+# smallest context the PLANNER will plan for, not the smallest one launched.
+MIN_NATIVE_CTX = MIN_LAUNCH_CTX
 
 
 class HangarError(RuntimeError):
