@@ -454,6 +454,65 @@ def device_labels(load: dict) -> list[str]:
     return sorted(labels)
 
 
+def weights_are_device_resident(load: dict) -> bool:
+    """Whether the load's own log says the WHOLE model's weights are on the device.
+
+    DR2-1. `compare_plan`'s `expected_vram_mb` is the plan's own prediction
+    (`memtruth.planned_mb`), and its weight term is the WHOLE GGUF file. That is
+    a device-side figure only when the engine placed the whole file on the
+    device. A dense spill (`ngl < n_layers`) keeps some layers in system RAM,
+    and `--n-cpu-moe` keeps expert weights there inside otherwise-GPU layers, so
+    for those shapes the whole-file prediction OVERSTATES the device figure by
+    exactly the RAM-resident weights — and above the slack that is a
+    `plan_divergence` on every launch of a healthy, intended configuration.
+    That is the same false-positive-on-a-healthy-load class A17 was fixed for,
+    so the two sides must be compared like with like.
+
+    The evidence is the load's OWN lines, never a guess:
+
+      * `offloaded N/M` with N < M is a dense partial offload: layers N..M-1
+        stayed on the CPU (`load_tensors: offloading ... layers to GPU`). M
+        counts the output layer (`max_backend_supported_layers = n_layer_all +
+        1`), so this is the engine's own placement statement.
+      * N == M but a non-empty `CPU model buffer` is `--n-cpu-moe`: expert
+        weights kept in the CPU buffer type inside the offloaded layers
+        (`llm_ffn_exps_block_regex` -> `ggml_backend_cpu_buffer_type()`). The
+        mmap'd token embedding is `CPU_Mapped`, a DIFFERENT label, so this does
+        not fire on the healthy all-GPU load (prism-v.log:4485-4486). A
+        `--no-mmap` all-GPU load names its token embedding `CPU` and is read as
+        non-resident; that only SUPPRESSES the axis (the safe direction), never
+        invents a divergence.
+
+    Returns True only when the whole file's weights are device-resident, False
+    when the log shows some of them in system RAM OR does not say (no
+    `offloaded` line). "Cannot tell" must not produce a verdict, and False is
+    the suppression direction. A caller must use this only to decide whether a
+    whole-file prediction is COMPARABLE — never to raise the expectation, which
+    would move the goalposts to whatever the engine actually did.
+    """
+    layers = load.get("offloaded_layers")
+    if layers is None:
+        return False
+    n_gpu, n_offloadable = layers
+    if n_gpu < n_offloadable:
+        return False
+    return not any(b["label"] == "CPU" and b["mb"] > 0
+                   for b in load.get("model_buffers", []))
+
+
+def _resident_why(load: dict) -> str:
+    """The load's own line that shows weights in system RAM, for the detail text."""
+    layers = load.get("offloaded_layers")
+    if layers is not None and layers[0] < layers[1]:
+        return ("offloaded %d/%d layers to GPU, so %d stayed on the CPU"
+                % (layers[0], layers[1], layers[1] - layers[0]))
+    if any(b["label"] == "CPU" and b["mb"] > 0
+           for b in load.get("model_buffers", [])):
+        return ("a CPU model buffer holds weights inside the offloaded layers "
+                "(an expert offload, or an unmapped CPU-resident weight buffer)")
+    return "the log does not report every layer offloaded to a GPU"
+
+
 def parse_loads(log_text: str) -> list[dict]:
     """Every model load in the log, in order.
 
@@ -773,6 +832,9 @@ def _unknown_plan(expected_vram_mb, expected_splits) -> dict:
         "unexpected_splits": None,
         "split_verdict": "not_comparable",
         "vram_verdict": "not_comparable",
+        # no basis either way on an unknown load; the named reasons live on the
+        # known-load path (DR2-1).
+        "vram_why": None,
         "diverges": None,       # no verdict, not "no problem"
         "detail": ("no buffer lines in the engine log: what the engine "
                    "allocated is UNKNOWN, not zero — a silent 0 would read as "
@@ -802,6 +864,19 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
     entirely the 2,176 MiB KV at ctx 65536. Pass None when no plan-side
     prediction is available at this point; the VRAM axis is then
     `vram_verdict == "not_comparable"`, never a wrong number.
+
+    DR2-1: that prediction's weight term is the WHOLE GGUF file, so it is a
+    device-side figure only when the engine put the whole file on the device.
+    A dense spill (`ngl < n_layers`) or an expert offload (`--n-cpu-moe`) keeps
+    weights in system RAM, where the whole-file prediction overstates the
+    device figure by exactly those bytes; comparing them is unlike with like and
+    warned `plan_divergence` on every launch of a healthy, intended
+    configuration. The load's own placement line (`offloaded N/M`, and a `CPU`
+    model buffer for expert weights) is the evidence: when it shows weights in
+    system RAM the axis is `not_comparable` with `vram_why ==
+    "not_device_resident"` and the reason in `detail` — visible, never silent.
+    A fully device-resident load is still compared, so a genuinely wrong
+    prediction is still caught.
 
     `expected_splits` is derived from the load's own plan fields
     (`expected_splits_for_load`: ngl, layer count, expert placement, backend,
@@ -840,15 +915,33 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
     host_ram = _sum_buffers(parsed, host=True)
 
     # --- VRAM axis ---------------------------------------------------------
+    # DR2-1: `expected_vram_mb` is the plan's WHOLE-FILE weights plus KV. It is
+    # a device-side figure only when the engine put the whole file on the
+    # device; for a dense spill or an expert offload it overstates the device
+    # figure by exactly the RAM-resident weights, and comparing the two is
+    # unlike with like — a `plan_divergence` on every launch of a healthy,
+    # intended configuration. The plan does not persist its placement (state.json
+    # carries no ngl / n_cpu_moe), so the device-side number is not honestly
+    # recoverable here; the engine's own placement line IS evidence, and the
+    # axis says NOT COMPARABLE — visibly, with the reason — rather than firing.
+    # This only ever SUPPRESSES: a fully device-resident load is still compared.
+    resident = weights_are_device_resident(parsed)
     if not expected_vram_mb or expected_vram_mb <= 0:
         vram_verdict = "not_comparable"
         divergence = None
         pct = None
+        vram_why = "no_prediction"
+    elif not resident:
+        vram_verdict = "not_comparable"
+        divergence = None
+        pct = None
+        vram_why = "not_device_resident"
     else:
         divergence = actual - expected_vram_mb
         pct = divergence / expected_vram_mb * 100.0
         slack = max(_VRAM_SLACK_MB, expected_vram_mb * _VRAM_SLACK_PCT)
         vram_verdict = "ok" if abs(divergence) <= slack else "diverges"
+        vram_why = None
 
     # --- split axis --------------------------------------------------------
     if expected_splits is None:
@@ -865,11 +958,20 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
               "+ device compute); host RAM %.2f MiB excluded. " % (actual,
                                                                    host_ram))
     if vram_verdict == "not_comparable":
-        detail += ("The VRAM comparison is NOT COMPARABLE: no plan-side "
-                   "prediction was supplied for this ctx / cache / slot count, "
-                   "and the engine's figure includes the KV cache, so a bare "
-                   "file size would read as a divergence that is only the "
-                   "cache. ")
+        if vram_why == "not_device_resident":
+            detail += ("The VRAM comparison is NOT COMPARABLE: the plan's own "
+                       "prediction covers the WHOLE GGUF file's weights plus "
+                       "the KV cache, while the engine's figure counts DEVICE "
+                       "buffers only, and this load kept part of the model's "
+                       "weights in system RAM (%s). A whole-file prediction is "
+                       "not a device-side figure for this plan, so no "
+                       "divergence is claimed. " % _resident_why(parsed))
+        else:
+            detail += ("The VRAM comparison is NOT COMPARABLE: no plan-side "
+                       "prediction was supplied for this ctx / cache / slot count, "
+                       "and the engine's figure includes the KV cache, so a bare "
+                       "file size would read as a divergence that is only the "
+                       "cache. ")
     else:
         detail += ("The plan's own prediction for the same ctx / cache / slots "
                    "was %.2f MiB; divergence %+.2f MiB (%+.1f%%), %s. " % (
@@ -890,6 +992,8 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
         "unexpected_splits": unexpected,
         "split_verdict": split_verdict,
         "vram_verdict": vram_verdict,
+        # DR2-1: why the VRAM axis gave no verdict, when it gave none.
+        "vram_why": vram_why,
         "diverges": (vram_verdict == "diverges"
                      or split_verdict == "diverges"),
         "detail": detail,
