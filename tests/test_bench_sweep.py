@@ -406,3 +406,250 @@ def test_a_no_op_offload_row_records_the_trialled_value(monkeypatch, tmp_path):
     assert logged["baseline"]["flags"] == {}
     # the winner (no-op-offload) is what calibration stores, with its value.
     assert _only_entry()["flags"] == {"no_op_offload": True}
+
+
+# --- C11: the attention-rotation env toggle ---------------------------------
+#
+# `LLAMA_ATTN_ROT_DISABLE` has NO argv spelling at either pin, so unlike C2's
+# `--no-op-offload` the only way to trial it is through the engine-spawn env
+# that `runtime.launch_server` merges over `os.environ`. It is the same class
+# of lever as the GGML_VK_* driver toggles already in the sweep.
+#
+# Provenance (raw.githubusercontent.com, fetched 2026-09-30):
+#   PrismML-Eng/llama.cpp@87268f77 src/llama-kv-cache.cpp L316-326
+#   ggml-org/llama.cpp@b9867     src/llama-kv-cache.cpp L329-339
+#     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
+#     const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(...) : false;
+#     attn_rot_k = !attn_rot_disable && ... && ggml_is_quantized(type_k) && ...
+# The rotation is therefore ON BY DEFAULT for a quantized KV cache, and this
+# machine's own load runs it: `.scratch/prism-v.log:4576-4578` shows
+# `K (q8_0): 1088.00 MiB` with `attn_rot_k = 1, attn_rot_v = 1`.
+
+def test_sweep_offers_the_attn_rot_axis_and_off_sets_nothing():
+    """C11: the axis is a sweep config, and its OFF/default case emits NOTHING.
+
+    `LLAMA_ATTN_ROT_DISABLE` is read with `getenv`, so an unset variable is the
+    engine's untouched default (rotation ON where it applies). The baseline
+    trial must therefore carry no `env` key at all — exactly C2's acceptance
+    criterion for argv, applied to the child environment.
+    """
+    cfgs = dict(bench.sweep_configs(ComboFlags(ctx=8192), moe=False))
+
+    assert cfgs["attn-rot-off"] == {"env": {"LLAMA_ATTN_ROT_DISABLE": "1"}}
+    # OFF: no env key anywhere it did not already exist, so the child inherits
+    # the parent environment unchanged (runtime.launch_server only builds a
+    # `Popen` env when `plan.flags.env` is non-empty).
+    assert "env" not in cfgs["baseline"]
+    assert _plan(**cfgs["baseline"]).flags.env == {}
+
+
+def test_a_default_sweep_leaves_every_pre_existing_trial_env_unchanged():
+    """C11 must not change an existing launch's environment.
+
+    Only the new axis may carry `LLAMA_ATTN_ROT_DISABLE`; every axis that had
+    no env before still has no env, so `runtime.launch_server` takes the
+    `if plan.flags.env:` false branch and the child inherits `os.environ`
+    byte for byte.
+    """
+    carrying = []
+    for label, override in bench.sweep_configs(ComboFlags(ctx=8192), moe=False):
+        env = override.get("env") or {}
+        if "LLAMA_ATTN_ROT_DISABLE" in env:
+            carrying.append(label)
+            continue
+        # every OTHER axis must not gain the variable, in its override or in a
+        # plan built from it
+        assert "LLAMA_ATTN_ROT_DISABLE" not in _plan(**override).flags.env
+        if label in ("baseline", "fa-off", "kv-q8", "kv-q4", "batch-big",
+                     "no-op-offload"):
+            # these axes carried no engine env before C11 and still carry none
+            assert "env" not in override
+    assert carrying == ["attn-rot-off"]
+
+
+def test_the_attn_rot_axis_is_the_childs_environment_only(monkeypatch):
+    """The ON case is a CHILD-only environment.
+
+    `runtime.launch_server` merges `plan.flags.env` over `os.environ` into the
+    `Popen` call, so constructing or running the trial must never write the
+    parent's `os.environ` — the lever would otherwise leak into every later
+    launch in this process.
+    """
+    import os
+
+    monkeypatch.delenv("LLAMA_ATTN_ROT_DISABLE", raising=False)
+    override = dict(bench.sweep_configs(ComboFlags(ctx=8192),
+                                        moe=False))["attn-rot-off"]
+
+    assert _plan(**override).flags.env == {"LLAMA_ATTN_ROT_DISABLE": "1"}
+    assert "LLAMA_ATTN_ROT_DISABLE" not in os.environ
+
+
+def test_a_tools_capable_default_sweep_does_not_trial_the_attn_rot_axis(
+        monkeypatch, tmp_path):
+    """The blast-radius fix. `sweep_configs` still OFFERS the axis (that is
+    where the lever lives), but the default `run_sweep` path for a tools-capable
+    model drops it exactly as it drops the q4_0 KV axis — so it is never
+    trialled, never crowned, and never persisted into calibration.json, which
+    `resolve()` would then merge into EVERY later launch's child environment.
+
+    The sweep still runs and still crowns a flagged row, so this is not a
+    vacuous "nothing was saved" pass."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+    launched = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(exe, plan, model_path, **k):
+        launched.append(dict(plan.flags.env))
+        return _FakeSrv()
+
+    n = {"i": 0}
+
+    def fake_bench(port, **k):
+        n["i"] += 1
+        return bench.BenchResult(pp_tps=100, tg_tps=float(n["i"]),
+                                 prompt_tokens=8, gen_tokens=8)
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", fake_bench)
+    rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601)
+
+    labels = [r["label"] for r in rows]
+    assert "attn-rot-off" not in labels
+    assert "kv-q4" not in labels          # the pre-existing guard still holds
+    assert all("LLAMA_ATTN_ROT_DISABLE" not in env for env in launched)
+    # the sweep did crown and persist something — just not a quality lever
+    assert _only_entry()["flags"] == {"no_op_offload": True}
+
+
+def test_crowned_row_refuses_a_quality_lever_row_without_an_opt_in():
+    """The single rule both readers share (`run_sweep` saves it, `rigma sweep`
+    prints it): a tokens/sec-only score may not crown a quality-degrading env
+    lever. The opt-in is explicit, so the CLI — which never passes it — and the
+    saved calibration cannot disagree."""
+    rows = [{"label": "attn-rot-off", "tg_tps": 99.0, "ok": True,
+             "flags": {"env": {"LLAMA_ATTN_ROT_DISABLE": "1"}}},
+            {"label": "fa-off", "tg_tps": 50.0, "ok": True,
+             "flags": {"flash_attn": "off"}}]
+
+    assert bench.crowned_row(rows)["label"] == "fa-off"
+    assert bench.crowned_row(rows, allow_quality_levers=True)["label"] == \
+        "attn-rot-off"
+
+
+def test_quick_configs_does_not_trial_the_attn_rot_axis():
+    """Not a launch default: the first-load calibration sweep (a default load
+    path) must not start trialling it."""
+    labels = [k for k, _ in bench.quick_configs(ComboFlags(ctx=8192), moe=False)]
+    assert "attn-rot-off" not in labels
+
+
+def test_a_tools_capable_sweep_drops_the_axis_even_when_it_is_the_fastest(
+        monkeypatch, tmp_path):
+    """A caller that hands `run_sweep` the rotation config explicitly cannot get
+    it crowned either: the config is dropped before it launches, so it never
+    even costs a model load."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+    seq = iter([bench.BenchResult(pp_tps=100, tg_tps=50, prompt_tokens=8,
+                                  gen_tokens=8),
+                bench.BenchResult(pp_tps=120, tg_tps=99, prompt_tokens=8,
+                                  gen_tokens=8)])
+    launched = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(exe, plan, model_path, **k):
+        launched.append(dict(plan.flags.env))
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: next(seq))
+    rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601,
+                           configs=[("baseline", {}),
+                                    ("attn-rot-off",
+                                     {"env": {"LLAMA_ATTN_ROT_DISABLE": "1"}})])
+    assert [r["label"] for r in rows] == ["baseline"]
+    assert launched == [{}]
+    assert bench.load_calibration() == {}
+
+
+def test_a_non_tools_sweep_trials_the_attn_rot_axis_but_does_not_crown_it(
+        monkeypatch, tmp_path):
+    """C11's lever is not deleted: a non-tools model still MEASURES the axis, so
+    its direction is recorded in bench-rows.jsonl for an operator to read. But
+    the row cannot win — and so cannot be persisted — on a tokens/sec-only
+    score, because rotation is what keeps a quantized KV cache's loss down."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: False)
+    seq = iter([bench.BenchResult(pp_tps=100, tg_tps=50, prompt_tokens=8,
+                                  gen_tokens=8),
+                bench.BenchResult(pp_tps=120, tg_tps=99, prompt_tokens=8,
+                                  gen_tokens=8)])
+    seen = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(exe, plan, model_path, **k):
+        seen.append(dict(plan.flags.env))
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: next(seq))
+    rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601,
+                           configs=[("baseline", {}),
+                                    ("attn-rot-off",
+                                     {"env": {"LLAMA_ATTN_ROT_DISABLE": "1"}})])
+    # the trial really launched with the variable, and its row is recorded...
+    assert seen[1] == {"LLAMA_ATTN_ROT_DISABLE": "1"}
+    assert seen[0] == {}
+    by_label = {r["label"]: r for r in rows}
+    assert by_label["attn-rot-off"]["flags"] == {
+        "env": {"LLAMA_ATTN_ROT_DISABLE": "1"}}
+    logged = {e["label"]: e for e in _rows_log(tmp_path)}
+    assert logged["attn-rot-off"]["flags"] == {
+        "env": {"LLAMA_ATTN_ROT_DISABLE": "1"}}
+    assert logged["baseline"]["flags"] == {}
+    # ...but it is not crowned, and nothing at all was persisted.
+    assert bench.crowned_row(rows)["label"] == "baseline"
+    assert bench.load_calibration() == {}
+
+
+def test_the_attn_rot_axis_is_crowned_only_with_an_explicit_opt_in(
+        monkeypatch, tmp_path):
+    """The escape hatch: an operator who accepts the quality trade can let the
+    rotation row win. `rigma sweep` never passes this, so the winner the CLI
+    announces and the flags saved to calibration stay in step."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: False)
+    seq = iter([bench.BenchResult(pp_tps=100, tg_tps=50, prompt_tokens=8,
+                                  gen_tokens=8),
+                bench.BenchResult(pp_tps=120, tg_tps=99, prompt_tokens=8,
+                                  gen_tokens=8)])
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: next(seq))
+    rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601,
+                           configs=[("baseline", {}),
+                                    ("attn-rot-off",
+                                     {"env": {"LLAMA_ATTN_ROT_DISABLE": "1"}})],
+                           allow_quality_levers=True)
+    assert bench.crowned_row(rows, allow_quality_levers=True)["label"] == \
+        "attn-rot-off"
+    assert _only_entry()["flags"] == {"env": {"LLAMA_ATTN_ROT_DISABLE": "1"}}
