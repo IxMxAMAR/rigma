@@ -336,6 +336,71 @@ def test_a_malformed_notification_produces_nothing_and_does_not_raise():
 
 
 # --------------------------------------------------------------------------
+# B2 nit: every notice text is ONE line and <=200 characters, including the
+# two paths that do not draw their content from `_UNKNOWN_NOTICE_FIELDS`. The
+# projector-failure fallback used to cap only its detail and then prepend a
+# ~40-character prefix (reachable ~240), and an exception message can carry
+# arbitrary prose — the one place §0.3's no-owner-prose rule could leak. The
+# raw event `type` is the other non-allow-listed input, named on purpose.
+# --------------------------------------------------------------------------
+
+
+class _ProjectorBoom(Exception):
+    """A projector failure whose message is long, multi-line and prose-bearing."""
+
+
+def test_a_projector_failure_notice_is_one_capped_line(monkeypatch):
+    """The fallback must not exceed the bound the ordinary notices use.
+
+    Before this, the emitted text was
+    `"session.event could not be projected: " + f"{type}: {exc}"[:200]` — the
+    prefix escaped the cap, so the finished notice could reach ~240 characters,
+    and a multi-line exception message put its second line straight into the
+    progress line.
+    """
+    secret = "owner prose that must not own the line\n" + "SECRET " * 80
+
+    def explode(notification, streamed=None):
+        raise _ProjectorBoom(secret)
+
+    monkeypatch.setattr(runner, "_project", explode)
+    emitted: list[dict] = []
+    monkeypatch.setattr(runner, "_emit", emitted.append)
+
+    runner._forward(_session_event("tool/call", {"name": "read"}))
+
+    assert len(emitted) == 1, emitted
+    text = emitted[0]["text"]
+    assert emitted[0]["type"] == "notice"
+    assert "\n" not in text and "\r" not in text, repr(text)
+    assert len(text) <= 200, (len(text), text)
+    assert text.startswith("session.event could not be projected:"), text
+    # The exception's own type name is still named — the notice stays useful.
+    assert "_ProjectorBoom" in text, text
+
+
+def test_the_projector_failure_notice_is_built_by_the_shared_helper(monkeypatch):
+    """Pinned to the helper, not to a hand-rolled cap: a future edit that
+    re-inlines the f-string would re-introduce the un-capped prefix."""
+    assert runner._notice_line("a" * 300) == "a" * runner._NOTICE_MAX
+    assert runner._notice_line("one\ntwo") == "one two"
+
+
+def test_an_unknown_event_type_cannot_add_a_line_or_outgrow_the_cap():
+    """The type is the only non-allow-listed token in this notice, and it is
+    named by design; the shared helper is what bounds it."""
+    out = runner._project(_session_event("PROSE " + "y" * 400, {}))
+    assert len(out) == 1 and out[0]["type"] == "notice"
+    assert "\n" not in out[0]["text"]
+    assert len(out[0]["text"]) <= 200
+    assert out[0]["text"].startswith("session.event PROSE ")
+
+    multiline = runner._project(_session_event("line one\nline two\nline three", {}))
+    assert "\n" not in multiline[0]["text"]
+    assert multiline[0]["text"] == "session.event line one line two line three"
+
+
+# --------------------------------------------------------------------------
 # The adapter's translation of those events onto the seam.
 
 
