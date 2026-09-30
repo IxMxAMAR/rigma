@@ -3,7 +3,7 @@
 // status while the engine comes up. Dismissible — the composer stays usable
 // for typing; sending is what needs a model.
 import { useEffect, useRef, useState } from "react";
-import { engineApi, type ModelCard } from "../lib/engineApi";
+import { engineApi, switchNotice, type ModelCard } from "../lib/engineApi";
 import { errText } from "./chatStore";
 import { useApp } from "../store";
 
@@ -15,10 +15,14 @@ export default function ModelPicker() {
   const [err, setErr] = useState("");
   const [loadErr, setLoadErr] = useState("");
   const [dismissed, setDismissed] = useState(false);
+  // A8c: a switch that succeeded can still have something to say (a KV-cache
+  // restore it refused, a cache it stepped down). The modal used to close on
+  // the next poll and take the sentence with it.
+  const [note, setNote] = useState("");
   const pickedRef = useRef<string | null>(null);
 
   const engineDown = server === null || !server.healthy;
-  const show = surface === "chat" && engineDown && !dismissed;
+  const show = surface === "chat" && (engineDown || note !== "") && !dismissed;
 
   useEffect(() => {
     if (!show || cards !== null) return;
@@ -33,23 +37,31 @@ export default function ModelPicker() {
       .catch((e) => setLoadErr(errText(e)));
   }, [show, cards]);
 
-  // engine came up (poll in App noticed): close ourselves
+  // engine came up (poll in App noticed): close ourselves — but not while a
+  // notice is on screen, which is the one thing this modal would otherwise
+  // erase without the user ever reading it.
   useEffect(() => {
-    if (!engineDown) {
+    if (!engineDown && !note) {
       setDismissed(false);
       setState("idle");
       pickedRef.current = null;
     }
-  }, [engineDown]);
+  }, [engineDown, note]);
 
   if (!show) return null;
 
   const pick = async (slug: string) => {
     setState("loading");
     setErr("");
+    setNote("");
     pickedRef.current = slug;
     try {
-      await engineApi.switchTo(slug);
+      const n = switchNotice(await engineApi.switchTo(slug));
+      if (n) {
+        setNote(n);
+        setState("idle");
+        return;
+      }
       // App's 5s poll flips server.healthy and this modal closes itself
     } catch (e) {
       setState("error");
@@ -62,7 +74,9 @@ export default function ModelPicker() {
          role="dialog" aria-modal="true" aria-label="Choose a model">
       <div className="w-[440px] max-w-[92vw] rounded-lg bg-float shadow-2xl overflow-hidden">
         <div className="px-4 pt-4 pb-2">
-          <h2 className="text-[14px] font-semibold">No model is loaded</h2>
+          <h2 className="text-[14px] font-semibold">
+            {note ? "Model loaded — with a note" : "No model is loaded"}
+          </h2>
           <p className="text-[12.5px] text-secondary mt-0.5">
             Pick one to start chatting — these are already on disk.
           </p>
@@ -107,6 +121,9 @@ export default function ModelPicker() {
               </li>
             ))}
           </ul>
+        )}
+        {note && (
+          <div className="px-4 py-2 text-[12px] text-secondary">{note}</div>
         )}
         {err && (
           <div className="px-4 py-2 text-[12px] text-red">{err} — try the Engine page.</div>

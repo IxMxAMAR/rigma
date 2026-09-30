@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState,
 import EmptyState from "../EmptyState";
 import LoadError from "../LoadError";
 import {
-  DEFAULT_FIT, engineApi, eta, gb,
+  DEFAULT_FIT, engineApi, eta, gb, switchNotice,
   type FitConfig, type HfHit, type HfRepoDetail, type ModelCard,
   type QuantRow,
 } from "../lib/engineApi";
@@ -248,12 +248,16 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // A8c: the switch's own note (a KV-cache restore it refused, or a cache it
+  // stepped down). Neutral, not red — the load succeeded, the note says how.
+  const [note, setNote] = useState<string | null>(null);
   const downloading = q.pull?.status === "downloading";
   const run = async (fn: () => Promise<unknown>) => {
     setBusy(true);
     setErr(null);
+    setNote(null);
     try {
-      await fn();
+      setNote(switchNotice(await fn()));
     } catch (e) {
       // AUDIT F11-4: the 1.5-8s poll only re-reads /api/models, so it can show
       // that the file is still not there but never WHY the pull was refused
@@ -351,6 +355,11 @@ function QuantLine({ card, q, onAction, best, showSpec }: {
         <div role="alert"
              className="text-red font-mono text-[11px] pl-3.5 pt-0.5 break-words">
           {err}
+        </div>
+      )}
+      {note && (
+        <div className="text-secondary font-mono text-[11px] pl-3.5 pt-0.5 break-words">
+          {note}
         </div>
       )}
       {/* IMP-2: a pull that FAILED is not a pull that finished. hangar keeps
@@ -525,6 +534,7 @@ function QuantTable({ card, rows, onAction, best, extra }: {
 function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   const anyOnDisk = card.quants.some((q) => q.on_disk);
   const onDiskGb = card.quants.filter((q) => q.on_disk)
     .reduce((n, q) => n + q.bytes, 0)
@@ -568,8 +578,9 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
             onClick={async () => {
               setBusy(true);
               setErr(null);
+              setNote(null);
               try {
-                await engineApi.switchTo(card.slug);
+                setNote(switchNotice(await engineApi.switchTo(card.slug)));
               } catch (e) {
                 // AUDIT F11-4: a refused switch is not "still polling"
                 setErr((e as Error).message);
@@ -599,6 +610,11 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
       {err && (
         <div className="rounded-md bg-red/10 text-red px-2.5 py-1.5 font-mono text-[11.5px] mb-2">
           {err}
+        </div>
+      )}
+      {note && (
+        <div className="rounded-md bg-surface text-secondary px-2.5 py-1.5 font-mono text-[11.5px] mb-2">
+          {note}
         </div>
       )}
       <NoTemplateNotice card={card} />

@@ -1,7 +1,7 @@
 // Engine room: what's loaded, how it's doing, and the levers.
 // Telemetry is mono + instant (CONSTITUTION §6: never animate data values).
 import { useCallback, useEffect, useState } from "react";
-import { engineApi, type EngineFinding, type ServerInfo,
+import { engineApi, switchNotice, type EngineFinding, type ServerInfo,
          type SwitchOption, type UsageStats } from "../lib/engineApi";
 import { filterLines } from "../lib/logTail";
 import { tokens, usageRows, sinceLabel } from "../lib/usage";
@@ -47,6 +47,11 @@ export default function EngineSurface() {
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // A8c: what the switch said about itself — today the KV-cache restore it
+  // refused. The server has always returned this; `j<unknown>` and callers that
+  // discarded the body kept it off the screen. Neutral, not red: a step-down
+  // (a smaller KV cache than asked for) is not a failure.
+  const [note, setNote] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -102,8 +107,12 @@ export default function EngineSurface() {
   const act = async (name: string, fn: () => Promise<unknown>) => {
     setBusy(name);
     setErr(null);
+    setNote(null);
     try {
-      await fn();
+      // A8c: keep the body. A switch that refused to restore the KV cache
+      // answers 200 with `notice`; dropping it is why the user never saw it.
+      const r = await fn();
+      setNote(switchNotice(r));
       await refresh();
     } catch (e) {
       setErr((e as Error).message);
@@ -152,6 +161,9 @@ export default function EngineSurface() {
       <div className="max-w-[1200px] mx-auto flex flex-col gap-5">
         {err && (
           <div className="rounded-md bg-red/10 text-red px-3 py-2 text-[13px]">{err}</div>
+        )}
+        {note && (
+          <div className="rounded-md bg-surface text-secondary px-3 py-2 text-[13px]">{note}</div>
         )}
 
         {/* What the engine decided at load and never said again. These are the
