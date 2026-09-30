@@ -8,6 +8,8 @@ implemented; nothing here changes a global default.
 
 ## OD-1 — What should the default run profile be? (finding 13-2, prompt injection → secret exfiltration)
 
+**DECIDED 2026-09-30: owner accepted the recommendation (option 4).** IMPLEMENTED (pre-existing, IMP-4): the v2 autonomous launcher renders the safety-profile chooser with `all` preselected (`frontend-v2/src/autonomous/AutonomousSurface.tsx` `Launcher`; `profiles.ts` `DEFAULT_PROFILE = "all"`), and the absent-key server default is unchanged. This run adds a frontend test pinning the chooser so a future edit cannot remove it silently.
+
 **State today:** the run profile defaults to `"all"` (`serve.py:2630`, `:6262`), which grants the
 full network + delete surface to an autonomous run. The finding's other three mitigations are
 already in the tree and both the read-confinement and outbound-post grants default **OFF**
@@ -81,6 +83,8 @@ walks and re-reads the owner's documents — which the Head Agent must not trigg
 
 ## OD-4 — LoRA attach (`--lora`/`--lora-scaled` + `/lora-adapters`)
 
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1, as its own future program).** SCHEDULED: not tonight — LoRA is a missing *feature* larger than any single item in this run and needs its own design note. Recorded so it is not rediscovered.
+
 **State today:** Rigma has no LoRA code at all. The engine accepts `--lora`/`--lora-scaled` and the
 server exposes `/lora-adapters` for runtime scaling. The owner trains LoRAs, so this is the one
 lever in the R4 survey that is a missing *feature* rather than a missing knob.
@@ -100,6 +104,8 @@ run's backlog and deserves its own design note. Recorded so it is not rediscover
 ---
 
 ## OD-5 — Two fit terms that can only be settled with the card (NEEDS-GPU)
+
+**DECIDED 2026-09-30: owner accepted the recommendation.** SCHEDULED: needs the GPU — the orchestrator runs the extended `docs/review/findings-r3/37a-262k-verification-plan.md` when the card is free; §0.1 forbids the Head Agent running a load in this session.
 
 The fit currently charges the whole GGUF file to VRAM, charges the recurrent state zero (being fixed
 as A2), and uses a flat `COMPUTE_BUFFER_MB = 150` (`resolve.py:28`). A real load log
@@ -125,6 +131,8 @@ own log.
 
 ## OD-6 — DSH ACP client, and answering `ask_user`
 
+**DECIDED 2026-09-30: owner accepted the recommendation.** SCHEDULED: needs one live mcode session to verify the ACP client and the elicitation capability; §0.1 forbids a live harness turn in this run.
+
 **State today:** the DSH ACP client is not on the wire (`findings-r3/28-harness-transport-matrix.md`
 §320), and mcode `ask_user`/plan are gated on the client declaring `elicitation.form`/`plan`, which
 Rigma does not (`28 §6a`). Answering a question needs a live mcode turn, which §0.1 forbids in this
@@ -141,6 +149,8 @@ silent discard).
 ---
 
 ## OD-7 — How many method drafts are kept on disk, and how long is a draft "in use"? (10-R3-17 / A15)
+
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1 — keep 20 / 12 h).** IMPLEMENTED (pre-existing, A15 `ca83bc0`): `MAX_DRAFTS = 20` and `_DRAFT_LIVE_SECONDS = 12 * 60 * 60` in `src/rigma/method_drafts.py`, with the eviction rule yielding rather than dropping a live draft.
 
 **State today:** `~/.rigma/method_drafts/` had no budget at all — a draft was removed only by
 `promote()`, so a creation chat the user abandons left its file there forever. Item A15 adds
@@ -172,6 +182,8 @@ the eviction rule must not produce.
 ---
 
 ## OD-8 — The mid-turn prompt queue cap, and how long a question waits for an answer (A12 / B4)
+
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1 — keep 32 and 5 s).** IMPLEMENTED (pre-existing): the queue refuses the 33rd prompt with a visible 429 (`tests/test_r3_prompt_queue.py::test_the_queue_is_bounded_and_refuses_rather_than_grows`) and a question returns a real decline plus an `expired`/`answered` event (`tests/test_b4_question_channel.py`). The behavioural half the recommendation called the important one is therefore already on the branch.
 
 **State today:** two bounds in `serve.py` are product decisions rather than engineering ones, and are
 recorded here because the brief requires it.
@@ -206,6 +218,8 @@ every question declines after `QUESTION_WAIT_SECS`.
 ---
 
 ## OD-9 — ACP session management (list / load / activate) was removed as dead code; wiring it to a route + UI is a feature of its own (B5)
+
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1 — leave them deleted).** IMPLEMENTED in `e2a9ce0` (`99d7fb7`); option 2 remains available as its own item if the owner wants a chat to continue an mcode session Rigma did not start.
 
 **State today:** three `AcpClient` wrappers had no product consumer. Item B5 **deleted two of them**
 from `src/rigma/harness_mcode_acp.py`: `session_list` (`session/list`) and `session_load`
@@ -251,6 +265,8 @@ fallback spelling, not a feature.
 
 ## OD-10 — The DSH approval audit trail is mounted but inert; making it real changes the system prompt (B8 / O4)
 
+**DECIDED 2026-09-30: owner accepted the recommendation — option 1 now, option 4 when a sandboxed shell is packaged.** IMPLEMENTED (no code change): the rows stay mounted and inert, exactly as measured, and the file itself now says why. Option 2 (setting `includeRuntimeContext: true`, a global system-prompt change that perturbs prompt-cache stability) was deliberately NOT taken.
+
 **State today:** `src/rigma/data/dsh/agent-capabilities.patch.yml` mounts `dsh-user-approval`
 (policy `never`) and `dsh-permission-presets` — the missing hop O4 identified, and the rows are correct
 and match the base bundle. But an independent verifier measured that this **does not yet make the
@@ -289,6 +305,8 @@ correct the moment option 4 lands.
 
 ## OD-11 — Should a shipped registry model be allowed to store launch defaults? (D2)
 
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1 — keep the refusal).** IMPLEMENTED (no code change): `hangar.set_launch_defaults` still refuses a `custom:false` spec, and the dialog disables Save and says why.
+
 **State today:** `hangar.set_launch_defaults` refuses any spec whose `custom` is False
 (`hangar.py:1123-1125`): "its launch settings are hand-authored and are not overwritten here". The D2
 backend work did **not** change that — it added the missing GET, accepted `backend`, and made `null`
@@ -315,6 +333,8 @@ its own merge/precedence rules.
 ---
 
 ## OD-12 — What happens to a question after its 5-second window closes? (B4b)
+
+**DECIDED 2026-09-30: owner accepted the recommendation; already RESOLVED and IMPLEMENTED** (option 1) — the server emits `approval/decided` with `decision: "expired"` (`17bfbe8`) and `"answered"` (`9167aa6`); all independently verified. No decision outstanding.
 
 **RESOLVED — option 1 was implemented; no owner decision is outstanding.** The server now emits
 `approval/decided` with `decision: "expired"` when the window closes (`17bfbe8`), and `"answered"`
@@ -353,6 +373,8 @@ reports the route's 409. Not a data-loss risk; a rough edge.
 
 ## OD-13 — Should a remotely-streaming chat have a stop affordance? (D3b)
 
+**DECIDED 2026-09-30: owner accepted the recommendation; already IMPLEMENTED** (option 1) in wave 14 (`5b4bcd5`/`5806031`) and independently verified. No decision outstanding.
+
 **State today:** D3b (merged) makes a reloaded chat read the server's `streaming`/`partial` state,
 suppress the false "interrupted" notice, show a rail dot, and poll. There is **no way to stop a turn
 this tab did not start** — the client's stop control only exists for a turn the tab owns. A user who
@@ -373,6 +395,8 @@ covered. Otherwise option 2 with the gap recorded.
 ---
 
 ## OD-14 — `taskkill /T` walks reused parent pids; the real fix is a Job Object per harness child (DR9)
+
+**DECIDED 2026-09-30: owner accepted the recommendation — option 2 now, option 1 as its own scoped item.** IMPLEMENTED (no code change): the current parent-link walk stands. The Windows Job Object is SCHEDULED as its own scoped item: it is real Windows API work with a new failure surface on a path that currently works, and it cannot be exercised meaningfully on this host.
 
 **State today:** on Windows, killing a harness process tree uses `taskkill /T` (`tools.py:4321`), which
 walks `ParentProcessId` links. Rigma's own server is spawned **detached** by a CLI process that then
@@ -431,6 +455,8 @@ risk — a feature that does less than its name suggests.
 ---
 
 ## OD-16 — two full test-suite runs at once deadlock, and the suite leaks its fake ACP servers
+
+**DECIDED 2026-09-30: owner accepted the recommendation; already RESOLVED and IMPLEMENTED** (options 1 and 3 both taken): six literal fake-server ports closed (`43e63de`, `f19395c`) and a full-suite session lock that exits **rc 4** on a second run (`e26b6c4`). No decision outstanding.
 
 **RESOLVED — options 1 and 3 were both taken; no owner decision is outstanding.** The diagnosis is
 complete: **six** literal fake-server TCP ports (`11594`–`11599`) were bound instead of `0`, so two
