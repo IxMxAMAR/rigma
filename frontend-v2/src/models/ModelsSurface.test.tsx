@@ -146,4 +146,16 @@ describe("the budget tooltip names the recurrent-state estimate", () => {
     expect(markup).toContain("ESTIMATE");
     expect(markup).toContain("32K");
   });
+
+  it("puts the ABSENT-provenance sentence in the cell's tooltip too", () => {
+    // verify-w14a nit: the committed suite asserted the absent-key wording only
+    // against `budgetHint`, while the `CtxCell` render covered only the ESTIMATE
+    // case. Pin it where the user reads it — the cell's own `title`.
+    const markup = renderToStaticMarkup(
+      <CtxCell fit={{ ok: true, ctx: 32768,
+                      budget: budget({ rs_mb: 512 }) }} />);
+    expect(markup).toContain(
+      "the server did not say whether this is a measurement or an estimate");
+    expect(markup).not.toContain("ESTIMATE");
+  });
 });
