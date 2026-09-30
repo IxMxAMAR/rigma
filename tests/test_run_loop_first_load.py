@@ -574,3 +574,117 @@ def test_an_unreadable_pointer_does_not_clear_another_runs_claim(home):
         "run B's claim")
     assert json.loads(real_read(ap, encoding="utf-8"))["id"] == b["id"]
 
+
+# ---------------------------------------------------------------------------
+# DR1-residual: a run the boot reaper could not see.
+#
+# When the READ failed and the pointer was readable (the common sub-case), the
+# release clears active.json and leaves run.json saying `running`. The boot
+# reaper only reconciled `_runs.active()`, so this run was INVISIBLE to it:
+# `restart_run` answered 409 "run is running" across reboots, and
+# pause/resume/inject 409 "run has no driver" — a dead end only Stop cleared.
+#
+# The reaper now sweeps every run DIRECTORY, not just the pointer. It reads
+# through `runs.load`, so a file that still cannot be READ is left exactly as it
+# is — DR1's guarantee is preserved: reconcile means an honest terminal status,
+# never a blind stub.
+# ---------------------------------------------------------------------------
+
+def test_the_boot_reaper_reconciles_a_run_the_pointer_cannot_see(home):
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()                    # what the read-failed release does
+
+    assert runs.active() is None
+    assert runs.load(rid)["status"] == "running"
+    assert "running" not in runs.RESTARTABLE
+
+    serve._reconcile_orphaned_runs(runs)
+
+    doc = runs.load(rid)
+    assert doc["status"] == "interrupted", doc
+    assert doc["status"] in runs.RESTARTABLE, (
+        "the reaper wrote a status restart_run still refuses")
+    assert doc["halt_reason"], "the reaper must say WHY it reconciled"
+
+
+def test_the_boot_reaper_never_overwrites_a_run_json_it_cannot_read(
+        home, monkeypatch):
+    """DR1's core guarantee, re-pinned on the new sweep: a run.json whose read
+    failed may be a perfectly good record a transient lock hid, so it is left
+    byte-identical — no stub, no terminal status."""
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()
+    rj = runs.run_dir(rid) / "run.json"
+    before = rj.read_bytes()
+
+    real_read = pathlib.Path.read_text
+
+    def _locked(self, *a, **k):
+        if self == rj:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", _locked)
+
+    serve._reconcile_orphaned_runs(runs)
+
+    assert rj.read_bytes() == before, (
+        "the sweep overwrote a run.json whose READ failed")
+
+
+def test_the_boot_reaper_never_touches_a_run_a_live_task_is_driving(home):
+    """The sweep must not interrupt a run that is actually being driven."""
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()
+
+    serve._reconcile_orphaned_runs(runs, driven_ids={rid})
+
+    assert runs.load(rid)["status"] == "running"
+
+
+def test_a_read_failed_release_is_reaped_at_the_next_boot(engine, home):
+    """DR1-residual, end to end: after a read-failed release, a simulated boot
+    reconciles the run and `restart_run` no longer answers 409."""
+    _Engine.script = [("manage_plan", {"action": "add", "task": "step one"})]
+    c = _client(engine)
+    sid = c.post("/api/sessions", json={}).json()["id"]
+    run = runs.create("keep my mission", sid)
+    rid = run["id"]
+    rj = runs.run_dir(rid) / "run.json"
+
+    # The READ fails (a lock), so the release cannot write a terminal status:
+    # run.json keeps saying `running` and the pointer is cleared.
+    real_load, real_read = runs.load, pathlib.Path.read_text
+    runs.load = lambda _rid: None
+
+    def _locked(self, *a, **k):
+        if self == rj:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_read(self, *a, **k)
+
+    pathlib.Path.read_text = _locked
+    try:
+        serve._release_unreadable_run(runs, rid, "run state could not be read")
+    finally:
+        runs.load = real_load
+        pathlib.Path.read_text = real_read
+
+    # the verifier's state: the reaper's precondition (`active()` is not None)
+    # is gone, and the record says running, which restart_run refuses.
+    assert runs.active() is None
+    assert runs.load(rid)["status"] == "running"
+    assert "running" not in runs.RESTARTABLE
+
+    # ...and a boot — a fresh app's lifespan — reconciles it.
+    c2 = _client(engine)
+
+    assert runs.load(rid)["status"] == "interrupted", runs.load(rid)
+    resp = c2.post(f"/api/runs/{rid}/restart")
+    assert resp.status_code == 200, (
+        "restart could not reattach after a read-failed release: "
+        f"{resp.status_code} {resp.text}")
+    assert resp.json().get("restarted") is True
+

@@ -100,6 +100,77 @@ def test_planned_vram_mb_is_none_when_not_recoverable(bad):
 
 
 # ---------------------------------------------------------------------------
+# DR2-2: ONE registry, and no registry parse per poll.
+#
+# The weight term follows `plan.gguf.bytes` (the caller's registry) but the KV
+# term used to come from a fresh global `Registry.load()` inside
+# `memtruth.planned_mb`, so the prediction was a chimera of two registries
+# whenever they disagreed. On the live path `registry is None`, so every poll
+# also paid that parse.
+# ---------------------------------------------------------------------------
+
+def _custom_registry_doubling_kv_heads():
+    """The real registry with one model's KV geometry changed, so the two
+    sources provably disagree on the KV term."""
+    reg = Registry.load()
+    spec = reg.models[SLUG]
+    changed = spec.model_copy(update={"kv_heads": spec.kv_heads * 2})
+    custom = Registry(gpus=reg.gpus, models={**reg.models, SLUG: changed},
+                      combos=reg.combos, use_cases=reg.use_cases)
+    return custom, spec, changed
+
+
+def test_planned_vram_mb_takes_its_kv_from_the_registry_it_was_handed(home):
+    custom, spec, changed = _custom_registry_doubling_kv_heads()
+
+    got = server_ops.planned_vram_mb(_state(), custom)
+
+    from rigma.resolve import kv_bytes_per_token, swa_kv_bytes
+    gguf = next(g for g in changed.ggufs if g.quant == QUANT)
+    want_kv = (CTX * kv_bytes_per_token(changed, "f16", "f16")
+               + swa_kv_bytes(changed, "f16", "f16", CTX)) / 2**20
+    global_kv = (CTX * kv_bytes_per_token(spec, "f16", "f16")
+                 + swa_kv_bytes(spec, "f16", "f16", CTX)) / 2**20
+
+    # BOTH terms follow the registry the caller handed...
+    assert got == pytest.approx(gguf.bytes / 2**20 + want_kv)
+    # ...and the KV term is NOT the process-global one (the pre-fix chimera).
+    assert got != pytest.approx(gguf.bytes / 2**20 + global_kv)
+
+
+def test_the_memo_does_not_serve_one_registrys_prediction_for_another(home):
+    custom, _spec, _changed = _custom_registry_doubling_kv_heads()
+
+    custom_mb = server_ops.planned_vram_mb(_state(), custom)
+    global_mb = server_ops.planned_vram_mb(_state())
+
+    assert custom_mb != pytest.approx(global_mb)
+
+
+def test_the_plan_prediction_is_memoised_not_reloaded_on_every_poll(
+        home, monkeypatch):
+    """`/api/server` is polled every 5 s from every open tab and the live app is
+    built with `registry=None`, so an unmemoised prediction paid a full
+    `Registry.load()` per poll — twice, because `planned_mb` loaded its own."""
+    from rigma.registry import Registry as _Registry
+    calls = {"n": 0}
+    real = _Registry.load
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(_Registry, "load", staticmethod(counting))
+
+    first = server_ops.planned_vram_mb(_state())
+    second = server_ops.planned_vram_mb(_state())
+
+    assert first == second
+    assert calls["n"] == 1, (
+        f"the registry was parsed {calls['n']} times for two polls")
+
+
+# ---------------------------------------------------------------------------
 # The route: a plan in state makes the axis live; no plan keeps it honest.
 # ---------------------------------------------------------------------------
 
