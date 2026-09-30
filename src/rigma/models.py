@@ -348,6 +348,10 @@ class ComboFlags(BaseModel):
     spec_n_max: int = 3
     batch: int = 0        # -b logical batch (0 = engine default 2048)
     ubatch: int = 0       # -ub physical batch (0 = engine default 512)
+    # Max context checkpoints per slot. -1 = NO OPINION (flag omitted, engine
+    # default 32 stands); 0 is a real value that disables checkpoints. See
+    # server_args for what a checkpoint count does on a recurrent hybrid.
+    ctx_checkpoints: int = -1
     env: dict[str, str] = Field(default_factory=dict)  # engine-spawn env overrides
 
     @field_validator("flash_attn", mode="before")
@@ -373,6 +377,20 @@ class ComboFlags(BaseModel):
     @classmethod
     def _known_cache_types(cls, v: str) -> str:
         return _valid_cache_type(v)
+
+    @field_validator("ctx_checkpoints")
+    @classmethod
+    def _checkpoints_in_range(cls, v: int) -> int:
+        # The engine itself checks nothing here: the fork and mainline handlers
+        # both just assign `params.n_ctx_checkpoints = value` (common/arg.cpp
+        # 87268f77:1690-1692, b9867:1452-1454), unlike the neighbouring
+        # `--checkpoint-min-step`, which rejects negatives. So -1 is Rigma's own
+        # "omit the flag" sentinel and everything below it is nonsense a
+        # negative count would pass straight to the engine.
+        if v < -1:
+            raise ValueError(
+                f"ctx_checkpoints must be -1 (engine default) or >= 0, got {v}")
+        return v
 
     @model_validator(mode="after")
     def _symmetric_kv(self):
@@ -468,5 +486,17 @@ class RunPlan(BaseModel):
         # history rolls back to the nearest checkpoint or reprocesses from
         # scratch. Denser checkpoints (default spacing 8192) make observation
         # masking and compaction edits cheap; harmless on pure transformers.
+        #
+        # `--checkpoint-min-step`/`-cms` sets the SPACING between checkpoints
+        # (PrismML 87268f77 common/arg.cpp:1695, mainline b9867:1457). The COUNT
+        # is a separate flag, `-ctxcp`/`--ctx-checkpoints` (same file,
+        # 87268f77:1687 / b9867:1449), default 32 per slot (common/common.h
+        # 87268f77:619 / b9867:623). The count is what bounds how far back a
+        # recurrent hybrid can rewind without reprocessing: every extra
+        # checkpoint is another point the DeltaNet state can be restored to,
+        # traded against the memory the checkpoints hold. -1 leaves it alone, so
+        # a plan that does not ask for the lever is byte-identical to before.
+        if self.flags.ctx_checkpoints >= 0:
+            args += ["--ctx-checkpoints", str(self.flags.ctx_checkpoints)]
         args += ["--checkpoint-min-step", "4096"]
         return args
