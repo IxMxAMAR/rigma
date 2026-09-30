@@ -4220,7 +4220,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
         `idle_unload_minutes` is the EFFECTIVE value (0 = never unload), which
         may come from RIGMA_KEEP_ALIVE_MIN; `env_override` says so, because a
-        setting the UI changes that has no effect would look broken.
+        setting changed here that has no effect would look broken.
+
+        There is NO UI for this route: neither frontend calls it, so the knob
+        is reachable only from the API or by hand-editing
+        `~/.rigma/settings.json`. This docstring used to reason about "a setting
+        the UI changes", which read as if a control existed. See
+        `app_settings` for the canonical description of the setting.
         """
         from . import app_settings
         return {"settings": app_settings.load(),

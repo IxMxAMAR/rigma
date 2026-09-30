@@ -44,6 +44,29 @@ def test_no_samples_means_no_answer():
     assert _sum_other_processes([], set()) is None
 
 
+def test_the_per_process_helper_is_tests_only():
+    """D6: `_sum_other_processes` has NO caller in `src/`.
+
+    `gpu_used_mb` reads the ADAPTER counter instead, because the per-process one
+    is untrustworthy. The helper is kept only because the four tests above pin
+    the parser semantics a future per-process reader would need — so its
+    docstring says "tests-only" and this is what makes that claim enforceable.
+
+    If a production caller ever appears, this fails and the NOTE in `probe.py`
+    has to be updated with it. Silently promoting a helper the codebase
+    deliberately stopped trusting for planning is the thing worth catching.
+    """
+    import pathlib
+
+    from rigma import probe
+
+    src = pathlib.Path(probe.__file__).parent
+    callers = sorted(
+        p.name for p in src.rglob("*.py")
+        if "_sum_other_processes" in p.read_text(encoding="utf-8"))
+    assert callers == ["probe.py"], callers
+
+
 def test_the_old_constant_is_a_floor_not_a_target():
     """A measurement must never make rigma MORE optimistic than the constant —
     the constant was conservative for a bare desktop and is still the right

@@ -48,6 +48,7 @@ EXPECTED_ROWS = {
     # "plan" is deliberately ABSENT — see `test_plan_mode_is_not_mounted_and_why`.
     "workflow": ["ptc-runtime", "workflow-ptc", "tool-workflow"],
     "context": ["token-meter", "compaction-basic"],
+    "governance": ["approval", "permission"],
 }
 
 
@@ -78,6 +79,58 @@ def test_every_capability_the_minimal_profile_omits_is_inserted():
     }
     missing = {g: v for g, v in missing.items() if v}
     assert not missing, f"capabilities the patch no longer inserts: {missing}"
+
+
+# --------------------------------------------------------------------------
+# O4 (checkpoint 30): the approval/governance audit trail. `sandbox/mode` fires
+# from `sandbox-policy`, which sdk-minimal mounts, so the panel looked live —
+# but the three `approval/*` events come only from `dsh-user-approval` and
+# `permission/preset` only from `dsh-permission-presets`, and neither plugin was
+# mounted. The trail could not fill and nothing said why. These pin the mount
+# rows through the same loader the runner uses, and pin the one config value
+# that decides whether mounting the approval service is safe.
+# --------------------------------------------------------------------------
+
+
+def test_the_approval_and_permission_services_are_mounted():
+    """The missing hop: without these rows the audit trail is unreachable.
+
+    Read through `_patch_rows()`, i.e. `harness_dsh.capability_patch()` plus
+    `yaml.safe_load` — the same loader the runner hands to DSH — so a row that
+    is present but unparseable fails here rather than silently at boot.
+    """
+    by_id = {str(r.get("id")): r for r in _patch_rows()}
+    assert by_id["approval"]["name"] == "@deepseek-ai/dsh-user-approval"
+    assert by_id["permission"]["name"] == "@deepseek-ai/dsh-permission-presets"
+
+
+def test_the_approval_policy_matches_the_sandbox_rigma_actually_runs():
+    """`never`, not the base bundle's `ask`.
+
+    sdk-minimal hardcodes `sandbox-policy: danger-full-access`, and Rigma never
+    sets DSH_PERMISSION_MODE — so the base's `!!js` expression would resolve to
+    `ask` here. `ask` on a transport with no answerer fails CLOSED (the SDK wire
+    has no approval-response method), which would deny calls the unconfined
+    sandbox permits. `never` rejects deterministically without a prompt, which
+    is the stance that matches the sandbox Rigma runs.
+    """
+    by_id = {str(r.get("id")): r for r in _patch_rows()}
+    assert by_id["approval"]["config"]["policy"] == "never"
+    # A plain string is also the only thing that can be here: `_patch_rows()`
+    # parses with `yaml.safe_load`, which raises on the base bundle's `!!js`
+    # tag, so copying that expression verbatim is not an option.
+    assert isinstance(by_id["approval"]["config"]["policy"], str)
+
+
+def test_the_danger_full_access_preset_agrees_with_the_approval_policy():
+    """A preset whose `approval` disagrees with the service's `policy` would make
+    `derive()` find no preset for the composed defaults and refuse to mount."""
+    by_id = {str(r.get("id")): r for r in _patch_rows()}
+    presets = by_id["permission"]["config"]["presets"]
+    assert presets["danger-full-access"] == {
+        "sandbox": "danger-full-access", "approval": "never"}
+    assert presets["read-only"]["approval"] == "ask"
+    assert presets["workspace-write"]["approval"] == "ask"
 
 
 def test_the_two_subagent_tools_are_the_same_plugin_under_two_names():
@@ -312,6 +365,71 @@ def test_a_malformed_notification_produces_nothing_and_does_not_raise():
                 SimpleNamespace(method="x", payload={"event": "not-a-dict"}),
                 SimpleNamespace(method="x", payload={"event": {"type": 5}})):
         assert runner._project(bad) == []
+
+
+# --------------------------------------------------------------------------
+# B2 nit: every notice text is ONE line and <=200 characters, including the
+# two paths that do not draw their content from `_UNKNOWN_NOTICE_FIELDS`. The
+# projector-failure fallback used to cap only its detail and then prepend a
+# ~40-character prefix (reachable ~240), and an exception message can carry
+# arbitrary prose — the one place §0.3's no-owner-prose rule could leak. The
+# raw event `type` is the other non-allow-listed input, named on purpose.
+# --------------------------------------------------------------------------
+
+
+class _ProjectorBoom(Exception):
+    """A projector failure whose message is long, multi-line and prose-bearing."""
+
+
+def test_a_projector_failure_notice_is_one_capped_line(monkeypatch):
+    """The fallback must not exceed the bound the ordinary notices use.
+
+    Before this, the emitted text was
+    `"session.event could not be projected: " + f"{type}: {exc}"[:200]` — the
+    prefix escaped the cap, so the finished notice could reach ~240 characters,
+    and a multi-line exception message put its second line straight into the
+    progress line.
+    """
+    secret = "owner prose that must not own the line\n" + "SECRET " * 80
+
+    def explode(notification, streamed=None):
+        raise _ProjectorBoom(secret)
+
+    monkeypatch.setattr(runner, "_project", explode)
+    emitted: list[dict] = []
+    monkeypatch.setattr(runner, "_emit", emitted.append)
+
+    runner._forward(_session_event("tool/call", {"name": "read"}))
+
+    assert len(emitted) == 1, emitted
+    text = emitted[0]["text"]
+    assert emitted[0]["type"] == "notice"
+    assert "\n" not in text and "\r" not in text, repr(text)
+    assert len(text) <= 200, (len(text), text)
+    assert text.startswith("session.event could not be projected:"), text
+    # The exception's own type name is still named — the notice stays useful.
+    assert "_ProjectorBoom" in text, text
+
+
+def test_the_projector_failure_notice_is_built_by_the_shared_helper(monkeypatch):
+    """Pinned to the helper, not to a hand-rolled cap: a future edit that
+    re-inlines the f-string would re-introduce the un-capped prefix."""
+    assert runner._notice_line("a" * 300) == "a" * runner._NOTICE_MAX
+    assert runner._notice_line("one\ntwo") == "one two"
+
+
+def test_an_unknown_event_type_cannot_add_a_line_or_outgrow_the_cap():
+    """The type is the only non-allow-listed token in this notice, and it is
+    named by design; the shared helper is what bounds it."""
+    out = runner._project(_session_event("PROSE " + "y" * 400, {}))
+    assert len(out) == 1 and out[0]["type"] == "notice"
+    assert "\n" not in out[0]["text"]
+    assert len(out[0]["text"]) <= 200
+    assert out[0]["text"].startswith("session.event PROSE ")
+
+    multiline = runner._project(_session_event("line one\nline two\nline three", {}))
+    assert "\n" not in multiline[0]["text"]
+    assert multiline[0]["text"] == "session.event line one line two line three"
 
 
 # --------------------------------------------------------------------------

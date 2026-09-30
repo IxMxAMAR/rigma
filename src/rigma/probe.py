@@ -66,8 +66,14 @@ def _sum_other_processes(samples, exclude: set[int]) -> float | None:
     is using nothing" are very different claims, and only one of them is safe
     to plan a 13GB allocation against.
 
-    NOTE: kept for the exclude-by-pid logic, but `gpu_used_mb` no longer uses
-    the per-process counter — see the comment there.
+    NOTE: this has NO caller in `src/`. The production path is `gpu_used_mb`
+    below, which reads the ADAPTER counter because the per-process one is not
+    trustworthy (one browser reported 359,777 MiB on a 16GB card — see that
+    function's comment). It is kept because `tests/test_vram_pressure.py` pins
+    the parser semantics a future per-process reader would need — the
+    `pid_<N>_luid_...` filter, the exclude-by-pid rule, and None-not-0. It is a
+    TESTED helper, not a live one; deleting it means deleting those tests, and
+    the guard in that file fails if a production caller ever appears.
     """
     total, seen = 0.0, False
     for name, value in samples:
