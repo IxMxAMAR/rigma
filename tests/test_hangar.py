@@ -451,6 +451,41 @@ def test_heal_records_mtp_per_file(home):
     assert "mtp" in spec.capabilities
 
 
+def _mamba_gguf(path):
+    """A pure-Mamba header: a complete ssm.* geometry and NO attention keys."""
+    kvs = [
+        _kv_str(b"general.architecture", b"mamba"),
+        _kv_str(b"general.name", b"Mamba Tune"),
+        _kv_u32(b"mamba.block_count", 48),
+        _kv_u32(b"mamba.context_length", 32768),
+        _kv_u32(b"mamba.embedding_length", 2048),
+        _kv_u32(b"mamba.ssm.state_size", 128),
+        _kv_u32(b"mamba.ssm.inner_size", 4096),
+        _kv_u32(b"mamba.ssm.conv_kernel", 4),
+        _kv_u32(b"mamba.ssm.group_count", 1),
+    ]
+    path.write_bytes(b"GGUF" + struct.pack("<I", 3)
+                     + struct.pack("<Q", 0) + struct.pack("<Q", len(kvs))
+                     + b"".join(kvs))
+    return path
+
+
+def test_heal_carries_an_unknown_recurrent_geometry(home):
+    """A2d: a pure-Mamba spec stored by the old probe has kv_heads = 0, which the
+    heal gate used to reject — so its silent zero would have survived the fix and
+    the model would still have been read as dense. PROBE_VERSION 5 re-probes it,
+    the gate accepts the positive answer about recurrence, and the flag reaches
+    the spec."""
+    from rigma.resolve import recurrent_state_unknown
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _mamba_gguf(home / "models" / "m.gguf")
+    _stale_spec(home, "m.gguf")
+    spec = Registry.load().models["hybrid-tune"]
+    assert spec.probe_version == hangar.PROBE_VERSION
+    assert spec.rs_geometry_unknown is True
+    assert recurrent_state_unknown(spec)
+
+
 def test_registry_models_are_never_rewritten_by_healing(home, tmp_path):
     """Registry entries are hand-authored and researched. Healing only ever
     touches custom imports."""

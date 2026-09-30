@@ -148,3 +148,17 @@ def test_the_budget_table_charges_the_recurrent_state():
     honest = _budget_rows(spec, gguf, 0.0, ctx, budget)
     assert fits["over_mb"] <= 0 < honest["over_mb"], (
         f"budget table disagrees with the fit: {fits} vs {honest}")
+
+
+def test_an_unrecognised_recurrent_geometry_is_unknown_not_zero():
+    """A2d: the probe reports `rs_geometry_unknown` for a pure-Mamba header, an
+    explicit `attention.recurrent_layers` array, or a partial `ssm.*` set — the
+    shapes whose count or buffer it cannot derive. The fit must say so instead of
+    charging a confident zero."""
+    spec = _bonsai(rs_geometry_unknown=True, recurrent_layers=0,
+                   **{k: 0 for k in SSM})
+    assert recurrent_state_unknown(spec)
+    explain: list[str] = []
+    flags = fit_gguf(spec, spec.ggufs[0], _profile(), 8192, explain)
+    assert flags is not None
+    assert any("rs=unknown" in ln for ln in explain), explain

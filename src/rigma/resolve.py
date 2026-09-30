@@ -242,10 +242,20 @@ def recurrent_state_mb(spec: ModelSpec) -> float:
 
 
 def recurrent_state_unknown(spec: ModelSpec) -> bool:
-    """True when the model declares recurrent layers but its header carried no
-    `ssm.*` geometry, so `recurrent_state_mb` returns 0 for lack of evidence
-    rather than because there is nothing to allocate. The fit says so in its
-    explain line instead of silently reading the model as dense."""
+    """True when the model gives evidence of recurrent layers but there is no
+    geometry to size them with, so `recurrent_state_mb` returns 0 for lack of
+    evidence rather than because there is nothing to allocate. The fit says so in
+    its explain line instead of silently reading the model as dense.
+
+    Two ways to know that, and both are the same statement:
+      * `recurrent_layers > 0` with no usable `ssm.*` geometry (A2);
+      * the probe could not derive the count or the buffer at all — a pure-Mamba
+        header, an explicit `attention.recurrent_layers` array, or a partial
+        `ssm.*` set (A2d). Before the flag existed those shapes charged 0 with no
+        note, which is a confident wrong number.
+    """
+    if getattr(spec, "rs_geometry_unknown", False):
+        return True
     return spec.recurrent_layers > 0 and recurrent_state_mb(spec) == 0.0
 
 
