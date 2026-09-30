@@ -73,16 +73,52 @@ _PATTERNS: list[tuple[str, re.Pattern, str, str, bool]] = [
 ]
 
 
+# One engine PROCESS starts at its parameter dump. `runtime.launch_server` opens
+# `server-<port>.log` with mode "w", so the file is normally truncated per
+# launch; a log that spans launches (an appended or rotated file) holds several
+# of these, and the last one is the process that is up now.
+_RUN_START = re.compile(r"common_params_print_info:")
+
+
+def _current_run(log_text: str) -> str:
+    """The part of `log_text` written by the engine process that is up now.
+
+    AUDIT 06R3-10: `findings` used to scan the whole file and quote the last
+    matching line, with a docstring asserting that line described the running
+    engine. It does not follow: on a log spanning several launches the last
+    occurrence can belong to a previous one, so the Engine page showed a
+    diagnostic for a flag state the running engine may not be in.
+
+    The engine's own parameter dump is the start marker — `common_params_print_info:`
+    is the first line of every one of this machine's 16 `server-*.log` files
+    (llama.cpp prints it once per process). When the text carries at least one
+    marker, everything before the LAST one is a previous process and is dropped.
+    When it carries none (a tail that begins mid-launch) the whole text is
+    scanned, because there is no evidence to segment on; in that case the
+    caller gets no current-run guarantee, which the docstring now says instead
+    of claiming one.
+    """
+    text = log_text or ""
+    starts = [m.start() for m in _RUN_START.finditer(text)]
+    return text[starts[-1]:] if starts else text
+
+
 def findings(log_text: str) -> list[dict]:
     """Significant one-off engine statements found in a log.
 
     Deduplicated: these fire once per load, and a log spanning several restarts
     would otherwise report the same fact many times. Ordered as listed, so the
     confirmed and consequential ones come first.
+
+    Only the current engine process's lines are considered (see `_current_run`),
+    so `count` and `example` describe the engine that is up now whenever the log
+    carries a launch marker. A log with no marker at all is scanned whole and no
+    current-run claim is made.
     """
+    text = _current_run(log_text)
     out = []
     for key, pat, severity, message, confirmed in _PATTERNS:
-        hits = [ln.strip() for ln in (log_text or "").splitlines()
+        hits = [ln.strip() for ln in text.splitlines()
                 if pat.search(ln)]
         if not hits:
             continue
@@ -92,8 +128,7 @@ def findings(log_text: str) -> list[dict]:
             "message": message,
             "count": len(hits),
             "confirmed_here": confirmed,
-            # the last occurrence: on a log covering several launches it is the
-            # one describing the engine currently running
+            # the last occurrence in the CURRENT run (see _current_run)
             "example": hits[-1][:300],
         })
     return out
