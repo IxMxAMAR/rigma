@@ -3737,17 +3737,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     s.update(out)
                     return True
 
-                alive = True
+                alive, saved, last_err = True, False, None
                 for _attempt in range(3):
                     try:
                         # 14-5: the whole load-merge-save runs in a worker; the
                         # pair inside stays unbroken there, and base_rev still
                         # catches a concurrent writer (hence the retry below).
                         alive = await asyncio.to_thread(_merge_and_save)
+                        saved = alive
                         break
-                    except sessions.StaleWriteError:
+                    except sessions.StaleWriteError as exc:
                         # another writer landed between the merge and the write;
                         # merging again is the right answer
+                        last_err = exc
                         _log.warning("session %s moved under the turn write; "
                                      "merging again", s.get("id"))
                 if not alive:
@@ -3755,7 +3757,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     # never resurrect the chat the user just removed
                     yield b"data: [DONE]\n\n"
                     return
-                _ckpt["saved"], _ckpt["final"] = False, True
+                if not saved:
+                    # A1: all three attempts lost the CAS race, so the finished
+                    # reply is NOT in the store. `alive` used to start True and
+                    # was only ever assigned on SUCCESS, so exhaustion left it
+                    # True and the turn was then marked final as if it had been
+                    # written — the loss was silent. Say so, and leave the turn
+                    # un-final so the checkpoint path can still hold the words.
+                    _log.error("session %s: could not save the finished turn "
+                               "after 3 attempts: %s", s.get("id"), last_err)
+                    _ckpt["final"] = False
+                    yield _sse({"note": (
+                        "_(This reply could not be saved as a finished turn — "
+                        "the session kept changing underneath it. What you see "
+                        "may not survive a reload; copy anything you need.)_")},
+                        event="notice")
+                    await _checkpoint_threaded(force=True)
+                else:
+                    _ckpt["saved"], _ckpt["final"] = False, True
                 # Rebuilt AFTER the save so it includes the reply that was just
                 # generated — that is what the slot actually holds now.
                 try:
