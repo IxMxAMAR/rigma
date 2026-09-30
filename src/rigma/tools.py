@@ -3632,10 +3632,36 @@ def _write_file_locked(args, ctx):
 # sample by reference; every name gets fuzzy recovery; nothing is ever
 # overwritten (collision-safe renaming).
 
-def _transfer_sources(args, ctx) -> tuple[list, list, list]:
+def _move_source_parent_gate(ctx, p: Path) -> None:
+    """ODR-3: a MOVE deletes its source, so the source's parent is a WRITE.
+
+    `_read_path` gates the source itself as a READ, so an absolute source only
+    ever needed `allow_absolute_reads`. Removing it is the other capability, and
+    it used to ride on that read grant alone:
+    `move_files{"paths":["C:\\\\Users\\\\amren\\\\Documents\\\\thesis.docx"],
+    "dest":"x"}` deleted the original out of Documents on a session that had
+    granted reading outside the workspace and nothing else.
+
+    The parent must pass the SAME workspace/grant/allowlist check as any other
+    write, so this DELEGATES to `_write_path` rather than re-deriving the rule —
+    a second hand-written copy of a permission check is how the two drift apart.
+    A parent INSIDE the workspace is what `_write_path`'s relative branch always
+    allows and needs no grant, so only an outside parent is handed to its
+    absolute branch. `_unlong` first: `_read_path` returns `\\\\?\\C:\\...` for a
+    long path, which is not `is_relative_to` the unprefixed workspace root.
+    """
+    parent = _unlong(p).parent
+    if not _inside_workspace(ctx, parent):
+        _write_path(ctx, str(parent))
+
+
+def _transfer_sources(args, ctx, move: bool = False) -> tuple[list, list, list]:
     """(found, errors, notes). The notes are the "asked X / used Y" corrections
     `_fuzzy_file` made — they used to be computed and then dropped on the floor
-    here, so a misfiled chapter arrived with no explanation (AUDIT F34)."""
+    here, so a misfiled chapter arrived with no explanation (AUDIT F34).
+
+    `move=True` additionally requires each source's parent to pass the write
+    gate — see `_move_source_parent_gate` (ODR-3)."""
     paths = args.get("paths") or []
     if isinstance(paths, str):
         paths = [paths]
@@ -3667,6 +3693,14 @@ def _transfer_sources(args, ctx) -> tuple[list, list, list]:
                 if note:
                     notes.append(note)
         if _stat_ok(p, "is_file"):
+            if move:
+                # the file's directory is where the removal lands — same write
+                # boundary as the destination (ODR-3)
+                try:
+                    _move_source_parent_gate(ctx, p)
+                except ValueError as e:
+                    errs.append(str(e))
+                    continue
             found.append(p)
         else:
             errs.append(f"no such file: {raw}")
@@ -3699,7 +3733,7 @@ def _do_transfer(args, ctx, move: bool):
         dest = _write_path(ctx, dest_raw)
     except ValueError as e:
         return f"error: {e}"
-    srcs, errs, notes = _transfer_sources(args, ctx)
+    srcs, errs, notes = _transfer_sources(args, ctx, move=move)
     if not srcs:
         return ("error: no source files — pass `paths`, or call sample_files "
                 "first and reference the sample"
