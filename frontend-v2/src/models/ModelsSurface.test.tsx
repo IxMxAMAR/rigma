@@ -87,6 +87,31 @@ describe("the budget tooltip names the recurrent-state estimate", () => {
     expect(hint).not.toContain("ESTIMATE");
   });
 
+  // Wave-4 verifier's risk (verify-w5f4): `rs_unknown?` is optional, so a
+  // backend that stops sending the marker must not have a charged estimate
+  // silently read as a measurement. An absent key is a THIRD state, not `false`.
+  it("labels a charged term whose provenance was NOT stated", () => {
+    const hint = budgetHint({ ok: true, budget: budget({ rs_mb: 512 }) });
+    expect(hint).toContain("recurrent state 512 MB");
+    expect(hint).toContain(
+      "the server did not say whether this is a measurement or an estimate");
+    // it is NOT asserted to be a measurement, and NOT asserted to be an
+    // estimate either — the server said nothing
+    expect(hint).not.toContain("ESTIMATE, not a measurement");
+    // the verdict line the page shows carries the caveat too
+    expect(hint).toContain("headroom       4,000 MB");
+    expect(hint).toContain("the recurrent-state term's provenance was not stated");
+  });
+
+  it("keeps the OVER line honest for an unstated provenance too", () => {
+    const hint = budgetHint({
+      ok: false, budget: budget({ over_mb: 1_200, rs_mb: 512 }),
+    });
+    expect(hint).toContain("OVER by        1,200 MB");
+    expect(hint).toContain("the recurrent-state term's provenance was not stated");
+    expect(hint).not.toContain("ESTIMATE, not a measurement");
+  });
+
   it("carries the caveat on the OVER line as well", () => {
     const hint = budgetHint({
       ok: false,

@@ -186,7 +186,12 @@ export interface Budget {
    *  no geometry to size them with, so `rs_mb` is an ESTIMATE (or a 0 charged
    *  for lack of evidence, not because there is nothing to allocate). A boolean
    *  BESIDE `rs_mb` on purpose — the term is still charged, and every numeric
-   *  consumer of the row is untouched. */
+   *  consumer of the row is untouched.
+   *
+   *  Optional, and ABSENT is its own state rather than a synonym for `false`:
+   *  a backend older than A2d-budget sends no marker, and a consumer must not
+   *  read that silence as "measured" — `budgetHint` labels a charged term whose
+   *  provenance is unstated instead of printing a bare figure. */
   rs_unknown?: boolean;
 }
 
