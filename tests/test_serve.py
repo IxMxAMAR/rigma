@@ -90,6 +90,26 @@ def test_proxy_applies_tool_params_only_when_tools_are_present(
     assert raw3.decode() in r3.text
 
 
+def test_proxy_ignores_a_tools_field_that_is_not_a_nonempty_list(
+        upstream, tmp_path, monkeypatch):
+    """B7d: `tools` was checked for TRUTHINESS, so any non-empty non-list value
+    ("abc", {"a": 1}, 1, true) took the merge path and the engine received
+    re-serialised JSON instead of the caller's exact bytes. Only a non-empty
+    LIST is a tool request; everything else keeps the byte-identical
+    passthrough. `null` is the control: falsy, so it passed before as well."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    client = TestClient(build_app(upstream_port=upstream))
+    for tools in ('"abc"', '{"a":1}', "1", "true", "null"):
+        raw = ('{"model":"m","temperature":0.9,"messages":[],"tools":'
+               + tools + "}").encode()
+        r = client.post("/v1/chat/completions", content=raw,
+                        headers={"content-type": "application/json"})
+        assert r.status_code == 200, (tools, r.status_code, r.text)
+        assert raw.decode() in r.text, (
+            f"tools={tools} is not a tool request — the proxy must not rewrite "
+            f"the body; engine saw {r.text!r}")
+
+
 def test_v1_passthrough_engine_down_is_openai_502(tmp_path, monkeypatch):
     """01-4: a dead engine must not surface as Starlette's plain-text 500 —
     every OpenAI client parses the body as JSON and then reports a decode
