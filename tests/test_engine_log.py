@@ -74,6 +74,19 @@ def test_a_warning_from_a_previous_launch_is_not_attributed_to_this_one():
     assert engine_log.findings(text) == []
 
 
+def test_a_process_that_prints_the_banner_twice_is_still_one_process():
+    """A16c: the pinned PrismML build emits TWO adjacent
+    `common_params_print_info:` lines at the start of one process
+    (`prism-v.log:1-2`), not one. The rule segments on the LAST marker, so the
+    second line of the banner must not make the process's own earlier half look
+    like a previous launch. The comment now says this instead of "once per
+    process"; this test pins the behaviour that sentence describes."""
+    text = (BANNER + BANNER + REAL          # launch 1: banner twice, warns
+            + BANNER + BANNER)              # launch 2: banner twice, clean
+
+    assert engine_log.findings(text) == []
+
+
 def test_a_warning_in_the_current_launch_is_reported_once():
     text = BANNER + REAL + BANNER + REAL
 
