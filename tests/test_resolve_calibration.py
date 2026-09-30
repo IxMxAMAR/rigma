@@ -71,6 +71,25 @@ def test_the_merge_gate_reuses_the_sweeps_one_list(monkeypatch):
     assert cleaned == {"env": {"KEEP_ME": "1"}}
 
 
+def test_a_lowercase_calibration_lever_is_dropped_at_merge(tmp_path,
+                                                           monkeypatch):
+    """The case-insensitive match must hold on the READ path too.
+
+    llama.cpp's `getenv` ignores case on Windows, so a hand-edited lowercase
+    key in `calibration.json` would reach the child's environment on every
+    later launch. The merge gate must drop it and still apply the rest of the
+    row."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    save_calibration("qwen3.6-35b-a3b:UD-Q3_K_XL:vulkan", {"tg_tps": 57.1},
+                     flags={"n_cpu_moe": 8,
+                            "env": {"llama_attn_rot_disable": "1"}})
+    plan = resolve(_profile(), Registry.load(), use_case="coding")
+    assert plan.flags.env == {}
+    assert plan.flags.n_cpu_moe == 8
+    assert any("dropped quality-degrading env lever" in e
+               for e in plan.explain), plan.explain
+
+
 def test_a_non_object_calibration_flags_row_is_ignored_not_fatal(
         tmp_path, monkeypatch):
     """GUIDANCE 7: the read path treats calibration.json as untrusted, and a

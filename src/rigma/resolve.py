@@ -179,11 +179,14 @@ def _without_quality_env_levers(flags: dict) -> tuple[dict, list[str]]:
 
     `bench._QUALITY_ENV_LEVERS` is the ONE list of such levers (the C11 verifier
     found `LLAMA_ATTN_ROT_DISABLE` applied end to end), and this reuses it
-    rather than inventing a second one. The rest of the row is kept: only the
-    quality lever is dropped, so a corrupt/hostile key cannot disable the gate
-    by riding in with a legitimate one.
+    rather than inventing a second one. The match is case-insensitive, exactly
+    as `bench._quality_env_levers_in` is, because the engine's `getenv` ignores
+    case on Windows — a lowercase hand-edited key must not slip through. The
+    rest of the row is kept: only the quality lever is dropped, so a
+    corrupt/hostile key cannot disable the gate by riding in with a legitimate
+    one.
     """
-    from .bench import _QUALITY_ENV_LEVERS
+    from .bench import _QUALITY_ENV_LEVERS, _quality_env_levers_in
     if not isinstance(flags, dict):
         # A hand-edited row can be a list/string. Leave it alone so the merge's
         # existing TypeError handler keeps reporting "flags is not an object"
@@ -192,11 +195,12 @@ def _without_quality_env_levers(flags: dict) -> tuple[dict, list[str]]:
     env = flags.get("env")
     if not isinstance(env, dict):
         return flags, []
-    dropped = [name for name in _QUALITY_ENV_LEVERS if name in env]
+    dropped = _quality_env_levers_in(env)
     if not dropped:
         return flags, []
+    levers = {name.upper() for name in _QUALITY_ENV_LEVERS}
     cleaned = {k: v for k, v in flags.items() if k != "env"}
-    rest = {k: v for k, v in env.items() if k not in _QUALITY_ENV_LEVERS}
+    rest = {k: v for k, v in env.items() if str(k).upper() not in levers}
     if rest:
         cleaned["env"] = rest
     return cleaned, dropped
