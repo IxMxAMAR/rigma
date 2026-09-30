@@ -432,6 +432,17 @@ def test_fit_argv_matches_what_the_engine_is_actually_launched_with():
     assert "--parallel" in argv and argv[argv.index("--parallel") + 1] == "2"
 
 
+def test_fit_argv_reads_the_parallel_constant_not_a_literal(monkeypatch):
+    """A2c: the oracle's `--parallel` must be the SAME single source the argv
+    builder writes (`models.LAUNCH_PARALLEL`). A hard-coded "2" silently
+    verifies a plan Rigma is not running the day that constant changes, which
+    is exactly the drift A2 removed everywhere else."""
+    from rigma import models
+    monkeypatch.setattr(models, "LAUNCH_PARALLEL", 3)
+    argv = memtruth.fit_argv(_a_plan(), "m.gguf")
+    assert argv[argv.index("--parallel") + 1] == "3"
+
+
 def test_verify_plan_reports_a_disagreement_without_refusing(tmp_path):
     """`verify_plan` never refuses anything itself — whether a modelling
     difference should block a launch is policy that belongs with the launch."""
