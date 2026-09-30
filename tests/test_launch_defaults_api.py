@@ -234,3 +234,23 @@ def test_the_batch_refusal_names_the_server_not_the_engine(client):
     assert "8192" in msg and "4096" in msg
     assert "physical batch" in msg and "logical batch" in msg
 
+
+def test_the_400_body_carries_no_pydantic_prefix(client):
+    """ITEM 2: `hangar.set_launch_defaults` joins pydantic's error messages into
+    the 400 body the dialog renders verbatim. Pydantic prefixes each with
+    "Value error, " — its own wrapper, not the sentence the author wrote — and
+    the user must see the sentence. A message whose text legitimately starts
+    with something else is untouched."""
+    c, slug = client
+    r = c.post(f"/api/models/{slug}/defaults",
+               json={"batch": 4096, "ubatch": 8192})
+    assert r.status_code == 400, r.text
+    msg = r.json()["error"]
+    assert not msg.startswith("Value error, "), msg
+    assert msg.startswith("ubatch 8192 exceeds batch 4096: the server refuses"), msg
+    # the other validator branch is stripped too, and its own sentence is intact
+    r = c.post(f"/api/models/{slug}/defaults", json={"batch": -1})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"] == \
+        "batch and ubatch must be 0 (no opinion) or a positive size"
+
