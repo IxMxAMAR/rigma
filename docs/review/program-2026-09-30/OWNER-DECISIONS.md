@@ -246,3 +246,42 @@ fallback spelling, not a feature.
 
 **If nothing is decided:** nothing changes; Rigma reaches mcode sessions only through `session/new` and
 `session/resume`. This is not a blocker.
+
+---
+
+## OD-10 — The DSH approval audit trail is mounted but inert; making it real changes the system prompt (B8 / O4)
+
+**State today:** `src/rigma/data/dsh/agent-capabilities.patch.yml` mounts `dsh-user-approval`
+(policy `never`) and `dsh-permission-presets` — the missing hop O4 identified, and the rows are correct
+and match the base bundle. But an independent verifier measured that this **does not yet make the
+governance panel fill**, for three independent reasons, all now stated in the file itself:
+
+- `sdk-minimal` sets `includeRuntimeContext: false`, which suppresses **every** runtime-context
+  contribution — including the `approval:policy` entry `dsh-user-approval` registers — so the model is
+  never told the policy. (The file previously claimed the opposite; that claim was false and is fixed.)
+- `sdk-minimal`'s `sandbox-policy` is hardcoded `danger-full-access` and only a strictly-wider target
+  escalates, so nothing ever asks and `approval/asked`/`approval/decided` stay quiet.
+- `dsh-permission-presets` also needs a confining `ctx.shell`; sdk-minimal mounts the PTY `terminal`
+  seam instead, and the packaged runtime closure carries neither `dsh-pwsh-sandbox` nor
+  `dsh-bash-sandbox`.
+
+The rows' only observable effect today is creating `ctx.approval` — a different deny *reason* if an ask
+ever fires. The tests pin row presence and config values, so they pass on inert config; they are not
+evidence the trail fills.
+
+**Options**
+1. **Leave it.** The rows are a correct, documented prerequisite; the trail stays quiet until a
+   confining shell row exists. Cost: the panel still looks live and shows nothing.
+2. **Also set `includeRuntimeContext: true`** so the model is told the policy. This changes the system
+   prompt on **every turn** — a global behaviour change that also perturbs prompt-cache stability,
+   which Rigma deliberately protects (`--parallel 2 --kv-unified` exists partly for that).
+3. **Hide the governance panel** until the trail can fill, so the UI stops promising a signal it cannot
+   show.
+4. **Compose a sandboxed shell row** (`dsh-pwsh-sandbox`) so `permission/preset` can log — a packaging
+   change, not a config one.
+
+**Recommendation: option 1 now, option 4 when a sandboxed shell is packaged.** Option 2 should not be
+taken merely to make a *panel* look alive; option 3 is UI honesty but removes a diagnostic that becomes
+correct the moment option 4 lands.
+
+**If nothing is decided:** the rows stay mounted and inert, exactly as measured, and the file says so.
