@@ -14,6 +14,7 @@ thread with its own `MemoryStore`, which is the only honest model of the
 concurrency the file lock exists for.
 """
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -180,3 +181,66 @@ def test_an_untouched_store_is_not_rolled_back_by_an_earlier_failure(
     assert "committed mid-restore" in texts, texts
     assert "Prefer q8_0." not in texts
     assert "Never type filenames." in texts
+
+
+# ---------------------------------------------------------------------------
+# A11d: the in-process lock must actually serialise two RESTORES.
+#
+# A11c put the whole snapshot -> apply -> rollback region under the store's
+# `_xlock`, but `serve._memory_store()` built a NEW `MemoryStore` per request, so
+# the RLock was a different lock for each restore. Only the 10-second
+# cross-process file lock serialised them — and `_FileLock.acquire` gives up
+# after that and lets the caller proceed unsynchronised. `memory.store_for`
+# makes the store (and therefore the RLock) process-wide.
+# ---------------------------------------------------------------------------
+
+
+def test_two_concurrent_restores_serialise_on_the_shared_store_lock(
+        client, home, monkeypatch):
+    """With the cross-process file lock made unavailable, the ONLY thing that
+    can keep two apply regions apart is the in-process store lock. Before A11d
+    both regions ran at once; after it, the second waits for the first."""
+    from rigma import memory as _mem
+    _seed(home)
+    doc = client.get("/api/backup").json()
+
+    # The cross-process fallback is unavailable for this test.
+    monkeypatch.setattr(_mem._FileLock, "acquire", lambda self, **k: False)
+
+    guard = threading.Lock()
+    active = {"n": 0}
+    overlap = threading.Event()
+
+    def slow_save_user(full):
+        # A real overlap detector: it fires only when two apply regions are
+        # inside the method write at the same instant.
+        with guard:
+            active["n"] += 1
+            if active["n"] > 1:
+                overlap.set()
+        time.sleep(0.3)
+        with guard:
+            active["n"] -= 1
+        return (full, [])
+
+    monkeypatch.setattr(methods, "save_user", slow_save_user)
+
+    results = []
+
+    def restore(tag):
+        c = TestClient(build_app(upstream_port=1),
+                       raise_server_exceptions=False)
+        body = {**doc, "methods": [_doc(tag)]}
+        results.append(c.post("/api/restore", json=body).status_code)
+
+    threads = [threading.Thread(target=restore, args=(f"m{i}",))
+               for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(20)
+
+    assert not overlap.is_set(), (
+        "two concurrent restores entered their apply regions at once — the "
+        "in-process store lock is not shared across requests")
+    assert sorted(results) == [200, 200], results

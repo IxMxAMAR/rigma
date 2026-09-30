@@ -447,6 +447,59 @@ def _resolve_for(slug: str, state: dict, registry, profile,
                    model_override=slug, backend_override=backend), reg, p
 
 
+def planned_vram_mb(state: dict, registry=None) -> float | None:
+    """The running plan's own weights+KV prediction, in MiB, or None.
+
+    A17d. `engine_log.compare_plan` can only judge the VRAM axis against the
+    PLAN'S OWN prediction for the same ctx / cache / slots — `memtruth.planned_mb`,
+    the exact function `verify_plan` compares the fit oracle against — and the
+    live `/api/server/findings` route passed nothing, so the axis was permanently
+    `not_comparable`. This rebuilds the plan from the state the launch wrote and
+    hands it to that same function; it is not a second estimate.
+
+    The plan is not persisted, so it is reconstructed from what state.json
+    records: `model` + `quant` select the registry's `GgufFile` (the same bytes
+    the fit charged), and `ctx` + `kv_cache` are the flags the launch recorded.
+    `cache_type_v` is not recorded, but `ComboFlags._symmetric_kv` forces K and V
+    equal, so the recorded K IS the V type — a plan that reached a launch always
+    had symmetric caches.
+
+    Returns None — never a number — whenever an input is missing: no model, no
+    quant, no ctx, an unknown model/quant, or an invalid cache type. A bare file
+    size would read as a divergence that is only the KV cache (GUIDANCE 5), so
+    "cannot compute" must stay None and let the axis say `not_comparable`.
+    """
+    from . import memtruth
+    from .models import ComboFlags, RunPlan
+    from .registry import Registry
+    slug = str(state.get("model") or "")
+    quant = str(state.get("quant") or "")
+    ctx = int(state.get("ctx") or 0)
+    if not slug or not quant or ctx <= 0:
+        return None
+    try:
+        reg = registry if registry is not None else Registry.load()
+        spec = reg.models.get(slug)
+        if spec is None:
+            return None
+        gguf = next((g for g in spec.ggufs if g.quant == quant), None)
+        if gguf is None:
+            return None
+        k = str(state.get("kv_cache") or "") or "f16"
+        plan = RunPlan(model_slug=slug, gguf=gguf,
+                       backend=str(state.get("backend") or "unknown"),
+                       flags=ComboFlags(ctx=ctx, cache_type_k=k,
+                                        cache_type_v=k),
+                       origin="state")
+        return float(memtruth.planned_mb(plan))
+    except Exception:
+        # A state written by a hand edit, or a registry that predates the model,
+        # is "no prediction", never an error on a read route.
+        _log.debug("planned_vram_mb: no plan prediction from state",
+                   exc_info=True)
+        return None
+
+
 def switch_options(state: dict, registry=None, profile=None) -> list[dict]:
     """Alternative plans limited to models already on disk (no downloads).
 
