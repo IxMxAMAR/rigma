@@ -1177,7 +1177,10 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
             argv, env=_env(), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace", bufsize=1,
-            creationflags=_NO_WINDOW)
+            creationflags=_NO_WINDOW,
+            # Detached on POSIX so `kill_tree`'s killpg reaches mcode's group and
+            # NOT Rigma's own (which a non-detached child would share).
+            **_harness._detached_kwargs())
     except OSError as e:
         yield TurnEvent("error", f"could not start mcode: {e}")
         return

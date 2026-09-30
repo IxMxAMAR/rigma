@@ -234,10 +234,14 @@ def test_a_stream_failure_does_not_leak_the_child(fake_cli, monkeypatch):
     def spy(*a, **k):
         p = real_popen(*a, **k)
         if p.stdout is not None:
-            # the TURN's child, not one of the setup commands (`provider list`
-            # is run through subprocess.run, which has no pipe). Hold the pipe
-            # ITSELF: Popen drops the attribute once the child is reaped, and
-            # the leak this checks for is the FD, not the attribute.
+            # The turn child is the one whose stdout is a PIPE. Anything else
+            # reaching `Popen` while this spy is installed has no pipe: the
+            # `taskkill` that `_stop -> kill_tree -> tools._kill_tree` spawns on
+            # the failure path (stdout=DEVNULL), and mcode's setup commands
+            # (subprocess.run, no pipe). Which of those is the LAST `Popen` call
+            # is a child-exit RACE, so select on the pipe, not on order. Hold the
+            # pipe ITSELF: Popen drops the attribute once the child is reaped,
+            # and the leak this checks for is the FD, not the attribute.
             proc_seen["p"], proc_seen["out"] = p, p.stdout
         return p
 
@@ -488,6 +492,47 @@ sys.exit(2)
 '''
 
 BASE = "http://127.0.0.1:11500/v1"
+
+
+def test_an_mcode_child_is_detached_on_posix_only(monkeypatch):
+    """mcode must be in its OWN process group on POSIX.
+
+    `kill_tree` reaches a tree with `killpg` there, and a child left in RIGMA's
+    group would make a stop take the server down with it. Windows is unchanged.
+
+    The setup commands are stubbed so the only `Popen` the spy sees is the turn
+    child's — a `subprocess.run` helper would be captured first otherwise.
+    """
+    captured = []
+
+    class _Stop(Exception):
+        pass
+
+    def spy(argv, **kw):
+        captured.append(kw)
+        raise _Stop
+
+    monkeypatch.setattr(harness_mcode, "bin_path", lambda: "mcode")
+    monkeypatch.setattr(harness_mcode, "_drift_notice", lambda exe: None)
+    monkeypatch.setattr(harness_mcode, "ensure_provider",
+                        lambda *a, **k: ("pid", ""))
+    monkeypatch.setattr(harness_mcode, "ensure_agents_md", lambda: None)
+    monkeypatch.setattr(harness_mcode, "ensure_mcp", lambda cwd: None)
+    monkeypatch.setattr(harness_mcode.subprocess, "Popen", spy)
+
+    def drive():
+        return list(harness_mcode.drive_turn(
+            base_url=BASE, model="local-test", prompt="p", state={}, timeout=5))
+
+    monkeypatch.setattr(harness_mcode._harness, "_DETACH_CHILDREN", True)
+    with pytest.raises(_Stop):
+        drive()
+    assert captured[-1].get("start_new_session") is True, captured[-1]
+
+    monkeypatch.setattr(harness_mcode._harness, "_DETACH_CHILDREN", False)
+    with pytest.raises(_Stop):
+        drive()
+    assert "start_new_session" not in captured[-1], captured[-1]
 
 
 def _prov(pid="custom_provider:rigma", *, active=True, enabled=True, url=BASE):

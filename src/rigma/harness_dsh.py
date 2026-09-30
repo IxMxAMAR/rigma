@@ -729,6 +729,9 @@ def _spawn(pkey: str, key: tuple, env: dict) -> "_Live":
         errors="replace",
         bufsize=1,
         env=env,
+        # Detached on POSIX so `kill_tree`'s killpg reaches this runner's group
+        # and NOT Rigma's own (which a non-detached child would share).
+        **_harness._detached_kwargs(),
     )
     _start_readers(run)
     live = _Live(run.proc, run, key)
