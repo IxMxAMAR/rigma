@@ -63,6 +63,18 @@ DOWNLOAD_ATTEMPTS = 6   # multi-GB pulls WILL drop; resume and retry
 # OSError from the write, arriving after the damage and leaving a huge .part.
 PULL_FREE_MARGIN_BYTES = 2 * 2**30
 
+# The floor a probed context window is raised to: a gguf whose header omits
+# `context_length` (or reports a tiny one) still gets a usable window. The SAME
+# 2048 launch floor is written out again at `server_ops.py:754`
+# (`max(2048, min(int(ctx), native))`), `serve.py:4731` (the "ctx must be at
+# least 2048" route guard) and the frontend's `CTX_FLOOR`
+# (`frontend-v2/src/models/LaunchDefaultsDialog.tsx`). Named here so THIS site
+# cannot drift; unifying the other three is a later wave's change. Note that
+# `resolve._ctx_floor` is a DIFFERENT floor — `CTX_FLOOR = 8192`
+# (`resolve.py:111`, used at `:297`); the 2048 in `resolve.py:1072` is the
+# `quant_verdicts` probe ladder, not this floor.
+MIN_NATIVE_CTX = 2048
+
 
 class HangarError(RuntimeError):
     pass
@@ -356,7 +368,7 @@ def spec_fields_from_probe(f: dict) -> dict:
     return {"n_layers": max(1, f["n_layers"]),
             "full_attn_layers": f["full_attn_layers"],
             "kv_heads": f["kv_heads"], "head_dim": f["head_dim"],
-            "native_ctx": max(2048, f["native_ctx"]),
+            "native_ctx": max(MIN_NATIVE_CTX, f["native_ctx"]),
             "params": int(f.get("params", 0) or 0),
             "mtp_layers": int(f.get("mtp_layers", 0) or 0),
             "full_attention_interval":
