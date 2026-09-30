@@ -57,6 +57,42 @@ def test_the_example_is_the_most_recent_occurrence():
         "the panel would describe a previous launch's model as the one running")
 
 
+# A new engine PROCESS starts at its parameter dump — the first line of every
+# one of this machine's 16 `server-*.log` files.
+BANNER = "0.00.038 I cmn common_param: common_params_print_info: verbosity = 3\n"
+
+
+def test_a_warning_from_a_previous_launch_is_not_attributed_to_this_one():
+    """06R3-10: `findings` scanned the whole log and quoted the last matching
+    line, so a launch that came up clean still reported the PREVIOUS launch's
+    warning as a fact about the engine that is up now. The engine's own
+    parameter dump marks where each process starts; only the last process's
+    lines belong to the running engine."""
+    text = (BANNER + REAL
+            + BANNER + "0.00.9 I srv init: initializing slots, n_slots = 2\n")
+
+    assert engine_log.findings(text) == []
+
+
+def test_a_warning_in_the_current_launch_is_reported_once():
+    text = BANNER + REAL + BANNER + REAL
+
+    got = engine_log.findings(text)
+
+    assert [f["id"] for f in got] == ["cache_reuse_disabled"]
+    # the CURRENT launch's one line, not the same warning from both launches
+    assert got[0]["count"] == 1
+
+
+def test_without_a_launch_banner_the_last_occurrence_is_still_used():
+    """A tail that begins mid-launch carries no marker to segment on, so the
+    whole text is scanned exactly as before — `findings` then makes no claim
+    beyond "this text contains it" (see the docstring)."""
+    got = engine_log.findings(REAL)
+
+    assert [f["id"] for f in got] == ["cache_reuse_disabled"]
+
+
 def test_empty_and_none_are_not_errors():
     assert engine_log.findings("") == []
     assert engine_log.findings(None) == []
