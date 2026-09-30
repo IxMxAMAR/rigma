@@ -357,6 +357,33 @@ class ComboFlags(BaseModel):
     batch: int = 0        # -b logical batch (0 = engine default 2048)
     ubatch: int = 0       # -ub physical batch (0 = engine default 512)
     env: dict[str, str] = Field(default_factory=dict)  # engine-spawn env overrides
+    # C2: a SWEEP-TRIALLED lever, never a launch default. `--no-op-offload`
+    # keeps llama.cpp's KV-cache KQ/KQV ops on the CPU instead of offloading
+    # them to the device. Verified at BOTH pins:
+    #   raw.githubusercontent.com/PrismML-Eng/llama.cpp/87268f77/common/arg.cpp
+    #     L2929-2936: {"--op-offload"}, {"--no-op-offload"} — bool, `params.no_op_offload = !value`
+    #   raw.githubusercontent.com/ggml-org/llama.cpp/b9867/common/arg.cpp
+    #     L2639-2646: the same pair, identically
+    # and the compiled default is op-offload ON at both pins:
+    #   .../87268f77/common/common.h L572: `bool no_op_offload = false;`
+    #   .../b9867/common/common.h    L581: `bool no_op_offload = false;`
+    # so this is a pure off-switch: True emits `--no-op-offload`, False emits
+    # NOTHING and every pre-existing argv stays byte-identical.
+    #
+    # WHY this lever is worth a trial on THIS card (RX 9070 XT, ROCm): it is the
+    # same class of lever as the GGML_VK_* driver toggles the sweep already A/Bs
+    # — a placement decision whose direction on RDNA4 is not knowable from first
+    # principles, only by a measurement, which is what a sweep row is for.
+    #
+    # PREDICTION (§0.5), NOT a measurement: if one offloaded KV op costs ~20 us
+    # of extra launch/sync overhead (UNVERIFIED assumed constant) and a 32-layer
+    # model runs one such op per layer per decoded token, host-side placement
+    # saves 32 * 20 us = 0.64 ms/token. Against the 36.8 t/s live figure already
+    # recorded in bench.crowned_row's docstring (27.2 ms/token) that is
+    # 27.2 -> 26.6 ms, about +2.4%.
+    # Below ~2 us/op the win is under 0.25% and the row must lose to baseline.
+    # The sweep decides; nothing here assumes it wins.
+    no_op_offload: bool = False
 
     @field_validator("flash_attn", mode="before")
     @classmethod
@@ -479,6 +506,13 @@ class RunPlan(BaseModel):
         args += ["-fa", self.flags.flash_attn]
         args += ["--cache-type-k", self.flags.cache_type_k,
                  "--cache-type-v", self.flags.cache_type_v]
+        # C2: keep the KV KQ/KQV ops on the CPU. The default (False) emits
+        # nothing, so no existing launch or argv changes; only a sweep that
+        # trialled and crowned this axis turns it on. Flag spelling and the
+        # op-offload-ON default verified at both pins — see
+        # ComboFlags.no_op_offload for the URLs/lines and the PREDICTION.
+        if self.flags.no_op_offload:
+            args += ["--no-op-offload"]
         if self.flags.reasoning:
             args += ["--reasoning", self.flags.reasoning]
         if self.flags.reasoning_budget >= 0:
