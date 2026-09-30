@@ -13,6 +13,11 @@ import json
 import sys
 
 port = int(sys.argv[sys.argv.index("--port") + 1])
+# `--token VALUE` is echoed as the X-Rigma-Fake-Token header on /health. The
+# bench fixture generates one per child so it can prove the readiness 200 came
+# from ITS OWN process and not from a foreign listener that happens to own the
+# port (REC-1). Absent, no header is sent.
+token = sys.argv[sys.argv.index("--token") + 1] if "--token" in sys.argv else ""
 logpath = sys.argv[sys.argv.index("--log") + 1] if "--log" in sys.argv else ""
 # `--tool NAME` makes the fake model ask for a tool on its FIRST request and
 # answer in words on the next one, so a test can see how an agent backend
@@ -58,7 +63,10 @@ CHUNKS = ("hello ", "from ", "dsh")
 
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200 if self.path == "/health" else 404)
+        health = self.path == "/health"
+        self.send_response(200 if health else 404)
+        if health and token:
+            self.send_header("X-Rigma-Fake-Token", token)
         self.end_headers()
 
     def do_POST(self):
