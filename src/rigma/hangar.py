@@ -68,6 +68,18 @@ class HangarError(RuntimeError):
     pass
 
 
+def _validation_message(err: dict) -> str:
+    """A pydantic error's message as the author wrote it.
+
+    Pydantic prefixes every `ValueError` raised in a validator with exactly
+    "Value error, ". That prefix is pydantic's, not the sentence the author
+    wrote, and this string is rendered verbatim in the launch dialog (the route
+    returns it as the 400 body), so strip that one prefix. A message that does
+    not carry it — or one that carries something else — is returned untouched.
+    """
+    return str(err.get("msg", err)).removeprefix("Value error, ")
+
+
 def models_dir() -> Path:
     p = rigma_home() / "models"
     p.mkdir(parents=True, exist_ok=True)
@@ -1158,13 +1170,16 @@ def set_launch_defaults(slug: str, registry=None, **fields) -> ModelSpec:
     try:
         launch = LaunchDefaults(**current)
     except ValidationError as e:
-        # C10: `batch`/`ubatch` are cross-checked (ubatch > batch is refused by
-        # the engine), so a bad pair is a user error with a user-facing reason —
-        # the same 400 as every other bad launch setting, not a 500. Before the
-        # check existed there was nothing here that could fail validation; now
-        # there is, and the route catches HangarError only.
+        # C10: `batch`/`ubatch` are cross-checked (the SERVER refuses a
+        # `ubatch > batch` pair; the engine would only clamp it), so a bad pair
+        # is a user error with a user-facing reason — the same 400 as every
+        # other bad launch setting, not a 500. Before the check existed there
+        # was nothing here that could fail validation; now there is, and the
+        # route catches HangarError only. Pydantic's own "Value error, " prefix
+        # is stripped: the dialog shows this sentence verbatim, and the prefix
+        # is pydantic's, not the author's.
         raise HangarError("; ".join(
-            str(err.get("msg", err)) for err in e.errors())) from None
+            _validation_message(err) for err in e.errors())) from None
     # Everything cleared means no opinion at all; store None rather than an
     # empty object, so a spec that pins nothing reads as pinning nothing.
     updated = spec.model_copy(update={
