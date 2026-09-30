@@ -454,6 +454,19 @@ export const engineApi = {
    *  dialog could WRITE a default but never show the one already stored. */
   modelDefaults: (slug: string) =>
     j<ModelDefaults>("GET", `/api/models/${slug}/defaults`),
+  /** D4b: re-read the gguf and correct the stored geometry/capabilities. Only
+   *  custom models; a registry spec is hand-authored and the route answers 409
+   *  with its own sentence. Costs a ranged header read over the network, which
+   *  is why it is explicit rather than automatic. */
+  reprobeModel: (slug: string) =>
+    j<ProbedFacts & { slug: string }>(
+      "POST", `/api/models/${slug}/reprobe`),
+  /** D4b: rename a custom model, carrying its template and calibration rows.
+   *  409 with the server's sentence when it is not custom, the name is empty,
+   *  the name is taken, or the model is running. */
+  renameModel: (slug: string, newSlug: string) =>
+    j<{ slug: string }>(
+      "POST", `/api/models/${slug}/rename`, { slug: newSlug }),
 };
 
 export const gb = (n: number) => (n / 2 ** 30).toFixed(1) + " GB";

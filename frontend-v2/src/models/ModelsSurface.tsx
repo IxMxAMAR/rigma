@@ -620,6 +620,10 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
   // have its defaults edited.
   const [setup, setSetup] = useState(false);
   const [showDefaults, setShowDefaults] = useState(false);
+  // D4b: reprobe / rename, custom models only (the routes refuse a registry
+  // spec with a 409 and their own sentence).
+  const [renaming, setRenaming] = useState(false);
+  const [renameText, setRenameText] = useState("");
   const anyOnDisk = card.quants.some((q) => q.on_disk);
   const onDiskGb = card.quants.filter((q) => q.on_disk)
     .reduce((n, q) => n + q.bytes, 0)
@@ -654,6 +658,41 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
         return;
       }
       setNote(switchNotice(await engineApi.switchTo(card.slug)));
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+    onAction();
+  };
+
+  /** D4b: re-read the gguf. The route may spend a ranged header read over the
+   *  network, which is why it is explicit; the server's 409 sentence ("not a
+   *  custom model…", "nothing of X is downloaded…") is shown verbatim. */
+  const reprobe = async () => {
+    setBusy(true);
+    setErr(null);
+    setNote(null);
+    try {
+      await engineApi.reprobeModel(card.slug);
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+    onAction();
+  };
+
+  /** D4b: rename a custom model. The route carries the repaired template and
+   *  the calibration rows with it, and refuses with its own sentence when the
+   *  name is unusable, taken, or the model is running. */
+  const rename = async () => {
+    const to = renameText.trim();
+    if (!to) return;
+    setBusy(true);
+    setErr(null);
+    setNote(null);
+    try {
+      await engineApi.renameModel(card.slug, to);
+      setRenaming(false);
     } catch (e) {
       setErr((e as Error).message);
     }
@@ -737,6 +776,55 @@ function Card({ card, onAction }: { card: ModelCard; onAction: () => void }) {
           note={note}
           className="rounded-md bg-surface text-secondary px-2.5 py-1.5 font-mono text-[11.5px] mb-2"
         />
+      )}
+      {card.custom && (
+        <div className="flex items-center gap-2 mb-2 flex-wrap">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void reprobe()}
+            title={"Re-read the gguf and correct the stored geometry and "
+                   + "capabilities. May read the repo header over the network, "
+                   + "which is why it is a click and not automatic."}
+            className="rounded-md bg-surface hover:bg-float text-muted px-2.5 py-0.5 text-[11.5px] disabled:opacity-40"
+          >
+            reprobe
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setRenaming((v) => !v);
+              setRenameText(card.slug);
+            }}
+            title={"Rename this model. Its repaired chat template and its "
+                   + "calibration rows move with it — renaming by hand used to "
+                   + "orphan both."}
+            className="rounded-md bg-surface hover:bg-float text-muted px-2.5 py-0.5 text-[11.5px] disabled:opacity-40"
+          >
+            rename
+          </button>
+          {renaming && (
+            <form
+              className="flex items-center gap-1.5"
+              onSubmit={(e) => { e.preventDefault(); void rename(); }}
+            >
+              <input
+                value={renameText}
+                onChange={(e) => setRenameText(e.target.value)}
+                aria-label={`new name for ${card.slug}`}
+                className="rounded-md bg-surface px-2 py-0.5 font-mono text-[11.5px] outline-none"
+              />
+              <button
+                type="submit"
+                disabled={busy || !renameText.trim()}
+                className="rounded-md bg-amber/15 text-amber px-2.5 py-0.5 text-[11.5px] font-semibold disabled:opacity-40"
+              >
+                save name
+              </button>
+            </form>
+          )}
+        </div>
       )}
       <NoTemplateNotice card={card} />
       <div className="font-mono text-[11.5px] text-muted mb-2">

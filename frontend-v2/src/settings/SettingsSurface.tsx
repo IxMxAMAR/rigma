@@ -6,6 +6,8 @@ import EmptyState from "../EmptyState";
 import LoadError from "../LoadError";
 import InlineError from "../InlineError";
 import AppSettingsCard from "./AppSettingsCard";
+import BackupCard from "./BackupCard";
+import McpCard from "./McpCard";
 import { engineApi } from "../lib/engineApi";
 import { readList, responseError } from "../lib/listFetch";
 import { openaiBase } from "../lib/openaiBase";
@@ -74,6 +76,11 @@ export default function SettingsSurface() {
             settings, so they belong on this page rather than in a chat's ⚙
             panel or a model's card. */}
         <AppSettingsCard />
+        {/* D4c: `/api/backup` + `/api/restore` and the MCP status report.
+            Restore replaces the whole store, so it lives behind its own
+            confirmation; the MCP report starts servers, so it is manual. */}
+        <BackupCard />
+        <McpCard />
         <section className="rounded-lg bg-panel p-4">
           <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-3">
             presets
