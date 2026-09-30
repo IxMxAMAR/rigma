@@ -72,14 +72,19 @@ REAL_LOAD = (
     "0.04.417.939 I sched_reserve: graph splits = 2\n"
 )
 
-# The plan's OWN prediction for the real load: the weight file
-# (CPU_Mapped 322.07 + ROCm0 6539.67 = 6861.74 MiB) plus the KV cache the
-# resolver computed for the same ctx (65536), cache type and slot count
-# (2176.00 MiB). These are exactly `memtruth.planned_mb`'s two terms. NOT the
-# file size on its own — the engine's actual includes the KV cache, and
-# comparing against 6861.74 alone reports a +35% "overrun" that is only the
-# cache (see `test_a_bare_file_size_would_report_the_kv_cache_as_a_divergence`).
-PLAN_PREDICTION_MB = 6861.74 + 2176.00        # 9037.74
+# The plan's OWN prediction for the real load, i.e. `memtruth.planned_mb` on the
+# real plan (ternary-bonsai-2-27b-uncensored-heretic-pq2-0, ctx 65536, q8_0/q8_0):
+# the WHOLE GGUF file (7,206,168,928 bytes = 6872.34 MiB) plus the KV cache the
+# resolver computed for the same ctx, cache type and slot count (2176.00 MiB)
+# = 9048.34 MiB. The weight term is the FILE, not the sum of the engine's weight
+# buffer labels below (CPU_Mapped 322.07 + ROCm0 6539.67 = 6861.74 MiB): those
+# buffers omit ~10.60 MiB of GGUF metadata, so using the label sum understates
+# the plan (9037.74 instead of 9048.34). NOT the file size on its own either —
+# the engine's actual includes the KV cache, and comparing against the weights
+# alone reports a +35% "overrun" that is only the cache (see
+# `test_a_bare_file_size_would_report_the_kv_cache_as_a_divergence`).
+GGUF_BYTES = 7206168928
+PLAN_PREDICTION_MB = GGUF_BYTES / 2**20 + 2176.00      # 9048.34
 
 # A log that never loaded anything: the panel must say UNKNOWN, never 0.
 NO_BUFFERS = (
@@ -411,26 +416,26 @@ def test_divergence_is_measured_against_device_vram_only():
     assert r["actual_vram_mb"] == pytest.approx(9275.57)
     assert r["host_ram_mb"] == pytest.approx(406.35)
     # against the plan's OWN prediction the gap is the compute buffer and the
-    # RS buffer minus the host-mapped weights, ~2.6% — not the 32% a bare
+    # RS buffer minus the host-mapped weights, ~2.5% — not the 32% a bare
     # budget produced.
-    assert r["divergence_mb"] == pytest.approx(237.83, abs=0.01)
-    assert r["divergence_pct"] == pytest.approx(2.6315, abs=1e-3)
+    assert r["divergence_mb"] == pytest.approx(227.23, abs=0.01)
+    assert r["divergence_pct"] == pytest.approx(2.5113, abs=1e-3)
 
 
 def test_a_bare_file_size_would_report_the_kv_cache_as_a_divergence():
     """GUIDANCE entry 5, pinned as a test.
 
     The engine's 9275.57 MiB "actual" includes the KV cache at ctx 65536.
-    Compared against the weight file alone (6861.74 MiB) that reads as a +35%
+    Compared against the weight file alone (6872.34 MiB) that reads as a +35%
     divergence that is entirely the KV cache; against the plan's own prediction
-    for the same ctx / cache / slots it is +2.6%.
+    for the same ctx / cache / slots it is +2.5%.
     """
     load = engine_log.parse_load(REAL_LOAD)
 
-    file_only = engine_log.compare_plan(load, 6861.74)
+    file_only = engine_log.compare_plan(load, GGUF_BYTES / 2**20)
     with_plan = engine_log.compare_plan(load, PLAN_PREDICTION_MB)
 
-    assert file_only["divergence_pct"] == pytest.approx(35.178, abs=1e-2)
+    assert file_only["divergence_pct"] == pytest.approx(34.970, abs=1e-2)
     assert file_only["vram_verdict"] == "diverges"
     assert with_plan["vram_verdict"] == "ok"
 
