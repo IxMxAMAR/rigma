@@ -47,6 +47,24 @@ LAUNCH_PARALLEL = 2
 ENGINE_DEFAULT_BATCH = 2048
 ENGINE_DEFAULT_UBATCH = 512
 
+# The smallest context Rigma will LAUNCH, preflight, price or attribute to a
+# model — the minimum usable window, in ONE place. It used to be a bare `2048`
+# at four Python sites that all have to agree: the relaunch raise-to
+# (`server_ops.perform_switch`), the `/api/server/ctx` preflight guard, the gguf
+# probe's floor for a header that omits `context_length` (`hangar`), and the
+# bottom rung of the `resolve.quant_verdicts` probe ladder. Raising the floor at
+# one of them alone would desync the others: the guard would reject a ctx the
+# raise-to would have accepted and silently bumped, and the Models page would
+# keep pricing a window no launch produces.
+#
+# NOT the same quantity as `resolve.PLAN_CTX_FLOOR` (8192). That one is the
+# smallest context the PLANNER will plan for — a model trained past it is
+# planned at it, and a model with a smaller window is planned at its own. This
+# one is the smallest context a launch will ask the engine for. The UI floors
+# (`data/ui/panels.js` and `frontend-v2/src/models/LaunchDefaultsDialog.tsx`,
+# both spelled `CTX_FLOOR`) are THIS floor, not the planning one. W5F5B-N3.
+MIN_LAUNCH_CTX = 2048
+
 
 def batch_pair_error(batch: int, ubatch: int) -> str:
     """Why this `-b`/`-ub` pair cannot launch, or "" when it can.
