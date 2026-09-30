@@ -297,6 +297,13 @@ def _inspect(f, fallback: str) -> GgufInfo:
     swa_window = _as_int(g("attention.sliding_window", 0) or 0,
                          f"{arch}.attention.sliding_window")
     swa_layers = swa_kv_heads = 0
+    # How many layers hold a FIXED recurrent state (Mamba/DeltaNet) rather than a
+    # growing KV cache. Positive evidence only, from the same attention pattern
+    # that decides `full_attn_layers`: a scalar kv count with a hybrid interval,
+    # or a per-layer table whose zero-kv-head rows are linear attention. A
+    # sliding-window model's windowed layers are NOT recurrent — they hold a
+    # windowed KV cache — so that branch leaves this 0.
+    recurrent_layers = 0
     if isinstance(kv, list):
         if isinstance(swa, list) and len(swa) == len(kv):
             gi = [i for i, w in enumerate(swa) if not w]   # global-layer indices
@@ -328,6 +335,7 @@ def _inspect(f, fallback: str) -> GgufInfo:
                             if _as_int(h, f"{arch}.attention.head_count_kv") > 0)
             kv_heads = max((_as_int(h, f"{arch}.attention.head_count_kv")
                             for h in kv), default=0)
+            recurrent_layers = max(0, n_layers - full_attn)
     else:
         # A SCALAR kv head count does not mean every layer is full attention.
         # Qwen3.5/3.8 interleave SSM (linear-attention) layers and declare the
@@ -345,6 +353,7 @@ def _inspect(f, fallback: str) -> GgufInfo:
                            f"{arch}.full_attention_interval")
         if interval > 1 and n_layers > 0:
             full_attn = max(1, n_layers // interval)
+            recurrent_layers = max(0, n_layers - full_attn)
         else:
             full_attn = n_layers
         kv_heads = _as_int(kv, f"{arch}.attention.head_count_kv")
@@ -354,6 +363,18 @@ def _inspect(f, fallback: str) -> GgufInfo:
         if heads else 0)
     caps, has_template = _capabilities(meta, tx)
     experts = _as_int(g("expert_count", 0) or 0, f"{arch}.expert_count")
+    # Recurrent-state geometry. llama.cpp allocates a per-sequence RS buffer for
+    # every recurrent layer, sized from these four keys (llama-hparams.cpp):
+    #     n_embd_s() = ssm_d_state * ssm_d_inner
+    #     n_embd_r() = (ssm_d_conv - 1) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state)
+    # A dense file has none of them and reports zeros, so it is charged nothing.
+    # `time_step_rank` is NOT read: it cancels out of n_embd_s, which the source
+    # writes as state * inner.
+    ssm_state = _as_int(g("ssm.state_size", 0) or 0, f"{arch}.ssm.state_size")
+    ssm_inner = _as_int(g("ssm.inner_size", 0) or 0, f"{arch}.ssm.inner_size")
+    ssm_conv = _as_int(g("ssm.conv_kernel", 0) or 0, f"{arch}.ssm.conv_kernel")
+    ssm_groups = _as_int(g("ssm.group_count", 0) or 0,
+                         f"{arch}.ssm.group_count")
     fields = {"n_layers": n_layers, "full_attn_layers": full_attn,
               "kv_heads": kv_heads, "head_dim": head_dim,
               "native_ctx": _as_int(g("context_length", 0),
@@ -371,6 +392,13 @@ def _inspect(f, fallback: str) -> GgufInfo:
               "swa_layers": swa_layers if swa_window else 0,
               "swa_kv_heads": swa_kv_heads if swa_window else 0,
               "swa_window": swa_window if swa_layers else 0,
+              # recurrent-state geometry: how many layers, and the four ssm.*
+              # numbers that size the buffer llama.cpp allocates for them.
+              "recurrent_layers": recurrent_layers,
+              "ssm_state_size": ssm_state,
+              "ssm_inner_size": ssm_inner,
+              "ssm_conv_kernel": ssm_conv,
+              "ssm_group_count": ssm_groups,
               "mtp_layers": mtp_layers,
               # the file's own inventory, not the header's claims
               "mtp": tx.has_mtp,

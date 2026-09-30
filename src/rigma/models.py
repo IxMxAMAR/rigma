@@ -27,6 +27,15 @@ CACHE_BYTES = {
     "q4_0": 0.5625,
 }
 
+# The `--parallel` value every launch uses, in ONE place: `RunPlan.server_args`
+# writes it into the argv and `resolve` multiplies the hybrid recurrent-state
+# buffer by it. Two literals would drift, and a fit that budgets one sequence
+# while the engine allocates two is the silent overcommit this arithmetic exists
+# to prevent. --kv-unified keeps the KV pool at ctx, so this multiplies only the
+# recurrent state (llama_memory_recurrent sizes its buffer by n_seq_max), not the
+# KV cache.
+LAUNCH_PARALLEL = 2
+
 
 def _valid_cache_type(v: str) -> str:
     if v not in CACHE_BYTES:
@@ -287,6 +296,17 @@ class ModelSpec(BaseModel):
     swa_layers: int = 0
     swa_kv_heads: int = 0
     swa_window: int = 0
+    # Recurrent (Mamba/DeltaNet-style) layers and the geometry llama.cpp uses to
+    # size their per-sequence RS buffer. `recurrent_layers` is how many of
+    # `n_layers` hold a fixed recurrent state instead of a growing KV cache;
+    # gguf_meta derives it from the attention pattern. The four ssm_* values are
+    # the header's `ssm.*` keys. A model that declares recurrent layers without
+    # them is charged 0 and MARKED UNKNOWN by the fit rather than read as dense.
+    recurrent_layers: int = 0
+    ssm_state_size: int = 0
+    ssm_inner_size: int = 0
+    ssm_conv_kernel: int = 0
+    ssm_group_count: int = 0
     # False = the gguf shipped no tokenizer.chat_template, so an empty
     # capability list is missing evidence rather than a finding about the model.
     has_template: bool = True
@@ -417,7 +437,7 @@ class RunPlan(BaseModel):
         # full ctx PER SLOT — the 4x overflow the old --parallel 1 avoided).
         args = ["-m", model_path, "--port", str(port), "--host", "127.0.0.1",
                 "-ngl", str(self.flags.ngl), "-c", str(self.flags.ctx),
-                "--parallel", "2", "--kv-unified"]
+                "--parallel", str(LAUNCH_PARALLEL), "--kv-unified"]
         if self.flags.n_cpu_moe > 0:
             args += ["--n-cpu-moe", str(self.flags.n_cpu_moe)]
         if self.flags.batch > 0:

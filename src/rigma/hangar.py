@@ -38,7 +38,9 @@ MTP_PROBE_LIMIT = 8
 #   3  MTP block excluded from n_layers; MTP verified from the tensor table;
 #      exact parameter/expert counts; "no chat template" told apart from
 #      "no capabilities"
-PROBE_VERSION = 3
+#   4  the recurrent (SSM/DeltaNet) layer count and the ssm.* geometry that
+#      sizes the per-sequence RS buffer the fit had been charging as zero
+PROBE_VERSION = 4
 _QUANT_RE = re.compile(
     r"(UD-)?(I?Q\d(?:_[A-Z0-9]+)*|F16|BF16|F32|MXFP4(?:_[A-Z0-9]+)*)",
     re.IGNORECASE)
@@ -345,6 +347,14 @@ def spec_fields_from_probe(f: dict) -> dict:
             "swa_layers": int(f.get("swa_layers", 0) or 0),
             "swa_kv_heads": int(f.get("swa_kv_heads", 0) or 0),
             "swa_window": int(f.get("swa_window", 0) or 0),
+            # The recurrent layers hold a fixed state, and llama.cpp allocates a
+            # per-sequence RS buffer for them. Without these the fit charged
+            # zero — 299 MiB of a 16GB card at --parallel 2.
+            "recurrent_layers": int(f.get("recurrent_layers", 0) or 0),
+            "ssm_state_size": int(f.get("ssm_state_size", 0) or 0),
+            "ssm_inner_size": int(f.get("ssm_inner_size", 0) or 0),
+            "ssm_conv_kernel": int(f.get("ssm_conv_kernel", 0) or 0),
+            "ssm_group_count": int(f.get("ssm_group_count", 0) or 0),
             "has_template": bool(f.get("has_template", True)),
             "probe_version": PROBE_VERSION}
 
