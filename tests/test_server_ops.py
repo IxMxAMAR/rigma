@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from types import SimpleNamespace
 
@@ -424,3 +425,89 @@ def test_a_negative_placement_is_not_replayed(tmp_path, monkeypatch):
                            flags={"ngl": -4, "n_cpu_moe": -1}, ctx=8192)
 
     assert server_ops._measured_placement(rp, 8192) == {}
+
+
+# --- A8: a cache the engine will not load is not a silent cold start ----------
+
+def _switch_world(tmp_path, monkeypatch, refuse):
+    """A switch whose saved cache exists for exactly this configuration, with the
+    engine refusing (`refuse` is the reason) or accepting the slot load."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    reg, profile = _fake_world(tmp_path)
+    monkeypatch.setattr("rigma.bench.is_calibrated", lambda *a, **k: True)
+    monkeypatch.setattr("rigma.runtime.ensure_engine",
+                        lambda backend, os_name: tmp_path / "llama-server.exe")
+    monkeypatch.setattr("rigma.state.kill_pid", lambda pid: None)
+    fake_sp = SimpleNamespace(proc=SimpleNamespace(pid=4242))
+    monkeypatch.setattr("rigma.runtime.launch_server",
+                        lambda exe, plan, mp, port=0, timeout=300.0,
+                        extra_args=None: fake_sp)
+    # `launch_fingerprint` is a pure function of the plan; pin it so the test can
+    # plant the blob whose name it will ask for.
+    monkeypatch.setattr("rigma.kvcache.launch_fingerprint",
+                        lambda rp, exe: "deadbeefdeadbeef")
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "kv-deadbeefdeadbeef.bin").write_bytes(b"not a real cache")
+    calls = []
+
+    def fake_slot_action(port, slot, action, filename, timeout=120.0):
+        calls.append(action)
+        return refuse
+    monkeypatch.setattr("rigma.kvcache.slot_action", fake_slot_action)
+    state.write_state("current-model", "Q0", 18500, engine_pid=999999,
+                      ui_pid=os.getpid(), backend="vulkan",
+                      use_case="general", ctx=4096)
+    return reg, profile, calls
+
+
+def test_a_refused_cache_restore_is_loud_and_still_keys_the_unload_save(
+        tmp_path, monkeypatch, caplog):
+    """A8. `kvcache.restore` REPORTS a refusal — it returns `(False, reason)`
+    rather than raising — so the `except Exception: pass` that stood at
+    server_ops.py:819 never saw the ordinary failure. The reason was dropped and
+    the four-minute re-prefill happened with nothing said. It must be logged AND
+    surfaced on the launch output the caller returns."""
+    caplog.set_level(logging.WARNING, logger="rigma.server_ops")
+    reg, profile, calls = _switch_world(
+        tmp_path, monkeypatch, "engine refused the restore (500)")
+
+    out = server_ops.perform_switch("small-model", registry=reg, profile=profile)
+
+    assert calls == ["restore"], "the saved blob must have been offered"
+    note = out["notice"]
+    assert "re-prefilled from zero" in note, note
+    assert "engine refused the restore (500)" in note, note
+    assert any("kv-cache restore failed" in r.getMessage()
+               and "engine refused the restore (500)" in r.getMessage()
+               for r in caplog.records), caplog.text
+    # kv_fp is deliberately NOT cleared. It is not a claim that the restore
+    # happened; it is the key the unload save writes under, and that save is the
+    # only thing that overwrites the file the engine could not read.
+    assert out["kv_fp"] == "deadbeefdeadbeef"
+    saved = []
+    monkeypatch.setattr("rigma.kvcache.save",
+                        lambda port, d, fp, **k: saved.append(fp) or (fp, None))
+    monkeypatch.setattr("rigma.kvcache.prune", lambda d, keep=3: [])
+    server_ops.perform_unload()
+    assert saved == ["deadbeefdeadbeef"], (
+        "clearing kv_fp would skip this save, leave the unreadable file in "
+        "place forever, and re-prefill on every later restart")
+
+
+def test_a_cache_that_is_simply_absent_stays_silent(tmp_path, monkeypatch,
+                                                    caplog):
+    """The normal case after any configuration change is "no cache under this
+    name", which `restore` reports as `(False, None)` — not a failure. Warning
+    there would put a four-minute notice on every launch, and clearing kv_fp
+    would disable the unload save entirely."""
+    caplog.set_level(logging.WARNING, logger="rigma.server_ops")
+    reg, profile, calls = _switch_world(tmp_path, monkeypatch, None)
+    (tmp_path / "sessions" / "kv-deadbeefdeadbeef.bin").unlink()
+
+    out = server_ops.perform_switch("small-model", registry=reg, profile=profile)
+
+    assert calls == [], "no blob, so the engine is never asked"
+    assert "notice" not in out
+    assert not [r for r in caplog.records if "kv-cache" in r.getMessage()]
+    assert out["kv_fp"] == "deadbeefdeadbeef"
