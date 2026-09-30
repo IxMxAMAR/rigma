@@ -461,9 +461,42 @@ def plan_placement(plan) -> dict:
     Recorded as a dict, not two loose keys, so an old record (no `placement`)
     and a fully-resident record (`n_cpu_moe` 0) stay distinguishable: absent
     must read as unknown, never as the confident zero.
+
+    DR21RN1-n1: the dict also carries `ubatch`, the `-ub` THIS launch emitted
+    (`RunPlan.server_args`, from `plan.flags.ubatch`; 0 = no `-ub`, i.e. the
+    engine's own 512). That value is the ACTUAL physical batch the engine sizes
+    its compute buffer from, and it is not otherwise recoverable after the
+    launch: `rigma up --ubatch N` (cli.py) reaches the argv but is not a stored
+    model default, so the spec the reader later resolves still says its own
+    `launch.ubatch` — the spec default, not what ran. `planned_vram_mb` charges
+    `resolve.compute_buffer_mb` for that term, so it must charge it for the
+    ubatch that actually launched. `rp.flags.ubatch` is the same field
+    `server_args` emits the flag from, so the record and the argv cannot drift.
     """
     f = plan.flags
-    return {"ngl": int(f.ngl), "n_cpu_moe": int(f.n_cpu_moe)}
+    return {"ngl": int(f.ngl), "n_cpu_moe": int(f.n_cpu_moe),
+            "ubatch": int(f.ubatch)}
+
+
+def _recorded_ubatch(value) -> int | None:
+    """The `-ub` a placement records, or None when the record does not say.
+
+    DR21RN1-n1. Absent is UNKNOWN, never 0: 0 is a real launch value (no `-ub`,
+    engine default 512), so reading a missing key as 0 would be a confident
+    default about a launch nobody recorded — exactly the failure mode
+    DR2-1-residual closed for `ngl` / `n_cpu_moe`. Typed the same way as
+    `_measured_placement` (AUDIT 06R3-1): JSON has no integer type, so a
+    whole-number float is a legitimate way for a row to read back and is
+    coerced; a string, a bool, a fractional float or a negative is a corrupt
+    row, and a corrupt row is dropped rather than half-applied.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float):
+        if not value.is_integer():
+            return None
+        value = int(value)
+    return value if value >= 0 else None
 
 
 def recorded_placement(state: dict) -> dict | None:
@@ -474,7 +507,15 @@ def recorded_placement(state: dict) -> dict | None:
     all return None. None means UNKNOWN, never "fully resident" — the caller
     must not fall back to `ngl=99 / n_cpu_moe=0`, which is the assumption that
     made the VRAM axis unusable for the owner's MoE (deep-review-3.md). Both
-    keys are required; a placement missing one is not a placement.
+    `ngl` and `n_cpu_moe` are required; a placement missing one is not a
+    placement.
+
+    DR21RN1-n1: `ubatch` is OPTIONAL and read separately from those two. A
+    record written before the ubatch was persisted has no such key and reads as
+    None ("unknown") — the whole placement is still a placement, because
+    `ngl`/`n_cpu_moe` are what scale the weight term, so an OLD record keeps its
+    device-side prediction. Only the compute charge then falls back, and
+    `_planned_vram_mb` says how.
     """
     if not isinstance(state, dict):
         return None
@@ -482,9 +523,11 @@ def recorded_placement(state: dict) -> dict | None:
     if not isinstance(p, dict):
         return None
     try:
-        return {"ngl": int(p["ngl"]), "n_cpu_moe": int(p["n_cpu_moe"])}
+        out = {"ngl": int(p["ngl"]), "n_cpu_moe": int(p["n_cpu_moe"])}
     except (KeyError, TypeError, ValueError):
         return None
+    out["ubatch"] = _recorded_ubatch(p.get("ubatch"))
+    return out
 
 
 def planned_vram_mb(state: dict, registry=None) -> float | None:
@@ -513,6 +556,13 @@ def planned_vram_mb(state: dict, registry=None) -> float | None:
     so the two sides are on ONE basis at every spill depth. Without it a deep
     spill's small expected figure fell below the 512 MiB slack floor and a
     healthy load reported `plan_divergence`; see `_planned_vram_mb`.
+
+    DR21RN1-n1: that charge is priced from the ubatch the LAUNCH recorded
+    (`placement["ubatch"]`, written by `plan_placement`), not the spec's launch
+    default, because an explicit `rigma up --ubatch N` is not a stored model
+    default and is otherwise invisible to this reader. A placement from before
+    the ubatch was recorded has none, and only then does the spec's own launch
+    ubatch stand in; see `_planned_vram_mb`.
 
     Returns None — never a number — whenever an input is missing: no model, no
     quant, no ctx, an unknown model/quant, an invalid cache type, OR no recorded
@@ -568,9 +618,12 @@ def _plan_cache_key(state: dict, registry) -> tuple:
         ctx = str(state.get("ctx"))
     # DR2-1-res: the placement is part of the prediction (it scales the weight
     # term), so it must be part of the key — otherwise two states that differ
-    # only in ngl / n_cpu_moe would serve each other's number.
+    # only in ngl / n_cpu_moe would serve each other's number. DR21RN1-n1: the
+    # recorded ubatch is part of the prediction too (it prices the compute
+    # charge), so it is in the key for the same reason.
     p = recorded_placement(state)
-    placement_key = None if p is None else (p["ngl"], p["n_cpu_moe"])
+    placement_key = None if p is None else (p["ngl"], p["n_cpu_moe"],
+                                            p["ubatch"])
     return (home, None if registry is None else id(registry),
             str(state.get("model") or ""), str(state.get("quant") or ""), ctx,
             str(state.get("kv_cache") or ""), str(state.get("backend") or ""),
@@ -632,11 +685,33 @@ def _planned_vram_mb(state: dict, registry) -> float | None:
         # this to `_spilled > 0` would only move the window to the resident case
         # (a small model at a large `-ub`).
         #
-        # The ubatch is the SPEC's own launch default (`launch_ubatch`), which is
-        # the one `resolve` / `fit_for_launch` priced. state.json records no
-        # per-launch `-ub` override, so the spec default is the plan's own
-        # assumption and the only honest source here.
-        return device_side_mb + float(compute_buffer_mb(launch_ubatch(spec)))
+        # The ubatch that prices this charge is the one the LAUNCH actually
+        # used, recorded in the placement by `plan_placement` (DR21RN1-n1) —
+        # NOT the spec's launch default. `rigma up --ubatch 2048` reaches the
+        # argv (cli.py) but is not a stored model default, so the spec this
+        # reader resolves still says 0/512 while the engine sizes its compute
+        # buffer for 2048: charging the spec here made a HEALTHY override load
+        # report `plan_divergence` (+1491.12 MiB at 2048 against the 512 MiB
+        # slack — the item's own false-positive class, on a shipped CLI path).
+        recorded_ub = placement.get("ubatch")
+        if recorded_ub is None:
+            # FALLBACK, and only for an OLD record: a placement written before
+            # `plan_placement` carried the ubatch has no opinion on it, so the
+            # spec's launch ubatch is the one honest source left. It is safe
+            # because it is exactly what this reader charged before the record
+            # existed — an OLD record cannot newly false-positive because of
+            # this change — and because the charge is a FLOOR: at or below the
+            # engine default it is COMPUTE_BUFFER_MB = 150, below the 410.28
+            # MiB the engine really allocates at 512, and the 512 MiB slack
+            # absorbs that 512-vs-spec gap. The residual is a launch that
+            # OVERRODE a spec which itself sets `launch.ubatch`, and no shipped
+            # registry model or combo sets one today; only the record can close
+            # it, which is why a recorded 0 (a real "no -ub" launch) is honoured
+            # as 0 rather than treated as absent.
+            charge_ub = launch_ubatch(spec)
+        else:
+            charge_ub = recorded_ub
+        return device_side_mb + float(compute_buffer_mb(charge_ub))
     except Exception:
         # A state written by a hand edit, or a registry that predates the model,
         # is "no prediction", never an error on a read route.
