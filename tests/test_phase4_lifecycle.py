@@ -30,6 +30,10 @@ class _E4(BaseHTTPRequestHandler):
     # or failed depending on machine load (they failed in a full-suite run).
     hold = None                       # threading.Event or None
     hold_timeout = 30.0
+    # Set the moment a streaming turn is inside the hold. The pause tests use it
+    # to know the run loop has already passed the top-of-iteration pause check,
+    # so a fabricated pause cannot be observed before the test means it to be.
+    entered = None                    # threading.Event or None
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0))
@@ -62,6 +66,8 @@ class _E4(BaseHTTPRequestHandler):
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         if _E4.hold is not None:
+            if _E4.entered is not None:
+                _E4.entered.set()
             _E4.hold.wait(timeout=_E4.hold_timeout)
 
         def sse(o):
@@ -97,6 +103,7 @@ def home(tmp_path, monkeypatch):
     _E4.compile_reply = "not a spec"
     _E4.judge_replies = []
     _E4.hold = None
+    _E4.entered = None
     yield tmp_path
     try:
         a = runs.active()
@@ -289,27 +296,40 @@ def test_a_pause_does_not_burn_the_clock(engine, tmp_path):
     done — and answering it resumed straight into budget_exhausted, discarding
     the answer (AUDIT F44).
 
-    The engine holds its turn open, so the run provably cannot stall while the
-    test arranges the pause."""
+    `entered` is what makes this deterministic. The fabricated `_paused_at`
+    below is deliberately two hours old, which is EXACTLY the state the
+    model-pause bound stalls on (`test_a_model_pause_that_is_never_answered_*`
+    exercises that bound on purpose). Writing it while the run loop was still
+    before its first top-of-iteration pause check therefore raced the bound: the
+    loop could load `paused=True` + a 2h-old `_paused_at` + `pending_question`
+    and stall the run at iteration 0 with "paused waiting for an answer for over
+    60 minutes" before the answer landed — the ~10% flake. Waiting for
+    `entered` proves the loop is inside the held turn (past that check), and
+    answering while it is still held means the loop cannot observe the
+    fabricated pause until `paused` is already false."""
     hold = threading.Event()
+    entered = threading.Event()
     _E4.hold = hold
+    _E4.entered = entered
     _E4.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
     c = _client(engine)
     rid = c.post("/api/runs", json={"mission": "small job",
                                     "budget_hours": 1}).json()["id"]
     # the run is inside its first turn and cannot move until we let it
+    assert entered.wait(10), "the run never reached its first engine turn"
     r = runs.load(rid)
     r["paused"] = True
     r["pending_question"] = {"q": "which folder?"}
     r["_paused_at"] = time.time() - 7200
     before = r["deadline"]
     runs.save(r)
+    # answer it WHILE the turn is held: the loop cannot observe the fabricated
+    # pause until after `paused` is already false, so it cannot stall on it
+    assert c.post(f"/api/runs/{rid}/inject",
+                  json={"message": "the one on the left"}).json().get("queued")
     hold.set()
-    # it observes the pause at the top of the next iteration
-    r = _wait(c, rid, until=lambda x: x.get("_paused_at") and x.get("paused"))
-    assert r["paused"] is True, r
-    # answer it: the run resumes, and the two hours come back
-    c.post(f"/api/runs/{rid}/inject", json={"message": "the one on the left"})
+    # it observes the pause at the top of the next iteration, banks the two
+    # hours it cost, and resumes
     r = _wait(c, rid, until=lambda x: not x.get("_paused_at"))
     assert r["deadline"] >= before + 7000, (before, r["deadline"])
     assert r.get("status") != "budget_exhausted", r.get("halt_reason")
