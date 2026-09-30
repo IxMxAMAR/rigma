@@ -4,11 +4,11 @@
 every ACP `elicitation/create` was answered `decline` and the agent silently took
 its non-interactive fallback — the question was never shown to anyone.
 
-The handler is the SAME handshake as the permission one, deliberately: one
-`_approvals` slot per session, the same `approval/asked` event, the same
-`POST /api/sessions/{sid}/approval` route. These tests drive a real chat turn whose
-adapter asks one question, answer it through that route, and assert the answer the
-handler returned reaches the turn's output.
+The handler is the SAME handshake as the permission one, deliberately: one slot
+per question in `_questions`, keyed by request id, the same `approval/asked`
+event, the same `POST /api/sessions/{sid}/approval` route. These tests drive a
+real chat turn whose adapter asks one question, answer it through that route,
+and assert the answer the handler returned reaches the turn's output.
 
 No model and no mcode process: the ACP driver is replaced by a fake that calls the
 handler it is given, which is the seam under test.
@@ -43,20 +43,37 @@ def _app_and_session(monkeypatch, tmp_path):
     return s
 
 
-def _approvals_of(client):
-    """The `_approvals` slot dict, reached through the route that reads it.
+def _questions_of(client):
+    """The `_questions` slot dict, reached through the route that reads it.
 
     It is a closure inside `build_app`, so it is not an attribute; the route's
     free variables are the only handle — the same technique
-    tests/test_r3_prompt_queue.py uses for the prompt queue."""
+    tests/test_r3_prompt_queue.py uses for the prompt queue. OD12-n2: question
+    slots are keyed by REQUEST ID here, not by session."""
     for route in client.app.routes:
         fn = getattr(route, "endpoint", None)
         if fn is None or fn.__closure__ is None:
             continue
         names = fn.__code__.co_freevars
-        if "_approvals" in names:
-            return fn.__closure__[names.index("_approvals")].cell_contents
-    raise AssertionError("could not reach the _approvals slot")
+        if "_questions" in names:
+            return fn.__closure__[names.index("_questions")].cell_contents
+    raise AssertionError("could not reach the _questions slot")
+
+
+def _slot_registry(client):
+    """Either registry, so a probe can poll before the fix exists too.
+
+    On the pre-OD12-n2 code only `_approvals` is a free variable of the route;
+    after it, `_questions` is. Prefer the question registry."""
+    for route in client.app.routes:
+        fn = getattr(route, "endpoint", None)
+        if fn is None or fn.__closure__ is None:
+            continue
+        names = fn.__code__.co_freevars
+        for reg in ("_questions", "_approvals"):
+            if reg in names:
+                return fn.__closure__[names.index(reg)].cell_contents
+    raise AssertionError("could not reach an approval slot registry")
 
 
 def _serve_source() -> str:
@@ -94,7 +111,7 @@ def test_a_question_reaches_the_approval_channel_and_its_answer_is_returned(
     monkeypatch.setattr(harness_mcode, "drive_turn_acp", _fake_acp)
 
     with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
-        approvals = _approvals_of(c)
+        questions = _questions_of(c)
         out = {}
 
         def _turn():
@@ -104,11 +121,11 @@ def test_a_question_reaches_the_approval_channel_and_its_answer_is_returned(
         t = threading.Thread(target=_turn, daemon=True)
         t.start()
         deadline = time.time() + 10
-        while time.time() < deadline and s["id"] not in approvals:
+        while time.time() < deadline and not questions:
             time.sleep(0.01)
-        assert s["id"] in approvals, (
+        assert questions, (
             "the question never reached the approval channel the UI reads")
-        slot = approvals[s["id"]]
+        slot = next(iter(questions.values()))
         assert slot["kind"] == "question", slot
         r = c.post(f"/api/sessions/{s['id']}/approval",
                    json={"requestId": slot["requestId"],
@@ -225,7 +242,7 @@ def test_a_question_answered_inside_the_window_is_answered_not_expired(
     monkeypatch.setattr(harness_mcode, "drive_turn_acp", _fake_acp)
 
     with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
-        approvals = _approvals_of(c)
+        questions = _questions_of(c)
         out: dict = {}
 
         def _turn():
@@ -235,10 +252,10 @@ def test_a_question_answered_inside_the_window_is_answered_not_expired(
         t = threading.Thread(target=_turn, daemon=True)
         t.start()
         deadline = time.time() + 10
-        while time.time() < deadline and s["id"] not in approvals:
+        while time.time() < deadline and not questions:
             time.sleep(0.01)
-        assert s["id"] in approvals, "the question never reached the channel"
-        slot = approvals[s["id"]]
+        assert questions, "the question never reached the channel"
+        slot = next(iter(questions.values()))
         r = c.post(f"/api/sessions/{s['id']}/approval",
                    json={"requestId": slot["requestId"],
                          "answer": {"path": "C:/work"}})
@@ -291,8 +308,8 @@ def test_an_answer_cannot_win_after_the_expiry_has_been_claimed(
     same request cannot be both answered and expired."""
     s = _app_and_session(monkeypatch, tmp_path)
     with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
-        approvals = _approvals_of(c)
-        approvals[s["id"]] = {
+        questions = _questions_of(c)
+        questions["q-claimed"] = {
             "requestId": "q-claimed", "answer": None, "kind": "question",
             "event": threading.Event(), "lock": threading.Lock(),
             "expired": True,
@@ -300,5 +317,82 @@ def test_an_answer_cannot_win_after_the_expiry_has_been_claimed(
         r = c.post(f"/api/sessions/{s['id']}/approval",
                    json={"requestId": "q-claimed", "answer": {"path": "C:/work"}})
         assert r.status_code == 409, r.text
-        assert not approvals[s["id"]]["event"].is_set(), (
+        assert not questions["q-claimed"]["event"].is_set(), (
             "an expired question must not be woken by a late answer")
+
+
+def test_two_concurrent_questions_each_keep_their_own_slot(
+        monkeypatch, tmp_path):
+    """OD12-n2. Two questions in flight for ONE session must each be answerable
+    by their OWN request id.
+
+    Before the fix one `_approvals` slot per session let the second question
+    overwrite the first: the first answer was refused (409, "no longer the one
+    being waited on") and the first question expired although the user had
+    answered it. Worse, the first handler's `finally` popped the SECOND
+    question's slot, so a second question whose window was still open could no
+    longer be answered at all."""
+    s = _app_and_session(monkeypatch, tmp_path)
+    monkeypatch.setattr(serve, "QUESTION_WAIT_SECS", 2.0)
+    real_urandom = os.urandom
+    minted = [b"\x01\x01\x01\x01", b"\x02\x02\x02\x02"]
+
+    def _mint(n):
+        if n == 4 and minted:
+            return minted.pop(0)
+        return real_urandom(n)
+
+    monkeypatch.setattr(serve.os, "urandom", _mint)
+
+    def _fake_acp(prompt, **kw):
+        out: dict = {}
+
+        def ask(tag):
+            out[tag] = kw["on_question"]("elicitation/create",
+                                         {"message": f"Q{tag}"})
+
+        t1 = threading.Thread(target=ask, args=("1",), daemon=True)
+        t2 = threading.Thread(target=ask, args=("2",), daemon=True)
+        t1.start()
+        time.sleep(0.3)
+        t2.start()
+        t1.join()
+        t2.join()
+        yield harness.TurnEvent("text", text=json.dumps(out))
+
+    monkeypatch.setattr(harness_mcode, "drive_turn_acp", _fake_acp)
+
+    with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
+        registry = _slot_registry(c)
+        out: dict = {}
+
+        def _turn():
+            out["r"] = c.post(f"/api/sessions/{s['id']}/chat",
+                              json={"message": "go"})
+
+        t = threading.Thread(target=_turn, daemon=True)
+        t.start()
+        deadline = time.time() + 10
+        while time.time() < deadline and not any(
+                v.get("requestId") == "q-02020202" for v in registry.values()):
+            time.sleep(0.01)
+        assert any(v.get("requestId") == "q-02020202"
+                   for v in registry.values()), "the second question never asked"
+
+        first = c.post(f"/api/sessions/{s['id']}/approval",
+                       json={"requestId": "q-01010101",
+                             "answer": {"path": "FIRST"}})
+        second = c.post(f"/api/sessions/{s['id']}/approval",
+                        json={"requestId": "q-02020202",
+                              "answer": {"path": "SECOND"}})
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        t.join(15)
+        assert not t.is_alive(), "the turn never finished"
+
+    body = out["r"].text
+    assert "FIRST" in body, body
+    assert "SECOND" in body, body
+    decided = {d["data"]["id"]: d["data"]["decision"] for d in _decided(body)}
+    assert decided == {"q-01010101": "answered",
+                       "q-02020202": "answered"}, decided
