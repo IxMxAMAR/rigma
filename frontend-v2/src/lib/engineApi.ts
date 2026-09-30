@@ -250,6 +250,36 @@ export interface ProbedFacts {
   template_override?: boolean;
 }
 
+/** How a model comes up, as stored on its spec (`LaunchDefaults.model_dump()`).
+ *
+ *  Every field has a FALSY SENTINEL rather than null — `""` or `0` — because
+ *  "unset" means NO OPINION, and `vision` is the one tri-state (`null` = keep
+ *  whatever the last launch used). The POST route treats an explicit `null` as
+ *  "clear this field", which is why a caller that means to remove a default must
+ *  send null and NOT the empty string the sentinel would suggest. */
+export interface LaunchDefaults {
+  quant?: string | null;
+  ctx?: number | null;
+  kv?: string | null;
+  vision?: boolean | null;
+  spec_type?: string | null;
+  spec_n_max?: number | null;
+  backend?: string | null;
+}
+
+/** `GET /api/models/{slug}/defaults` — the D2 route. `first_load` is the
+ *  server's own honest signal: nothing is pinned AND no turn has ever finished
+ *  for this model. `custom` is the other half — a registry model's launch
+ *  settings are hand-authored and the POST refuses to overwrite them, so the
+ *  dialog must be able to explain that refusal rather than swallow it. */
+export interface ModelDefaults {
+  slug: string;
+  launch: LaunchDefaults | null;
+  custom: boolean;
+  last_used: number | null;
+  first_load: boolean;
+}
+
 export interface ModelCard extends ProbedFacts {
   slug: string;
   family: string;
@@ -265,6 +295,9 @@ export interface ModelCard extends ProbedFacts {
    *  is often nothing like the repo, so the card shows both. */
   source?: string;
   running: boolean;
+  /** D2: the stored launch defaults, straight from `hangar.list_models`. null
+   *  when the spec pins nothing, which is the same fact `first_load` reports. */
+  launch?: LaunchDefaults | null;
 }
 
 // Mirrors hf_browse.search() EXACTLY — see tests/test_hf_browse.py, which
@@ -413,11 +446,14 @@ export const engineApi = {
    *  clears one. A plain load then lands here instead of on whatever the
    *  resolver picked — which on this hardware is the difference between
    *  38 and 53 tok/s, not a matter of taste. */
-  setDefaults: (slug: string, d: {
-    quant?: string | null; ctx?: number | null; kv?: string | null;
-    vision?: boolean | null; spec_type?: string | null;
-    spec_n_max?: number | null;
-  }) => j<unknown>("POST", `/api/models/${slug}/defaults`, d),
+  setDefaults: (slug: string, d: LaunchDefaults) =>
+    j<{ slug: string; launch: LaunchDefaults | null }>(
+      "POST", `/api/models/${slug}/defaults`, d),
+  /** D2: what is pinned for this model, whether it is custom, and whether this
+   *  is a first load. The GET did not exist (the POST answered 405), so a
+   *  dialog could WRITE a default but never show the one already stored. */
+  modelDefaults: (slug: string) =>
+    j<ModelDefaults>("GET", `/api/models/${slug}/defaults`),
 };
 
 export const gb = (n: number) => (n / 2 ** 30).toFixed(1) + " GB";

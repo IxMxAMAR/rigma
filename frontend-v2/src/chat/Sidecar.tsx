@@ -18,12 +18,13 @@ import { responseError } from "../lib/listFetch";
 import { clampParam, rangeFor } from "../lib/paramLimits";
 import { useApp } from "../store";
 import MethodBuilder from "./MethodBuilder";
+import LaunchDefaultsDialog from "../models/LaunchDefaultsDialog";
+import { KV_TYPES } from "../models/launchDefaults";
 import { errText, selectAnyStreaming, useChat } from "./chatStore";
 import { GRANTS, NO_GRANTS, readGrants,
          type GrantKey, type Grants } from "./grants";
 
 const CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 262144];
-const KV_TYPES = ["f16", "q8_0", "q5_1", "q4_0"];
 
 /** Engine settings, in the panel where they are actually needed.
  *
@@ -47,6 +48,8 @@ function EngineCard() {
   // one at a time.
   const [want, setWant] = useState<{ctx?: number; kv?: string;
                                     vision?: boolean; backend?: string}>({});
+  // D2: the launch-defaults dialog, seeded from the running configuration.
+  const [showDefaults, setShowDefaults] = useState(false);
 
   const load = useCallback(() => {
     engineApi.server().then(setSrv).catch(() => setSrv(null));
@@ -225,43 +228,17 @@ measure rather than assume.">
       {srv.model && (
         <button
           disabled={!!busy}
-          onClick={async () => {
-            const ctx = want.ctx ?? srv.ctx ?? 0;
-            const kv = want.kv ?? srv.kv_cache ?? "";
-            const vision = want.vision ?? !srv.no_vision;
-            if (!window.confirm(
-              `Make this the default for ${srv.model}?
-
-` +
-              `  context  ${Math.round(ctx / 1024)}K
-` +
-              `  kv cache ${kv || "auto"}
-` +
-              `  vision   ${vision ? "on" : "off"}
-
-` +
-              "Loading this model will come up here instead of wherever the " +
-              "resolver puts it. You can still change any of it per-launch.")) {
-              return;
-            }
-            setBusy("saving default");
-            setErr(null);
-            try {
-              await engineApi.setDefaults(srv.model as string,
-                                          { ctx, kv, vision });
-            } catch (e) {
-              setErr((e as Error).message);
-            }
-            setBusy(null);
-            load();
-          }}
+          onClick={() => setShowDefaults(true)}
           className="mt-0.5 rounded-md px-2.5 py-1 text-[11.5px] text-muted hover:text-amber text-left disabled:opacity-40"
-          title={"Remember this configuration for this model, so a plain load "
-                 + "lands on it. The resolver's guess is not always the fast "
-                 + "one — on this hardware the gap between configurations of "
-                 + "the same model has measured 4x."}
+          title={"How this model comes up when it is loaded without an explicit "
+                 + "setting. The dialog opens on the RUNNING configuration, so "
+                 + "this is how you remember what you just relaunched with — and "
+                 + "it can also pin the quant and the compute backend, which the "
+                 + "one-click version could not. The resolver's guess is not "
+                 + "always the fast one: on this hardware the gap between "
+                 + "configurations of the same model has measured 4x."}
         >
-          {busy === "saving default" ? "saving…" : "set as this model's default"}
+          launch defaults…
         </button>
       )}
       {srv.has_mmproj && (
@@ -299,6 +276,24 @@ often the single biggest context lever a vision model has.">
         reply in progress does not. See every quant's context and VRAM budget
         on the <span className="text-secondary">Models</span> page.
       </p>
+      {/* D2: one defaults write path. The old button POSTed `{ctx, kv, vision}`
+          itself — which silently dropped `backend`, the one field the route
+          had just learned to accept — so it now opens the same dialog the
+          Models page uses, seeded from what is running. */}
+      {showDefaults && srv.model && (
+        <LaunchDefaultsDialog
+          slug={srv.model}
+          open
+          seed={{
+            ctx: String(want.ctx ?? srv.ctx ?? ""),
+            kv: want.kv ?? srv.kv_cache ?? "",
+            vision: (want.vision ?? !srv.no_vision) ? "on" : "off",
+            backend: want.backend ?? srv.backend ?? "",
+          }}
+          onClose={() => setShowDefaults(false)}
+          onSaved={() => { setShowDefaults(false); load(); }}
+        />
+      )}
     </section>
   );
 }
