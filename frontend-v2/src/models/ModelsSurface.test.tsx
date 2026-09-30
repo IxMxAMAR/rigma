@@ -96,6 +96,24 @@ describe("the budget tooltip names the recurrent-state estimate", () => {
     expect(hint).toContain("the recurrent-state term is an estimate");
   });
 
+  it("checks a broken fit FIRST, before any budget it carries", () => {
+    // The wave-2 A16b nit: only `RunsCell` covered `fit.error`, so the
+    // `budgetHint` branch itself could be deleted and the whole suite stayed
+    // green. Assert it directly, with a budget present as well — without the
+    // error-first check the function would fall through and render that
+    // arithmetic as a real verdict.
+    const hint = budgetHint({
+      ok: false, speed: "no", offload_pct: 100, error: "fit failed",
+      budget: budget({ over_mb: -4_000 }),
+    });
+    expect(hint).toContain("the fit could not be computed — fit failed");
+    expect(hint).toContain(
+      "This is NOT a verdict that the model does not fit this machine.");
+    expect(hint).not.toContain("VRAM budget");     // no arithmetic was rendered
+    expect(hint).not.toContain("headroom");
+    expect(hint).not.toBe("does not fit this machine");
+  });
+
   it("puts the estimate sentence in the cell's tooltip, not only in a helper", () => {
     const markup = renderToStaticMarkup(
       <CtxCell fit={{ ok: true, ctx: 32768,
