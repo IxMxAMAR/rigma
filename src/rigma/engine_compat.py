@@ -65,6 +65,49 @@ FORK_TYPES: dict[int, tuple[str, str, str]] = {
 }
 
 
+def engine_is_prism_fork(engine) -> bool:
+    """Whether a REGISTERED engine build is the PrismML fork.
+
+    THE ONE PLACE that answers "is this the fork?". `server_ops` freezes this
+    answer onto the plan at the moment it chooses the binary
+    (`server_ops.engine_binary_for_plan`), and `RunPlan.server_args` consumes the
+    frozen value rather than re-asking at argv-build time. That matters because
+    the two moments are not interchangeable: `_registered_engine_for` needs the
+    model on disk, so a re-ask AFTER `ensure_model` can name a different build
+    than the one already chosen. Freezing makes the binary and the fork-only flags
+    come from the same decision.
+
+    The answer is read from the build's OWN declared type table — the same fact
+    `engine_registry.select` used to choose it — so it cannot drift from the
+    binary. `engine` is an `engine_registry.CustomEngine`, or None for the pinned
+    build; the pin is mainline b9867 and is never the fork. Unknown is not a fork:
+    anything unprovable here must omit the fork-only flags, because their absence
+    costs nothing on the fork while their presence kills a mainline launch in
+    argparse before a weight is read.
+
+    KNOWN LIMITATION — VERSION BLINDNESS. A PrismML build OLDER than 87268f77
+    declares the same private types but predates `--reasoning-effort`, which was
+    added at that commit. Registration carries a free-text `source` string and no
+    version or commit (`engine_registry.CustomEngine`), so the age cannot be
+    checked here: there is no ordered version to compare and no way to read the
+    flag list without starting the engine. Such a build is therefore a FALSE
+    POSITIVE. `runtime.launch_server` keeps that from being fatal — an engine
+    that exits on the unknown argument is relaunched once without it (see
+    `runtime._engine_rejected_flag`) — so the cost is a lost lever and one extra
+    spawn, not a dead launch.
+
+    Never raises: any failure to answer means "not the fork".
+    """
+    if engine is None:
+        return False
+    try:
+        if not getattr(engine, "types_known", False):
+            return False
+        return any(int(t) in FORK_TYPES for t in (engine.types or []))
+    except Exception:
+        return False
+
+
 @dataclass
 class Compatibility:
     """Whether an engine can load a model, and why not if it cannot."""
