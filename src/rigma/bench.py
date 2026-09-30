@@ -18,10 +18,170 @@ class BenchResult(BaseModel):
     tg_tps: float
     prompt_tokens: int
     gen_tokens: int
+    # D1/S3: the DEPTH dimension. `depth` is the window occupancy the number was
+    # measured at, and `ctx` the context the engine was launched with. A stored
+    # result without them is from before depth existed: that is UNKNOWN, never
+    # zero (see `measured_depth`). `prompt_tokens` is the size actually sent.
+    depth: int | None = None
+    ctx: int | None = None
 
 
-def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128) -> BenchResult:
-    filler = "The quick brown fox jumps over the lazy dog. " * (prompt_tokens // 8)
+# --- the bench prompt ---------------------------------------------------------
+#
+# The prompt used to be ONE sentence repeated: `"The quick brown fox jumps over
+# the lazy dog. " * (prompt_tokens // 8)`. Two things were wrong with that.
+#
+# 1. A MoE routes to a NARROW set of experts on repetitive text. The owner
+#    measured this on 2026-08-23: `n_cpu_moe 18` was crowned on filler, and on
+#    varied text `n_cpu_moe 0` beat it by 24%. The benchmark therefore measured a
+#    routing pattern no real conversation produces, and could crown the wrong
+#    placement off it.
+# 2. There was no depth dimension at all. llama.cpp attends only over OCCUPIED
+#    cells (`get_n_kv` pads to 256), so a short run at a huge ctx measures
+#    nothing about that ctx; `docs/review/findings-r3/37-262k-context.md` §3.
+#
+# So the filler is replaced with deterministic, seeded, lexically varied text,
+# generated here — never fetched and never the owner's prose. It is built once
+# per size and cached, so it cannot come to dominate a benchmark that loads a
+# model per config.
+_BENCH_VOCAB = tuple(dict.fromkeys((
+    "time", "year", "people", "way", "day", "thing", "woman", "life", "child",
+    "world", "school", "state", "family", "student", "group", "country",
+    "problem", "hand", "part", "place", "case", "week", "company", "system",
+    "program", "question", "work", "government", "number", "night", "point",
+    "home", "water", "room", "mother", "area", "money", "story", "fact",
+    "month", "right", "study", "book", "eye", "job", "word", "business",
+    "issue", "side", "kind", "head", "house", "service", "friend", "father",
+    "power", "hour", "game", "line", "member", "law", "car", "city",
+    "community", "name", "president", "team", "minute", "idea", "body",
+    "information", "back", "parent", "face", "level", "office", "door",
+    "health", "person", "art", "history", "party", "result", "change",
+    "morning", "reason", "research", "girl", "moment", "air", "teacher",
+    "force", "education", "foot", "age", "policy", "process", "music",
+    "market", "sense", "nation", "plan", "college", "interest", "death",
+    "experience", "effect", "class", "control", "care", "field",
+    "development", "role", "effort", "rate", "heart", "drug", "show",
+    "leader", "light", "voice", "wife", "police", "mind", "price", "report",
+    "decision", "view", "relationship", "town", "road", "arm", "difference",
+    "value", "building", "action", "model", "season", "society", "tax",
+    "director", "position", "player", "record", "paper", "space", "ground",
+    "form", "event", "official", "matter", "center", "couple", "site",
+    "project", "activity", "star", "table", "need", "court", "production",
+    "situation", "cost", "industry", "figure", "street", "image", "phone",
+    "data", "cover", "picture", "practice", "piece", "land", "product",
+    "doctor", "wall", "patient", "worker", "news", "test", "movie", "north",
+    "love", "support", "technology", "step", "baby", "computer", "type",
+    "attention", "film", "tree", "source", "organization", "cause", "hair",
+    "century", "evidence", "window", "culture", "chance", "brother", "energy",
+    "period", "course", "summer", "plant", "opportunity", "term", "letter",
+    "condition", "choice", "rule", "daughter", "administration", "south",
+    "husband", "floor", "campaign", "material", "population", "economy",
+    "medical", "hospital", "church", "risk", "current", "fire", "future",
+    "defense", "increase", "security", "bank", "west", "sport", "board",
+    "subject", "officer", "private", "behavior", "performance", "fight",
+    "goal", "second", "order", "author", "focus", "foreign", "blood",
+    "agency", "nature", "color", "store", "reduce", "sound", "note",
+    "movement", "page", "share", "common", "natural", "race", "concern",
+    "series", "similar", "language", "response", "animal", "factor",
+    "decade", "article", "artist", "scene", "stock", "career", "central",
+    "treatment", "happy", "approach", "size", "fund", "media", "ready",
+    "sign", "thought", "individual", "quality", "pressure", "answer",
+    "resource", "meeting", "disease", "success", "amount", "ability",
+    "staff", "character", "growth", "loss", "degree", "wonder", "attack",
+    "region", "television", "training", "trade", "election", "physical",
+    "general", "feeling", "standard", "message", "outside", "analysis",
+    "benefit", "forward", "lawyer", "present", "section", "glass", "skill",
+    "sister", "professor", "operation", "financial", "crime", "stage",
+    "compare", "authority", "design", "knowledge", "station", "strategy",
+    "discuss", "truth", "song", "example", "check", "environment", "public",
+    "various", "guess", "executive", "prove", "entire", "rock", "forget",
+    "claim", "remove", "manager", "enjoy", "network", "legal", "religious",
+    "cold", "final", "main", "science", "green", "memory", "card", "seat",
+    "cell", "establish", "trial", "expert", "spring", "firm", "option",
+    "normal", "separate", "direct", "reveal", "weight", "tonight", "tough",
+    "hill", "leg", "arrive", "master", "track", "spend",
+)))
+
+_BENCH_SEED = 0x5EED_C0DE
+
+# Built once per size: generating the text must not dominate a benchmark whose
+# real cost is a model load. A sweep benches one size, so this holds one entry.
+_TEXT_CACHE: dict[int, str] = {}
+
+
+def _prng(seed: int):
+    """A tiny seeded LCG, so the text is byte-identical across processes and
+    Python versions rather than depending on `random`'s internals."""
+    state = seed & 0xFFFFFFFFFFFFFFFF
+
+    def _next(lo: int, hi: int) -> int:
+        nonlocal state
+        state = (state * 6364136223846793005 + 1442695040888963407) \
+            & 0xFFFFFFFFFFFFFFFF
+        return lo + (state >> 11) % (hi - lo + 1)
+
+    return _next
+
+
+def bench_text(n_tokens: int) -> str:
+    """Deterministic, varied synthetic text of exactly `n_tokens` words.
+
+    "Tokens" here are words — the unit the old filler was sized in — so a budget
+    means the same thing to the caller as it always did. The text is seeded from
+    the size, so the same budget always builds the same bytes (numbers stay
+    comparable run to run) while different budgets build different text.
+
+    Variety is the point: a MoE router spreads over experts on this and does not
+    on a repeated sentence (owner's measurement, 2026-08-23 — see above).
+    """
+    if n_tokens <= 0:
+        return ""
+    cached = _TEXT_CACHE.get(n_tokens)
+    if cached is not None:
+        return cached
+    rng = _prng(_BENCH_SEED ^ ((n_tokens * 2654435761) & 0xFFFFFFFFFFFFFFFF))
+    vocab = _BENCH_VOCAB
+    last = len(vocab) - 1
+    sentences: list[str] = []
+    remaining = n_tokens
+    while remaining > 0:
+        take = min(rng(6, 16), remaining)   # varied sentence lengths
+        words = [vocab[rng(0, last)] for _ in range(take)]
+        words[0] = words[0].capitalize()
+        sentences.append(" ".join(words) + ".")
+        remaining -= take
+    text = " ".join(sentences)
+    _TEXT_CACHE[n_tokens] = text
+    return text
+
+
+def measured_depth(entry: dict) -> int | None:
+    """The fill depth a STORED measurement was taken at, or None if unknown.
+
+    A result written before depth existed, a depth-less run, and a stored null
+    all mean the same thing: the window depth is UNKNOWN. None is returned for
+    all of them — never 0, which would claim the window was measured empty, a
+    claim the old entries cannot support.
+    """
+    d = (entry.get("measured") or {}).get("depth")
+    if isinstance(d, bool) or not isinstance(d, int) or d <= 0:
+        return None
+    return d
+
+
+def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128,
+              depth: int | None = None, ctx: int | None = None) -> BenchResult:
+    """Measure prefill/generation on the running server.
+
+    `depth` is the window occupancy to measure at. When given, the prompt is
+    EXTENDED (never shortened) so at least that many tokens occupy the KV window
+    at generation time — otherwise "tok/s at 131K" is measured with an almost
+    empty window and says nothing about a filled one. `depth=None` is the old
+    behaviour exactly: the measured prompt is the whole window. `ctx` is only
+    recorded, as provenance for the number.
+    """
+    sent_tokens = max(prompt_tokens, depth) if depth else prompt_tokens
+    filler = bench_text(sent_tokens)
     r = httpx.post(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         json={"messages": [{"role": "user",
@@ -43,7 +203,8 @@ def run_bench(port: int, prompt_tokens: int = 2048, gen_tokens: int = 128) -> Be
         raise RuntimeError("engine reported 0 tokens/s for both prefill and "
                            "generation — no usable measurement")
     return BenchResult(pp_tps=pp, tg_tps=tg,
-                       prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
+                       prompt_tokens=sent_tokens, gen_tokens=gen_tokens,
+                       depth=depth, ctx=ctx)
 
 
 def _capabilities(slug: str) -> tuple:
@@ -419,6 +580,7 @@ def _log_rows(plan, rows: list[dict], best: dict | None) -> None:
                       "ctx": plan.flags.ctx, "engine": _engine_version(plan.backend),
                       "label": r.get("label"), "flags": r.get("flags") or {},
                       "tg_tps": r.get("tg_tps"), "pp_tps": r.get("pp_tps"),
+                      "depth": r.get("depth"),
                       "ok": bool(r.get("ok")), "error": r.get("error", ""),
                       "crowned": r.get("label") == won})
     except Exception:
@@ -519,11 +681,15 @@ def quick_configs(base: ComboFlags, moe: bool,
 def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
               prompt_tokens: int = 2048, gen_tokens: int = 96,
               progress=None, configs=None, extra_args=None,
-              mark_calibrated: bool = False) -> list[dict]:
+              mark_calibrated: bool = False, depth: int | None = None) -> list[dict]:
     """Launch `plan` under each config on `port`, bench it, and persist the best
     tg/s config to calibration (which resolve() then applies automatically). The
     caller guarantees `port` is free (scratch port, or mid-switch with the old
-    engine already killed) — this never touches a live server."""
+    engine already killed) — this never touches a live server.
+
+    `depth` is passed through to every `run_bench` and recorded on every row, so
+    a sweep can A/B at a FILLED window rather than the almost-empty one a short
+    prompt leaves (see `run_bench`)."""
     is_moe = plan.flags.n_cpu_moe > 0
     if configs is None:
         configs = sweep_configs(plan.flags, is_moe,
@@ -548,15 +714,18 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
                                 extra_args=extra_args)
         except Exception as e:  # a config that OOMs/crashes is a valid "loss"
             rows.append({"label": label, "flags": override, "tg_tps": 0.0,
-                         "pp_tps": 0.0, "ok": False, "error": str(e)[:200]})
+                         "pp_tps": 0.0, "depth": depth, "ok": False,
+                         "error": str(e)[:200]})
             continue
         try:
-            res = run_bench(port, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
+            res = run_bench(port, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
+                            depth=depth, ctx=plan.flags.ctx or None)
             rows.append({"label": label, "flags": override, "tg_tps": res.tg_tps,
-                         "pp_tps": res.pp_tps, "ok": True})
+                         "pp_tps": res.pp_tps, "depth": res.depth, "ok": True})
         except Exception as e:  # loaded but wouldn't serve — count as a loss
             rows.append({"label": label, "flags": override, "tg_tps": 0.0,
-                         "pp_tps": 0.0, "ok": False, "error": str(e)[:200]})
+                         "pp_tps": 0.0, "depth": depth, "ok": False,
+                         "error": str(e)[:200]})
         finally:
             srv.stop()
     rows.sort(key=lambda r: r["tg_tps"], reverse=True)
@@ -564,7 +733,8 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     _log_rows(plan, rows, best)
     if best is not None and (best["flags"] or mark_calibrated):
         key = calibration_key(plan.model_slug, plan.gguf.quant, plan.backend)
-        save_calibration(key, {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"]},
+        save_calibration(key, {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"],
+                               "depth": best.get("depth")},
                          flags=best["flags"], calibrated=mark_calibrated,
                          ctx=plan.flags.ctx, backend=plan.backend,
                          identity=_identity_cache_key(plan.backend))
