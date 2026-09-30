@@ -4305,6 +4305,13 @@ def _kill_tree(pid: int, proc=None, *, timeout: float = 3.0) -> bool:
     grandchild, so the exit code is not a signal — poll the process instead.
     Returns True only when the process is confirmed gone (AUDIT F35).
 
+    On POSIX the tree is reached with `killpg`, which is only safe for a child
+    that was DETACHED into its own group (`start_new_session`). A caller that
+    left its child in RIGMA'S group would otherwise have `killpg` take the
+    server down with the child — a stop button that stops everything — so the
+    target's group is compared with ours first and a shared group falls back to
+    signalling the single pid.
+
     `proc`, when the caller still holds it, is the reliable poll: it costs
     nothing extra, where re-asking Windows by pid means another process spawn."""
     if pid <= 0:
@@ -4316,7 +4323,9 @@ def _kill_tree(pid: int, proc=None, *, timeout: float = 3.0) -> bool:
                            check=False)
         else:
             import signal
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            # SIGKILL is POSIX-only; the fallback keeps the branch exercisable
+            # on a Windows host (it is never reached there in production).
+            _signal_tree(pid, getattr(signal, "SIGKILL", 9))
     except Exception:
         pass
     if proc is not None:
@@ -4326,6 +4335,30 @@ def _kill_tree(pid: int, proc=None, *, timeout: float = 3.0) -> bool:
         except Exception:
             return False
     return not _pid_alive(pid)
+
+
+def _signal_tree(pid: int, sig: int) -> None:
+    """Signal `pid`'s process group — never RIGMA's own.
+
+    `getpgid` raises `ProcessLookupError` when the child is already reaped;
+    there is then nothing left to signal, which is not an error. When the target
+    shares our group (a caller that did not detach its child), signal the single
+    pid instead: `killpg` on our own group would kill the server too."""
+    try:
+        target = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    try:
+        ours = os.getpgid(0)
+    except OSError:
+        # Cannot prove the groups differ: signal only the pid rather than risk
+        # taking our own group down.
+        os.kill(pid, sig)
+        return
+    if target == ours:
+        os.kill(pid, sig)
+    else:
+        os.killpg(target, sig)
 
 
 def _pid_alive(pid: int) -> bool:
