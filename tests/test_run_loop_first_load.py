@@ -22,6 +22,8 @@ import json
 import logging
 import os
 import pathlib
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -699,47 +701,95 @@ def test_a_read_failed_release_is_reaped_at_the_next_boot(engine, home):
 #
 # The check is `runs.driver_is_live_elsewhere`, which reads the stamp every
 # non-terminal `save` writes (pid + create time, so a recycled pid cannot make
-# a dead driver look alive). These tests fabricate the stamp: the pid has to be
-# a DIFFERENT live process, which a test cannot honestly conjure.
+# a dead driver look alive).
+#
+# DR4-2: these tests used to fabricate `os.getpid() + 1` and monkeypatch
+# `state._is_recorded_process` to a lambda that IGNORED its arguments, so the
+# pid+create-time mechanism they are named for never ran — rename the writer's
+# key or swap the call's arguments and DR3-4 died with a green suite. They now
+# drive the real thing: a real foreign child process for the pid, its real
+# create time for the stamp, and no stub over the identity call.
 # ---------------------------------------------------------------------------
 
-def _stamp(rid, pid, started):
+def _stamp_driver(rid, pid, started):
+    """Write a driver stamp the way a WRITER in another process would.
+
+    `started` must be the REAL create time of `pid` (from `state._create_time`),
+    never a fabricated constant: the point of these tests is to exercise the
+    create-time comparison, not to satisfy it with a number that matches
+    nothing."""
     doc = runs.load(rid)
     doc["driver_pid"] = pid
     doc["driver_started_at"] = started
     (runs.run_dir(rid) / "run.json").write_text(
         json.dumps(doc, indent=2), encoding="utf-8")
+    return doc
 
 
-def test_the_boot_reaper_skips_a_run_another_live_process_drives(
-        home, monkeypatch):
+def _foreign_sleeper():
+    """A REAL process that is neither this one nor driving anything.
+
+    A plain interpreter asleep in `time.sleep` — no engine, no model, no port
+    (§0.1). The caller owns it and reaps it in a `finally`."""
+    return subprocess.Popen([sys.executable, "-c",
+                             "import time; time.sleep(30)"])
+
+
+def _reap(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:        # pragma: no cover - defensive
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_the_boot_reaper_skips_a_run_another_live_process_drives(home):
+    """The REAL identity check decides this, against a REAL process.
+
+    `_is_recorded_process` is NOT monkeypatched: the sweep reaches it with the
+    child's true pid and create time, so an argument-order slip at
+    `runs.driver_is_live_elsewhere`'s call site fails here instead of passing."""
     run = runs.create("m", "sess")
     rid = run["id"]
     runs.clear_active()
-    _stamp(rid, os.getpid() + 1, 12345.0)
 
     from rigma import state
-    monkeypatch.setattr(state, "_is_recorded_process",
-                        lambda pid, started: True)
+    proc = _foreign_sleeper()
+    try:
+        started = state._create_time(proc.pid)
+        assert started > 0.0, (
+            "could not read the foreign child's create time, so this test "
+            "cannot exercise the mechanism it exists for")
+        _stamp_driver(rid, proc.pid, started)
 
-    serve._reconcile_orphaned_runs(runs)
+        # The reader half, executed for real — this is exactly the call the old
+        # arg-ignoring lambda replaced.
+        assert runs.driver_is_live_elsewhere(runs.load(rid)) is True
 
-    assert runs.load(rid)["status"] == "running", (
-        "the sweep forced a run another live process was driving to terminal")
+        serve._reconcile_orphaned_runs(runs)
+
+        assert runs.load(rid)["status"] == "running", (
+            "the sweep forced a run another live process was driving to terminal")
+    finally:
+        _reap(proc)
 
 
-def test_the_boot_reaper_still_reaps_a_run_whose_driver_is_gone(
-        home, monkeypatch):
-    """The other direction: a stamp whose process is dead (or whose pid has been
-    reused) is an orphan like any other — DR1-residual stays closed."""
+def test_the_boot_reaper_still_reaps_a_run_whose_driver_is_gone(home):
+    """The other direction, on a REAL dead process: the same stamp once the
+    child is gone is an orphan like any other — DR1-residual stays closed."""
     run = runs.create("m", "sess")
     rid = run["id"]
     runs.clear_active()
-    _stamp(rid, os.getpid() + 1, 12345.0)
 
     from rigma import state
-    monkeypatch.setattr(state, "_is_recorded_process",
-                        lambda pid, started: False)
+    proc = _foreign_sleeper()
+    started = state._create_time(proc.pid)
+    assert started > 0.0
+    _stamp_driver(rid, proc.pid, started)
+    _reap(proc)
+
+    assert runs.driver_is_live_elsewhere(runs.load(rid)) is False
 
     serve._reconcile_orphaned_runs(runs)
 
@@ -749,13 +799,61 @@ def test_the_boot_reaper_still_reaps_a_run_whose_driver_is_gone(
 def test_a_run_this_process_stamped_is_still_reaped(home):
     """Our OWN stamp is never "live elsewhere": a `running` record this process
     wrote and then stopped driving is exactly the orphan the sweep is for, so
-    stamping must not make DR1-residual unreachable."""
+    stamping must not make DR1-residual unreachable.
+
+    DR4-2, the WRITER half: this reads the stamp a REAL `runs.save` wrote and
+    checks it through the production helper, so a renamed writer key or a stamp
+    of 0.0 is caught here (it used to be asserted only for `driver_pid`)."""
     run = runs.create("m", "sess")
     rid = run["id"]
     runs.clear_active()
 
-    assert runs.load(rid).get("driver_pid") == os.getpid()
+    run["iteration"] = 1
+    runs.save(run)                          # the real writer path
+    doc = runs.load(rid)
 
+    from rigma import state
+    assert doc.get("driver_pid") == os.getpid()
+    assert doc.get("driver_started_at", 0.0) > 0.0, (
+        "runs.save wrote no real create time, so the identity check has nothing "
+        "to compare a recycled pid against")
+    assert state._is_recorded_process(
+        doc["driver_pid"], doc["driver_started_at"]) is True, (
+        "the stamp does not identify a live process through the production helper")
+
+    serve._reconcile_orphaned_runs(runs)
+
+    assert runs.load(rid)["status"] == "interrupted"
+
+
+# ---------------------------------------------------------------------------
+# DR4-3: an UNKNOWN driver identity must read as "not live elsewhere", so the
+# run IS reconciled. `_driver_stamp` writes 0.0 when it cannot read its own
+# create time, and reading that as "live" left active.json wedged — the
+# start_run 409 the boot sweep exists to clear. The process-KILLING path keeps
+# the opposite, conservative default (see tests/test_state.py).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("drop", [False, True], ids=["zero", "missing-key"])
+def test_an_unknown_driver_identity_does_not_wedge_the_run(home, drop):
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()
+
+    # A foreign pid that is not this process. Whether it is alive is irrelevant:
+    # the record carries no identity to check, which is the case under test.
+    doc = runs.load(rid)
+    doc["driver_pid"] = os.getpid() + 1
+    if drop:
+        doc.pop("driver_started_at", None)
+    else:
+        doc["driver_started_at"] = 0.0
+    (runs.run_dir(rid) / "run.json").write_text(
+        json.dumps(doc, indent=2), encoding="utf-8")
+
+    assert runs.driver_is_live_elsewhere(runs.load(rid)) is False, (
+        "an unknown driver identity was read as 'live elsewhere', so the run "
+        "can never be reconciled")
     serve._reconcile_orphaned_runs(runs)
 
     assert runs.load(rid)["status"] == "interrupted"

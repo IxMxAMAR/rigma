@@ -80,6 +80,14 @@ def driver_is_live_elsewhere(run: dict) -> bool:
     False for a record with no stamp (written before this existed), for our own
     process (a `running` record WE hold at boot is exactly the orphan the sweep
     is for), and for a stamp whose process is gone or whose pid has been reused.
+
+    DR4-3: also False when the stamp carries NO usable identity — the key is
+    missing or `driver_started_at` is 0.0, which `_driver_stamp` writes when it
+    cannot read its own create time. Answering "live elsewhere" there would
+    leave the run unreconciled forever (the start_run 409 wedge the sweep exists
+    to clear), so this asks `state._is_identified_process`, whose unknown-identity
+    default is the OPPOSITE of the process-KILLING path's `_is_recorded_process`
+    (an unknown there must not be killed). Two questions, two safe directions.
     """
     try:
         pid = int(run.get("driver_pid") or 0)
@@ -88,8 +96,8 @@ def driver_is_live_elsewhere(run: dict) -> bool:
     if pid <= 0 or pid == os.getpid():
         return False
     try:
-        from .state import _is_recorded_process
-        return bool(_is_recorded_process(pid, run.get("driver_started_at")))
+        from .state import _is_identified_process
+        return bool(_is_identified_process(pid, run.get("driver_started_at")))
     except Exception:
         return False
 
