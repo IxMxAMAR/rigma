@@ -5,8 +5,8 @@ import re
 
 from pydantic import ValidationError
 
-from .models import (CACHE_BYTES, CachePolicy, ComboFlags, GgufFile,
-                     HardwareProfile, ModelSpec, RunPlan)
+from .models import (CACHE_BYTES, LAUNCH_PARALLEL, CachePolicy, ComboFlags,
+                     GgufFile, HardwareProfile, ModelSpec, RunPlan)
 from .registry import Registry
 
 VRAM_RESERVE_MB = {"windows": 1200, "linux": 400, "darwin": 0}
@@ -208,6 +208,45 @@ def swa_kv_bytes(spec: ModelSpec, k: str, v: str, ctx: int) -> float:
     # than the window cannot fill it.
     return min(ctx, window) * (per_side * CACHE_BYTES[k]
                                + per_side * CACHE_BYTES[v])
+
+
+def recurrent_state_mb(spec: ModelSpec) -> float:
+    """Per-SEQUENCE MiB llama.cpp allocates for a hybrid's recurrent state.
+
+    A Mamba/DeltaNet layer holds a fixed-size state instead of a growing KV
+    cache, and llama.cpp gives it its own buffer — `llama_memory_recurrent`,
+    sized `n_embd_r() + n_embd_s()` per recurrent layer per sequence, both f32
+    (llama-memory-recurrent.cpp builds one `r` and one `s` tensor of
+    `mem_size * (1 + n_rs_seq)` rows; llama-hparams.cpp sizes the rows):
+
+        n_embd_s() = ssm_d_state * ssm_d_inner
+        n_embd_r() = (ssm_d_conv - 1) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state)
+
+    MEASURED, not predicted: a real load of Ternary-Bonsai-2-27B (qwen35, 64
+    layers, 48 recurrent) at n_seq_max=1 logged `RS buffer size = 149.62 MiB`
+    and `R (f32): 5.62 MiB, S (f32): 144.00 MiB` (.scratch/prism-v.log). The 48
+    layers are what `recurrent_layers` counts and the four ssm_* numbers are the
+    file's own header keys. Zero for a dense model, and zero — with
+    `recurrent_state_unknown` true — for a hybrid whose header omitted them.
+    """
+    n = spec.recurrent_layers
+    if n <= 0:
+        return 0.0
+    state, inner = spec.ssm_state_size, spec.ssm_inner_size
+    if state <= 0 or inner <= 0:
+        return 0.0
+    s_bytes = state * inner * 4
+    r_bytes = max(spec.ssm_conv_kernel - 1, 0) * (
+        inner + 2 * spec.ssm_group_count * state) * 4
+    return n * (s_bytes + r_bytes) / 2**20
+
+
+def recurrent_state_unknown(spec: ModelSpec) -> bool:
+    """True when the model declares recurrent layers but its header carried no
+    `ssm.*` geometry, so `recurrent_state_mb` returns 0 for lack of evidence
+    rather than because there is nothing to allocate. The fit says so in its
+    explain line instead of silently reading the model as dense."""
+    return spec.recurrent_layers > 0 and recurrent_state_mb(spec) == 0.0
 
 
 # Speculative decoding's draft head needs its own KV cache and compute buffers.
@@ -525,12 +564,25 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     # is resident too, and until now was budgeted as zero.
     swa_mb = swa_kv_bytes(spec, k, v, ctx) / 2**20
     kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20 + swa_mb
+    # A hybrid's recurrent state is allocated PER SEQUENCE, and the launch runs
+    # LAUNCH_PARALLEL sequences. --kv-unified keeps the KV pool at ctx, so only
+    # this term multiplies. Zero for every dense model; a hybrid whose header
+    # carried no ssm.* geometry is charged 0 and marked unknown, not read as
+    # dense.
+    rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
+    if rs_mb:
+        rs_txt = f"rs={rs_mb:.0f}MB "
+    elif recurrent_state_unknown(spec):
+        rs_txt = "rs=unknown "
+    else:
+        rs_txt = ""
     explain.append(f"{gguf.quant}@ctx{ctx} kv={k}: file={file_mb:.0f}MB kv={kv_mb:.0f}MB "
                    + (f"(incl. {swa_mb:.0f}MB windowed) " if swa_mb else "")
                    + (f"mmproj={mm_mb:.0f}MB " if mm_mb else "")
+                   + rs_txt
                    + f"vs vram={usable_vram:.0f}MB ram={usable_ram:.0f}MB")
     if spec.moe is None:
-        if file_mb + mm_mb + kv_mb <= usable_vram:
+        if file_mb + mm_mb + kv_mb + rs_mb <= usable_vram:
             return ComboFlags(ctx=ctx, cache_type_k=k, cache_type_v=v)
         if strict:
             return None            # try the next cache type before offloading
@@ -541,7 +593,7 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         if spec.n_layers <= 0:
             return None
         per_layer = file_mb / spec.n_layers
-        gpu_room = usable_vram - mm_mb - kv_mb
+        gpu_room = usable_vram - mm_mb - kv_mb - rs_mb
         n_gpu = int(gpu_room // per_layer) if per_layer else 0
         if n_gpu <= 0:
             return None                      # not even one layer + kv fits
@@ -552,7 +604,7 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         explain.append(f"dense partial offload: {n_gpu}/{spec.n_layers} layers "
                        f"on GPU ({spilled:.0f}MB to RAM)")
         return ComboFlags(ctx=ctx, ngl=n_gpu, cache_type_k=k, cache_type_v=v)
-    if strict and file_mb + mm_mb + kv_mb > usable_vram:
+    if strict and file_mb + mm_mb + kv_mb + rs_mb > usable_vram:
         return None                # ditto for MoE expert offload
     # AUDIT F06-1: a MoE header that omits block_count reports n_layers = 0, and
     # this divide ran before the `if need_off` test, so even a fully-resident
@@ -562,7 +614,7 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         return None
     expert_mb = file_mb * spec.moe.expert_weight_fraction
     per_layer = expert_mb / spec.n_layers
-    need_off = max(0.0, file_mb + mm_mb + kv_mb - usable_vram)
+    need_off = max(0.0, file_mb + mm_mb + kv_mb + rs_mb - usable_vram)
     n_off = math.ceil(need_off / per_layer) if need_off else 0
     if n_off <= spec.n_layers and n_off * per_layer <= usable_ram:
         return ComboFlags(ctx=ctx, n_cpu_moe=n_off, cache_type_k=k, cache_type_v=v)
@@ -837,11 +889,12 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
 # is not what costs the time.
 #
 # 262144 FITS FULLY on this card with a smaller cache: q8_0/q8_0 is 8704 MB of
-# KV (15576 MB total against a 14954 MB budget, so it spills 7 layers), while
-# q5_1/q5_1 is 6144 MB (13016 MB total, 1938 MB of headroom) and keeps every
-# layer on the GPU. A pinned q8_0 policy is what turns a fully-resident 262K
-# plan into a 7-layer spill (~4x slower); `fit_for_launch` now treats the
-# requested type as a CEILING so that cannot happen silently.
+# KV (15576 MB total, plus 299 MB of recurrent state at --parallel 2, against a
+# 14954 MB budget, so it spills 10 layers), while q5_1/q5_1 is 6144 MB (13315 MB
+# total, 1639 MB of headroom) and keeps every layer on the GPU. A pinned q8_0
+# policy is what turns a fully-resident 262K plan into a 10-layer spill (~4x
+# slower); `fit_for_launch` now treats the requested type as a CEILING so that
+# cannot happen silently.
 #
 # The user selects this policy (Models page -> Growth policy), so it is not
 # forced — but the dropdown prices it as "more context" and never as "4x
