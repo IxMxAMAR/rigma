@@ -241,10 +241,15 @@ def findings(log_text: str, *, expected_vram_mb: float | None = None
 # placed across D devices is 1 + D runs: the CPU embedding run, then one run per
 # device (CPU -> ROCm0 -> ROCm1 = 3). D is taken from the load's own distinct
 # DEVICE labels (`ROCm0`, `ROCm1`, `CUDA0`, ...); `CPU_Mapped` and every
-# `<device>_Host` staging buffer are host RAM, not devices. A load that reports
-# GPU layers but names no device has an UNKNOWN device count, and the verdict is
-# "not comparable" — the same rule as the MoE case below, never a single-device
-# guess that would flag a two-device load on every launch.
+# `<device>_Host` staging buffer are host RAM, not devices. A17e nit: the labels
+# come from BOTH the buffer lines and the engine's direct device statements
+# (`load_tensors: layer N assigned to device ROCm0`,
+# `llama_prepare_model_devices: using device ROCm0`), so a truncated buffer
+# section no longer loses the count; the direct per-layer line is the precise
+# source and the `using device` list is a fallback (see `device_labels`). A load
+# that reports GPU layers but names no device has an UNKNOWN device count, and
+# the verdict is "not comparable" — the same rule as the MoE case below, never a
+# single-device guess that would flag a two-device load on every launch.
 #
 # CIRCULARITY, stated precisely. Taking D from the log means the expectation
 # moves with the log being judged. The failure this detector exists for is still
@@ -309,6 +314,26 @@ _BUFFER = re.compile(
 _N_SEQ_MAX = re.compile(r"n_seq_max\s*=\s*(\d+)")
 _GRAPH_SPLITS = re.compile(r"graph splits\s*=\s*(\d+)")
 
+# The engine names the device DIRECTLY as well, without a buffer label:
+#
+#   D load_tensors: layer  33 assigned to device ROCm0, is_swa = 0
+#   I llama_prepare_model_devices: using device ROCm0 (AMD Radeon RX 9070 XT) ...
+#
+# (prism-v.log:2510-2574 — 65 lines per load — and :81; both pins print them,
+# `llama-model.cpp` `load_tensors`: `ggml_backend_dev_name(dev)` at b9867:1287
+# /:1292 and 87268f77:1623/:1628). They are the second source for the device
+# count (A17e nit) and the only source when the buffer section is truncated.
+#
+# The two are kept apart on purpose. `assigned to device` names the device that
+# HOLDS a layer, so each label is provably a backend run; `using device` names
+# the model's prepared device list, which can include a device that received no
+# layers. The precise source therefore wins and the prepared one is only a
+# fallback, so this cannot raise the expectation above the layer evidence and
+# mask a divergence.
+_ASSIGNED_DEVICE = re.compile(r"assigned to device\s+(?P<dev>[A-Za-z][\w.]*)")
+_USING_DEVICE = re.compile(
+    r"llama_prepare_model_devices: using device\s+(?P<dev>[A-Za-z][\w.]*)")
+
 _KIND_KEY = {
     "model": "model_buffers",
     "KV": "kv_buffers",
@@ -326,12 +351,22 @@ def _is_host_buffer(label: str) -> bool:
     are the pinned host-side staging buffers `sched_reserve` sets aside. Every
     other label (`ROCm0`, `CUDA0`, `Vulkan0`, `Metal`) is a device buffer.
 
+    A17e nit: the `_Mapped` and `_pinned` suffixes are host spellings too. No
+    label the engine actually prints takes the form `CUDA_Mapped` /
+    `ROCm0_pinned` — the mmap'd copy is always `CPU_Mapped` and the staging
+    buffers always end `_Host` — but if one ever did, counting it as a DEVICE
+    would raise the expectation and so could MASK a real divergence (the
+    over-count direction the verifier recorded). Classifying them as host is
+    strictly safer and cannot touch a real device label, none of which ends in
+    either suffix.
+
     Confirmed for `CPU_Mapped` / `ROCm0` / `ROCm_Host` in prism-v.log:4485-4670.
     The CUDA/Vulkan/Metal spellings follow the same llama.cpp buffer-type naming
     but were not observed in this machine's log; a synthetic test pins the
     classification (UNVERIFIED against llama.cpp source in this run).
     """
-    return label in ("CPU", "CPU_Mapped") or label.endswith("_Host")
+    return (label in ("CPU", "CPU_Mapped") or label.endswith("_Host")
+            or label.endswith("_Mapped") or label.endswith("_pinned"))
 
 
 def _empty_load() -> dict:
@@ -346,20 +381,30 @@ def _empty_load() -> dict:
         "kv_buffers": [],
         "rs_buffers": [],
         "compute_buffers": [],
+        # A17e nit: the devices the engine named directly, not via a buffer.
+        # `devices` is the precise per-layer evidence; `prepared_devices` is the
+        # `using device` list, used only when nothing more precise exists.
+        "devices": [],
+        "prepared_devices": [],
         "n_seq_max": None,
         "graph_splits": None,
     }
 
 
 def _backend_of(load: dict) -> str:
-    """The backend the load's buffer labels name, or "" when none does.
+    """The backend the load's device labels name, or "" when none does.
 
     The device labels the engine prints are the plan's backend in the log:
     `ROCm0 model buffer size` means the weights were placed on a ROCm device.
-    A load whose only buffers are `CPU` / `CPU_Mapped` ran on the CPU; a load
-    with no buffer lines at all has no answer (""), which is not "cpu".
+    A17e nit: a device named directly (`assigned to device ROCm0`, `using
+    device ROCm0`) counts too, so a truncated buffer section does not turn a
+    GPU load into a "cpu" one. A load whose only evidence is host labels
+    (`CPU` / `CPU_Mapped` / `*_Host`) ran on the CPU; a load with no evidence at
+    all has no answer (""), which is not "cpu".
     """
     labels = [b["label"] for key in _BUFFER_KEYS for b in load.get(key, [])]
+    labels += list(load.get("devices") or ())
+    labels += list(load.get("prepared_devices") or ())
     for label in labels:
         for token, name in _DEVICE_FAMILIES:
             if label.startswith(token):
@@ -370,20 +415,30 @@ def _backend_of(load: dict) -> str:
 
 
 def device_labels(load: dict) -> list[str]:
-    """The distinct DEVICE labels the load's own buffers name, sorted.
+    """The distinct DEVICE labels the load's own log names, sorted.
 
     A17e: the scheduler cuts one run per device, so the device count has to
     come from somewhere. The plan does not carry it — `ComboFlags`/`RunPlan`
     have no tensor split and `--tensor-split` is only a known-flag entry
     (`engines.py:109`), never emitted — and the `/api/server/findings` surface
-    is given log text alone. The load's buffer labels are therefore the only
-    source available here.
+    is given log text alone. The load's own lines are therefore the only source
+    available here.
 
-    Host buffers (`CPU`, `CPU_Mapped`, any `*_Host`) are not devices. A label
-    counts once however many buffers carry it, and it counts even when
-    `_DEVICE_FAMILIES` does not recognize its family: the question is how many
-    separate device segments the engine reported, and an unknown-family label
-    is still a device.
+    A17e nit: TWO sources are unioned. The buffer labels (`ROCm0 model buffer
+    size`) are the original one; the engine's direct statements (`load_tensors:
+    layer N assigned to device ROCm0`, `llama_prepare_model_devices: using
+    device ROCm0`) are the second, and they are the only evidence when the
+    buffer section is truncated away. The union can only add a device the
+    engine really named, so a single-device load reads exactly as before. The
+    `using device` list is a FALLBACK only: it names the prepared device list,
+    which can include a device with no layers, and using it while precise
+    evidence exists could over-count and mask a divergence.
+
+    Host buffers (`CPU`, `CPU_Mapped`, any `*_Host`, `*_Mapped`, `*_pinned`)
+    are not devices. A label counts once however many lines carry it, and it
+    counts even when `_DEVICE_FAMILIES` does not recognize its family: the
+    question is how many separate device segments the engine reported, and an
+    unknown-family label is still a device.
 
     Circularity is inherent to reading this from the log (see the module
     comment): the expectation moves with the labels. A per-op CPU fallback is
@@ -391,7 +446,12 @@ def device_labels(load: dict) -> list[str]:
     a whole device silently dropping out of the load is not.
     """
     labels = {b["label"] for key in _BUFFER_KEYS for b in load.get(key, [])}
-    return sorted(label for label in labels if not _is_host_buffer(label))
+    labels |= set(load.get("devices") or ())
+    labels = {label for label in labels if not _is_host_buffer(label)}
+    if not labels:
+        labels = {label for label in (load.get("prepared_devices") or ())
+                  if not _is_host_buffer(label)}
+    return sorted(labels)
 
 
 def parse_loads(log_text: str) -> list[dict]:
@@ -408,17 +468,42 @@ def parse_loads(log_text: str) -> list[dict]:
     from the text gets `n_expert is None` (unknown), never the previous model's
     count.
 
+    The direct device statements (`assigned to device`, `using device`) are
+    carried forward the same way and for the same reason: the engine prints
+    them, and the weight tensors, BEFORE the `offloaded N/M` summary line
+    (prism-v.log:2510-2574 then :4485), so they belong to the load whose marker
+    FOLLOWS them. Attaching them to the load already open would charge the
+    previous load with the next one's devices.
+
     A log tail that starts after the marker (no `offloaded` line but buffer
-    lines present) still yields one entry, so the data is not dropped.
+    lines present) still yields one entry, so the data is not dropped; the
+    pending devices attach to it too.
     """
     loads: list[dict] = []
     cur: dict | None = None
     pending_experts: int | None = None
+    pending_devices: list[str] = []
+    pending_prepared: list[str] = []
+
+    def _attach(load: dict) -> None:
+        load["devices"] = pending_devices[:]
+        load["prepared_devices"] = pending_prepared[:]
 
     for line in (log_text or "").splitlines():
         m = _N_EXPERT.search(line)
         if m:
             pending_experts = int(m.group(1))
+            continue
+
+        m = _ASSIGNED_DEVICE.search(line)
+        if m:
+            if m.group("dev") not in pending_devices:
+                pending_devices.append(m.group("dev"))
+            continue
+        m = _USING_DEVICE.search(line)
+        if m:
+            if m.group("dev") not in pending_prepared:
+                pending_prepared.append(m.group("dev"))
             continue
 
         marker = _LOAD_MARKER.search(line)
@@ -430,6 +515,9 @@ def parse_loads(log_text: str) -> list[dict]:
                                        int(marker.group(2)))
             cur["n_expert"] = pending_experts
             pending_experts = None
+            _attach(cur)
+            pending_devices.clear()
+            pending_prepared.clear()
             loads.append(cur)
             continue
 
@@ -438,6 +526,9 @@ def parse_loads(log_text: str) -> list[dict]:
             if cur is None:
                 cur = _empty_load()
                 cur["found"] = True
+                _attach(cur)
+                pending_devices.clear()
+                pending_prepared.clear()
                 loads.append(cur)
             label = buf.group("label")
             cur[_KIND_KEY[buf.group("kind")]].append({
@@ -563,11 +654,12 @@ def expected_splits(*, ngl, n_layers, n_cpu_moe=None,
 def expected_splits_for_load(load: dict) -> int | None:
     """`expected_splits` for a parsed load; None when it cannot be derived.
 
-    The device count is the load's own distinct device labels (`device_labels`).
-    A load that reports GPU layers but names no device — a truncated tail, or a
-    label this parser does not recognize as a device — has an UNKNOWN device
-    count, so it is NOT COMPARABLE rather than the single-device 2 that would
-    flag its `graph splits` line on every launch.
+    The device count is the load's own distinct device labels (`device_labels`,
+    the union of the buffer labels and the engine's direct `assigned to device`
+    statements, with `using device` as a fallback). A load that reports GPU
+    layers but names no device anywhere — not even on a direct statement — has
+    an UNKNOWN device count, so it is NOT COMPARABLE rather than the
+    single-device 2 that would flag its `graph splits` line on every launch.
     """
     fields = plan_fields_from_load(load)
     devices = device_labels(load)
@@ -593,8 +685,9 @@ def _split_why_not_comparable(load: dict) -> str:
         return "the log does not report the offloaded layer count"
     if int(fields["ngl"]) > 0 and not device_labels(load):
         return ("the log reports %d layers offloaded to a GPU but names no "
-                "device buffer (no ROCm0 / CUDA0 / ... line), so the number of "
-                "devices — and therefore of GPU runs — is unknown"
+                "device (no ROCm0 / CUDA0 / ... buffer line and no "
+                "`assigned to device` line), so the number of devices — and "
+                "therefore of GPU runs — is unknown"
                 % fields["ngl"])
     return "the plan's placement does not determine a split count"
 

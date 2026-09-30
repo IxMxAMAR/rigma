@@ -609,3 +609,140 @@ def test_existing_findings_are_unaffected_by_memory_lines():
     got = engine_log.findings(text)
 
     assert [f["id"] for f in got] == ["cache_reuse_disabled"]
+
+
+# ---------------------------------------------------------------------------
+# A17e nit: the engine's DIRECT device statements are a second label source
+# ---------------------------------------------------------------------------
+#
+# Buffer labels are not the only place the engine names a device. Per load it
+# also prints, per layer (65 lines for the real load):
+#   D load_tensors: layer   0 assigned to device ROCm0, is_swa = 0
+# (prism-v.log:2510-2574) and once per model:
+#   I llama_prepare_model_devices: using device ROCm0 (AMD Radeon RX 9070 XT) ...
+# (prism-v.log:81). Both name a DEVICE directly, so they are a second source for
+# the device count — and the only one when the buffer section is truncated.
+
+_PREPARE_ROCm0 = (
+    "0.00.264.167 I llama_prepare_model_devices: using device ROCm0 "
+    "(AMD Radeon RX 9070 XT) (0000:04:00.0) - 16368 MiB\n")
+
+
+def _assigned(dev, n, start=0):
+    """`n` verbatim `assigned to device` lines, as the engine prints them."""
+    return "".join(
+        "0.00.521.%03d D load_tensors: layer %3d assigned to device %s, "
+        "is_swa = 0\n" % (i, start + i, dev) for i in range(n))
+
+
+DIRECT_DEVICE_LINES = _PREPARE_ROCm0 + _assigned("ROCm0", 65)
+
+# The real load with its device buffer line CUT OFF — only the host-mapped
+# weight copy survives — but the direct statements still name ROCm0.
+TRUNCATED_BUFFERS_WITH_DIRECT_DEVICE = (
+    DIRECT_DEVICE_LINES
+    + "0.00.987.636 I print_info: n_expert              = 0\n"
+    + "0.01.522.670 I load_tensors: offloaded 65/65 layers to GPU\n"
+    + "0.01.522.675 I load_tensors:   CPU_Mapped model buffer size =   322.07 MiB\n"
+    + "0.04.417.939 I sched_reserve: graph splits = 2\n")
+
+# Two devices named ONLY by the direct statements (the buffer section is host
+# RAM only), so the count cannot come from the buffer labels.
+TWO_DEVICE_TRUNCATED_BUFFERS = (
+    _PREPARE_ROCm0
+    + "0.00.264.168 I llama_prepare_model_devices: using device ROCm1 "
+      "(AMD Radeon RX 9070 XT) (0000:05:00.0) - 16368 MiB\n"
+    + _assigned("ROCm0", 33, start=0)
+    + _assigned("ROCm1", 32, start=33)
+    + "0.00.987.636 I print_info: n_expert              = 0\n"
+    + "0.01.522.670 I load_tensors: offloaded 65/65 layers to GPU\n"
+    + "0.01.522.675 I load_tensors:   CPU_Mapped model buffer size =   322.07 MiB\n"
+    + "0.04.417.939 I sched_reserve: graph splits = 3\n")
+
+# Only the `using device` line survives: no buffer label and no per-layer line.
+PREPARED_ONLY_TRUNCATED = (
+    _PREPARE_ROCm0
+    + "0.00.987.636 I print_info: n_expert              = 0\n"
+    + "0.01.522.670 I load_tensors: offloaded 65/65 layers to GPU\n"
+    + "0.01.522.675 I load_tensors:   CPU_Mapped model buffer size =   322.07 MiB\n"
+    + "0.04.417.939 I sched_reserve: graph splits = 2\n")
+
+
+def test_direct_device_statements_agree_with_the_buffer_labels():
+    """The union of the two sources must not move the single-device reading."""
+    with_direct = engine_log.parse_load(DIRECT_DEVICE_LINES + REAL_LOAD)
+    without = engine_log.parse_load(REAL_LOAD)
+
+    assert engine_log.device_labels(with_direct) == ["ROCm0"]
+    assert engine_log.expected_splits_for_load(with_direct) == 2
+    # byte-identical to the buffer-label-only reading: same expected count, same
+    # sentence, same divergence
+    assert engine_log.compare_plan(with_direct, PLAN_PREDICTION_MB) == \
+        engine_log.compare_plan(without, PLAN_PREDICTION_MB)
+
+
+def test_a_truncated_buffer_section_still_has_a_device_count():
+    """The device buffer line was cut off, but the direct per-layer statements
+    still name ROCm0, so the count is derivable — this reads HEALTHY instead of
+    NOT COMPARABLE."""
+    load = engine_log.parse_load(TRUNCATED_BUFFERS_WITH_DIRECT_DEVICE)
+
+    assert engine_log.device_labels(load) == ["ROCm0"]
+    assert engine_log.expected_splits_for_load(load) == 2
+
+    r = engine_log.compare_plan(load)
+    assert r["split_verdict"] == "ok"
+    assert r["expected_splits"] == 2
+    assert engine_log.findings(TRUNCATED_BUFFERS_WITH_DIRECT_DEVICE) == []
+
+
+def test_two_devices_named_only_by_the_direct_statements_are_counted():
+    load = engine_log.parse_load(TWO_DEVICE_TRUNCATED_BUFFERS)
+
+    assert engine_log.device_labels(load) == ["ROCm0", "ROCm1"]
+    assert engine_log.expected_splits_for_load(load) == 3
+    assert engine_log.compare_plan(load)["split_verdict"] == "ok"
+
+
+def test_using_device_is_a_fallback_when_no_precise_evidence_exists():
+    load = engine_log.parse_load(PREPARED_ONLY_TRUNCATED)
+
+    assert load["devices"] == []           # no per-layer line in this tail
+    assert load["prepared_devices"] == ["ROCm0"]
+    assert engine_log.device_labels(load) == ["ROCm0"]
+    assert engine_log.expected_splits_for_load(load) == 2
+
+
+def test_using_device_cannot_raise_the_count_above_the_layer_evidence():
+    """`assigned to device` names the device that HOLDS a layer, so each label
+    is provably a backend run; `using device` names the model's prepared device
+    list, which can include a device that received no layers. The precise source
+    wins, so a phantom prepared device cannot raise the expectation and MASK a
+    real divergence."""
+    text = (_PREPARE_ROCm0
+            + "0.00.264.168 I llama_prepare_model_devices: using device ROCm1 "
+              "(AMD Radeon RX 9070 XT) (0000:05:00.0) - 16368 MiB\n"
+            + _assigned("ROCm0", 65)
+            + REAL_LOAD)
+    load = engine_log.parse_load(text)
+
+    assert load["prepared_devices"] == ["ROCm0", "ROCm1"]
+    assert engine_log.device_labels(load) == ["ROCm0"]
+    assert engine_log.expected_splits_for_load(load) == 2
+
+
+def test_mapped_and_pinned_labels_are_host_not_devices():
+    """Verifier nit 3: `CUDA_Mapped` / `CUDA0_pinned` do not end `_Host`, so they
+    used to be counted as devices — an over-count that raises the expectation
+    and so can MASK a real divergence. No llama.cpp label takes those forms, but
+    the classification is now closed for them."""
+    text = ("0.00.1 I print_info: n_expert              = 0\n"
+            "0.00.2 I load_tensors: offloaded 65/65 layers to GPU\n"
+            "0.00.3 I load_tensors:    CUDA_Mapped model buffer size =   322.07 MiB\n"
+            "0.00.4 I load_tensors:  CUDA0_pinned model buffer size =    10.00 MiB\n"
+            "0.00.5 I load_tensors:        CUDA0 model buffer size =  6539.67 MiB\n"
+            "0.01.1 I sched_reserve: graph splits = 2\n")
+    load = engine_log.parse_load(text)
+
+    assert engine_log.device_labels(load) == ["CUDA0"]
+    assert engine_log.expected_splits_for_load(load) == 2
