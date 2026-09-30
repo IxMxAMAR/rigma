@@ -218,3 +218,31 @@ def test_rag_reindex_without_raggity_is_400(live_client, monkeypatch):
     # the refused pre-check must not leave the server "busy" forever
     assert live_client.get("/api/rag/status").json()["indexing"] is False
 
+
+def test_rag_reindex_records_a_failure_and_clears_busy(live_client, monkeypatch):
+    """The state the happy-path tests do not reach: the rebuild itself fails
+    (a non-zero raggity ingest, or an rmtree that could not remove the index).
+    The failure must land in ingest_state["error"] and busy must be cleared, or
+    the panel is stuck "indexing" forever and the 409 guard blocks every retry."""
+    import time
+
+    from rigma import rag
+
+    monkeypatch.setattr(rag, "raggity_cmd", lambda: ["raggity"])
+
+    def boom():
+        raise RuntimeError("raggity ingest failed:\nboom")
+
+    monkeypatch.setattr(rag, "rebuild_index", boom)
+    r = live_client.post("/api/rag/reindex")
+    assert r.status_code == 202
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not live_client.get("/api/rag/status").json()["indexing"]:
+            break
+        time.sleep(0.05)
+    status = live_client.get("/api/rag/status").json()
+    assert status["indexing"] is False
+    assert "boom" in status["error"]
+
+
