@@ -318,23 +318,44 @@ export interface UsageStats {
              last_used?: number | null }[];
 }
 
+/** The body `POST /api/server/switch` and `/api/server/ctx` answer with.
+ *
+ *  It is the new server state plus, when the switch had something to say, a
+ *  `notice` — today the KV-cache restore being refused (server_ops.py:856-874).
+ *  Both routes returned it all along; `j<unknown>` erased it and every caller
+ *  discarded the value, so the sentence never reached the screen (A8c). */
+export interface SwitchResult {
+  notice?: string;
+  [k: string]: unknown;
+}
+
+/** The server's `notice` from a switch/relaunch body, trimmed; `""` when there
+ *  is none or the shape is wrong. Pure, so the decision is testable without a
+ *  fetch. A step-down notice is NOT a failure, so callers render it neutrally
+ *  rather than in the error slot. */
+export function switchNotice(r: unknown): string {
+  if (!r || typeof r !== "object") return "";
+  const n = (r as { notice?: unknown }).notice;
+  return typeof n === "string" ? n.trim() : "";
+}
+
 export const engineApi = {
   server: () => j<ServerInfo>("GET", "/api/server"),
   switchOptions: () => j<SwitchOption[]>("GET", "/api/server/switch-options"),
   switchTo: (model: string, quant?: string) =>
-    j<unknown>("POST", "/api/server/switch", quant ? { model, quant } : { model }),
+    j<SwitchResult>("POST", "/api/server/switch", quant ? { model, quant } : { model }),
   /** Relaunch the RUNNING model with different engine settings. Every one of
    *  these stops the engine and starts it again — see EngineCard's warning. */
   relaunchWith: (o: { ctx: number; kv?: string; vision?: boolean;
                       backend?: string }) =>
-    j<unknown>("POST", "/api/server/ctx", {
+    j<SwitchResult>("POST", "/api/server/ctx", {
       ctx: o.ctx,
       ...(o.kv ? { kv: o.kv } : {}),
       ...(o.vision === undefined ? {} : { vision: o.vision }),
       ...(o.backend ? { backend: o.backend } : {}),
     }),
   relaunch: (ctx: number, kv?: string) =>
-    j<unknown>("POST", "/api/server/ctx", kv ? { ctx, kv } : { ctx }),
+    j<SwitchResult>("POST", "/api/server/ctx", kv ? { ctx, kv } : { ctx }),
   load: () => j<unknown>("POST", "/api/server/load", {}),
   unload: () => j<unknown>("POST", "/api/server/unload", {}),
   recalibrate: () => j<unknown>("POST", "/api/server/recalibrate", {}),
