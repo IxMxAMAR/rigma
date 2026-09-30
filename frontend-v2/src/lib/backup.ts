@@ -1,12 +1,14 @@
 // D4c: `/api/backup` (GET) and `/api/restore` (POST), from the UI's side.
 //
-// `/api/restore` REPLACES MEMORY and MERGES settings and methods: the file's
-// settings keys are written over the stored ones, each file method is saved by
-// id (nothing is deleted), and the memory store is replaced outright
-// (`serve.py::_apply_restore`). So the decision this module owns is not "how do
-// we render it" but "what, exactly, is about to change". `restoreSummary`
-// answers that from the file itself, before anything is sent, and the card
-// refuses to post until the user has confirmed that sentence.
+// `/api/restore` REPLACES THE WHOLE STORE — memory, settings and methods
+// (OD-15 option 1): the memory store is replaced outright, the settings are
+// written with `app_settings.replace` (defaults overlaid with the document's
+// keys, so a key the document omits goes back to its default), and every user
+// method the document does not name is deleted (`serve.py::_apply_restore`).
+// So the decision this module owns is not "how do we render it" but "what,
+// exactly, is about to change". `restoreSummary` answers that from the file
+// itself, before anything is sent, and the card refuses to post until the user
+// has confirmed that sentence.
 //
 // The route is all-or-nothing (A11): it validates the WHOLE document and then
 // applies it, so the only errors the UI can show are the server's own — a bad

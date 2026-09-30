@@ -77,9 +77,9 @@ export default function SettingsSurface() {
             panel or a model's card. */}
         <AppSettingsCard />
         {/* D4c: `/api/backup` + `/api/restore` and the MCP status report.
-            Restore replaces memory and merges settings and methods, so it
-            lives behind its own confirmation; the MCP report starts servers,
-            so it is manual. */}
+            Restore replaces the whole store — memory, settings and methods
+            (OD-15 option 1) — so it lives behind its own confirmation; the MCP
+            report starts servers, so it is manual. */}
         <BackupCard />
         <McpCard />
         <section className="rounded-lg bg-panel p-4">
