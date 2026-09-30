@@ -293,6 +293,22 @@ def restore(port: int, save_dir: Path, fp: str, *, slot: int = MAIN_SLOT,
     return (False, err) if err else (True, None)
 
 
+def restore_failure_note(kv_err: str) -> str:
+    """The user-facing line for a slot the engine would not load (A8/A8b).
+
+    ONE definition on purpose, for the same reason `launch_fingerprint` is: both
+    launch paths offer the saved slot — `rigma up` in cli.py and the UI's switch
+    in server_ops.py — and a refusal must read identically on both, or the two
+    drift into two different accounts of the same event. The "about four
+    minutes" figure is the measurement in this module's docstring (120K window,
+    ~560 t/s prefill on this machine), not a new claim.
+    """
+    return (f"the saved prompt cache for this exact configuration would not "
+            f"load ({kv_err}) — this conversation will be re-prefilled from "
+            f"zero, about four minutes on a 120K window. The cache is "
+            f"rewritten when the model is next unloaded.")
+
+
 def prune(save_dir: Path, keep: int = KEEP_CACHES) -> list[str]:
     """Drop all but the `keep` newest caches. Returns what was removed.
 

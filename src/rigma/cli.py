@@ -2604,6 +2604,12 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             f"download engine + model ({rp.gguf.bytes / 2**30:.1f} GB)?", abort=True)
     from .resolve import fallback_plans
     candidates = [rp, *fallback_plans(rp, reg, p)]
+    # A8b: the fingerprint is computed HERE, once, for the candidate that
+    # actually launches, and the SAME value is what `write_state` records below
+    # and what the restore is asked for. Re-deriving it after the launch would
+    # let the offered slot and the recorded key disagree.
+    from . import kvcache as _kvcache
+    kv_fp = ""
     sp = None
     for i, cand in enumerate(candidates):
         try:
@@ -2655,6 +2661,27 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             sp = runtime.launch_server(exe, cand, model_path, port=port - 1,
                                        extra_args=extra or None)
             rp = cand
+            # A8b (BACKLOG follow-up to A8): the server path offers the saved
+            # slot to the engine it just started; the CLI path recorded the
+            # fingerprint and never did, so every `rigma up` paid the full
+            # prefill even when the exact cache sat on disk. Mirror it here.
+            # `restore` does NOT raise on the ordinary refusal — it returns
+            # `(False, reason)` — so the reason has to be read from the tuple,
+            # exactly as A8 fixed in server_ops.perform_switch. `kv_fp` is
+            # still recorded below on failure, deliberately: it keys the unload
+            # save that overwrites the blob the engine could not read (see the
+            # A8 note in server_ops.py).
+            kv_fp = _kvcache.launch_fingerprint(rp, exe)
+            kv_err: str | None = None
+            try:
+                _restored, kv_err = _kvcache.restore(
+                    port - 1, runtime.rigma_home() / "sessions", kv_fp)
+            except Exception as e:      # restore() reports, it does not raise
+                kv_err = str(e)[:200]
+            if kv_err:
+                cold = _kvcache.restore_failure_note(kv_err)
+                typer.echo(cold)
+                rp.explain.append(cold)
             break
         except _VerifyRefused:
             # A5c: `--verify --refuse` said no. `typer.Exit` is a RuntimeError,
@@ -2682,14 +2709,14 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     # omitting this turned off prefix reuse AND restore-on-unload for every
     # CLI-started run — the whole reason a long conversation re-prefilled from
     # zero. `write_state` reverts unnamed fields to their defaults by design, so
-    # the launch path has to name it.
-    from . import kvcache as _kvcache
+    # the launch path has to name it. A8b: this is the SAME `kv_fp` the restore
+    # above was asked for, computed once in the launch loop.
     st.write_state(rp.model_slug, rp.gguf.quant, port,
                    engine_pid=sp.proc.pid, ui_pid=os.getpid(),
                    backend=rp.backend, use_case=use_case, ctx=rp.flags.ctx,
                    gguf=rp.gguf.file,
                    kv_cache=rp.flags.cache_type_k or "",
-                   kv_fp=_kvcache.launch_fingerprint(rp, exe),
+                   kv_fp=kv_fp,
                    engine=_engines.LLAMACPP,
                    # a projector this launch left off must stay off: perform_switch
                    # reads no_vision back when the caller has no opinion, and a

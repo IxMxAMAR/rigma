@@ -20,6 +20,15 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
+
+from typer.testing import CliRunner
+
+import rigma.cli as cli
+from rigma import state as st
+from rigma.models import (CachePolicy, CpuInfo, GgufFile, GpuInfo,
+                          HardwareProfile, ModelSpec)
+from rigma.registry import Registry
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "rigma"
 
@@ -93,3 +102,130 @@ def test_the_guard_would_have_caught_the_original_bug():
     call = next(n for n in ast.walk(bug) if isinstance(n, ast.Call))
     assert _kw(call, "kv_fp") is None
     assert _kw(call, "engine_pid") is not None
+
+
+# --- A8b: recording the key is only half — the launch must OFFER the slot -----
+#
+# A8 made a refused restore loud on the UI's switch path. The CLI's `up` path
+# wrote the same fingerprint and never called `kvcache.restore` at all, so a
+# cache saved by a previous launch was never offered to the engine: every
+# `rigma up` re-prefilled from zero no matter what sat on disk. These tests run
+# the real `up` command against a fake world (no engine is started) and assert
+# the slot is offered for a matching fingerprint, ignored for a mismatched one,
+# and that a refusal is printed while the key is still recorded.
+
+_runner = CliRunner()
+_FP = "deadbeefdeadbeef"
+
+
+def _profile():
+    gpu = GpuInfo(vendor="amd", name="RX 9070 XT", vram_mb=16368,
+                  arch="rdna4", slug="amd-radeon-rx-9070-xt-16g",
+                  backends=["vulkan"])
+    return HardwareProfile(gpus=[gpu], ram_mb=32768, ram_free_mb=20000,
+                           cpu=CpuInfo(cores=16), os="windows",
+                           disk_free_gb=400.0)
+
+
+def _up_world(tmp_path, monkeypatch, fingerprint):
+    """Everything `up` touches, stubbed. `fingerprint` is what the launch will
+    ask the cache for; `seen["calls"]` records the slot actions the engine was
+    asked to perform (it is never actually started)."""
+    gguf = GgufFile(repo="r", file="m.gguf", bytes=6 * 2**30, quant="Q4")
+    spec = ModelSpec(slug="m", family="f", kind="dense", n_layers=40,
+                     full_attn_layers=40, kv_heads=8, head_dim=128,
+                     native_ctx=131072, ggufs=[gguf], use_cases=["general"],
+                     cache_type_policy=CachePolicy())
+    (tmp_path / "models").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models" / "m.gguf").write_text("x")
+    reg = Registry([], {"m": spec}, {})
+    seen: dict = {"calls": [], "refuse": None}
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(Registry, "load", classmethod(lambda cls: reg))
+    monkeypatch.setattr(cli, "probe_hardware",
+                        lambda gpus, raw_gpus=None: _profile())
+    monkeypatch.setattr(cli, "_port_holder", lambda port: "")
+    monkeypatch.setattr("rigma.runtime.ensure_engine",
+                        lambda backend, os_name: tmp_path / "llama-server.exe")
+    monkeypatch.setattr("rigma.runtime.ensure_model",
+                        lambda g: tmp_path / "models" / g.file)
+    monkeypatch.setattr("rigma.bench.is_calibrated", lambda *a, **k: True)
+    # The fake engine pid must never be signalled on the way out.
+    monkeypatch.setattr(st, "kill_pid", lambda pid: None)
+
+    def fake_launch(exe, plan, mp, port=0, timeout=300.0, extra_args=None):
+        seen["plan"] = plan
+        return SimpleNamespace(proc=SimpleNamespace(pid=4242))
+    monkeypatch.setattr("rigma.runtime.launch_server", fake_launch)
+    monkeypatch.setattr("rigma.serve.run_ui",
+                        lambda port, eport: seen.update(state=st.read_state()))
+    # Pure function of the plan; pin it so the test can plant the blob whose
+    # name the launch will ask for.
+    monkeypatch.setattr("rigma.kvcache.launch_fingerprint",
+                        lambda rp, exe: fingerprint)
+
+    def fake_slot_action(port, slot, action, filename, timeout=120.0):
+        seen["calls"].append(action)
+        return seen["refuse"]
+    monkeypatch.setattr("rigma.kvcache.slot_action", fake_slot_action)
+    return seen
+
+
+def _run_up():
+    return _runner.invoke(cli.app, ["up", "--model", "m", "--yes",
+                                    "--no-browser", "--no-calibrate"])
+
+
+def test_up_offers_the_saved_cache_for_a_matching_fingerprint(tmp_path,
+                                                              monkeypatch):
+    """The defect: `rigma up` wrote `kv_fp` but never called `restore`, so a
+    cache saved under exactly this configuration was never offered. Before the
+    fix `seen["calls"]` is empty and the engine is left to re-prefill."""
+    seen = _up_world(tmp_path, monkeypatch, _FP)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / f"kv-{_FP}.bin").write_bytes(b"a saved cache")
+    res = _run_up()
+    assert res.exit_code == 0, res.output
+    assert seen["calls"] == ["restore"], (
+        "a matching fingerprint must offer the saved slot to the engine")
+    assert seen["state"]["kv_fp"] == _FP
+
+
+def test_up_does_not_offer_a_cache_saved_under_another_fingerprint(
+        tmp_path, monkeypatch):
+    """A blob exists, but under a different key. Offering it would restore a
+    history taken under another configuration — the silent-corruption case
+    `kvcache` exists to prevent — so the engine must never be asked."""
+    seen = _up_world(tmp_path, monkeypatch, _FP)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "kv-0000000000000000.bin").write_bytes(b"another config")
+    res = _run_up()
+    assert res.exit_code == 0, res.output
+    assert seen["calls"] == [], "a mismatched fingerprint must not restore"
+    assert "re-prefilled from zero" not in res.output
+    assert seen["state"]["kv_fp"] == _FP
+
+
+def test_a_refused_restore_is_reported_and_still_keys_the_unload_save(
+        tmp_path, monkeypatch):
+    """`restore` RETURNS `(False, reason)` on the ordinary refusal; it does not
+    raise. The reason must reach the user, and `kv_fp` must still be recorded:
+    it is the key the unload save writes under, and that save is the only thing
+    that overwrites the blob the engine could not read (A8's rule)."""
+    seen = _up_world(tmp_path, monkeypatch, _FP)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / f"kv-{_FP}.bin").write_bytes(b"a saved cache")
+    seen["refuse"] = "engine refused the restore (500)"
+    res = _run_up()
+    assert res.exit_code == 0, res.output
+    assert seen["calls"] == ["restore"]
+    assert "engine refused the restore (500)" in res.output, res.output
+    assert "re-prefilled from zero" in res.output, res.output
+    # the same note is on the plan's own explain surface
+    assert any("re-prefilled from zero" in w for w in seen["plan"].explain)
+    assert seen["state"]["kv_fp"] == _FP, (
+        "clearing kv_fp would skip the unload save, leave the unreadable file "
+        "in place forever, and re-prefill on every later restart")
