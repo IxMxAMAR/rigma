@@ -162,3 +162,51 @@ def test_an_unrecognised_recurrent_geometry_is_unknown_not_zero():
     flags = fit_gguf(spec, spec.ggufs[0], _profile(), 8192, explain)
     assert flags is not None
     assert any("rs=unknown" in ln for ln in explain), explain
+
+
+def test_the_over_mb_delta_double_rounds_by_less_than_one_mb():
+    """A2e, closed as COSMETIC: no change, and this pins the arithmetic.
+
+    A2b's verifier measured that the `over_mb` delta reads 300 for a 299.25 MiB
+    term. It is double rounding, not a wrong charge. `_budget_rows` reports each
+    `over_mb` as `round(exact)`, and the delta differences TWO independently
+    rounded numbers, so it carries up to one whole MB of rounding noise on top
+    of the term it is meant to show:
+
+        over_mb(row)   = round(X + 299.25)
+        over_mb(blind) = round(X)
+        delta          = round(X + 299.25) - round(X)
+
+    with X = file + kv - budget = -7615.661773681641 for the constants below.
+    round(-7316.411773681641) - round(-7615.661773681641) = -7316 - (-7616) = 300,
+    while the charged term is 299.25 — a 0.25 MB (0.08%) overstatement in the
+    DELTA. Neither row is wrong: each is the exact arithmetic rounded to the
+    whole MB the display shows, and 0.25 MB is below that display's resolution.
+
+    Making the delta exact is worse, not better: summing the already-rounded
+    columns would let `over_mb`'s SIGN disagree with the exact arithmetic by up
+    to 2 MB, and `over_mb > 0` is the page's "OVER by ... that much spills to
+    RAM" vs "headroom" verdict. A wrong verdict is a wrong answer; 0.25 MB on a
+    299 MB term is not. The fit's own arithmetic is untouched either way."""
+    from rigma.resolve import LAUNCH_PARALLEL, _budget_rows, recurrent_state_mb
+    spec = _bonsai()
+    gguf = spec.ggufs[0]
+    rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
+    assert rs_mb == pytest.approx(299.25, abs=0.02)
+
+    ctx, budget = 8192, 15000.0
+    row = _budget_rows(spec, gguf, 0.0, ctx, budget)
+    blind = _budget_rows(spec.model_copy(update={"recurrent_layers": 0}),
+                         gguf, 0.0, ctx, budget)
+    assert row["rs_mb"] == 299            # the charge, rounded to whole MB
+    delta = row["over_mb"] - blind["over_mb"]
+    assert delta == 300                   # the measured double rounding
+    # ... and it is bounded by the display's own resolution: no fractional part
+    # of X can move the delta more than 0.75 MB away from the true term.
+    assert abs(delta - rs_mb) <= 0.75
+
+    # the two rows, reconstructed: each is the exact sum rounded once
+    x = gguf.bytes / MIB + ctx * kv_bytes_per_token(spec, "f16", "f16") / MIB \
+        - budget
+    assert blind["over_mb"] == round(x)
+    assert row["over_mb"] == round(x + rs_mb)
