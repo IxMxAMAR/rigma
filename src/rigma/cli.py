@@ -1627,6 +1627,11 @@ def status():
 @app.command()
 def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
           gen_tokens: int = typer.Option(128, "--gen-tokens"),
+          depth: int = typer.Option(None, "--depth",
+                                    help="Fill the context window to this many "
+                                         "tokens before measuring, so the number "
+                                         "describes a window that deep "
+                                         "(default: the prompt is the window)"),
           evidence: str = typer.Option(None, "--evidence",
                                        help="Write registry-format evidence JSON here")):
     """Measure real prefill/generation speed of the running server."""
@@ -1650,12 +1655,19 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     # traceback instead of "the engine is not answering". RuntimeError covers
     # the no-timings case 08-7 raises.
     try:
-        r = run_bench(s["public_port"], prompt_tokens, gen_tokens)
+        r = run_bench(s["public_port"], prompt_tokens, gen_tokens,
+                      depth=depth, ctx=s.get("ctx") or None)
     except (httpx.HTTPError, RuntimeError) as e:
         typer.echo(f"benchmark failed: {e}")
         raise typer.Exit(1) from e
+    # D1/S3: say how deep the window actually was — a number taken at depth 0
+    # says nothing about a filled window, and llama.cpp only attends over
+    # occupied cells.
+    window = f", window {r.depth:,} deep" if r.depth else ""
+    if r.ctx:
+        window += f", ctx {r.ctx:,}"
     typer.echo(f"prefill: {r.pp_tps:.0f} t/s   gen: {r.tg_tps:.1f} t/s "
-               f"({r.prompt_tokens}-token prompt)")
+               f"({r.prompt_tokens}-token prompt{window})")
     reg = Registry.load()
     combo_expected = None
     for c in reg.combos.values():
@@ -1665,8 +1677,8 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     typer.echo(verdict(r, combo_expected))
     from .bench import calibration_key, current_identity
     _be = s.get("backend", "unknown")
-    save_calibration(calibration_key(s["model"], s["quant"], _be), r.model_dump(),
-                     identity=current_identity(_be))
+    save_calibration(calibration_key(s["model"], s["quant"], _be),
+                     r.as_measured(), identity=current_identity(_be))
     # AUDIT F15-7: `~` is POSIX shorthand — Explorer and cmd do not expand it.
     # Print the path the file was actually written to.
     typer.echo(f"recorded to {calibration_path()}")
@@ -1676,7 +1688,7 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
                    "date": datetime.date.today().isoformat(),
                    "llamacpp": _engines_manifest()["version"],
                    "os": platform.system().lower(),
-                   "measured": r.model_dump()}
+                   "measured": r.as_measured()}
         Path(evidence).parent.mkdir(parents=True, exist_ok=True)
         Path(evidence).write_text(_json.dumps(payload, indent=2), encoding="utf-8")
         typer.echo(f"evidence written -> {evidence}")
@@ -1689,7 +1701,13 @@ def sweep(use_case: str = typer.Option("general", "--use-case"),
                                    help="Scratch port for the trial engine — "
                                         "NOT your live server"),
           prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
-          gen_tokens: int = typer.Option(96, "--gen-tokens")):
+          gen_tokens: int = typer.Option(96, "--gen-tokens"),
+          depth: int = typer.Option(None, "--depth",
+                                    help="Fill each trial's context window to "
+                                         "this many tokens before measuring — a "
+                                         "placement that only wins on a "
+                                         "near-empty window can lose on a "
+                                         "filled one")):
     """A/B every speedup on THIS machine and save the winner to calibration.
 
     Launches a throwaway engine on a scratch port (default 11601) and measures
@@ -1718,8 +1736,15 @@ def sweep(use_case: str = typer.Option("general", "--use-case"),
     model_path = runtime.ensure_model(rp.gguf)
     rows = run_sweep(rp, exe, model_path, port=port,
                      prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
+                     depth=depth,
                      progress=lambda label: typer.echo(f"  trying {label} ..."))
-    typer.echo("\n  config             gen t/s   prefill t/s")
+    # D1/S3: the window the rows describe. Without a depth the rows measure a
+    # near-empty window at whatever ctx was resolved, which is not the same
+    # machine state as a filled one.
+    typer.echo(f"\n  window: {prompt_tokens:,} tokens"
+               + (f", filled to {depth:,}" if depth else "")
+               + f", ctx {rp.flags.ctx:,}")
+    typer.echo("  config             gen t/s   prefill t/s")
     typer.echo("  " + "-" * 40)
     for r in rows:
         mark = "" if r["ok"] else "  (failed)"
