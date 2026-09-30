@@ -868,7 +868,10 @@ def _release_unreadable_run(runs_mod, run_id: str,
     except FileNotFoundError:
         raw = None
     except Exception:
-        raw = {"id": run_id}    # an unreadable pointer is nobody's claim
+        # DR8: an unreadable pointer is NOT this run's claim. `runs.active()`
+        # returns None for it, so a new run may already have started and own the
+        # slot; clearing here would drop THAT run's claim.
+        raw = None
     if isinstance(raw, dict) and raw.get("id") == run_id:
         try:
             runs_mod.clear_active()
@@ -5972,19 +5975,35 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # 409 "run is running", a new run 409 "a run is already active". Only
         # Stop cleared it. Found by the full suite under concurrency
         # (test_phase4_lifecycle's restart test), not by reading.
-        run, readable = _load_run_for_loop(_runs, run_id)
-        if not readable:
-            _release_unreadable_run(_runs, run_id, "run state could not be read")
-            return
-        if run is None:
-            return                    # deleted: nothing to drive
-        sid = run["session_id"]
-        try:
-            await _compile_spec(run_id, sid)
-        except Exception:
-            pass                      # never block a run on compilation
+        #
+        # DR8: the first load lives INSIDE the try/finally. Its `return` used to
+        # sit BEFORE it, so a run released here skipped every piece of
+        # end-of-run cleanup: the chat kept `mission`/`run_id` (so it was never
+        # auto-titled again and compacted in masking style), no "RUN
+        # INTERRUPTED" line reached progress.md, and the dead driver task stayed
+        # in `_run_tasks`. `sid` starts empty and is only filled once a record
+        # was actually recovered, so the cleanup never touches a chat it cannot
+        # prove belongs to this run.
         prev_sig = None
+        sid = ""
         try:
+            run, readable = _load_run_for_loop(_runs, run_id)
+            if not readable:
+                # `_release_unreadable_run` returns the record it managed to
+                # recover, so the finally below can still clear THIS run's
+                # session when the file turned out to be readable after all.
+                released = _release_unreadable_run(
+                    _runs, run_id, "run state could not be read")
+                if released:
+                    sid = str(released.get("session_id") or "")
+                return
+            if run is None:
+                return                # deleted: nothing to drive
+            sid = run["session_id"]
+            try:
+                await _compile_spec(run_id, sid)
+            except Exception:
+                pass                  # never block a run on compilation
             while True:
                 # R3-RUN-5: `_runs.load` swallows EVERY exception and returns
                 # None, so "I could not read my own state" was indistinguishable
@@ -6713,7 +6732,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 _runs.set_status(r, "error", f"loop crashed: {str(e)[:200]}")
         finally:
             _run_tasks.pop(run_id, None)
-            s2 = sessions.load(sid)
+            # DR8: `sid` is empty when the first load never recovered a record
+            # (an unreadable state that could not be re-read). There is then no
+            # chat we can prove belongs to this run, so the session cleanup is
+            # skipped rather than guessed at.
+            s2 = sessions.load(sid) if sid else None
             if s2 is not None and s2.get("mission"):
                 # R3-2: the LAST unguarded whole-row save in the run. The chat's
                 # own UI is back on this session the moment the run ends (the
