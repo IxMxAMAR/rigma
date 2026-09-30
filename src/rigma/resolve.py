@@ -1441,11 +1441,28 @@ def resolve(profile: HardwareProfile, registry: Registry,
                       "packaged one disagree)")
             why = _combo_rejection(combo, spec, gguf, profile)
             if not why:
+                # w13b2 NIT 2: a registry combo is hand-authored, and its `env`
+                # used to be copied straight onto the plan — so a combo carrying
+                # `LLAMA_ATTN_ROT_DISABLE` (or a lowercase variant) reached a
+                # plain launch, the silent quality regression C11 closed for the
+                # calibration merge. Route the copy through the SAME gate, so a
+                # hand-edited combo cannot reopen the path. No in-tree combo
+                # carries a lever today; this is the read-path guard.
+                combo_flags, dropped_levers = _without_quality_env_levers(
+                    combo.flags.model_dump())
                 plan = RunPlan(
                     model_slug=combo.model, gguf=gguf, backend=combo.backend,
-                    flags=combo.flags, origin=f"{kind}:{rel}",
+                    flags=(ComboFlags.model_validate(combo_flags)
+                           if dropped_levers else combo.flags),
+                    origin=f"{kind}:{rel}",
                     explain=([f"registry match: {rel}"]
                              + _tier_note(rel, profile) + combo.sources))
+                if dropped_levers:
+                    plan.explain.append(
+                        f"registry {kind} dropped quality-degrading env lever(s) "
+                        + ", ".join(dropped_levers) + ": the engine turns the "
+                        "quality-preserving default ON for a reason "
+                        "(see bench._QUALITY_ENV_LEVERS)")
                 # A model's stored launch defaults apply on the combo path too:
                 # `rigma up` with no --model lands here, and a stored ubatch/ngl
                 # that only worked through the calculator would be a default

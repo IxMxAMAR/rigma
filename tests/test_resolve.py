@@ -378,6 +378,43 @@ def test_a_combo_the_machine_still_has_the_headroom_for_is_kept():
     assert plan.origin.startswith("combo:"), plan.explain
 
 
+def _combo_with_env(env):
+    """The shipped ram-16 coding combo with `env` added to its stored flags."""
+    base = Registry.load().combos[COMBO_REL]
+    return _broken_combo_registry(flags={**base.flags.model_dump(), "env": env})
+
+
+def test_a_combo_env_quality_lever_is_dropped_with_a_visible_note():
+    """w13b2 NIT 2: `resolve()` copied `combo.flags` onto the plan with no
+    `_without_quality_env_levers` pass, so a hand-edited registry combo carrying
+    `LLAMA_ATTN_ROT_DISABLE` (or a lowercase variant) reached a plain launch —
+    the silent quality regression C11 closed for the calibration merge. The lever
+    is dropped and the drop is named in `explain`; an unrelated env var rides
+    along untouched."""
+    for spelling in ("LLAMA_ATTN_ROT_DISABLE", "llama_attn_rot_disable"):
+        plan = resolve(_pressured(used_mb=0),
+                       _combo_with_env({spelling: "1",
+                                        "RIGMA_UNRELATED": "keep"}),
+                       use_case="coding")
+        assert plan.origin.startswith("combo:"), (spelling, plan.explain)
+        assert plan.flags.env == {"RIGMA_UNRELATED": "keep"}, \
+            (spelling, plan.flags.env)
+        assert any("LLAMA_ATTN_ROT_DISABLE" in e and "dropped" in e
+                   for e in plan.explain), (spelling, plan.explain)
+
+
+def test_a_combo_env_without_a_quality_lever_is_untouched():
+    """The gate drops ONLY a `bench._QUALITY_ENV_LEVERS` name: a combo whose env
+    carries an unrelated engine variable is copied through exactly as authored,
+    and nothing is claimed to have been dropped."""
+    plan = resolve(_pressured(used_mb=0),
+                   _combo_with_env({"RIGMA_UNRELATED": "keep"}),
+                   use_case="coding")
+    assert plan.origin.startswith("combo:"), plan.explain
+    assert plan.flags.env == {"RIGMA_UNRELATED": "keep"}, plan.flags.env
+    assert not any("dropped" in e for e in plan.explain), plan.explain
+
+
 def test_a_combo_whose_placement_no_longer_exists_falls_through():
     """Even with no declared budget the placement has to still EXIST: a combo
     verified at 32K is not usable on a box that can no longer place it at
