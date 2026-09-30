@@ -255,3 +255,186 @@ def test_a_junction_inside_the_workspace_does_not_reach_startup(home):
     out = _write("link/x.cmd")
     _refused(out)
     assert not (startup / "x.cmd").exists()
+
+
+# --- FAIL-1: trailing dot/space on a shape whose ANCESTOR is not a shape ------
+#
+# Windows strips a trailing dot/space from every component at the filesystem
+# API, but `Path.resolve()` canonicalises a component only when it already
+# EXISTS. The creation case is a component that does not exist yet, so
+# `PowerShell.` stays `PowerShell.` and never matched the shape `PowerShell`.
+# The earlier `Startup./x.cmd` case was caught by the `%APPDATA%\Microsoft\
+# Windows` ANCESTOR shape, so it never exercised a standalone shape.
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows strips trailing dots/spaces")
+@pytest.mark.parametrize("rel", [
+    ".gitconfig.",
+    ".gitconfig ",                        # trailing SPACE, not dot
+    "_gitconfig.",
+    ".bashrc.",
+    ".profile ",
+    ".zshrc.",
+    ".config/git/config.",
+    ".config/fish/config.fish.",
+    ".config/autostart./x.desktop",
+    "Documents/PowerShell./Microsoft.PowerShell_profile.ps1",
+    "Documents/WindowsPowerShell./Microsoft.PowerShell_profile.ps1",
+])
+def test_a_trailing_dot_or_space_on_a_standalone_shape_is_refused(home, rel):
+    out = _write(rel)
+    _refused(out)
+    assert not (home / rel).exists(), f"{rel} was created"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows strips trailing dots/spaces")
+def test_a_relative_copy_destination_with_a_trailing_dot_is_refused(home):
+    """The dir does not exist yet, so `resolve()` keeps `PowerShell.`."""
+    (home / "a.txt").write_text("x", encoding="utf-8")
+    out = tools.run_tool("copy_files", {"paths": ["a.txt"],
+                                        "dest": "Documents/PowerShell."},
+                         _ctx())
+    _refused(out)
+    assert not (home / "Documents" / "PowerShell").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows strips trailing dots/spaces")
+def test_scheduled_tasks_with_a_trailing_dot_is_refused_through_the_grant(home):
+    systemroot = Path(os.environ["SystemRoot"])
+    (home / "a.txt").write_text("x", encoding="utf-8")
+    out = tools.run_tool("copy_files",
+                         {"paths": ["a.txt"],
+                          "dest": str(systemroot / "System32" / "Tasks.")},
+                         _ctx(allow_absolute_writes=True))
+    _refused(out)
+    assert not (systemroot / "System32" / "Tasks").exists()
+
+
+# --- FAIL-2: a local UNC / admin-share spelling of the same directory ---------
+#
+# `Path.resolve()` keeps a UNC path as UNC, so `\\localhost\c$\…\Startup` and
+# the `\\?\UNC\` spelling never matched a drive-letter anchor — and with
+# `allow_absolute_writes=True` they wrote straight into Startup.
+
+def _unc(p: Path) -> str:
+    s = str(p)
+    return "\\\\localhost\\" + s[0].lower() + "$" + s[2:]
+
+
+def _unc_reaches(unc: str) -> bool:
+    """Can this box actually open the admin share? Skip if not. (Do NOT compare
+    `resolve()` forms: a UNC path resolves to itself, not to the drive form.)"""
+    try:
+        return Path(unc).is_dir()
+    except (OSError, ValueError):
+        return False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="admin shares are a Windows property")
+def test_a_unc_admin_share_of_startup_is_refused_through_the_grant(home):
+    startup = _startup(home)
+    startup.mkdir(parents=True, exist_ok=True)
+    unc = _unc(startup)
+    if not _unc_reaches(unc):
+        pytest.skip("the c$ admin share is not reachable from this session")
+    (home / "a.txt").write_text("x", encoding="utf-8")
+    out = tools.run_tool("copy_files", {"paths": ["a.txt"], "dest": unc},
+                         _ctx(allow_absolute_writes=True))
+    _refused(out)
+    assert not (startup / "a.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="admin shares are a Windows property")
+def test_the_extended_unc_spelling_of_startup_is_refused_through_the_grant(home):
+    startup = _startup(home)
+    startup.mkdir(parents=True, exist_ok=True)
+    unc = _unc(startup)
+    if not _unc_reaches(unc):
+        pytest.skip("the c$ admin share is not reachable from this session")
+    extended = "\\\\?\\UNC\\" + unc[2:]
+    (home / "a.txt").write_text("x", encoding="utf-8")
+    out = tools.run_tool("copy_files", {"paths": ["a.txt"], "dest": extended},
+                         _ctx(allow_absolute_writes=True))
+    _refused(out)
+    assert not (startup / "a.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="admin shares are a Windows property")
+def test_a_unc_admin_share_is_refused_without_the_grant_too(home):
+    startup = _startup(home)
+    startup.mkdir(parents=True, exist_ok=True)
+    unc = _unc(startup)
+    if not _unc_reaches(unc):
+        pytest.skip("the c$ admin share is not reachable from this session")
+    (home / "a.txt").write_text("x", encoding="utf-8")
+    out = tools.run_tool("copy_files", {"paths": ["a.txt"], "dest": unc}, _ctx())
+    assert out.startswith("error"), out            # outside the workspace
+    assert not (startup / "a.txt").exists()
+
+
+# --- ODR-6-residual: the credential/state-dir rule and a >=260-char path ------
+#
+# `_ws_path`/`_long_path` hand back a `\\?\`-prefixed path once it is >=260
+# chars, and `_credential_path_reason` matches the path SHAPE — `\\?\C:\...` is
+# not `is_relative_to` the unprefixed state dir. `_unlong` is now applied at
+# `_read_path`, `_write_path`, `_resolve_image` and the workspace walker.
+
+def _deep_dir(base: Path, leaf: str = "deep") -> Path:
+    """A directory whose path is >=300 chars (so `_long_path` prefixes it)."""
+    d = base
+    while len(str(d / leaf)) < 300:
+        d = d / ("d" * 40)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the \\\\?\\ prefix is Windows-only")
+def test_a_long_state_dir_path_is_refused_by_read_file(home):
+    rigma = Path(os.environ["RIGMA_HOME"])
+    target = _deep_dir(rigma) / "secret.txt"
+    target.write_text("TOP SECRET", encoding="utf-8")
+    assert len(str(target)) >= 260
+    out = tools.run_tool("read_file", {"path": str(target)},
+                         _ctx(allow_absolute_reads=True))
+    assert out.startswith("error"), out
+    assert "state" in out.lower(), out
+    assert "TOP SECRET" not in out
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the \\\\?\\ prefix is Windows-only")
+def test_a_long_state_dir_destination_is_refused_by_copy_files(home):
+    rigma = Path(os.environ["RIGMA_HOME"])
+    dest = _deep_dir(rigma)
+    (home / "a.txt").write_text("x", encoding="utf-8")
+    assert len(str(dest)) >= 260
+    out = tools.run_tool("copy_files", {"paths": ["a.txt"], "dest": str(dest)},
+                         _ctx(allow_absolute_writes=True))
+    assert out.startswith("error"), out
+    assert "state" in out.lower(), out
+    assert not (dest / "a.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the \\\\?\\ prefix is Windows-only")
+def test_a_long_workspace_does_not_walk_into_the_state_dir(tmp_path, monkeypatch):
+    ws = _deep_dir(tmp_path / "longws")
+    state = ws / ".rigma"
+    (state / "sessions").mkdir(parents=True, exist_ok=True)
+    (state / "sessions" / "x.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("RIGMA_HOME", str(state))
+    ctx = {"workspace": str(ws), "allow_code": True}
+    out = tools.run_tool("find_files", {"pattern": "**/*.json"}, ctx)
+    assert "x.json" not in out, out
+    assert "state" not in out.lower(), out
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the \\\\?\\ prefix is Windows-only")
+def test_a_long_relative_image_in_the_state_dir_is_refused(tmp_path, monkeypatch):
+    ws = _deep_dir(tmp_path / "longws")
+    state = ws / ".rigma"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "secret.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+    monkeypatch.setenv("RIGMA_HOME", str(state))
+    out = tools.run_tool("view_image", {"path": ".rigma/secret.png"},
+                         {"workspace": str(ws), "allow_code": True,
+                          "has_vision": True})
+    assert out.startswith("error"), out
+    assert "state" in out.lower(), out
