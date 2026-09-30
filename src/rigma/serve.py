@@ -2240,8 +2240,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             sessions.validate_field_types(body)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        return sessions.create(title=body.get("title", "New chat"),
-                               system_prompt=body.get("system_prompt", ""))
+        # ODR-9: `sessions.create` builds the write-allowlist seed, which runs
+        # `json_extract` over EVERY stored session body. On the loop that
+        # stalls every live stream while "New chat" is answered, so the whole
+        # create runs in a worker thread like the other store scans above.
+        return await asyncio.to_thread(
+            sessions.create, title=body.get("title", "New chat"),
+            system_prompt=body.get("system_prompt", ""))
 
     @app.get("/api/sessions/search")
     async def search_sessions(q: str = ""):
