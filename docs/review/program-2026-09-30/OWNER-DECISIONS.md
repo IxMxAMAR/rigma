@@ -171,6 +171,40 @@ the eviction rule must not produce.
 
 ---
 
+## OD-8 — The mid-turn prompt queue cap, and how long a question waits for an answer (A12 / B4)
+
+**State today:** two bounds in `serve.py` are product decisions rather than engineering ones, and are
+recorded here because the brief requires it.
+
+- **The mid-turn prompt queue.** A prompt typed while a reply is streaming is held in memory
+  (`_queued`) until the running turn drains it. It is capped at `_QUEUE_MAX = 32` per chat, enforced
+  at the door: the 33rd prompt is refused with HTTP **429** and a body that says how many are already
+  queued — the client is TOLD, rather than the prompt being silently discarded later. 32 is a
+  typing-spree bound, not a memory bound: each entry is one message. (Implemented in R3-5/A12, already
+  on the branch.)
+- **The elicitation wait.** mcode's `ask_user` arrives as an ACP `elicitation/create`; `serve.py` now
+  answers it on the same channel as a permission. `QUESTION_WAIT_SECS = 5.0` is how long the ACP
+  reader thread waits for the user before returning `None` (a decline). It is deliberately shorter
+  than `_APPROVAL_WAIT_SECS` (120 s) because **no client renders elicitation yet** — a two-minute
+  hang per question would be worse than the auto-decline it replaces.
+
+**Options**
+1. Keep 32 and 5 s. Raise `QUESTION_WAIT_SECS` toward `_APPROVAL_WAIT_SECS` in the same change that
+   ships the UI card; keep the queue cap.
+2. A smaller or larger queue cap. 32 is already far past what a person types during one reply; a
+   larger cap only lengthens the in-memory tail.
+3. Wait the full 120 s for a question now. Rejected: with no UI to answer, it stalls the turn for two
+   minutes to reach the same decline.
+
+**Recommendation: option 1.** Both numbers are one-line edits. The important half is behavioural: the
+queue refuses *visibly* (429) and a question returns a real decline instead of hanging.
+
+**If nothing is decided:** the numbers stand. What the UI still needs for B4 is a card for the
+`approval/asked` event when `data.kind == "question"` that renders `data.question` + `data.schema` and
+POSTs `{"requestId": data.id, "answer": {...}}` to `/api/sessions/{sid}/approval`. Until it exists,
+every question declines after `QUESTION_WAIT_SECS`.
+---
+
 ## OD-9 — ACP session management (list / load / activate) was removed as dead code; wiring it to a route + UI is a feature of its own (B5)
 
 **State today:** three `AcpClient` wrappers had no product consumer. Item B5 **deleted two of them**
@@ -196,9 +230,12 @@ dispatched through `getattr`.
 
 **Evidence:** the deletion is in this commit; `harness_mcode_acp.py:1339` (`session_resume` is the
 reattach that is actually wired); `tests/test_harness_mcode_acp.py:471`; the `STANDARD_METHODS`
-entries `session/load` (`:69`) and `session/list` (`:71`) were deliberately left in place — they still
-record the measured mcode surface, and the guard at `tests/test_acp_control.py:514-529` still passes
-because its fallback accepts a method whose literal appears anywhere in the file.
+entries `session/load` (`:69`) and `session/list` (`:71`) were **removed in item B5c**, and the guard at
+`tests/test_acp_control.py:514-529` was made non-vacuous at the same time. The old fallback accepted a
+method whose literal appeared anywhere in the file — including the table itself — so it could never
+fail for *any* of the seven entries (measured: pre-filter `['session/list','session/load']`,
+post-filter `[]`). Keeping the two rows would have made the table a false record of what the client
+can send.
 
 **Recommendation: option 1**, with option 2 as its own item if the owner wants a chat to continue an
 mcode session Rigma did not start. Deleting was right because `session_list`'s only proposed consumer
