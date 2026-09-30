@@ -21,7 +21,7 @@ from starlette.background import BackgroundTask
 
 from . import context
 from . import harness as _harness
-from .atomicio import atomic_write_json
+from .atomicio import atomic_write_bytes, atomic_write_json
 from . import methods_api
 from . import mission as _mission_mod
 from . import presets
@@ -1370,6 +1370,56 @@ def _driving_message(run, session):
         # passive while it acts, directive the moment it stops.
         lines.append("no tool ran last turn — call one now to continue")
     return "\n".join(lines)
+
+
+class _RestoreStageError(RuntimeError):
+    """A restore apply step failed. `stage` is the section to name to the client
+    ("settings", "methods", "memory") — A11/R3-3: the old code answered a bare
+    500 and the client could not tell how far the restore got."""
+
+    def __init__(self, stage: str, detail: str):
+        super().__init__(detail)
+        self.stage = stage
+
+
+def _snapshot_store(path) -> bytes | None:
+    """The exact bytes of `path`, or None when it does not exist yet."""
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _snapshot_stores(targets: list[tuple[str, object]]) -> list:
+    """The undo log for a restore: (label, path, prior-bytes-or-None) per file."""
+    return [(label, path, _snapshot_store(path)) for label, path in targets]
+
+
+def _restore_snapshot(path, data: bytes | None) -> None:
+    """Put `data` back at `path`, or remove a file that was not there.
+
+    `atomic_write_bytes`, not `atomic_write_text`: the bytes must come back
+    EXACTLY as they were (see that helper on the CRLF trap)."""
+    if data is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    atomic_write_bytes(path, data)
+
+
+def _rollback_stores(prior: list) -> list[str]:
+    """Replay an undo log. Returns the labels whose write-back itself failed —
+    the rollback is best-effort, because the same full disk that failed the
+    restore can fail the restore OF the old bytes."""
+    failed: list[str] = []
+    for label, path, data in reversed(prior):
+        try:
+            _restore_snapshot(path, data)
+        except OSError:
+            failed.append(label)
+    return failed
 
 
 def build_app(upstream_port: int, default_prompt: str | None = None,
@@ -6522,18 +6572,70 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         except ValueError as e:
             return JSONResponse({"error": f"memory: {e}"}, status_code=400)
 
-        # --- apply ---
-        if patch:
-            await asyncio.to_thread(app_settings.save, patch)
-        for full in normalized:
-            _, errs = await asyncio.to_thread(_methods.save_user, full)
-            if errs:      # validated above, so this is a disk/permission fault
-                return JSONResponse(
-                    {"error": f"could not write method {full.get('id')}: "
-                              + "; ".join(errs)}, status_code=500)
+        # --- apply: snapshot, then write; a failure puts the snapshot back ---
+        #
+        # A11 / R3-3: the validate pass above is all-or-nothing, but the APPLY
+        # pass was not. Settings were saved, then each method was written with a
+        # plain `write_text`, then memory was replaced. An OSError on the Nth
+        # method (full disk, permission fault) left settings and the first N-1
+        # methods applied and memory untouched, and the client saw a bare 500
+        # with no idea how far it got.
+        #
+        # Multi-file all-or-nothing is not a filesystem primitive, so this is an
+        # undo log: capture the exact bytes of every file the restore will touch,
+        # write through the stores' OWN writers (so the on-disk format cannot
+        # drift from `app_settings.save` / `methods.save_user` /
+        # `MemoryStore.restore`), and put every captured byte back if any write
+        # fails. It is NOT a temp-file rename transaction, and deliberately so:
+        # `MemoryStore.restore` must keep its cross-process lock, and staging
+        # would mean re-implementing three serializers here and bypassing that
+        # lock. The one thing that is best-effort is the rollback itself — the
+        # same full disk that failed the write can fail the write-back, and that
+        # is reported in the error rather than hidden. A process crash mid-apply
+        # would still leave a partial store; no scheme without a journal survives
+        # that, and the journal is not worth a new format here.
         store = _memory_store()
-        before = len(store.all())
-        after = await asyncio.to_thread(store.restore, rows)
+        targets: list[tuple[str, object]] = []
+        if patch:
+            targets.append(("settings", app_settings.settings_path()))
+        for full in normalized:
+            targets.append((f"method {full.get('id')}",
+                            _methods._method_file(full["id"])))
+        targets.append(("memory", store.path))
+        try:
+            prior = await asyncio.to_thread(_snapshot_stores, targets)
+        except OSError as e:
+            return JSONResponse(
+                {"error": f"restore failed at staging: {e}"}, status_code=500)
+
+        try:
+            if patch:
+                try:
+                    await asyncio.to_thread(app_settings.save, patch)
+                except Exception as e:
+                    raise _RestoreStageError("settings", str(e)) from e
+            for full in normalized:
+                try:
+                    _, errs = await asyncio.to_thread(_methods.save_user, full)
+                except Exception as e:
+                    raise _RestoreStageError(
+                        "methods", f"method {full.get('id')}: {e}") from e
+                if errs:      # validated above, so this is a disk/permission fault
+                    raise _RestoreStageError(
+                        "methods", f"method {full.get('id')}: "
+                                   + "; ".join(errs))
+            before = len(store.all())
+            try:
+                after = await asyncio.to_thread(store.restore, rows)
+            except Exception as e:
+                raise _RestoreStageError("memory", str(e)) from e
+        except _RestoreStageError as e:
+            failed = await asyncio.to_thread(_rollback_stores, prior)
+            detail = f"restore failed at {e.stage}: {e}"
+            if failed:
+                detail += ("; rollback of " + ", ".join(failed)
+                           + " failed — the store may be left part-applied")
+            return JSONResponse({"error": detail}, status_code=500)
         return {"restored": True, "version": BACKUP_VERSION,
                 "methods": len(normalized),
                 "memory": {"before": before, "after": after},
