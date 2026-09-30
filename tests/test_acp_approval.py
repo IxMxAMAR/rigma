@@ -82,7 +82,9 @@ def test_the_awaiting_flag_is_what_arms_the_button():
     src = inspect.getsource(serve.build_app)
     assert '"awaiting": True' in src
     # And the driver sets it only on the ACP path, which is the only one with a handler.
-    assert "on_permission=_answer_permission)" in src
+    # B4 added `on_question` on the same call, so this no longer ends the argument
+    # list — assert the call, not the trailing paren.
+    assert "on_permission=_answer_permission" in src
 
 
 def test_the_driver_reports_the_ask_before_it_waits():
