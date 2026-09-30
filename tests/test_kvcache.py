@@ -311,3 +311,58 @@ def test_a_pinned_launch_keeps_the_fingerprint_it_had(tmp_path, monkeypatch):
     # what the fingerprint was BEFORE this change: engine_identity(backend)
     old = kvcache.fingerprint(kvcache.config_of(rp, str(exe)))
     assert old == kvcache.launch_fingerprint(rp, exe)
+
+
+# --- DR7: an UNMEASURABLE engine is still identified by its own file ----------
+#
+# A13b keyed on the launched binary's measured identity, but only while that
+# binary answered `--version`. When it did not, the identity fell back to
+# `engine_identity(backend)` — the PIN directory's identity — so two
+# unmeasurable builds swapped at one registered path hashed alike and the old
+# build's cache was restored under the new one. The fallback now folds in the
+# same (size, nanosecond mtime) key the build memo is built on (A13d).
+
+
+def _unmeasurable(monkeypatch):
+    """Make every `--version` fail, as a timeout or a broken runtime does."""
+    from rigma import engine_build, server_ops
+    engine_build._BUILD_CACHE.clear()
+    monkeypatch.setattr(engine_build, "read_build",
+                        lambda *a, **k: engine_build.EngineBuild(
+                            reason="could not run llama-server.exe --version: timed out"))
+    monkeypatch.setattr(server_ops, "engine_version",
+                        lambda backend="": "b9867+152d337fa")
+
+
+def test_an_unmeasurable_registered_engine_is_not_identified_as_the_pin(
+        tmp_path, monkeypatch):
+    """The pin answers for the backend; the launched file is what will run, and
+    an unreadable file is still its own file."""
+    _unmeasurable(monkeypatch)
+    exe = _registered_exe(tmp_path)
+    ident = kvcache.launched_engine_identity(_plan(), exe)
+    assert ident != "b9867+152d337fa", \
+        "an unmeasurable registered engine was identified as the pin"
+    assert ident.startswith("b9867+152d337fa+file:")
+
+
+def test_an_unmeasurable_swap_at_one_path_changes_the_fingerprint(
+        tmp_path, monkeypatch):
+    """DR7: one registered path, two builds, neither measurable. The same file
+    must still key the same cache (the memo keeps working); replacing it must
+    not — or the old build's cache is restored under the new one."""
+    import os
+    _unmeasurable(monkeypatch)
+    exe = _registered_exe(tmp_path)
+    rp = _plan()
+    before = kvcache.launch_fingerprint(rp, exe)
+    assert before == kvcache.launch_fingerprint(rp, exe), \
+        "the same file must key the same cache, or restore is silently disabled"
+    # A SAME-SIZE replacement written later in the same second: size alone would
+    # miss it, so this also pins that the nanosecond mtime is what is folded in.
+    exe.write_bytes(b"y")
+    st = exe.stat()
+    os.utime(exe, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    after = kvcache.launch_fingerprint(rp, exe)
+    assert before != after, \
+        "an unmeasurable build swapped in place reused the old build's cache"
