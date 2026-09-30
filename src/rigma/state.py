@@ -37,6 +37,17 @@ _FIELD_DEFAULTS = {
     # recorded". Separate from `engine` above: that one is the runtime name and
     # is compared for equality by calibration, so it must stay a string.
     "engine_binary": None,
+    # DR2-1-res: the DEVICE-SIDE PLACEMENT the launch actually used —
+    # `{"ngl": int, "n_cpu_moe": int}`, the plan's own flags as launched. The
+    # VRAM axis (`engine_log.compare_plan`) can only judge the engine's device
+    # buffers against a DEVICE-SIDE prediction, and the plan's weight term is
+    # the whole GGUF file; these two fields are what `resolve._spilled` needs to
+    # scale that term to the device. Absent (None) means "not recorded" — an
+    # adopted/orphan engine (cli.py:2007-2020) genuinely cannot recover them —
+    # and MUST NOT be read as ngl=99 / n_cpu_moe=0 ("fully resident"), which is
+    # the confident assumption that made the axis unusable for MoE. A record
+    # written before this field existed has no `placement` and reads as unknown.
+    "placement": None,
 }
 
 _PID_STAMP = {"engine_pid": "engine_started_at", "ui_pid": "ui_started_at"}
@@ -152,6 +163,12 @@ def _write_record(rec: dict) -> dict:
         # back-compat reason as `engine` — a record written before this field exists must
         # degrade rather than raise.
         "engine_binary": rec.get("engine_binary"),
+        # DR2-1-res: the plan's device-side placement (see _FIELD_DEFAULTS). `.get`
+        # for the same back-compat reason: a record written before this field
+        # existed must degrade to "unknown" rather than raise. A dict (never a
+        # bare number) so an absent record and a fully-resident record stay
+        # distinguishable.
+        "placement": rec.get("placement"),
     }
     atomic_write_json(state_path(), out)
     return out
@@ -163,7 +180,8 @@ def write_state(model_slug: str, quant: str, public_port: int,
                 unloaded: bool = False, kv_cache: str = "",
                 no_vision: bool = False, gguf: str = "",
                 kv_fp: str = "", engine: str | None = None,
-                engine_binary: dict | None = None) -> None:
+                engine_binary: dict | None = None,
+                placement: dict | None = None) -> None:
     """Write a whole record. Every field not named reverts to its default —
     which is what a launch wants and what an edit must never do; see
     `update_state`.
@@ -179,6 +197,11 @@ def write_state(model_slug: str, quant: str, public_port: int,
     `rigma up`, `perform_unload`), and a default of "llamacpp" would make every
     state.json ever written — including one from a vLLM launch that named it —
     assert llama.cpp. Absent means "not recorded"; a launcher that knows says so.
+
+    `placement` (DR2-1-res) is the device-side placement the launch used —
+    `{"ngl", "n_cpu_moe"}`, the plan's own flags. It defaults to None ("not
+    recorded") for the same reason: an adopted engine did not choose a plan and
+    cannot recover these, so it must say unknown rather than assert a placement.
     """
     _write_record({"model": model_slug, "quant": quant,
                    "public_port": public_port, "engine_pid": engine_pid,
@@ -186,7 +209,7 @@ def write_state(model_slug: str, quant: str, public_port: int,
                    "ctx": ctx, "started_at": time.time(), "unloaded": unloaded,
                    "kv_cache": kv_cache, "no_vision": no_vision, "gguf": gguf,
                    "kv_fp": kv_fp, "engine": engine,
-                   "engine_binary": engine_binary,
+                   "engine_binary": engine_binary, "placement": placement,
                    "engine_started_at": _create_time(engine_pid),
                    "ui_started_at": _create_time(ui_pid)})
 
