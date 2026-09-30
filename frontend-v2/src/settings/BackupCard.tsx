@@ -27,15 +27,16 @@ import {
 } from "../lib/backup";
 
 /** The confirmation step, pure props so the sentence a user must read before
- *  rewriting memory is assertable without a store. */
+ *  rewriting memory is assertable without a store. No success line here: on
+ *  success `replace()` clears `pending` (which unmounts this panel) before it
+ *  sets `done`, so the card renders the result. */
 export function RestoreConfirm({
-  summary, confirmed, busy, error, done, onConfirm, onReplace, onCancel,
+  summary, confirmed, busy, error, onConfirm, onReplace, onCancel,
 }: {
   summary: string;
   confirmed: boolean;
   busy: boolean;
   error: string | null;
-  done: string | null;
   onConfirm: (v: boolean) => void;
   onReplace: () => void;
   onCancel: () => void;
@@ -62,9 +63,6 @@ export function RestoreConfirm({
         <div role="alert" className="text-red font-mono text-[11.5px] break-words">
           {error}
         </div>
-      )}
-      {done !== null && (
-        <p className="text-moss font-mono text-[11.5px]">{done}</p>
       )}
       <div className="flex items-center gap-2">
         <button
@@ -176,7 +174,6 @@ export default function BackupCard() {
           confirmed={confirmed}
           busy={busy}
           error={error}
-          done={done}
           onConfirm={setConfirmed}
           onReplace={() => void replace()}
           onCancel={() => {

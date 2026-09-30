@@ -279,12 +279,10 @@ export default function LaunchDefaultsDialog({
 
   const save = async () => {
     if (!draft) return;
+    // No empty-payload guard: the button is disabled on `!changed`, and
+    // `changed` IS `Object.keys(defaultsPayload(...)).length > 0`, so this is
+    // only reachable with something to send.
     const payload = defaultsPayload(draft, initial);
-    if (Object.keys(payload).length === 0) {
-      setSaved(true);
-      onSaved?.();
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
