@@ -15,6 +15,7 @@ import {
   questionRefusal,
   sandboxLabel,
   sandboxTone,
+  type QuestionValues,
 } from "./governance";
 
 const ask = (id: string, toolName = "bash", reason = "") => ({
@@ -449,6 +450,166 @@ describe("B4b-schema: nested objects, arrays and defaults", () => {
     });
     expect(questionProblem(fields, {})).toContain("Directory");
   });
+});
+
+// B4b-schema, second defect (the verifier of 873b90c's BREAKS line). The two
+// functions disagreed about a required CONTAINER: `questionProblem` counted UI
+// ROWS, while `questionAnswer` DROPPED blank ones. A required array with one
+// blank row — or a required object whose children are all optional and untouched
+// — reported READY with `problem === ""`, and the answer built from it was `{}`,
+// omitting a property the schema marks `required`.
+//
+// The rule chosen: a required container must SURVIVE `answerFor`. `problemFor`
+// asks `answerFor` whether the container would be present and names the
+// container when it would not, instead of restating the emptiness rule — so the
+// two functions cannot drift apart again. The alternative (make `answerFor` emit
+// `{}`/`[]` for a required container) was rejected: it would change the
+// "empty container is ABSENT" contract the rest of the form is built on, break
+// the existing zero-row required-array test, and invent an answer the user never
+// gave. See the shape table below.
+describe("B4b-schema: a required container the answer would drop", () => {
+  const S = (required: string[], props: Record<string, unknown>) => ({
+    type: "object", required, properties: props,
+  });
+  const tags = { type: "array", title: "Tags", items: { type: "string" } };
+  const cfgAllOptional = {
+    type: "object", title: "Config",
+    properties: { a: { type: "string", title: "A" } },
+  };
+  const cfgReqLeaf = {
+    type: "object", title: "Config", required: ["a"],
+    properties: { a: { type: "string", title: "A" } },
+  };
+  const cfgReqTags = {
+    type: "object", title: "Config", required: ["tags"],
+    properties: { tags },
+  };
+  const steps = {
+    type: "array", title: "Steps",
+    items: { type: "object", properties: { cmd: { type: "string", title: "Cmd" } } },
+  };
+
+  interface Shape {
+    name: string;
+    schema: unknown;
+    values: Record<string, unknown>;
+    ready: boolean;
+    problem: string;
+    answer: Record<string, unknown>;
+  }
+
+  const shapes: Shape[] = [
+    {
+      name: "1 required array, one all-blank row",
+      schema: S(["tags"], { tags }), values: { tags: [""] },
+      ready: false, problem: "“Tags” is required", answer: {},
+    },
+    {
+      name: "1b required array, no rows at all",
+      schema: S(["tags"], { tags }), values: {},
+      ready: false, problem: "“Tags” is required", answer: {},
+    },
+    {
+      name: "2 required object, all children optional and untouched",
+      schema: S(["cfg"], { cfg: cfgAllOptional }), values: {},
+      ready: false, problem: "“Config” is required", answer: {},
+    },
+    {
+      name: "2b required object, a child touched then left blank",
+      schema: S(["cfg"], { cfg: cfgAllOptional }), values: { cfg: { a: "" } },
+      ready: false, problem: "“Config” is required", answer: {},
+    },
+    {
+      name: "3 required string, empty",
+      schema: S(["s"], { s: { type: "string", title: "S" } }), values: {},
+      ready: false, problem: "“S” is required", answer: {},
+    },
+    {
+      name: "4 required boolean is always present",
+      schema: S(["flag"], { flag: { type: "boolean", title: "Flag" } }), values: {},
+      ready: true, problem: "", answer: { flag: false },
+    },
+    {
+      name: "5 nested required LEAF inside an optional parent",
+      schema: { properties: { cfg: cfgReqLeaf } }, values: {},
+      ready: false, problem: "“A” is required", answer: {},
+    },
+    {
+      name: "6 nested required ARRAY inside an optional parent, all-blank row",
+      schema: { properties: { cfg: cfgReqTags } }, values: { cfg: { tags: [""] } },
+      ready: false, problem: "“Tags” is required", answer: {},
+    },
+    {
+      name: "7 required array with one good row and one blank",
+      schema: S(["tags"], { tags }), values: { tags: ["a", ""] },
+      ready: true, problem: "", answer: { tags: ["a"] },
+    },
+    {
+      name: "8 required object with an optional boolean child",
+      schema: S(["cfg"], {
+        cfg: { type: "object", title: "Config",
+          properties: { on: { type: "boolean", title: "On" } } },
+      }), values: {},
+      ready: true, problem: "", answer: { cfg: { on: false } },
+    },
+    {
+      name: "9 required object holding a required all-blank array",
+      schema: S(["cfg"], { cfg: cfgReqTags }), values: { cfg: { tags: [""] } },
+      ready: false, problem: "“Tags” is required", answer: {},
+    },
+    {
+      name: "10 required array of objects, one all-blank row",
+      schema: S(["steps"], { steps }), values: { steps: [{ cmd: "" }] },
+      ready: false, problem: "“Steps” is required", answer: {},
+    },
+    {
+      name: "11 required array of objects, one filled row",
+      schema: S(["steps"], { steps }), values: { steps: [{ cmd: "make" }] },
+      ready: true, problem: "", answer: { steps: [{ cmd: "make" }] },
+    },
+  ];
+
+  /** Every `required` name appears in the answer, recursing only into objects
+   *  the answer actually contains: JSON Schema applies a nested `required` only
+   *  when its own object is present. */
+  function assertRequiredPresent(schema: unknown, answer: unknown, path = "$"): void {
+    const s = (schema && typeof schema === "object" ? schema : {}) as Record<string, unknown>;
+    const obj = (answer && typeof answer === "object" && !Array.isArray(answer)
+      ? answer : {}) as Record<string, unknown>;
+    for (const k of (Array.isArray(s.required) ? s.required.map(String) : [])) {
+      expect(Object.prototype.hasOwnProperty.call(obj, k), `${path}.${k}`).toBe(true);
+    }
+    const props = (s.properties && typeof s.properties === "object"
+      ? s.properties : {}) as Record<string, unknown>;
+    for (const [k, raw] of Object.entries(props)) {
+      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+      const p = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+      if (p.type === "object" || p.properties) {
+        assertRequiredPresent(p, obj[k], `${path}.${k}`);
+      }
+      if (p.type === "array" && p.items) {
+        const rows = Array.isArray(obj[k]) ? obj[k] as unknown[] : [];
+        rows.forEach((e, i) => assertRequiredPresent(p.items, e, `${path}.${k}[${i}]`));
+      }
+    }
+  }
+
+  for (const s of shapes) {
+    it(`${s.name}: ready, problem and the exact submitted JSON agree`, () => {
+      const fields = questionFields(s.schema);
+      const values = s.values as unknown as QuestionValues;
+      expect(questionProblem(fields, values)).toBe(s.problem);
+      expect(questionReady(fields, values)).toBe(s.ready);
+      const answer = questionAnswer(fields, values);
+      expect(answer).toEqual(s.answer);
+      // Transcript.tsx POSTs `{requestId, answer}` verbatim.
+      expect(JSON.stringify({ requestId: "q-1", answer }))
+        .toBe(JSON.stringify({ requestId: "q-1", answer: s.answer }));
+      // The defect itself: a form that reports ready must not submit an answer
+      // that omits a `required` property.
+      if (s.ready) assertRequiredPresent(s.schema, answer);
+    });
+  }
 });
 
 // B4b/OD-12. A 409 from `/approval` is the server saying it is no longer
