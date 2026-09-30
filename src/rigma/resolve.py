@@ -582,14 +582,23 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     kv_mb = ctx * kv_bytes_per_token(spec, k, v) / 2**20 + swa_mb
     # A hybrid's recurrent state is allocated PER SEQUENCE, and the launch runs
     # LAUNCH_PARALLEL sequences. --kv-unified keeps the KV pool at ctx, so only
-    # this term multiplies. Zero for every dense model; a hybrid whose header
-    # carried no ssm.* geometry is charged 0 and marked unknown, not read as
-    # dense.
+    # this term multiplies. Zero for every dense model.
+    #
+    # A2d-gap: `recurrent_state_unknown` is tested FIRST, not as the fallback
+    # for a zero. An unrecognised geometry can still yield a nonzero
+    # interval-derived count AND a size — the upstream header that carries BOTH
+    # an explicit `attention.recurrent_layers` array and a complete `ssm.*` set
+    # — and that estimate must not read as a confident number: the interval is
+    # only right for a uniform layout, which is exactly what is not known here.
+    # The estimate is still CHARGED. Dropping it would free VRAM llama.cpp is
+    # about to allocate, which is the launch OOM this fit exists to prevent; the
+    # label says what the number is instead.
     rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
-    if rs_mb:
+    if recurrent_state_unknown(spec):
+        rs_txt = (f"rs=unknown(est {rs_mb:.0f}MB) " if rs_mb
+                  else "rs=unknown ")
+    elif rs_mb:
         rs_txt = f"rs={rs_mb:.0f}MB "
-    elif recurrent_state_unknown(spec):
-        rs_txt = "rs=unknown "
     else:
         rs_txt = ""
     explain.append(f"{gguf.quant}@ctx{ctx} kv={k}: file={file_mb:.0f}MB kv={kv_mb:.0f}MB "
