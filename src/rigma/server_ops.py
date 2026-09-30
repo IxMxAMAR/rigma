@@ -448,6 +448,45 @@ def _resolve_for(slug: str, state: dict, registry, profile,
                    model_override=slug, backend_override=backend), reg, p
 
 
+def plan_placement(plan) -> dict:
+    """The device-side placement a plan will actually apply, for state.json.
+
+    DR2-1-res. `resolve._spilled` decides what fraction of a model's weights
+    stays in system RAM from exactly two plan fields: `ngl` (dense) and
+    `n_cpu_moe` (MoE expert offload). Recording them at launch is what lets
+    `planned_vram_mb` rebuild a DEVICE-SIDE prediction later — the plan object
+    itself is gone once the engine is up, and state.json previously carried no
+    placement at all, so the reader could only ASSUME "fully resident".
+
+    Recorded as a dict, not two loose keys, so an old record (no `placement`)
+    and a fully-resident record (`n_cpu_moe` 0) stay distinguishable: absent
+    must read as unknown, never as the confident zero.
+    """
+    f = plan.flags
+    return {"ngl": int(f.ngl), "n_cpu_moe": int(f.n_cpu_moe)}
+
+
+def recorded_placement(state: dict) -> dict | None:
+    """The device-side placement the record's launch used, or None if unknown.
+
+    Tolerant reader (DR2-1-res): a record written before `placement` existed,
+    an adopted/orphan engine, a hand-edited file, or a partially-written dict
+    all return None. None means UNKNOWN, never "fully resident" — the caller
+    must not fall back to `ngl=99 / n_cpu_moe=0`, which is the assumption that
+    made the VRAM axis unusable for the owner's MoE (deep-review-3.md). Both
+    keys are required; a placement missing one is not a placement.
+    """
+    if not isinstance(state, dict):
+        return None
+    p = state.get("placement")
+    if not isinstance(p, dict):
+        return None
+    try:
+        return {"ngl": int(p["ngl"]), "n_cpu_moe": int(p["n_cpu_moe"])}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def planned_vram_mb(state: dict, registry=None) -> float | None:
     """The running plan's own weights+KV prediction, in MiB, or None.
 
@@ -458,17 +497,21 @@ def planned_vram_mb(state: dict, registry=None) -> float | None:
     `not_comparable`. This rebuilds the plan from the state the launch wrote and
     hands it to that same function; it is not a second estimate.
 
-    The plan is not persisted, so it is reconstructed from what state.json
-    records: `model` + `quant` select the registry's `GgufFile` (the same bytes
-    the fit charged), and `ctx` + `kv_cache` are the flags the launch recorded.
-    `cache_type_v` is not recorded, but `ComboFlags._symmetric_kv` forces K and V
-    equal, so the recorded K IS the V type — a plan that reached a launch always
-    had symmetric caches.
+    DR2-1-res: the prediction is DEVICE-SIDE. `memtruth.planned_mb`'s weight
+    term is the whole GGUF file, which is the device figure only when the engine
+    put the whole file on the device; for a dense spill (`ngl < n_layers`) or an
+    expert offload (`n_cpu_moe > 0`) it overstates the device figure by the
+    RAM-resident weights. The placement the launch recorded (`placement` in
+    state.json, via `recorded_placement`) is what `resolve._spilled` needs to
+    scale that term, so the number returned here already excludes the weights
+    the plan itself left in system RAM. It is therefore comparable to
+    `compare_plan`'s device-buffer `actual` without the DR2-1 suppression.
 
     Returns None — never a number — whenever an input is missing: no model, no
-    quant, no ctx, an unknown model/quant, or an invalid cache type. A bare file
-    size would read as a divergence that is only the KV cache (GUIDANCE 5), so
-    "cannot compute" must stay None and let the axis say `not_comparable`.
+    quant, no ctx, an unknown model/quant, an invalid cache type, OR no recorded
+    placement. A whole-file prediction with no recorded placement would be a
+    confident "fully resident" assumption (GUIDANCE 5); "cannot compute" must
+    stay None and let the axis say `not_comparable`.
 
     DR2-2: ONE registry, and no re-parse per poll. The spec is resolved once from
     the registry the caller handed (or one `Registry.load()` when it handed
@@ -516,9 +559,15 @@ def _plan_cache_key(state: dict, registry) -> tuple:
         ctx = int(state.get("ctx") or 0)
     except (TypeError, ValueError):
         ctx = str(state.get("ctx"))
+    # DR2-1-res: the placement is part of the prediction (it scales the weight
+    # term), so it must be part of the key — otherwise two states that differ
+    # only in ngl / n_cpu_moe would serve each other's number.
+    p = recorded_placement(state)
+    placement_key = None if p is None else (p["ngl"], p["n_cpu_moe"])
     return (home, None if registry is None else id(registry),
             str(state.get("model") or ""), str(state.get("quant") or ""), ctx,
-            str(state.get("kv_cache") or ""), str(state.get("backend") or ""))
+            str(state.get("kv_cache") or ""), str(state.get("backend") or ""),
+            placement_key)
 
 
 def _planned_vram_mb(state: dict, registry) -> float | None:
@@ -526,10 +575,17 @@ def _planned_vram_mb(state: dict, registry) -> float | None:
     from . import memtruth
     from .models import ComboFlags, RunPlan
     from .registry import Registry
+    from .resolve import _spilled
     slug = str(state.get("model") or "")
     quant = str(state.get("quant") or "")
     ctx = int(state.get("ctx") or 0)
     if not slug or not quant or ctx <= 0:
+        return None
+    # DR2-1-res: no recorded placement means the plan-side basis is unknown. The
+    # whole-file weight term would then be a confident "fully resident" guess,
+    # so refuse a prediction rather than hand back one the axis would trust.
+    placement = recorded_placement(state)
+    if placement is None:
         return None
     try:
         reg = registry if registry is not None else Registry.load()
@@ -540,14 +596,21 @@ def _planned_vram_mb(state: dict, registry) -> float | None:
         if gguf is None:
             return None
         k = str(state.get("kv_cache") or "") or "f16"
+        flags = ComboFlags(ctx=ctx, cache_type_k=k, cache_type_v=k,
+                           ngl=placement["ngl"],
+                           n_cpu_moe=placement["n_cpu_moe"])
         plan = RunPlan(model_slug=slug, gguf=gguf,
                        backend=str(state.get("backend") or "unknown"),
-                       flags=ComboFlags(ctx=ctx, cache_type_k=k,
-                                        cache_type_v=k),
-                       origin="state")
+                       flags=flags, origin="state")
         # DR2-2: pass the spec resolved from THIS registry, so the KV geometry
         # cannot come from a different (process-global) one.
-        return float(memtruth.planned_mb(plan, spec))
+        whole_plus_kv = float(memtruth.planned_mb(plan, spec))
+        # DR2-1-res: `planned_mb` charges the WHOLE file; the plan's recorded
+        # placement says what share it left in system RAM (`_spilled`, the one
+        # implementation the page and the fit already share). Subtract that share
+        # so the figure is the DEVICE-side one `compare_plan` measures against.
+        whole_weights_mb = gguf.bytes / 2**20
+        return whole_plus_kv - whole_weights_mb * _spilled(spec, flags)
     except Exception:
         # A state written by a hand edit, or a registry that predates the model,
         # is "no prediction", never an error on a read route.
@@ -1003,7 +1066,11 @@ def perform_switch(model: str, registry=None, profile=None,
                    no_vision=not vision, gguf=rp.gguf.file, kv_fp=kv_fp,
         # Carried through so `rigma status` can say which binary is serving. Set above
         # from the selection that actually ran, so it cannot drift from the exe used.
-        engine_binary=_engine_binary)
+        engine_binary=_engine_binary,
+        # DR2-1-res: the placement THIS launch applied, so the VRAM axis can make
+        # the plan's prediction device-side instead of assuming "fully resident".
+        # `rp` is the final plan (post auto-calibration), so this is what ran.
+        placement=plan_placement(rp))
     out = st.read_state() or {}
     if notice:
         # Transient, in the response only: a switch that stepped the cache down

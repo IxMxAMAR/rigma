@@ -4627,9 +4627,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # A17d: the VRAM axis needs the plan's own weights+KV prediction for
             # the same ctx / cache / slots, not the log alone — without it
             # `compare_plan` reports `not_comparable` and the axis is inert.
+            # DR2-1-res: `planned_vram_mb` is now DEVICE-SIDE, scaled by the
+            # placement the launch recorded, so hand that placement to
+            # `findings` too — it is what tells the axis the prediction is
+            # already like-with-like and must not be suppressed as non-resident.
             out["engine_findings"] = engine_log.findings(
                 server_ops.log_text(),
-                expected_vram_mb=server_ops.planned_vram_mb(s, registry))
+                expected_vram_mb=server_ops.planned_vram_mb(s, registry),
+                expected_placement=server_ops.recorded_placement(s))
         except OSError as e:
             out["engine_findings"] = []
             out["engine_findings_error"] = f"cannot read the engine log: {e}"
@@ -4778,7 +4783,9 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         A17d: the running plan's own weights+KV prediction is passed so the
         VRAM axis is comparable. With no engine running there is no plan, so the
         axis stays `not_comparable` rather than comparing against a bare file
-        size (GUIDANCE 5).
+        size (GUIDANCE 5). DR2-1-res: the placement the launch recorded is
+        passed with it, so the prediction is device-side and a MoE / spilled
+        load is judged instead of suppressed.
         """
         from . import engine_log, server_ops
         try:
@@ -4794,8 +4801,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         expected = (await asyncio.to_thread(server_ops.planned_vram_mb, s,
                                             registry)
                     if s else None)
+        # DR2-1-res: the recorded placement, so the axis can judge a MoE /
+        # spilled load on the plan's own device-side figure instead of
+        # suppressing it.
+        placement = server_ops.recorded_placement(s) if s else None
         return {"findings": engine_log.findings(text,
-                                                expected_vram_mb=expected)}
+                                                expected_vram_mb=expected,
+                                                expected_placement=placement)}
 
     @app.get("/api/server/switch-options")
     async def server_switch_options():

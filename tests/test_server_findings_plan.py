@@ -14,13 +14,24 @@ would read as a divergence that is only the cache (GUIDANCE 5).
 Both `/api/server/findings` and `/api/server` (via `_engine_extras`) pass it; the
 route tests below pin the two outcomes the owner sees: a plan in state gives a
 real verdict, and no plan gives `not_comparable` (no finding).
+
+DR2-1-res adds the other axis the plan never recorded: its device-side
+PLACEMENT. `planned_vram_mb` used to rebuild the plan with `ComboFlags`'
+defaults (`ngl=99, n_cpu_moe=0`), i.e. "fully resident"; for a dense spill or a
+MoE expert offload the whole-file prediction is not comparable to the engine's
+device buffers, so `compare_plan` suppressed the VRAM axis and a real divergence
+was blind. The launch now writes `placement = {"ngl", "n_cpu_moe"}` into
+state.json, `planned_vram_mb` scales the weight term to the device with it, and
+`compare_plan` compares it directly. An OLD record with no `placement` reads as
+UNKNOWN (None), never as the confident zero.
 """
+import json
 import os
 
 import pytest
 from fastapi.testclient import TestClient
 
-from rigma import memtruth, server_ops
+from rigma import engine_log, memtruth, server_ops
 from rigma import state as st
 from rigma.models import ComboFlags, RunPlan
 from rigma.registry import Registry
@@ -30,11 +41,32 @@ SLUG = "qwen3-0.6b"
 QUANT = "Q8_0"
 CTX = 32768
 
+# The owner's 35B MoE — the shape DR2-1-res exists for (expert weights kept in
+# RAM inside GPU layers, `--n-cpu-moe`).
+MOE_SLUG = "qwen3.6-35b-a3b"
+MOE_QUANT = "UD-Q4_K_XL"
+MOE_CTX = 16384
+RESIDENT = {"ngl": 99, "n_cpu_moe": 0}
+MOE_12 = {"ngl": 99, "n_cpu_moe": 12}
+
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _reset_work_route_limiter():
+    """The work-route limiter is PROCESS-GLOBAL (`serve._rate_hits`, 6 GETs per
+    10 s per path). This file GETs `/api/server/findings` several times; without
+    a reset those hits spend the budget of whatever test file runs next and it
+    gets a 429 (`test_engine_log_findings_route.py`). Reset before AND after, so
+    this file leaves no residue. Same idea as test_audit_sec13_net.py:87."""
+    from rigma import serve
+    serve._rate_hits.clear()
+    yield
+    serve._rate_hits.clear()
 
 
 def _client(home):
@@ -45,7 +77,12 @@ def _client(home):
 
 def _state() -> dict:
     return {"model": SLUG, "quant": QUANT, "ctx": CTX, "kv_cache": "f16",
-            "backend": "rocm"}
+            "backend": "rocm", "placement": dict(RESIDENT)}
+
+
+def _moe_state() -> dict:
+    return {"model": MOE_SLUG, "quant": MOE_QUANT, "ctx": MOE_CTX,
+            "kv_cache": "q8_0", "backend": "rocm", "placement": dict(MOE_12)}
 
 
 def _write_log(home, text):
@@ -178,7 +215,7 @@ def test_the_findings_route_reports_a_real_vram_verdict_with_a_plan(home):
     _write_log(home, _divergent_log())
     st.write_state(SLUG, QUANT, 11500, engine_pid=os.getpid(),
                    ui_pid=os.getpid(), backend="rocm", ctx=CTX,
-                   kv_cache="f16")
+                   kv_cache="f16", placement=dict(RESIDENT))
 
     r = _client(home).get("/api/server/findings")
 
@@ -203,8 +240,138 @@ def test_server_info_carries_the_same_verdict(home):
     _write_log(home, _divergent_log())
     st.write_state(SLUG, QUANT, 11500, engine_pid=os.getpid(),
                    ui_pid=os.getpid(), backend="rocm", ctx=CTX,
-                   kv_cache="f16")
+                   kv_cache="f16", placement=dict(RESIDENT))
 
     info = _client(home).get("/api/server").json()
 
     assert "plan_divergence" in [f["id"] for f in info["engine_findings"]]
+
+
+# ---------------------------------------------------------------------------
+# DR2-1-res: the plan PERSISTS the placement it used, and the axis READS it.
+#
+# Before this, state.json carried no ngl / n_cpu_moe, so `planned_vram_mb`
+# rebuilt the plan with `ComboFlags`' defaults (ngl=99, n_cpu_moe=0) — the
+# confident "fully resident" assumption. The whole-file prediction is then not
+# comparable to a MoE / spilled load's device buffers, so `compare_plan`
+# suppressed the VRAM axis entirely and a real divergence was blind
+# (deep-review-3.md, DR2-1-res).
+# ---------------------------------------------------------------------------
+
+def test_the_launch_placement_round_trips_through_state(home):
+    st.write_state(SLUG, QUANT, 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="rocm", ctx=CTX,
+                   kv_cache="f16", placement={"ngl": 99, "n_cpu_moe": 12})
+
+    disk = st.read_state()
+    assert disk["placement"] == {"ngl": 99, "n_cpu_moe": 12}
+    assert server_ops.recorded_placement(disk) == {"ngl": 99, "n_cpu_moe": 12}
+
+    # ...and a merge write (an unload) must carry it, not drop it.
+    st.update_state(engine_pid=-1, unloaded=True)
+    assert server_ops.recorded_placement(st.read_state()) == {
+        "ngl": 99, "n_cpu_moe": 12}
+
+
+def test_an_old_record_without_placement_reads_as_unknown(home):
+    # A record written before `placement` existed: no key at all.
+    st.state_path().write_text(json.dumps({
+        "model": SLUG, "quant": QUANT, "ctx": CTX, "kv_cache": "f16",
+        "backend": "rocm", "engine_pid": os.getpid(), "ui_pid": os.getpid()}),
+        encoding="utf-8")
+    s = st.read_state()
+    assert "placement" not in s
+
+    assert server_ops.recorded_placement(s) is None
+    # UNKNOWN, not a confident whole-file ("fully resident") prediction: before
+    # the fix this returned ~the whole GGUF, which is what the axis trusted.
+    assert server_ops.planned_vram_mb(s) is None
+    # A partial or non-dict placement is equally not a placement, so an absent
+    # field can never be read as the confident `n_cpu_moe = 0`.
+    assert server_ops.recorded_placement({"placement": {"ngl": 99}}) is None
+    assert server_ops.recorded_placement({"placement": 0}) is None
+
+
+def test_the_prediction_scales_the_weight_term_by_the_recorded_placement(home):
+    resident = server_ops.planned_vram_mb({**_moe_state(),
+                                           "placement": dict(RESIDENT)})
+    moe = server_ops.planned_vram_mb(_moe_state())
+
+    spec = Registry.load().models[MOE_SLUG]
+    gguf = next(g for g in spec.ggufs if g.quant == MOE_QUANT)
+    from rigma.resolve import _spilled
+    spill = _spilled(spec, ComboFlags(ctx=MOE_CTX, ngl=99, n_cpu_moe=12,
+                                      cache_type_k="q8_0", cache_type_v="q8_0"))
+    assert spill > 0
+
+    # The device-side figure is the whole-file one minus exactly the share the
+    # plan's own recorded placement leaves in system RAM.
+    assert moe == pytest.approx(resident - gguf.bytes / 2**20 * spill)
+    assert moe < resident - 5000
+
+
+def _moe_log(device_model_mb: float) -> str:
+    return (
+        "0.00.1 I print_info: n_expert              = 256\n"
+        "0.00.2 I print_info: n_expert_used         = 8\n"
+        "0.00.3 I load_tensors: offloaded 49/49 layers to GPU\n"
+        "0.00.4 I load_tensors:        ROCm0 model buffer size = "
+        f"{device_model_mb:.2f} MiB\n"
+        "0.00.5 I load_tensors:           CPU model buffer size =  5430.00 MiB\n"
+        "0.00.6 I sched_reserve:      ROCm0 compute buffer size =   600.00 MiB\n"
+        "0.00.7 I sched_reserve: graph splits = 98\n"
+    )
+
+
+def test_a_recorded_moe_placement_makes_the_vram_axis_live(home):
+    device_side = server_ops.planned_vram_mb(_moe_state())
+    _write_log(home, _moe_log(device_side - 600))   # actual == prediction
+    st.write_state(MOE_SLUG, MOE_QUANT, 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="rocm", ctx=MOE_CTX,
+                   kv_cache="q8_0", placement=dict(MOE_12))
+
+    r = _client(home).get("/api/server/findings")
+
+    assert r.status_code == 200
+    assert r.json()["findings"] == []   # healthy, judged, no false alarm
+
+
+def test_a_divergent_moe_load_is_caught_once_the_placement_is_recorded(home):
+    device_side = server_ops.planned_vram_mb(_moe_state())
+    _write_log(home, _moe_log(device_side + 6000))  # far above the device figure
+    st.write_state(MOE_SLUG, MOE_QUANT, 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="rocm", ctx=MOE_CTX,
+                   kv_cache="q8_0", placement=dict(MOE_12))
+
+    r = _client(home).get("/api/server/findings")
+
+    assert r.status_code == 200
+    ids = [f["id"] for f in r.json()["findings"]]
+    assert ids == ["plan_divergence"], ids
+
+
+def test_a_recorded_placement_compares_the_device_figure_directly(home):
+    """The decision path consumes the persisted placement: the same MoE log is
+    `diverges` against the device-side figure, and the plan's own placement is
+    named in the detail. A whole-file figure (no placement) stays suppressed."""
+    device_side = server_ops.planned_vram_mb(_moe_state())
+    load = engine_log.parse_load(_moe_log(device_side + 6000))
+
+    r = engine_log.compare_plan(load, device_side,
+                                expected_placement=dict(MOE_12))
+    assert r["vram_verdict"] == "diverges"
+    assert r["vram_why"] is None
+    assert "ngl=99, n_cpu_moe=12" in r["detail"]
+
+    # DR2-1 is retained for a caller that has only a whole-file figure: it is
+    # still not comparable to a non-resident load, so no false alarm.
+    whole_file = server_ops.planned_vram_mb({**_moe_state(),
+                                             "placement": dict(RESIDENT)})
+    r2 = engine_log.compare_plan(load, whole_file)
+    assert r2["vram_verdict"] == "not_comparable"
+    assert r2["vram_why"] == "not_device_resident"
+
+    # And with no prediction at all the axis stays unjudged.
+    r3 = engine_log.compare_plan(load, None)
+    assert r3["vram_verdict"] == "not_comparable"
+    assert r3["vram_why"] == "no_prediction"
