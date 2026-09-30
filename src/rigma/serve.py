@@ -2606,6 +2606,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             Returns the answer object, or None when nobody answered — which
             `drive_turn_acp` reports as `answer_elicitation(accepted=False)`, a
             REAL decline mcode can fall back from, not a request left waiting.
+
+            OD-12: whichever way this ends, the DECISION is published on the same
+            `approval/decided` channel the ask went out on. It used to be published
+            nowhere, so an expired question left the row `awaiting` with a live form
+            whose next click hit the route's 409 — the server knew it had declined
+            and said nothing.
             """
             # ACP carries no id for an elicitation (unlike a permission's
             # toolCallId), so one is minted here: the route refuses an answer whose
@@ -2613,7 +2619,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # decide a later question.
             request_id = "q-" + os.urandom(4).hex()
             slot = {"requestId": request_id, "answer": None, "kind": "question",
-                    "event": threading.Event()}
+                    "event": threading.Event(), "lock": threading.Lock(),
+                    "expired": False}
             _approvals[sid] = slot
             # Same `approval/asked` channel as a permission ask. `kind` is what lets
             # the UI draw a question form rather than an allow/deny card; the message
@@ -2630,9 +2637,36 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 }))
             try:
                 answered = slot["event"].wait(QUESTION_WAIT_SECS)
+                if not answered:
+                    # OD-12. The timeout is re-checked under the slot's lock, which
+                    # the answer route also holds while it sets the event, so "the
+                    # wait gave up" and "the user answered" cannot both be true.
+                    # Without the lock a click in the instant after `wait()`
+                    # returned False would be accepted by the route (200) while this
+                    # handler had already declined — the server contradicting itself
+                    # about the same request.
+                    with slot["lock"]:
+                        answered = slot["event"].is_set()
+                        if not answered:
+                            slot["expired"] = True
             finally:
                 # Cleared even on the timeout path, exactly like a permission slot.
                 _approvals.pop(sid, None)
+            # The decision, in the shape `approval/decided` already has: the SAME id
+            # as the ask, plus a verdict. `decision` is the field that names the
+            # outcome; `outcome` carries the same value because that is the field the
+            # governance fold already reads, and a second vocabulary would be a
+            # second thing to keep in step. A just-in-time answer wins: it sets the
+            # event under the lock before the expiry can be claimed, so `answered`
+            # is True here and no `expired` is ever emitted for it.
+            decision = "answered" if answered else "expired"
+            loop.call_soon_threadsafe(q.put_nowait, _harness.TurnEvent(
+                "state", event="approval/decided", data={
+                    "id": request_id,
+                    "kind": "question",
+                    "decision": decision,
+                    "outcome": decision,
+                }))
             if not answered:
                 return None
             return slot["answer"]
@@ -5676,7 +5710,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 return JSONResponse(
                     {"error": "this chat is waiting on a permission request, "
                               "not a question"}, status_code=409)
-            slot["answer"] = answer
+            # OD-12: the answer and the timeout are decided under the SAME lock, so
+            # only one of them can win. A click that arrives after the handler has
+            # claimed the expiry is refused rather than accepted for a question the
+            # server has already declined and reported as `decision: "expired"`.
+            with slot["lock"]:
+                if slot.get("expired"):
+                    return JSONResponse(
+                        {"error": "that question's window has closed"},
+                        status_code=409)
+                slot["answer"] = answer
+                slot["event"].set()
+            return {"ok": True, "requestId": slot.get("requestId"),
+                    "allow": allow, "answer": answer}
         else:
             if slot.get("kind") == "question":
                 return JSONResponse(
