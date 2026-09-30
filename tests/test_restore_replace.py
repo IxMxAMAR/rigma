@@ -200,6 +200,30 @@ def test_restore_clears_macro_trust_for_every_method_it_writes_or_deletes(
     assert macros.is_trusted("untouched", "peek") is True
 
 
+def test_restore_returns_the_ids_it_deleted(client, home):
+    """ODR-7: the response must name every method id the restore actually
+    deleted — the card's confirmation could not say how many existed before,
+    and the route reported only "restored N method(s)" after silently
+    deleting the rest. Additive: the existing fields stay."""
+    _seed(home, method_ids=("mine", "keepme", "other"), minutes=12)
+    doc = {"rigma_backup": 1, "settings": {},
+           "methods": [_doc("mine")], "memory": []}
+    r = client.post("/api/restore", json=doc)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert sorted(body["deleted"]) == ["keepme", "other"], body
+    assert body["restored"] is True and body["methods"] == 1
+
+
+def test_restore_reports_no_deletions_when_nothing_is_stale(client, home):
+    _seed(home, method_ids=("mine",), minutes=12)
+    doc = {"rigma_backup": 1, "settings": {},
+           "methods": [_doc("mine")], "memory": []}
+    r = client.post("/api/restore", json=doc)
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] == []
+
+
 def test_the_happy_path_still_restores_memory(client, home):
     """The replace must not break the section that already worked.
 
