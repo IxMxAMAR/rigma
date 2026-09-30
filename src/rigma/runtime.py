@@ -112,8 +112,9 @@ def update_engines_manifest(url: str = ENGINES_MANIFEST_URL) -> bool:
     """Fetch a newer engine pin into ~/.rigma/engines.json. Best-effort:
     False (never an exception) when offline or the payload is unusable.
 
-    Kept as the boolean door for callers that only care whether a newer pin
-    landed; `update_engines_manifest_result` is the one that says WHY (A6)."""
+    True whenever a valid manifest was fetched and written — including when it is the
+    same version already in use, which is the base behaviour. Kept as the boolean door
+    for callers that only want yes/no; `update_engines_manifest_result` says WHY (A6)."""
     return update_engines_manifest_result(url).ok
 
 
@@ -132,15 +133,17 @@ MANIFEST_UNSAVED = "unsaved"     # a valid pin that could not be written to disk
 class ManifestUpdate:
     """The result of `update_engines_manifest_result` (A6).
 
-    `version` is the fetched pin when one was readable, else "". `ok` keeps the old
-    boolean meaning: a newer pin is now installed.
+    `version` is the fetched pin when one was readable, else "". `ok` keeps the OLD
+    boolean meaning exactly: the base function returned True whenever a valid manifest
+    was fetched and written, whether or not its version differed — so `ok` is True for
+    `current` as well as `updated`, and False for network / unusable / unsaved.
     """
     status: str
     version: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.status == MANIFEST_UPDATED
+        return self.status in (MANIFEST_UPDATED, MANIFEST_CURRENT)
 
 
 def update_engines_manifest_result(url: str = ENGINES_MANIFEST_URL) -> ManifestUpdate:

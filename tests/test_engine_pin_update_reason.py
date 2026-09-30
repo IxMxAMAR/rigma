@@ -117,6 +117,21 @@ def test_the_boolean_door_still_works(tmp_path, monkeypatch):
     assert runtime.update_engines_manifest() is False
 
 
+def test_the_boolean_door_is_true_for_already_current(tmp_path, monkeypatch):
+    """The OLD meaning: base returned True whenever a valid manifest was fetched and
+    written, even when the version did not change. `ok` must match that (A6)."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(runtime.httpx, "get",
+                        lambda *a, **k: _response(runtime._engines_manifest()))
+    assert runtime.update_engines_manifest() is True
+    assert runtime.ManifestUpdate(runtime.MANIFEST_CURRENT).ok is True
+    assert runtime.ManifestUpdate(runtime.MANIFEST_UPDATED).ok is True
+    for bad in (runtime.MANIFEST_NETWORK, runtime.MANIFEST_UNUSABLE,
+                runtime.MANIFEST_UNSAVED):
+        assert runtime.ManifestUpdate(bad).ok is False
+
+
+
 def test_the_update_command_prints_the_reason(tmp_path, monkeypatch):
     """The wiring, not just the formatter: `rigma update` must report the result."""
     from typer.testing import CliRunner
