@@ -420,3 +420,44 @@ deliberately, with its own confirmation wording and a test that a post-backup me
 
 **If nothing is decided:** the merge stands and the card tells the truth about it. Not a data-loss
 risk — a feature that does less than its name suggests.
+
+---
+
+## OD-16 — two full test-suite runs at once deadlock, and the suite leaks its fake ACP servers
+
+**Found during the power-cut recovery, not by reading code.** Two `pytest tests` runs overlapped
+(the Head Agent's and a verifier's). **Both froze**: each was blocked on an established loopback
+socket to its own fake ACP server, with a CPU delta of **0 over 25 seconds** — not slow, stopped.
+**72 `tests/fake_acp_server.py` processes** were still alive 9+ minutes later, children of the two
+frozen pytest processes, and they stayed alive until the owning agent jobs were killed (the shell
+guard forbids killing processes, correctly — the owner's own benchmark was running).
+
+Run **alone**, the same suite proceeds, and `tests/test_harness_mcode_acp.py` alone is green
+(61 passed in 7.1 s). So the deadlock needs **two concurrent runs**, which is exactly what a CI
+matrix, a developer with two terminals, or this program's own "at most three pytest processes"
+rule can produce.
+
+**It is not diagnosed yet** — it could be a fixed port, a fixed temp path, or a shared `RIGMA_HOME`
+between the fake servers, and it could equally be a fake-server fixture that never reaps. Nothing
+here says the *product* leaks children: the leak is in `tests/`, and the shipped stop paths were
+independently verified (DR2/DR4/B1).
+
+1. **Diagnose and fix it** (recommended). One focused session: start two suites, find the shared
+   resource or the un-reaped fixture, and make the suite safe to run concurrently — or make it
+   refuse to start a second copy with a clear message. **Cost:** a few hours. **Benefit:** "the full
+   suite is green" becomes a statement that can be trusted when two people run it, and the machine
+   stops accumulating orphaned Python processes.
+2. **Leave it, and document it.** **Cost:** a CI matrix or two concurrent runs will hang with no
+   diagnostic, and a hung run leaves dozens of orphaned processes that nothing reaps. This is the
+   kind of failure that reads as "the code is broken" when it is the harness.
+3. **Add a `conftest.py` session lock** so a second concurrent suite exits immediately with a
+   message. **Cost:** trivial; it does not fix the leak, only converts a hang into a clear error.
+
+**Recommendation: option 1, then option 3 as a belt-and-braces guard.** A test suite that can
+deadlock against itself and leave processes behind is a defect in the harness — and this program's
+whole premise is that the harness seam matters. It is also cheap to diagnose now that the symptom
+is captured precisely.
+
+**If nothing is decided:** the suite stays green when run alone (which is how it is normally run) and
+the failure mode stays unrecorded in code — so the next person to see it will spend an hour
+concluding the product is broken.
