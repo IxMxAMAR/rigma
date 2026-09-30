@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import platform
 import time
 from pathlib import Path
@@ -10,6 +11,12 @@ import typer
 from .probe import probe_hardware
 from .registry import Registry
 from .resolve import ResolveError, resolve
+
+# A8b-n1: the CLI path needs a log trace for the same reason the server path has
+# one. `up` writes to stderr, which is the terminal in the foreground and
+# `~/.rigma/logs/detached-<port>.log` for `--detach` (see `_detached_log_path`),
+# so a WARNING here is diagnosable after the fact on both.
+_log = logging.getLogger(__name__)
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -2679,9 +2686,21 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             except Exception as e:      # restore() reports, it does not raise
                 kv_err = str(e)[:200]
             if kv_err:
-                cold = _kvcache.restore_failure_note(kv_err)
-                typer.echo(cold)
-                rp.explain.append(cold)
+                # A8b-n1: the server path logs the refusal at WARNING
+                # (server_ops.perform_switch); this path echoed it and left no
+                # trace, so a refusal on the launch path a CLI user actually
+                # runs was the one with nothing to diagnose afterwards. Same
+                # message and level as the server, so a grep for
+                # "kv-cache restore failed" finds either.
+                _log.warning("kv-cache restore failed for %s [%s]: %s — "
+                             "re-prefilling from zero", rp.model_slug, kv_fp,
+                             kv_err)
+                # The note is the user-facing half, echoed exactly once. A8b-n2:
+                # the old `rp.explain.append(cold)` was inert here — the explain
+                # loop at the top of `up` had already run, nothing after this
+                # reads `rp.explain`, and `write_state` does not persist it — so
+                # it was removed rather than left looking like a report.
+                typer.echo(_kvcache.restore_failure_note(kv_err))
             break
         except _VerifyRefused:
             # A5c: `--verify --refuse` said no. `typer.Exit` is a RuntimeError,
