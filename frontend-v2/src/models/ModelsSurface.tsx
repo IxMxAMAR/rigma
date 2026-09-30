@@ -57,8 +57,10 @@ const SPEED: Record<string, { dot: string; text: string; label: string; hint: st
  *  fit's own explain line has said `rs=unknown(est N MB)` since A2d-gap, but
  *  this row (the number behind "OVER by / headroom") printed a bare figure for
  *  the same shape. A number with no provenance reads as a measured one, which
- *  is exactly the silent confidence the A2 family exists to remove. Exported so
- *  the sentence is assertable without mounting the page. */
+ *  is exactly the silent confidence the A2 family exists to remove. The marker
+ *  is optional on the wire, so an ABSENT one is labelled "provenance not
+ *  stated" rather than silently taken for a measurement. Exported so the
+ *  sentence is assertable without mounting the page. */
 export function budgetHint(fit?: QuantRow["fit"]): string {
   // A16: checked FIRST, because a broken fit has no budget and would otherwise
   // fall through to the "does not fit this machine" sentence below — a verdict
@@ -74,18 +76,34 @@ export function budgetHint(fit?: QuantRow["fit"]): string {
   // A2d-budget: say what the term IS, not only how big it is. The estimate is
   // still charged — dropping it would free VRAM llama.cpp is about to allocate
   // — so the label is the whole fix.
-  const rs = b.rs_unknown
-    ? (b.rs_mb
-        ? `recurrent state ${b.rs_mb.toLocaleString()} MB  ← ESTIMATE, not a `
+  //
+  // THREE states, not two. `rs_unknown === true` is the server's own marker
+  // that the geometry could not be read; `false` is a measurement. An ABSENT
+  // key is a third thing — a backend that stopped sending the marker — and it
+  // must not be read as either: `rs_unknown?` is optional in the type, so the
+  // old `b.rs_unknown ? … : …` rendered a charged estimate as a measurement the
+  // moment the key went missing (the wave-4 verifier's risk). Only a POSITIVE
+  // charge gets the unstated label; a 0 is the dense case and stays silent,
+  // because stamping "provenance unstated" on every dense row is noise, not
+  // honesty.
+  const charged = typeof b.rs_mb === "number" && b.rs_mb > 0;
+  const rs = b.rs_unknown === true
+    ? (charged
+        ? `recurrent state ${b.rs_mb!.toLocaleString()} MB  ← ESTIMATE, not a `
           + "measurement (this model's recurrent geometry could not be read)"
         : "recurrent state  unknown geometry — 0 is charged for lack of "
           + "evidence, NOT because there is nothing to allocate")
-    : b.rs_mb
-      ? `recurrent state ${b.rs_mb.toLocaleString()} MB`
+    : charged
+      ? (b.rs_unknown === false
+          ? `recurrent state ${b.rs_mb!.toLocaleString()} MB`
+          : `recurrent state ${b.rs_mb!.toLocaleString()} MB  ← the server did `
+            + "not say whether this is a measurement or an estimate")
       : "";
-  const caveat = b.rs_unknown
+  const caveat = b.rs_unknown === true
     ? " — the recurrent-state term is an estimate, not a measurement"
-    : "";
+    : charged && b.rs_unknown !== false
+      ? " — the recurrent-state term's provenance was not stated"
+      : "";
   const L = [
     `weights        ${b.file_mb.toLocaleString()} MB`,
     ...(b.mmproj_mb ? [`vision proj    ${b.mmproj_mb.toLocaleString()} MB  (always resident)`] : []),
