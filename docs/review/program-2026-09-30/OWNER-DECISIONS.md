@@ -311,3 +311,54 @@ one disabled button with a reason. Option 2 is a real product change and should 
 its own merge/precedence rules.
 
 **If nothing is decided:** the refusal stands and the dialog explains it. Not a blocker.
+
+---
+
+## OD-12 — What happens to a question after its 5-second window closes? (B4b)
+
+**State today:** item B4 puts mcode's `ask_user` on the existing permission channel with
+`kind: "question"` and a 5-second bound (`QUESTION_WAIT_SECS = 5.0`, OD-8). When the window closes
+the server returns a real **decline** — but it emits **no `approval/decided` event**. The frontend
+half (B4b, merged) now draws a real question form; because no decided-event arrives, **the row stays
+`awaiting` and the form stays clickable after the question has already been declined.** A click then
+hits the route's 409 and shows up as `lastError`.
+
+**Options**
+
+1. **Emit a server-side expiry event** (`approval/decided` with `decision: "expired"`) when
+   `QUESTION_WAIT_SECS` elapses, and have the UI fold the row to a disabled "expired" state. The
+   client then never guesses the clock. **Cost:** a small server change plus the fold; the event is
+   one more thing on the wire that the harness must tolerate.
+2. **A client-side countdown** that disables the form after 5 s. No server change. **Cost:** the
+   client guesses the server's clock and the request's start time, so it will sometimes disable a
+   question that is still live and sometimes leave a dead one clickable — the exact class of
+   wrong-state bug this program has been removing.
+3. **Leave it.** The window is 5 s and a late click is harmless (a 409 surfaced as a notice).
+
+**Recommendation: option 1.** The server knows when it declined; making it say so is the honest
+version, and it is the only one that cannot drift. Option 3 is acceptable if the deadline is close,
+but it should then be written down as a known rough edge rather than left implicit.
+
+**If nothing is decided:** the form stays clickable for up to 5 s after the decline and a late click
+reports the route's 409. Not a data-loss risk; a rough edge.
+
+---
+
+## OD-13 — Should a remotely-streaming chat have a stop affordance? (D3b)
+
+**State today:** D3b (merged) makes a reloaded chat read the server's `streaming`/`partial` state,
+suppress the false "interrupted" notice, show a rail dot, and poll. There is **no way to stop a turn
+this tab did not start** — the client's stop control only exists for a turn the tab owns. A user who
+reloads mid-generation can watch it but not cancel it.
+
+**Options**
+
+1. Add a stop control for a remotely-owned streaming turn (POST the existing stop route for that
+   session id). **Cost:** small; needs care that two tabs do not both believe they own the stop.
+2. Leave it: reloading is rare, and the turn finishes on its own.
+
+**Recommendation: option 1** if a follow-up wave has room — it is a small, contained UI addition on
+an existing route, and "I can see it but cannot stop it" is the kind of gap the owner asked to have
+covered. Otherwise option 2 with the gap recorded.
+
+**If nothing is decided:** the turn runs to completion and the tab only observes it.
