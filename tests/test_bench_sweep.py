@@ -310,3 +310,99 @@ def test_a_calibration_entry_says_what_it_was_measured_on(monkeypatch, tmp_path)
     # entry can explain itself rather than just being absent.
     assert entry["hardware"]["id"]
     assert entry["hardware"]["backend"] == "vulkan"
+
+
+# The exact baseline argv as produced by the parent commit dbb2110, captured
+# before C2 touched anything. `--no-op-offload` is a sweep axis, so a default
+# launch must still emit this list byte for byte.
+BEFORE_C2_BASELINE_ARGV = [
+    "-m", "/tmp/m.gguf", "--port", "11601", "--host", "127.0.0.1",
+    "-ngl", "99", "-c", "8192", "--parallel", "2", "--kv-unified",
+    "--alias", "m", "-fa", "on", "--cache-type-k", "f16",
+    "--cache-type-v", "f16", "--reasoning-format", "deepseek",
+    "--cache-reuse", "256", "--checkpoint-min-step", "4096"]
+
+
+def test_sweep_offers_the_no_op_offload_axis_and_off_emits_nothing():
+    """C2: the axis is a sweep config, and it is boolean.
+
+    `--no-op-offload` is `{"--op-offload"}, {"--no-op-offload"}` (bool) in
+    common/arg.cpp at both pins, and the compiled default is op-offload ON, so
+    the OFF value must add NOTHING to the argv.
+    """
+    cfgs = dict(bench.sweep_configs(ComboFlags(ctx=8192), moe=False))
+    assert cfgs["no-op-offload"] == {"no_op_offload": True}
+    # ON: the per-trial value reaches the argv.
+    on = _plan(no_op_offload=True).server_args("/tmp/m.gguf", 11601)
+    assert "--no-op-offload" in on
+    # OFF: the default value, and the baseline trial, emit nothing at all.
+    assert "--no-op-offload" not in _plan().server_args("/tmp/m.gguf", 11601)
+    assert "--no-op-offload" not in _plan(
+        **cfgs["baseline"]).server_args("/tmp/m.gguf", 11601)
+
+
+def test_a_default_sweep_leaves_every_other_argv_unchanged():
+    """C2 must not change an existing launch or an existing measurement.
+
+    Only the new axis may carry the flag; the baseline argv is the one captured
+    from the parent commit, and no other axis gained a token.
+    """
+    carrying = []
+    for label, override in bench.sweep_configs(ComboFlags(ctx=8192), moe=False):
+        argv = _plan(**override).server_args("/tmp/m.gguf", 11601)
+        if "--no-op-offload" in argv:
+            carrying.append(label)
+        if label == "baseline":
+            assert argv == BEFORE_C2_BASELINE_ARGV
+    assert carrying == ["no-op-offload"]
+
+
+def test_quick_configs_does_not_trial_the_no_op_offload_axis():
+    """Not a launch default: the first-load calibration sweep (which is a
+    default load path) must not start trialling it."""
+    labels = [k for k, _ in bench.quick_configs(ComboFlags(ctx=8192), moe=False)]
+    assert "no-op-offload" not in labels
+
+
+def test_a_no_op_offload_row_records_the_trialled_value(monkeypatch, tmp_path):
+    """A stored row is self-describing: it says which value was trialled.
+
+    Same shape as the env toggles — the override dict IS the recorded flags, in
+    the returned row, in bench-rows.jsonl and in calibration.json — and the row
+    corresponds to an argv that really carried the flag.
+    """
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    seq = iter([bench.BenchResult(pp_tps=100, tg_tps=50, prompt_tokens=8,
+                                  gen_tokens=8),
+                bench.BenchResult(pp_tps=120, tg_tps=70, prompt_tokens=8,
+                                  gen_tokens=8)])
+    seen = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(exe, plan, model_path, **k):
+        from rigma import runtime
+        seen.append((bool(getattr(plan.flags, "no_op_offload", False)),
+                     runtime.server_argv(exe, plan, model_path,
+                                         k.get("port", 11601))))
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: next(seq))
+    rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
+                           port=11601,
+                           configs=[("baseline", {}),
+                                    ("no-op-offload", {"no_op_offload": True})])
+    # the trial really launched the flag; the baseline really did not.
+    assert "--no-op-offload" in seen[1][1] and seen[1][0] is True
+    assert "--no-op-offload" not in seen[0][1] and seen[0][0] is False
+    by_label = {r["label"]: r for r in rows}
+    assert by_label["no-op-offload"]["flags"] == {"no_op_offload": True}
+    assert by_label["baseline"]["flags"] == {}
+    logged = {e["label"]: e for e in _rows_log(tmp_path)}
+    assert logged["no-op-offload"]["flags"] == {"no_op_offload": True}
+    assert logged["baseline"]["flags"] == {}
+    # the winner (no-op-offload) is what calibration stores, with its value.
+    assert _only_entry()["flags"] == {"no_op_offload": True}
