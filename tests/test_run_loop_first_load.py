@@ -775,6 +775,45 @@ def test_the_boot_reaper_skips_a_run_another_live_process_drives(home):
         _reap(proc)
 
 
+def test_the_boot_reaper_reconciles_a_live_pid_with_a_different_create_time(home):
+    """DR42-n1: the create-time COMPARISON itself, on the driver path.
+
+    A live pid whose recorded create time DIFFERS is a recycled number — some
+    other process owns it now — so the run is NOT being driven elsewhere and
+    must be reconciled, not skipped. The stamp is a REAL foreign child's pid
+    with a deliberately different time (never a fabricated identity), so the
+    branch that compares the two times is what decides this. Replace the
+    comparison in `state._recorded_identity_matches` with
+    `psutil.Process(pid).create_time(); return True` and this test fails while
+    every other DR3-4/DR4-2 test stays green."""
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()
+
+    from rigma import state
+    proc = _foreign_sleeper()
+    try:
+        real = state._create_time(proc.pid)
+        assert real > 0.0, (
+            "could not read the foreign child's create time, so this test "
+            "cannot exercise the comparison it exists for")
+        # The pid IS live, but this stamp is NOT its create time: the recorded
+        # identity and the live process disagree.
+        _stamp_driver(rid, proc.pid, real - 10_000.0)
+
+        assert runs.driver_is_live_elsewhere(runs.load(rid)) is False, (
+            "a live pid with a DIFFERENT create time was read as the recorded "
+            "driver, so a recycled pid still makes a dead driver look alive")
+
+        serve._reconcile_orphaned_runs(runs)
+
+        assert runs.load(rid)["status"] == "interrupted", (
+            "the sweep skipped a run whose recorded driver identity does not "
+            "match the live process that now owns the pid")
+    finally:
+        _reap(proc)
+
+
 def test_the_boot_reaper_still_reaps_a_run_whose_driver_is_gone(home):
     """The other direction, on a REAL dead process: the same stamp once the
     child is gone is an orphan like any other — DR1-residual stays closed."""
