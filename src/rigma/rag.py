@@ -15,6 +15,13 @@ from .runtime import rigma_home
 
 RAG_PORT = 11510
 
+# The one sentence every "raggity is missing" path answers with. OD-3: the
+# rebuild route returns this verbatim in a 400, and `ingest`/`ensure_sidecar`
+# raise it, so the route and the CLI cannot drift apart — the R3-11 lesson was
+# that a second hand-maintained copy of a security list is how the bug happened.
+RAGGITY_MISSING_MSG = ("raggity not found — install with `pip install "
+                       "raggity[server]` or set RIGMA_RAGGITY_CMD")
+
 
 def rag_dir() -> Path:
     d = rigma_home() / "rag"
@@ -269,9 +276,7 @@ def ensure_sidecar(port: int = RAG_PORT, timeout: float = 90.0) -> dict:
         return health
     cmd = raggity_cmd()
     if cmd is None:
-        raise RuntimeError(
-            "raggity not found — install with `pip install raggity[server]` "
-            "or set RIGMA_RAGGITY_CMD")
+        raise RuntimeError(RAGGITY_MISSING_MSG)
     cfg = write_rag_config()
     log_path = rag_dir() / "serve.log"
     with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
@@ -372,15 +377,52 @@ def discover(deep: bool = False, timeout: float = 30.0) -> dict:
 def ingest() -> str:
     cmd = raggity_cmd()
     if cmd is None:
-        raise RuntimeError(
-            "raggity not found — install with `pip install raggity[server]` "
-            "or set RIGMA_RAGGITY_CMD")
+        raise RuntimeError(RAGGITY_MISSING_MSG)
     cfg = write_rag_config()
     res = subprocess.run([*cmd, "ingest", "--config", str(cfg)],
                          capture_output=True, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"raggity ingest failed:\n{res.stderr or res.stdout}")
     return res.stdout
+
+
+def rebuild_index() -> str:
+    """Throw away the index and build a fresh one from the configured sources.
+
+    OD-3 / R3-11 residual: the credential `exclude` list is written by
+    `write_rag_config`, so it only changes a FUTURE ingest. An index built
+    before R3-11 still holds whatever was under an added folder — `.env`,
+    `.ssh/id_rsa`, `.git-credentials`, browser cookie DBs — and regenerating the
+    config does not remove those rows. Deleting the index directory is the only
+    way to evict them, so this is a TRUE rebuild rather than a re-ingest.
+
+    ORDER IS LOAD-BEARING — stop -> clear -> ingest:
+      1. `stop_sidecar()` first: a running sidecar holds the lancedb index open,
+         so deleting the directory under a live server leaves it serving an
+         index that no longer exists. A `False` return means there was no
+         recorded sidecar, which is not an error.
+      2. clear the index directory next, BEFORE the ingest: if ingest ran first,
+         raggity would add to the existing rows and the pre-denylist entries
+         would survive — the exact thing this exists to remove. `rmtree` is
+         deliberately NOT given `ignore_errors=True`: a removal that fails must
+         raise so the caller records an error, because a silent failure leaves
+         the secrets in place while reporting success.
+      3. `ingest()` last: it regenerates `raggity.toml` (and therefore the
+         credential excludes) and re-reads the configured sources.
+
+    Never called automatically: `POST /api/rag/reindex` is the only caller,
+    because re-reading the owner's documents is the owner's decision (§0.8).
+    """
+    if raggity_cmd() is None:
+        # Before stopping or deleting: with no raggity the rebuild cannot
+        # finish, and clearing the index first would leave the owner with
+        # neither the old index nor a new one.
+        raise RuntimeError(RAGGITY_MISSING_MSG)
+    stop_sidecar()
+    index_dir = rag_dir() / "index"
+    if index_dir.exists():
+        shutil.rmtree(index_dir)
+    return ingest()
 
 
 def retrieve(query: str, k: int = 8, max_context_tokens: int | None = None,

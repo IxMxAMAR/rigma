@@ -263,3 +263,59 @@ def test_add_source_recovers_from_a_wrong_typed_sources_file(home, monkeypatch):
     (home / "docs").mkdir()
     assert rag.add_source("docs") == [str((home / "docs").resolve())]
 
+
+# --- OD-3: a "rebuild index" must be a TRUE rebuild, not a re-ingest ---------
+#
+# The R3-11 credential `exclude` list only affects a FUTURE ingest, so an index
+# built before it still holds `.env`, `.ssh/id_rsa`, browser cookie DBs and
+# whatever else was under an added folder. `rebuild_index` stops the sidecar,
+# deletes the index directory and ingests again; that ORDER is what evicts the
+# pre-denylist rows instead of adding to them.
+
+
+def test_rebuild_index_stops_clears_then_ingests(home, monkeypatch):
+    monkeypatch.setattr(rag, "raggity_cmd", lambda: ["raggity"])
+    index = rag.rag_dir() / "index"
+    index.mkdir(parents=True, exist_ok=True)
+    (index / "stale.lance").write_text("rows embedded before R3-11",
+                                       encoding="utf-8")
+    order = []
+    real_rmtree = rag.shutil.rmtree
+
+    def fake_stop():
+        order.append("stop")
+        return False            # no recorded sidecar is NOT an error
+
+    def fake_rmtree(path, *args, **kwargs):
+        order.append("remove")
+        assert Path(path) == index
+        return real_rmtree(path, *args, **kwargs)
+
+    def fake_ingest():
+        order.append("ingest")
+        assert not index.exists(), (
+            "the stale index must be gone before ingest, or the pre-denylist "
+            "rows survive the rebuild")
+        return "Indexed. added=2\n"
+
+    monkeypatch.setattr(rag, "stop_sidecar", fake_stop)
+    monkeypatch.setattr(rag.shutil, "rmtree", fake_rmtree)
+    monkeypatch.setattr(rag, "ingest", fake_ingest)
+
+    assert rag.rebuild_index() == "Indexed. added=2\n"
+    assert order == ["stop", "remove", "ingest"]
+    assert not index.exists()
+
+
+def test_rebuild_index_without_raggity_keeps_the_old_index(home, monkeypatch):
+    """A rebuild that cannot run must not destroy what is there: the missing
+    raggity check comes before the sidecar is stopped and before the directory
+    is removed."""
+    index = rag.rag_dir() / "index"
+    index.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(rag, "raggity_cmd", lambda: None)
+    with pytest.raises(RuntimeError, match="raggity not found"):
+        rag.rebuild_index()
+    assert index.exists(), "a rebuild that cannot run deleted the index"
+
+
