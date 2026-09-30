@@ -516,7 +516,7 @@ def test_a_timeout_is_still_an_error_not_a_stop(monkeypatch, tmp_path):
     assert "timed out" in events[-1].text
 
 
-def _tree_proc():
+def _tree_proc(*, wait_ok: bool = True):
     """A process stub for `kill_tree`: never spawned, never left behind."""
     class FakeProc:
         pid = 4242
@@ -529,12 +529,28 @@ def _tree_proc():
             pass
 
         def wait(self, timeout=None):
+            if not wait_ok:
+                raise subprocess.TimeoutExpired("fake", timeout)
             return 0
 
         def poll(self):
-            return None     # `_stop` must take the kill path; `_kill_tree` is stubbed
+            return None     # `_stop` must take the kill path
 
     return FakeProc()
+
+
+def _posix_kill_tree(monkeypatch):
+    """Put `tools._kill_tree` on its real POSIX branch with no real process.
+
+    The os primitives are stubbed, so `killpg` is recorded, never sent. This is
+    what makes the two tests below exercise the branch `kill_tree` actually
+    takes on Linux/macOS rather than a `_kill_tree` stub. `raising=False` adds
+    `os.getpgid`/`os.killpg`, which do not exist on a Windows host.
+    """
+    monkeypatch.setattr(tools.sys, "platform", "linux")
+    monkeypatch.setattr(tools.os, "getpgid", lambda pid: 9000 + pid, raising=False)
+    monkeypatch.setattr(tools.os, "killpg", lambda pgid, sig: None, raising=False)
+    monkeypatch.setattr(tools.os, "kill", lambda pid, sig: None)
 
 
 def test_a_failed_tree_kill_is_reported_not_assumed(monkeypatch):
@@ -580,34 +596,28 @@ def test_a_posix_tree_kill_reports_the_death_it_confirmed(monkeypatch):
     """POSIX + already-dead → ok True.
 
     The old body hardcoded `ok = False` off Windows, so a tree that HAD died was
-    reported as unconfirmed on every Linux/macOS timeout.
+    reported as unconfirmed on every Linux/macOS timeout. This runs the real
+    `tools._kill_tree` POSIX branch (killpg then poll) with its os primitives
+    stubbed, so the branch under test is the one POSIX takes.
     """
-    calls = []
-    monkeypatch.setattr(harness_dsh._harness.os, "name", "posix")
-    monkeypatch.setattr(tools, "_kill_tree",
-                        lambda pid, proc=None, **kw: calls.append(pid) or True)
+    _posix_kill_tree(monkeypatch)
 
-    result = harness_dsh._harness.kill_tree(_tree_proc())
+    result = harness_dsh._harness.kill_tree(_tree_proc(wait_ok=True))
 
     assert result.ok is True
     assert result.attempted is True
     assert result.confirmed is True
-    assert calls == [4242], calls
 
 
 def test_a_posix_tree_kill_reports_a_death_it_could_not_confirm(monkeypatch):
     """POSIX + still-alive-after-kill → ok False and attempted True."""
-    calls = []
-    monkeypatch.setattr(harness_dsh._harness.os, "name", "posix")
-    monkeypatch.setattr(tools, "_kill_tree",
-                        lambda pid, proc=None, **kw: calls.append(pid) or False)
+    _posix_kill_tree(monkeypatch)
 
-    result = harness_dsh._harness.kill_tree(_tree_proc())
+    result = harness_dsh._harness.kill_tree(_tree_proc(wait_ok=False))
 
     assert result.ok is False
     assert result.attempted is True
     assert result.confirmed is False
-    assert calls == [4242], calls
 
 
 def test_the_tree_kill_is_delegated_exactly_once(monkeypatch):
@@ -617,7 +627,6 @@ def test_the_tree_kill_is_delegated_exactly_once(monkeypatch):
     kill happened twice. `kill_tree` must not spawn a killer of its own.
     """
     calls = []
-    monkeypatch.setattr(harness_dsh._harness.os, "name", "nt")
     monkeypatch.setattr(tools, "_kill_tree",
                         lambda pid, proc=None, **kw: calls.append(pid) or True)
     monkeypatch.setattr(subprocess, "run",
@@ -634,11 +643,10 @@ def test_a_confirmed_dead_tree_is_not_reported_as_a_failure(monkeypatch):
     """The timeout message must not claim the agent may still be running when the
     kill was confirmed.
 
-    On POSIX the old body returned `ok = False` unconditionally, so every
+    The old `kill_tree` returned `ok = False` off Windows unconditionally, so a
     Linux/macOS timeout claimed the agent might still be holding VRAM even when
     the process was already gone. The message is the only signal the owner gets.
     """
-    monkeypatch.setattr(harness_dsh._harness.os, "name", "posix")
     monkeypatch.setattr(tools, "_kill_tree", lambda *a, **k: True)
 
     run = harness_dsh._Run(proc=_tree_proc(), hard=True)
@@ -648,6 +656,36 @@ def test_a_confirmed_dead_tree_is_not_reported_as_a_failure(monkeypatch):
     assert "and was killed" in events[-1].text, events[-1].text
     assert "could not be confirmed dead" not in events[-1].text
     assert "STILL BE RUNNING" not in events[-1].text
+
+
+def test_a_dsh_child_is_detached_on_posix_only(monkeypatch):
+    """The pooled runner must be in its OWN process group on POSIX.
+
+    `kill_tree` reaches a tree with `killpg` there, and a runner left in RIGMA's
+    group would make a stop take the server down with it. Windows is unchanged:
+    `_detached_kwargs` adds nothing there. The platform decision is the module
+    constant, flipped here so no global `os.name` patch is needed.
+    """
+    captured = []
+
+    class _Stop(Exception):
+        pass
+
+    def spy(argv, **kw):
+        captured.append(kw)
+        raise _Stop
+
+    monkeypatch.setattr(harness_dsh.subprocess, "Popen", spy)
+
+    monkeypatch.setattr(harness_dsh._harness, "_DETACH_CHILDREN", True)
+    with pytest.raises(_Stop):
+        harness_dsh._spawn("pkey", ("k",), {})
+    assert captured[-1].get("start_new_session") is True, captured[-1]
+
+    monkeypatch.setattr(harness_dsh._harness, "_DETACH_CHILDREN", False)
+    with pytest.raises(_Stop):
+        harness_dsh._spawn("pkey", ("k",), {})
+    assert "start_new_session" not in captured[-1], captured[-1]
 
 
 # --- R4-SESS-1: a lost agent context must not be silent ----------------------

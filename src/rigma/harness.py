@@ -589,6 +589,27 @@ def resolve(name: str | None, *, port: int | None = None) -> Harness:
 _ADAPTERS = {DSH: "harness_dsh", MCODE: "harness_mcode"}
 
 
+# POSIX children must be detached so `kill_tree`'s killpg reaches THEIR group,
+# not Rigma's own. A module constant rather than a fresh `os.name` read, so a
+# test can flip the platform decision without patching `os.name` — which
+# `pathlib` reads to choose WindowsPath vs PosixPath, and which would make
+# unrelated code explode on a Windows host.
+_DETACH_CHILDREN = os.name != "nt"
+
+
+def _detached_kwargs() -> dict:
+    """Popen kwargs that put a harness child in its OWN process group on POSIX.
+
+    `kill_tree` reaches a tree with `killpg` on POSIX, so a child left in
+    RIGMA'S own process group would make a stop take the server down with it.
+    Every adapter that can end up in `kill_tree`'s path must spawn detached; this
+    is the same idiom as `tools._launch_killable`. Windows needs nothing here —
+    `tools._kill_tree` uses `taskkill /T` there, and the native job launcher
+    already sets CREATE_NEW_PROCESS_GROUP.
+    """
+    return {"start_new_session": True} if _DETACH_CHILDREN else {}
+
+
 @dataclass(frozen=True)
 class KillResult:
     """What `kill_tree` established, not just what it tried.
