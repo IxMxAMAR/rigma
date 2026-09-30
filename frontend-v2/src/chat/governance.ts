@@ -161,17 +161,36 @@ export function isQuestion(a: GovernanceEvent): boolean {
   return a.requestKind === "question";
 }
 
-/** One field of an elicitation's form, as the schema asked for it. */
+/** One field of an elicitation's form, as the schema asked for it.
+ *
+ *  B4b-schema: `requestedSchema` is JSON Schema, and nothing in the wire
+ *  contract keeps it flat. A property whose `type` is `object` carries its own
+ *  `properties` (and its own `required`), and an `array` carries an `items`
+ *  schema. Before this, both fell to a text box that could not express the
+ *  answer at all: a nested object was submitted as the string "[object Object]"
+ *  and an array could not be built. */
 export interface QuestionField {
   /** The key the answer object must use — the schema's own property name. */
   name: string;
   /** What a human reads: the schema's `title`, or the key. */
   label: string;
-  kind: "text" | "boolean" | "choice";
+  /** `object` and `array` are the nested shapes; the rest are leaves. */
+  kind: "text" | "number" | "boolean" | "choice" | "object" | "array";
   /** The allowed values, when the schema enumerated them. */
   choices: string[];
   required: boolean;
   description: string;
+  /** The schema's own `default`, when it gave one. `hasDefault` is a SEPARATE
+   *  fact because `default: false` and `default: ""` are real pre-fills while an
+   *  absent default must leave the control empty. */
+  hasDefault: boolean;
+  default: unknown;
+  /** `object`: its own properties, with the nested `required` already applied. */
+  fields?: QuestionField[];
+  /** `array`: the element's shape, parsed from `items`. An absent `items` is
+   *  JSON Schema's "any element", read as free text — the same reading an
+   *  untyped property already gets. */
+  items?: QuestionField;
 }
 
 /** The string values a property enumerates, from `enum`, `oneOf` or `anyOf`.
@@ -199,6 +218,65 @@ function schemaChoices(prop: Record<string, unknown>): string[] {
   return out;
 }
 
+/** The element an unconstrained `items` (or an untyped property) gets. */
+function textField(name: string): QuestionField {
+  return {
+    name, label: name, kind: "text", choices: [], required: false,
+    description: "", hasDefault: false, default: undefined,
+  };
+}
+
+/** One property of a schema's `properties`, or null when it is not an object.
+ *
+ *  `required` is the CONTAINING schema's list — a nested object's own `required`
+ *  is applied when its `fields` are parsed, not here. */
+function schemaField(
+  name: string, raw: unknown, required: string[],
+): QuestionField | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const p = raw as Record<string, unknown>;
+  const choices = schemaChoices(p);
+  const type = typeof p.type === "string" ? p.type : "";
+  const field: QuestionField = {
+    name,
+    label: typeof p.title === "string" && p.title !== "" ? p.title : name,
+    kind: "text",
+    choices: [],
+    required: required.includes(name),
+    description: typeof p.description === "string" ? p.description : "",
+    hasDefault: "default" in p,
+    default: p.default,
+  };
+  // A closed set wins over the declared type: a control that silently degrades
+  // to free text would let the user type a value the server refuses.
+  if (choices.length > 0) return { ...field, kind: "choice", choices };
+  if (type === "boolean") return { ...field, kind: "boolean" };
+  // `integer` is a number to a form; the schema's own `multipleOf`/`minimum`
+  // are not enforced here, and refusing to submit a non-numeric string is.
+  if (type === "number" || type === "integer") return { ...field, kind: "number" };
+  if (type === "array") {
+    return { ...field, kind: "array", items: schemaField("", p.items, []) ?? textField("") };
+  }
+  if (type === "object" || (p.properties && typeof p.properties === "object"
+      && !Array.isArray(p.properties))) {
+    return { ...field, kind: "object", fields: schemaFields(p) };
+  }
+  return field;
+}
+
+/** The `properties` of one schema object, in the schema's own order. */
+function schemaFields(s: Record<string, unknown>): QuestionField[] {
+  const props = (s.properties && typeof s.properties === "object"
+    && !Array.isArray(s.properties) ? s.properties : {}) as Record<string, unknown>;
+  const required = Array.isArray(s.required) ? s.required.map((r) => String(r)) : [];
+  const fields: QuestionField[] = [];
+  for (const [name, raw] of Object.entries(props)) {
+    const f = schemaField(name, raw, required);
+    if (f) fields.push(f);
+  }
+  return fields;
+}
+
 /** The form an elicitation's `requestedSchema` describes, or none.
  *
  *  NEVER INVENTS A FIELD. A schema with no `properties` (the server is allowed to
@@ -207,54 +285,205 @@ function schemaChoices(prop: Record<string, unknown>): string[] {
 export function questionFields(schema: unknown): QuestionField[] {
   const s = (schema && typeof schema === "object" && !Array.isArray(schema)
     ? schema : {}) as Record<string, unknown>;
-  const props = (s.properties && typeof s.properties === "object"
-    && !Array.isArray(s.properties) ? s.properties : {}) as Record<string, unknown>;
-  const required = Array.isArray(s.required) ? s.required.map((r) => String(r)) : [];
-  const fields: QuestionField[] = [];
-  for (const [name, raw] of Object.entries(props)) {
-    if (!raw || typeof raw !== "object") continue;
-    const p = raw as Record<string, unknown>;
-    const choices = schemaChoices(p);
-    const type = typeof p.type === "string" ? p.type : "";
-    fields.push({
-      name,
-      label: typeof p.title === "string" && p.title !== "" ? p.title : name,
-      kind: choices.length > 0 ? "choice" : type === "boolean" ? "boolean" : "text",
-      choices,
-      required: required.includes(name),
-      description: typeof p.description === "string" ? p.description : "",
-    });
-  }
-  return fields;
+  return schemaFields(s);
 }
 
-/** The answer object for `/approval`, built from what the user filled in.
+/** A value the form holds for one field: a leaf, or a nested container for an
+ *  `object`/`array` field. The shape mirrors the answer object's. */
+export type QuestionInput =
+  | string
+  | boolean
+  | QuestionInput[]
+  | { [k: string]: QuestionInput };
+
+/** The form's values, keyed by the top-level schema property names. */
+export type QuestionValues = Record<string, QuestionInput>;
+
+/** The form value a schema `default` should pre-fill, or undefined to leave the
+ *  control empty. A default whose type does not match the field is IGNORED
+ *  rather than coerced: a checkbox cannot be "true" because a string said so.
  *
- *  Keys are the schema's own property names; a blank optional field is ABSENT
- *  rather than `""`, so mcode can tell "not answered" from "answered with
- *  nothing". A boolean is always present: a checkbox is a definite answer, and
- *  `false` is one. */
-export function questionAnswer(
-  fields: QuestionField[], values: Record<string, string | boolean>,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+ *  An `object` recurses even when it has NO default of its own, because a nested
+ *  property may carry one — a parent default is not required for a child to
+ *  pre-fill. */
+function defaultFor(f: QuestionField, raw: unknown): QuestionInput | undefined {
+  if (raw === null) return undefined;
+  switch (f.kind) {
+    case "boolean":
+      return typeof raw === "boolean" ? raw : undefined;
+    case "number":
+      return typeof raw === "number" || typeof raw === "string" ? String(raw) : undefined;
+    case "choice":
+    case "text":
+      return typeof raw === "string" ? raw
+        : typeof raw === "number" ? String(raw) : undefined;
+    case "object": {
+      if (raw !== undefined && (typeof raw !== "object" || Array.isArray(raw))) {
+        return undefined;
+      }
+      const src = (raw !== undefined ? raw : {}) as Record<string, unknown>;
+      const out = defaultsFrom(f.fields ?? [], src);
+      return Object.keys(out).length > 0 ? out : undefined;
+    }
+    case "array": {
+      if (!Array.isArray(raw) || !f.items) return undefined;
+      const out: QuestionInput[] = [];
+      for (const e of raw) {
+        const v = defaultFor(f.items, e);
+        if (v !== undefined) out.push(v);
+      }
+      return out;
+    }
+  }
+}
+
+/** Pre-fill every field that names a default, from `src` when the parent's own
+ *  default object supplies a value and from the field's `default` otherwise. */
+function defaultsFrom(
+  fields: QuestionField[], src: Record<string, unknown>,
+): QuestionValues {
+  const out: QuestionValues = {};
   for (const f of fields) {
-    const v = values[f.name];
-    if (f.kind === "boolean") out[f.name] = v === true;
-    else if (typeof v === "string" && v.trim() !== "") out[f.name] = v.trim();
+    const raw = src[f.name] !== undefined ? src[f.name]
+      : f.hasDefault ? f.default : undefined;
+    const v = defaultFor(f, raw);
+    if (v !== undefined) out[f.name] = v;
   }
   return out;
 }
 
+/** The form's starting values: the schema's own `default`s, so a question that
+ *  names one can be answered by pressing send. */
+export function questionDefaults(fields: QuestionField[]): QuestionValues {
+  return defaultsFrom(fields, {});
+}
+
+/** One field's answer value, or undefined when it has none to contribute. */
+function answerFor(f: QuestionField, raw: QuestionInput | undefined): unknown {
+  switch (f.kind) {
+    case "boolean":
+      // Always present: a checkbox is a definite answer, and `false` is one.
+      return raw === true;
+    case "number": {
+      if (typeof raw !== "string" || raw.trim() === "") return undefined;
+      const n = Number(raw.trim());
+      // A non-numeric string would be refused by mcode against its own schema,
+      // so it is never sent; `questionProblem` blocks the submit first.
+      return Number.isFinite(n) ? n : undefined;
+    }
+    case "choice":
+    case "text":
+      return typeof raw === "string" && raw.trim() !== "" ? raw.trim() : undefined;
+    case "object": {
+      const src = (raw && typeof raw === "object" && !Array.isArray(raw)
+        ? raw : {}) as QuestionValues;
+      const out = answerObject(f.fields ?? [], src);
+      // An object with nothing in it is ABSENT, not `{}`: the same "no blank
+      // keys" rule the flat form already used.
+      return Object.keys(out).length > 0 ? out : undefined;
+    }
+    case "array": {
+      if (!Array.isArray(raw) || !f.items) return undefined;
+      const out: unknown[] = [];
+      for (const e of raw) {
+        const v = answerFor(f.items, e);
+        // A row that expresses nothing is dropped rather than sent as null —
+        // which is why an untouched trailing row is not an element.
+        if (v !== undefined) out.push(v);
+      }
+      return out.length > 0 ? out : undefined;
+    }
+  }
+}
+
+function answerObject(
+  fields: QuestionField[], values: QuestionValues,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const f of fields) {
+    const v = answerFor(f, values[f.name]);
+    if (v !== undefined) out[f.name] = v;
+  }
+  return out;
+}
+
+/** The answer object for `/approval`, built from what the user filled in.
+ *
+ *  Keys are the schema's own property names — nested ones included, so the
+ *  object mirrors the schema rather than flattening it. A blank optional field is
+ *  ABSENT rather than `""`, so mcode can tell "not answered" from "answered with
+ *  nothing". */
+export function questionAnswer(
+  fields: QuestionField[], values: QuestionValues,
+): Record<string, unknown> {
+  return answerObject(fields, values);
+}
+
+/** The first thing stopping submit, in words, or "" when the form is ready.
+ *
+ *  A sentence rather than a boolean so the form can say WHY. "fill the required
+ *  fields first" is wrong for a number that will not parse, and a silent
+ *  disabled button on a question with a 5-second life is a dead end. */
+function problemFor(f: QuestionField, raw: QuestionInput | undefined): string {
+  if (f.kind === "boolean") return "";
+  if (f.kind === "object") {
+    const src = (raw && typeof raw === "object" && !Array.isArray(raw)
+      ? raw : {}) as QuestionValues;
+    for (const sub of f.fields ?? []) {
+      const p = problemFor(sub, src[sub.name]);
+      if (p) return p;
+    }
+    return "";
+  }
+  if (f.kind === "array") {
+    const rows = Array.isArray(raw) ? raw : [];
+    // A required array needs at least one row; an optional one may be absent.
+    if (rows.length === 0) return f.required ? `“${f.label}” is required` : "";
+    for (const e of rows) {
+      const p = f.items ? problemFor(f.items, e) : "";
+      if (p) return p;
+    }
+    return "";
+  }
+  const s = typeof raw === "string" ? raw.trim() : "";
+  if (s === "") return f.required ? `“${f.label}” is required` : "";
+  if (f.kind === "number" && !Number.isFinite(Number(s))) {
+    return `“${f.label}” must be a number`;
+  }
+  return "";
+}
+
+/** The first problem, in words, or "" when every field is answerable. */
+export function questionProblem(
+  fields: QuestionField[], values: QuestionValues,
+): string {
+  for (const f of fields) {
+    const p = problemFor(f, values[f.name]);
+    if (p) return p;
+  }
+  return "";
+}
+
 /** Whether every required field has an answer. Optional fields never block. */
 export function questionReady(
-  fields: QuestionField[], values: Record<string, string | boolean>,
+  fields: QuestionField[], values: QuestionValues,
 ): boolean {
-  return fields.every((f) => {
-    if (f.kind === "boolean" || !f.required) return true;
-    const v = values[f.name];
-    return typeof v === "string" && v.trim() !== "";
-  });
+  return questionProblem(fields, values) === "";
+}
+
+/** What to say when the approval route refuses an answer with 409.
+ *
+ *  The route's own sentence — "that request is no longer the one being waited
+ *  on" — describes the wire, not what happened to the question. A 409 is the
+ *  server saying it is not waiting on this request any more: the window closed,
+ *  or it was already answered. Until an expiry EVENT arrives it is the only
+ *  signal the client gets, so it must read as the expired state rather than as a
+ *  network error. */
+export function questionRefusal(message: string, status?: number): string {
+  if (status === 409) {
+    return "this question is no longer available — it expired or was already answered";
+  }
+  return message;
 }
 
 /** `allowed-once` reads as permission granted; the other three do not. */export function outcomeTone(outcome: string): string {

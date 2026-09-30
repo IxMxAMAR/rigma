@@ -223,9 +223,20 @@ async function j<T>(method: string, path: string, body?: unknown): Promise<T> {
   });
   if (!r.ok) {
     const e = (await r.json().catch(() => ({}))) as { error?: string };
-    throw new Error(e.error ?? `server replied ${r.status}`);
+    const err = new Error(e.error ?? `server replied ${r.status}`) as Error
+      & { status?: number };
+    // The STATUS travels with the message because some refusals mean something
+    // the sentence does not say: a 409 from `/approval` is the server stating it
+    // is no longer waiting on the request, which is a state, not a failure.
+    err.status = r.status;
+    throw err;
   }
   return r.json() as Promise<T>;
+}
+
+/** The HTTP status behind a failed `j()` call, when it carried one. */
+export function apiStatus(e: unknown): number | undefined {
+  return (e as { status?: number } | null)?.status;
 }
 
 export const api = {

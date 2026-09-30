@@ -1,14 +1,14 @@
 // Transcript: persisted messages + the live streaming turn. Thinking blocks
 // collapse once the reply starts; chips expand to show their result.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type ChatMessage } from "../lib/api";
+import { api, apiStatus, type ChatMessage } from "../lib/api";
 import Markdown from "./Markdown";
 import {
   errText, selectStreaming, useChat, type Chip, type Source, type StreamingTurn,
 } from "./chatStore";
 import { formatArgs, previewArgs } from "./toolChip";
 import AgentState from "./AgentState";
-import { EMPTY_GOVERNANCE } from "./governance";
+import { EMPTY_GOVERNANCE, questionRefusal } from "./governance";
 import { normaliseGoal } from "./goal";
 import { compactionLine, running } from "./compaction";
 import { retryLine } from "./retry";
@@ -305,7 +305,18 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
       await api.answerApproval(sid, answer !== undefined
         ? { requestId, answer } : { allow, requestId });
     } catch (e) {
-      useChat.setState({ lastError: errText(e) });
+      const status = apiStatus(e);
+      // B4b/OD-12: a 409 on a QUESTION is the server saying it is no longer
+      // waiting on it — the window closed, or it was already answered. Fold the
+      // row terminal (the same state an expiry event produces) so the dead form
+      // stops being clickable, and say so rather than repeating the wire's own
+      // sentence. A permission's error handling is untouched.
+      if (answer !== undefined && status === 409) {
+        useChat.getState().expireQuestion(requestId);
+        useChat.setState({ lastError: questionRefusal(errText(e), status) });
+      } else {
+        useChat.setState({ lastError: errText(e) });
+      }
     }
   }, []);
 
