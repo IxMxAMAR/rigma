@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   COMMANDS,
+  commandPrompt,
   commandQuery,
   helpText,
   isPermissionMode,
@@ -241,5 +242,27 @@ describe("R6-ACP-REACH: permissionTrap", () => {
     // An unknown value must not be read as `exec`, or a future transport would inherit
     // a warning that may not apply to it.
     expect(permissionTrap("mcode", "smart", "something-new")).toBe("");
+  });
+});
+
+// B6c. `acp_commands` was a dead menu: the backend advertised commands and the
+// panel drew `/name description` with no way to invoke one. The invocation is a
+// prompt, so the exact text sent is the whole decision and it is pinned here.
+describe("commandPrompt", () => {
+  it("sends the advertised name as a slash command", () => {
+    expect(commandPrompt("compact")).toBe("/compact");
+    expect(commandPrompt("review")).toBe("/review");
+  });
+
+  it("uses the name VERBATIM, because it came from the server", () => {
+    // A second vocabulary here would be a second thing to keep in step with
+    // mcode's advertised list.
+    expect(commandPrompt("mcode/foo")).toBe("/mcode/foo");
+  });
+
+  it("produces a bare slash for an empty name, which is why the caller refuses it", () => {
+    // The button is not drawn for a nameless command (see AgentState.test.tsx);
+    // this pins the value so the guard cannot be mistaken for dead code.
+    expect(commandPrompt("")).toBe("/");
   });
 });

@@ -53,6 +53,23 @@ export const COMMANDS: SlashCommand[] = [
   { name: "help", summary: "list these commands", takesArgs: false },
 ];
 
+/** B6c: what to send to RUN a command the BACKEND advertised.
+ *
+ *  ACP's `available_commands_update` names commands mcode itself resolves, and
+ *  the invocation is a `session/prompt` whose text is the command. Rigma's
+ *  composer cannot be the path: `parseSlash` above knows only Rigma's own
+ *  roster, so an advertised name that collides with one of them (`/compact` is
+ *  the real case — mcode advertises its own) would be intercepted and Rigma's
+ *  compaction would run instead of the backend's command. The caller therefore
+ *  hands this string straight to `send()`, which bypasses the parser by design.
+ *
+ *  Pure, so the one decision here — the exact text sent — is testable without a
+ *  renderer or a store. The name is used verbatim: it came from the server, and
+ *  a second vocabulary invented here is a second thing to keep in step. */
+export function commandPrompt(name: string): string {
+  return `/${name}`;
+}
+
 /** `{name, args}` for a line that IS a command, else null.
  *
  *  Deliberately strict, and the strictness is the feature. DSH's own regex is

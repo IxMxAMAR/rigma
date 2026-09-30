@@ -51,3 +51,55 @@ describe("the usage panel renders what a turn cost", () => {
     expect(markup).not.toContain("free");
   });
 });
+
+// B6c. `acp_commands` was a dead menu: the backend advertised commands and the
+// panel drew `/name description` with no control, so a capability mcode had
+// announced could not be invoked from the UI at all. The list must stay
+// information on a durable turn, which has no live session to send a prompt to.
+function renderCommands(onRunCommand?: (name: string) => void): string {
+  return renderToStaticMarkup(
+    <AgentState
+      goal={null}
+      todos={[]}
+      planMode={false}
+      subagents={[]}
+      usage={null}
+      governance={EMPTY_GOVERNANCE}
+      acpCommands={[{ name: "compact", description: "summarise the session" }]}
+      onRunCommand={onRunCommand}
+    />,
+  ).replace(/<!-- -->/g, "");
+}
+
+describe("an advertised ACP command", () => {
+  it("is a button that runs it when the live turn supplies a handler", () => {
+    const markup = renderCommands(() => {});
+    expect(markup).toContain("<button");
+    expect(markup).toContain("/compact");
+    expect(markup).toContain("run /compact on the backend");
+  });
+
+  it("stays plain text on a turn that cannot run it", () => {
+    const markup = renderCommands(undefined);
+    expect(markup).toContain("/compact");
+    expect(markup).not.toContain("<button");
+  });
+
+  it("draws no button for a command the server sent without a name", () => {
+    // The only thing a nameless command could send is a bare "/".
+    const markup = renderToStaticMarkup(
+      <AgentState
+        goal={null}
+        todos={[]}
+        planMode={false}
+        subagents={[]}
+        usage={null}
+        governance={EMPTY_GOVERNANCE}
+        acpCommands={[{ description: "no name at all" }]}
+        onRunCommand={() => {}}
+      />,
+    );
+    expect(markup).toContain("no name at all");
+    expect(markup).not.toContain("<button");
+  });
+});
