@@ -12,6 +12,12 @@ import ModelsSurface from "./ModelsSurface";
 // up, and the page must ask BEFORE it switches — the engine starts on the
 // resolver's guess otherwise, which is the state D2 exists to remove.
 //
+// There are TWO trigger sites and both must be pinned: the card's own `run`
+// (which switches the model, no quant) and the per-quant `load` on a row
+// (`ModelsSurface.tsx` `QuantLine`, which switches that exact quant). The wave-4
+// verifier found only the first one tested — disabling the row's check left the
+// suite green.
+//
 // The negative half matters just as much: a model that is not a first load must
 // switch immediately, with no extra prompt in the way.
 
@@ -89,6 +95,22 @@ describe("the first-load trigger", () => {
     });
   }
 
+  /** The row's own `load` — a different button from the card's `run`, and the
+   *  second place `first_load` gates the switch. */
+  async function clickLoad() {
+    await act(async () => {
+      root.render(<ModelsSurface />);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const load = [...container.querySelectorAll("button")]
+      .find((b) => b.textContent === "load");
+    expect(load, "no per-quant load button").not.toBeUndefined();
+    await act(async () => {
+      load!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
   it("asks before a first load instead of switching straight away", async () => {
     serve(true);
     await clickRun();
@@ -114,5 +136,32 @@ describe("the first-load trigger", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(switches).toEqual([{ model: "m" }]);
+  });
+
+  it("asks before a per-quant load too, not only before the card's run", async () => {
+    serve(true);
+    await clickLoad();
+    expect(container.textContent).toContain("First load of m");
+    expect(switches).toEqual([]);          // the row did not switch behind the dialog
+  });
+
+  it("switches straight to that quant when it is not a first load", async () => {
+    serve(false);
+    await clickLoad();
+    expect(container.textContent).not.toContain("First load of m");
+    expect(switches).toEqual([{ model: "m", quant: "q4_0" }]);
+  });
+
+  it("loads the quant when the per-quant dialog is dismissed with 'not now'", async () => {
+    serve(true);
+    await clickLoad();
+    const skip = [...container.querySelectorAll("button")]
+      .find((b) => b.textContent === "not now");
+    expect(skip).not.toBeUndefined();
+    await act(async () => {
+      skip!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(switches).toEqual([{ model: "m", quant: "q4_0" }]);
   });
 });
