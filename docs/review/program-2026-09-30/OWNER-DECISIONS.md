@@ -362,3 +362,30 @@ an existing route, and "I can see it but cannot stop it" is the kind of gap the 
 covered. Otherwise option 2 with the gap recorded.
 
 **If nothing is decided:** the turn runs to completion and the tab only observes it.
+
+---
+
+## OD-14 — `taskkill /T` walks reused parent pids; the real fix is a Job Object per harness child (DR9)
+
+**State today:** on Windows, killing a harness process tree uses `taskkill /T` (`tools.py:4321`), which
+walks `ParentProcessId` links. Rigma's own server is spawned **detached** by a CLI process that then
+exits (`cli._spawn_detached`), so the server's recorded parent pid is free for reuse. If a harness
+descendant is assigned that pid, `taskkill /T` could treat the server (and `llama-server` under it) as
+part of the tree. The **root** pid is safe — the `Popen` handle pins it.
+
+**Options**
+
+1. **A Windows Job Object per harness child** (`CreateJobObject` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`,
+   assign the child, terminate the job instead of walking pids). This is the correct fix: it is immune
+   to pid reuse because the kernel tracks the members, not the links. **Cost:** real Windows API work
+   (`ctypes`), a new failure surface on a path that currently works, and it cannot be exercised
+   meaningfully on a non-Windows CI. It is a contained module plus tests against the API surface.
+2. **Leave it.** The scenario needs a pid to be reused *and* assigned to a harness descendant inside a
+   narrow window. It is a plausible-but-unwitnessed hazard, and the guard that refuses to signal
+   Rigma's own process group (B1) already covers the POSIX half.
+
+**Recommendation: option 2 for now, option 1 as a scoped item of its own.** It is design work, not a
+one-liner, and the current behaviour is the status quo the owner has been running. Recording it here
+is the point: the next session should not rediscover it as a mystery.
+
+**If nothing is decided:** `taskkill /T` keeps walking parent links. No observed incident.
