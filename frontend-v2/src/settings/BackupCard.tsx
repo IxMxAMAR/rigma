@@ -133,7 +133,10 @@ export default function BackupCard() {
       </h3>
       <p className="text-[13px] text-secondary mb-3">
         One versioned JSON file with your settings, your methods and memory —
-        for moving to another machine, or for getting back to a known state.
+        for moving to another machine. Restoring replaces memory, but MERGES
+        settings and methods: the file's keys and methods are written over the
+        stored ones and everything else is kept, so a restore does not
+        reproduce the file's state exactly.
       </p>
       <div className="flex items-center gap-2 flex-wrap">
         <a
