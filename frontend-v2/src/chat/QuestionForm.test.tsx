@@ -81,6 +81,27 @@ function nestedGov(): Governance {
   });
 }
 
+/** B4b-schema: a required array whose only row is blank. Before the fix this
+ *  reported READY and POSTed `{answer: {}}` — the required key dropped. */
+function requiredArrayGov(): Governance {
+  return foldApproval(EMPTY_GOVERNANCE, {
+    event: "approval/asked",
+    data: {
+      id: "q-tags",
+      kind: "question",
+      question: "Which tags?",
+      schema: {
+        type: "object",
+        required: ["tags"],
+        properties: {
+          tags: { type: "array", title: "Tags", items: { type: "string" } },
+        },
+      },
+      awaiting: true,
+    },
+  });
+}
+
 describe("an elicitation the turn is blocked on", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -281,6 +302,34 @@ describe("an elicitation the turn is blocked on", () => {
       config: { level: 3, enabled: false },
       tags: ["alpha"],
     });
+  });
+
+  it("will not submit a required array whose only row is blank (B4b-schema)", async () => {
+    // The verifier of 873b90c's finding: this shape used to be READY and POST
+    // `{requestId, answer: {}}`, dropping a property the schema marks required.
+    // The form must now say WHY, and the answer after filling the row must
+    // carry the key.
+    const onAnswer = vi.fn();
+    await mount(requiredArrayGov(), onAnswer);
+    await act(async () => {
+      byLabel<HTMLButtonElement>("add Tags").click();
+    });
+    expect(sendButton().disabled).toBe(true);
+    expect(container.textContent).toContain("“Tags” is required");
+    await act(async () => {
+      sendButton().click();
+    });
+    expect(onAnswer).not.toHaveBeenCalled();
+
+    await type(byLabel<HTMLInputElement>("Tags 1"), "alpha");
+    expect(sendButton().disabled).toBe(false);
+    await act(async () => {
+      sendButton().click();
+    });
+    const [id, allow, answer] = onAnswer.mock.calls[0];
+    expect(JSON.stringify({ requestId: id, answer }))
+      .toBe('{"requestId":"q-tags","answer":{"tags":["alpha"]}}');
+    expect(allow).toBe(false);
   });
 
   it("offers no control at all once the question has expired (OD-12)", async () => {

@@ -423,7 +423,11 @@ export function questionAnswer(
  *
  *  A sentence rather than a boolean so the form can say WHY. "fill the required
  *  fields first" is wrong for a number that will not parse, and a silent
- *  disabled button on a question with a 5-second life is a dead end. */
+ *  disabled button on a question with a 5-second life is a dead end.
+ *
+ *  It is the ONE judge of readiness, and it must never pass a form whose answer
+ *  would omit a `required` property. `answerFor` decides presence, so the
+ *  container guards below ask IT rather than restating its emptiness rule. */
 function problemFor(f: QuestionField, raw: QuestionInput | undefined): string {
   if (f.kind === "boolean") return "";
   if (f.kind === "object") {
@@ -432,6 +436,15 @@ function problemFor(f: QuestionField, raw: QuestionInput | undefined): string {
     for (const sub of f.fields ?? []) {
       const p = problemFor(sub, src[sub.name]);
       if (p) return p;
+    }
+    // B4b-schema. `answerFor` DROPS a container holding nothing that survives it:
+    // an object whose children are all optional and untouched is ABSENT, not
+    // `{}`. A schema that marks such an object `required` therefore has to block
+    // HERE, or the form reports ready and the wire answer omits a required key.
+    // The test is `answerFor` itself rather than a second copy of its rule, so
+    // the two can never disagree again.
+    if (f.required && answerFor(f, raw) === undefined) {
+      return `“${f.label}” is required`;
     }
     return "";
   }
@@ -442,6 +455,12 @@ function problemFor(f: QuestionField, raw: QuestionInput | undefined): string {
     for (const e of rows) {
       const p = f.items ? problemFor(f.items, e) : "";
       if (p) return p;
+    }
+    // A row that expresses nothing is dropped by `answerFor`, so an all-blank
+    // required array would be omitted from the answer entirely. Same guard as
+    // the object case, and for the same reason.
+    if (f.required && answerFor(f, raw) === undefined) {
+      return `“${f.label}” is required`;
     }
     return "";
   }
