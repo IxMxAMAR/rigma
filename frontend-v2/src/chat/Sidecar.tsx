@@ -8,6 +8,7 @@ import ControlPanel from "./ControlPanel";
 import HarnessFacts from "./HarnessFacts";
 import {
   createDraft,
+  deleteMethod,
   exportUrl,
   importMethod,
   listMethods,
@@ -1084,7 +1085,11 @@ export function SamplingCard() {
 // One-click workflow setups: prompt + sampler profile + effort + tool
 // posture + a Notes template + the how-to guide, per activity. The method
 // knowledge lives in the product, not in the user's memory.
-function MethodCard({ onApplied }: { onApplied?: () => void }) {
+//
+// Exported for its own test: the D4d delete control is a render line that no
+// static render can reach (the method list arrives over fetch and the delete
+// button only exists once a row is expanded).
+export function MethodCard({ onApplied }: { onApplied?: () => void }) {
   const currentId = useChat((s) => s.currentId);
   const open = useChat((s) => s.open);
   const loadSessions = useChat((s) => s.loadSessions);
@@ -1162,6 +1167,22 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
       setActive(id);
       setApplied(id);
       onApplied?.();
+    } catch (e) {
+      setImportError((e as Error).message);
+    }
+  };
+
+  /** D4d: delete one of the user's own methods. Built-ins have no button at
+   *  all, so the route's "built-in methods cannot be deleted" sentence is a
+   *  backstop rather than the expected path — and when it does arrive (a
+   *  renamed built-in, a stale list) it is shown verbatim. */
+  const remove = async (m: Method) => {
+    if (!window.confirm(`Delete the method “${m.name}”? This cannot be undone.`))
+      return;
+    setImportError("");
+    try {
+      await deleteMethod(m.id);
+      setMethods(await listMethods());
     } catch (e) {
       setImportError((e as Error).message);
     }
@@ -1254,6 +1275,17 @@ function MethodCard({ onApplied }: { onApplied?: () => void }) {
                     >
                       Export
                     </a>
+                    {!m.builtin && (
+                      <button
+                        type="button"
+                        onClick={() => void remove(m)}
+                        title="delete this method from your library"
+                        aria-label={`delete method ${m.name}`}
+                        className="rounded-md bg-surface hover:bg-float text-muted hover:text-red px-2.5 py-1 text-[12px]"
+                      >
+                        Delete
+                      </button>
+                    )}
                   </div>
                   {/* what the method actually CONTAINS — running its macros
                       belongs to the strip above the composer, not here */}

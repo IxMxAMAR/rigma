@@ -1,6 +1,7 @@
 // Methods: the catalog, macro preview, and the macro run stream. Types live
 // here rather than beside one consumer because the Sidecar, the MacroStrip
 // and the store all need them.
+import { responseError } from "./listFetch";
 import { makeSseParser, type SseEvent } from "./sse";
 
 export interface MacroDef {
@@ -74,6 +75,19 @@ export async function importMethod(doc: unknown): Promise<Method> {
 
 export function exportUrl(mid: string): string {
   return `/api/methods/${mid}/export`;
+}
+
+/** D4d: delete one of the user's own methods.
+ *
+ *  Built-ins cannot be deleted; the route answers 400 with its own sentence
+ *  ("save a user method with the same id to override it instead"), which is
+ *  thrown verbatim rather than replaced. The catalog GET already carries every
+ *  method's full body, so `GET /api/methods/{mid}` has no separate UI; and
+ *  `POST /api/methods` is redundant with draft→promote, so it has none either. */
+export async function deleteMethod(mid: string): Promise<void> {
+  const r = await fetch(`/api/methods/${encodeURIComponent(mid)}`,
+                        { method: "DELETE" });
+  if (!r.ok) throw new Error(await responseError(r));
 }
 
 export async function createDraft(): Promise<
