@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import EmptyState from "../EmptyState";
 import LoadError from "../LoadError";
 import InlineError from "../InlineError";
+import AppSettingsCard from "./AppSettingsCard";
 import { engineApi } from "../lib/engineApi";
 import { readList, responseError } from "../lib/listFetch";
 import { openaiBase } from "../lib/openaiBase";
@@ -69,6 +70,10 @@ export default function SettingsSurface() {
   return (
     <main className="flex-1 overflow-y-auto p-6">
       <div className="max-w-[640px] mx-auto flex flex-col gap-4">
+        {/* D4a: `/api/settings` had no UI anywhere — this is the app's OWN
+            settings, so they belong on this page rather than in a chat's ⚙
+            panel or a model's card. */}
+        <AppSettingsCard />
         <section className="rounded-lg bg-panel p-4">
           <h3 className="font-mono text-[11px] text-muted uppercase tracking-[0.08em] mb-3">
             presets
