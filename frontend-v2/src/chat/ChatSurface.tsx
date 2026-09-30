@@ -22,7 +22,10 @@ import {
 } from "./commands";
 import { isSendKey, isStopKey, isTypingTarget } from "./keyboard";
 
-function SessionRail() {
+/** D3b: exported so a render test can reach the per-chat liveness dot. The wave-2
+ *  verifier's lesson (W5F1a) is that a small render line inside an unexported
+ *  component can be deleted with the whole suite green. */
+export function SessionRail() {
   const sessions = useChat((s) => s.sessions);
   const currentId = useChat((s) => s.currentId);
   const open = useChat((s) => s.open);
@@ -100,6 +103,16 @@ function SessionRail() {
               <span role="img" aria-label={`unsent draft in ${s.title}`}
                     title="unsent draft"
                     className="shrink-0 pr-1 text-amber">•</span>
+            ) : null}
+            {/* D3b: the server is still generating in this chat. Without it a
+                reloaded rail showed a mid-turn chat as idle — the transcript's
+                `partial` message was the only clue, and it reads as "interrupted".
+                A dot rather than a word, like the draft marker: it is state, not
+                an action. */}
+            {s.streaming ? (
+              <span role="img" aria-label={`generating in ${s.title}`}
+                    title="still generating on the server"
+                    className="shrink-0 pr-1 text-moss">●</span>
             ) : null}
             {/* Always rendered, not `hidden group-hover:flex`: a display:none
                 control is outside the tab order, so export/duplicate/delete

@@ -15,6 +15,7 @@ import { retryLine } from "./retry";
 import { argHint, delegateSentence, summariseDelegate } from "./delegate";
 import { chipOutcome } from "./toolChip";
 import { commandPrompt } from "./commands";
+import { liveTail } from "./reattach";
 
 // How each outcome is drawn. `unknown` is deliberately NOT moss — see
 // `chipOutcome` in toolChip.ts for why an unreported result is not a success.
@@ -106,7 +107,7 @@ function Thinking({ text, live }: { text: string; live: boolean }) {
   );
 }
 
-function Bubble({ m }: { m: ChatMessage }) {
+function Bubble({ m, tailNotice }: { m: ChatMessage; tailNotice?: string }) {
   const isUser = m.role === "user";
   const text =
     typeof m.content === "string"
@@ -199,9 +200,17 @@ function Bubble({ m }: { m: ChatMessage }) {
             <HarnessBadge name={m.harness} label={m.harness_label} />
           </div>
         )}
-        {m.notice && (
-          <p className="text-[12px] italic text-muted mt-1.5">{m.notice}</p>
-        )}
+        {/* D3b: the tail of a reloaded transcript may be a mid-turn CHECKPOINT,
+            and the server's own notice on it says "interrupted". While the
+            session is still `streaming` that sentence is false, so the tail's
+            sentence is passed in. `undefined` (not "") leaves an ordinary
+            message's notice exactly as the server wrote it. */}
+        {(() => {
+          const notice = tailNotice !== undefined ? tailNotice : m.notice;
+          return notice ? (
+            <p className="text-[12px] italic text-muted mt-1.5">{notice}</p>
+          ) : null;
+        })()}
       </div>
     </div>
   );
@@ -539,6 +548,10 @@ const WINDOW = 150;
 export default function Transcript() {
   const messages = useChat((s) => s.messages);
   const streaming = useChat(selectStreaming);
+  // D3b: is the SERVER still generating this chat? Not `streaming`, which only
+  // knows about turns this tab started — that is the whole defect.
+  const remote = useChat((s) =>
+    s.currentId ? s.remoteStreaming[s.currentId] === true : false);
   const currentId = useChat((s) => s.currentId);
   const lastError = useChat((s) => s.lastError);
   const clearError = useChat((s) => s.clearError);
@@ -546,6 +559,23 @@ export default function Transcript() {
   useEffect(() => setShown(WINDOW), [currentId]);
   const endRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+
+  // D3b: while the server is generating, re-read the transcript on a bounded
+  // timer so the reloaded chat catches each 20 s checkpoint and stops the moment
+  // the turn ends. The interval is shorter than `CHECKPOINT_SECS` so a finished
+  // turn is noticed within one checkpoint, and it is torn down on a chat switch
+  // or unmount — a poll that outlived the chat on screen would write another
+  // chat's messages (the ownership guard in `refreshRemote` also refuses).
+  useEffect(() => {
+    if (!currentId || !remote) return;
+    const t = setInterval(() => {
+      void useChat.getState().refreshRemote(currentId);
+    }, 10000);
+    return () => clearInterval(t);
+  }, [currentId, remote]);
+
+  // The sentence for the tail, and whether the chat is live. See `reattach.ts`.
+  const tail = liveTail(messages, remote);
 
   // R5-PERSIST: the stored durable state for the chat on screen. Read here rather
   // than passed down so the panel and the transcript cannot disagree about which
@@ -604,9 +634,14 @@ export default function Transcript() {
           if (m.kind === "tool_result") return null;
           const isLastAssistant =
             abs === messages.length - 1 && m.role === "assistant";
+          // D3b: only the tail checkpoint gets the liveness sentence. `undefined`
+          // for every other message keeps its own notice untouched.
+          const tailNotice =
+            abs === messages.length - 1 && m.partial === true
+              ? tail.text : undefined;
           return (
             <div key={abs} className="group/msg">
-              <Bubble m={m} />
+              <Bubble m={m} tailNotice={tailNotice} />
               {isLastAssistant && !streaming && <MessageActions m={m} />}
             </div>
           );

@@ -732,6 +732,13 @@ export interface ChatState {
   /** One controller per in-flight turn: Stop must cancel the chat on screen,
    *  not whichever turn happened to start last. */
   aborts: Record<string, AbortController>;
+  /** D3b: whether the SERVER is generating in this chat, per session.
+   *
+   *  `streams` only knows about turns THIS tab started. A reload (or a second
+   *  tab) saw a mid-turn chat as idle and read its `partial` message as an
+   *  interruption. Written from the session payload's `streaming` flag on open
+   *  and by `refreshRemote` while it is true. */
+  remoteStreaming: Record<string, boolean>;
   /** The take a regenerate set aside, per session — it is folded back in when
    *  THAT session's turn returns, however many chats later. */
   pendingVariants: Record<string, { content: unknown; variants: unknown[] }>;
@@ -785,6 +792,14 @@ export interface ChatState {
   savedAgent: Record<string, SavedAgentState>;
 
   loadSessions: () => Promise<void>;
+
+  /** D3b: re-read the open chat's transcript and its `streaming` flag.
+   *
+   *  The server rewrites its `partial` message in place every `CHECKPOINT_SECS`
+   *  (20 s) and drops it when the turn ends, so a reloaded chat that is still
+   *  generating needs a bounded poll to catch up. Returns without touching state
+   *  for a chat that is no longer on screen. */
+  refreshRemote: (id: string) => Promise<void>;
   search: (q: string) => Promise<void>;
   open: (id: string) => Promise<void>;
   newChat: () => Promise<void>;
@@ -892,12 +907,39 @@ export const useChat = create<ChatState>((set, get) => ({
   permission: "full",
   mcodeTransport: "exec",
   savedAgent: {},
+  remoteStreaming: {},
 
   loadSessions: async () => {
     try {
-      set({ sessions: await api.listSessions() });
+      const rows = await api.listSessions();
+      // D3b: keep the open chat's flag in step with the same payload the rail
+      // draws. The rail reads `sessions[].streaming` directly, but the transcript
+      // reads this map, and two sources for one fact must not disagree.
+      const cur = get().currentId;
+      set((st) => ({
+        sessions: rows,
+        ...(cur && rows.some((r) => r.id === cur)
+          ? { remoteStreaming: { ...st.remoteStreaming,
+                                 [cur]: rows.find((r) => r.id === cur)?.streaming === true } }
+          : {}),
+      }));
     } catch (e) {
       set({ lastError: errText(e) });
+    }
+  },
+
+  refreshRemote: async (id) => {
+    try {
+      const s = await api.getSession(id);
+      // Ownership guard, the same one every terminal write follows (AUDIT F1):
+      // a transcript that arrived while the user moved on must not paint the
+      // chat now on screen.
+      set((st) => ({
+        remoteStreaming: { ...st.remoteStreaming, [id]: s.streaming === true },
+        ...(st.currentId === id ? { messages: s.messages } : {}),
+      }));
+    } catch {
+      // A poll that failed is not worth a banner; the next tick retries.
     }
   },
 
@@ -932,6 +974,8 @@ export const useChat = create<ChatState>((set, get) => ({
       streams: without(st.streams, id),
       aborts: without(st.aborts, id),
       pendingVariants: without(st.pendingVariants, id),
+      // D3b: the chat is gone, so its liveness flag must not outlive it.
+      remoteStreaming: without(st.remoteStreaming, id),
       // the draft was typed for a chat that is about to stop existing
       drafts: without(st.drafts, id),
       // R5-PERSIST: and so was the agent state. Same reason as the draft — every
@@ -975,6 +1019,8 @@ export const useChat = create<ChatState>((set, get) => ({
             harness: s.harness ?? "native",
         permission: s.permission ?? "full", mcodeTransport: s.mcode_transport ?? "exec", lastError: null,
         notice: null,
+        // D3b: the reload's own answer to "is this chat still generating?".
+        remoteStreaming: { ...get().remoteStreaming, [id]: s.streaming === true },
         // R5-PERSIST: the agent's durable state comes back with the chat, so the
         // panel survives a reload. Replaced rather than merged — this is the
         // server's authoritative copy for THIS chat, and a stale local fragment
