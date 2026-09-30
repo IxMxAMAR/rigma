@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import subprocess
 import threading
 from contextlib import asynccontextmanager
 from importlib import resources
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -699,6 +701,51 @@ def _load_run_for_loop(runs_mod, run_id: str):
     return None, False
 
 
+# A18d(2): the counter that makes two backups in the same second impossible to
+# collide. Process-wide and monotonic; the pid is in the name too, so two
+# processes releasing at the same instant cannot collide either.
+_UNREADABLE_SEQ = itertools.count(1)
+
+
+def _preserve_unreadable_run(src: Path) -> Path | None:
+    """Copy an unreadable `run.json` aside, returning where, or None.
+
+    A18d(2). The old name was `<ts>` second-granular and guarded by
+    `not dst.exists()`, so two releases inside one second kept only the FIRST
+    backup and silently dropped the second run's bytes. The name now carries the
+    pid and a process-wide counter, so two releases can never name the same file
+    and the guard is gone. It is not "overwrite deliberately": each release gets
+    its own name, so there is nothing to overwrite.
+
+    A18d(1). The copy used to be a bare `except Exception: pass`. `shutil.copy2`
+    can fail on the same transient Windows sharing violation that `_atomic_write`'s
+    `_replace_retrying` survives — so the terminal write would succeed and
+    overwrite the original with NO backup and no trace. A failed copy is now
+    retried briefly (the cause is transient) and then logged at WARNING with the
+    exception. The caller still writes the terminal status: releasing the slot
+    with an honest terminal record matters more than preserving bytes
+    `runs.load` could not parse, and leaving `run.json` saying `running` is the
+    exact failure this path exists to close.
+    """
+    dst = src.with_name(
+        f"run.json.unreadable-{int(time.time())}-{os.getpid()}"
+        f"-{next(_UNREADABLE_SEQ)}")
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            shutil.copy2(src, dst)
+            return dst
+        except FileNotFoundError:
+            return None                     # nothing to preserve
+        except Exception as e:              # noqa: PERF203 — bounded retry
+            last = e
+            time.sleep(0.05 * (attempt + 1))
+    _log.warning(
+        "run: could not copy an unreadable run.json aside after retries (%s) — "
+        "the terminal release will overwrite it with no backup", last)
+    return None
+
+
 def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
     """Release the one-run slot for a run whose state cannot be read.
 
@@ -719,9 +766,15 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
     So the slot is released explicitly: a terminal status for the id we were
     asked to drive, then the active pointer dropped when it points here. The
     record written is minimal when the real one could not be read, so whatever
-    is on disk is copied aside first — a release must be recoverable, not
-    destructive. The run's mission and transcript survive on its session, so
-    `restart` still reattaches meaningfully.
+    is on disk is copied aside first (see `_preserve_unreadable_run`) — a release
+    must be recoverable, not destructive. The run's mission and transcript
+    survive on its session, so `restart` still reattaches meaningfully.
+
+    A18d(3): when `run.json` is unreadable AND unwritable the terminal status
+    cannot land, so it keeps saying `running` on disk even though the slot IS
+    released. There is no way to fix that from here — the lock that fails the
+    `os.replace` fails any rename we could try instead — so the failure is logged
+    at ERROR naming that residual rather than a bare "could not write".
     """
     run = None
     try:
@@ -736,17 +789,20 @@ def _release_unreadable_run(runs_mod, run_id: str, reason: str) -> None:
     if run is None:
         try:
             src = runs_mod.run_dir(run_id) / "run.json"
-            dst = src.with_name(f"run.json.unreadable-{int(time.time())}")
-            if src.exists() and not dst.exists():
-                shutil.copy2(src, dst)
+            if src.exists():
+                _preserve_unreadable_run(src)
         except Exception:
-            pass            # nothing to preserve, or it is locked as well
+            _log.warning("run %s: could not inspect run.json to back it up",
+                         run_id, exc_info=True)
         run = {"id": run_id}
     if run.get("status") not in runs_mod.TERMINAL:
         try:
             runs_mod.set_status(run, "interrupted", reason)
         except Exception:
-            _log.exception("run %s: could not write a terminal status", run_id)
+            _log.exception(
+                "run %s: could not write a terminal status — the slot is "
+                "released, but run.json still says 'running' because the file "
+                "is unreadable AND unwritable", run_id)
     # The pointer is read directly, by id: `runs.active()` returns None for an
     # unreadable run, and clearing unconditionally could free a DIFFERENT run's
     # slot — a new run may have started since this one wedged.
