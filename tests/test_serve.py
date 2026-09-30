@@ -52,6 +52,44 @@ def test_proxy_get_and_streaming_post(upstream):
     assert raw.decode() in r.text and "[DONE]" in r.text, r.text
 
 
+def test_proxy_applies_tool_params_only_when_tools_are_present(
+        upstream, tmp_path, monkeypatch):
+    """B7: the passthrough stays byte-for-byte unless the request carries
+    `tools`. When it does, the tool-call parameter layer (model card <
+    RUN_PARAMS < caller) is applied, because at the engine's stock ~0.8 an
+    IQ-quant model's call SYNTAX drifts and the strict parser misses it. The
+    response path is untouched: this is still an SSE stream."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))  # no running model: layer = RUN_PARAMS
+    client = TestClient(build_app(upstream_port=upstream))
+
+    # No `tools` -> the exact bytes, spacing and all (creative generation).
+    raw = b'{"model":"m","temperature":0.9,"messages":[]}'
+    r = client.post("/v1/chat/completions", content=raw,
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 200 and raw.decode() in r.text
+
+    # `tools` present -> RUN_PARAMS injected, and the caller's 0.9 wins.
+    raw2 = (b'{"model":"m","messages":[],"temperature":0.9,'
+            b'"tools":[{"type":"function","function":{"name":"f"}}]}')
+    r2 = client.post("/v1/chat/completions", content=raw2,
+                     headers={"content-type": "application/json"})
+    assert r2.status_code == 200
+    assert "text/event-stream" in r2.headers["content-type"]
+    assert "[DONE]" in r2.text
+    seen = json.loads(r2.text.split("data: ", 1)[1].split("\n", 1)[0])
+    assert seen["temperature"] == 0.9          # caller's own value wins
+    assert seen["dry_multiplier"] == 0.8       # RUN_PARAMS reached the engine
+    assert seen["dry_penalty_last_n"] == 4096
+    assert seen["repeat_penalty"] == 1.05
+    assert seen["tools"] == [{"type": "function", "function": {"name": "f"}}]
+
+    # An empty `tools` list is not a tool request: still byte-identical.
+    raw3 = b'{"model":"m","messages":[],"tools":[]}'
+    r3 = client.post("/v1/chat/completions", content=raw3,
+                     headers={"content-type": "application/json"})
+    assert raw3.decode() in r3.text
+
+
 def test_v1_passthrough_engine_down_is_openai_502(tmp_path, monkeypatch):
     """01-4: a dead engine must not surface as Starlette's plain-text 500 —
     every OpenAI client parses the body as JSON and then reports a decode
