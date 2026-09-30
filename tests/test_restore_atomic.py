@@ -146,7 +146,10 @@ def test_a_clean_restore_still_applies_every_section(client, home):
     assert r.status_code == 200, r.text
     assert app_settings.load()["idle_unload_minutes"] == 99.0
     assert methods.get("aaa") is not None
-    assert methods.get("mine") is not None        # additive, as before
+    # OD-15: the document's method set is now the whole set. "mine" was in the
+    # store but not in this document, so a true replace deletes it (the old
+    # merge kept it and the test said "additive, as before").
+    assert methods.get("mine") is None
     assert [m["text"] for m in store.all()] == ["Prefer q8_0."]
 
 

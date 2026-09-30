@@ -1761,20 +1761,50 @@ def _apply_restore(store, targets, patch, normalized, rows):
 
     `_snapshot_stores` is inside the lock too: its memory entry is the bytes
     the rollback writes back, so it must be the bytes as of the region's start.
+
+    OD-15 (option 1): this is a TRUE replace, not a merge. Memory was always
+    replaced; settings and methods were not. `app_settings.save` merges key by
+    key and `methods.save_user` deletes nothing, so anything created after the
+    backup survived the restore and the store never came back to the file's
+    state. Now settings are written with `app_settings.replace` (every key the
+    document omits returns to its default) and every user method the document
+    does not name is deleted through `methods.delete_user`. The stale methods
+    are resolved BEFORE the snapshot and added to the undo log, because the
+    delete is the one step here that removes data the restore did not write.
     """
     from . import app_settings
     from . import methods as _methods
     with store.locked():
+        # OD-15: the deletion set is part of the transaction. Resolve it (and
+        # its paths) before the snapshot so the rollback has the bytes. A file
+        # whose id cannot name it (a hand-edited `con.json`) is left alone:
+        # `delete_user` refuses it too, so there is no honest way to remove it.
+        keep = {full.get("id") for full in normalized}
+        stale: list[tuple[str, object]] = []
+        stale_ids: list[str] = []
+        for m in _methods.user_methods():
+            mid = m.get("id")
+            if mid in keep:
+                continue
+            try:
+                p = _methods._method_file(mid)
+            except _methods.MethodIdError:
+                continue
+            stale.append((f"method {mid}", p))
+            stale_ids.append(mid)
+        targets = list(targets) + stale
         try:
             prior = _snapshot_stores(targets)
         except OSError as e:
             raise _RestoreFailed(f"restore failed at staging: {e}") from e
         try:
-            if patch:
-                try:
-                    app_settings.save(patch)
-                except Exception as e:
-                    raise _RestoreStageError("settings", str(e)) from e
+            # Always write, even for `settings: {}`: a true replace means the
+            # keys the document omits are reset, and a merge-save of nothing
+            # would leave the pre-restore values in place.
+            try:
+                app_settings.replace(patch)
+            except Exception as e:
+                raise _RestoreStageError("settings", str(e)) from e
             for full in normalized:
                 try:
                     _, errs = _methods.save_user(full)
@@ -1785,6 +1815,14 @@ def _apply_restore(store, targets, patch, normalized, rows):
                     raise _RestoreStageError(
                         "methods", f"method {full.get('id')}: "
                                    + "; ".join(errs))
+            for mid in stale_ids:
+                try:
+                    # A False here is "already gone", which is the state the
+                    # restore wanted; only an exception is a failure.
+                    _methods.delete_user(mid)
+                except Exception as e:
+                    raise _RestoreStageError(
+                        "methods", f"method {mid}: {e}") from e
             before = len(store.all())
             try:
                 after = store.restore(rows)
@@ -7309,7 +7347,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # Multi-file all-or-nothing is not a filesystem primitive, so this is an
         # undo log: capture the exact bytes of every file the restore will touch,
         # write through the stores' OWN writers (so the on-disk format cannot
-        # drift from `app_settings.save` / `methods.save_user` /
+        # drift from `app_settings.replace` / `methods.save_user` /
         # `MemoryStore.restore`), and put every captured byte back if any write
         # fails. It is NOT a temp-file rename transaction, and deliberately so:
         # `MemoryStore.restore` must keep its cross-process lock, and staging
@@ -7325,9 +7363,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # snapshot and the rollback used to run outside any lock, so a memory
         # committed between them was reverted by the rollback.
         store = _memory_store()
-        targets: list[tuple[str, object]] = []
-        if patch:
-            targets.append(("settings", app_settings.settings_path()))
+        # OD-15: settings are ALWAYS a target now. A true replace resets the
+        # keys the document omits even when it carries `settings: {}`, so the
+        # file is written on every restore and must be in the undo log on every
+        # restore. The methods the document does not name are added to the log
+        # inside `_apply_restore`, which is where the deletion set is resolved.
+        targets: list[tuple[str, object]] = [
+            ("settings", app_settings.settings_path())]
         for full in normalized:
             targets.append((f"method {full.get('id')}",
                             _methods._method_file(full["id"])))
