@@ -76,7 +76,10 @@ _PATTERNS: list[tuple[str, re.Pattern, str, str, bool]] = [
 # One engine PROCESS starts at its parameter dump. `runtime.launch_server` opens
 # `server-<port>.log` with mode "w", so the file is normally truncated per
 # launch; a log that spans launches (an appended or rotated file) holds several
-# of these, and the last one is the process that is up now.
+# of these, and the last one is the process that is up now. The pinned PrismML
+# build emits the marker TWICE adjacently per process (`prism-v.log:1-2`), so a
+# marker COUNT is not a process count — only the LAST marker is what the rule
+# below uses.
 _RUN_START = re.compile(r"common_params_print_info:")
 
 
@@ -90,9 +93,11 @@ def _current_run(log_text: str) -> str:
     diagnostic for a flag state the running engine may not be in.
 
     The engine's own parameter dump is the start marker — `common_params_print_info:`
-    is the first line of every one of this machine's 16 `server-*.log` files
-    (llama.cpp prints it once per process). When the text carries at least one
-    marker, everything before the LAST one is a previous process and is dropped.
+    is the first line of every one of this machine's 16 `server-*.log` files. The
+    pinned PrismML build prints it TWICE adjacently at the start of a process
+    (`prism-v.log:1-2`), so "one marker per process" is not the invariant; the rule
+    is only that a later marker means a later process. When the text carries at
+    least one marker, everything before the LAST one is dropped.
     When it carries none (a tail that begins mid-launch) the whole text is
     scanned, because there is no evidence to segment on; in that case the
     caller gets no current-run guarantee, which the docstring now says instead
