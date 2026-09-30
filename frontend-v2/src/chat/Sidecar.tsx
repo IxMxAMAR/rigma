@@ -318,7 +318,10 @@ interface RagCandidate {
   why: string;
 }
 
-function GroundingCard() {
+/** Exported so a render test can reach the OD-3 rebuild control without
+ *  mounting the whole sidecar (the same reason `EngineCard`, `SamplingCard` and
+ *  `MethodCard` are exported). */
+export function GroundingCard() {
   const currentId = useChat((s) => s.currentId);
   // R3-UI-1: the Grounded toggle writes to a chat, so it needs the same
   // create-on-demand path the rest of the panel uses.
@@ -330,6 +333,12 @@ function GroundingCard() {
   const [adding, setAdding] = useState<string | null>(null);
   const [removeErr, setRemoveErr] = useState<string | null>(null);
   const [addErr, setAddErr] = useState<string | null>(null);
+  // OD-3 option 2: the rebuild control's own state. A refused rebuild reports
+  // through the same `role="alert"` channel as `addErr`/`removeErr`; `rebuildMsg`
+  // is the local acknowledgement that the 202 landed.
+  const [rebuilding, setRebuilding] = useState(false);
+  const [rebuildErr, setRebuildErr] = useState<string | null>(null);
+  const [rebuildMsg, setRebuildMsg] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -380,6 +389,35 @@ function GroundingCard() {
     void refresh();
     void loadSuggestions();     // drop the one just added from the offers
   }, [refresh, loadSuggestions]);
+
+  const rebuildIndex = useCallback(async () => {
+    setRebuildErr(null);
+    setRebuildMsg(null);
+    setRebuilding(true);
+    try {
+      const r = await fetch("/api/rag/reindex", { method: "POST" });
+      // The `r.ok` check `addFolder` needed (R3-UI-2) applies here for the same
+      // reason: 409 (an ingest is already running) and 400 (raggity is not
+      // installed) both carry the server's own sentence, and dropping it would
+      // leave the button looking like it started a rebuild that is not running.
+      if (!r.ok) {
+        setRebuildErr(await responseError(r));
+        return;
+      }
+      // 202 {indexing: true}: start the existing 2 s poll now rather than waiting
+      // for the next status read to notice the ingest.
+      const d = (await r.json().catch(() => null)) as { indexing?: boolean } | null;
+      if (d?.indexing) {
+        setStatus((prev) => (prev ? { ...prev, indexing: true } : prev));
+      }
+      setRebuildMsg("rebuild started");
+      void refresh();
+    } catch (e) {
+      setRebuildErr((e as Error).message || "could not rebuild the index");
+    } finally {
+      setRebuilding(false);
+    }
+  }, [refresh]);
 
   useEffect(() => {
     void refresh();
@@ -531,6 +569,33 @@ function GroundingCard() {
         />
         <button className="rounded-md bg-surface hover:bg-float px-2 text-[13px]">+</button>
       </form>
+      {/* OD-3 option 2 (accepted). The credential-`exclude` denylist (R3-11 /
+          R3-17) applies to NEW indexing only, so an index built before it can
+          still hold whatever the walk read then — `.env`, `.ssh/id_rsa`, browser
+          cookie DBs. Rebuilding is the fix, but it re-reads the owner's
+          documents, so this is deliberately owner-triggered and NEVER automatic
+          (§0.8): the decision stays with the person whose files they are. */}
+      <div className="mt-2 flex items-center gap-2">
+        <button
+          type="button"
+          disabled={!!status?.indexing || rebuilding}
+          onClick={() => void rebuildIndex()}
+          title={"Re-walk the indexed folders so the credential denylist applies "
+                 + "to them. This reads your documents again — nothing happens "
+                 + "until you click."}
+          className="rounded-md bg-surface hover:bg-float disabled:opacity-50 px-2 py-1 text-[12px]"
+        >
+          {rebuilding ? "rebuilding…" : "rebuild index"}
+        </button>
+        {rebuildMsg && (
+          <span className="font-mono text-[11px] text-muted">{rebuildMsg}</span>
+        )}
+      </div>
+      {rebuildErr && (
+        <p role="alert" className="font-mono text-[11px] text-red mt-1">
+          {rebuildErr}
+        </p>
+      )}
       <div className={`font-mono text-[11px] mt-1.5 ${status?.error ? "text-red" : status?.running ? "text-moss" : "text-muted"}`}>
         {status?.indexing ? "● indexing…"
           : status?.error ? "▲ " + status.error

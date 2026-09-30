@@ -75,7 +75,9 @@ const RESTARTABLE = new Set([
   "interrupted", "stopped", "stalled", "frozen", "budget_exhausted", "error",
 ]);
 
-function Launcher({ onLaunched, missionRef }: {
+/** Exported so the OD-1 option 4 first-launch test can pin the safety-profile
+ *  chooser without mounting the whole surface (which fetches on mount). */
+export function Launcher({ onLaunched, missionRef }: {
   onLaunched: (id: string) => void;
   /** IMP-10: the empty history's primary action focuses the mission box. */
   missionRef?: RefObject<HTMLTextAreaElement>;
