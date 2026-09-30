@@ -89,6 +89,47 @@ def test_a_file_or_glob_rag_source_is_not_a_write_root(home):
     assert sessions.default_write_allowlist() == []
 
 
+def test_a_broad_stored_workspace_is_not_seeded(home):
+    """ODR-2: one old chat whose workspace was the home dir (or a drive root,
+    or an ancestor of %APPDATA%, or a persistence folder) must not hand every
+    NEW chat that root as an absolute write destination. The narrow folder is
+    the control: the floor must not touch the normal case."""
+    import os as _os
+
+    narrow = _mk(home, "narrow")
+    broad = {"home": pathlib.Path.home(),
+             "drive root": pathlib.Path(pathlib.Path.home().anchor)}
+    appdata = _os.environ.get("APPDATA")
+    if appdata:
+        broad["appdata ancestor"] = pathlib.Path(appdata).parent
+        broad["startup"] = (pathlib.Path(appdata) / "Microsoft" / "Windows"
+                            / "Start Menu" / "Programs" / "Startup")
+    for name, ws in broad.items():
+        s = sessions.create(f"broad-{name}")
+        s["workspace"] = str(ws)
+        sessions.save(s)
+    s = sessions.create("narrow")
+    s["workspace"] = str(narrow)
+    sessions.save(s)
+
+    got = sessions.default_write_allowlist()
+    assert str(narrow.resolve()) in got, got
+    for name, ws in broad.items():
+        assert str(ws.resolve()) not in got, (name, got)
+
+
+def test_a_relative_stored_workspace_is_ignored_not_resolved(home):
+    """ODR-2: `resolve()` used to run BEFORE `is_absolute()`, so the check was
+    dead — a stored workspace of `.` became the SERVER's current directory and
+    was seeded into every new chat."""
+    s = sessions.create("rel")
+    s["workspace"] = "."
+    sessions.save(s)
+    got = sessions.default_write_allowlist()
+    assert str(pathlib.Path.cwd().resolve()) not in got, got
+    assert got == [], got
+
+
 def test_write_allowlist_is_a_list_not_a_bool():
     assert "write_allowlist" in sessions.MUTABLE_FIELDS
     assert sessions._FIELD_TYPES.get("write_allowlist") is list
