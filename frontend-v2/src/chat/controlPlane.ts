@@ -281,9 +281,53 @@ export function configOptionValues(options: unknown): string[] {
     .filter((v) => v !== "");
 }
 
+/** B6d: one mode the SESSION advertised. `id` is what `mode_set` must carry. */
+export interface AcpModeOption {
+  id: string;
+  label: string;
+}
+
+export interface AcpModeList {
+  /** One entry per mode the session advertised, in the server's own order. */
+  options: AcpModeOption[];
+  /** The mode the session says it is in, or "". */
+  current: string;
+  /** True when there is NOTHING to choose — no list advertised, or an empty one.
+   *
+   *  `mode_set` was rejected as a control until the real list could be read, and
+   *  the reason is this flag: a hardcoded `plan`/`default` pair is a control whose
+   *  values stop matching the server on the next mcode version. Both "no list"
+   *  and "an empty list" leave the user nothing to pick, so both must render as
+   *  UNKNOWN rather than as a fabricated default. */
+  unknown: boolean;
+}
+
+/** The session's advertised modes as select options, or an explicit unknown.
+ *
+ *  NEVER FABRICATES. The payload is `harness_mcode_acp.acp_modes_payload`'s
+ *  `{availableModes, currentModeId, known}`; anything else (null, a string, a
+ *  malformed entry) contributes no option rather than a guessed one. An entry
+ *  with no usable `id` is dropped, because `mode_set` requires one and a select
+ *  value that cannot be sent is a dead control.
+ */
+export function acpModeList(modes: unknown): AcpModeList {
+  const raw = (modes && typeof modes === "object" ? modes : {}) as Record<string, unknown>;
+  const listed = Array.isArray(raw.availableModes) ? raw.availableModes : [];
+  const options: AcpModeOption[] = [];
+  for (const m of listed) {
+    if (!m || typeof m !== "object") continue;
+    const o = m as Record<string, unknown>;
+    const id = typeof o.id === "string" ? o.id.trim() : "";
+    if (!id) continue;
+    const name = typeof o.name === "string" ? o.name.trim() : "";
+    options.push({ id, label: name || id });
+  }
+  const current = typeof raw.currentModeId === "string" ? raw.currentModeId : "";
+  return { options, current, unknown: options.length === 0 };
+}
+
 /** Whether an operation can be attempted, given both inputs. */
-export function controlReady(spec: ControlOp, arg: string, choice = ""): boolean {
-  if (spec.choices) {
+export function controlReady(spec: ControlOp, arg: string, choice = ""): boolean {  if (spec.choices) {
     // The default is the first value, so this is satisfied unless the table is empty —
     // and an empty table is a bug in the table, not a user error, so it is reported as
     // an error rather than silently sending nothing.
@@ -297,8 +341,13 @@ export function controlReady(spec: ControlOp, arg: string, choice = ""): boolean
  *  A control operation is a MUTATION, so silence is not acceptable feedback: a button
  *  that appears to do nothing is indistinguishable from one that failed. Each result
  *  shape gets a sentence that says what changed.
+ *
+ *  `detail` is the value the CALLER sent, for the operations whose answer does not
+ *  echo it back. `mode_set` is the one that needs it: ACP's `session/set_mode`
+ *  answers with the session (or nothing), so without it the confirmation could only
+ *  say "done" — which is the sentence this function exists to avoid.
  */
-export function controlResultText(op: string, result: unknown): string {
+export function controlResultText(op: string, result: unknown, detail = ""): string {
   const r = (result ?? {}) as Record<string, unknown>;
   const goal = r.goal as Record<string, unknown> | null | undefined;
   switch (op) {
@@ -348,6 +397,16 @@ export function controlResultText(op: string, result: unknown): string {
       return "sent into the running turn";
     case "activate":
       return "this is now the active session";
+    case "mode_set": {
+      // B6d. Never a bare "done": the mode is the whole point of the operation,
+      // and a user who cannot see which mode took effect cannot tell a change
+      // from a no-op. ACP does not promise to echo the id, so the caller's own
+      // `detail` is the fallback and the wording stays honest when neither is
+      // known.
+      const echoed = typeof r.modeId === "string" ? r.modeId : "";
+      const id = echoed || detail;
+      return id ? `mode is now ${id}` : "mode changed";
+    }
     default:
       return "done";
   }

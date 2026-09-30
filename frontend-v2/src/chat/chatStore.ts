@@ -128,6 +128,15 @@ export interface StreamingTurn {
   acpQueue: AcpQueueItem[];
   acpDelegation: AcpDelegation | null;
   acpConfig: AcpConfigOption[];
+  /** B6d: the modes the SESSION advertised, as `session/new` answered.
+   *
+   *  `mode_set` was reachable over HTTP with no UI for one reason: the valid
+   *  `modeId`s arrive in `session/new`'s `modes.availableModes`, and nothing put
+   *  them on the wire. They are mirrored on the SAME `acp_config` event as
+   *  `configOptions` (one event, two fields), so a consumer replaces only the
+   *  field it was sent. `null` until the backend reports any — a fabricated
+   *  `plan`/`default` pair is exactly the control that was rejected. */
+  acpModes: AcpModes | null;
   acpCommands: AcpCommand[];
   /** ACP's own plan review, when the backend offered one. Distinct from
    *  `todos`, which is the model's checklist, and from `planMode`, which is
@@ -214,6 +223,29 @@ export interface AcpConfigOption {
   name?: string;
   currentValue?: unknown;
   options?: { value?: unknown; name?: string }[];
+  [k: string]: unknown;
+}
+
+/** One mode a session advertised — `{id, name, description}` in ACP's own words.
+ *
+ *  The `id` is what `mode_set` has to carry; the `name` is what a human reads.
+ *  Both optional because the payload is the server's and this side does not own
+ *  the schema. */
+export interface AcpModeEntry {
+  id?: string;
+  name?: string;
+  description?: string;
+  [k: string]: unknown;
+}
+
+/** B6d: the session's advertised mode list, as `harness_mcode_acp.acp_modes_payload`
+ *  translates `session/new`'s `modes`. `known` separates "the session advertised an
+ *  (empty) list" from "no list was advertised at all"; either way there is nothing
+ *  to choose, so the control must say unknown rather than invent `plan`/`default`. */
+export interface AcpModes {
+  availableModes?: AcpModeEntry[];
+  currentModeId?: string;
+  known?: boolean;
   [k: string]: unknown;
 }
 
@@ -312,6 +344,7 @@ export const emptyTurn = (): StreamingTurn => ({
   acpQueue: [],
   acpDelegation: null,
   acpConfig: [],
+  acpModes: null,
   acpCommands: [],
   acpPlan: null,
   workflow: [],
@@ -570,8 +603,20 @@ export function applyEvent(turn: StreamingTurn, ev: SseEvent): StreamingTurn {
       return { ...turn, acpDelegation: snap };
     }
     case "acp_config": {
-      const opts = Array.isArray(d.configOptions) ? d.configOptions : [];
-      return { ...turn, acpConfig: opts as AcpConfigOption[] };
+      // B6d: ONE EVENT, TWO FIELDS. The adapter mirrors the session's
+      // `configOptions` and its advertised `modes` on this channel
+      // (`harness_mcode_acp._settings_event`), and a `config_option_update`
+      // carries only the options. Replacing both unconditionally would blank the
+      // modes on an options-only update and vice versa, so a field the event did
+      // not carry is left exactly as it was.
+      const next: Partial<StreamingTurn> = {};
+      if (Array.isArray(d.configOptions)) {
+        next.acpConfig = d.configOptions as AcpConfigOption[];
+      }
+      if (d.modes && typeof d.modes === "object") {
+        next.acpModes = d.modes as AcpModes;
+      }
+      return { ...turn, ...next };
     }
     case "acp_commands": {
       const cmds = Array.isArray(d.commands) ? d.commands : [];
@@ -802,6 +847,15 @@ export interface ChatState {
    *  accepted fact rather than an optimistic guess.
    */
   setAcpConfigOption: (optionId: string, value: string) => void;
+  /** B6d: record a mode change the SERVER already accepted.
+   *
+   *  The same problem `setAcpConfigOption` solves, for the same reason: the mode
+   *  select reads the live turn's `acpModes`, which is written only by an
+   *  `acp_config` event from the connection that ran the turn — and a control
+   *  operation runs on its own short-lived mcode process whose notifications
+   *  nobody reads. Called only AFTER the server confirmed the change, so the
+   *  select shows an accepted fact rather than an optimistic guess. */
+  setAcpMode: (modeId: string) => void;
 }
 
 /** The live turn for the chat on screen — nothing else may render. */
@@ -1332,5 +1386,20 @@ export const useChat = create<ChatState>((set, get) => ({
       const acpConfig = turn.acpConfig.map((c) =>
         String(c.id) === optionId ? { ...c, currentValue: value } : c);
       return { streams: { ...st.streams, [id]: { ...turn, acpConfig } } };
+    }),
+
+  setAcpMode: (modeId) =>
+    set((st) => {
+      const id = st.currentId;
+      if (!id) return {};
+      const turn = st.streams[id];
+      if (!turn || !turn.acpModes) return {};
+      // A NEW object, for the same zustand-selector reason as `setAcpConfigOption`.
+      return {
+        streams: {
+          ...st.streams,
+          [id]: { ...turn, acpModes: { ...turn.acpModes, currentModeId: modeId } },
+        },
+      };
     }),
 }));
