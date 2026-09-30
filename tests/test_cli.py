@@ -353,6 +353,82 @@ def test_up_ctx_override_and_clamp(tmp_path, monkeypatch):
     assert res.exit_code == 0 and "-c 262144" in res.output  # qwen native cap
 
 
+def test_up_surfaces_a_clamped_default_ngl(tmp_path, monkeypatch):
+    """C10-nits N3: the resolver records a clamp in `explain` ("launch default
+    ngl 999 exceeds what fits ...: using 99"), but `rigma up` never printed it —
+    so a launch could run at a clamped ngl with no notice while `rigma plan
+    --explain` showed the note. The dry-run preview must show it too."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    from rigma.models import LaunchDefaults
+    real_load = cli.Registry.load
+
+    def _load(*a, **k):
+        reg = real_load(*a, **k)
+        models = dict(reg.models)
+        spec = models["qwen3.6-35b-a3b"]
+        models["qwen3.6-35b-a3b"] = spec.model_copy(
+            update={"launch": LaunchDefaults(ngl=999)})
+        return cli.Registry(reg.gpus, models, reg.combos)
+
+    monkeypatch.setattr(cli.Registry, "load", staticmethod(_load))
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run"])
+    assert res.exit_code == 0, res.output
+    assert "launch default ngl 999 exceeds what fits" in res.output
+
+
+def test_up_batch_ubatch_ngl_overrides_reach_the_argv(tmp_path, monkeypatch):
+    """C10-cli: the CLI could not SET the three levers C10 made storable per
+    model. They must reach the argv the launch uses."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run",
+                                  "--batch", "8192", "--ubatch", "2048",
+                                  "--ngl", "40"])
+    assert res.exit_code == 0, res.output
+    assert "-b 8192" in res.output
+    assert "-ub 2048" in res.output
+    assert "-ngl 40" in res.output
+    assert "+cli-request" in res.output
+
+
+def test_up_ubatch_override_is_charged_by_the_fit(tmp_path, monkeypatch):
+    """The override must reach the FIT, not just the argv: llama.cpp sizes its
+    compute buffer from the physical batch, so a bigger `-ub` has to be paid
+    for in offloaded experts. At 512 the fit offloads 10; at 2048 it offloads
+    15 (DR2-3 charges the engine's own 410.28 MiB base, not 150)."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    base = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                   "--use-case", "coding", "--dry-run"])
+    big = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run",
+                                  "--ubatch", "2048"])
+    assert base.exit_code == 0 and big.exit_code == 0, (base.output, big.output)
+    assert "--n-cpu-moe 10" in base.output
+    assert "--n-cpu-moe 15" in big.output
+    assert "-ub 2048" in big.output
+
+
+def test_up_refuses_an_illegal_batch_pair(tmp_path, monkeypatch):
+    """Same validation as a stored default: `n_ubatch <= n_batch` is the
+    engine's contract, so an illegal pair is a usage error (exit 2) naming the
+    numbers, not an engine that dies at load."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run",
+                                  "--batch", "1024", "--ubatch", "2048"])
+    assert res.exit_code == 2, res.output
+    assert "ubatch 2048 exceeds batch 1024" in res.output
+    res = runner.invoke(cli.app, ["up", "--model", "qwen3.6-35b-a3b",
+                                  "--use-case", "coding", "--dry-run",
+                                  "--batch", "-1"])
+    assert res.exit_code == 2, res.output
+
+
 def test_up_reasoning_override(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "probe_hardware", _fake_probe)
