@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import { selectStreaming, useChat, type AcpConfigOption } from "./chatStore";
 import {
   CONTROL_OPS,
+  acpModeList,
   controlAvailability,
   controlOpError,
   controlParams,
@@ -79,6 +80,13 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
   // `?? NO_CONFIG`, never `?? []`: see the comment on NO_CONFIG.
   const config = useChat((s) => selectStreaming(s)?.acpConfig ?? NO_CONFIG);
   const recordConfigOption = useChat((s) => s.setAcpConfigOption);
+  /* B6d: the modes the SESSION advertised. `mode_set` had no control because the
+     valid ids never reached a consumer; they now ride the same `acp_config` event
+     as the options above. `acpModeList` never fabricates a list, so an absent or
+     empty one renders as "unknown" rather than a guessed `plan`/`default`. */
+  const acpModes = useChat((s) => selectStreaming(s)?.acpModes ?? null);
+  const recordMode = useChat((s) => s.setAcpMode);
+  const modes = acpModeList(acpModes);
   const settingsBusy = busy;
 
   const blocked = controlAvailability(harness, transport, hasSession);
@@ -112,8 +120,29 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
     }
   };
 
-  const send = async () => {
-    if (!ready || busy) return;
+  /** B6d: change the session's mode, from the list the session itself advertised.
+   *
+   *  The id comes from that list, never from a constant here. The confirmation
+   *  names the mode (`controlResultText("mode_set", …, modeId)`) because ACP does
+   *  not promise to echo it back, and `recordMode` mirrors the accepted change so
+   *  the select does not snap back — the same two problems `setOption` solves. */
+  const setMode = async (modeId: string) => {
+    if (busy || !modeId) return;
+    setBusy(true);
+    setResult("");
+    setError("");
+    try {
+      const r = await api.control(sessionId, "mode_set", { modeId });
+      setResult(controlResultText("mode_set", r.result, modeId));
+      recordMode(modeId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "the mode change failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const send = async () => {    if (!ready || busy) return;
     setBusy(true);
     setResult("");
     setError("");
@@ -258,6 +287,45 @@ export default function ControlPanel({ sessionId, harness, transport, hasSession
               })}
             </div>
           )}
+          {/* B6d. `mode_set` is drawn from the SESSION's own list, and from
+              nothing else. An absent or empty list is rendered as "unknown": a
+              fabricated `plan`/`default` pair is a control whose values stop
+              matching the server on the next mcode version, which is exactly why
+              this operation had no UI until the real list reached a consumer. */}
+          <div className="flex flex-col gap-1 border-t border-muted/20 pt-1.5 mt-0.5">
+            <span className="text-[10.5px] text-muted uppercase tracking-[0.08em]">
+              session mode
+            </span>
+            {modes.unknown ? (
+              <p className="text-muted leading-snug">
+                unknown — this session has not advertised a mode list, so there is
+                nothing to choose. Rigma will not offer a guessed one.
+              </p>
+            ) : (
+              <label className="flex items-center gap-2">
+                <span className="w-20 shrink-0 text-secondary">mode</span>
+                <select
+                  value={modes.current || modes.options[0].id}
+                  disabled={settingsBusy}
+                  aria-label="mcode session mode"
+                  onChange={(e) => void setMode(e.target.value)}
+                  className="flex-1 min-w-0 rounded-md bg-surface px-2 py-1 text-[12px]
+                             outline-none disabled:opacity-50"
+                >
+                  {/* The session's current mode is always an option, even when it
+                      is not in the advertised list — otherwise the select would
+                      show the first entry as if it were the live one. */}
+                  {modes.current !== "" &&
+                    !modes.options.some((m) => m.id === modes.current) && (
+                    <option value={modes.current}>{modes.current}</option>
+                  )}
+                  {modes.options.map((m) => (
+                    <option key={m.id} value={m.id}>{m.label}</option>
+                  ))}
+                </select>
+              </label>
+            )}
+          </div>
           <div className="flex items-center gap-2">
             <button
               type="button"

@@ -80,6 +80,47 @@ describe("R6-ACP: the live selects", () => {
   });
 });
 
+describe("R6-ACP-SETTINGS: the session's modes", () => {
+  // B6d. `mode_set` is reachable over HTTP and had no UI because the session's
+  // `availableModes` never reached a consumer. They ride the SAME `acp_config`
+  // event as `configOptions` (one event, two fields), so a field an event did not
+  // carry must be left alone rather than blanked.
+  it("stores the modes the session advertised", () => {
+    const t = feed(emptyTurn(), [
+      ["acp_config", {
+        configOptions: [],
+        modes: { availableModes: [{ id: "default" }, { id: "plan" }],
+                 currentModeId: "default", known: true },
+      }],
+    ]);
+    expect(t.acpModes?.availableModes?.map((m) => m.id)).toEqual(["default", "plan"]);
+    expect(t.acpModes?.currentModeId).toBe("default");
+  });
+
+  it("does not blank the modes when a later event carries only configOptions", () => {
+    const t = feed(emptyTurn(), [
+      ["acp_config", { modes: { availableModes: [{ id: "plan" }],
+                                currentModeId: "plan", known: true } }],
+      ["acp_config", { configOptions: [{ id: "model", currentValue: "m:x" }] }],
+    ]);
+    expect(t.acpModes?.currentModeId).toBe("plan");
+    expect(t.acpConfig).toHaveLength(1);
+  });
+
+  it("does not blank the config options when a later event carries only modes", () => {
+    const t = feed(emptyTurn(), [
+      ["acp_config", { configOptions: [{ id: "model", currentValue: "m:x" }] }],
+      ["acp_config", { modes: { availableModes: [{ id: "plan" }], known: true } }],
+    ]);
+    expect(t.acpConfig).toEqual([{ id: "model", currentValue: "m:x" }]);
+    expect(t.acpModes?.availableModes).toHaveLength(1);
+  });
+
+  it("starts with no mode list, not a fabricated one", () => {
+    expect(emptyTurn().acpModes).toBeNull();
+  });
+});
+
 describe("R6-ACP: commands and the plan review", () => {
   it("stores the advertised commands", () => {
     const t = feed(emptyTurn(), [

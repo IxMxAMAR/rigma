@@ -5,6 +5,7 @@ import {
   CONTROL_OPS,
   QUEUE_ACTIONS,
   ROW_OPS,
+  acpModeList,
   configOptionValues,
   controlAvailability,
   delegationDepths,
@@ -83,6 +84,61 @@ describe("R6-ACP-CONTROL: controlResultText", () => {
     expect(controlResultText("queue_list", { items: [] })).toContain("empty");
     expect(controlResultText("queue_list", { items: [1] })).toContain("1 message");
     expect(controlResultText("queue_list", { items: [1, 2] })).toContain("2 messages");
+  });
+
+  it("names the mode a `mode_set` landed on, never a bare `done`", () => {
+    // B6d. The verifier's note: `controlResultText` had no `mode_set` case, so the
+    // operation fell through to the generic "done" — which cannot distinguish a
+    // change from a no-op. ACP does not promise to echo the id, so the caller's
+    // own value is the fallback.
+    expect(controlResultText("mode_set", { modeId: "plan" })).toContain("plan");
+    expect(controlResultText("mode_set", {}, "acceptEdits")).toContain("acceptEdits");
+    const unknown = controlResultText("mode_set", {});
+    expect(unknown).not.toBe("done");
+    expect(unknown).not.toContain("undefined");
+    expect(unknown).not.toContain("object Object");
+  });
+});
+
+describe("R6-ACP-SETTINGS: the session's advertised modes", () => {
+  it("lists exactly what the session advertised, in its own order", () => {
+    const list = acpModeList({
+      availableModes: [
+        { id: "default" },
+        { id: "plan", name: "Plan" },
+        { id: "acceptEdits", name: "Accept edits" },
+      ],
+      currentModeId: "plan",
+      known: true,
+    });
+    expect(list.unknown).toBe(false);
+    expect(list.options.map((m) => m.id)).toEqual(["default", "plan", "acceptEdits"]);
+    // The human name wins over the protocol id, and the id is the fallback.
+    expect(list.options[1]).toEqual({ id: "plan", label: "Plan" });
+    expect(list.options[0].label).toBe("default");
+    expect(list.current).toBe("plan");
+  });
+
+  it("never invents a mode when the session advertised none", () => {
+    // The whole reason `mode_set` had no UI: a hardcoded `plan`/`default` pair is
+    // a control whose values stop matching the server on the next mcode version.
+    for (const raw of [
+      null, undefined, {}, { availableModes: [] }, { availableModes: null },
+      { availableModes: "plan" }, { availableModes: ["plan"] },
+      { availableModes: [{ name: "no id at all" }] }, "plan", 7,
+    ]) {
+      const list = acpModeList(raw);
+      expect(list.options, JSON.stringify(raw)).toEqual([]);
+      expect(list.unknown, JSON.stringify(raw)).toBe(true);
+    }
+  });
+
+  it("drops an entry whose id cannot be sent, rather than offering a dead value", () => {
+    const list = acpModeList({
+      availableModes: [{ id: "  " }, { id: "plan" }, { id: 7 }, null],
+    });
+    expect(list.options.map((m) => m.id)).toEqual(["plan"]);
+    expect(list.unknown).toBe(false);
   });
 });
 
