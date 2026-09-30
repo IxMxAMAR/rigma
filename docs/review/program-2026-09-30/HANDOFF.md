@@ -77,19 +77,35 @@ Baseline at program start (2026-09-30, base `7ea1827`): **2935 non-hardware test
 8. Owner decisions go to `OWNER-DECISIONS.md` with a recommendation — do not make them.
 9. Subagents run DeepSeek-V4.1-Flash on tokenjuice.
 
+**Two additions made during the run, both from `GUIDANCE.md` / an incident:**
+
+10. **Never override the git author.** Plain `git commit` only — no `-c user.name`, no `-c user.email`,
+    no `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. The branch may be published, so every commit must carry
+    `IxMxAMAR <officialamrendrasingh@gmail.com>`. Check with `git log -1 --format='%an <%ae>'`. (The
+    orchestrator broke this early on; the affected commits were re-authored in a metadata-only
+    rewrite — see `STATUS.md`.)
+11. **Never use `git stash`.** It is repository-wide, not per-worktree: one agent's `stash push` was
+    consumed by another agent's `pop`, which then applied a foreign stash into a third worktree. Use
+    `git show HEAD:path` or a copy for before/after evidence. Commit on your own branch instead.
+
+Also: prefer `git commit -F <file>` for messages (the PreToolUse guard no longer inspects heredoc text,
+but a `-F` file is unambiguous).
+
 ## What has landed
 
 _(updated at every wave boundary — see `STATUS.md` for the per-item table)_
 
 | wave | commits | items |
 |---|---|---|
-| 0 | `d8f84ab` | recon + backlog + program docs only; no source change |
-| 1 | `e605134` `cb4d221` `a56c0e0` `5b9f149` `dee1c43` `854bcaf` | A1, A17/S2, A4, A2, A3, A13, A5, A6 — all merged, each independently verified (new test observed failing on the unmodified base, then passing) |
-| 2 | _in flight_ | B2 (verifying), D1 (verifying) |
-| 3 | _in flight_ | A8, A14, A15, B7, A7, A11 |
-| 1 | _sent back_ | B1 — the verifier rejected the merge: delegating to `tools._kill_tree` would `killpg` Rigma's own process group on POSIX because the harness children are not detached |
+| 0 | `8de0434` | recon + backlog + program docs only; no source change |
+| 1 | `4eaec9d` `30e711e` `5df51a6` `f93ea8e` `e922c41` `6c83ab5` | A1, A17/S2, A4, A2, A3, A13, A5, A6 — all merged, each independently verified (new test observed failing on the unmodified base, then passing) |
+| 2 | `b040751` `ca83bc0` | B2, A14, A15 merged; D1 sent back once (its "unchanged default path" is 11.1 % shorter than before and the test tolerance hides it) |
+| 3 | `e6e8c3d` | A7, A11 merged; A8 and B7 implemented and in verification |
+| 4 | _in flight_ | A16, A9, A12, B4, C1, C3, B8 |
+| 1 | _sent back once, fixed_ | B1 — the verifier rejected the merge because delegating to `tools._kill_tree` would `killpg` Rigma's own process group on POSIX (the harness children are not detached); fixed in `8afc625` and re-verifying |
 
-Integration head after the wave-1 merges: **`854bcaf`**.
+Integration head: **`e6e8c3d`**. `STATUS.md` carries the per-item table and a note on the
+metadata-only author rewrite (the pre-rewrite hashes are listed there).
 
 ## What is in flight
 
