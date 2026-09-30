@@ -6278,7 +6278,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse(
                 {"error": "budget_hours: must be greater than 0"},
                 status_code=400)
+        # A7: an unrecognised `profile` used to be silently coerced to "all" —
+        # the profile that grants the full network and delete surface — both
+        # here (`run_profile=... if ... else "all"`) and again in
+        # `runs.create`. So a typo, or a client that sent "read-only", started
+        # the MOST permissive run and was told nothing. The default when the
+        # field is ABSENT is still "all" (the owner's OD-1 choice, unchanged);
+        # a value that is PRESENT must be one of `runs.PROFILES`. The type is
+        # checked first: `[] in PROFILES` raises TypeError, it does not answer
+        # False, so an unhashable value would be a 500 rather than this 400.
         profile = (body or {}).get("profile", "all")
+        if not isinstance(profile, str) or profile not in _runs.PROFILES:
+            return JSONResponse(
+                {"error": "profile: must be one of "
+                          + ", ".join(sorted(_runs.PROFILES))},
+                status_code=400)
         workspace = str((body or {}).get("workspace", "")).strip()
         # R3-4: an autonomous run could never be granted code execution, and no
         # surface could turn it on either. `allow_code=True` was set below while
