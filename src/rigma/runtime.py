@@ -8,6 +8,7 @@ import subprocess
 import tarfile
 import time
 import zipfile
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
@@ -109,19 +110,74 @@ ENGINES_MANIFEST_URL = ("https://raw.githubusercontent.com/IxMxAMAR/"
 
 def update_engines_manifest(url: str = ENGINES_MANIFEST_URL) -> bool:
     """Fetch a newer engine pin into ~/.rigma/engines.json. Best-effort:
-    False (never an exception) when offline or the payload is unusable."""
+    False (never an exception) when offline or the payload is unusable.
+
+    True whenever a valid manifest was fetched and written — including when it is the
+    same version already in use, which is the base behaviour. Kept as the boolean door
+    for callers that only want yes/no; `update_engines_manifest_result` says WHY (A6)."""
+    return update_engines_manifest_result(url).ok
+
+
+# A6: the outcome of an engine-pin update. A bare bool could not tell "already
+# current" from "offline" from "fetched but unusable", so the CLI reported every
+# failure as "no newer pin published" — telling an offline user they were up to
+# date. `status` is exactly one of the constants below.
+MANIFEST_UPDATED = "updated"     # a newer, valid pin is now installed
+MANIFEST_CURRENT = "current"     # fetched fine, same version as the one in use
+MANIFEST_NETWORK = "network"     # the request failed: offline, DNS, HTTP error
+MANIFEST_UNUSABLE = "unusable"   # fetched, but not a manifest this build will use
+MANIFEST_UNSAVED = "unsaved"     # a valid pin that could not be written to disk
+
+
+@dataclass(frozen=True)
+class ManifestUpdate:
+    """The result of `update_engines_manifest_result` (A6).
+
+    `version` is the fetched pin when one was readable, else "". `ok` keeps the OLD
+    boolean meaning exactly: the base function returned True whenever a valid manifest
+    was fetched and written, whether or not its version differed — so `ok` is True for
+    `current` as well as `updated`, and False for network / unusable / unsaved.
+    """
+    status: str
+    version: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status in (MANIFEST_UPDATED, MANIFEST_CURRENT)
+
+
+def update_engines_manifest_result(url: str = ENGINES_MANIFEST_URL) -> ManifestUpdate:
+    """Fetch a newer engine pin into ~/.rigma/engines.json, saying what happened.
+
+    Best-effort like `update_engines_manifest`: never raises for a network, payload
+    or write problem. The status distinguishes the cases the old bool flattened, so
+    the CLI can stop calling an offline run "already current" (A6)."""
     try:
         r = httpx.get(url, follow_redirects=True, timeout=30)
         r.raise_for_status()
+    except Exception:
+        return ManifestUpdate(MANIFEST_NETWORK)
+    try:
         cand = r.json()
-        if not _manifest_ok(cand):
-            return False
-        p = rigma_home() / "engines.json"
+    except Exception:
+        # A 200 that is not JSON is a bad payload, not a network failure.
+        return ManifestUpdate(MANIFEST_UNUSABLE)
+    if not _manifest_ok(cand):
+        return ManifestUpdate(MANIFEST_UNUSABLE)
+    version = str(cand.get("version") or "")
+    try:
+        current = _engines_manifest().get("version")
+    except Exception:
+        current = None
+    p = rigma_home() / "engines.json"
+    try:
         # R3-STORE-10: fixed temp name -> unique temp + retried replace.
         atomic_write_json(p, cand, indent=1)
-        return True
     except Exception:
-        return False
+        return ManifestUpdate(MANIFEST_UNSAVED, version)
+    if version and version == current:
+        return ManifestUpdate(MANIFEST_CURRENT, version)
+    return ManifestUpdate(MANIFEST_UPDATED, version)
 
 
 def _redirect_allowed(url: str) -> bool:
