@@ -291,12 +291,16 @@ def test_the_launch_placement_round_trips_through_state(home):
 
     disk = st.read_state()
     assert disk["placement"] == {"ngl": 99, "n_cpu_moe": 12}
-    assert server_ops.recorded_placement(disk) == {"ngl": 99, "n_cpu_moe": 12}
+    # DR21RN1-n1: the reader now also reports the recorded ubatch. This record
+    # predates that key, so it reads as None ("unknown") — the on-disk dict is
+    # untouched and the placement itself is still a placement.
+    assert server_ops.recorded_placement(disk) == {
+        "ngl": 99, "n_cpu_moe": 12, "ubatch": None}
 
     # ...and a merge write (an unload) must carry it, not drop it.
     st.update_state(engine_pid=-1, unloaded=True)
     assert server_ops.recorded_placement(st.read_state()) == {
-        "ngl": 99, "n_cpu_moe": 12}
+        "ngl": 99, "n_cpu_moe": 12, "ubatch": None}
 
 
 def test_an_old_record_without_placement_reads_as_unknown(home):
@@ -580,3 +584,183 @@ def test_a_device_resident_load_is_judged_exactly_as_before(home):
     assert r["vram_verdict"] == "diverges"
     assert r["vram_why"] is None
     assert r["diverges"] is True
+
+
+# ---------------------------------------------------------------------------
+# DR21RN1-n1: the compute charge follows the ubatch the LAUNCH used, not the
+# spec's launch default.
+#
+# DR21R-n1 put `resolve.compute_buffer_mb(launch_ubatch(spec))` on the plan side,
+# but an explicit `rigma up --ubatch N` (cli.py) is a REQUEST on the plan flags,
+# not a stored model default: the spec the reader later resolves still says
+# 0/512, while the engine sizes its compute buffer for N. At N=2048 that is
+# 150 MiB charged against the engine's ~1641.12 MiB, and a HEALTHY override load
+# reported `plan_divergence` (+1491.12 > the 512 MiB slack) — the item's own
+# false-positive class, on a shipped CLI path. The launch now records the ubatch
+# it emitted in the `placement` dict, and the reader charges THAT.
+# ---------------------------------------------------------------------------
+
+UBATCH = 2048
+# compute_buffer_mb(2048) = MEASURED_COMPUTE_BUFFER_MB * 2048 / 512.
+UBATCH_COMPUTE_MB = 1641.12
+
+
+def _override_plan(ubatch: int) -> RunPlan:
+    """The plan `rigma up --ubatch <ubatch>` builds.
+
+    The override is a REQUEST on the flags — `RunPlan.server_args` emits `-ub`
+    from exactly `flags.ubatch` — and is not written into the spec, which is why
+    the reader cannot recover it from the registry afterwards."""
+    spec = Registry.load().models[SLUG]
+    gguf = next(g for g in spec.ggufs if g.quant == QUANT)
+    return RunPlan(model_slug=SLUG, gguf=gguf, backend="rocm",
+                   flags=ComboFlags(ctx=CTX, cache_type_k="f16",
+                                    cache_type_v="f16", ngl=99, n_cpu_moe=0,
+                                    ubatch=ubatch), origin="state")
+
+
+def _resident_flags() -> ComboFlags:
+    return ComboFlags(ctx=CTX, cache_type_k="f16", cache_type_v="f16",
+                      ngl=99, n_cpu_moe=0)
+
+
+def _spec_with_launch_ubatch(ubatch: int):
+    """The packaged registry with `launch.ubatch` set on SLUG.
+
+    Zero shipped models set it (the verifier's NIT 3), so this is the only way
+    to exercise a spec-level ubatch above 512."""
+    from rigma.models import LaunchDefaults
+    reg = Registry.load()
+    spec = reg.models[SLUG]
+    base = getattr(spec, "launch", None) or LaunchDefaults()
+    changed = spec.model_copy(
+        update={"launch": base.model_copy(update={"ubatch": ubatch})})
+    return Registry(gpus=reg.gpus, models={**reg.models, SLUG: changed},
+                    combos=reg.combos, use_cases=reg.use_cases)
+
+
+def test_a_launch_with_an_explicit_ubatch_records_it_and_the_healthy_load_is_ok(
+        home):
+    """(a) The override reaches the argv AND the record, and a load that matches
+    the plan at that ubatch adds no finding."""
+    from rigma.resolve import compute_buffer_mb, launch_ubatch
+
+    plan = _override_plan(UBATCH)
+    argv = plan.server_args("model.gguf", 1)
+    assert argv[argv.index("-ub") + 1] == str(UBATCH)   # what the engine gets
+    rec = server_ops.plan_placement(plan)
+    assert rec == {"ngl": 99, "n_cpu_moe": 0, "ubatch": UBATCH}
+
+    # The spec the READER resolves still says 0 (the 150 MiB floor), which is
+    # exactly why the record has to carry the override.
+    assert launch_ubatch(Registry.load().models[SLUG]) == 0
+    state = {**_state(), "placement": dict(rec)}
+    expected = server_ops.planned_vram_mb(state)
+
+    _whole, dev_w, kv = _plan_terms(_resident_flags())
+    assert expected == pytest.approx(
+        dev_w + kv + compute_buffer_mb(UBATCH), abs=0.01)
+    assert compute_buffer_mb(UBATCH) == pytest.approx(UBATCH_COMPUTE_MB)
+
+    log = _load_log(dev_w, kv, ngl=29, compute_mb=compute_buffer_mb(UBATCH))
+    _write_log(home, log)
+    st.write_state(SLUG, QUANT, 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="rocm", ctx=CTX,
+                   kv_cache="f16", placement=dict(rec))
+
+    direct = engine_log.compare_plan(engine_log.parse_load(log), expected,
+                                     expected_placement=dict(rec))
+    assert direct["vram_verdict"] == "ok", direct["detail"]
+    assert abs(direct["divergence_mb"]) < 512.0
+
+    resp = _client(home).get("/api/server/findings")
+    assert resp.status_code == 200
+    assert resp.json()["findings"] == []
+
+
+def test_an_explicit_ubatch_override_with_genuinely_wrong_vram_still_fires(home):
+    """(b) The same shape with the device model buffer 6000 MiB above the plan
+    still yields `plan_divergence`: (a) was not bought by widening the slack."""
+    from rigma.resolve import compute_buffer_mb
+
+    rec = server_ops.plan_placement(_override_plan(UBATCH))
+    _whole, dev_w, kv = _plan_terms(_resident_flags())
+    _write_log(home, _load_log(dev_w + 6000.0, kv, ngl=29,
+                               compute_mb=compute_buffer_mb(UBATCH)))
+    st.write_state(SLUG, QUANT, 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid(), backend="rocm", ctx=CTX,
+                   kv_cache="f16", placement=dict(rec))
+
+    resp = _client(home).get("/api/server/findings")
+    assert resp.status_code == 200
+    ids = [f["id"] for f in resp.json()["findings"]]
+    assert ids == ["plan_divergence"], ids
+
+
+def test_an_old_record_without_a_recorded_ubatch_uses_the_spec_fallback(home):
+    """(c) A placement written before the ubatch was persisted still predicts,
+    and the compute charge falls back to the spec's launch ubatch — whose floor
+    is absorbed by the 512 MiB slack."""
+    from rigma.resolve import MEASURED_COMPUTE_BUFFER_MB, compute_buffer_mb
+
+    state = {**_state(), "placement": {"ngl": 99, "n_cpu_moe": 0}}
+    assert server_ops.recorded_placement(state) == {
+        "ngl": 99, "n_cpu_moe": 0, "ubatch": None}
+
+    _whole, dev_w, kv = _plan_terms(_resident_flags())
+    expected = server_ops.planned_vram_mb(state)
+    assert expected is not None                      # still loads / predicts
+    assert expected == pytest.approx(dev_w + kv + compute_buffer_mb(0))
+
+    # The engine really allocates 410.28 MiB at ubatch 512 while the fallback
+    # charges the 150 floor; the 512 MiB slack absorbs that gap, so a healthy
+    # 512 load is still `ok`.
+    gap = MEASURED_COMPUTE_BUFFER_MB - compute_buffer_mb(0)
+    assert 0.0 < gap < 512.0
+    log = _load_log(dev_w, kv, ngl=29, compute_mb=MEASURED_COMPUTE_BUFFER_MB)
+    r = engine_log.compare_plan(engine_log.parse_load(log), expected,
+                                expected_placement=server_ops.recorded_placement(
+                                    state))
+    assert r["vram_verdict"] == "ok", r["detail"]
+
+    # Absent OR corrupt reads as UNKNOWN, never as the confident 0 (a real
+    # "no -ub" launch): only a genuine non-negative integer is a claim.
+    for junk in ("junk", -1, True, None, 2048.5):
+        p = server_ops.recorded_placement(
+            {"placement": {"ngl": 99, "n_cpu_moe": 0, "ubatch": junk}})
+        assert p["ubatch"] is None, junk
+    assert server_ops.recorded_placement(
+        {"placement": {"ngl": 99, "n_cpu_moe": 0, "ubatch": 0}})["ubatch"] == 0
+    # JSON has no integer type, so a whole-number float is a legitimate read.
+    assert server_ops.recorded_placement(
+        {"placement": {"ngl": 99, "n_cpu_moe": 0,
+                       "ubatch": 2048.0}})["ubatch"] == 2048
+
+
+def test_a_spec_ubatch_above_512_is_charged_correctly(home):
+    """(d) A spec whose own `launch.ubatch` is above 512 is charged at that
+    ubatch — and a RECORDED ubatch still beats the spec when they disagree."""
+    from rigma.resolve import compute_buffer_mb
+
+    custom = _spec_with_launch_ubatch(UBATCH)
+    _whole, dev_w, kv = _plan_terms(_resident_flags())
+
+    # An OLD record (no ubatch) with a spec that sets launch.ubatch 2048: the
+    # fallback charges the spec's ubatch, and a healthy load there is `ok`.
+    old_state = {**_state(), "placement": {"ngl": 99, "n_cpu_moe": 0}}
+    old_expected = server_ops.planned_vram_mb(old_state, custom)
+    assert old_expected == pytest.approx(
+        dev_w + kv + compute_buffer_mb(UBATCH), abs=0.01)
+    log = _load_log(dev_w, kv, ngl=29, compute_mb=compute_buffer_mb(UBATCH))
+    r = engine_log.compare_plan(
+        engine_log.parse_load(log), old_expected,
+        expected_placement=server_ops.recorded_placement(old_state))
+    assert r["vram_verdict"] == "ok", r["detail"]
+
+    # The RECORD wins over the spec: a launch that overrode the spec down to 512
+    # charges the 150 floor, not the spec's 1641.12 MiB.
+    rec_state = {**_state(),
+                 "placement": {"ngl": 99, "n_cpu_moe": 0, "ubatch": 512}}
+    rec_expected = server_ops.planned_vram_mb(rec_state, custom)
+    assert rec_expected == pytest.approx(dev_w + kv + compute_buffer_mb(512))
+    assert rec_expected < old_expected - 1000.0
