@@ -44,9 +44,10 @@ class BenchResult(BaseModel):
         the `in` test to disagree.
         """
         d = self.model_dump()
-        for k in ("depth", "ctx"):
-            if d.get(k) is None:
-                d.pop(k, None)
+        if _recorded_depth(d.get("depth")) is None:
+            d.pop("depth", None)
+        if d.get("ctx") is None:
+            d.pop("ctx", None)
         return d
 
 
@@ -204,6 +205,20 @@ def bench_text(n_tokens: int) -> str:
     return text
 
 
+def _recorded_depth(value) -> int | None:
+    """A depth that may be WRITTEN as a recorded value, or None.
+
+    This is the single predicate `measured_depth` reads a stored value back
+    with: a positive, non-bool int. None, 0 and negatives all mean "no depth
+    was recorded" — `run_bench` already treats a falsy depth as depth-less, so
+    persisting the raw value would let ``"depth" in measured`` disagree with
+    `measured_depth` (D1d).
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def measured_depth(entry: dict) -> int | None:
     """The fill depth a STORED measurement was taken at, or None if unknown.
 
@@ -212,10 +227,7 @@ def measured_depth(entry: dict) -> int | None:
     all of them — never 0, which would claim the window was measured empty, a
     claim the old entries cannot support.
     """
-    d = (entry.get("measured") or {}).get("depth")
-    if isinstance(d, bool) or not isinstance(d, int) or d <= 0:
-        return None
-    return d
+    return _recorded_depth((entry.get("measured") or {}).get("depth"))
 
 
 def measured_filler(entry: dict) -> str | None:
@@ -649,9 +661,12 @@ def _log_rows(plan, rows: list[dict], best: dict | None) -> None:
                      "ok": bool(r.get("ok")), "error": r.get("error", ""),
                      "crowned": r.get("label") == won}
             # Omit rather than null: "no depth recorded" must not be spelled the
-            # same way as a recorded value (see BenchResult.as_measured).
-            if r.get("depth") is not None:
-                entry["depth"] = r["depth"]
+            # same way as a recorded value (see BenchResult.as_measured). The
+            # gate is `measured_depth`'s predicate, so a non-positive depth the
+            # sweep was handed is not written as a "recorded" one (D1d).
+            recorded = _recorded_depth(r.get("depth"))
+            if recorded is not None:
+                entry["depth"] = recorded
             _log_row(entry)
     except Exception:
         pass          # a sweep that lost its log is still a sweep
@@ -976,11 +991,14 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
         if progress:
             progress(label)
         # `depth` is added only when one was requested: a depth-less row must not
-        # carry a null that a reader could mistake for a recorded value.
+        # carry a null that a reader could mistake for a recorded value, and a
+        # non-positive one is depth-less too (`run_bench` ignores it), so it is
+        # gated on the same predicate `measured_depth` reads back with (D1d).
         base = {"label": label, "flags": override,
                 "filler": FILLER_GENERATION}
-        if depth is not None:
-            base["depth"] = depth
+        recorded = _recorded_depth(depth)
+        if recorded is not None:
+            base["depth"] = recorded
         try:
             srv = launch_server(exe, trial, model_path, port=port, timeout=300.0,
                                 extra_args=extra_args)
@@ -1005,8 +1023,9 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
         key = calibration_key(plan.model_slug, plan.gguf.quant, plan.backend)
         measured = {"tg_tps": best["tg_tps"], "pp_tps": best["pp_tps"],
                     "filler": best.get("filler") or FILLER_GENERATION}
-        if best.get("depth") is not None:
-            measured["depth"] = best["depth"]
+        recorded = _recorded_depth(best.get("depth"))
+        if recorded is not None:
+            measured["depth"] = recorded
         save_calibration(key, measured,
                          flags=best["flags"], calibrated=mark_calibrated,
                          ctx=plan.flags.ctx, backend=plan.backend,
