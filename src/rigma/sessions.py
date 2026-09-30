@@ -479,6 +479,24 @@ def _resolved_dirs(raw: list) -> list[Path]:
     return out
 
 
+def _appdata_bases() -> list[Path]:
+    """The roaming-profile roots to floor, from the environment.
+
+    ODR-2b: `%APPDATA%` can be UNSET (a service or a stripped environment). The
+    Windows fallback is `home/AppData/Roaming`, and the home floor does NOT
+    cover it — it neither equals nor contains the home dir — so the fallback
+    must be added explicitly. Off Windows there is no roaming profile and this
+    is harmless.
+    """
+    raw = os.environ.get("APPDATA")
+    if raw:
+        return [Path(raw)]
+    try:
+        return [Path.home() / "AppData" / "Roaming"]
+    except (OSError, RuntimeError):
+        return []
+
+
 def _seed_broad_floors() -> list[Path]:
     """Locations a seeded write root may not equal or CONTAIN.
 
@@ -492,14 +510,7 @@ def _seed_broad_floors() -> list[Path]:
         raw.append(Path.home())
     except (OSError, RuntimeError):
         pass
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        raw.append(Path(appdata))
-    else:
-        # %APPDATA% unset: on Windows the fallback is `home/AppData/Roaming`,
-        # already covered by the home floor above (a root containing it
-        # contains home too). Nothing extra to add.
-        pass
+    raw.extend(_appdata_bases())
     return _resolved_dirs(raw)
 
 
@@ -511,7 +522,8 @@ def _seed_persistence_floors() -> list[Path]:
     a seeded write root. These are the same shapes the OD-2 write denylist
     names — Startup (per-user and all-user), the Start Menu trees, the
     PowerShell profile dirs and `System32\\Tasks`. An unset variable simply
-    contributes nothing, so this is a no-op off Windows.
+    contributes nothing, so this is a no-op off Windows; the per-user family
+    still derives from the `%APPDATA%` FALLBACK when that variable is unset.
     """
     out: list[Path] = []
 
@@ -523,10 +535,11 @@ def _seed_persistence_floors() -> list[Path]:
         except (TypeError, ValueError):
             pass
 
-    add(os.environ.get("APPDATA"), "Microsoft", "Windows", "Start Menu")
-    add(os.environ.get("APPDATA"), "Microsoft", "Windows", "Start Menu",
-        "Programs", "Startup")
-    add(os.environ.get("APPDATA"), "Microsoft", "Windows", "PowerShell")
+    for roaming in _appdata_bases():
+        add(roaming, "Microsoft", "Windows", "Start Menu")
+        add(roaming, "Microsoft", "Windows", "Start Menu", "Programs",
+            "Startup")
+        add(roaming, "Microsoft", "Windows", "PowerShell")
     add(os.environ.get("PROGRAMDATA"), "Microsoft", "Windows", "Start Menu")
     add(os.environ.get("PROGRAMDATA"), "Microsoft", "Windows", "Start Menu",
         "Programs", "Startup")
@@ -571,7 +584,7 @@ def _seed_floor_reason(p: Path, broad: list[Path],
 
 
 def default_write_allowlist(home=None) -> list[str]:
-    """OD-2: the absolute write roots a NEW session starts with.
+    r"""OD-2: the absolute write roots a NEW session starts with.
 
     The owner's EXISTING working folders, used as metadata only: the
     `workspace` of every session already in the store, plus the folders
@@ -591,6 +604,13 @@ def default_write_allowlist(home=None) -> list[str]:
     folders the owner works in" from becoming "the whole machine"; a narrow
     folder (including one inside the home dir) is seeded exactly as before.
 
+    ODR-2b: `resolve()` does NOT normalize an extended-length (`\\?\`), device
+    (`\\.\`) or UNC (`\\host\share`) path, so an alias of the home dir would
+    never match the floor's lexical comparison and would be seeded — and
+    `_write_path` would then admit an absolute destination under it. A local
+    working folder is never written in one of those forms, so the whole family
+    is ignored BEFORE `resolve()`.
+
     Entries are resolved and deduped (case-insensitively on Windows); a
     non-absolute or unparseable entry is ignored, never raised.
     """
@@ -600,8 +620,13 @@ def default_write_allowlist(home=None) -> list[str]:
     roots: list[str] = []
     seen: set[str] = set()
     for raw in _store_workspaces(base) + _rag_source_folders(base):
+        text = str(raw).strip()
+        # ODR-2b: `\\?\`, `\\.\` and `\\host\share` (either separator) are
+        # aliases `resolve()` leaves untouched, so the floor cannot see them.
+        if text.startswith(("\\\\", "//")):
+            continue
         try:
-            cand = Path(str(raw))
+            cand = Path(text)
         except (OSError, ValueError, TypeError):
             continue
         # ODR-2: test `is_absolute` on the RAW entry, BEFORE `resolve()`.
