@@ -1,3 +1,4 @@
+import socket
 import subprocess
 import sys
 import time
@@ -21,26 +22,64 @@ from rigma.bench import (
 from rigma.models import ComboFlags, GgufFile, RunPlan
 
 
+def _free_port() -> int:
+    """An ephemeral loopback port the OS just told us was free.
+
+    REC-1: this fixture used to hard-code 11598, and it is the ONLY server in
+    the suite that binds a literal port — every other one passes 0 and lets the
+    kernel choose. So two concurrent `pytest tests` runs collided here: the
+    second run's child died on `address already in use`, the parent's /health
+    poll was then answered by the FIRST run's server (so the fixture reported
+    "ready" and the tests silently measured another process), and when the
+    first run tore its server down the second blocked on an established socket
+    to a server that had gone away — the frozen-suite / leaked-children failure
+    recorded as REC-1. Binding an ephemeral port removes the shared resource.
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
 @pytest.fixture
 def oai_server():
     fake = Path(__file__).parent / "fake_oai_server.py"
-    proc = subprocess.Popen([sys.executable, str(fake), "--port", "11598"])
-    ready = False
-    for _ in range(50):
-        try:
-            if httpx.get("http://127.0.0.1:11598/health", timeout=1).status_code == 200:
-                ready = True
-                break
-        except Exception:
-            time.sleep(0.1)
-    if not ready:
-        # the loop used to fall through silently, so a server that never came
-        # up surfaced as a confusing connection error inside whichever test
-        # happened to run first (AUDIT F60)
+    # Retry on a fresh port: the child can still lose the race to another
+    # process between our probe and its bind. What must NOT happen is falling
+    # through to someone else's server, so a dead child is treated as "try
+    # again", never as "ready".
+    for _attempt in range(5):
+        port = _free_port()
+        proc = subprocess.Popen([sys.executable, str(fake), "--port", str(port)])
+        ready = False
+        for _ in range(50):
+            if proc.poll() is not None:
+                break  # the child could not bind — pick another port
+            try:
+                if httpx.get(f"http://127.0.0.1:{port}/health",
+                             timeout=1).status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.1)
+        if ready:
+            try:
+                yield port
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+            return
         proc.terminate()
-        pytest.fail("fake engine on port 11598 never answered /health")
-    yield 11598
-    proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+    # the loop used to fall through silently, so a server that never came
+    # up surfaced as a confusing connection error inside whichever test
+    # happened to run first (AUDIT F60)
+    pytest.fail("fake engine never answered /health on any free port")
 
 
 def test_run_bench_reads_timings(oai_server):
