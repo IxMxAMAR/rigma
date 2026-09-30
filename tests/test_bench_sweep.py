@@ -855,6 +855,55 @@ def test_a_tools_capable_q4_plan_that_drops_everything_says_so(
     assert "every config was dropped" in caplog.text
 
 
+def test_auto_calibrate_on_a_q4_tools_plan_caches_nothing_to_calibrate(
+        monkeypatch, tmp_path, caplog):
+    """W15A-n2. `auto_calibrate` promises the first-load tune is cached forever
+    after. On a tools-capable model whose plan already carries q4_0 the whole
+    quick set is dropped before it can launch, so `run_sweep` crowns nothing and
+    wrote no entry: every later load re-entered the sweep and re-fired the
+    warning. The DECISION ("nothing to calibrate here") is now recorded, with no
+    `flags` and no `measured` numbers, so it can never be read as a measured
+    placement of a config that never ran."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    monkeypatch.setattr(bench, "_tools_capable", lambda slug: True)
+    launched = []
+
+    class _FakeSrv:
+        def stop(self):
+            pass
+
+    def fake_launch(*a, **k):
+        launched.append(1)
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
+    monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
+        pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
+    plan = _plan(cache_type_k="q4_0", cache_type_v="q4_0")
+
+    assert bench.is_calibrated("m", "Q4", "vulkan") is False
+    with caplog.at_level("WARNING", logger="rigma.bench"):
+        out = bench.auto_calibrate(plan, tmp_path / "srv.exe",
+                                   tmp_path / "m.gguf", port=11601)
+    # Nothing was trialled, and the first load says why.
+    assert launched == []
+    assert "already quantizes the KV cache to q4_0" in caplog.text
+    # ... but the decision IS cached, which is what "forever after" needs.
+    assert bench.is_calibrated("m", "Q4", "vulkan") is True
+    entry = _only_entry()
+    assert entry.get("calibrated") is True
+    assert not entry.get("flags")             # never a measured placement
+    assert not (entry.get("measured") or {})  # no numbers were measured
+    assert out.flags.cache_type_k == "q4_0"   # nothing was applied
+    # Second load: a cache hit — no launch and, crucially, no repeat warning.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="rigma.bench"):
+        bench.auto_calibrate(out, tmp_path / "srv.exe", tmp_path / "m.gguf",
+                             port=11601)
+    assert launched == []
+    assert "already quantizes the KV cache to q4_0" not in caplog.text
+
+
 def test_a_calibration_merged_one_sided_q4_plan_is_dropped_too(
         monkeypatch, tmp_path):
     """The shape the CONSTRUCTOR cannot make but a calibration merge can.
