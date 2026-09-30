@@ -739,6 +739,16 @@ export interface ChatState {
    *  interruption. Written from the session payload's `streaming` flag on open
    *  and by `refreshRemote` while it is true. */
   remoteStreaming: Record<string, boolean>;
+  /** OD-13: the sessions this tab has ASKED the server to stop, while the
+   *  server's own `streaming` flag has not yet gone false.
+   *
+   *  A remotely-owned turn is not this tab's to declare stopped. The tab that
+   *  clicks only REQUESTS; the server's `streaming` is the truth. This map is
+   *  what lets the control say "stop requested…" instead of claiming a stop the
+   *  tab did not perform, and what stops a second click from firing a second
+   *  POST. It is dropped the moment the server says the chat is no longer
+   *  generating, so a later remote turn cannot inherit a spent request. */
+  remoteStopRequested: Record<string, boolean>;
   /** The take a regenerate set aside, per session — it is folded back in when
    *  THAT session's turn returns, however many chats later. */
   pendingVariants: Record<string, { content: unknown; variants: unknown[] }>;
@@ -830,6 +840,13 @@ export interface ChatState {
    *  back where it came from even if the user has switched chats since. */
   setDraft: (text: string, sid?: string) => void;
   stop: () => void;
+  /** OD-13: stop a turn this tab does NOT own — a reload or a second tab
+   *  started it. The SAME route as `stop` (`POST /api/sessions/{sid}/stop`),
+   *  but there is no local stream to abort, so nothing here may claim the turn
+   *  ended: the request is recorded, the server's own `streaming` flag is
+   *  re-read, and a `stopped: false` answer ("nothing was running") is said out
+   *  loud rather than dressed up as a stop this tab performed. */
+  stopRemote: (id: string) => Promise<void>;
   /** Fold this chat's older turns into a digest. Returns the server's own
    *  refusal message when it refuses, so the caller can SHOW it: the two
    *  refusals (mid-reply, nothing to compact) are informative, and a silent
@@ -908,6 +925,7 @@ export const useChat = create<ChatState>((set, get) => ({
   mcodeTransport: "exec",
   savedAgent: {},
   remoteStreaming: {},
+  remoteStopRequested: {},
 
   loadSessions: async () => {
     try {
@@ -916,11 +934,18 @@ export const useChat = create<ChatState>((set, get) => ({
       // draws. The rail reads `sessions[].streaming` directly, but the transcript
       // reads this map, and two sources for one fact must not disagree.
       const cur = get().currentId;
+      const curRow = cur ? rows.find((r) => r.id === cur) : undefined;
       set((st) => ({
         sessions: rows,
-        ...(cur && rows.some((r) => r.id === cur)
+        ...(cur && curRow
           ? { remoteStreaming: { ...st.remoteStreaming,
-                                 [cur]: rows.find((r) => r.id === cur)?.streaming === true } }
+                                 [cur]: curRow.streaming === true },
+              // OD-13: the server says this chat is done, so any stop request
+              // this tab made is spent — keeping it would arm the NEXT remote
+              // turn with a stale "stop requested…".
+              ...(curRow.streaming === true
+                ? {} : { remoteStopRequested:
+                           without(st.remoteStopRequested, cur) }) }
           : {}),
       }));
     } catch (e) {
@@ -939,6 +964,11 @@ export const useChat = create<ChatState>((set, get) => ({
       // `messages` under it would draw that reply twice.
       set((st) => ({
         remoteStreaming: { ...st.remoteStreaming, [id]: s.streaming === true },
+        // OD-13: a stop request only means anything while the server still says
+        // the chat is generating. Its own flag is the truth, so the moment it
+        // says otherwise the request is spent.
+        ...(s.streaming === true
+          ? {} : { remoteStopRequested: without(st.remoteStopRequested, id) }),
         ...(st.currentId === id && !st.streams[id]
           ? { messages: s.messages } : {}),
       }));
@@ -980,6 +1010,8 @@ export const useChat = create<ChatState>((set, get) => ({
       pendingVariants: without(st.pendingVariants, id),
       // D3b: the chat is gone, so its liveness flag must not outlive it.
       remoteStreaming: without(st.remoteStreaming, id),
+      // OD-13: and neither must a stop request made against it.
+      remoteStopRequested: without(st.remoteStopRequested, id),
       // the draft was typed for a chat that is about to stop existing
       drafts: without(st.drafts, id),
       // R5-PERSIST: and so was the agent state. Same reason as the draft — every
@@ -1025,6 +1057,12 @@ export const useChat = create<ChatState>((set, get) => ({
         notice: null,
         // D3b: the reload's own answer to "is this chat still generating?".
         remoteStreaming: { ...get().remoteStreaming, [id]: s.streaming === true },
+        // OD-13: the same truth decides whether a stop request is still live.
+        // Opening a chat the server says is NOT generating clears any spent
+        // request, so the control cannot open already reading "stop requested…".
+        ...(s.streaming === true
+          ? {} : { remoteStopRequested:
+                     without(get().remoteStopRequested, id) }),
         // R5-PERSIST: the agent's durable state comes back with the chat, so the
         // panel survives a reload. Replaced rather than merged — this is the
         // server's authoritative copy for THIS chat, and a stale local fragment
@@ -1391,6 +1429,50 @@ export const useChat = create<ChatState>((set, get) => ({
     void api.stopSession(currentId)
       .catch(() => {})
       .then(() => get().aborts[currentId]?.abort());
+  },
+
+  // OD-13. A turn this tab did NOT start — a reload mid-generation, or another
+  // tab — is visible (D3b) but used to be unstoppable. Same route as `stop`;
+  // what is different is what this tab is allowed to CLAIM afterwards.
+  //
+  // There is no local stream to abort, so the server's own `streaming` flag is
+  // the only thing that decides whether the turn ended. This tab records that
+  // it REQUESTED a stop and re-reads that flag; if the server answers
+  // `stopped: false` ("nothing was running") the honest thing is to say the
+  // turn had already finished, never to claim a stop this tab did not perform.
+  // Two tabs clicking the same turn both only request, so neither believes it
+  // owns the stop.
+  stopRemote: async (id) => {
+    // One request at a time: the control is disabled while it is in flight, but
+    // the store is the guard that survives a fast double-click.
+    if (get().remoteStopRequested[id]) return;
+    set((st) => ({
+      remoteStopRequested: { ...st.remoteStopRequested, [id]: true },
+      lastError: null,
+    }));
+    let stopped: boolean;
+    try {
+      stopped = (await api.stopSession(id)).stopped === true;
+    } catch (e) {
+      // The route refused or the request never landed. Nothing was stopped, so
+      // clear the request rather than leaving the control stuck on
+      // "stop requested…", and keep the server's sentence.
+      set((st) => ({
+        remoteStopRequested: without(st.remoteStopRequested, id),
+        lastError: errText(e),
+      }));
+      return;
+    }
+    // The SERVER's state, not this tab's request, is the truth about whether
+    // the turn is over. `refreshRemote` also drops the request if it is.
+    await get().refreshRemote(id);
+    if (get().remoteStreaming[id] === true) return;   // still unwinding
+    if (!stopped) {
+      // The event this route sets did not exist: the turn was already over
+      // (finished, or stopped by another tab). Say that, do not claim a stop.
+      set({ notice: "the server says that turn had already finished — "
+                    + "nothing was running to stop" });
+    }
   },
 
   compactChat: async () => {

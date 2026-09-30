@@ -225,13 +225,25 @@ function ContextMeter() {
   );
 }
 
-function Composer() {
+/** Exported (like `SessionRail`) so a render test can reach the stop control
+ *  for a remotely-owned turn — the wave-2 verifier's lesson (W5F1a) is that a
+ *  small render line inside an unexported component can be deleted with the
+ *  whole suite green. */
+export function Composer() {
   const send = useChat((s) => s.send);
   const notice = useChat((s) => s.notice);
   const clearNotice = useChat((s) => s.clearNotice);
   const stop = useChat((s) => s.stop);
+  const stopRemote = useChat((s) => s.stopRemote);
   const streaming = useChat(selectStreaming);
   const currentId = useChat((s) => s.currentId);
+  // OD-13: the server is generating a turn THIS tab did not start. `streaming`
+  // (the tab's own turn) is null here, so before this there was no control at
+  // all — a reloaded chat could watch the turn but not cancel it.
+  const remote = useChat((s) =>
+    s.currentId ? s.remoteStreaming[s.currentId] === true : false);
+  const stopRequested = useChat((s) =>
+    s.currentId ? s.remoteStopRequested[s.currentId] === true : false);
   const images = useChat((s) => s.images);
   const addImage = useChat((s) => s.addImage);
   const removeImage = useChat((s) => s.removeImage);
@@ -427,6 +439,37 @@ function Composer() {
             className="shrink-0 text-muted hover:text-secondary text-[12px] leading-none"
           >
             ×
+          </button>
+        </div>
+      )}
+      {/* OD-13: a stop control for a turn this tab did NOT start — a reload
+          mid-generation, or a second tab. The server's own `streaming` flag is
+          what puts this row on screen, and it is what takes it away: the tab
+          only REQUESTS a stop, so the button says "stop requested…" until the
+          server itself says the turn is over. It is a row above the composer
+          rather than the composer's send/stop slot so that a queued message
+          can still be sent while the remote turn finishes. */}
+      {remote && !streaming && currentId && (
+        <div role="status"
+             className="flex items-center gap-2 rounded-md bg-amber/10 px-3 py-1.5 mb-1.5">
+          <span className="flex-1 min-w-0 text-[12px] text-amber">
+            this chat is still generating on the server — a reload or another
+            tab started this turn
+          </span>
+          <button
+            onClick={() => void stopRemote(currentId)}
+            disabled={stopRequested}
+            aria-label={stopRequested ? "stop requested" : "stop the remote turn"}
+            title={stopRequested
+              ? "the server has the stop request. It ends the turn in its own "
+                + "time, and this row disappears when its own state says so."
+              : "ask the server to stop the turn running in this chat. This "
+                + "tab did not start it, so the server's state — not this "
+                + "click — decides when it ends."}
+            className="shrink-0 rounded-md bg-red/15 text-red px-3 py-1 text-[12px]
+                       font-semibold disabled:opacity-50"
+          >
+            {stopRequested ? "stop requested…" : "stop it"}
           </button>
         </div>
       )}
