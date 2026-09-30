@@ -935,15 +935,25 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
                  usable_vram: float, k: str = "", v: str = "") -> dict:
     """Where the VRAM actually goes, in MB. The whole point of the explorer is
     that a single "8K" tells you nothing about WHY — this is the arithmetic
-    behind it, so a 46MB near-miss reads as a near-miss."""
+    behind it, so a 46MB near-miss reads as a near-miss.
+
+    A2b: the RS term was missing here. `_fit_with_cache` charges it (A2) and the
+    explorer's `offload_pct` follows the fit (A3), but this table did not — so a
+    row could read "fits" (`over_mb` <= 0) while the fit it describes offloaded a
+    layer. Same term, same multiplier, one source: `recurrent_state_mb` times
+    `LAUNCH_PARALLEL`, exactly as the fit computes it. Zero for a dense model and
+    for a hybrid whose geometry is unknown (the fit says `rs=unknown` there).
+    """
     k = k or spec.cache_type_policy.k
     v = v or spec.cache_type_policy.v
     kv_mb = (ctx * kv_bytes_per_token(spec, k, v)
              + swa_kv_bytes(spec, k, v, ctx)) / 2**20
     file_mb = gguf.bytes / 2**20
+    rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
     return {"file_mb": round(file_mb), "mmproj_mb": round(mm_mb),
-            "kv_mb": round(kv_mb), "budget_mb": round(usable_vram),
-            "over_mb": round(file_mb + mm_mb + kv_mb - usable_vram),
+            "kv_mb": round(kv_mb), "rs_mb": round(rs_mb),
+            "budget_mb": round(usable_vram),
+            "over_mb": round(file_mb + mm_mb + kv_mb + rs_mb - usable_vram),
             "ctx": ctx, "kv_type": k}
 
 

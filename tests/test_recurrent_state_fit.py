@@ -115,3 +115,36 @@ def test_a_recurrent_model_without_ssm_geometry_is_charged_zero_and_says_so():
     flags = fit_gguf(spec, spec.ggufs[0], _profile(), 8192, explain)
     assert flags is not None
     assert any("rs=unknown" in ln for ln in explain), explain
+
+
+def test_the_budget_table_charges_the_recurrent_state():
+    """A2b: the fit charges RS (A2), but the display-only budget table did not —
+    so an explorer row could read "fits" (`over_mb` <= 0) while the fit actually
+    offloads a layer. The geometry is the owner's real hybrid, and every constant
+    comes from the code: 48 recurrent layers of 64, ssm.* from the header,
+    multiplied by LAUNCH_PARALLEL."""
+    from rigma.resolve import LAUNCH_PARALLEL, _budget_rows, recurrent_state_mb
+    spec = _bonsai()
+    gguf = spec.ggufs[0]
+    per_seq = recurrent_state_mb(spec)
+    rs_mb = per_seq * LAUNCH_PARALLEL
+    # 48 x (S + R) = 149.625 MiB per sequence; the launch runs two
+    assert rs_mb == pytest.approx(299.25, abs=0.02)
+    assert LAUNCH_PARALLEL == 2
+
+    ctx, generous = 8192, 15000.0
+    row = _budget_rows(spec, gguf, 0.0, ctx, generous)
+    blind = spec.model_copy(update={"recurrent_layers": 0})
+    blind_row = _budget_rows(blind, blind.ggufs[0], 0.0, ctx, generous)
+    assert row["rs_mb"] == round(rs_mb)
+    # the term is inside the arithmetic the page calls "over", not only in its
+    # own column (both columns are rounded to whole MB, so allow the rounding)
+    assert row["over_mb"] - blind_row["over_mb"] == pytest.approx(rs_mb, abs=1)
+
+    # and the failure the finding describes: a budget with room for everything
+    # EXCEPT the RS buffer. The old table said it fits; the fit offloads.
+    budget = gguf.bytes / MIB + blind_row["kv_mb"] + 150.0
+    fits = _budget_rows(blind, gguf, 0.0, ctx, budget)
+    honest = _budget_rows(spec, gguf, 0.0, ctx, budget)
+    assert fits["over_mb"] <= 0 < honest["over_mb"], (
+        f"budget table disagrees with the fit: {fits} vs {honest}")
