@@ -677,6 +677,27 @@ def _engine_version(backend: str = "") -> str:
 _QUALITY_ENV_LEVERS = ("LLAMA_ATTN_ROT_DISABLE",)
 
 
+def _quality_env_levers_in(env: dict | None) -> list[str]:
+    """The `_QUALITY_ENV_LEVERS` names that `env` sets, matched case-INSENSITIVELY.
+
+    llama.cpp reads each lever with the C library's `getenv`
+    (`ggml-org/llama.cpp@b9867 src/llama-kv-cache.cpp`:
+    `getenv("LLAMA_ATTN_ROT_DISABLE")`), and on Windows that lookup ignores
+    case — Microsoft's own reference: "getenv isn't case sensitive in the
+    Windows operating system"
+    (learn.microsoft.com/en-us/cpp/c-runtime-library/reference/getenv-wgetenv).
+    So a lowercase `llama_attn_rot_disable` really does disable the rotation
+    there and must be gated. On POSIX `getenv` IS case-sensitive, so this
+    over-matches there — the safe direction (a dropped trial, never a crowned
+    or persisted lever).
+
+    Returns the canonical names (not the caller's spelling) so a message names
+    the lever, not a hand-edited alias of it.
+    """
+    present = {str(k).upper() for k in (env or {})}
+    return [name for name in _QUALITY_ENV_LEVERS if name.upper() in present]
+
+
 def _carries_quality_env_lever(flags: dict | None) -> bool:
     """Whether a trial's override flips an engine default that protects QUALITY.
 
@@ -687,9 +708,11 @@ def _carries_quality_env_lever(flags: dict | None) -> bool:
     on tokens/sec alone would write it to calibration.json, and
     `runtime.launch_server` would merge it into every later launch's child
     environment — a silent quality regression traded for a speed win.
+
+    The name match is case-insensitive (`_quality_env_levers_in`) because the
+    engine's own lookup is on Windows.
     """
-    env = (flags or {}).get("env") or {}
-    return any(name in env for name in _QUALITY_ENV_LEVERS)
+    return bool(_quality_env_levers_in((flags or {}).get("env")))
 
 
 def _effective_env(plan_flags, override: dict) -> dict:
