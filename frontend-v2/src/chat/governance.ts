@@ -107,7 +107,15 @@ export function foldApproval(
     id: str(d.id),
     toolName: str(d.toolName),
     reason: str(d.reason),
-    outcome: str(d.outcome),
+    // OD-12: the server's own clock, never the client's. When a question's
+    // window closes the server emits `approval/decided` for the SAME id with
+    // `decision: "expired"` and NO `outcome` — a real allow/refuse still carries
+    // `outcome`. Both land on the trail's own `outcome` field, so an expired
+    // question becomes the same terminal, decided row every other verdict
+    // already renders (glyph, tone, label, no control) instead of a second
+    // visual language. `outcome` is read FIRST, so a real decision folds exactly
+    // as it did; `decision` is only a fallback for the expiry word.
+    outcome: str(d.outcome) || (str(d.decision) === "expired" ? "expired" : ""),
     policy: str(d.policy),
     // B4: the elicitation's own fields. `requestKind` is a SEPARATE name from
     // `kind` on purpose: `kind` is the approval/ SUFFIX (`asked`/`decided`), and
@@ -251,7 +259,11 @@ export function questionReady(
 
 /** `allowed-once` reads as permission granted; the other three do not. */export function outcomeTone(outcome: string): string {
   if (outcome === "allowed-once") return "text-amber";
-  if (outcome === "rejected" || outcome === "unavailable") return "text-red";
+  // `expired` is the same fail-closed family as `unavailable`: nobody answered,
+  // so the question was NOT answered and the turn went on without one. It must
+  // not read as a neutral `cancelled`, which was a decision the user made.
+  if (outcome === "rejected" || outcome === "unavailable"
+      || outcome === "expired") return "text-red";
   return "text-muted";
 }
 
@@ -264,6 +276,10 @@ export function outcomeLabel(outcome: string): string {
     // DSH's fail-closed outcome: nobody could answer, so it was NOT permitted.
     // Spelling that out matters — "unavailable" alone reads like a network blip.
     case "unavailable": return "not permitted (nobody could answer)";
+    // OD-12: the word the server sends when a question's 5 s window closed with
+    // no answer. "expired" alone reads like a cache miss; the row must say that
+    // nobody answered in time and the turn went on without one.
+    case "expired": return "expired — no answer in time";
     default: return outcome;
   }
 }
