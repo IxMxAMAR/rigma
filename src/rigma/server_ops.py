@@ -999,7 +999,8 @@ def perform_switch(model: str, registry=None, profile=None,
     if (ctx is None and rp.backend != "cpu"
             and os.environ.get("RIGMA_AUTO_CALIBRATE", "1") != "0"
             and (force_calibrate
-                 or not is_calibrated(rp.model_slug, rp.gguf.quant, rp.backend))):
+                 or not is_calibrated(rp.model_slug, rp.gguf.quant, rp.backend,
+                                      rp.flags))):
         _write_calib_marker(rp.model_slug, "starting")
         try:
             rp = auto_calibrate(rp, exe, model_path, port=port, extra_args=extra,
