@@ -113,12 +113,12 @@ export function LaunchDefaultsForm({
   // Without this an unknown window would hide the pinned value and the user
   // could not remove it from here.
   if (draft.ctx && !ctxs.includes(Number(draft.ctx))) ctxs.push(Number(draft.ctx));
-  const storedCtx = Number(draft.ctx) || 0;
+  const currentCtx = Number(draft.ctx) || 0;
   // The launch path (`server_ops.perform_switch`) does
   // `want = max(2048, min(int(ctx), spec.native_ctx))` — so a stored value above
   // the window is CLAMPED, not honoured. Say it here, where the value was
   // chosen, instead of letting the resolver do it silently.
-  const ctxClampedTo = ctxKnown(nativeCtx) && storedCtx > nativeCtx
+  const ctxClampedTo = ctxKnown(nativeCtx) && currentCtx > nativeCtx
     ? nativeCtx : null;
   const qs = quants.slice();
   if (draft.quant && !qs.includes(draft.quant)) qs.push(draft.quant);
@@ -169,20 +169,23 @@ export function LaunchDefaultsForm({
           // DR2-4: the pre-fix fallback invented 262144, so a 32K model was
           // offered 64K/128K/256K. An unknown window gets NO steps — only
           // "model default", which is the resolver's own safe choice — and the
-          // control says so. A stored value stays visible so it can be cleared.
+          // control says so. A value already in the draft (a stored default, or
+          // the Sidecar's running-config seed) stays visible so it can be
+          // cleared; it is not a new offer.
           <p role="note" className="text-[11.5px] text-amber pl-28 -mt-1">
             {slug}'s native context window is unknown right now — the models
             list and the engine both failed to answer. Rigma will not offer a
             context it cannot justify, so only "model default" (the resolver's
             own safe choice) is offered here
-            {storedCtx
-              ? `; the stored ${storedCtx} is kept visible so you can clear it`
+            {currentCtx
+              ? `; the current value ${currentCtx} is kept visible so you can `
+                + "clear it"
               : ""}.
           </p>
         )}
         {ctxClampedTo !== null && (
           <p role="note" className="text-[11.5px] text-amber pl-28 -mt-1">
-            the stored context {storedCtx} is above {slug}'s native window
+            the current context {currentCtx} is above {slug}'s native window
             {" "}{ctxClampedTo}, so a launch clamps it to {ctxClampedTo} — the
             pinned value is not what runs. Pick {ctxClampedTo} or lower, or
             clear it.
