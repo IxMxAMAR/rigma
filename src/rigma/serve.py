@@ -880,6 +880,59 @@ def _release_unreadable_run(runs_mod, run_id: str,
     return run
 
 
+def _reconcile_orphaned_runs(runs_mod=None, *, driven_ids=()) -> None:
+    """A run that says "running" at boot is lying: no task is driving it.
+
+    Before this hook existed, any restart mid-run (crash, Windows update reboot,
+    manual restart) left active.json wedged at status=running — and start_run
+    409s while a run is active, so EVERY future run was blocked until someone
+    hand-cleared the file. On a machine doing 20-hour unattended jobs, a reboot
+    permanently disabled the feature.
+
+    DR1-residual: the pointer alone is not enough. When a run's `run.json` could
+    not be READ at release time, `_release_unreadable_run` leaves the file
+    untouched (DR1: it may be a good record a transient lock hid) and clears
+    active.json — so `runs.active()` returns None and this hook was blind to it.
+    `restart_run` then answered 409 "run is running" ACROSS REBOOTS, and
+    pause/resume/inject 409 "run has no driver": a dead end only Stop cleared.
+
+    So the sweep below reads every run DIRECTORY, not just the pointer. At boot
+    the lock that failed the read is gone, so a `run.json` that still says
+    `running`/`paused` is read again and given the same honest terminal status.
+    `runs.load` is used deliberately, never a direct overwrite: a file that still
+    cannot be READ is left exactly as it is (DR1's guarantee), and a record whose
+    `id` is not its directory name is skipped, so releasing A never writes into
+    B's directory. `driven_ids` names the runs a live task is driving — empty at
+    boot — so a caller can never reconcile a run that is actually being driven.
+    """
+    if runs_mod is None:
+        from . import runs as runs_mod
+    try:
+        a = runs_mod.active()
+        if a and a.get("status") in ("running", "paused"):
+            # 'interrupted', NOT 'stopped': the user never asked for this,
+            # and everything needed to continue is still on disk — the UI
+            # offers Resume for exactly this state
+            runs_mod.set_status(a, "interrupted", "server restarted mid-run")
+    except Exception:
+        _log.exception("startup: run reconciliation failed")
+    try:
+        for d in sorted(runs_mod._runs_dir().iterdir()):
+            if not d.is_dir() or d.name in driven_ids:
+                continue
+            run = runs_mod.load(d.name)
+            if (not isinstance(run, dict) or run.get("id") != d.name
+                    or run.get("status") not in ("running", "paused")):
+                continue
+            try:
+                runs_mod.set_status(run, "interrupted",
+                                    "server restarted mid-run")
+            except Exception:
+                _log.exception("startup: could not reconcile run %s", d.name)
+    except Exception:
+        _log.exception("startup: orphaned-run sweep failed")
+
+
 def _patch_session(sid: str, body: dict) -> dict | None:
     """Apply only the fields in `body` to a session, without clobbering a turn.
 
@@ -1750,11 +1803,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     async def _lifespan(_app: FastAPI):
         """Startup/shutdown. Replaces @app.on_event, which FastAPI deprecated.
 
-        The four steps are defined further down this function, beside the
+        The remaining steps are defined further down this function, beside the
         state each one touches; names in a closure resolve when the closure
         RUNS, and lifespan runs long after build_app has returned, so they are
-        all bound by then."""
-        await _reconcile_orphaned_runs()
+        all bound by then. `_reconcile_orphaned_runs` is module-level so a test
+        can drive a boot without starting the app."""
+        # DR1-residual: pass the runs a live task is driving so the sweep can
+        # never reconcile a run that is actually being driven (empty at boot).
+        _reconcile_orphaned_runs(
+            driven_ids={rid for rid, t in _run_tasks.items() if not t.done()})
         if os.environ.get("RIGMA_MEMORY") != "0":
             # 14-10: the embedding model load must never land inside a turn
             await _warm_memory_embedder()
@@ -7525,25 +7582,6 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # "stopped" often never ran, leaving run.json at "running".
             await asyncio.wait(tasks, timeout=10)
         _run_tasks.clear()
-
-    async def _reconcile_orphaned_runs():
-        """A run that says "running" at boot is lying: _run_tasks is empty at
-        startup, so no task is driving it. Before this hook existed, any
-        restart mid-run (crash, Windows update reboot, manual restart) left
-        active.json wedged at status=running — and start_run 409s while a run
-        is active, so EVERY future run was blocked until someone hand-cleared
-        the file. On a machine doing 20-hour unattended jobs, a reboot
-        permanently disabled the feature."""
-        from . import runs as _runs
-        try:
-            a = _runs.active()
-            if a and a.get("status") in ("running", "paused"):
-                # 'interrupted', NOT 'stopped': the user never asked for this,
-                # and everything needed to continue is still on disk — the UI
-                # offers Resume for exactly this state
-                _runs.set_status(a, "interrupted", "server restarted mid-run")
-        except Exception:
-            _log.exception("startup: run reconciliation failed")
 
     def _start_keepalive():
         """The idle auto-unload poller.
