@@ -988,12 +988,9 @@ def perform_switch(model: str, registry=None, profile=None,
     except Exception as e:          # restore() reports, it does not raise
         kv_err = str(e)[:200]
     if kv_err:
-        # "about four minutes" is the measurement in kvcache's module docstring
-        # (120K window, ~560 t/s prefill on this machine), not a new claim.
-        cold = (f"the saved prompt cache for this exact configuration would not "
-                f"load ({kv_err}) — this conversation will be re-prefilled from "
-                f"zero, about four minutes on a 120K window. The cache is "
-                f"rewritten when the model is next unloaded.")
+        # A8b: the wording lives in kvcache.restore_failure_note so `rigma up`
+        # and this path cannot describe the same refusal two different ways.
+        cold = kvcache.restore_failure_note(kv_err)
         _log.warning("kv-cache restore failed for %s [%s]: %s — re-prefilling "
                      "from zero", rp.model_slug, kv_fp, kv_err)
         rp.explain.append(cold)
