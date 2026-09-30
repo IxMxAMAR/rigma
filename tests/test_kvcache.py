@@ -221,3 +221,93 @@ def test_a_legacy_entry_without_the_engine_version_is_invalid_not_a_match(
     restored, note = kvcache.restore(1, tmp_path, kvcache.fingerprint(modern))
     assert restored is False
     assert note is None
+
+
+# --- A13b: a REGISTERED engine's identity is its own binary, not the pin's ----
+#
+# `engine_binary_for` prefers a registered engine at an arbitrary path (this
+# machine has prism-b10743-vulkan and prism-b10743-hip). The fingerprint recorded
+# that path but the version of the PIN — `engine_identity(backend)` looks under
+# ~/.rigma/engines/<manifest version>/<backend> — so an in-place swap of a
+# registered engine kept the same name and a stale cache was reused. A path is
+# not a build, and `launch_fingerprint` already receives the exe that will run.
+
+LEGACY = ("llama-server.exe : version: 9867 (152d337fa)\n"
+          "built with Clang 20.1.8 for Windows x86_64\n")
+# The modern scheme, from the hand-installed PrismML fork. Its identity differs
+# from the pin's in BOTH the build number and the commit.
+MODERN = ("llama-server.exe : version: 0.2.0-dev (build 10743, commit 9a9394a89)\n"
+          "built with Clang 21.0.0 for Windows AMD64\n")
+
+
+def _registered_exe(tmp_path):
+    """A registered engine at its own path — the shape `engine_binary_for`
+    returns for `prism-b10743-vulkan`, not the pinned directory layout."""
+    p = tmp_path / "prism-b10743-vulkan" / "llama-server.exe"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(b"x")
+    return p
+
+
+def test_a_registered_engine_is_identified_by_its_own_binary(tmp_path,
+                                                             monkeypatch):
+    """The pin answers for the backend; the launched file is what will run. A
+    fingerprint that records the pin's version next to a registered path cannot
+    see that engine change."""
+    from rigma import engine_build, server_ops
+    exe = _registered_exe(tmp_path)
+    engine_build._BUILD_CACHE.clear()
+    monkeypatch.setattr(engine_build, "read_build",
+                        lambda *a, **k: engine_build.parse_version(MODERN))
+    monkeypatch.setattr(server_ops, "engine_version",
+                        lambda backend="": "b9867+152d337fa")
+    rp = _plan()
+    got = kvcache.launch_fingerprint(rp, exe)
+    measured = engine_build.parse_version(MODERN).identity
+    assert got == kvcache.fingerprint(
+        kvcache.config_of(rp, str(exe), engine_version=measured))
+    assert got != kvcache.fingerprint(
+        kvcache.config_of(rp, str(exe), engine_version="b9867+152d337fa")), \
+        "the registered engine was identified as the pin"
+
+
+def test_swapping_a_registered_engine_in_place_changes_the_fingerprint(
+        tmp_path, monkeypatch):
+    """The failure this closes: the same registered path, a different build, and
+    a cache that would otherwise be offered to an engine that never wrote it."""
+    from rigma import engine_build, server_ops
+    exe = _registered_exe(tmp_path)
+    state = {"modern": False}
+    engine_build._BUILD_CACHE.clear()
+    monkeypatch.setattr(engine_build, "read_build",
+                        lambda *a, **k: engine_build.parse_version(
+                            MODERN if state["modern"] else LEGACY))
+    monkeypatch.setattr(server_ops, "engine_version",
+                        lambda backend="": "b9867+152d337fa")
+    rp = _plan()
+    before = kvcache.launch_fingerprint(rp, exe)
+    state["modern"] = True
+    exe.write_bytes(b"a much longer replacement binary")   # same path, new build
+    after = kvcache.launch_fingerprint(rp, exe)
+    assert before != after
+
+
+def test_a_pinned_launch_keeps_the_fingerprint_it_had(tmp_path, monkeypatch):
+    """The fix must not move the hash for an ordinary pinned launch: every
+    existing cache would be orphaned — a four-minute re-prefill — for a change
+    that has nothing to do with it. Here the pin's own directory is measured, so
+    the identity is the same one `engine_identity(backend)` returns."""
+    from rigma import engine_build, runtime
+    home = tmp_path / "home"
+    exe = home / "engines" / "b9867" / "vulkan" / "llama-server.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"x")
+    engine_build._BUILD_CACHE.clear()
+    monkeypatch.setattr(runtime, "rigma_home", lambda: home)
+    monkeypatch.setattr(runtime, "_engines_manifest", lambda: {"version": "b9867"})
+    monkeypatch.setattr(engine_build, "read_build",
+                        lambda *a, **k: engine_build.parse_version(LEGACY))
+    rp = _plan()
+    # what the fingerprint was BEFORE this change: engine_identity(backend)
+    old = kvcache.fingerprint(kvcache.config_of(rp, str(exe)))
+    assert old == kvcache.launch_fingerprint(rp, exe)

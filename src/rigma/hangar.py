@@ -43,7 +43,10 @@ MTP_PROBE_LIMIT = 8
 #      "no capabilities"
 #   4  the recurrent (SSM/DeltaNet) layer count and the ssm.* geometry that
 #      sizes the per-sequence RS buffer the fit had been charging as zero
-PROBE_VERSION = 4
+#   5  A2d: an unrecognised recurrent geometry (pure Mamba, an explicit
+#      attention.recurrent_layers array, a partial ssm.* set) is reported
+#      unknown instead of silently charged zero
+PROBE_VERSION = 5
 _QUANT_RE = re.compile(
     r"(UD-)?(I?Q\d(?:_[A-Z0-9]+)*|F16|BF16|F32|MXFP4(?:_[A-Z0-9]+)*)",
     re.IGNORECASE)
@@ -358,6 +361,10 @@ def spec_fields_from_probe(f: dict) -> dict:
             "ssm_inner_size": int(f.get("ssm_inner_size", 0) or 0),
             "ssm_conv_kernel": int(f.get("ssm_conv_kernel", 0) or 0),
             "ssm_group_count": int(f.get("ssm_group_count", 0) or 0),
+            # A2d: the header showed recurrent state whose count or buffer could
+            # not be derived. Carried so the fit reports `rs=unknown` instead of
+            # charging a zero it cannot stand behind.
+            "rs_geometry_unknown": bool(f.get("rs_geometry_unknown", False)),
             "has_template": bool(f.get("has_template", True)),
             "probe_version": PROBE_VERSION}
 
@@ -524,7 +531,7 @@ def heal_spec(spec: ModelSpec) -> ModelSpec:
     info = next((probed[g.file] for g in spec.ggufs if g.file in probed), None)
     f = info.spec_fields if info else None
     if stale and info and f and f.get("n_layers", 0) > 0 \
-            and f.get("kv_heads", 0) > 0:
+            and (f.get("kv_heads", 0) > 0 or f.get("rs_geometry_unknown")):
         healed = _with_probe(spec, info, fields)     # geometry + caps + files
     else:
         healed = spec.model_copy(update={"ggufs": [   # just the per-file answer

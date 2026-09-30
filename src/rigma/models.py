@@ -307,6 +307,12 @@ class ModelSpec(BaseModel):
     ssm_inner_size: int = 0
     ssm_conv_kernel: int = 0
     ssm_group_count: int = 0
+    # A2d: positive evidence of recurrent state whose COUNT or SIZE the probe
+    # could not derive — a pure-Mamba header, an explicit
+    # `attention.recurrent_layers` array, or a partial `ssm.*` set. The fit
+    # reports `rs=unknown` rather than charging a zero it cannot stand behind;
+    # a confident wrong number is the failure mode.
+    rs_geometry_unknown: bool = False
     # False = the gguf shipped no tokenizer.chat_template, so an empty
     # capability list is missing evidence rather than a finding about the model.
     has_template: bool = True

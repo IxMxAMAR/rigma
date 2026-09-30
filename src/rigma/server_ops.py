@@ -34,8 +34,8 @@ def engine_version(backend: str = "") -> str:
     calibration measured on it was labelled `b9867`.
 
     Now the binary is asked. `engine_build.cached_build` memoises on (path, size,
-    mtime), so this is one process spawn per binary per process rather than per call,
-    and replacing a binary at the same path invalidates it.
+    nanosecond mtime), so this is one process spawn per binary per process rather
+    than per call, and replacing a binary at the same path invalidates it.
 
     Falls back to the manifest string when no binary can be found or run: the honest
     answer is then "we do not know", and the manifest is at least the intended value.

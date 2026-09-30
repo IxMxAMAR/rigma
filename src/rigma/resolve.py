@@ -242,10 +242,20 @@ def recurrent_state_mb(spec: ModelSpec) -> float:
 
 
 def recurrent_state_unknown(spec: ModelSpec) -> bool:
-    """True when the model declares recurrent layers but its header carried no
-    `ssm.*` geometry, so `recurrent_state_mb` returns 0 for lack of evidence
-    rather than because there is nothing to allocate. The fit says so in its
-    explain line instead of silently reading the model as dense."""
+    """True when the model gives evidence of recurrent layers but there is no
+    geometry to size them with, so `recurrent_state_mb` returns 0 for lack of
+    evidence rather than because there is nothing to allocate. The fit says so in
+    its explain line instead of silently reading the model as dense.
+
+    Two ways to know that, and both are the same statement:
+      * `recurrent_layers > 0` with no usable `ssm.*` geometry (A2);
+      * the probe could not derive the count or the buffer at all — a pure-Mamba
+        header, an explicit `attention.recurrent_layers` array, or a partial
+        `ssm.*` set (A2d). Before the flag existed those shapes charged 0 with no
+        note, which is a confident wrong number.
+    """
+    if getattr(spec, "rs_geometry_unknown", False):
+        return True
     return spec.recurrent_layers > 0 and recurrent_state_mb(spec) == 0.0
 
 
@@ -935,15 +945,25 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
                  usable_vram: float, k: str = "", v: str = "") -> dict:
     """Where the VRAM actually goes, in MB. The whole point of the explorer is
     that a single "8K" tells you nothing about WHY — this is the arithmetic
-    behind it, so a 46MB near-miss reads as a near-miss."""
+    behind it, so a 46MB near-miss reads as a near-miss.
+
+    A2b: the RS term was missing here. `_fit_with_cache` charges it (A2) and the
+    explorer's `offload_pct` follows the fit (A3), but this table did not — so a
+    row could read "fits" (`over_mb` <= 0) while the fit it describes offloaded a
+    layer. Same term, same multiplier, one source: `recurrent_state_mb` times
+    `LAUNCH_PARALLEL`, exactly as the fit computes it. Zero for a dense model and
+    for a hybrid whose geometry is unknown (the fit says `rs=unknown` there).
+    """
     k = k or spec.cache_type_policy.k
     v = v or spec.cache_type_policy.v
     kv_mb = (ctx * kv_bytes_per_token(spec, k, v)
              + swa_kv_bytes(spec, k, v, ctx)) / 2**20
     file_mb = gguf.bytes / 2**20
+    rs_mb = recurrent_state_mb(spec) * LAUNCH_PARALLEL
     return {"file_mb": round(file_mb), "mmproj_mb": round(mm_mb),
-            "kv_mb": round(kv_mb), "budget_mb": round(usable_vram),
-            "over_mb": round(file_mb + mm_mb + kv_mb - usable_vram),
+            "kv_mb": round(kv_mb), "rs_mb": round(rs_mb),
+            "budget_mb": round(usable_vram),
+            "over_mb": round(file_mb + mm_mb + kv_mb + rs_mb - usable_vram),
             "ctx": ctx, "kv_type": k}
 
 
