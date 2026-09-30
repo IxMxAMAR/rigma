@@ -221,7 +221,24 @@ def anchor_spec(spec: dict, workspace: str = "") -> dict:
                 parent, name = Path(raw_p).parent, Path(raw_p).name
             else:
                 continue                        # relative: already anchored
-            if not parent.exists():
+            # `parent.exists()` is NOT a total function: pathlib re-raises any
+            # OSError whose errno is outside its small ignored set (ENOENT,
+            # ENOTDIR, EBADF, ELOOP + a few Windows errors). A BitLocker-locked
+            # volume, an offline network share, a stale drive letter or a
+            # device-not-ready answer arrives as errno 22 / WinError
+            # -2144272384, so `exists()` RAISES instead of returning False.
+            # This function's contract is "anchor to an EXISTING parent"; a
+            # parent the OS will not stat is, for that purpose, not there — so
+            # treat the error as "missing" and take the SAME basename branch.
+            # Letting it propagate made `compile_mission` raise, `_compile_spec`'s
+            # `except Exception: pass` swallow the whole compile, and the run
+            # execute with `spec = None` instead of the documented best-effort
+            # fallback (module docstring above; live D:-drive failures).
+            try:
+                parent_exists = parent.exists()
+            except OSError:
+                parent_exists = False
+            if not parent_exists:
                 item[key] = name
     return spec
 
