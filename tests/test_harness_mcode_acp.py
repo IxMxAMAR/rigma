@@ -31,6 +31,7 @@ import pytest
 
 from rigma import harness as _harness
 from rigma import harness_mcode_acp as acp
+from rigma import tools
 
 FAKE = str(Path(__file__).parent / "fake_acp_server.py")
 
@@ -196,7 +197,7 @@ def test_stopping_the_client_releases_a_waiting_caller(events):
     assert caught and isinstance(caught[0], acp.AcpUnavailable)
 
 
-# --- B1b: the ACP child is detached, and its stop path still reaches it ------
+# --- B1b/DR2: the ACP child is detached, and its stop path still reaches it ---
 #
 # WHAT WAS WRONG. `harness_mcode_acp`'s child was spawned without
 # `_detached_kwargs`, so on POSIX it sat in RIGMA'S process group. It never calls
@@ -212,10 +213,22 @@ def test_stopping_the_client_releases_a_waiting_caller(events):
 # have left the subagents out of reach; the group signal alone would have been
 # unsafe, because it could have hit Rigma's own group.
 #
-# WHAT IS VERIFIED HERE AND WHAT IS NOT. This host is Windows: the kwargs are
-# asserted for both platform decisions, and the Windows stop path is pinned as
-# unchanged (`terminate()`, then `kill()`). The POSIX group signal — `killpg` on
-# the child's own group — CANNOT be executed here and is UNVERIFIED.
+# DR2, AND WHY THE WINDOWS PIN CHANGED. On Windows there is no `killpg`: the
+# process Rigma holds is the `mcode.cmd` SHIM, and the node agent plus its
+# subagents are its DESCENDANTS, so `terminate()`/`kill()` on the shim left the
+# agent running against the workspace and the engine. The Windows half of
+# `_signal` is therefore a TREE kill now — `tools._kill_tree` (`taskkill /F /T`)
+# on the shim's pid, issued BEFORE the shim dies and the walk loses its root,
+# with the old terminate/kill pair kept only as the fallback when the tree kill
+# cannot be confirmed. The earlier revision pinned the Windows path as
+# "byte-for-byte terminate()/kill()"; that pin was the test gap DR2 named, and it
+# is deliberately broken here.
+#
+# WHAT IS VERIFIED HERE AND WHAT IS NOT. This host is Windows, so the Windows
+# stop path — including the real `tools._kill_tree` taskkill call, with only
+# `subprocess.run` faked so nothing is actually killed — IS executed below. The
+# POSIX group signal — `killpg` on the child's own group — CANNOT be executed
+# here and is UNVERIFIED.
 
 def test_an_acp_child_is_detached_on_posix_only(monkeypatch):
     """The ACP child must lead its OWN group on POSIX, as B1's other children do.
@@ -249,20 +262,31 @@ def test_an_acp_child_is_detached_on_posix_only(monkeypatch):
     assert "creationflags" in captured[-1], captured[-1]
 
 
-def test_the_acp_stop_path_is_unchanged_on_windows(monkeypatch):
-    """Detaching must not cost the child a clean stop.
+def test_the_acp_stop_path_kills_the_whole_tree_on_windows(monkeypatch):
+    """DR2: the Windows stop must reach the node agent, not just the `mcode.cmd`
+    shim.
 
-    On Windows there is no `killpg`, so `_signal` must be exactly the old
-    `terminate()`/`kill()` pair: the graceful stdin-close wait, then SIGTERM,
-    then the SIGKILL escalation when SIGTERM did not reap the child. The POSIX
-    half of `_signal` (the group signal) is UNVERIFIED on this host.
+    The process Rigma holds on Windows is the shim, and the agent plus every
+    subagent it spawned are its descendants. `terminate()` therefore kills
+    cmd.exe and leaves the agent running. The tree kill has to be `taskkill /F
+    /T` on the shim's pid, and it has to happen while the shim is still there to
+    be the root of the walk — so the old terminate/kill pair must NOT be what
+    runs when the tree kill is confirmed.
+
+    `subprocess.run` is faked so the recorded command is never executed against a
+    real pid; the fake pid is deliberately not a live process.
     """
     if sys.platform != "win32":
         pytest.skip("this pins the Windows stop path, which is the one this host has")
 
+    kills: list[list[str]] = []
+    monkeypatch.setattr(tools.subprocess, "run",
+                        lambda cmd, **kw: kills.append(cmd))
+
     calls: list[str] = []
 
     class _Proc:
+        pid = 999_999          # never real: `subprocess.run` is faked above
         stdin = None
 
         def __init__(self, reaps: bool):
@@ -272,7 +296,10 @@ def test_the_acp_stop_path_is_unchanged_on_windows(monkeypatch):
         def wait(self, timeout=None):
             calls.append("wait")
             self.waits += 1
-            if not self.reaps and self.waits <= 2:
+            # The FIRST wait is the graceful stdin-close grace. When it times
+            # out, the tree kill is what makes the next wait succeed — which is
+            # how `_kill_tree` confirms the process Rigma holds is gone.
+            if not self.reaps and self.waits <= 1:
                 raise subprocess.TimeoutExpired("mcode", timeout)
             return 0
 
@@ -287,11 +314,55 @@ def test_the_acp_stop_path_is_unchanged_on_windows(monkeypatch):
     graceful.proc = _Proc(reaps=True)
     graceful.stop()
     assert calls == ["wait"], calls
+    assert kills == [], kills
 
-    # A child that never exits is terminated, then killed.
+    # A child that never exits is taken as a TREE, before terminate()/kill()
+    # could take the root away.
     stubborn = acp.AcpClient(["mcode"])
     stubborn.proc = _Proc(reaps=False)
     stubborn.stop()
+    assert kills == [["taskkill", "/F", "/T", "/PID", "999999"]], kills
+    assert "terminate" not in calls, calls
+    assert "kill" not in calls, calls
+
+
+def test_the_windows_stop_falls_back_to_the_shim_when_the_tree_kill_fails(
+        monkeypatch):
+    """A tree kill that could not be confirmed must not leave the stop with
+    nothing.
+
+    `_kill_tree` reports what it CONFIRMED. A refused `taskkill` is no reason to
+    skip the terminate/kill pair this change replaced rather than removed — that
+    would trade one leak for a worse one.
+    """
+    if sys.platform != "win32":
+        pytest.skip("this pins the Windows stop path, which is the one this host has")
+
+    calls: list[str] = []
+    tree_attempts: list[int] = []
+
+    class _Proc:
+        pid = 999_999
+        stdin = None
+
+        def wait(self, timeout=None):
+            calls.append("wait")
+            raise subprocess.TimeoutExpired("mcode", timeout)
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def kill(self):
+            calls.append("kill")
+
+    monkeypatch.setattr(tools, "_kill_tree",
+                        lambda pid, proc=None, **k: tree_attempts.append(pid) or False)
+    c = acp.AcpClient(["mcode"])
+    c.proc = _Proc()
+    c.stop()
+    # The tree kill is ATTEMPTED first (twice: the SIGTERM and the SIGKILL
+    # escalation), and the shim is only taken directly when it fails.
+    assert tree_attempts == [999_999, 999_999], tree_attempts
     assert calls.count("terminate") == 1, calls
     assert calls.count("kill") == 1, calls
 

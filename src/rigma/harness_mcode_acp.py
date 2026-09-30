@@ -52,6 +52,12 @@ _FRAME_MAX = 8_000_000
 # with `protocolVersion: 1` and accepts 1.
 PROTOCOL_VERSION = 1
 
+# Which stop path `_signal`/`stop` take. A module constant rather than a fresh
+# `sys.platform` read, so a test can exercise the POSIX branch on a Windows host
+# (and vice versa) without patching `sys.platform` globally, which other library
+# code reads. Same idiom as `harness._DETACH_CHILDREN`.
+_WINDOWS = sys.platform == "win32"
+
 # mcode's own extension surface, as advertised in
 # `_meta["minimax-code/extensions"]` on `initialize`. Recorded rather than
 # hardcoded into calls so a version that drops or renames one is visible instead
@@ -261,14 +267,30 @@ class AcpClient:
         what happens if detachment is off, so this degrades to the old
         behaviour rather than killing the server).
 
-        Windows is deliberately byte-for-byte the old path: `terminate()` for
-        SIGTERM, `kill()` for SIGKILL. There is no `killpg` there — the
-        codebase's tree kill uses `taskkill /T` instead — so nothing changes.
+        WINDOWS IS A TREE KILL, NOT A SINGLE PROCESS (DR2). The process Rigma
+        holds there is the `mcode.cmd` SHIM (`shutil.which("mcode")`;
+        `harness_mcode.py` says so itself), and the agent plus every subagent it
+        spawned are its DESCENDANTS. `terminate()`/`kill()` reach only cmd.exe,
+        so a cancelled turn whose shim did not exit on stdin EOF left the node
+        agent running against the workspace and the engine with nobody holding
+        it. `tools._kill_tree` is the codebase's one tree kill (`taskkill /F
+        /T`), and it has to run BEFORE the shim dies or the walk loses its root.
+        It cannot reach RIGMA's own tree: `taskkill /T` walks DOWNWARD through
+        ParentProcessId, and Rigma is the shim's parent, not its child. The old
+        terminate/kill pair is kept as the fallback for a tree kill that could
+        not be confirmed, so a refused `taskkill` is no worse than before.
         """
         proc = self.proc
         if proc is None:
             return
-        if sys.platform == "win32":
+        if _WINDOWS:
+            try:
+                from . import tools as _tools
+
+                if _tools._kill_tree(proc.pid, proc):
+                    return
+            except Exception:
+                pass
             try:
                 if sig == getattr(signal, "SIGKILL", 9):
                     proc.kill()
@@ -314,13 +336,15 @@ class AcpClient:
             try:
                 proc.wait(timeout=min(2.0, timeout))
             except Exception:
-                # SIGTERM to the GROUP on POSIX (see `_signal`), the child alone
-                # on Windows — where this is exactly the old `terminate()`.
+                # SIGTERM to the GROUP on POSIX (see `_signal`); on Windows the
+                # whole TREE via `taskkill /T`, because the process Rigma holds
+                # there is only the `mcode.cmd` shim (DR2).
                 self._signal(getattr(signal, "SIGTERM", 15))
                 proc.wait(timeout=timeout)
         except Exception:
             # The escalation. On POSIX this is SIGKILL to the group, so a
-            # subagent that ignored SIGTERM is not left holding the pipe.
+            # subagent that ignored SIGTERM is not left holding the pipe; on
+            # Windows it is the same tree kill again.
             self._signal(getattr(signal, "SIGKILL", 9))
         # Any waiter still blocked must learn the transport is gone rather than
         # wait out its full timeout.
