@@ -939,7 +939,11 @@ export function liveTurnId(messages: ChatMessage[]): string | null {
  *  `pin` is `remoteStopTurn[id]`. Spent when the server says the chat is no
  *  longer generating, or when it reports a DIFFERENT turn, or when a refresh
  *  failed while the request was outstanding and the server's turn cannot be
- *  shown to be the pinned one. Pure, so the rule is assertable without a fetch. */
+ *  shown to be the pinned one. An UNNAMEABLE request (`turn: null`, made before
+ *  the turn's first checkpoint existed) is spent as soon as the server names a
+ *  turn at all — the tab cannot prove that turn is its own, and requiring a name
+ *  neither side has wedged the control disabled for the rest of the chat's life
+ *  (deep-review-3 DR3-3). Pure, so the rule is assertable without a fetch. */
 export function stopRequestSpent(
   streaming: boolean, serverTurn: string | null,
   pin: { turn: string | null; lost: boolean } | undefined,
@@ -948,7 +952,17 @@ export function stopRequestSpent(
   if (pin === undefined) return false;            // nothing pinned: cannot judge
   if (pin.turn !== null && pin.turn === serverTurn) return false;   // same turn
   if (pin.lost) return true;                      // evidence of sameness was lost
-  return pin.turn !== null && serverTurn !== null && serverTurn !== pin.turn;
+  if (pin.turn === null) {
+    // DR3-3: the remote control is drawn from the server's `streaming` flag
+    // alone, so it can be clicked before the turn's first checkpoint exists —
+    // `liveTurnId` is then null and the tab cannot name what it asked to stop.
+    // It cannot PROVE a nameable turn is its own, so it must not stay armed
+    // across one. Spending it re-enables the button; a second POST is idempotent
+    // server-side, and the tab still never claims it stopped something it did not.
+    return serverTurn !== null;
+  }
+  if (serverTurn === null) return false;          // named pin, no turn reported
+  return serverTurn !== pin.turn;                 // named: spent unless it agrees
 }
 
 export const useChat = create<ChatState>((set, get) => ({
