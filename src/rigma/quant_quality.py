@@ -148,7 +148,10 @@ def quality_of(quant: str) -> dict | None:
 # column — an earlier version of this table mixed the two and understated q4_1 /
 # q4_0 by ~2x. PR 7412 predates KV rotation, which the fork at 87268f77 enables
 # BY DEFAULT for a quantized cache with head_dim % 64 == 0 (llama-kv-cache.cpp;
-# no CLI flag, only the env LLAMA_ATTN_ROT_DISABLE=1, which Rigma never sets).
+# no CLI flag — the only switch is the env LLAMA_ATTN_ROT_DISABLE=1, which the
+# sweep trials as the C11 `attn-rot-off` axis but does NOT crown or persist
+# without an explicit opt-in, and not at all on a tools-capable model; see
+# bench._carries_quality_env_lever and bench.crowned_row).
 # Rotation measured q4_0/q4_0 at +0.19% on llama-2-7B (vs +2.42% off) and
 # +1.22% on gemma3-4b, so these are an UPPER BOUND on the loss for a quantized
 # cache on this build.
