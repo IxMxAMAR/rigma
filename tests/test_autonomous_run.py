@@ -864,6 +864,44 @@ def test_compiled_spec_seeds_the_plan(engine):
     assert "sample images" in texts and "write prompts 1-25" in texts
 
 
+def test_compile_survives_a_stat_error_on_the_artifact_parent(
+        engine, monkeypatch, tmp_path):
+    """The D:-path failure, simulated so it passes on any machine.
+
+    A BitLocker-locked volume / offline share makes `Path.exists()` RAISE
+    (errno 22 is outside pathlib's ignored set) instead of returning False.
+    `anchor_spec` runs OUTSIDE compile_mission's per-attempt try, so the OSError
+    escaped to serve's `except Exception: pass` and left `run["spec"] = None`:
+    the run executed with no compiled plan and no best-effort fallback. With the
+    parent guarded, the spec must land.
+    """
+    locked = tmp_path / "locked"
+    locked_s = str(locked).lower()
+    real_exists = pathlib.Path.exists
+
+    def exists(self):
+        s = str(self).lower()
+        if s == locked_s or s.startswith(locked_s + os.sep):
+            raise OSError(22, "BitLocker locked")
+        return real_exists(self)
+
+    monkeypatch.setattr(pathlib.Path, "exists", exists)
+    _Engine.compile_reply = json.dumps({
+        "objective": "write a batch",
+        "deliverables": [{"path": str(locked / "a.txt"), "description": "b1"}],
+        "constraints": [],
+        "steps": [{"id": 1, "description": "write batch 1",
+                   "artifact": str(locked / "a.txt"),
+                   "verification": {"type": "file_min_size", "value": 10}}]})
+    _Engine.script = [None]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "make a batch",
+                                    "budget_hours": 1}).json()["id"]
+    r = _wait(c, rid, timeout=25)
+    assert r["spec"] is not None
+    assert r["spec"]["compiled"] is True
+
+
 def test_feed_marks_display_truncation(engine, tmp_path):
     # a 12-path sample was cut mid-path in the UI ("D:\Good St") and looked like
     # corrupted data. The model gets the full result; the FEED must say it cut.

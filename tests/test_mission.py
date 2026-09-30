@@ -73,6 +73,70 @@ def test_verify_step_checks_the_artifact_on_disk(tmp_path):
                                 "verification": {"type": "none"}})[0] is True
 
 
+def _spec_with_artifact(artifact: str) -> dict:
+    return {"objective": "o", "deliverables": [], "constraints": [],
+            "steps": [{"id": 1, "description": "d", "artifact": artifact,
+                       "verification": {"type": "none", "value": 0}}],
+            "compiled": True}
+
+
+def test_anchor_spec_keeps_an_absolute_path_when_its_parent_exists(tmp_path):
+    """The normal case must not change: an absolute artifact whose parent is
+    really there stays exactly as the compiler wrote it."""
+    real = tmp_path / "real"
+    real.mkdir()
+    spec = _spec_with_artifact(str(real / "a.md"))
+    assert mission.anchor_spec(spec)["steps"][0]["artifact"] == str(real / "a.md")
+
+
+def test_anchor_spec_treats_an_unstatable_parent_as_missing(monkeypatch,
+                                                            tmp_path):
+    """A BitLocker-locked volume, an offline network share or a device-not-ready
+    answer makes Path.exists() RAISE (errno 22 is outside pathlib's ignored set)
+    instead of returning False. anchor_spec's contract is "anchor to an EXISTING
+    parent", so a parent the OS will not stat must take the SAME basename branch
+    as a genuinely absent one — not propagate and abort the whole compile, which
+    left `run["spec"] = None` and the run executing with no plan."""
+    import pathlib
+    locked = tmp_path / "locked"        # really exists; we make stat fail on it
+    locked.mkdir()
+    missing = tmp_path / "missing"      # genuinely absent
+    real_exists = pathlib.Path.exists
+
+    def exists(self):
+        if "locked" in str(self):
+            raise OSError(22, "BitLocker locked")
+        return real_exists(self)
+
+    monkeypatch.setattr(pathlib.Path, "exists", exists)
+
+    got = mission.anchor_spec(_spec_with_artifact(str(locked / "a.md")))
+    want = mission.anchor_spec(_spec_with_artifact(str(missing / "a.md")))
+    assert got["steps"][0]["artifact"] == "a.md"       # returned, did not raise
+    assert got["steps"][0]["artifact"] == want["steps"][0]["artifact"]
+
+
+def test_anchor_spec_also_guards_deliverable_paths(monkeypatch, tmp_path):
+    """The deliverables collection is anchored by the same loop and the same
+    hazard, so it gets the same guard."""
+    import pathlib
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    real_exists = pathlib.Path.exists
+
+    def exists(self):
+        if "locked" in str(self):
+            raise OSError(22, "locked")
+        return real_exists(self)
+
+    monkeypatch.setattr(pathlib.Path, "exists", exists)
+    spec = {"objective": "o", "constraints": [], "steps": [],
+            "deliverables": [{"path": str(locked / "core.md"),
+                              "description": "d"}], "compiled": True}
+    got = mission.anchor_spec(spec)
+    assert got["deliverables"][0]["path"] == "core.md"
+
+
 class _Recorder:
     """Captures the payloads compile_mission sends, and replies per-attempt."""
     def __init__(self, replies):
