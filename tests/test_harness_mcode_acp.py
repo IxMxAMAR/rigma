@@ -21,6 +21,7 @@ directly, because "refused" and "never asked" must never be conflated again.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import threading
 import time
@@ -28,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+from rigma import harness as _harness
 from rigma import harness_mcode_acp as acp
 
 FAKE = str(Path(__file__).parent / "fake_acp_server.py")
@@ -192,6 +194,106 @@ def test_stopping_the_client_releases_a_waiting_caller(events):
     c.stop()
     t.join(timeout=5.0)
     assert caught and isinstance(caught[0], acp.AcpUnavailable)
+
+
+# --- B1b: the ACP child is detached, and its stop path still reaches it ------
+#
+# WHAT WAS WRONG. `harness_mcode_acp`'s child was spawned without
+# `_detached_kwargs`, so on POSIX it sat in RIGMA'S process group. It never calls
+# `kill_tree`, so it could never take the server down — but `stop` signalled only
+# the direct child, and mcode's own subagents (which inherit its group) survived a
+# cancelled turn as orphans holding the inherited stdout/stderr pipe, so the
+# reader never saw EOF.
+#
+# THE FIX, IN TWO HALVES. `start` now passes `_harness._detached_kwargs()`, giving
+# the child its own session/group on POSIX; `stop` escalates through `_signal`,
+# which on POSIX signals that GROUP (via the codebase's one safe group-signal
+# helper, `tools._signal_tree`) instead of the single pid. Detaching alone would
+# have left the subagents out of reach; the group signal alone would have been
+# unsafe, because it could have hit Rigma's own group.
+#
+# WHAT IS VERIFIED HERE AND WHAT IS NOT. This host is Windows: the kwargs are
+# asserted for both platform decisions, and the Windows stop path is pinned as
+# unchanged (`terminate()`, then `kill()`). The POSIX group signal — `killpg` on
+# the child's own group — CANNOT be executed here and is UNVERIFIED.
+
+def test_an_acp_child_is_detached_on_posix_only(monkeypatch):
+    """The ACP child must lead its OWN group on POSIX, as B1's other children do.
+
+    The platform decision is `harness._DETACH_CHILDREN`, flipped here rather than
+    patching `os.name` — which `pathlib` reads to choose WindowsPath vs PosixPath
+    and which would make unrelated code explode on this host.
+    """
+    captured = []
+
+    class _Stop(Exception):
+        pass
+
+    def spy(argv, **kw):
+        captured.append(kw)
+        raise _Stop
+
+    monkeypatch.setattr(acp.subprocess, "Popen", spy)
+
+    monkeypatch.setattr(_harness, "_DETACH_CHILDREN", True)
+    with pytest.raises(_Stop):
+        acp.AcpClient(_argv()).start()
+    assert captured[-1].get("start_new_session") is True, captured[-1]
+
+    monkeypatch.setattr(_harness, "_DETACH_CHILDREN", False)
+    with pytest.raises(_Stop):
+        acp.AcpClient(_argv()).start()
+    assert "start_new_session" not in captured[-1], captured[-1]
+    # The spawn's other Windows/POSIX-neutral kwargs are untouched by the change.
+    assert captured[-1].get("stdin") is subprocess.PIPE, captured[-1]
+    assert "creationflags" in captured[-1], captured[-1]
+
+
+def test_the_acp_stop_path_is_unchanged_on_windows(monkeypatch):
+    """Detaching must not cost the child a clean stop.
+
+    On Windows there is no `killpg`, so `_signal` must be exactly the old
+    `terminate()`/`kill()` pair: the graceful stdin-close wait, then SIGTERM,
+    then the SIGKILL escalation when SIGTERM did not reap the child. The POSIX
+    half of `_signal` (the group signal) is UNVERIFIED on this host.
+    """
+    if sys.platform != "win32":
+        pytest.skip("this pins the Windows stop path, which is the one this host has")
+
+    calls: list[str] = []
+
+    class _Proc:
+        stdin = None
+
+        def __init__(self, reaps: bool):
+            self.reaps = reaps
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            calls.append("wait")
+            self.waits += 1
+            if not self.reaps and self.waits <= 2:
+                raise subprocess.TimeoutExpired("mcode", timeout)
+            return 0
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def kill(self):
+            calls.append("kill")
+
+    # A child that exits on the graceful stdin-close wait is never signalled.
+    graceful = acp.AcpClient(["mcode"])
+    graceful.proc = _Proc(reaps=True)
+    graceful.stop()
+    assert calls == ["wait"], calls
+
+    # A child that never exits is terminated, then killed.
+    stubborn = acp.AcpClient(["mcode"])
+    stubborn.proc = _Proc(reaps=False)
+    stubborn.stop()
+    assert calls.count("terminate") == 1, calls
+    assert calls.count("kill") == 1, calls
 
 
 # --- streaming, which `exec` can only batch --------------------------------

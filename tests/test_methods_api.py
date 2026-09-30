@@ -234,3 +234,38 @@ def test_wrong_typed_apply_values_are_a_400_at_save(client, bad, field):
     r = client.post("/api/methods", json=doc)
     assert r.status_code == 400, r.text
     assert any(field in e for e in r.json()["errors"]), r.json()
+
+
+def test_post_api_methods_is_not_redundant_with_import_or_promote(client):
+    """D4-backend: `POST /api/methods` is the ONLY route that saves under the
+    caller's id, so it is not a strict subset of anything and must not be folded
+    into one.
+
+    The two candidate "duplicates" both differ exactly where it matters:
+
+      * `POST /api/methods/import` (`methods_api.py:122-126`) re-slugs a colliding
+        id instead of overwriting it — that is deliberate, because an imported
+        document arrives from somewhere else and must never take over a method
+        this machine already has;
+      * `POST /api/methods/draft/{did}/promote` (`methods_api.py:174`) takes no
+        document at all — it saves a stored draft.
+
+    Overwrite-by-id is a capability, not an accident: `catalog()` documents that a
+    user method reusing a built-in's id REPLACES it ("clone and edit a built-in"),
+    and `delete_method`'s 400 tells the user to do exactly this. This test pins it
+    so a later "de-duplication" cannot silently remove it.
+    """
+    # POST /api/methods overwrites the built-in 'coding' in place...
+    assert client.post("/api/methods", json=_doc("coding")).status_code == 200
+    got = client.get("/api/methods/coding").json()
+    assert got["name"] == "Mine" and got["builtin"] is False
+
+    # ...whereas /import, given the same body, renames the id and leaves the
+    # built-in untouched: the two routes are NOT interchangeable.
+    assert client.delete("/api/methods/coding").status_code == 200
+    r = client.post("/api/methods/import", json=_doc("coding"))
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] != "coding", r.json()
+    coding = client.get("/api/methods/coding").json()
+    assert coding["builtin"] is True and coding["name"] == "Coding"
+

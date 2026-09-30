@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -184,7 +185,24 @@ class AcpClient:
         Closing it early — or pointing it at a file — makes mcode read what it can,
         see EOF, and exit before answering. That is the failure this module exists
         partly to not repeat, so it is stated where the pipe is created.
+
+        DETACHED ON POSIX (B1b). `_detached_kwargs` puts this child in its OWN
+        session and process group, the same mechanism B1 gave the two children
+        that reach `kill_tree`. This child never calls `kill_tree` — it can never
+        kill Rigma — but without its own group `stop` cannot reach mcode's own
+        subagents, which inherit this process's group: on a cancelled ACP turn
+        they survived as orphans holding the inherited stdout/stderr pipe, so the
+        reader never saw EOF. Windows is unchanged: `_detached_kwargs` returns
+        `{}` there and `creationflags` still carries CREATE_NO_WINDOW.
+
+        The import is LAZY, not at module level: `harness.py` imports this module
+        indirectly while it builds `BACKENDS` (`_verified_of("harness_mcode")`),
+        and `harness_mcode` imports this module at module level, so a top-level
+        `from . import harness` here would close the cycle with a half-built
+        `harness_mcode_acp` and fail on `CONTROL_OPS`.
         """
+        from . import harness as _harness
+
         env = dict(os.environ if self._env is None else self._env)
         flags = 0
         if sys.platform == "win32":
@@ -201,6 +219,7 @@ class AcpClient:
             errors="replace",
             bufsize=1,
             creationflags=flags,
+            **_harness._detached_kwargs(),
         )
         self._reader = threading.Thread(target=self._read_loop, name="acp-reader",
                                         daemon=True)
@@ -224,6 +243,49 @@ class AcpClient:
         for slot in waiters:
             slot["error"] = AcpUnavailable(message)
             slot["event"].set()
+
+    def _signal(self, sig: int) -> None:
+        """Signal the child — and, on POSIX, its whole process GROUP.
+
+        WHY THE GROUP IS REQUIRED ONCE THE CHILD IS DETACHED (B1b). `start`
+        gives the child its own session/group on POSIX, and mcode's own
+        subagents inherit that group. `proc.terminate()` signals ONLY the direct
+        child, so a cancelled turn could leave a subagent alive holding the
+        inherited stdout/stderr pipe — the reader would never see EOF, which is
+        the defect this change closes. A group signal reaches them, and it is
+        safe precisely BECAUSE the child is detached: the group is the child's
+        own, never Rigma's. The codebase's one safe group-signal helper is
+        reused rather than a second `killpg` written here — `tools._signal_tree`
+        re-reads the target's group and refuses to signal Rigma's own, falling
+        back to the single pid when it cannot prove they differ (which is also
+        what happens if detachment is off, so this degrades to the old
+        behaviour rather than killing the server).
+
+        Windows is deliberately byte-for-byte the old path: `terminate()` for
+        SIGTERM, `kill()` for SIGKILL. There is no `killpg` there — the
+        codebase's tree kill uses `taskkill /T` instead — so nothing changes.
+        """
+        proc = self.proc
+        if proc is None:
+            return
+        if sys.platform == "win32":
+            try:
+                if sig == getattr(signal, "SIGKILL", 9):
+                    proc.kill()
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+            return
+        try:
+            from . import tools as _tools
+
+            _tools._signal_tree(proc.pid, sig)
+        except Exception:
+            try:
+                os.kill(proc.pid, sig)
+            except Exception:
+                pass
 
     def stop(self, timeout: float = 5.0) -> None:
         """Terminate the child. Safe to call twice."""
@@ -252,13 +314,14 @@ class AcpClient:
             try:
                 proc.wait(timeout=min(2.0, timeout))
             except Exception:
-                proc.terminate()
+                # SIGTERM to the GROUP on POSIX (see `_signal`), the child alone
+                # on Windows — where this is exactly the old `terminate()`.
+                self._signal(getattr(signal, "SIGTERM", 15))
                 proc.wait(timeout=timeout)
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            # The escalation. On POSIX this is SIGKILL to the group, so a
+            # subagent that ignored SIGTERM is not left holding the pipe.
+            self._signal(getattr(signal, "SIGKILL", 9))
         # Any waiter still blocked must learn the transport is gone rather than
         # wait out its full timeout.
         self._fail_all_pending("the mcode acp process ended")
