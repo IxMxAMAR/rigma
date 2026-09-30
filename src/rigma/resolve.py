@@ -418,14 +418,18 @@ def kv_geometry_unknown(spec: ModelSpec) -> bool:
     Set by `gguf_meta` while the header is parsed (`kv_geometry_unknown`). The
     derived clause is the same statement for a spec written by an older probe,
     which stored no flag: attention layers are declared but the growing cache's
-    width computes to zero. A pure-Mamba spec has `full_attn_layers == 0` and
-    is NOT flagged — it genuinely has no KV cache, and its missing count is
-    what `rs_unknown` already reports.
+    width computes to zero. `head_dim > 0` is the attention EVIDENCE that
+    separates that shape from a pure-Mamba spec — the probe reads a Mamba header
+    as `full_attn_layers == n_layers` (there is no attention pattern, so every
+    layer falls through to full attention) with `head_dim == 0`, and that spec
+    genuinely has no KV cache; its missing count is what `rs_unknown` already
+    reports. Without the head_dim guard this clause flagged every Mamba file
+    `kv=unknown` (A2d-kv verifier FAIL, 2026-09-30).
     """
     if getattr(spec, "kv_geometry_unknown", False):
         return True
-    return spec.full_attn_layers > 0 and (spec.kv_heads <= 0
-                                          or spec.head_dim <= 0)
+    return (spec.full_attn_layers > 0 and spec.head_dim > 0
+            and spec.kv_heads <= 0)
 
 
 # Speculative decoding's draft head needs its own KV cache and compute buffers.

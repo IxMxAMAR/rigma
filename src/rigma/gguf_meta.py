@@ -333,6 +333,12 @@ def _inspect(f, fallback: str) -> GgufInfo:
     # SPLIT this module cannot derive. The failure mode is the same silent
     # confidence A2d removed for the recurrent state: `kv_mb` computes to a
     # confident number — often exactly 0 — with no way to tell it is a guess.
+    #
+    # Deliberately NOT flagged: a window length with no `sliding_window_pattern`
+    # (the mainstream Mistral shape). llama.cpp reads that as all layers
+    # windowed; this module cannot represent that, so it charges every layer at
+    # full context — an OVER-estimate in the safe direction, and labelling a
+    # whole mainstream family `kv=unknown` is noise (A2d-kv verifier nit).
     kv_geometry_unknown = False
     # How many layers hold a FIXED recurrent state (Mamba/DeltaNet) rather than a
     # growing KV cache. Positive evidence only, from the same attention pattern
@@ -378,11 +384,6 @@ def _inspect(f, fallback: str) -> GgufInfo:
             kv_heads = max((_as_int(h, f"{arch}.attention.head_count_kv")
                             for h in kv), default=0)
             recurrent_layers = max(0, n_layers - full_attn)
-            # A2d-kv: a window length with no usable layer pattern leaves the
-            # split (WHICH layers are windowed) underivable, so the second
-            # cache cannot be sized.
-            if swa_window > 0:
-                kv_geometry_unknown = True
     else:
         # A SCALAR kv head count does not mean every layer is full attention.
         # Qwen3.5/3.8 interleave SSM (linear-attention) layers and declare the
@@ -404,10 +405,6 @@ def _inspect(f, fallback: str) -> GgufInfo:
         else:
             full_attn = n_layers
         kv_heads = _as_int(kv, f"{arch}.attention.head_count_kv")
-        # A2d-kv: a window length with no per-layer pattern leaves the split
-        # underivable, exactly as in the table branch above.
-        if swa_window > 0:
-            kv_geometry_unknown = True
     head_dim = _as_int(g("attention.key_length", 0),
                        f"{arch}.attention.key_length") or (
         _as_int(g("embedding_length", 0), f"{arch}.embedding_length") // heads
