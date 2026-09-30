@@ -48,7 +48,11 @@ MTP_PROBE_LIMIT = 8
 #   5  A2d: an unrecognised recurrent geometry (pure Mamba, an explicit
 #      attention.recurrent_layers array, a partial ssm.* set) is reported
 #      unknown instead of silently charged zero
-PROBE_VERSION = 5
+#   6  A2d-kv: a KV cache whose width or layer split the probe could not derive
+#      (a missing attention.head_count_kv, a partial sliding-window geometry, a
+#      declared recurrent-layers array over a scalar kv count) is reported
+#      unknown instead of silently charged a confident zero
+PROBE_VERSION = 6
 _QUANT_RE = re.compile(
     r"(UD-)?(I?Q\d(?:_[A-Z0-9]+)*|F16|BF16|F32|MXFP4(?:_[A-Z0-9]+)*)",
     re.IGNORECASE)
@@ -391,6 +395,10 @@ def spec_fields_from_probe(f: dict) -> dict:
             # not be derived. Carried so the fit reports `rs=unknown` instead of
             # charging a zero it cannot stand behind.
             "rs_geometry_unknown": bool(f.get("rs_geometry_unknown", False)),
+            # A2d-kv: the header showed a KV cache whose width or layer split
+            # could not be derived. Carried so the fit reports `kv=unknown`
+            # instead of presenting a confident zero as a measured number.
+            "kv_geometry_unknown": bool(f.get("kv_geometry_unknown", False)),
             "has_template": bool(f.get("has_template", True)),
             "probe_version": PROBE_VERSION}
 
@@ -557,7 +565,8 @@ def heal_spec(spec: ModelSpec) -> ModelSpec:
     info = next((probed[g.file] for g in spec.ggufs if g.file in probed), None)
     f = info.spec_fields if info else None
     if stale and info and f and f.get("n_layers", 0) > 0 \
-            and (f.get("kv_heads", 0) > 0 or f.get("rs_geometry_unknown")):
+            and (f.get("kv_heads", 0) > 0 or f.get("rs_geometry_unknown")
+                 or f.get("kv_geometry_unknown")):
         healed = _with_probe(spec, info, fields)     # geometry + caps + files
     else:
         healed = spec.model_copy(update={"ggufs": [   # just the per-file answer
