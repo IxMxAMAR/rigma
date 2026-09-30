@@ -142,3 +142,163 @@ def test_a_question_nobody_answers_is_declined_and_does_not_hang(
 
     assert r.status_code == 200, r.text
     assert "answer=None" in r.text, r.text
+
+
+# --- OD-12: the decision is published, expiry included -----------------------
+
+
+def _approval_events(body: str) -> list[dict]:
+    """The `{event, data}` approval payloads the chat stream carried, in order.
+
+    Read off the SSE body the browser reads rather than from a server closure: the
+    wire is the contract the UI folds, so these assert on the wire itself."""
+    out: list[dict] = []
+    for block in body.split("\n\n"):
+        name = ""
+        data = ""
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                name = line[len("event: "):].strip()
+            elif line.startswith("data: "):
+                data += line[len("data: "):]
+        if name != "approval" or not data:
+            continue
+        try:
+            out.append(json.loads(data))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _asked(body: str) -> list[dict]:
+    return [d for d in _approval_events(body)
+            if d.get("event") == "approval/asked"]
+
+
+def _decided(body: str) -> list[dict]:
+    return [d for d in _approval_events(body)
+            if d.get("event") == "approval/decided"]
+
+
+def test_a_question_that_times_out_says_expired_with_the_same_id(
+        monkeypatch, tmp_path):
+    """OD-12. On expiry the handler returns a real decline, and it must ALSO say so
+    on the channel the ask went out on. Without the decided event the row stays
+    `awaiting`, the form stays clickable, and the next click hits the route's 409
+    and surfaces as an error — the server knew it declined and said nothing."""
+    s = _app_and_session(monkeypatch, tmp_path)
+    monkeypatch.setattr(serve, "QUESTION_WAIT_SECS", 0.05)
+
+    def _fake_acp(prompt, **kw):
+        answer = kw["on_question"]("elicitation/create", {"message": "Which?"})
+        yield harness.TurnEvent("text", text=f"answer={answer}")
+
+    monkeypatch.setattr(harness_mcode, "drive_turn_acp", _fake_acp)
+
+    with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "go"})
+
+    assert r.status_code == 200, r.text
+    assert "answer=None" in r.text, r.text
+    asked = _asked(r.text)
+    decided = _decided(r.text)
+    assert len(asked) == 1, asked
+    assert len(decided) == 1, decided
+    assert decided[0]["data"]["decision"] == "expired", decided[0]
+    assert decided[0]["data"]["id"] == asked[0]["data"]["id"], (asked, decided)
+
+
+def test_a_question_answered_inside_the_window_is_answered_not_expired(
+        monkeypatch, tmp_path):
+    """The other half of OD-12: an answer that beats the clock IS the decision, and
+    the trail must say so. It must not also say `expired` — a pair would claim the
+    server took the answer and let the question lapse."""
+    s = _app_and_session(monkeypatch, tmp_path)
+
+    def _fake_acp(prompt, **kw):
+        answer = kw["on_question"]("elicitation/create", {
+            "message": "Which directory?",
+            "requestedSchema": {"type": "object",
+                                "properties": {"path": {"type": "string"}}}})
+        yield harness.TurnEvent("text", text=f"answer={json.dumps(answer)}")
+
+    monkeypatch.setattr(harness_mcode, "drive_turn_acp", _fake_acp)
+
+    with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
+        approvals = _approvals_of(c)
+        out: dict = {}
+
+        def _turn():
+            out["r"] = c.post(f"/api/sessions/{s['id']}/chat",
+                              json={"message": "go"})
+
+        t = threading.Thread(target=_turn, daemon=True)
+        t.start()
+        deadline = time.time() + 10
+        while time.time() < deadline and s["id"] not in approvals:
+            time.sleep(0.01)
+        assert s["id"] in approvals, "the question never reached the channel"
+        slot = approvals[s["id"]]
+        r = c.post(f"/api/sessions/{s['id']}/approval",
+                   json={"requestId": slot["requestId"],
+                         "answer": {"path": "C:/work"}})
+        assert r.status_code == 200, r.text
+        t.join(15)
+        assert not t.is_alive(), "the turn never finished"
+
+    body = out["r"].text
+    assert "C:/work" in body, body
+    decided = _decided(body)
+    assert len(decided) == 1, decided
+    assert decided[0]["data"]["decision"] == "answered", decided[0]
+    assert decided[0]["data"]["id"] == slot["requestId"], decided
+
+
+def test_the_expiry_fires_once_and_a_late_click_cannot_add_a_decision(
+        monkeypatch, tmp_path):
+    """OD-12's own scenario. By the time the row is stale the server has already
+    said `expired` exactly once, and the click that follows is refused (409) rather
+    than accepted — one ask never ends with two decisions."""
+    s = _app_and_session(monkeypatch, tmp_path)
+    monkeypatch.setattr(serve, "QUESTION_WAIT_SECS", 0.05)
+
+    def _fake_acp(prompt, **kw):
+        kw["on_question"]("elicitation/create", {"message": "Which?"})
+        yield harness.TurnEvent("text", text="done")
+
+    monkeypatch.setattr(harness_mcode, "drive_turn_acp", _fake_acp)
+
+    with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "go"})
+        asked = _asked(r.text)
+        assert len(asked) == 1, asked
+        # The turn is over, so the slot is gone: this is the late click.
+        late = c.post(f"/api/sessions/{s['id']}/approval",
+                      json={"requestId": asked[0]["data"]["id"],
+                            "answer": {"path": "C:/work"}})
+
+    assert late.status_code == 409, late.text
+    decided = _decided(r.text)
+    assert len(decided) == 1, decided
+    assert decided[0]["data"]["decision"] == "expired", decided[0]
+
+
+def test_an_answer_cannot_win_after_the_expiry_has_been_claimed(
+        monkeypatch, tmp_path):
+    """The lock's whole purpose. Once the handler has claimed the expiry it has
+    already returned a decline and published `expired`; the route must refuse an
+    answer that lands after that rather than accept one the server has denied — the
+    same request cannot be both answered and expired."""
+    s = _app_and_session(monkeypatch, tmp_path)
+    with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
+        approvals = _approvals_of(c)
+        approvals[s["id"]] = {
+            "requestId": "q-claimed", "answer": None, "kind": "question",
+            "event": threading.Event(), "lock": threading.Lock(),
+            "expired": True,
+        }
+        r = c.post(f"/api/sessions/{s['id']}/approval",
+                   json={"requestId": "q-claimed", "answer": {"path": "C:/work"}})
+        assert r.status_code == 409, r.text
+        assert not approvals[s["id"]]["event"].is_set(), (
+            "an expired question must not be woken by a late answer")
