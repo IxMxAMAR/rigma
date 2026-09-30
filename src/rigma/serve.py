@@ -7062,6 +7062,38 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             switch_lock.release()
         return asyncio.create_task(_loop())
 
+    def _proxy_body(body: bytes, content_type: str) -> bytes:
+        """The request bytes the engine sees, with Rigma's tool-call parameter
+        layer applied — and ONLY when the request carries `tools`.
+
+        This proxy is otherwise a byte-for-byte passthrough, deliberately: the
+        test that guards it posts raw bytes with odd spacing, and a creative
+        request must not be flattened by a temperature that exists to make
+        tool-call SYNTAX deterministic. At the engine's stock ~0.8 an IQ-quant
+        model's call syntax drifts and the strict parser misses it (live
+        2026-07-20; the same request parsed clean on replay), which is exactly
+        the case `tools` marks. A body that is not JSON, or carries no tools,
+        is forwarded untouched, and the RESPONSE is never touched at all — a
+        streaming reply is still streamed straight through.
+        """
+        if "json" not in content_type.lower():
+            return body
+        try:
+            doc = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return body
+        if not isinstance(doc, dict) or not doc.get("tools"):
+            return body
+        # Weakest to strongest: model card < RUN_PARAMS < caller. RUN_PARAMS is
+        # the same layer Rigma's own turns use, and the caller's own values
+        # always win, so an agent that sets temperature itself is untouched.
+        layer = sessions.effective_params({}, {"params": RUN_PARAMS},
+                                          _model_defaults())
+        merged = {**layer, **doc}
+        if merged == doc:
+            return body          # nothing to add: keep the exact bytes
+        return json.dumps(merged, ensure_ascii=False).encode("utf-8")
+
     @app.api_route("/v1/{path:path}",
                    methods=["GET", "POST", "OPTIONS", "DELETE"])
     async def proxy(request: Request, path: str):
@@ -7071,7 +7103,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                    if k.lower() not in _HOP_HEADERS}
         upstream = client.build_request(
             request.method, f"/v1/{path}", headers=headers,
-            content=await request.body())
+            content=_proxy_body(await request.body(),
+                                request.headers.get("content-type", "")))
 
         def _engine_down(e: Exception) -> JSONResponse:
             # AUDIT 01-4: an OpenAI-compatible client parses the body as JSON.

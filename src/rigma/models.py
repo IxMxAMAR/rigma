@@ -344,6 +344,14 @@ class ComboFlags(BaseModel):
     # measured on its own. The runaway-deliberation problem it was meant to
     # solve is real, but it is worth less than 50x the speed.
     reasoning_budget: int = -1
+    # How thought tags come back on the OpenAI wire: ""(use the plan default
+    # below) | none | auto | deepseek | deepseek-legacy. `deepseek` keeps
+    # thinking OUT of `message.content` and in `message.reasoning_content`,
+    # including in streaming deltas — the shape a DeepSeek-style client parses.
+    reasoning_format: str = ""
+    # The name an OpenAI-compatible client asks for. Empty = the plan's slug,
+    # which is the name Rigma itself writes into its harness configs.
+    alias: str = ""
     spec_type: str = "none"   # none | draft-mtp | ngram-simple | ... (engine list)
     spec_n_max: int = 3
     batch: int = 0        # -b logical batch (0 = engine default 2048)
@@ -357,6 +365,19 @@ class ComboFlags(BaseModel):
             return "on" if v else "off"
         if v not in ("on", "off", "auto"):
             raise ValueError("flash_attn must be on, off, or auto")
+        return v
+
+    @field_validator("reasoning_format")
+    @classmethod
+    def _known_reasoning_format(cls, v: str) -> str:
+        # The engine's own accepted spellings (common/arg.cpp, both pins:
+        # `{"--reasoning-format"}, "FORMAT"` — none | deepseek |
+        # deepseek-legacy, plus `auto` in the enum). Validated HERE so a combo
+        # or a model default with a typo is a ValidationError at parse time
+        # rather than an engine that refuses to launch.
+        ok = {"", "none", "auto", "deepseek", "deepseek-legacy"}
+        if v not in ok:
+            raise ValueError(f"reasoning_format must be one of {sorted(ok)}")
         return v
 
     @field_validator("spec_type")
@@ -438,6 +459,17 @@ class RunPlan(BaseModel):
         args = ["-m", model_path, "--port", str(port), "--host", "127.0.0.1",
                 "-ngl", str(self.flags.ngl), "-c", str(self.flags.ctx),
                 "--parallel", str(LAUNCH_PARALLEL), "--kv-unified"]
+        # llama-server ids the model by its gguf PATH unless told otherwise, so
+        # an OpenAI-compatible client configured with the slug (the name Rigma
+        # itself writes into its harness configs) asks for a name the server
+        # does not answer to. `--alias` adds the slug as a name it does. It is
+        # additive — the path id stays — so nothing that already worked stops.
+        # Flag verified at both pins: common/arg.cpp `{"-a", "--alias"},
+        # "STRING"`, "set model name aliases, comma-separated (to be used by
+        # API)".
+        served_as = self.flags.alias or self.model_slug
+        if served_as:
+            args += ["--alias", served_as]
         if self.flags.n_cpu_moe > 0:
             args += ["--n-cpu-moe", str(self.flags.n_cpu_moe)]
         if self.flags.batch > 0:
@@ -456,6 +488,13 @@ class RunPlan(BaseModel):
             # lost; with it, the budget ends in a conclusion instead of a
             # guillotine.
             args += ["--reasoning-budget-message", BUDGET_EXHAUSTED]
+        # Pin the wire format for thought tags. Both pins' compiled default is
+        # already DEEPSEEK (common/common.h: `reasoning_format =
+        # COMMON_REASONING_FORMAT_DEEPSEEK`), so emitting it explicitly changes
+        # nothing today — but the flag's own help text claims "auto" and
+        # LLAMA_ARG_THINK can move it from the environment, so the contract a
+        # DeepSeek-style client depends on is pinned rather than inherited.
+        args += ["--reasoning-format", self.flags.reasoning_format or "deepseek"]
         if self.flags.spec_type and self.flags.spec_type != "none":
             args += ["--spec-type", self.flags.spec_type,
                      "--spec-draft-n-max", str(self.flags.spec_n_max)]
