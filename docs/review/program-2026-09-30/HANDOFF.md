@@ -186,8 +186,9 @@ _(see `STATUS.md` for the per-item table with outcomes and verifier corrections)
 | 12 | `a903474` `81db56f` + frontend wave 5 + `f038121` | DR7, DR2-3/C11-read/C10-nits/C10-cli, and the frontend wave 5 (with its one FAILED commit fixed) |
 | 13 | `5241a44` `866bf7b` | **DR2-1/DR2-2/DR1-residual** (the deep-review-2 regression), W13-B (the effective env + case-insensitivity) |
 | 14 | `5b4bcd5` `5806031` `009730d` `02785bf` `7b0db3b` `cefd6fd` `97da7b5` `f6a0874` | OD-13's remote stop, the A2d-budget UI, the 400 provenance + prefix strip, the frontend nits, and W14-E (the **flaky** pause test — Head Agent's own 30/30 — the `serve.py` provenance comment, and the registry-combo env gate) |
+| 15 | `12be5cd` `85abd8a` `8977ea8` | **deep review 3's four findings** — DR3-1 (the launch dialog's native-ctx fallback still took the *running* model's window: DR2-4 surviving one fallback later), DR3-3 (a remote-stop request pinned to an unnameable turn never expired), and `impl/w15a`'s DR3-2 (the sweep's `q4_0` guard read the override, not the effective flags — DR2-6's asymmetry one lever over) + DR3-4 (the boot sweep must not reconcile a run a **different live process** drives) |
 
-Integration head at this hand-off: **`8977ea8`** (plus the docs commits that follow it). `STATUS.md`
+Integration head at this hand-off: **`f6a0874`** (plus the docs commits that follow it). `STATUS.md`
 carries the per-item table and the note on the metadata-only author rewrite (with the old→new hash
 mapping for every pre-rewrite commit).
 

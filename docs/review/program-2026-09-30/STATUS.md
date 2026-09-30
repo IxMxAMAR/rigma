@@ -32,7 +32,23 @@ i.e. the real **A18** bug (a transient first read killing the run loop), not a f
 exit 0, 548 s.** The `test_phase4_lifecycle` test that exposed A18 now passes **in the full run**, which
 is A18's acceptance criterion. The count is up from the 2935 baseline because every item added tests.
 
-Integration branch head: `8977ea8` (plus the docs commits that follow it).
+> **FINAL SUITE — blocked by the environment, not by the code (see `REC-1` in `BACKLOG.md`).** The
+> acceptance run for waves 9–15 was started three times and each time the box was already carrying
+> **two orphaned full-suite runs** (`PID 364`/`23672` from 16:33 UTC, `PID 22828`/`25412` from
+> 16:46 UTC) plus **72 live `tests/fake_acp_server.py` children**; the runs froze at 55 % with the
+> CPU flat, exactly as `REC-1` describes. The guard refused `taskkill`, and a process this session
+> did not start is not its to stop, so the orphans could only be waited out. **They exited by
+> ~17:00 UTC**, and a clean full-suite run on `f6a0874` was then started with the box otherwise idle
+> apart from the owner's own `sage-amd` benchmark. Per-chunk evidence gathered while the box was
+> contended: `tests/test_harness_mcode_acp.py` **61 passed in 17.16 s**, `test_acp_control.py` +
+> `test_acp_modes_surface.py` + `test_harness_mcode_acp_turn.py` **62 passed in 58.06 s**, the tail
+> 9 files **59 passed in 13.23 s**, `test_phase4_lifecycle` + `test_resolve` + `test_resolve_calibration`
+> + `test_launch_batch_ngl` + `test_quant_quality` + `test_bench_sweep` **140 passed**, all exit 0,
+> `ruff check src tests` clean, and the frontend gates at HEAD green (`npm run build` exit 0 with
+> `src/rigma/data/ui_v2` **idempotent**, `tsc --noEmit` exit 0, `vitest run` **56 files / 656 tests
+> passed**). The one number this session could not produce is the single-process whole-suite count.
+
+Integration branch head: `f6a0874` (plus the docs commits that follow it).
 
 > **Commit-identity note (2026-09-30).** Early in the run the orchestrator overrode the git author for
 > its merge commits, and several implementers committed under a local identity
