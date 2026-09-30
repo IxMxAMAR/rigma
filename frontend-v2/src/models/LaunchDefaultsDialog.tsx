@@ -395,11 +395,21 @@ export default function LaunchDefaultsDialog({
         ]);
         if (!live) return;
         const card = models?.models.find((m) => m.slug === slug) ?? null;
+        // DR3-1: `/api/server`'s `native_ctx`/`has_mmproj` describe the model that
+        // is RUNNING (`serve.py:4527` reads the live state's own slug), not the one
+        // this dialog is for. Falling back to them unconditionally re-introduced
+        // the invented-ceiling bug DR2-4 removed: when `/api/models` fails or the
+        // slug is absent from it, the dialog offered another model's context steps
+        // and the "unknown window" note never rendered, because the window looked
+        // known. Use the server's answer only when the server says it is about
+        // THIS model — which is the Sidecar case, where the dialog is opened for
+        // the model already loaded.
+        const srvHere = srv?.model === slug ? srv : null;
         setInitial(md.launch);
         setCustom(md.custom);
         setModelCard(card);
-        setNativeCtx(card?.native_ctx || srv?.native_ctx || null);
-        setHasMmproj(!!card?.mmproj || srv?.has_mmproj === true);
+        setNativeCtx(card?.native_ctx || srvHere?.native_ctx || null);
+        setHasMmproj(!!card?.mmproj || srvHere?.has_mmproj === true);
         setBackends((srv?.backends ?? []).filter((b) => b.buildable)
           .map((b) => b.name));
         setDraft(seedDraft(draftFromLaunch(md.launch), md.launch, seedRef.current));

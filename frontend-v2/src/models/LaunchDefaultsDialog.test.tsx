@@ -399,6 +399,52 @@ describe("the launch-defaults dialog against the real route", () => {
     expect(container.textContent).toMatch(/clamps it to 32768/);
   });
 
+  // --- DR3-1: the server's window is the RUNNING model's -------------------
+  //
+  // DR2-4's test covers "models() AND server() both fail". The state it never
+  // reached is "models() fails while server() answers" — and `/api/server`'s
+  // `native_ctx` is the window of whatever model is LOADED (`serve.py:4527`),
+  // not of `slug`. The old fallback therefore offered another model's context
+  // steps and suppressed the "unknown window" note: the invented ceiling DR2-4
+  // removed, one fallback later.
+
+  it("does not take the RUNNING model's window for another model's", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u === "/api/models/m/defaults") return reply(200, { ...STORED, launch: null });
+      if (u === "/api/models") throw new Error("models down");
+      if (u === "/api/server") {
+        return reply(200, { model: "other", native_ctx: 262144, has_mmproj: true });
+      }
+      return reply(200, {});
+    }));
+    await mount();
+    const sel = container.querySelector<HTMLSelectElement>(
+      '[aria-label="Default context"]')!;
+    expect([...sel.querySelectorAll("option")].map((o) => o.textContent))
+      .toEqual(["model default"]);
+    for (const invented of ["64K", "128K", "256K"]) {
+      expect(container.textContent).not.toContain(invented);
+    }
+    expect(container.textContent).toContain("native context window is unknown");
+  });
+
+  it("still takes the server's window when the server says it is THIS model", async () => {
+    // The Sidecar case the fallback exists for: the dialog is open for the model
+    // that is already loaded, so the server's answer IS about this model.
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u === "/api/models/m/defaults") return reply(200, { ...STORED, launch: null });
+      if (u === "/api/models") throw new Error("models down");
+      if (u === "/api/server") return reply(200, { model: "m", native_ctx: 32768 });
+      return reply(200, {});
+    }));
+    await mount();
+    expect(container.textContent).toContain("32K");
+    expect(container.textContent)
+      .not.toContain("native context window is unknown");
+  });
+
   // --- C10: the server's own 400, verbatim ---------------------------------
 
   it("draws the server's own 400 for a batch pair the server refuses", async () => {
