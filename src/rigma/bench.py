@@ -670,7 +670,30 @@ def _engine_version(backend: str = "") -> str:
         return ""
 
 
-def crowned_row(rows: list[dict]) -> dict | None:
+# C11: engine env vars that turn OFF a quality-preserving default. A sweep
+# scores tokens/sec only, so a row carrying one of these may be MEASURED but
+# must not be crowned — and so never persisted into calibration, which
+# `resolve()` then applies to EVERY later launch.
+_QUALITY_ENV_LEVERS = ("LLAMA_ATTN_ROT_DISABLE",)
+
+
+def _carries_quality_env_lever(flags: dict | None) -> bool:
+    """Whether a trial's override flips an engine default that protects QUALITY.
+
+    `LLAMA_ATTN_ROT_DISABLE` disables llama.cpp's Hadamard attention rotation,
+    which the engine enables BY DEFAULT for a quantized KV cache and which is
+    what keeps that cache's loss down: `quant_quality._KV_PPL` records q4_0/q4_0
+    at +0.19% perplexity WITH rotation vs +2.42% without (PR 7412). Crowning it
+    on tokens/sec alone would write it to calibration.json, and
+    `runtime.launch_server` would merge it into every later launch's child
+    environment — a silent quality regression traded for a speed win.
+    """
+    env = (flags or {}).get("env") or {}
+    return any(name in env for name in _QUALITY_ENV_LEVERS)
+
+
+def crowned_row(rows: list[dict],
+                allow_quality_levers: bool = False) -> dict | None:
     """The config a sweep actually crowns. ONE rule, two readers.
 
     `run_sweep` saves the winner; `rigma sweep` prints it. They used to decide
@@ -683,9 +706,17 @@ def crowned_row(rows: list[dict]) -> dict | None:
     speculation config must beat the best non-spec row decisively or the
     non-spec row is crowned instead.
 
+    The quality gate (C11): a row that carries a quality-degrading env lever is
+    not a candidate at all unless `allow_quality_levers` is set. Both readers
+    call this with the default, so the winner the CLI announces and the flags
+    `run_sweep` saves cannot disagree.
+
     Sorts a copy, so the answer does not depend on whether the caller sorted.
     """
-    ok = sorted((r for r in rows if r.get("ok")),
+    ok = sorted((r for r in rows
+                 if r.get("ok")
+                 and (allow_quality_levers
+                      or not _carries_quality_env_lever(r.get("flags")))),
                 key=lambda r: r.get("tg_tps", 0.0), reverse=True)
     best = next(iter(ok), None)
     if best is not None and (best.get("flags") or {}).get("spec_type"):
@@ -702,8 +733,14 @@ def sweep_configs(base: ComboFlags, moe: bool,
     """Flag-override sets to A/B on this machine. Baseline first; each entry is
     a partial ComboFlags update. Axes come from the RDNA4 findings: FA gates the
     fast KV path, symmetric KV precision, prefill batch, Vulkan coopmat,
-    host-side KV-op placement (C2 `--no-op-offload`), and (MoE only)
-    graphics-queue + offload depth."""
+    host-side KV-op placement (C2 `--no-op-offload`), attention-rotation
+    disabling (C11 `LLAMA_ATTN_ROT_DISABLE`), and (MoE only) graphics-queue +
+    offload depth.
+
+    Whether the C11 axis may be TRIALLED and whether its row may be CROWNED are
+    decided by `run_sweep` (tools-capable models drop it; no model crowns it
+    without an explicit opt-in), not here — this function only lists the axes.
+    """
     cfgs: list[tuple[str, dict]] = [("baseline", {})]
     cfgs.append(("fa-off", {"flash_attn": "off"}))
     cfgs.append(("kv-q8", {"cache_type_k": "q8_0", "cache_type_v": "q8_0"}))
@@ -719,6 +756,32 @@ def sweep_configs(base: ComboFlags, moe: bool,
     # NOT in quick_configs: a default load must not change. See
     # ComboFlags.no_op_offload for the upstream URLs/lines and the PREDICTION.
     cfgs.append(("no-op-offload", {"no_op_offload": True}))
+    # C11: disable the Hadamard attention rotation. There is NO argv flag for
+    # this at either pin — only the env `LLAMA_ATTN_ROT_DISABLE` — so unlike C2
+    # it is trialled through the engine-spawn env (`ComboFlags.env`), exactly
+    # like the GGML_VK_* driver toggles above. Provenance:
+    #   PrismML-Eng/llama.cpp@87268f77 src/llama-kv-cache.cpp L316-326
+    #   ggml-org/llama.cpp@b9867     src/llama-kv-cache.cpp L329-339
+    #     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
+    #     attn_rot_k = !attn_rot_disable && ... && ggml_is_quantized(type_k) ...
+    # Fork override (same pin, src/llama-kv-cache.cpp L329-332): for
+    # LLAMA_ARCH_DEEPSEEK32 / DEEPSEEK4 / GLM_DSA / DOTS3NOTE, when
+    # n_embd_head_k_full == indexer_head_size, `attn_rot_k` is forced back to
+    # true AFTER the `!attn_rot_disable` expression — so on those archs this
+    # axis disables only V rotation. The general path above is what the owner's
+    # current load runs.
+    # `getenv` returning null is the engine default, so the OFF case sets
+    # nothing at all and every pre-existing trial's child environment is
+    # byte-identical; the ON case merges the variable over `os.environ` for the
+    # CHILD only (`runtime.launch_server`), never the parent. The rotation is ON
+    # by default for a QUANTIZED KV cache and this machine's own load runs it
+    # (`.scratch/prism-v.log:4576-4578`: `K (q8_0)` with `attn_rot_k = 1`), so
+    # the axis has a real effect on the resolved plan — not only on kv-q8/q4.
+    # It is a QUALITY lever, not a driver toggle: `run_sweep` does not trial it
+    # on a tools-capable model and does not crown it for any model without an
+    # explicit opt-in (`allow_quality_levers`), so it cannot reach calibration.
+    # Deliberately NOT in quick_configs: a default load must not change.
+    cfgs.append(("attn-rot-off", {"env": {"LLAMA_ATTN_ROT_DISABLE": "1"}}))
     if moe:
         cfgs.append(("gfxqueue-on", {"env": {"GGML_VK_ALLOW_GRAPHICS_QUEUE": "1"}}))
         if base.n_cpu_moe > 0:
@@ -748,7 +811,9 @@ def quick_configs(base: ComboFlags, moe: bool,
         cfgs.append(("gfxqueue-on", {"env": {"GGML_VK_ALLOW_GRAPHICS_QUEUE": "1"}}))
     # NOTE: the C2 `--no-op-offload` axis is deliberately NOT in the first-load
     # set either: it is a sweep-only trial, so a default load's argv is unchanged
-    # whether or not the sweep has ever been run.
+    # whether or not the sweep has ever been run. The C11 `LLAMA_ATTN_ROT_DISABLE`
+    # axis is omitted for the same reason, and because it is a quality lever: a
+    # default load must not acquire it.
     # NOTE: spec-mtp trials deliberately NOT in the auto first-load set.
     # Live lesson 2026-07-21: the 96-token bench summarises highly
     # predictable filler, which inflates MTP draft acceptance — draft-mtp
@@ -761,7 +826,8 @@ def quick_configs(base: ComboFlags, moe: bool,
 def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
               prompt_tokens: int = 2048, gen_tokens: int = 96,
               progress=None, configs=None, extra_args=None,
-              mark_calibrated: bool = False, depth: int | None = None) -> list[dict]:
+              mark_calibrated: bool = False, depth: int | None = None,
+              allow_quality_levers: bool = False) -> list[dict]:
     """Launch `plan` under each config on `port`, bench it, and persist the best
     tg/s config to calibration (which resolve() then applies automatically). The
     caller guarantees `port` is free (scratch port, or mid-switch with the old
@@ -769,7 +835,17 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
 
     `depth` is passed through to every `run_bench` and recorded on every row, so
     a sweep can A/B at a FILLED window rather than the almost-empty one a short
-    prompt leaves (see `run_bench`)."""
+    prompt leaves (see `run_bench`).
+
+    Quality levers (C11): a config that flips a quality-degrading engine env var
+    (`_carries_quality_env_lever`) is treated like the q4_0 KV cache is on a
+    tools-capable model — it is not crowned, and so never persisted into
+    calibration and applied to every later launch. On a tools-capable model it
+    is not even trialled (it cannot win, so the engine load would be wasted);
+    on any other model it IS trialled and recorded, because the measurement is
+    the point of a sweep, but `allow_quality_levers=True` is required before it
+    may win.
+    """
     is_moe = plan.flags.n_cpu_moe > 0
     if configs is None:
         configs = sweep_configs(plan.flags, is_moe,
@@ -778,11 +854,14 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     # own function-calling docs warn extreme KV quantization significantly
     # degrades tool calling, and the sweep scores tokens/sec only — it would
     # trade a silent quality regression for a speed win. (Mirrors the
-    # registry's DeltaNet q8_0 cache policy.)
+    # registry's DeltaNet q8_0 cache policy.) C11's rotation env toggle is the
+    # same class of hazard through the child environment, so it is dropped here
+    # too; on a non-tools model `crowned_row` still refuses to crown it.
     if _tools_capable(plan.model_slug):
         configs = [(label, o) for label, o in configs
                    if o.get("cache_type_k") != "q4_0"
-                   and o.get("cache_type_v") != "q4_0"]
+                   and o.get("cache_type_v") != "q4_0"
+                   and not _carries_quality_env_lever(o)]
     rows: list[dict] = []
     for label, override in configs:
         flags = plan.flags.model_copy(update=override)
@@ -813,7 +892,7 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
         finally:
             srv.stop()
     rows.sort(key=lambda r: r["tg_tps"], reverse=True)
-    best = crowned_row(rows)
+    best = crowned_row(rows, allow_quality_levers=allow_quality_levers)
     _log_rows(plan, rows, best)
     if best is not None and (best["flags"] or mark_calibrated):
         key = calibration_key(plan.model_slug, plan.gguf.quant, plan.backend)
