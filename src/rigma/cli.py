@@ -1939,7 +1939,7 @@ def _adopt_or_refuse(port: int, reattach: bool, dry_run: bool) -> None:
             rec = orphan.record_from_props(props, pid, exe, port)
             # kv_fp stays EMPTY, explicitly and for the same reason the vLLM
             # path leaves it empty: it keys llama.cpp's slot cache, and it is
-            # a hash of THIRTEEN launch fields (ctx, cache_type_k/v, ngl,
+            # a hash of FOURTEEN launch fields (ctx, cache_type_k/v, ngl,
             # n_cpu_moe, spec_type, spec_n_max, flash_attn, ...). An adopted
             # engine was launched by a process that is gone, and /props reports
             # the window but not the rest, so any value computed here would be a

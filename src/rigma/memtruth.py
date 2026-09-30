@@ -58,6 +58,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import models
+
 # The oracle writes fitted CLI args to stdout and its reasoning to stderr.
 # stderr is where the numbers are.
 _TIMEOUT_S = 120.0
@@ -469,9 +471,13 @@ def fit_argv(plan, model_path: str, *, backend_args: list[str] | None = None
             argv += [flag, str(val)]
     if int(getattr(f, "n_cpu_moe", 0) or 0) > 0:
         argv += ["--n-cpu-moe", str(int(f.n_cpu_moe))]
-    # --parallel 2 is what Rigma actually launches with, and the oracle reports
+    # --parallel is what Rigma actually launches with, and the oracle reports
     # on what it is given, so verifying without it would verify a different plan.
-    argv += ["--parallel", "2"]
+    # Read from the SAME constant the argv builder writes (`models.LAUNCH_PARALLEL`)
+    # rather than a literal: a literal is a second copy that drifts, and a fit
+    # for one sequence count while the engine allocates another is exactly the
+    # silent overcommit this oracle exists to catch.
+    argv += ["--parallel", str(models.LAUNCH_PARALLEL)]
     argv += list(backend_args or [])
     argv += ["-lv", "4"]
     return argv
