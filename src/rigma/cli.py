@@ -416,7 +416,7 @@ def update():
     """Fetch the latest community combo registry (and engine pin) from
     GitHub."""
     from .registry import update_registry
-    from .runtime import _engines_manifest, update_engines_manifest
+    from .runtime import _engines_manifest, update_engines_manifest_result
 
     before = Registry.load()
     dest = update_registry()
@@ -426,12 +426,28 @@ def update():
                f"combos {len(before.combos)} -> {len(after.combos)}")
     # engine pin rides the same update: llama.cpp ships weekly, pip doesn't
     old_v = _engines_manifest().get("version", "?")
-    if update_engines_manifest():
-        new_v = _engines_manifest().get("version", "?")
-        typer.echo(f"engine pin: {old_v} -> {new_v}"
-                   + ("" if new_v != old_v else " (unchanged)"))
-    else:
-        typer.echo(f"engine pin: {old_v} (no newer pin published)")
+    typer.echo(_engine_pin_line(old_v, update_engines_manifest_result()))
+
+
+def _engine_pin_line(old_v: str, res) -> str:
+    """One line for the engine half of `rigma update` (A6).
+
+    Every failure used to print "(no newer pin published)", so an offline user or a
+    failed download was told the pin was current. Each outcome now says what
+    actually happened, in the CLI's one-line voice."""
+    from .runtime import (MANIFEST_CURRENT, MANIFEST_NETWORK, MANIFEST_UNSAVED,
+                          MANIFEST_UNUSABLE)
+    if res.status == MANIFEST_CURRENT:
+        return f"engine pin: {old_v} (already current)"
+    if res.status == MANIFEST_NETWORK:
+        return f"engine pin: {old_v} (could not reach the network — not checked)"
+    if res.status == MANIFEST_UNUSABLE:
+        return (f"engine pin: {old_v} (the published pin was fetched but is "
+                f"unusable)")
+    if res.status == MANIFEST_UNSAVED:
+        return (f"engine pin: {old_v} (fetched {res.version or '?'} but could not "
+                f"save it)")
+    return f"engine pin: {old_v} -> {res.version or '?'}"
 
 
 def _port_status(port: int) -> str:
