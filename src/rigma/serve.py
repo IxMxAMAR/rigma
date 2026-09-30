@@ -4685,7 +4685,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": f"cannot read the engine log: {e}", "findings": []},
                 status_code=503, headers=_NO_STORE)
         s = st.server_running()
-        expected = server_ops.planned_vram_mb(s, registry) if s else None
+        # DR2-2: `planned_vram_mb` can pay a registry parse on a cache miss, and
+        # this route is hit by every open tab; keep it off the event loop, as the
+        # log read above already is.
+        expected = (await asyncio.to_thread(server_ops.planned_vram_mb, s,
+                                            registry)
+                    if s else None)
         return {"findings": engine_log.findings(text,
                                                 expected_vram_mb=expected)}
 
