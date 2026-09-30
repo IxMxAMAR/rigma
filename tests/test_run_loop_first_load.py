@@ -825,3 +825,36 @@ def test_a_run_this_process_stamped_is_still_reaped(home):
 
     assert runs.load(rid)["status"] == "interrupted"
 
+
+# ---------------------------------------------------------------------------
+# DR4-3: an UNKNOWN driver identity must read as "not live elsewhere", so the
+# run IS reconciled. `_driver_stamp` writes 0.0 when it cannot read its own
+# create time, and reading that as "live" left active.json wedged — the
+# start_run 409 the boot sweep exists to clear. The process-KILLING path keeps
+# the opposite, conservative default (see tests/test_state.py).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("drop", [False, True], ids=["zero", "missing-key"])
+def test_an_unknown_driver_identity_does_not_wedge_the_run(home, drop):
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()
+
+    # A foreign pid that is not this process. Whether it is alive is irrelevant:
+    # the record carries no identity to check, which is the case under test.
+    doc = runs.load(rid)
+    doc["driver_pid"] = os.getpid() + 1
+    if drop:
+        doc.pop("driver_started_at", None)
+    else:
+        doc["driver_started_at"] = 0.0
+    (runs.run_dir(rid) / "run.json").write_text(
+        json.dumps(doc, indent=2), encoding="utf-8")
+
+    assert runs.driver_is_live_elsewhere(runs.load(rid)) is False, (
+        "an unknown driver identity was read as 'live elsewhere', so the run "
+        "can never be reconciled")
+    serve._reconcile_orphaned_runs(runs)
+
+    assert runs.load(rid)["status"] == "interrupted"
+

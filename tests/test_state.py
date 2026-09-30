@@ -122,3 +122,41 @@ def test_update_state_reidentifies_a_new_pid(tmp_path, monkeypatch):
     state.update_state(engine_pid=os.getpid())
     s = state.read_state()
     assert abs(s["engine_started_at"] - psutil.Process(os.getpid()).create_time()) < 1.0
+
+
+# --- DR4-3: two questions, two opposite safe directions ---------------------
+#
+# The kill path and the driver path both ask "is this pid still the recorded
+# process?", but an unknown identity must default the other way for each: never
+# kill what you cannot identify, and never let an unidentifiable run wedge the
+# active pointer forever. `runs._driver_stamp` writes exactly 0.0 when it cannot
+# read its own create time, so the driver path must read 0.0 as "not live
+# elsewhere" (deep-review-4.md DR4-3).
+
+
+def test_the_two_predicates_default_an_unknown_identity_oppositely():
+    me = os.getpid()
+    # started_at 0.0: a pre-upgrade record for the kill path (still killable),
+    # but no identity at all for the driver path (not a live driver).
+    assert state._is_recorded_process(me, 0.0) is True
+    assert state._is_identified_process(me, 0.0) is False
+    # a missing key is unparseable identity: neither path matches
+    assert state._is_recorded_process(me, None) is False
+    assert state._is_identified_process(me, None) is False
+
+
+def test_a_missing_create_time_key_is_not_killed(tmp_path, monkeypatch):
+    """The KILL path refuses when the identity is absent entirely: nothing is
+    terminated. The DRIVER path reads the same absence the opposite way and
+    reconciles the run (test_run_loop_first_load.py::
+    test_an_unknown_driver_identity_does_not_wedge_the_run)."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    me = os.getpid()
+    state.write_state("m", "q", 11500, engine_pid=me, ui_pid=me)
+    s = state.read_state()
+    del s["engine_started_at"]
+    (tmp_path / "state.json").write_text(json.dumps(s), encoding="utf-8")
+    killed = []
+    monkeypatch.setattr(state, "kill_pid", lambda pid: killed.append(pid))
+    assert state.kill_recorded(state.read_state(), "engine_pid") is False
+    assert killed == []

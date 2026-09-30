@@ -52,14 +52,14 @@ def _create_time(pid: int) -> float:
         return 0.0
 
 
-def _is_recorded_process(pid: int, started_at) -> bool:
-    """Is `pid` still the process the record was written about?
+def _recorded_identity_matches(pid: int, started_at):
+    """Does `pid` name the live process the record was written about?
 
-    True when the record carries no identity to check (started_at 0.0), so a
-    pre-upgrade state.json is never made unkillable. Otherwise the create time
-    must match: a recycled pid belongs to some other process and must be left
-    alone. Unreadable identity counts as "not ours" — the safe direction, since
-    the only action gated on this is terminating a process.
+    True/False is a positive answer. None means the record carries NO identity
+    to check (started_at 0.0): a pre-upgrade record, or the 0.0 that
+    `runs._driver_stamp` writes when it cannot read its own create time. The
+    caller must then choose the safe direction for ITS action — the two
+    predicates below choose opposite ones, on purpose (DR4-3).
     """
     if pid <= 0:
         return False
@@ -68,11 +68,39 @@ def _is_recorded_process(pid: int, started_at) -> bool:
     except (TypeError, ValueError):
         return False
     if want <= 0.0:
-        return True
+        return None
     try:
         return abs(psutil.Process(pid).create_time() - want) < 1.0
     except Exception:
         return False
+
+
+def _is_recorded_process(pid: int, started_at) -> bool:
+    """Is `pid` still the process the record was written about? — the
+    TERMINATION direction.
+
+    An unknown identity (started_at 0.0) counts as OURS, so a pre-upgrade
+    state.json is never made unkillable (AUDIT F08-1). A pid whose create time
+    cannot be read (the process is gone) or that has moved is not ours, so
+    nothing is killed that we cannot identify.
+    """
+    return _recorded_identity_matches(pid, started_at) is not False
+
+
+def _is_identified_process(pid: int, started_at) -> bool:
+    """Is `pid` POSITIVELY the process the record was written about? — the
+    DRIVER direction.
+
+    The opposite default from `_is_recorded_process`, deliberately. A second
+    consumer (`runs.driver_is_live_elsewhere`) asks whether a run is being
+    driven elsewhere, and there an unknown identity must NOT keep a wedged run
+    alive forever: `runs._driver_stamp` writes exactly 0.0 when it cannot read
+    its own create time, so reading that as "live elsewhere" would leave
+    active.json unreconcilable and restore the start_run 409 wedge the boot
+    sweep exists to clear (DR4-3, deep-review-4.md). Only a create time that
+    MATCHES is a yes; unknown is a no.
+    """
+    return _recorded_identity_matches(pid, started_at) is True
 
 
 def _write_record(rec: dict) -> dict:
