@@ -47,6 +47,9 @@ _FIELD_DEFAULTS = {
     # and MUST NOT be read as ngl=99 / n_cpu_moe=0 ("fully resident"), which is
     # the confident assumption that made the axis unusable for MoE. A record
     # written before this field existed has no `placement` and reads as unknown.
+    # DR21RN1-n1: the dict also carries `"ubatch": int`, the `-ub` the launch
+    # emitted (0 = none, engine default 512). It is OPTIONAL in the reader: a
+    # record written before it existed reads it as absent/unknown, never as 0.
     "placement": None,
 }
 

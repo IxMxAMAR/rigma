@@ -115,7 +115,8 @@ def test_ctx_relaunch_carries_dense_ngl(monkeypatch, tmp_path):
     monkeypatch.setattr("rigma.runtime.ensure_engine", lambda b, o: "x.exe")
     monkeypatch.setattr("rigma.runtime.launch_server",
                         lambda e, rp, p, port, extra_args=None:
-                        (launched.update(ngl=rp.flags.ngl, ctx=rp.flags.ctx)
+                        (launched.update(ngl=rp.flags.ngl, ctx=rp.flags.ctx,
+                                         ubatch=rp.flags.ubatch)
                          or _SP()))
     monkeypatch.setattr(st, "kill_pid", lambda pid: None)
     monkeypatch.setattr(server_ops, "_await_port_free",
@@ -131,8 +132,11 @@ def test_ctx_relaunch_carries_dense_ngl(monkeypatch, tmp_path):
     # DR2-1-res: the placement the launch APPLIED is persisted, and it is the
     # recomputed partial offload — not the stale ngl=99 the old record kept. The
     # VRAM axis reads this back to make the plan's prediction device-side.
+    # DR21RN1-n1: the record also carries the `-ub` this launch emitted, so the
+    # reader prices its compute charge from the ubatch that actually ran.
     assert st.read_state()["placement"] == {"ngl": launched["ngl"],
-                                            "n_cpu_moe": 0}
+                                            "n_cpu_moe": 0,
+                                            "ubatch": launched["ubatch"]}
 
 
 def test_kv_override_reaches_the_launch_flags(env):
