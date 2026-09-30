@@ -18,6 +18,9 @@ Baseline full suite: **2935 non-hardware tests, all pass (exit 0)**; `ruff check
 **Full suite at `e745820` (waves 1–3 merged): 1 failure — `tests/test_phase4_lifecycle.py::test_restart_reattaches_and_finishes`,
 which passes in isolation. Its traceback is `serve.py:5508 TypeError: 'NoneType' object is not subscriptable`,
 i.e. the real **A18** bug (a transient first read killing the run loop), not a flaky test.**
+**Full suite at `eac509f` (waves 1–8 merged, A18 in): 3229 passed, 3 skipped, 5 deselected, 0 failed,
+exit 0, 548 s.** The `test_phase4_lifecycle` test that exposed A18 now passes **in the full run**, which
+is A18's acceptance criterion. The count is up from the 2935 baseline because every item added tests.
 
 Integration branch head: `773d39d`.
 
