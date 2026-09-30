@@ -402,14 +402,15 @@ describe("the launch-defaults dialog against the real route", () => {
   // --- C10: the server's own 400, verbatim ---------------------------------
 
   it("draws the server's own 400 for a batch pair the server refuses", async () => {
-    // C5: this is the REAL body, verbatim — pydantic's `"Value error, "` prefix
-    // included (verified against `LaunchDefaults(batch=4096, ubatch=8192)`,
-    // whose validator message `hangar.py:1166` joins into the 400). The old
-    // fixture was a hand-written paraphrase without the prefix, so the test
-    // would have passed even if the dialog stripped the prefix on the way in.
-    const REFUSAL_400 = "Value error, ubatch 8192 exceeds batch 4096: "
-      + "llama.cpp refuses to start when the physical batch is larger than "
-      + "the logical batch";
+    // C5: this is the REAL body, verbatim — the server's own 400 for
+    // `LaunchDefaults(batch=4096, ubatch=8192)`. The route returns
+    // `str(HangarError)`, and `hangar._validation_message` has already stripped
+    // pydantic's `"Value error, "`, so the dialog shows this sentence with no
+    // prefix and with the SERVER — not the engine — as the one that refuses.
+    // The old fixture was the pre-strip paraphrase, engine blame and all, so it
+    // pinned wording the server no longer produces.
+    const REFUSAL_400 = "ubatch 8192 exceeds batch 4096: "
+      + "the server refuses a physical batch larger than the logical batch";
     serve(() => reply(400, { error: REFUSAL_400 }));
     await mount();
     await type("Default batch", "4096");
