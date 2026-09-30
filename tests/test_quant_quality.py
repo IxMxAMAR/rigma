@@ -157,7 +157,40 @@ def test_fit_is_computed_when_a_profile_is_given(tmp_path, monkeypatch):
     assert small["fit"]["speed"] in ("gpu", "light", "offload")
     assert huge["fit"]["ok"] is False          # 60GB on a 16GB card
     assert huge["fit"]["speed"] == "no"
+    # ... and a genuine "does not fit" is NOT marked as a broken fit (06R3-7)
+    assert "error" not in huge["fit"]
     assert card["recommended"] == "Q4_K_M"     # the only one that runs
+
+
+def test_a_fit_exception_is_recorded_not_rendered_as_no_profile(
+        tmp_path, monkeypatch, caplog):
+    """06R3-7: `except Exception: pass` left `fits` as `[{} for _ in ggufs]`,
+    which renders exactly like "no profile was passed" — so a KeyError inside
+    the fit arithmetic was invisible on the page AND in the log. The rows must
+    carry an explicit failure, and the exception must be logged."""
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    from rigma import resolve
+    from rigma.models import CpuInfo, GpuInfo, HardwareProfile
+    prof = HardwareProfile(
+        gpus=[GpuInfo(vendor="amd", name="RX", vram_mb=16368,
+                      backends=["vulkan"])],
+        ram_mb=32768, ram_free_mb=24000, cpu=CpuInfo(cores=16),
+        os="windows", disk_free_gb=400.0)
+    spec = _spec(tmp_path, [("m-Q4_K_M.gguf", 8 * 2**30)])
+
+    def boom(*_a, **_k):
+        raise KeyError("kv")
+
+    monkeypatch.setattr(resolve, "quant_verdicts", boom)
+    with caplog.at_level("ERROR", logger="rigma.hangar"):
+        card = hangar.list_models(_Reg(spec), prof)["models"][0]
+
+    fit = card["quants"][0]["fit"]
+    assert fit["ok"] is False
+    assert fit["speed"] == "no"
+    assert fit["error"] == "fit failed"        # NOT an empty dict
+    assert any("fit verdicts failed" in r.getMessage()
+               for r in caplog.records), caplog.text
 
 
 def test_the_models_page_and_the_hf_page_use_one_fit_implementation():

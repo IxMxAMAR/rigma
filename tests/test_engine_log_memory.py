@@ -11,8 +11,9 @@ The fitting pass at lines 2159-2340 is a *different* load in the same file,
 with `ROCm0 model buffer size = 0.00 MiB`; a parser that takes the first (or
 any) occurrence reports zeros and reads as "it fits".
 
-These are trimmed copies embedded here on purpose: the real file is 5 MB and
-reading it at test time would couple a unit test to a scratch artifact.
+These are trimmed copies embedded here on purpose: the real file is 357,442
+bytes (~350 KiB) and reading it at test time would couple a unit test to a
+scratch artifact.
 """
 import pytest
 
@@ -183,6 +184,27 @@ def test_no_memory_data_is_explicitly_unknown_never_zero():
     assert "unknown" in r["detail"].lower()
     # a silent 0 would read as "it fits"
     assert r["actual_vram_mb"] != 0
+    # S2b: an unknown load has no split verdict either — `False` would read as
+    # "no split problem" to a caller looking at this key alone.
+    assert r["unexpected_splits"] is None
+
+
+def test_a_found_load_with_no_buffer_lines_is_unknown_not_zero():
+    """S2b: `compare_plan`'s OTHER unknown branch. `found` is True (the
+    `offloaded` marker was there) but no buffer line followed, so there is
+    nothing to sum — it must be as explicitly unknown as a log with no load at
+    all, including `unexpected_splits`."""
+    load = engine_log.parse_load(
+        "0.0 I load_tensors: offloaded 65/65 layers to GPU\n")
+    assert load["found"] is True            # the marker was there ...
+    assert load["model_buffers"] == []      # ... and no buffer line followed
+
+    r = engine_log.compare_plan(load, 7000)
+
+    assert r["known"] is False
+    assert r["actual_vram_mb"] is None
+    assert r["divergence_mb"] is None
+    assert r["unexpected_splits"] is None
 
 
 def test_compare_plan_accepts_the_full_load_list():

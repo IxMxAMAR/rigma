@@ -17,6 +17,23 @@ _SIMPLE = {0: ("<B", 1), 1: ("<b", 1), 2: ("<H", 2), 3: ("<h", 2),
 _MAX_STR = 10_000_000      # metadata strings top out ~100KB (chat templates)
 _MAX_KEPT_ARRAY = 4096     # per-layer arrays are tiny; vocab arrays are not
 
+# AUDIT 06R3-8: the layouts this reader implements, exactly. The check used to
+# be `version < 2` — a floor — so a header declaring v4, v5 or 4294967295 was
+# parsed as if it were v2/v3 and every field (n_layers, kv_heads,
+# context_length) was silently wrong, which is how a wrong number becomes "a
+# model that will not load". A later version is NOT a newer file this reader
+# understands: both engines Rigma launches define GGUF_VERSION 3 — mainline
+# `b9867` (ggml/include/gguf.h and gguf-py/gguf/constants.py) and PrismML
+# `87268f77` (ggml/include/gguf.h) — so an allow-list trades a wrong number for
+# a refusal that names the version.
+_KNOWN_GGUF_VERSIONS = (2, 3)
+
+# AUDIT 06R3-9: an upper bound for the tensor table's own arithmetic. Every
+# other count the parser reads has one (`n_kv`, `n_tensors`, `n_dims`, string
+# lengths); the product of a tensor's dims did not. The largest real model is
+# ~1e12 parameters, so a file declaring more than 1e15 cannot be real.
+_MAX_PARAMS = 10**15
+
 
 class GgufParseError(ValueError):
     pass
@@ -96,8 +113,10 @@ def _read_meta(f) -> tuple[dict, int]:
     if f.read(4) != b"GGUF":
         raise GgufParseError("not a GGUF file")
     version = _read(f, "<I", 4)
-    if version < 2:
-        raise GgufParseError(f"gguf v{version} is too old")
+    if version not in _KNOWN_GGUF_VERSIONS:
+        raise GgufParseError(
+            f"unsupported gguf version {version} (this reader implements "
+            + " and ".join(str(v) for v in _KNOWN_GGUF_VERSIONS) + ")")
     n_tensors = _read(f, "<Q", 8)
     n_kv = _read(f, "<Q", 8)
     if n_kv > 100_000:
@@ -192,6 +211,7 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
     if n_tensors > 1_000_000:
         raise GgufParseError("implausible tensor count")
     for _ in range(n_tensors):
+        n = 0
         try:
             name = _read_str(f)
             n_dims = _read(f, "<I", 4)
@@ -205,6 +225,19 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
         except GgufParseError:
             idx.truncated = True
             return idx
+        # AUDIT 06R3-9: the dims are multiplied with no plausibility bound, and
+        # Python has no overflow — rank 8 with every dim 2**64-1 is not an
+        # error, it is a silently 3.4e153-element tensor. That count then
+        # survives every downstream ratio: moe_from_probe keeps a
+        # plausible-looking expert share and measured_bpw turns it into a
+        # -100% "drift" that reads as a real finding. The largest real model is
+        # ~1e12 parameters, so 1e15 is already beyond corrupt. The check is
+        # OUTSIDE the try: a GgufParseError raised inside it is caught as a
+        # truncated ranged read, which is the opposite verdict.
+        if n > _MAX_PARAMS or idx.params + n > _MAX_PARAMS:
+            raise GgufParseError(
+                f"implausible tensor size: {name!r} declares {n} elements, "
+                f"which puts the file over {_MAX_PARAMS} parameters")
         idx.params += n
         idx.type_counts[gtype] = idx.type_counts.get(gtype, 0) + 1
         if name.startswith("blk."):
