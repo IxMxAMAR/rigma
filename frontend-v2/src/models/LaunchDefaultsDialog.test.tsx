@@ -129,6 +129,59 @@ describe("LaunchDefaultsForm markup", () => {
     expect(markup).toContain("clamped");
   });
 
+  it("draws a fully-resident fit as all 64 layers, never '99 of 64'", () => {
+    // C1: the fully-resident case the only committed fixture (ngl 59) never
+    // reached. `ngl: 99` is the sentinel, so the markup must not carry it.
+    const markup = renderToStaticMarkup(
+      <LaunchDefaultsForm
+        {...base}
+        nLayers={64}
+        fit={{
+          ok: true, ctx: 16384, ngl: 99, kv: "q8_0", offload_pct: 0,
+          budget: { file_mb: 14200, mmproj_mb: 0, kv_mb: 800,
+                    budget_mb: 15018, over_mb: 5518, ctx: 16384,
+                    kv_type: "q8_0" },
+        }} />);
+    expect(markup).toContain("places all 64 layers on the GPU");
+    expect(markup).not.toContain("99 of 64");
+    expect(markup).not.toContain("places 99");
+  });
+
+  it("prices the fit at the STORED ubatch, not the one being typed", () => {
+    // C2: the fit on screen is the stored one, so a draft ubatch must not
+    // relabel it. Before the fix this said "stored ubatch (8192)" the moment
+    // the user typed, while the fit was still priced at the stored 2048.
+    const markup = renderToStaticMarkup(
+      <LaunchDefaultsForm
+        {...base}
+        initial={{ ...STORED.launch, ubatch: 2048 }}
+        draft={{ ...draftFromLaunch(STORED.launch), ubatch: "8192" }} />);
+    expect(markup).toContain("stored ubatch (2048)");
+    expect(markup).not.toContain("stored ubatch (8192)");
+  });
+
+  it("says the SERVER refuses the batch pair, not the engine", () => {
+    // C3: b9867 clamps `n_ubatch` to `n_batch`; the 400 comes from Rigma's own
+    // route (hangar.set_launch_defaults -> HangarError). The old note claimed
+    // the engine refuses, which is the backend's own wrong provenance.
+    const markup = renderToStaticMarkup(<LaunchDefaultsForm {...base} />);
+    expect(markup).toContain("refused by the SERVER with a 400");
+    expect(markup).not.toContain("refused by the engine");
+  });
+
+  it("says a stored context below the 2048 floor is raised at launch", () => {
+    // C6: `server_ops.perform_switch` does `max(2048, min(int(ctx), native))`,
+    // so a stored value below the floor does not run either — and said nothing
+    // before this note. Mirrors the above-window note.
+    const markup = renderToStaticMarkup(
+      <LaunchDefaultsForm
+        {...base}
+        draft={{ ...draftFromLaunch(STORED.launch), ctx: "1024" }} />);
+    expect(markup).toContain("below the launch floor 2048");
+    expect(markup).toContain("a launch raises it to 2048");
+    expect(markup).not.toContain("above m's native window");
+  });
+
   it("says nothing about a fit it does not have", () => {
     const markup = renderToStaticMarkup(<LaunchDefaultsForm {...base} />);
     expect(markup).not.toContain("layers on the GPU");
@@ -348,11 +401,15 @@ describe("the launch-defaults dialog against the real route", () => {
 
   // --- C10: the server's own 400, verbatim ---------------------------------
 
-  it("draws the server's own 400 for a batch pair the engine refuses", async () => {
-    // The pair is refused by `hangar` (`batch_pair_error`), not by a local
-    // guess: the dialog must not rewrite or swallow that sentence.
-    const REFUSAL_400 = "ubatch 8192 exceeds batch 4096: llama.cpp refuses to "
-      + "start when the physical batch is larger than the logical batch";
+  it("draws the server's own 400 for a batch pair the server refuses", async () => {
+    // C5: this is the REAL body, verbatim — pydantic's `"Value error, "` prefix
+    // included (verified against `LaunchDefaults(batch=4096, ubatch=8192)`,
+    // whose validator message `hangar.py:1166` joins into the 400). The old
+    // fixture was a hand-written paraphrase without the prefix, so the test
+    // would have passed even if the dialog stripped the prefix on the way in.
+    const REFUSAL_400 = "Value error, ubatch 8192 exceeds batch 4096: "
+      + "llama.cpp refuses to start when the physical batch is larger than "
+      + "the logical batch";
     serve(() => reply(400, { error: REFUSAL_400 }));
     await mount();
     await type("Default batch", "4096");
