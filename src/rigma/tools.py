@@ -2038,13 +2038,45 @@ def _glob_re(pat: str):
     which is the only reading that is not an error, and `find_files("[z-a].txt")`
     returns "no files match" rather than 500ing.
 
+    THIRD, and this is the bound rather than the collapse: a run is fixed, but a
+    pattern that SEPARATES the groups with literals — `**/a/**/a/...`, or
+    `**a**a...` — still emits one ambiguous group per `**`, and those backtrack
+    against each other combinatorially. MEASURED at the base of this change:
+    `**/a/`x12 against a 28-component path took 1.72 s and x14 did not finish in
+    25 s; `**a`x20 against a 44-character path likewise. Past
+    `_MAX_GLOB_BACKTRACK_GROUPS` ambiguous groups the pattern is matched by
+    `_GlobMatcher` instead, which is a position-set DP and cannot backtrack.
+
     The `except re.error` below is kept as a guard for that invariant rather than
     for a case anyone has found: if a future edit makes the escaping partial
     again, the tool still reports a bad pattern instead of dying. The return type
-    is `Pattern | re.error` and callers MUST test it, because this is the one
-    place in the tool layer where a bad ARGUMENT could become a bad RESPONSE.
+    is `Pattern | _GlobMatcher | re.error` and callers MUST test it, because this
+    is the one place in the tool layer where a bad ARGUMENT could become a bad
+    RESPONSE.
     """
-    out, i, n = [], 0, len(pat)
+    body, toks = _glob_tokens(pat)
+    text = "(?s:" + body + r")\Z"
+    try:
+        rx = re.compile(text)
+    except re.error as e:
+        return e
+    ambiguous = sum(1 for k, _ in toks if k in ("seg", "any", "star"))
+    if ambiguous > _MAX_GLOB_BACKTRACK_GROUPS:
+        return _GlobMatcher(text, toks)
+    return rx
+
+
+def _glob_tokens(pat: str) -> tuple[str, list[tuple[str, str | None]]]:
+    """The regex body and the token list for `pat`; see `_glob_re` for the grammar.
+
+    Both are produced in one pass so the regex string (kept for `.pattern` and
+    for the class tests) and the linear matcher can never drift apart. Token
+    kinds: `seg` = `(?:.*/)?`, `any` = `.*`, `star` = `[^/]*`, `q` = `[^/]`,
+    `class` = one character of a class, `lit` = one literal character.
+    """
+    out: list[str] = []
+    toks: list[tuple[str, str | None]] = []
+    i, n = 0, len(pat)
     while i < n:
         c = pat[i]
         if c == "*":
@@ -2054,23 +2086,28 @@ def _glob_re(pat: str):
                     j += 3
                 if j > i:               # a RUN of `**/` is one group
                     out.append("(?:.*/)?")
+                    toks.append(("seg", None))
                     i = j
                     continue
                 i += 2
                 if i < n and pat[i] == "/":
                     i += 1
                     out.append("(?:.*/)?")
+                    toks.append(("seg", None))
                 else:
                     out.append(".*")
+                    toks.append(("any", None))
                 continue
             while i < n and pat[i] == "*":
                 i += 1
             out.append("[^/]*")         # `*` is idempotent under `[^/]*`
+            toks.append(("star", None))
             continue
         elif c == "?":
             while i < n and pat[i] == "?":
                 i += 1
             out.append("[^/]")          # `?` likewise
+            toks.append(("q", None))
             continue
         elif c == "[":
             j = i + 1
@@ -2082,20 +2119,77 @@ def _glob_re(pat: str):
                 j += 1
             if j >= n:
                 out.append(re.escape(c))
+                toks.append(("lit", c))
             else:
                 inner = pat[i + 1:j]
                 if inner.startswith("!"):
                     inner = "^" + inner[1:]
-                out.append("[" + _safe_class_body(inner) + "]")
+                frag = "[" + _safe_class_body(inner) + "]"
+                out.append(frag)
+                toks.append(("class", frag))
                 i = j + 1
                 continue
         else:
             out.append(re.escape(c))
+            toks.append(("lit", c))
         i += 1
-    try:
-        return re.compile("(?s:" + "".join(out) + r")\Z")
-    except re.error as e:
-        return e
+    return "".join(out), toks
+
+
+# R3-16: at most this many ambiguous quantifiers (`**/`, `**`, `*`) may go to the
+# regex engine. Two is the last count whose worst case is merely quadratic; a
+# pattern above it is matched linearly instead. Chosen so the ordinary globs
+# (`**/*.py`, `src/**/*.py`, `**/*/*.py`) keep the faster engine.
+_MAX_GLOB_BACKTRACK_GROUPS = 2
+
+
+class _GlobMatcher:
+    """A linear-time stand-in for a compiled glob that would backtrack.
+
+    `_glob_re` returns one of these when the translation holds more than
+    `_MAX_GLOB_BACKTRACK_GROUPS` ambiguous quantifiers. It exposes what the
+    walkers use — `match` and `pattern` — and reproduces the regex semantics
+    exactly, because the token list is the same one the regex string was built
+    from. `match` is a position-set DP over that list: O(len(tokens) x
+    len(path)) with no backtracking, so no pattern can make it exponential.
+    """
+
+    __slots__ = ("pattern", "_toks", "_classes")
+
+    def __init__(self, pattern: str, toks: list[tuple[str, str | None]]):
+        self.pattern = pattern
+        self._toks = toks
+        self._classes = {v: re.compile(v) for k, v in toks if k == "class"}
+
+    def match(self, s: str) -> bool:
+        n = len(s)
+        slash_ends = [i + 1 for i, ch in enumerate(s) if ch == "/"]
+        pos = {0}
+        for kind, val in self._toks:
+            if not pos:
+                return False
+            if kind == "lit":
+                pos = {p + 1 for p in pos if p < n and s[p] == val}
+            elif kind == "q":
+                pos = {p + 1 for p in pos if p < n and s[p] != "/"}
+            elif kind == "class":
+                rx = self._classes[val]
+                pos = {p + 1 for p in pos if p < n and rx.match(s[p])}
+            elif kind == "star":
+                nxt: set[int] = set()
+                for p in pos:
+                    e = p
+                    while e < n and s[e] != "/":
+                        e += 1
+                    nxt.update(range(p, e + 1))
+                pos = nxt
+            elif kind == "any":
+                pos = set(range(min(pos), n + 1))
+            else:                       # "seg"
+                first = min(pos)
+                pos = set(pos)
+                pos.update(q for q in slash_ends if q > first)
+        return n in pos
 
 
 def _safe_class_body(inner: str) -> str:
