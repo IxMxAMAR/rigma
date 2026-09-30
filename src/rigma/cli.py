@@ -2453,7 +2453,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     # would reach the argv but not the arithmetic.
     _cli_spec = None
     if batch is not None or ubatch is not None or ngl is not None:
-        from .models import LaunchDefaults
+        from .models import ComboFlags, LaunchDefaults
         _cur = getattr(reg.models[rp.model_slug], "launch", None) \
             or LaunchDefaults()
         _merged = _cur.model_copy(update={
@@ -2479,7 +2479,32 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if _merged.ngl >= 0:
             _cli_upd["ngl"] = _merged.ngl
         if _cli_upd:
-            rp.flags = rp.flags.model_copy(update=_cli_upd)
+            # The check above validated `_merged` against the MODEL's stored
+            # defaults, but `rp.flags` can already carry a `batch` those defaults
+            # do not: `resolve._apply_calibration` merges a stored placement's
+            # `batch`/`ubatch` into the plan (resolve.py:254-265, and
+            # `_CALIBRATION_PLACEMENT_KEYS` names both) on this very `--model`
+            # path. `model_copy` does not validate, so a calibration
+            # `batch: 1024` plus `--ubatch 2048` passes the check above (the
+            # model's batch is unset, so the engine's 2048 stands) and reaches
+            # the argv as `-b 1024 -ub 2048`. llama.cpp CLAMPS `n_ubatch` to
+            # `n_batch` (src/llama-context.cpp:207, quoted at
+            # models.batch_pair_error), so the launch is healthy at 1024 while
+            # the plan charged 2048 — a +820.56 MiB over-charge that reports a
+            # healthy load as `plan_divergence` (UBATCH-n1, the DR21RN1-n1
+            # class). Re-validate the flags that will actually launch, through
+            # the same owner (`ComboFlags` -> `batch_pair_error`) every other
+            # construction uses.
+            _merged_flags = rp.flags.model_copy(update=_cli_upd)
+            try:
+                _merged_flags = ComboFlags.model_validate(
+                    _merged_flags.model_dump())
+            except ValueError as e:
+                _errs = getattr(e, "errors", lambda: [])()
+                typer.echo("--batch/--ubatch/--ngl: "
+                           + (_errs[0]["msg"] if _errs else str(e)))
+                raise typer.Exit(2) from None
+            rp.flags = _merged_flags
             rp.origin += "+cli-request"
     if ctx is not None:
         native = reg.models[rp.model_slug].native_ctx
