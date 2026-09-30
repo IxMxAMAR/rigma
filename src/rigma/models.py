@@ -378,6 +378,12 @@ class ModelSpec(BaseModel):
     # reports `rs=unknown` rather than charging a zero it cannot stand behind;
     # a confident wrong number is the failure mode.
     rs_geometry_unknown: bool = False
+    # A2d-kv: positive evidence of a KV cache whose WIDTH or LAYER SPLIT the
+    # probe could not derive — a missing `attention.head_count_kv`, a partial
+    # sliding-window geometry, or a declared recurrent-layers array over a
+    # scalar kv count. The fit reports `kv=unknown` rather than presenting a
+    # confident zero (or estimate) as a measured number.
+    kv_geometry_unknown: bool = False
     # False = the gguf shipped no tokenizer.chat_template, so an empty
     # capability list is missing evidence rather than a finding about the model.
     has_template: bool = True
