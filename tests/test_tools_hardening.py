@@ -64,6 +64,55 @@ def test_view_image_missing_file():
     assert "no such file" in out
 
 
+def _raise_stat_for_locked(monkeypatch, message="device not ready"):
+    """Make every stat of a path containing 'locked' raise errno 22 — what a
+    BitLocker-locked volume, an offline network share or a device-not-ready
+    answer actually does. errno 22 is outside pathlib's ignored set, so
+    `exists()`/`is_file()`/`is_dir()` all RAISE rather than return False."""
+    import pathlib
+    real_stat = pathlib.Path.stat
+
+    def stat(self, *a, **k):
+        if "locked" in str(self):
+            raise OSError(22, message)
+        return real_stat(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "stat", stat)
+
+
+def test_fuzzy_file_answers_none_when_the_parent_cannot_be_statd(
+        tmp_path, monkeypatch):
+    """_fuzzy_file has exactly two outcomes — "here it is" and "not there" — and
+    an unstatable path is the second. Before the guard, `p.exists()` re-raised
+    the raw OS error instead of returning (None, "")."""
+    _raise_stat_for_locked(monkeypatch)
+    got, note = tools._fuzzy_file(tmp_path / "locked" / "gone.png")
+    assert got is None and note == ""
+
+
+def test_view_image_unstatable_path_answers_no_such_file(tmp_path, monkeypatch):
+    """The tool must answer its OWN "no such file" (which the model can act on),
+    not leak the drive's error text — the live D:-drive BitLocker failure."""
+    _raise_stat_for_locked(monkeypatch)
+    out = tools.run_tool("view_image",
+                         {"path": str(tmp_path / "locked" / "gone.png")},
+                         {"has_vision": True})
+    assert "no such file" in out
+    assert "device not ready" not in out
+    assert "Errno 22" not in out
+
+
+def test_read_file_unstatable_path_answers_no_such_file(tmp_path, monkeypatch):
+    """read_file reaches _fuzzy_file through the same is_file() probe, so it gets
+    the same answer rather than the raw OS error."""
+    _raise_stat_for_locked(monkeypatch)
+    out = tools.run_tool("read_file",
+                         {"path": str(tmp_path / "locked" / "gone.txt")},
+                         {"workspace": str(tmp_path)})
+    assert "no such file" in out
+    assert "device not ready" not in out
+
+
 def test_ask_gemini_is_a_safe_tool():
     base = {t["function"]["name"] for t in tools.tool_specs()}
     assert "ask_gemini" in base                # available without opt-in
