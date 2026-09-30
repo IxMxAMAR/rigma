@@ -534,6 +534,16 @@ class ComboFlags(BaseModel):
         # (`hangar._slugify` strips every non-`[a-z0-9.]` character), so the
         # only way in is a hand-written alias, which is what this rejects.
         # Empty stays legal: "" means "use the plan's slug".
+        # CONSTRUCTION-ONLY (B7E-n1): pydantic's `validate_assignment` is off for
+        # this model, so `model_copy(update={"alias": ...})` and a plain
+        # `flags.alias = ...` bypass this validator. That is safe today because
+        # NOTHING sets `alias` after construction: `sweep_configs`/
+        # `quick_configs` override keys are a fixed literal set (bench.py), and
+        # the resolver, CLI, server_ops and bench never write it — the only
+        # reader is `served_as = self.flags.alias or self.model_slug` below. Do
+        # NOT turn on `validate_assignment` to close the gap: that would change
+        # the validation behaviour of every model in this file for a bypass no
+        # production caller can reach.
         if "," in v:
             raise ValueError(
                 "alias must not contain a comma: llama.cpp splits --alias on "

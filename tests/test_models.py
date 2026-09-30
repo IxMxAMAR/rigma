@@ -165,6 +165,35 @@ def test_a_comma_in_an_explicit_alias_is_rejected():
     assert ComboFlags(ctx=4096, alias="rigma").alias == "rigma"
 
 
+def test_the_alias_guard_is_construction_only_by_design():
+    """B7E-n1: the validator runs at construction, and the source note says so.
+
+    Pydantic's `validate_assignment` is off, so `model_copy(update=...)` and a
+    plain attribute assignment reach a comma alias unvalidated. No production
+    call site sets `alias` after construction, so the gap is unreachable today;
+    this pins that scope and the provenance note, so enabling
+    `validate_assignment` (which the note forbids) or adding a post-construction
+    writer surfaces here instead of as a silently unguarded served name.
+    """
+    import pathlib
+
+    import pytest as _p
+    from pydantic import ValidationError
+
+    with _p.raises(ValidationError, match="alias"):
+        ComboFlags(ctx=4096, alias="a,b")
+    # The documented bypass, pinned: the guard is construction-only.
+    assert ComboFlags(ctx=4096).model_copy(
+        update={"alias": "a,b"}).alias == "a,b"
+    flags = ComboFlags(ctx=4096)
+    flags.alias = "a,b"
+    assert flags.alias == "a,b"
+    # The provenance NOTE is the deliverable; it must stay with the validator.
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src" / "rigma" / "models.py").read_text(encoding="utf-8")
+    assert "CONSTRUCTION-ONLY (B7E-n1)" in src
+
+
 def test_server_args_pins_the_deepseek_reasoning_format():
     """B7: `--reasoning-format deepseek` keeps thought tags in
     `message.reasoning_content` (streaming deltas included) instead of leaking

@@ -760,6 +760,22 @@ def available_engine_runtimes(registry=None) -> list[dict]:
     return [a.as_dict() for a in engines.engine_runtimes(registry)]
 
 
+def _raised_launch_ctx(ctx: int, native_ctx: int,
+                       floor: int | None = None) -> int:
+    """The context a relaunch actually asks the engine for (W5F5B-N3).
+
+    `perform_switch` used to inline `max(MIN_LAUNCH_CTX, min(int(ctx),
+    native_ctx))`, so the raise-to could only be exercised by launching an
+    engine. It is one function now, so the arithmetic — cap the request to the
+    model's native window, then raise it to the launch floor — is testable on
+    its own and cannot drift from the guard that shares the floor. `floor=None`
+    reads the live `MIN_LAUNCH_CTX` at call time, exactly as the inlined global
+    did, so a rebind of the module name is honoured.
+    """
+    floor = MIN_LAUNCH_CTX if floor is None else floor
+    return max(floor, min(int(ctx), int(native_ctx)))
+
+
 def perform_switch(model: str, registry=None, profile=None,
                    ctx: int | None = None, force_calibrate: bool = False,
                    kv: str | None = None, vision: bool | None = None,
@@ -870,7 +886,7 @@ def perform_switch(model: str, registry=None, profile=None,
         # honest relaunch at a requested context: real fit math, not hope.
         # rp.flags.ctx is the calculator's grow-to-fit maximum for this quant.
         from .resolve import fit_for_launch, step_down_notice
-        want = max(MIN_LAUNCH_CTX, min(int(ctx), spec_full.native_ctx))
+        want = _raised_launch_ctx(ctx, spec_full.native_ctx)
         # The requested cache type — an explicit `kv`, or the model's stored
         # launch default — is a CEILING, fitted in BEFORE the placement is
         # chosen. Applying it AFTER the fit (the old order, below) let a stored
