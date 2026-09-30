@@ -368,12 +368,31 @@ export function usageLine(usage: Record<string, unknown>): string {
   // visible instead of being dropped. Booleans are skipped: `usageIncomplete`
   // is rendered as its own sentence by the caller, where it can be explained.
   const known = new Set([...Object.keys(LABELS), "durationMs", "model",
-                         "usageIncomplete"]);
+                         "usageIncomplete", "cost"]);
   for (const [k, v] of Object.entries(usage)) {
     if (known.has(k) || typeof v !== "number") continue;
     bits.push(`${k} ${v}`);
   }
+
+  // ACP's `usage_update.cost`. It arrived in the store and stopped there: it is
+  // an object, so the numeric loop above skipped it and the user never saw what
+  // the turn cost. Last, because the money is the summary of the numbers before
+  // it. `cost` is in `known` so a bare numeric cost cannot reappear above as
+  // `cost 0.01` — a number with no currency names nothing (B6).
+  const cost = costLine(usage.cost);
+  if (cost) bits.push(cost);
   return bits.join(" · ");
+}
+
+/** ACP's `Cost` — `{amount: number, currency?: string}` — as one money bit,
+ *  e.g. `USD 0.0123`. `""` for anything else: a cost the backend did not shape
+ *  is not a number to guess at, and a wrong amount is worse than no amount. */
+export function costLine(cost: unknown): string {
+  if (!cost || typeof cost !== "object") return "";
+  const c = cost as { amount?: unknown; currency?: unknown };
+  if (typeof c.amount !== "number" || !Number.isFinite(c.amount)) return "";
+  const cur = typeof c.currency === "string" ? c.currency.trim() : "";
+  return cur ? `${cur} ${c.amount}` : `${c.amount}`;
 }
 
 /** The model's name, from whichever shape the backend used. */
