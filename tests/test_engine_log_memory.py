@@ -22,6 +22,12 @@ healthy case — `offloaded 65/65 layers to GPU`, flash attention fused,
 flagged. The tests below pin the corrected reading: the real fixture is HEALTHY
 (no finding), a synthetic CPU attention fallback is a finding, and a MoE that
 offloads experts reads "not comparable" rather than a finding.
+
+A17e closes the residual version of the same defect: the derived baseline knew
+`ngl` but not the DEVICE COUNT, so a healthy dense load split across two devices
+(CPU embedding + ROCm0 + ROCm1 = 3 splits) was flagged. The device count now
+comes from the load's own distinct device labels; a load whose device count
+cannot be derived reads "not comparable", never a single-device guess.
 """
 import pytest
 
@@ -125,6 +131,44 @@ MOE_EXPERT_OFFLOAD = (
     "0.00.7 I sched_reserve: graph splits = 98\n"
 )
 
+# SYNTHETIC and HEALTHY: the same dense 65/65 load split across TWO devices.
+# The graph is the CPU embedding run plus one run per device — CPU -> ROCm0 ->
+# ROCm1 = 3 splits — and that is the correct count, not a divergence. A17b's
+# derived baseline knew `ngl` but not the device count, so it expected 2 and
+# flagged this healthy load; the device count now comes from the load's own
+# distinct device labels (`ROCm0` / `ROCm1`, `ROCm_Host` excluded).
+TWO_DEVICE_DENSE = (
+    "0.00.1 I print_info: n_expert              = 0\n"
+    "0.00.2 I load_tensors: offloaded 65/65 layers to GPU\n"
+    "0.00.3 I load_tensors:   CPU_Mapped model buffer size =   322.07 MiB\n"
+    "0.00.4 I load_tensors:        ROCm0 model buffer size =  3270.00 MiB\n"
+    "0.00.5 I load_tensors:        ROCm1 model buffer size =  3269.67 MiB\n"
+    "0.00.6 I llama_kv_cache:      ROCm0 KV buffer size =  1088.00 MiB\n"
+    "0.00.7 I llama_kv_cache:      ROCm1 KV buffer size =  1088.00 MiB\n"
+    "0.00.8 I sched_reserve:      ROCm0 compute buffer size =   205.14 MiB\n"
+    "0.00.9 I sched_reserve:      ROCm1 compute buffer size =   205.14 MiB\n"
+    "0.01.0 I sched_reserve:  ROCm_Host compute buffer size =    84.28 MiB\n"
+    "0.01.1 I sched_reserve: graph splits = 3\n"
+)
+
+# SYNTHETIC and pathological: the same two-device load, but the fused attention
+# node fell back to the CPU per layer (GPU -> CPU -> GPU), so the count is far
+# above the 3 the two-device placement expects.
+TWO_DEVICE_CPU_ATTENTION_FALLBACK = TWO_DEVICE_DENSE.replace(
+    "graph splits = 3", "graph splits = 35")
+
+# SYNTHETIC and TRUNCATED: the log reports layers offloaded to a GPU but the
+# buffer section names no device at all (only the host-mapped weight copy), so
+# the number of devices — and therefore the number of GPU runs — cannot be
+# derived. The honest answer is NOT COMPARABLE, not the 2 a single-device guess
+# would produce (which would flag this load's `graph splits = 2`).
+GPU_LAYERS_WITHOUT_DEVICE_LABEL = (
+    "0.00.1 I print_info: n_expert              = 0\n"
+    "0.00.2 I load_tensors: offloaded 65/65 layers to GPU\n"
+    "0.00.3 I load_tensors:   CPU_Mapped model buffer size =   322.07 MiB\n"
+    "0.01.1 I sched_reserve: graph splits = 2\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -220,12 +264,31 @@ def test_the_real_loads_plan_fields_come_from_its_own_log():
                       "backend": "rocm"}
 
 
-def test_a_dense_load_with_any_gpu_layers_expects_two_splits():
+def test_a_dense_load_with_any_gpu_layers_expects_two_splits_on_one_device():
     # all-GPU ...
-    assert engine_log.expected_splits(ngl=65, n_layers=64, n_cpu_moe=0) == 2
+    assert engine_log.expected_splits(ngl=65, n_layers=64, n_cpu_moe=0,
+                                      n_devices=1) == 2
     # ... and a contiguous partial offload (first layers on the CPU) are the
     # same two runs: the CPU embedding is contiguous with the CPU layers.
-    assert engine_log.expected_splits(ngl=40, n_layers=64, n_cpu_moe=0) == 2
+    assert engine_log.expected_splits(ngl=40, n_layers=64, n_cpu_moe=0,
+                                      n_devices=1) == 2
+
+
+def test_a_dense_load_without_a_device_count_is_not_comparable():
+    """A17e: the same rule as the MoE case. `ngl` alone does not determine the
+    number of backend runs — one per device — so a plan that does not carry the
+    device count gets NO verdict rather than the single-device 2."""
+    assert engine_log.expected_splits(ngl=65, n_layers=64, n_cpu_moe=0) is None
+    assert engine_log.expected_splits(ngl=65, n_layers=64, n_cpu_moe=0,
+                                      n_devices=0) is None
+
+
+def test_a_dense_load_across_two_devices_expects_one_run_per_device():
+    # CPU embedding run + ROCm0 run + ROCm1 run = 3.
+    assert engine_log.expected_splits(ngl=65, n_layers=64, n_cpu_moe=0,
+                                      n_devices=2) == 3
+    assert engine_log.expected_splits(ngl=65, n_layers=64, n_cpu_moe=0,
+                                      n_devices=4) == 5
 
 
 def test_a_cpu_only_plan_expects_one_split():
@@ -244,6 +307,65 @@ def test_moe_expert_offload_has_no_derivable_split_count():
     # no layer count: nothing to derive from.
     assert engine_log.expected_splits(ngl=65, n_layers=None,
                                       n_cpu_moe=0) is None
+
+
+def test_device_labels_are_the_distinct_non_host_labels_in_the_load():
+    """A17e: the device count comes from the load's own buffer labels. Host
+    buffers (`CPU_Mapped`, `ROCm_Host`) are not devices, and a device label is
+    counted once however many buffers it carries."""
+    two = engine_log.parse_load(TWO_DEVICE_DENSE)
+    assert engine_log.device_labels(two) == ["ROCm0", "ROCm1"]
+    # the one-device real load: ROCm_Host is staging RAM, not a second device
+    assert engine_log.device_labels(engine_log.parse_load(REAL_LOAD)) == ["ROCm0"]
+    # the other families the engine names in the same position are devices too
+    assert engine_log.device_labels(engine_log.parse_load(OTHER_BACKENDS)) == [
+        "CUDA0", "Metal", "Vulkan0"]
+
+
+def test_a_two_device_dense_load_expects_three_splits():
+    load = engine_log.parse_load(TWO_DEVICE_DENSE)
+
+    assert engine_log.expected_splits_for_load(load) == 3
+    # the log's own placement is named in the sentence, not a single-device 2
+    r = engine_log.compare_plan(load)
+    assert r["expected_splits"] == 3
+    assert r["split_verdict"] == "ok"
+    assert r["unexpected_splits"] is False
+    assert r["diverges"] is False
+
+
+def test_a_gpu_load_whose_device_count_cannot_be_derived_is_not_comparable():
+    """A17e: the load says layers went to a GPU but names no device, so the
+    number of GPU runs is unknown. NOT COMPARABLE — never the single-device 2
+    that would flag this (healthy-looking) `graph splits = 2`."""
+    load = engine_log.parse_load(GPU_LAYERS_WITHOUT_DEVICE_LABEL)
+
+    assert engine_log.device_labels(load) == []
+    assert engine_log.expected_splits_for_load(load) is None
+
+    r = engine_log.compare_plan(load)
+    assert r["graph_splits"] == 2
+    assert r["expected_splits"] is None
+    assert r["split_verdict"] == "not_comparable"
+    assert r["unexpected_splits"] is None
+    assert r["diverges"] is False
+    assert "NOT COMPARABLE" in r["detail"]
+    assert "device" in r["detail"]
+
+
+def test_an_overridden_expectation_is_described_consistently():
+    """Verifier nit: `_split_sentence` used to recompute the parenthetical from
+    the LOAD, so `expected_splits=1` on an all-GPU load read "ABOVE the 1 ...
+    (an all-GPU dense load)" — a sentence that contradicts its own number. The
+    words now follow the `expected_splits` argument."""
+    load = engine_log.parse_load(REAL_LOAD)
+
+    r = engine_log.compare_plan(load, expected_splits=1)
+
+    assert r["split_verdict"] == "diverges"
+    assert "the 1 the plan expects" in r["detail"]
+    assert "all-GPU dense load" not in r["detail"]
+    assert "CPU-only plan" in r["detail"]
 
 
 def test_the_old_constant_baseline_of_one_would_flag_the_healthy_load():
@@ -340,6 +462,22 @@ def test_a_cpu_attention_fallback_diverges():
     assert "CPU attention fallback" in r["detail"]
 
 
+def test_a_two_device_cpu_attention_fallback_still_diverges():
+    """A17e: widening the baseline to one run per device must NOT hide a genuine
+    CPU attention fallback. On two devices the healthy count is 3; a per-layer
+    GPU -> CPU -> GPU fallback pushes it far above that."""
+    load = engine_log.parse_load(TWO_DEVICE_CPU_ATTENTION_FALLBACK)
+
+    r = engine_log.compare_plan(load)
+
+    assert r["graph_splits"] == 35
+    assert r["expected_splits"] == 3
+    assert r["split_verdict"] == "diverges"
+    assert r["unexpected_splits"] is True
+    assert r["diverges"] is True
+    assert "CPU attention fallback" in r["detail"]
+
+
 def test_moe_expert_offload_is_not_comparable_not_a_divergence():
     load = engine_log.parse_load(MOE_EXPERT_OFFLOAD)
 
@@ -421,6 +559,19 @@ def test_a_healthy_load_yields_no_finding():
     assert engine_log.findings(REAL_LOAD) == []
 
 
+def test_a_healthy_two_device_load_yields_no_finding():
+    """A17e acceptance criterion: a healthy all-GPU dense load split across TWO
+    devices (CPU embedding + ROCm0 + ROCm1 = 3 splits) must produce NO finding.
+    Before the fix the baseline was 2 for any dense load, so this healthy load
+    was flagged `diverges`."""
+    assert engine_log.findings(TWO_DEVICE_DENSE) == []
+
+
+def test_a_gpu_load_with_an_underivable_device_count_yields_no_finding():
+    # "not comparable" is not a finding; the device count is unknown here.
+    assert engine_log.findings(GPU_LAYERS_WITHOUT_DEVICE_LABEL) == []
+
+
 def test_a_cpu_attention_fallback_load_yields_a_finding():
     got = engine_log.findings(CPU_ATTENTION_FALLBACK)
 
@@ -429,6 +580,13 @@ def test_a_cpu_attention_fallback_load_yields_a_finding():
     assert got[0]["confirmed_here"] is False
     assert "CPU attention fallback" in got[0]["message"]
     assert "graph splits = 34" in got[0]["example"]
+
+
+def test_a_two_device_cpu_attention_fallback_yields_a_finding():
+    got = engine_log.findings(TWO_DEVICE_CPU_ATTENTION_FALLBACK)
+
+    assert [f["id"] for f in got] == ["plan_divergence"]
+    assert "graph splits = 35" in got[0]["example"]
 
 
 def test_a_moe_expert_offload_load_yields_no_finding():
