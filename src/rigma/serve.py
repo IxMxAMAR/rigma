@@ -904,12 +904,22 @@ def _reconcile_orphaned_runs(runs_mod=None, *, driven_ids=()) -> None:
     `id` is not its directory name is skipped, so releasing A never writes into
     B's directory. `driven_ids` names the runs a live task is driving — empty at
     boot — so a caller can never reconcile a run that is actually being driven.
+
+    DR3-4: `driven_ids` only knows THIS process's tasks, and two Rigma processes
+    can share one RIGMA_HOME (the CLI's own "pass a different --port" invites a
+    second instance). A run being driven by another LIVE process is not an
+    orphan, so `runs.driver_is_live_elsewhere` is asked before either branch
+    writes — otherwise this sweep would force a live run terminal, and `save`'s
+    sticky-terminal rule would propagate that to its real driver. A record with
+    no stamp, or whose stamp is our own process or a dead/reused pid, is still
+    reconciled, so DR1-residual stays closed.
     """
     if runs_mod is None:
         from . import runs as runs_mod
     try:
         a = runs_mod.active()
-        if a and a.get("status") in ("running", "paused"):
+        if (a and a.get("status") in ("running", "paused")
+                and not runs_mod.driver_is_live_elsewhere(a)):
             # 'interrupted', NOT 'stopped': the user never asked for this,
             # and everything needed to continue is still on disk — the UI
             # offers Resume for exactly this state
@@ -922,7 +932,8 @@ def _reconcile_orphaned_runs(runs_mod=None, *, driven_ids=()) -> None:
                 continue
             run = runs_mod.load(d.name)
             if (not isinstance(run, dict) or run.get("id") != d.name
-                    or run.get("status") not in ("running", "paused")):
+                    or run.get("status") not in ("running", "paused")
+                    or runs_mod.driver_is_live_elsewhere(run)):
                 continue
             try:
                 runs_mod.set_status(run, "interrupted",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -11,6 +12,8 @@ from . import hwid
 from .atomicio import atomic_write_json, atomic_write_text
 from .models import ComboFlags, RunPlan
 from .runtime import launch_server, rigma_home
+
+_log = logging.getLogger(__name__)
 
 
 class BenchResult(BaseModel):
@@ -730,6 +733,29 @@ def _effective_env(plan_flags, override: dict) -> dict:
     return getattr(plan_flags.model_copy(update=override), "env", None) or {}
 
 
+def _effective_flags(plan_flags, override: dict):
+    """The flags a trial ACTUALLY runs with.
+
+    DR3-2: `run_sweep` builds every trial as
+    `plan.flags.model_copy(update=override)`, so a guard that inspects the
+    OVERRIDE alone is blind to a value the PLAN already carries. That matters
+    for the KV cache type: `cache_type_k`/`cache_type_v` are in
+    `resolve._CALIBRATION_PLACEMENT_KEYS`, so a calibration row (written when
+    the slug was not yet known to be tools-capable, hand-edited, or written by
+    an older build) can put q4_0 on the plan — and then every trial of a
+    tools-capable model would run the very cache the guard exists to avoid.
+    The same asymmetry `_effective_env` closes for the rotation lever, one
+    lever over.
+    """
+    return plan_flags.model_copy(update=override)
+
+
+def _q4_kv(flags) -> bool:
+    """Does this flag set quantize the KV cache to q4_0 on either side?"""
+    return (getattr(flags, "cache_type_k", None) == "q4_0"
+            or getattr(flags, "cache_type_v", None) == "q4_0")
+
+
 def crowned_row(rows: list[dict],
                 allow_quality_levers: bool = False) -> dict | None:
     """The config a sweep actually crowns. ONE rule, two readers.
@@ -898,12 +924,34 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
     # C11-nits: ask about the EFFECTIVE env (`_effective_env`), not the override
     # alone — the plan may already carry the lever (a merged calibration row),
     # in which case every env-less override would inherit it.
+    # DR3-2: and ask about the EFFECTIVE flags for the cache type, for exactly
+    # the same reason — the plan may already carry q4_0 (it is a calibration
+    # placement key), in which case every override that does not itself name a
+    # cache type would run the cache this guard exists to avoid. The filter is
+    # therefore about what the trial will ACTUALLY run, not what it asks for.
     if _tools_capable(plan.model_slug):
-        configs = [(label, o) for label, o in configs
-                   if o.get("cache_type_k") != "q4_0"
-                   and o.get("cache_type_v") != "q4_0"
-                   and not _carries_quality_env_lever(
-                       {"env": _effective_env(plan.flags, o)})]
+        if _q4_kv(plan.flags):
+            # Dropping trials cannot fix a plan that already carries q4_0 —
+            # every override that leaves the cache type alone inherits it. Say
+            # so rather than silently shrinking the sweep to the few axes that
+            # happen to replace the cache type.
+            _log.warning(
+                "sweep: %s is tools-capable and its plan already quantizes the "
+                "KV cache to q4_0 (%s/%s); every config that does not replace "
+                "the cache type is dropped, so this sweep cannot measure the "
+                "default configuration",
+                plan.model_slug, plan.flags.cache_type_k, plan.flags.cache_type_v)
+        kept = [(label, o) for label, o in configs
+                if not _q4_kv(_effective_flags(plan.flags, o))
+                and not _carries_quality_env_lever(
+                    {"env": _effective_env(plan.flags, o)})]
+        if configs and not kept:
+            # A silent empty sweep would look like "nothing worth measuring".
+            _log.warning(
+                "sweep: every config was dropped on the tools-capable model %s "
+                "(%d of them): each would run q4_0 KV or a quality-degrading "
+                "env lever", plan.model_slug, len(configs))
+        configs = kept
     rows: list[dict] = []
     for label, override in configs:
         flags = plan.flags.model_copy(update=override)

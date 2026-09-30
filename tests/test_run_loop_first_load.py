@@ -688,3 +688,75 @@ def test_a_read_failed_release_is_reaped_at_the_next_boot(engine, home):
         f"{resp.status_code} {resp.text}")
     assert resp.json().get("restarted") is True
 
+
+# ---------------------------------------------------------------------------
+# DR3-4: the sweep must not reconcile a run ANOTHER LIVE PROCESS is driving.
+#
+# `driven_ids` only knows THIS process's tasks, and two Rigma processes can
+# share one RIGMA_HOME — the CLI's own "free it or pass a different --port"
+# invites a second instance. Forcing such a run terminal would then propagate
+# to its real driver through `save`'s sticky-terminal rule.
+#
+# The check is `runs.driver_is_live_elsewhere`, which reads the stamp every
+# non-terminal `save` writes (pid + create time, so a recycled pid cannot make
+# a dead driver look alive). These tests fabricate the stamp: the pid has to be
+# a DIFFERENT live process, which a test cannot honestly conjure.
+# ---------------------------------------------------------------------------
+
+def _stamp(rid, pid, started):
+    doc = runs.load(rid)
+    doc["driver_pid"] = pid
+    doc["driver_started_at"] = started
+    (runs.run_dir(rid) / "run.json").write_text(
+        json.dumps(doc, indent=2), encoding="utf-8")
+
+
+def test_the_boot_reaper_skips_a_run_another_live_process_drives(
+        home, monkeypatch):
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()
+    _stamp(rid, os.getpid() + 1, 12345.0)
+
+    from rigma import state
+    monkeypatch.setattr(state, "_is_recorded_process",
+                        lambda pid, started: True)
+
+    serve._reconcile_orphaned_runs(runs)
+
+    assert runs.load(rid)["status"] == "running", (
+        "the sweep forced a run another live process was driving to terminal")
+
+
+def test_the_boot_reaper_still_reaps_a_run_whose_driver_is_gone(
+        home, monkeypatch):
+    """The other direction: a stamp whose process is dead (or whose pid has been
+    reused) is an orphan like any other — DR1-residual stays closed."""
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()
+    _stamp(rid, os.getpid() + 1, 12345.0)
+
+    from rigma import state
+    monkeypatch.setattr(state, "_is_recorded_process",
+                        lambda pid, started: False)
+
+    serve._reconcile_orphaned_runs(runs)
+
+    assert runs.load(rid)["status"] == "interrupted"
+
+
+def test_a_run_this_process_stamped_is_still_reaped(home):
+    """Our OWN stamp is never "live elsewhere": a `running` record this process
+    wrote and then stopped driving is exactly the orphan the sweep is for, so
+    stamping must not make DR1-residual unreachable."""
+    run = runs.create("m", "sess")
+    rid = run["id"]
+    runs.clear_active()
+
+    assert runs.load(rid).get("driver_pid") == os.getpid()
+
+    serve._reconcile_orphaned_runs(runs)
+
+    assert runs.load(rid)["status"] == "interrupted"
+
