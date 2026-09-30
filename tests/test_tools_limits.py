@@ -3,7 +3,6 @@ the whole thing (regression: a 2330-file folder showed only 200 silently)."""
 import io
 import os
 from contextlib import contextmanager
-from pathlib import Path
 
 from rigma import tools
 
@@ -79,19 +78,28 @@ def test_sample_files_bounds_the_scan(tmp_path, monkeypatch):
 # --- 14-3: grep/find must bound the INPUT, not the output --------------------
 
 def test_grep_bounds_the_input_not_just_the_output(tmp_path, monkeypatch):
-    """A never-matching pattern used to read every file under the workspace."""
+    """A never-matching pattern used to read every file under the workspace.
+
+    The content search now runs in a bounded child process (DR6), so the parent
+    no longer reads the files itself — the INPUT bound is the candidate list
+    handed to that child, which is what this observes now. The behaviour
+    asserted is unchanged: at most `_GREP_MAX_FILES` files are ever searched.
+    """
     monkeypatch.setattr(tools, "_GREP_MAX_FILES", 3)
     for i in range(20):
         (tmp_path / f"f{i:02d}.txt").write_text("nothing here\n" * 10)
 
-    opened = []
-    real = Path.read_text
-    monkeypatch.setattr(
-        Path, "read_text",
-        lambda self, *a, **k: (opened.append(str(self)), real(self, *a, **k))[1])
+    searched = []
+    real = tools._grep_search_bounded
+
+    def spy(files, pattern, flags, budget):
+        searched.extend(files)
+        return real(files, pattern, flags, budget)
+
+    monkeypatch.setattr(tools, "_grep_search_bounded", spy)
 
     out = tools.run_tool("grep", {"pattern": "zzzznope"}, _ws(tmp_path))
-    assert len(opened) == 3, opened
+    assert len(searched) == 3, searched
     assert "searched the first 3 files" in out, out
 
 
