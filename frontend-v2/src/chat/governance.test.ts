@@ -7,8 +7,11 @@ import {
   outcomeLabel,
   outcomeTone,
   questionAnswer,
+  questionDefaults,
   questionFields,
+  questionProblem,
   questionReady,
+  questionRefusal,
   sandboxLabel,
   sandboxTone,
 } from "./governance";
@@ -287,6 +290,182 @@ describe("the elicitation form the schema describes", () => {
     expect(questionReady(fields, { path: "C:/work" })).toBe(true);
     // No fields at all is ready: the answer is legitimately empty.
     expect(questionReady([], {})).toBe(true);
+  });
+});
+
+// B4b-schema. `requestedSchema` is JSON Schema and nothing keeps it flat: a
+// property can be an `object` with its own `properties`, an `array` with an
+// `items` shape, or carry a `default`. Before this the form rendered a text box
+// for all three, so a nested object was submitted as a string and an array could
+// not be built at all — a form that "cannot express the answer".
+describe("B4b-schema: nested objects, arrays and defaults", () => {
+  const nested = {
+    type: "object",
+    required: ["name"],
+    properties: {
+      name: { type: "string" },
+      config: {
+        type: "object",
+        title: "Config",
+        required: ["level"],
+        properties: {
+          level: { type: "integer", default: 3 },
+          enabled: { type: "boolean" },
+        },
+      },
+      tags: { type: "array", title: "Tags", items: { type: "string" } },
+      steps: {
+        type: "array",
+        items: { type: "object", properties: { cmd: { type: "string" } } },
+      },
+    },
+  };
+
+  it("parses a nested object with its OWN required list", () => {
+    const fields = questionFields(nested);
+    const config = fields.find((f) => f.name === "config")!;
+    expect(config.kind).toBe("object");
+    expect(config.label).toBe("Config");
+    expect(config.fields!.map((f) => [f.name, f.kind, f.required])).toEqual([
+      ["level", "number", true],
+      ["enabled", "boolean", false],
+    ]);
+  });
+
+  it("parses an array's items, primitives and objects alike", () => {
+    const fields = questionFields(nested);
+    expect(fields.find((f) => f.name === "tags")!.kind).toBe("array");
+    expect(fields.find((f) => f.name === "tags")!.items!.kind).toBe("text");
+    const steps = fields.find((f) => f.name === "steps")!;
+    expect(steps.kind).toBe("array");
+    expect(steps.items!.kind).toBe("object");
+    expect(steps.items!.fields!.map((f) => f.name)).toEqual(["cmd"]);
+  });
+
+  it("keeps an untyped array's elements as text rather than dropping the field", () => {
+    const fields = questionFields({ properties: { any: { type: "array" } } });
+    expect(fields[0].kind).toBe("array");
+    expect(fields[0].items!.kind).toBe("text");
+  });
+
+  it("reads a number rather than calling every non-boolean a string", () => {
+    const fields = questionFields({ properties: { n: { type: "number" } } });
+    expect(fields[0].kind).toBe("number");
+  });
+
+  it("pre-fills the schema's own defaults, nested ones included", () => {
+    const fields = questionFields(nested);
+    expect(questionDefaults(fields)).toEqual({ config: { level: "3" } });
+  });
+
+  it("pre-fills a boolean default only when it IS a boolean", () => {
+    const fields = questionFields({
+      properties: {
+        on: { type: "boolean", default: false },
+        off: { type: "boolean", default: "yes" },
+      },
+    });
+    expect(questionDefaults(fields)).toEqual({ on: false });
+  });
+
+  it("treats an empty-string default as a real pre-fill and an absent one as none", () => {
+    const fields = questionFields({
+      properties: { a: { type: "string", default: "" }, b: { type: "string" } },
+    });
+    expect(fields[0].hasDefault).toBe(true);
+    expect(fields[1].hasDefault).toBe(false);
+    expect(questionDefaults(fields)).toEqual({ a: "" });
+  });
+
+  it("builds the NESTED answer the route forwards to mcode", () => {
+    const fields = questionFields(nested);
+    expect(questionAnswer(fields, {
+      name: " build ",
+      config: { level: "3", enabled: true },
+      tags: ["a", "b"],
+      steps: [{ cmd: "make" }, { cmd: "" }],
+    })).toEqual({
+      name: "build",
+      config: { level: 3, enabled: true },
+      tags: ["a", "b"],
+      // The blank row expresses nothing, so it is dropped rather than sent null.
+      steps: [{ cmd: "make" }],
+    });
+  });
+
+  it("sends a number as a number, not as the string the box held", () => {
+    const fields = questionFields({ properties: { n: { type: "number" } } });
+    expect(questionAnswer(fields, { n: " 12.5 " })).toEqual({ n: 12.5 });
+  });
+
+  it("omits an all-blank nested object, and keeps a nested boolean as a definite answer", () => {
+    // The "no blank keys" rule reaches into a nested object: one whose only
+    // property is an untouched text box contributes nothing. A checkbox is the
+    // exception it already is at the top level — unchecked is `false`, a
+    // definite answer, so the object is present.
+    const fields = questionFields({
+      properties: {
+        note: { type: "object", properties: { text: { type: "string" } } },
+        flag: { type: "object", properties: { on: { type: "boolean" } } },
+      },
+    });
+    expect(questionAnswer(fields, {})).toEqual({ flag: { on: false } });
+  });
+
+  it("blocks submit on a required field inside a nested object", () => {
+    const fields = questionFields(nested);
+    expect(questionReady(fields, { name: "x" })).toBe(false);
+    expect(questionProblem(fields, { name: "x" })).toContain("level");
+    expect(questionReady(fields, { name: "x", config: { level: "3" } })).toBe(true);
+  });
+
+  it("blocks submit on a number that will not parse, and says so", () => {
+    const fields = questionFields({
+      properties: { n: { type: "number", title: "Count" } },
+    });
+    expect(questionProblem(fields, { n: "many" })).toContain("must be a number");
+    expect(questionReady(fields, { n: "many" })).toBe(false);
+    // An OPTIONAL number left empty is not a problem; a filled one must parse.
+    expect(questionReady(fields, {})).toBe(true);
+  });
+
+  it("requires at least one row for a required array, and none for an optional one", () => {
+    const fields = questionFields({
+      required: ["tags"],
+      properties: {
+        tags: { type: "array", items: { type: "string" } },
+        extra: { type: "array", items: { type: "string" } },
+      },
+    });
+    expect(questionProblem(fields, {})).toContain("tags");
+    expect(questionReady(fields, { tags: ["a"] })).toBe(true);
+  });
+
+  it("names the field that is missing rather than a generic 'fill the form'", () => {
+    const fields = questionFields({
+      required: ["path"],
+      properties: { path: { type: "string", title: "Directory" } },
+    });
+    expect(questionProblem(fields, {})).toContain("Directory");
+  });
+});
+
+// B4b/OD-12. A 409 from `/approval` is the server saying it is no longer
+// waiting on the request. Until an expiry EVENT arrives it is the only signal,
+// so it has to read as the question's state rather than as the wire's sentence.
+describe("questionRefusal", () => {
+  it("turns the route's 409 into the state it actually means", () => {
+    const msg = questionRefusal(
+      "that request is no longer the one being waited on", 409);
+    expect(msg).toContain("no longer available");
+    expect(msg).toContain("expired");
+    expect(msg).not.toContain("no longer the one being waited on");
+  });
+
+  it("passes any other failure through untouched", () => {
+    expect(questionRefusal("network down", undefined)).toBe("network down");
+    expect(questionRefusal("answer: must be an object", 400))
+      .toBe("answer: must be an object");
   });
 });
 

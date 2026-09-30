@@ -866,6 +866,12 @@ export interface ChatState {
    *  no-op would read as the command being broken. */
   compactChat: () => Promise<string>;
   clearError: () => void;
+  /** OD-12/B4b: the approval route refused an answer with 409, which is the
+   *  server's own word that it is no longer waiting on the request. Fold the
+   *  live question to the same terminal state the expiry EVENT produces, so a
+   *  dead form stops being clickable — the client never guesses the clock, it
+   *  acts on the refusal. */
+  expireQuestion: (requestId: string) => void;
   /** Show what a command did. One message at a time: a queue would need
    *  dismissals the user did not ask for. */
   pushNotice: (text: string) => void;
@@ -1609,6 +1615,21 @@ export const useChat = create<ChatState>((set, get) => ({
   },
 
   clearError: () => set({ lastError: null }),
+
+  expireQuestion: (requestId) =>
+    set((st) => {
+      const sid = st.currentId;
+      if (!sid) return {};
+      // The SAME fold the server's expiry event uses, so there is one terminal
+      // state rather than two spellings of it.
+      return patchTurn(sid, (t) => ({
+        ...t,
+        governance: foldApproval(t.governance, {
+          event: "approval/decided",
+          data: { id: requestId, decision: "expired" },
+        }),
+      }))(st);
+    }),
 
   pushNotice: (text) => set({ notice: text }),
 
