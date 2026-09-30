@@ -1712,9 +1712,11 @@ def sweep(use_case: str = typer.Option("general", "--use-case"),
     typer.echo(f"sweeping {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
                f"(scratch engine on :{port}, live server untouched)")
     # R3-ENG-3: the sweep must measure the engine that would actually serve this model,
-    # or it reports throughput for a binary the user will never run.
-    from .server_ops import engine_binary_for as _engine_binary_for
-    exe, _eb = _engine_binary_for(rp.gguf, rp.backend, os_name)
+    # or it reports throughput for a binary the user will never run. C3: it must also
+    # freeze that binary's fork identity onto the plan HERE, so the argv built inside
+    # the sweep carries a fork-only flag only when the swept binary really is the fork.
+    from .server_ops import engine_binary_for_plan as _engine_binary_for_plan
+    exe, _eb = _engine_binary_for_plan(rp, os_name)
     model_path = runtime.ensure_model(rp.gguf)
     rows = run_sweep(rp, exe, model_path, port=port,
                      prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
@@ -2096,6 +2098,12 @@ def up(use_case: str = typer.Option("general", "--use-case"),
            None, "--reasoning-budget",
            help="Max thinking tokens per turn (0 = end thinking "
                 "immediately, -1 = unlimited)"),
+       reasoning_effort: str = typer.Option(
+           None, "--reasoning-effort",
+           help="Launch-level reasoning effort for the chat template: "
+                "default|minimal|low|medium|high|xhigh|max. PrismML fork only "
+                "— omitted on the pinned mainline engine, which has no such "
+                "flag, and on any engine that has not been chosen yet"),
        ctx_checkpoints: int = typer.Option(
            None, "--ctx-checkpoints",
            help="Max context checkpoints per slot on a hybrid/recurrent model "
@@ -2356,6 +2364,19 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         rp.flags = rp.flags.model_copy(
             update={"reasoning_budget": reasoning_budget})
         rp.origin += "+rbudget-override"
+    if reasoning_effort is not None:
+        # Validated here as well as on the model: a typo would otherwise reach
+        # the engine, which stores the string verbatim in the template kwargs and
+        # a template that does not know the name simply ignores it — a silent
+        # no-op rather than an error.
+        from .models import REASONING_EFFORTS
+        if reasoning_effort not in REASONING_EFFORTS:
+            typer.echo(f"--reasoning-effort must be one of: "
+                       f"{', '.join(REASONING_EFFORTS)}")
+            raise typer.Exit(2)
+        rp.flags = rp.flags.model_copy(
+            update={"reasoning_effort": reasoning_effort})
+        rp.origin += "+effort-override"
     if ctx_checkpoints is not None:
         if ctx_checkpoints < 0:
             typer.echo("--ctx-checkpoints must be 0 or greater "
@@ -2455,8 +2476,13 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             # directly here meant a registered engine was bypassed on the CLI path, so
             # `rigma up --model <pq2_0 model>` launched the pin, the pin refused type 142,
             # and the fallback ladder below quietly served SmolLM2 instead.
-            from .server_ops import engine_binary_for as _engine_binary_for
-            exe, _eb = _engine_binary_for(cand.gguf, cand.backend, os_name)
+            # C3: `engine_binary_for_plan` also FREEZES the chosen binary's fork identity
+            # onto `cand`, BEFORE `ensure_model` on the next line can put the model on
+            # disk. Re-deriving it later — at argv-build time — named the fork for a model
+            # that was absent when the pinned binary was chosen, so the pin was launched
+            # with the fork-only `--reasoning-effort` and died in argparse.
+            from .server_ops import engine_binary_for_plan as _engine_binary_for_plan
+            exe, _eb = _engine_binary_for_plan(cand, os_name)
             model_path = runtime.ensure_model(cand.gguf)
             extra = []
             spec_c = reg.models.get(cand.model_slug)

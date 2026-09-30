@@ -9,6 +9,7 @@ import psutil
 from .atomicio import atomic_write_json
 from .models import CACHE_BYTES
 from .runtime import rigma_home
+from . import engine_compat
 
 
 def ram_snapshot() -> dict:
@@ -216,15 +217,42 @@ def engine_binary_for(gguf, backend: str, os_name: str):
 
     `record` is the description that goes into `state["engine_binary"]`, so which binary
     served a launch is answerable afterwards rather than only from the process table.
+
+    `record["is_prism_fork"]` is the build's fork identity, from the SAME decision that
+    chose it (`engine_compat.engine_is_prism_fork`). Callers that are about to build an
+    argv must use `engine_binary_for_plan`, which freezes it onto the plan; a caller
+    that uses this function directly gets no frozen identity and therefore no
+    fork-only flags.
     """
     from . import runtime
     custom = _registered_engine_for(gguf, backend)
     if custom is not None:
         return custom.exe, {"kind": "registered", "name": custom.name,
-                            "path": str(custom.exe), "source": custom.source}
+                            "path": str(custom.exe), "source": custom.source,
+                            "is_prism_fork": engine_compat.engine_is_prism_fork(custom)}
     exe = runtime.ensure_engine(backend, os_name)
     return exe, {"kind": "pinned", "name": f"{os_name}/{backend}",
-                 "path": str(exe), "source": ""}
+                 "path": str(exe), "source": "", "is_prism_fork": False}
+
+
+def engine_binary_for_plan(plan, os_name: str):
+    """`engine_binary_for`, plus THE FREEZE of the fork identity onto `plan`.
+
+    This is the function the launch paths call. It picks the binary from the model's
+    tensor types and immediately records whether that binary is the PrismML fork on
+    `plan.engine_is_prism_fork`, so `RunPlan.server_args` reads a decision instead of
+    re-asking one. The two must be the same decision: `_registered_engine_for` needs
+    the model on disk, and `ensure_model` — which runs AFTER this on a first launch —
+    is what puts it there. Re-deriving at argv-build time therefore named the fork for
+    a model that was not downloaded when the PINNED binary was chosen, and the pinned
+    mainline build was handed the fork-only `--reasoning-effort`; llama-server exits
+    in argparse on an unknown argument, so the first launch of any model died.
+
+    Returns `(exe, record)` exactly like `engine_binary_for`.
+    """
+    exe, record = engine_binary_for(plan.gguf, plan.backend, os_name)
+    plan.engine_is_prism_fork = bool(record.get("is_prism_fork"))
+    return exe, record
 
 
 def _calib_marker_path():
@@ -756,7 +784,11 @@ def perform_switch(model: str, registry=None, profile=None,
     # calibration, so a description there would corrupt provenance. It is handed to
     # `write_state` at the end of the launch instead, because that call rebuilds the record
     # from its arguments and would drop anything set on `s` here.
-    exe, _engine_binary = engine_binary_for(rp.gguf, rp.backend, os_name)
+    #
+    # C3: `engine_binary_for_plan` also freezes the chosen binary's fork identity onto
+    # `rp`, so the argv this switch launches carries a fork-only flag only when the
+    # binary that will actually run is the fork.
+    exe, _engine_binary = engine_binary_for_plan(rp, os_name)
     port = int(s["public_port"]) - 1
     st.kill_recorded(s, "engine_pid")   # AUDIT F08-1: identity-checked
     if not _await_port_free(port):      # Windows TIME_WAIT grace
