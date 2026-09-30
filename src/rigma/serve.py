@@ -1768,7 +1768,8 @@ def _write_restore_undo(prior: list) -> None:
     Data files first, then the manifest ATOMICALLY. A crash while journaling
     therefore leaves either no manifest (nothing was applied yet, so the boot
     step correctly does nothing) or a complete one. The manifest is written
-    last on purpose: it is the commit record.
+    last on purpose: a manifest with no `committed` flag is a restore that was
+    still IN FLIGHT when the process died.
     """
     d = _restore_undo_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -1789,8 +1790,47 @@ def _clear_restore_undo() -> None:
     shutil.rmtree(_restore_undo_dir(), ignore_errors=True)
 
 
+def _mark_restore_undo_committed() -> None:
+    """Record that the restore COMMITTED, before the best-effort clear.
+
+    E1: the journal used to be spent only by deleting the directory, so a kill
+    between the commit and the clear — the exact crash class this feature
+    exists for — or a silent `rmtree` failure made the next boot roll back a
+    restore that had already been applied: the UNSAFE direction. Rewriting the
+    manifest with `committed: true` is the durable commit record; the boot step
+    treats a committed journal as DISCARD.
+
+    Never raises: the apply already committed, and a failed marker must not be
+    reported as a failed restore. If the manifest cannot be rewritten, unlink
+    it — a missing manifest also means "nothing to replay". If even that
+    fails the journal stays uncommitted and the boot step will roll back; that
+    is logged, not hidden.
+    """
+    d = _restore_undo_dir()
+    manifest_path = d / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return
+        manifest["committed"] = True
+        atomic_write_json(manifest_path, manifest)
+        return
+    except Exception:
+        pass
+    try:
+        manifest_path.unlink()
+    except OSError:
+        _log.exception("restore-undo: could not record the commit marker in %s",
+                       d)
+
+
 def _replay_restore_undo() -> None:
     """Boot step: roll back an interrupted restore, then clear the journal.
+
+    A journal whose manifest carries `committed: true` belongs to a restore
+    that finished applying — the only thing that did not happen is the clear —
+    so it is DISCARDED, never replayed. Only an uncommitted journal (a restore
+    killed while still applying) is rolled back.
 
     Best-effort and it never raises — a recovery that cannot write must not
     stop the server from booting. If any write-back fails the journal is KEPT
@@ -1801,6 +1841,9 @@ def _replay_restore_undo() -> None:
     try:
         manifest = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, ValueError):
+        return
+    if isinstance(manifest, dict) and manifest.get("committed"):
+        _clear_restore_undo()
         return
     entries = manifest.get("entries") if isinstance(manifest, dict) else None
     if not isinstance(entries, list):
@@ -1963,6 +2006,10 @@ def _apply_restore(store, targets, patch, normalized, rows):
                 detail += ("; rollback of " + ", ".join(failed)
                            + " failed — the store may be left part-applied")
             raise _RestoreFailed(detail) from e
+        # E1: record the commit durably BEFORE the best-effort clear. If the
+        # process dies in the gap, or `rmtree` fails silently, the next boot
+        # must DISCARD this journal, not roll a committed restore back.
+        _mark_restore_undo_committed()
         # ODR-4: the apply committed, so the journal is spent. Cleared INSIDE
         # the locked region on purpose: releasing the lock first would let a
         # second restore write its own journal in the gap and this clear would
