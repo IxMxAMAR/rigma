@@ -7056,8 +7056,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         try:
                             await asyncio.to_thread(server_ops.perform_unload)
                             telemetry["tg"] = None
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # A9: this was `pass`, so a failed unload left the card
+                            # occupied and said nothing about why. `perform_unload`
+                            # records `unloaded` only on success, so the idle state
+                            # is left exactly as it was and the next poll retries;
+                            # only the reason is new. It is a warning, not an
+                            # exception trace: the engine is still up and the turn
+                            # path is unaffected.
+                            _log.warning("idle auto-unload failed, engine left "
+                                         "loaded: %s", e)
                         finally:
                             switch_lock.release()
         return asyncio.create_task(_loop())
