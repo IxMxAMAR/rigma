@@ -5748,7 +5748,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
 
     def _memory_store():
         from . import memory as _mem
-        return _mem.MemoryStore(runtime.rigma_home() / "memory" / "memories.jsonl")
+        # A11d: `store_for`, not a fresh `MemoryStore`, so two restores in this
+        # process share the store's RLock and the whole snapshot -> apply ->
+        # rollback region is serialised even when the cross-process file lock
+        # cannot be taken.
+        return _mem.store_for(runtime.rigma_home() / "memory" / "memories.jsonl")
 
     def _score_current_step(run, delta):
         """Discredit/credit memories injected into the run's current step."""
