@@ -670,6 +670,13 @@ def _engine_version(backend: str = "") -> str:
         return ""
 
 
+# C11: engine env vars that turn OFF a quality-preserving default. A sweep
+# scores tokens/sec only, so a row carrying one of these may be MEASURED but
+# must not be crowned — and so never persisted into calibration, which
+# `resolve()` then applies to EVERY later launch.
+_QUALITY_ENV_LEVERS = ("LLAMA_ATTN_ROT_DISABLE",)
+
+
 def crowned_row(rows: list[dict]) -> dict | None:
     """The config a sweep actually crowns. ONE rule, two readers.
 

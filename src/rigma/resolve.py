@@ -160,6 +160,41 @@ def _desktop_vram_mb(profile: HardwareProfile | None) -> float | None:
         return None
 
 
+def _without_quality_env_levers(flags: dict) -> tuple[dict, list[str]]:
+    """`flags` with any quality-degrading engine env lever removed, and their names.
+
+    C11-read: C11 closed the WRITE path — `bench.crowned_row` no longer crowns a
+    trial that turns off a quality-preserving engine default, so `run_sweep`
+    cannot persist one. But a `calibration.json` written BEFORE that fix, or
+    hand-edited, is still merged by `_apply_calibration` and reaches the child's
+    environment on every later launch. A sweep scores tokens/sec only, so the
+    read path must refuse the same lever the write path refuses to crown.
+
+    `bench._QUALITY_ENV_LEVERS` is the ONE list of such levers (the C11 verifier
+    found `LLAMA_ATTN_ROT_DISABLE` applied end to end), and this reuses it
+    rather than inventing a second one. The rest of the row is kept: only the
+    quality lever is dropped, so a corrupt/hostile key cannot disable the gate
+    by riding in with a legitimate one.
+    """
+    from .bench import _QUALITY_ENV_LEVERS
+    if not isinstance(flags, dict):
+        # A hand-edited row can be a list/string. Leave it alone so the merge's
+        # existing TypeError handler keeps reporting "flags is not an object"
+        # rather than this helper raising AttributeError first.
+        return flags, []
+    env = flags.get("env")
+    if not isinstance(env, dict):
+        return flags, []
+    dropped = [name for name in _QUALITY_ENV_LEVERS if name in env]
+    if not dropped:
+        return flags, []
+    cleaned = {k: v for k, v in flags.items() if k != "env"}
+    rest = {k: v for k, v in env.items() if k not in _QUALITY_ENV_LEVERS}
+    if rest:
+        cleaned["env"] = rest
+    return cleaned, dropped
+
+
 def _apply_calibration(plan: RunPlan,
                        profile: HardwareProfile | None = None) -> RunPlan:
     from .bench import calibration_entry, calibration_stale, current_identity, load_calibration
@@ -184,6 +219,10 @@ def _apply_calibration(plan: RunPlan,
         if reason:
             plan.explain.append(f"calibration override skipped: {reason}")
             return plan
+        # C11-read: re-gate the quality-degrading env levers at MERGE time too.
+        # The write path (bench.crowned_row) cannot crown one, but a row
+        # written before that fix — or hand-edited — is still applied here.
+        stored, dropped = _without_quality_env_levers(entry["flags"])
         # AUDIT F06-4: model_copy(update=...) does not validate, so a stored
         # entry replayed the flash_attn enum, the spec_type whitelist, the
         # cache-type table and _symmetric_kv straight onto the plan — `-fa
@@ -195,7 +234,7 @@ def _apply_calibration(plan: RunPlan,
         # placement anyone measured.
         try:
             merged = ComboFlags.model_validate(
-                {**plan.flags.model_dump(), **entry["flags"]})
+                {**plan.flags.model_dump(), **stored})
         except ValidationError as exc:
             plan.explain.append(
                 f"calibration override ignored: {exc.error_count()} invalid "
@@ -207,8 +246,14 @@ def _apply_calibration(plan: RunPlan,
             return plan
         plan.flags = merged
         plan.origin += "+calibrated"
-        plan.explain.append(f"calibration override applied: {entry['flags']} "
+        plan.explain.append(f"calibration override applied: {stored} "
                             f"(measured {entry.get('date', '?')})")
+        if dropped:
+            plan.explain.append(
+                "calibration override dropped quality-degrading env lever(s) "
+                + ", ".join(dropped) + ": a sweep scores speed only, and the "
+                "engine turns the quality-preserving default ON for a reason "
+                "(see bench._QUALITY_ENV_LEVERS)")
     return plan
 
 
