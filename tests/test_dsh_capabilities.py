@@ -418,6 +418,52 @@ def test_the_projector_failure_notice_is_built_by_the_shared_helper(monkeypatch)
     assert runner._notice_line("one\ntwo") == "one two"
 
 
+def test_the_projector_failure_log_line_is_one_collapsed_line(monkeypatch, caplog):
+    """B2c: the LOG line the notice accompanies must not carry the exception's
+    newlines either. Before this, `_log.warning(..., exc)` wrote the raw
+    multi-line message, so one projector failure read as a wall of lines and a
+    message that merely wrapped was mis-shaped. The notice was already collapsed
+    and capped; the log now takes the same collapse (not the cap — a log is read
+    after the fact, and whether it must be capped too is the §0.3 question the
+    backlog leaves open, not a call this fix makes)."""
+    secret = "owner prose that must not own the line\nSECRET " * 40
+
+    def explode(notification, streamed=None):
+        raise _ProjectorBoom(secret)
+
+    monkeypatch.setattr(runner, "_project", explode)
+    monkeypatch.setattr(runner, "_emit", lambda _ev: None)
+    with caplog.at_level(logging.WARNING, logger="rigma._dsh_runner"):
+        runner._forward(_session_event("tool/call", {"name": "read"}))
+
+    failed = [r for r in caplog.records if "projector failed" in r.getMessage()]
+    assert len(failed) == 1, [r.getMessage() for r in caplog.records]
+    msg = failed[0].getMessage()
+    assert "\n" not in msg and "\r" not in msg, repr(msg)
+    # Still useful: the exception's own type name is named, and the collapsed
+    # message is kept whole rather than dropped.
+    assert "_ProjectorBoom" in msg, msg
+    assert "owner prose that must not own the line SECRET" in msg, msg
+
+
+def test_the_emit_failure_log_line_is_one_collapsed_line(monkeypatch, caplog):
+    """The identical shape one branch below in `_forward`: an exception message
+    is collapsed before it reaches the log record, so no un-collapsed exception
+    log line remains in the function."""
+    def explode(_ev):
+        raise RuntimeError("emit failed\nSECRET " * 20)
+
+    monkeypatch.setattr(runner, "_emit", explode)
+    with caplog.at_level(logging.WARNING, logger="rigma._dsh_runner"):
+        runner._forward(_session_event("goal/change", {"operation": "create"}))
+
+    failed = [r for r in caplog.records if "could not emit" in r.getMessage()]
+    assert len(failed) == 1, [r.getMessage() for r in caplog.records]
+    msg = failed[0].getMessage()
+    assert "\n" not in msg and "\r" not in msg, repr(msg)
+    assert "RuntimeError" in msg, msg
+
+
 def test_an_unknown_event_type_cannot_add_a_line_or_outgrow_the_cap():
     """The type is the only non-allow-listed token in this notice, and it is
     named by design; the shared helper is what bounds it."""

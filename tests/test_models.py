@@ -146,6 +146,25 @@ def test_server_args_answers_to_the_slug_name():
     assert nargs[nargs.index("--alias") + 1] == "rigma"
 
 
+def test_a_comma_in_an_explicit_alias_is_rejected():
+    """B7e: `--alias` is comma-separated at both pins
+    (PrismML-Eng 87268f77 common/arg.cpp:2997, ggml-org b9867 :2707:
+    `string_split(value, ',')` into a `std::set<std::string>`), and the served id
+    is `*model_alias.begin()` — the lexicographically first name. A hand-written
+    alias with a comma therefore becomes several names and the one served is not
+    the one written; an auto-slug cannot contain a comma (`hangar._slugify`), so
+    only this path needs the guard."""
+    import pytest as _p
+    from pydantic import ValidationError
+
+    with _p.raises(ValidationError, match="alias"):
+        ComboFlags(ctx=4096, alias="rigma,other")
+    # The two legal shapes still parse: empty (use the plan's slug) and a plain
+    # single name (which reaches argv verbatim).
+    assert ComboFlags(ctx=4096).alias == ""
+    assert ComboFlags(ctx=4096, alias="rigma").alias == "rigma"
+
+
 def test_server_args_pins_the_deepseek_reasoning_format():
     """B7: `--reasoning-format deepseek` keeps thought tags in
     `message.reasoning_content` (streaming deltas included) instead of leaking
