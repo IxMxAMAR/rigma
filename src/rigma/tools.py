@@ -1450,6 +1450,27 @@ def _numbers_in(name: str) -> list[str]:
     return [d.lstrip("0") or "0" for d in re.findall(r"\d+", name)]
 
 
+def _stat_ok(p: Path, probe: str) -> bool:
+    """`Path.exists()` / `is_file()` / `is_dir()` that answer False when the path
+    cannot be stat'd at all.
+
+    Those three are NOT total functions: pathlib re-raises any OSError whose
+    errno is outside its small ignored set (`_IGNORED_ERRNOS` = ENOENT, ENOTDIR,
+    EBADF, ELOOP plus three Windows errors). A BitLocker-locked volume, an
+    offline network share, a stale drive letter or a device-not-ready answer
+    arrives as errno 22 / WinError -2144272384, so `exists()` RAISES instead of
+    returning False. Every caller below has exactly two outcomes — "use this
+    path" and "it is not there" — and for both a path the OS refuses to stat IS
+    not there. Propagating the raw OSError replaces the tool's own "no such
+    file" (which the model can act on) with the drive's error text (which it
+    cannot). `probe` is the method name so the call site reads as the check it
+    is replacing."""
+    try:
+        return bool(getattr(p, probe)())
+    except OSError:
+        return False
+
+
 def _fuzzy_file(p: Path, ctx: dict | None = None):
     """Recover a near-miss filename. Weak models retype paths from memory and
     mangle them — dropping zero padding is the classic one, because digit runs
@@ -1469,10 +1490,13 @@ def _fuzzy_file(p: Path, ctx: dict | None = None):
     the recovery then substituted the real sibling underneath it — so
     `read_file('.en')` handed back `.env` (and the note named it). `ctx` is
     optional so a caller with no context keeps the old behaviour."""
-    if p.exists():
+    # _stat_ok, not p.exists(): on an unstatable parent (locked/offline drive)
+    # exists() raises, and the raw OS error would replace this tool's own
+    # "no such file" answer. See _stat_ok.
+    if _stat_ok(p, "exists"):
         return p, ""
     parent = p.parent
-    if not parent.is_dir():
+    if not _stat_ok(parent, "is_dir"):
         return None, ""
 
     def norm(s: str) -> str:
@@ -3181,11 +3205,14 @@ def _read_file(args, ctx):
     raw = str(args.get("path", ""))
     p = _read_path(ctx, raw)
     _read_note = ""
-    if not p.is_file():
+    # _stat_ok, not p.is_file(): on an unstatable path (locked/offline drive)
+    # is_file() RAISES, so the raw OS error would replace this tool's own
+    # "no such file" answer. See _stat_ok.
+    if not _stat_ok(p, "is_file"):
         fixed, _read_note = _fuzzy_file(p, ctx)
         if fixed is not None:
             p = fixed
-    if not p.is_file():
+    if not _stat_ok(p, "is_file"):
         # Inside a run the model hunts for its own progress log and loops on
         # "no such file" (the real one lives in the run dir, not the workspace).
         # Hand it the actual progress instead of an error. Checked FIRST so
@@ -3201,7 +3228,7 @@ def _read_file(args, ctx):
         # A DIRECTORY is not an error to read -- it's the model saying "what's
         # in here?". Answer that (live 2026-07-21: read_file on a folder said
         # "no such file" and the model started guessing filenames blind).
-        if p.is_dir():
+        if _stat_ok(p, "is_dir"):
             return _folder_listing(p)
         # A GLOB in the path: the model gave up on the exact name and reached
         # for a pattern. Resolve it. One hit -> just read it; several -> show
@@ -3223,12 +3250,12 @@ def _read_file(args, ctx):
                         "path.")
         # last resort: name what's REALLY at the deepest folder that exists,
         # so a wrong directory component is a one-turn fix, not a guessing loop
-        if not p.is_file() and ctx.get("workspace"):
+        if not _stat_ok(p, "is_file") and ctx.get("workspace"):
             try:
                 return _nearest_hint(Path(ctx["workspace"]).resolve(), raw)
             except Exception:
                 pass
-        if not p.is_file():
+        if not _stat_ok(p, "is_file"):
             return f"error: no such file: {args.get('path')}"
     size = p.stat().st_size
     if size > 8_000_000:
@@ -3633,13 +3660,13 @@ def _transfer_sources(args, ctx) -> tuple[list, list, list]:
         except ValueError as e:
             errs.append(str(e))
             continue
-        if not p.is_file():
+        if not _stat_ok(p, "is_file"):
             fixed, note = _fuzzy_file(p, ctx)
             if fixed is not None:
                 p = fixed
                 if note:
                     notes.append(note)
-        if p.is_file():
+        if _stat_ok(p, "is_file"):
             found.append(p)
         else:
             errs.append(f"no such file: {raw}")
@@ -3805,7 +3832,10 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
                       "workspace' on the session, or pass a path relative to "
                       "the workspace"), ""
     note = ""
-    if not p.is_file():
+    # _stat_ok, not p.is_file(): on an unstatable path (locked/offline drive)
+    # is_file() RAISES, and that raw OS error replaced this tool's own
+    # "no such file" answer. See _stat_ok.
+    if not _stat_ok(p, "is_file"):
         # A mangled filename is the model's memory failing, not a missing file
         # — and this repair has to run for ABSOLUTE paths too. The early return
         # that used to sit above skipped it for every absolute path, which is
@@ -3818,6 +3848,16 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
         if found is None:
             return None, f"no such file: {ps}" + _candidates(p), ""
         p = found
+    # The fuzzy repair can hand back a DIRECTORY: `_fuzzy_file`'s exists()
+    # accepts one, and it returns `p` itself when `p` is a directory named like
+    # an image. The suffix check below passes and stat() succeeds on a
+    # directory, so `adir.png` was returned as a viewable image and
+    # `_view_image` emitted the sentinel — a FALSE SUCCESS that hands the model
+    # a "picture" it can never describe. `read_file` and `view_images` both
+    # re-check is_file() after the repair; view_image was the odd one out. Answer
+    # with the SAME "no such file" a genuinely missing file gets.
+    if not _stat_ok(p, "is_file"):
+        return None, f"no such file: {ps}" + _candidates(p), ""
     # AUDIT R3-7: this branch never consulted the credential denylist, so an
     # image inside `.ssh`, a browser profile or Rigma's own state dir was the
     # one read the 13-2 fix did not cover — the grant is irrelevant to it, and
