@@ -537,7 +537,7 @@ class AcpClient:
 
         `session/load` takes the same parameter and is registered to a near-identical
         handler; `resume` is used because it is the one whose name says what is
-        wanted here. `session_load` is kept as an alias for a version that drops one.
+        wanted here.
         """
         body: dict = {"sessionId": session_id}
         if cwd:
@@ -552,25 +552,6 @@ class AcpClient:
         self.modes = res.get("modes") or self.modes
         self.config_options = res.get("configOptions") or self.config_options
         return res
-
-    def session_load(self, session_id: str, cwd: str = "",
-                     mcp_servers: list | None = None,
-                     timeout: float | None = None) -> dict:
-        """The other spelling of reattaching. Same parameter, same handler shape."""
-        body: dict = {"sessionId": session_id}
-        if cwd:
-            body["cwd"] = cwd
-        if mcp_servers is not None:
-            body["mcpServers"] = mcp_servers
-        res = self.request("session/load", body, timeout=timeout) or {}
-        self.session_id = str(res.get("sessionId") or session_id)
-        self.modes = res.get("modes") or self.modes
-        self.config_options = res.get("configOptions") or self.config_options
-        return res
-
-    def session_list(self, timeout: float | None = None) -> Any:
-        """Every session mcode is holding, so Rigma can offer to continue one."""
-        return self.request("session/list", {}, timeout=timeout)
 
     def available_modes(self) -> list[dict]:
         return list(self.modes.get("availableModes") or [])
