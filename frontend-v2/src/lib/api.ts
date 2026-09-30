@@ -5,6 +5,13 @@ export interface SessionSummary {
   title: string;
   message_count?: number;
   use_rag?: boolean;
+  /** D3a/D3b: the SERVER is generating a reply in this chat right now.
+   *
+   *  `chatStore.streams` only knows about turns THIS tab started, so a reload
+   *  (or a second tab) saw a mid-turn chat as idle. `partial` in the transcript
+   *  was the only clue, and it reads as "interrupted" — which is false while the
+   *  turn is still running. */
+  streaming?: boolean;
 }
 
 export interface ChatMessage {
@@ -33,6 +40,14 @@ export interface ChatMessage {
   variants?: unknown[];
   kind?: string;          // "tool_result" = model-context carrier, not UI
   notice?: string;        // server-authored status line — shown, never fed
+  /** AUDIT F7: this message is a mid-turn CHECKPOINT, not a finished reply. The
+   *  server replaces it in place every `CHECKPOINT_SECS` and removes it when the
+   *  turn ends. On its own it means "cut off"; combined with the session's
+   *  `streaming` it means "still being written". */
+  partial?: boolean;
+  /** AUDIT F7: which checkpoint wrote this message. Stable across rewrites of the
+   *  same turn, so a client can tell one turn's partial from another's. */
+  ckpt_id?: string;
   /** Which EXTERNAL agent backend wrote this reply, and what to call it. Both
    *  are absent on a reply the built-in loop wrote: the badge explains the
    *  unusual case, so the ordinary one carries no marker. */
@@ -53,6 +68,9 @@ export interface Session {
    *  `acp`. Only meaningful for mcode, and a SESSION field rather than a turn's,
    *  because the mcode session id belongs to one wire. */
   mcode_transport?: string;
+  /** D3a/D3b: the server is generating in this chat right now. See
+   *  `SessionSummary.streaming`. */
+  streaming?: boolean;
   /** AUDIT 13-2/13-3 per-chat tool grants. None has a server default, so a
    *  chat that has never been toggled reports all three absent — which the UI
    *  must read as OFF, never as granted (see chat/grants.ts). */
