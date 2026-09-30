@@ -199,10 +199,10 @@ def test_the_post_accepts_batch_ubatch_and_ngl(client):
 
 
 def test_an_illegal_batch_pair_is_a_400_not_a_500(client):
-    """llama.cpp refuses to start with `-ub` > `-b`, so the pair is refused at
-    write time with a reason. The engine default batch (2048) applies when
-    `batch` is unset, so a lone `ubatch: 4096` is refused too — and neither may
-    surface as an uncaught pydantic ValidationError (a 500)."""
+    """`-ub` > `-b` is refused at write time with a reason. The default batch
+    (2048) applies when `batch` is unset, so a lone `ubatch: 4096` is refused
+    too — and neither may surface as an uncaught pydantic ValidationError (a
+    500)."""
     c, slug = client
     r = c.post(f"/api/models/{slug}/defaults",
                json={"batch": 4096, "ubatch": 8192})
@@ -210,5 +210,47 @@ def test_an_illegal_batch_pair_is_a_400_not_a_500(client):
     assert "ubatch 8192 exceeds batch 4096" in r.json()["error"]
     r = c.post(f"/api/models/{slug}/defaults", json={"ubatch": 4096})
     assert r.status_code == 400, r.text
-    assert "engine default" in r.json()["error"]
+    assert "2048" in r.json()["error"]
     assert c.get(f"/api/models/{slug}/defaults").json()["launch"] is None
+
+
+def test_the_batch_refusal_names_the_server_not_the_engine(client):
+    """N1: the launch dialog renders this body VERBATIM (`serve.py:5111`
+    returns `str(HangarError)` as the 400 `error`), so it must not blame
+    llama.cpp for a refusal Rigma itself makes. At b9867 the engine only clamps
+    `n_ubatch` to `n_batch` (`src/llama-context.cpp:207`); the 400 is the
+    SERVER's. The old wording ("llama.cpp refuses to start…") contradicted the
+    dialog's own note and would fail this test."""
+    c, slug = client
+    r = c.post(f"/api/models/{slug}/defaults",
+               json={"batch": 4096, "ubatch": 8192})
+    assert r.status_code == 400, r.text
+    msg = r.json()["error"]
+    # the SERVER refuses — not the engine, and not llama.cpp
+    assert "server" in msg.lower()
+    assert "llama.cpp" not in msg
+    assert "engine" not in msg.lower()
+    # still names both values and the constraint
+    assert "8192" in msg and "4096" in msg
+    assert "physical batch" in msg and "logical batch" in msg
+
+
+def test_the_400_body_carries_no_pydantic_prefix(client):
+    """ITEM 2: `hangar.set_launch_defaults` joins pydantic's error messages into
+    the 400 body the dialog renders verbatim. Pydantic prefixes each with
+    "Value error, " — its own wrapper, not the sentence the author wrote — and
+    the user must see the sentence. A message whose text legitimately starts
+    with something else is untouched."""
+    c, slug = client
+    r = c.post(f"/api/models/{slug}/defaults",
+               json={"batch": 4096, "ubatch": 8192})
+    assert r.status_code == 400, r.text
+    msg = r.json()["error"]
+    assert not msg.startswith("Value error, "), msg
+    assert msg.startswith("ubatch 8192 exceeds batch 4096: the server refuses"), msg
+    # the other validator branch is stripped too, and its own sentence is intact
+    r = c.post(f"/api/models/{slug}/defaults", json={"batch": -1})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"] == \
+        "batch and ubatch must be 0 (no opinion) or a positive size"
+

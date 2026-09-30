@@ -51,28 +51,28 @@ ENGINE_DEFAULT_UBATCH = 512
 def batch_pair_error(batch: int, ubatch: int) -> str:
     """Why this `-b`/`-ub` pair cannot launch, or "" when it can.
 
-    The engine's contract is `n_ubatch <= n_batch` — the physical batch is a
-    slice of the logical one — so Rigma refuses a stored pair that violates it
-    at write time rather than letting the engine die at load. An unset side is
-    compared at the ENGINE default, not at 0: `batch` unset means 2048, so a
-    stored `ubatch: 4096` is still illegal and must not be waved through.
+    The constraint is `n_ubatch <= n_batch` — the physical batch is a slice of
+    the logical one. The engine does NOT refuse a violation: it silently CLAMPS
+    the physical batch down to the logical one, so the `-ub` the user asked for
+    never takes effect. Rigma therefore refuses the pair at write time — the
+    SERVER answers 400 — rather than launching something other than what was
+    asked for. An unset side is compared at the ENGINE default, not at 0:
+    `batch` unset means 2048, so a stored `ubatch: 4096` is still illegal and
+    must not be waved through.
 
-    UNVERIFIED: the exact line where the engine rejects `n_ubatch > n_batch`
-    (it was not fetched). The constraint itself is confirmed by the source
-    defaults above and by two independent secondary sources
-    (multigrid.ai/learn/llamacpp-batch-ubatch; jonathanding.github.io/
-    llm-learning/en/articles/llama-cpp-batch-ubatch, "Key constraint:
-    n_ubatch <= n_batch").
+    CONFIRMED at mainline b9867 src/llama-context.cpp:207 (fetched, not run):
+        cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    (https://raw.githubusercontent.com/ggml-org/llama.cpp/b9867/src/llama-context.cpp)
     """
     if batch < 0 or ubatch < 0:
         return ("batch and ubatch must be 0 (no opinion) or a positive size")
     eff_b = batch or ENGINE_DEFAULT_BATCH
     eff_ub = ubatch or ENGINE_DEFAULT_UBATCH
     if eff_ub > eff_b:
-        return (f"ubatch {eff_ub} exceeds batch {eff_b}: llama.cpp refuses to "
-                "start when the physical batch is larger than the logical "
-                "batch" + (" (batch is unset, so the engine default 2048 "
-                           "applies)" if not batch else ""))
+        return (f"ubatch {eff_ub} exceeds batch {eff_b}: the server refuses a "
+                "physical batch larger than the logical batch" +
+                (" (batch is unset, so the default 2048 applies)"
+                 if not batch else ""))
     return ""
 
 
