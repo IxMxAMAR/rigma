@@ -187,7 +187,7 @@ _(see `STATUS.md` for the per-item table with outcomes and verifier corrections)
 | 13 | `5241a44` `866bf7b` | **DR2-1/DR2-2/DR1-residual** (the deep-review-2 regression), W13-B (the effective env + case-insensitivity) |
 | 14 | `5b4bcd5` `5806031` `009730d` `02785bf` `7b0db3b` `cefd6fd` `97da7b5` `f6a0874` | OD-13's remote stop, the A2d-budget UI, the 400 provenance + prefix strip, the frontend nits, and W14-E (the **flaky** pause test — Head Agent's own 30/30 — the `serve.py` provenance comment, and the registry-combo env gate) |
 
-Integration head at this hand-off: **`f6a0874`** (plus the docs commits that follow it). `STATUS.md`
+Integration head at this hand-off: **`8977ea8`** (plus the docs commits that follow it). `STATUS.md`
 carries the per-item table and the note on the metadata-only author rewrite (with the old→new hash
 mapping for every pre-rewrite commit).
 
@@ -202,34 +202,55 @@ could not see) were fixed in waves 11 and 13.
 
 ## What is in flight / what to do next
 
-**Nothing is in flight.** Waves 0–14 are merged. Every item in `deep-review-1.md` (DR1–DR9) and
-`deep-review-2.md` (DR2-1…DR2-6) is fixed except **DR9** (which is `OD-14`, an owner decision) and
-the residuals recorded below. `BACKLOG.md`'s follow-up tables are the work queue — read them before
-starting anything.
+**Nothing is in flight.** Waves 0–15 are merged. Every item in `deep-review-1.md` (DR1–DR9),
+`deep-review-2.md` (DR2-1…DR2-6) and `deep-review-3.md` (DR3-1…DR3-4) is fixed except **DR9** (which
+is `OD-14`, an owner decision) and the residuals recorded below. `BACKLOG.md`'s follow-up tables are
+the work queue — read them before starting anything.
+
+**Read this before trusting any verdict written after ~16:20 UTC.** The power-cut resume left this
+session at subagent **depth 1**, so `subagent`/`subagent_fork` fail with
+`SubagentDepthError: subagent depth 2 exceeds maxDepth 1`. From that point the Head Agent ran the
+verifier's *checks* itself, so those verdicts are **single-sourced**: `verify-w15a.md` says so
+explicitly, and the wave-14 verdicts are Head-Agent-sourced too. The program's whole verification
+discipline is "an agent that did not write the code checks it" — that property is **absent** for
+those items, so re-verify them first if the next session has subagent capacity.
+
+**Also read `REC-1` in `BACKLOG.md` before running the suite.** Two concurrent full-suite runs
+deadlock and leak ~72 `tests/fake_acp_server.py` processes. This happened **again** at the final
+hand-off (two orphaned runs from 16:33/16:37 UTC, still alive with 72 children at 16:46), and the
+harness guard **refused the process-reaping route twice** ("use `job_kill` for your own jobs" — but
+they were not in the job list). The final suite therefore ran **alongside** them and is slower than a
+clean run. **Never start a second suite while one is running, and check for leaked
+`fake_acp_server.py` children before believing a slow or hung run.**
 
 The highest-value open items, in the program's ranking (what can make something else fail > the
 harness seam > missing levers > UI/UX polish):
 
-1. **DR2-1-residual** — the DR2-1 fix suppresses the VRAM axis for any non-device-resident load, so
+1. **REC-1** — the suite is not safe to run twice at once and a leaked run cannot be reaped from the
+   shell. One focused diagnosis (run two suites and find the shared resource: a fixed port, a fixed
+   temp path, or a shared `RIGMA_HOME`) would make every future session's acceptance gate trustworthy.
+   This is now the top item because it can make *another* session fail.
+2. **DR2-1-residual** — the DR2-1 fix suppresses the VRAM axis for any non-device-resident load, so
    **MoE is now blind on both the split axis and the VRAM axis**. Honest, but a real loss; restoring
    it needs the plan to persist its device-side placement (a `state.json` schema change).
-2. **W13B-1** — `bench._effective_env` duplicates `run_sweep`'s construction with no test pinning
+3. **W13B-1** — `bench._effective_env` duplicates `run_sweep`'s construction with no test pinning
    them together, so a future edit to either silently desyncs the gate from the child it gates. A
-   shared `_trial_flags(plan, override)` makes it structurally impossible.
-3. **W5F5B-N3** — the context floor `2048` is still a bare literal at `server_ops.py:754`,
+   shared `_trial_flags(plan, override)` makes it structurally impossible. (W15-A added a second
+   caller, `_effective_flags`, so this is now three call sites.)
+4. **W5F5B-N3** — the context floor `2048` is still a bare literal at `server_ops.py:754`,
    `serve.py:4731-4732`, `resolve.py:1072` and the frontend's `CTX_FLOOR` (the `hangar.py` and
    legacy-panel sites are named). Unify in one wave.
-4. **B4b-schema / OD-12** — the question form's nested objects/arrays and `default`, and whether a
+5. **B4b-schema / OD-12** — the question form's nested objects/arrays and `default`, and whether a
    timed-out question should emit a server-side expiry event (`QUESTION_WAIT_SECS = 5.0`).
-5. **`OWNER-DECISIONS.md`** — now **OD-1…OD-15**. Each has options, evidence and a recommendation.
-   OD-15 is the newest: `/api/restore` replaces memory but **merges** settings and methods, so
-   "restore a backup" does not reproduce the file's state (the card now says so; the deeper question
-   is whether the route should truly replace). **OD-13 was implemented** because its recorded
-   recommendation was option 1.
-6. **A third deep review.** Both previous ones found real defects inside already-verified fixes, and
-   the marginal cost is one read-only agent. `deep-review-2.md` reviewed the diff since
-   `deep-review-1.md`; the next one should cover waves 11–14 (which have not had that treatment).
-   Its method is rule 13: *name one realistic state the test does NOT put the code in.*
+6. **`OWNER-DECISIONS.md`** — now **OD-1…OD-16**. Each has options, evidence and a recommendation.
+   OD-15 is `/api/restore`'s merge-not-replace semantics (the card now says so; the deeper question
+   is whether the route should truly replace). OD-16 is REC-1. **OD-13 was implemented** because its
+   recorded recommendation was option 1.
+7. **A fourth deep review.** All three previous ones found real defects inside already-verified
+   fixes, and the marginal cost is one read-only agent. `deep-review-3.md` covered waves 11–14; the
+   next one should cover waves 15–16 **and re-verify the Head-Agent-sourced verdicts**, which have
+   had no independent pass at all. Its method is rule 13: *name one realistic state the test does NOT
+   put the code in.*
 
 ## What is waiting on the GPU (`NEEDS-GPU`)
 
