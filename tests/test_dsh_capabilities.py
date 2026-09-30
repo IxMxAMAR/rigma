@@ -48,6 +48,7 @@ EXPECTED_ROWS = {
     # "plan" is deliberately ABSENT — see `test_plan_mode_is_not_mounted_and_why`.
     "workflow": ["ptc-runtime", "workflow-ptc", "tool-workflow"],
     "context": ["token-meter", "compaction-basic"],
+    "governance": ["approval", "permission"],
 }
 
 
@@ -78,6 +79,58 @@ def test_every_capability_the_minimal_profile_omits_is_inserted():
     }
     missing = {g: v for g, v in missing.items() if v}
     assert not missing, f"capabilities the patch no longer inserts: {missing}"
+
+
+# --------------------------------------------------------------------------
+# O4 (checkpoint 30): the approval/governance audit trail. `sandbox/mode` fires
+# from `sandbox-policy`, which sdk-minimal mounts, so the panel looked live —
+# but the three `approval/*` events come only from `dsh-user-approval` and
+# `permission/preset` only from `dsh-permission-presets`, and neither plugin was
+# mounted. The trail could not fill and nothing said why. These pin the mount
+# rows through the same loader the runner uses, and pin the one config value
+# that decides whether mounting the approval service is safe.
+# --------------------------------------------------------------------------
+
+
+def test_the_approval_and_permission_services_are_mounted():
+    """The missing hop: without these rows the audit trail is unreachable.
+
+    Read through `_patch_rows()`, i.e. `harness_dsh.capability_patch()` plus
+    `yaml.safe_load` — the same loader the runner hands to DSH — so a row that
+    is present but unparseable fails here rather than silently at boot.
+    """
+    by_id = {str(r.get("id")): r for r in _patch_rows()}
+    assert by_id["approval"]["name"] == "@deepseek-ai/dsh-user-approval"
+    assert by_id["permission"]["name"] == "@deepseek-ai/dsh-permission-presets"
+
+
+def test_the_approval_policy_matches_the_sandbox_rigma_actually_runs():
+    """`never`, not the base bundle's `ask`.
+
+    sdk-minimal hardcodes `sandbox-policy: danger-full-access`, and Rigma never
+    sets DSH_PERMISSION_MODE — so the base's `!!js` expression would resolve to
+    `ask` here. `ask` on a transport with no answerer fails CLOSED (the SDK wire
+    has no approval-response method), which would deny calls the unconfined
+    sandbox permits. `never` rejects deterministically without a prompt, which
+    is the stance that matches the sandbox Rigma runs.
+    """
+    by_id = {str(r.get("id")): r for r in _patch_rows()}
+    assert by_id["approval"]["config"]["policy"] == "never"
+    # A plain string is also the only thing that can be here: `_patch_rows()`
+    # parses with `yaml.safe_load`, which raises on the base bundle's `!!js`
+    # tag, so copying that expression verbatim is not an option.
+    assert isinstance(by_id["approval"]["config"]["policy"], str)
+
+
+def test_the_danger_full_access_preset_agrees_with_the_approval_policy():
+    """A preset whose `approval` disagrees with the service's `policy` would make
+    `derive()` find no preset for the composed defaults and refuse to mount."""
+    by_id = {str(r.get("id")): r for r in _patch_rows()}
+    presets = by_id["permission"]["config"]["presets"]
+    assert presets["danger-full-access"] == {
+        "sandbox": "danger-full-access", "approval": "never"}
+    assert presets["read-only"]["approval"] == "ask"
+    assert presets["workspace-write"]["approval"] == "ask"
 
 
 def test_the_two_subagent_tools_are_the_same_plugin_under_two_names():
