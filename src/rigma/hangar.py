@@ -63,9 +63,33 @@ DOWNLOAD_ATTEMPTS = 6   # multi-GB pulls WILL drop; resume and retry
 # OSError from the write, arriving after the damage and leaving a huge .part.
 PULL_FREE_MARGIN_BYTES = 2 * 2**30
 
+# The floor a probed context window is raised to: a gguf whose header omits
+# `context_length` (or reports a tiny one) still gets a usable window. The SAME
+# 2048 launch floor is written out again at `server_ops.py:754`
+# (`max(2048, min(int(ctx), native))`), `serve.py:4731` (the "ctx must be at
+# least 2048" route guard) and the frontend's `CTX_FLOOR`
+# (`frontend-v2/src/models/LaunchDefaultsDialog.tsx`). Named here so THIS site
+# cannot drift; unifying the other three is a later wave's change. Note that
+# `resolve._ctx_floor` is a DIFFERENT floor — `CTX_FLOOR = 8192`
+# (`resolve.py:111`, used at `:297`); the 2048 in `resolve.py:1072` is the
+# `quant_verdicts` probe ladder, not this floor.
+MIN_NATIVE_CTX = 2048
+
 
 class HangarError(RuntimeError):
     pass
+
+
+def _validation_message(err: dict) -> str:
+    """A pydantic error's message as the author wrote it.
+
+    Pydantic prefixes every `ValueError` raised in a validator with exactly
+    "Value error, ". That prefix is pydantic's, not the sentence the author
+    wrote, and this string is rendered verbatim in the launch dialog (the route
+    returns it as the 400 body), so strip that one prefix. A message that does
+    not carry it — or one that carries something else — is returned untouched.
+    """
+    return str(err.get("msg", err)).removeprefix("Value error, ")
 
 
 def models_dir() -> Path:
@@ -344,7 +368,7 @@ def spec_fields_from_probe(f: dict) -> dict:
     return {"n_layers": max(1, f["n_layers"]),
             "full_attn_layers": f["full_attn_layers"],
             "kv_heads": f["kv_heads"], "head_dim": f["head_dim"],
-            "native_ctx": max(2048, f["native_ctx"]),
+            "native_ctx": max(MIN_NATIVE_CTX, f["native_ctx"]),
             "params": int(f.get("params", 0) or 0),
             "mtp_layers": int(f.get("mtp_layers", 0) or 0),
             "full_attention_interval":
@@ -1158,13 +1182,16 @@ def set_launch_defaults(slug: str, registry=None, **fields) -> ModelSpec:
     try:
         launch = LaunchDefaults(**current)
     except ValidationError as e:
-        # C10: `batch`/`ubatch` are cross-checked (ubatch > batch is refused by
-        # the engine), so a bad pair is a user error with a user-facing reason —
-        # the same 400 as every other bad launch setting, not a 500. Before the
-        # check existed there was nothing here that could fail validation; now
-        # there is, and the route catches HangarError only.
+        # C10: `batch`/`ubatch` are cross-checked (the SERVER refuses a
+        # `ubatch > batch` pair; the engine would only clamp it), so a bad pair
+        # is a user error with a user-facing reason — the same 400 as every
+        # other bad launch setting, not a 500. Before the check existed there
+        # was nothing here that could fail validation; now there is, and the
+        # route catches HangarError only. Pydantic's own "Value error, " prefix
+        # is stripped: the dialog shows this sentence verbatim, and the prefix
+        # is pydantic's, not the author's.
         raise HangarError("; ".join(
-            str(err.get("msg", err)) for err in e.errors())) from None
+            _validation_message(err) for err in e.errors())) from None
     # Everything cleared means no opinion at all; store None rather than an
     # empty object, so a spec that pins nothing reads as pinning nothing.
     updated = spec.model_copy(update={

@@ -1058,3 +1058,42 @@ def test_list_models_marks_the_running_row_by_file_not_label(home, monkeypatch):
     cards = out["models"] if isinstance(out, dict) else out
     rows = next(c for c in cards if c["slug"] == "s")["quants"]
     assert [r["quant"] for r in rows if r["running"]] == ["Q3_K_L"]
+
+
+# --- N1/C10: the launch dialog must not show pydantic's prefix ---------------
+
+def test_a_validation_message_drops_only_pydantics_prefix():
+    """`set_launch_defaults` turns a ValidationError into the 400 body, which
+    the dialog renders verbatim. Pydantic's own "Value error, " prefix is not
+    part of the sentence the author wrote, so it is stripped; a message that
+    does not carry that exact prefix is untouched, and only ONE is removed."""
+    msg = hangar._validation_message
+    assert msg({"msg": "Value error, ubatch 8192 exceeds batch 4096: nope"}) == \
+        "ubatch 8192 exceeds batch 4096: nope"
+    # a message that legitimately starts with something else: unchanged
+    assert msg({"msg": "batch and ubatch must be 0 (no opinion) or a "
+                       "positive size"}) == \
+        "batch and ubatch must be 0 (no opinion) or a positive size"
+    # only the exact prefix, and only once
+    assert msg({"msg": "Value error, Value error, x"}) == "Value error, x"
+    assert msg({"msg": "value error, x"}) == "value error, x"
+    # an error dict with no "msg" key still yields a string, not a crash
+    assert msg({"type": "value_error"}) == "{'type': 'value_error'}"
+
+
+# --- N3: the 2048 context floor is one named constant at this site -----------
+
+def test_the_native_ctx_floor_is_a_named_constant():
+    """N3: the literal 2048 that floors a probed window lived inline in
+    `spec_fields_from_probe`. Naming it stops THIS site drifting from the 2048
+    launch floor the routes and the dialog also hard-code (unifying those four
+    is a later wave). The value and the behaviour are unchanged."""
+    assert hangar.MIN_NATIVE_CTX == 2048
+    f = {"n_layers": 2, "full_attn_layers": 2, "kv_heads": 2, "head_dim": 64,
+         "native_ctx": 512}
+    assert hangar.spec_fields_from_probe(f)["native_ctx"] == hangar.MIN_NATIVE_CTX
+    # a window above the floor is NOT raised
+    f["native_ctx"] = 32768
+    assert hangar.spec_fields_from_probe(f)["native_ctx"] == 32768
+
+
