@@ -128,6 +128,11 @@ def test_ctx_relaunch_carries_dense_ngl(monkeypatch, tmp_path):
                            disk_free_gb=400.0)
     server_ops.perform_switch("big", reg, prof, ctx=16384)
     assert 0 < launched["ngl"] < 40      # partial offload carried through
+    # DR2-1-res: the placement the launch APPLIED is persisted, and it is the
+    # recomputed partial offload — not the stale ngl=99 the old record kept. The
+    # VRAM axis reads this back to make the plan's prediction device-side.
+    assert st.read_state()["placement"] == {"ngl": launched["ngl"],
+                                            "n_cpu_moe": 0}
 
 
 def test_kv_override_reaches_the_launch_flags(env):

@@ -2684,6 +2684,10 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     # zero. `write_state` reverts unnamed fields to their defaults by design, so
     # the launch path has to name it.
     from . import kvcache as _kvcache
+    # DR2-1-res: record the placement this launch applied (`rp` is the launched
+    # candidate, set just above), so the VRAM axis can rebuild a device-side
+    # prediction instead of assuming "fully resident".
+    from .server_ops import plan_placement as _plan_placement
     st.write_state(rp.model_slug, rp.gguf.quant, port,
                    engine_pid=sp.proc.pid, ui_pid=os.getpid(),
                    backend=rp.backend, use_case=use_case, ctx=rp.flags.ctx,
@@ -2694,7 +2698,8 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                    # a projector this launch left off must stay off: perform_switch
                    # reads no_vision back when the caller has no opinion, and a
                    # ctx change from the UI would otherwise reload it
-                   no_vision=not _wants_vision(reg.models.get(rp.model_slug)))
+                   no_vision=not _wants_vision(reg.models.get(rp.model_slug)),
+                   placement=_plan_placement(rp))
     typer.echo(f"chat UI:  http://127.0.0.1:{port}")
     typer.echo(f"OpenAI:   http://127.0.0.1:{port}/v1")
     typer.echo("stop:     Ctrl+C here, or `rigma stop` from any terminal")

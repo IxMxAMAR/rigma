@@ -103,8 +103,8 @@ def _current_run(log_text: str) -> str:
     return text[starts[-1]:] if starts else text
 
 
-def findings(log_text: str, *, expected_vram_mb: float | None = None
-             ) -> list[dict]:
+def findings(log_text: str, *, expected_vram_mb: float | None = None,
+             expected_placement: dict | None = None) -> list[dict]:
     """Significant one-off engine statements found in a log.
 
     Deduplicated: these fire once per load, and a log spanning several restarts
@@ -129,6 +129,14 @@ def findings(log_text: str, *, expected_vram_mb: float | None = None
     raises a finding, because the engine's actual includes the KV cache and a
     bare file size would read as a divergence that is only the cache. A caller
     that has the running plan can pass it to make that axis comparable.
+
+    `expected_placement` (DR2-1-res) is the plan's recorded device-side
+    placement (`{"ngl", "n_cpu_moe"}`, from `state.json`), and it says that
+    `expected_vram_mb` has ALREADY been scaled to the device side with it. That
+    is what lets a MoE / dense-spill load be judged at all: the whole-file
+    prediction is not comparable to the engine's device buffers, so the axis was
+    suppressed and a real divergence was blind (deep-review-3.md). Pass None
+    when no placement was recorded; the resident check then still applies.
     """
     text = _current_run(log_text)
     out = []
@@ -149,7 +157,8 @@ def findings(log_text: str, *, expected_vram_mb: float | None = None
 
     # A17/S2: the load accounting. Only a real DIVERGENCE is a finding; a
     # healthy load and a "not comparable" one both add nothing.
-    r = compare_plan(parse_load(text), expected_vram_mb)
+    r = compare_plan(parse_load(text), expected_vram_mb, None,
+                     expected_placement=expected_placement)
     if r["known"] and r["diverges"]:
         # Quote the engine's own line, as the pattern findings do — and quote
         # the line that belongs to the axis that actually diverged.
@@ -843,7 +852,8 @@ def _unknown_plan(expected_vram_mb, expected_splits) -> dict:
 
 
 def compare_plan(parsed, expected_vram_mb: float | None = None,
-                 expected_splits: int | None = None) -> dict:
+                 expected_splits: int | None = None, *,
+                 expected_placement: dict | None = None) -> dict:
     """What the engine allocated vs what the plan charged it for.
 
     `actual_vram_mb` sums the DEVICE buffers only:
@@ -877,6 +887,16 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
     "not_device_resident"` and the reason in `detail` — visible, never silent.
     A fully device-resident load is still compared, so a genuinely wrong
     prediction is still caught.
+
+    DR2-1-res: that suppression is honest but blind, and it is now avoidable.
+    When the plan's own placement was recorded (`expected_placement`, the
+    `{"ngl", "n_cpu_moe"}` from state.json) the caller's `expected_vram_mb` has
+    already been scaled to the DEVICE side by `server_ops.planned_vram_mb`, so
+    it is like-with-like with `actual` without consulting the log's residency
+    at all — and a MoE / spilled load is judged again, in both directions. The
+    two inputs travel together: pass `expected_placement` ONLY for a figure
+    that was scaled with it. Pass None for a whole-file figure; the residency
+    gate then still protects it.
 
     `expected_splits` is derived from the load's own plan fields
     (`expected_splits_for_load`: ngl, layer count, expert placement, backend,
@@ -920,17 +940,28 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
     # device; for a dense spill or an expert offload it overstates the device
     # figure by exactly the RAM-resident weights, and comparing the two is
     # unlike with like — a `plan_divergence` on every launch of a healthy,
-    # intended configuration. The plan does not persist its placement (state.json
-    # carries no ngl / n_cpu_moe), so the device-side number is not honestly
-    # recoverable here; the engine's own placement line IS evidence, and the
-    # axis says NOT COMPARABLE — visibly, with the reason — rather than firing.
-    # This only ever SUPPRESSES: a fully device-resident load is still compared.
+    # intended configuration. The engine's own placement line IS evidence, and
+    # the axis says NOT COMPARABLE — visibly, with the reason — rather than
+    # firing. This only ever SUPPRESSES: a fully device-resident load is still
+    # compared.
+    #
+    # DR2-1-res: when the plan's own placement WAS recorded, the caller already
+    # scaled the prediction to the device side with it, so it is comparable
+    # directly — the log's residency no longer has to be consulted, and a MoE /
+    # spilled load gets a verdict again. The plan's record is the authority for
+    # its own plan; the log is the fallback only when there is no record.
     resident = weights_are_device_resident(parsed)
     if not expected_vram_mb or expected_vram_mb <= 0:
         vram_verdict = "not_comparable"
         divergence = None
         pct = None
         vram_why = "no_prediction"
+    elif expected_placement is not None:
+        divergence = actual - expected_vram_mb
+        pct = divergence / expected_vram_mb * 100.0
+        slack = max(_VRAM_SLACK_MB, expected_vram_mb * _VRAM_SLACK_PCT)
+        vram_verdict = "ok" if abs(divergence) <= slack else "diverges"
+        vram_why = None
     elif not resident:
         vram_verdict = "not_comparable"
         divergence = None
@@ -973,6 +1004,12 @@ def compare_plan(parsed, expected_vram_mb: float | None = None,
                        "file size would read as a divergence that is only the "
                        "cache. ")
     else:
+        if expected_placement is not None:
+            detail += ("The plan recorded its device-side placement "
+                       "(ngl=%s, n_cpu_moe=%s), so this prediction is already "
+                       "the plan's DEVICE figure. " % (
+                           expected_placement.get("ngl"),
+                           expected_placement.get("n_cpu_moe")))
         detail += ("The plan's own prediction for the same ctx / cache / slots "
                    "was %.2f MiB; divergence %+.2f MiB (%+.1f%%), %s. " % (
                        expected_vram_mb, divergence, pct,
