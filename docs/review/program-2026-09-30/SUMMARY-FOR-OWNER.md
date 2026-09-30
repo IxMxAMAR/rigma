@@ -5,6 +5,21 @@
 You said you would trust the recommendations, so I implemented the ones that fit in the evening and
 wrote the rest down as accepted-and-scheduled. This is the short version of what changed for you.
 
+**A late review found a real hole, and it is closed.** After you went to sleep, an independent review of
+the backup/restore and file-tool work found that a new chat using the default home workspace could be
+talked into writing a startup script, a `.gitconfig` or a PowerShell profile — a way to make something run
+later — with no permission asked. That is fixed: the file tools now refuse those specific locations
+whatever the chat is allowed to do. The first attempt was rejected by its own checker, which found two ways
+around it (a trailing dot on a folder name, and a network-share spelling of the same path); both are closed
+and re-checked, and no way around it survived. The review's three smaller findings are also fixed: moving a
+file out of your workspace now needs the same permission as writing there; the list of folders a new chat
+may write into can no longer contain your whole home folder or a drive root; and restoring a backup now
+clears the "always allow" trust on any method it rewrites, so a backup from another machine cannot smuggle
+in a trusted method that writes files. The restore card now says exactly what a restore replaces and lists
+which methods it deleted. Two items from the review — an on-disk undo for a restore interrupted by a crash,
+and a lock so a save cannot race a restore — are written down as the first work for the next session, not
+done tonight.
+
 **Restoring a backup now actually restores.** The Backup/Restore card promised that a restore
 "replaces the whole store — anything not in the file is gone". It didn't: it replaced your memories
 but quietly merged settings and methods, so a method you created after the backup survived and an old

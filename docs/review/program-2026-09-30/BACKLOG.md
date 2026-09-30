@@ -378,3 +378,24 @@ rediscover them as mysteries. Ordered by item.
 | **STAT-n2** | `_fuzzy_file`'s internal `x.is_file()` still leaks `[Errno 13] access denied` for a statable directory with a denied child. | `tools.py:1508` | same class, narrower state. |
 | **STAT-n3** | `mission.verify_step` still raises `[Errno 22]` on an unstatable artifact (reachable; the caller at `serve.py:6637` is not in a try). | `mission.py:152` | flagged by the implementer as out of scope. |
 | **STAT-n4** | A directory with a non-image extension now says "no such file" instead of "is not an image". | `tools.py::_resolve_image` | wording only. |
+
+## Wave 20 nits (the OD-2/OD-15 deep-review wave)
+
+**OD2-n5 (wave 19) is now CLOSED at the four named sites** by ODR-6-residual (`_read_path`, `_write_path`,
+the workspace walker, `_resolve_image` all pass `_unlong(p)`); the two remaining callers are ODR1-n4 below.
+
+| id | nit | where | disposition |
+|---|---|---|---|
+| **ODR1-n1** | A redirected/OneDrive `Documents` PowerShell profile is not matched by the persistence denylist (no env var names it; needs `SHGetKnownFolderPath`). Confirmed fail-open. | `tools.py::_persistence_path_reason` | **owner call**; recorded, not fixed. |
+| **ODR1-n2** | A `\\?\`-prefixed trailing-space path misses the matcher in a direct call; unreachable end-to-end because `_write_path`/`_ws_path` unlong before resolving. Smallest fix: `_unlong` after `.resolve()`. | `tools.py::_persistence_path_reason` | fragility, not a hole. |
+| **ODR1-n3** | Only local `X$` admin shares are mapped; a locally-created non-admin share spelling `\\localhost\<share>\…` is unmapped (needs the owner to have made the share). Remote shares deliberately untouched. | `tools.py::_local_unc_to_drive` | accepted. |
+| **ODR1-n4** | `_glob_under` (1618) and `_fuzzy_file` (1511) still pass a `\\?\` path to `_credential_path_reason`; safe today (verified `read_file "**/*.json"` in a 307-char workspace with `RIGMA_HOME=ws/.rigma` returns "matched no files") but fragile. | `tools.py` | follow-up. |
+| **ODR1-n5** | `write_file ".env"` is still allowed while `read_file ".env"` refuses — a separate pre-existing capability gap, not the persistence denylist. | `tools.py` | recorded. |
+| **ODR1-n6** | `%LOCALAPPDATA%\Microsoft\Windows` and `~/.git/hooks` are deliberately allowed. | `tools.py` | accepted. |
+| **ODR3-n1** | Sample-mode moves whose sample folder is outside the workspace now also need the write grant/allowlist (intended tightening; no pre-existing test covered it). | `tools.py::_move_source_parent_gate` | intended. |
+| **ODR5-n1** | Macro-trust read-modify-write is non-atomic (inherited from `trust()`); a forced interleave lost one clear. Safe direction only. | `macros.py` | recorded. |
+| **ODR7-n1** | `deleted` is the pre-snapshot resolved set, so a hand-named/already-gone id is over-reported (`foo.json` id `bar` survives, response says deleted `['bar']`). Smallest fix: append from `delete_user`'s truthy returns. | `serve.py::_apply_restore` | safe direction. |
+| **ODR7FE-n1** | `SettingsSurface.tsx:80` and `lib/backup.test.ts:5` still contain the stale "whole store" wording in comments (not rendered). | frontend | cosmetic. |
+| **ODR7FE-n2** | `deletedLine` uses `String(x)`, so a malformed id array renders `[object Object]` / a blank id rather than "did not report"; duplicates are not deduped. | `lib/backup.ts` | cosmetic; the server sends strings. |
+| **ODR6-n1** | `encode_image_data_uri`'s raw-bytes fallback still base64s a non-image file with an image name (content-type nit, not a denylist bypass). | `tools.py` | recorded. |
+| **ODR-HK** | Owner housekeeping: a verifier's scratch file `C:\nonexistent-odr1\a.txt` could not be deleted (the guard blocks deletes outside the workspace). | host | needs the owner. |

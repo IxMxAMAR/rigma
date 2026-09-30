@@ -1,5 +1,31 @@
 # HANDOFF — Rigma improvement program, 2026-09-30
 
+> ## READ FIRST — Wave 20 closed the OD-2/OD-15 deep-review findings (2026-09-30 21:45–23:xx UTC)
+>
+> **ODR-1 (HIGH, security) IS MERGED** (`2d58d55`+`562b20f`, merged `7ec8712`): a persistence-location write
+> denylist now refuses `write_file` / `edit_file` / relative `copy_files` / `move_files` into the Startup
+> folder, Start Menu, `%APPDATA%\Microsoft\Windows`, PowerShell profile dirs, `.gitconfig`, `System32\Tasks`
+> on the DEFAULT home workspace, with no grant. ODR-3, ODR-6, ODR-2, ODR-5 and ODR-7 (backend + card) are
+> merged too — see `STATUS.md`'s Wave 20. **OD-2 therefore does close the persistence primitive for the
+> locations the denylist names**; a redirected/OneDrive `Documents` PowerShell profile is still open (owner
+> call, needs `SHGetKnownFolderPath`). The ODR-1 verifier **FAILED** the first attempt (trailing dot/space;
+> UNC admin share); both were closed in `562b20f` and re-verified.
+>
+> **NEXT SESSION'S FIRST WORK — not merged tonight, in this order:**
+> 1. **ODR-4 (MED)** — on-disk restore undo replayed at startup + atomic `save_user` (`serve.py:1818-1830`,
+>    `methods.py:604`). The undo log is in memory only; a kill between the stale-method deletes and memory's
+>    `os.replace` leaves a mixed store. Not started tonight.
+> 2. **ODR-8 (LOW)** — one module lock for method/settings writers, held by the restore (`serve.py:1777-1845`).
+> 3. **ODR-9 (LOW)** — `asyncio.to_thread(sessions.create)` (`serve.py:2116`).
+> 4. **ODR-1 residuals** — OneDrive/redirected `Documents` PowerShell profile (needs `SHGetKnownFolderPath`);
+>    `_glob_under`/`_fuzzy_file` still pass a `\\?\` path to the credential rule (safe today, fragile);
+>    `write_file ".env"` is still allowed while `read_file ".env"` refuses.
+> 5. **REC-1** — re-test the intermittent full-suite stall (see `STATUS.md`).
+> 6. Owner housekeeping — remove `C:\nonexistent-odr1\a.txt`, a verifier's scratch file the guard would not
+>    let the session delete.
+>
+> Full details, verdicts and evidence: `STATUS.md` Wave 20 and `.scratch/orchestrator/verify-odr*.md`.
+
 **Read this first if you are a new session with a different model.** It is written to be
 self-sufficient: it names the commands, the paths, the rules and the state, and it does not assume
 you share any context with the session that wrote it.

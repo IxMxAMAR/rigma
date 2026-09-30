@@ -1,11 +1,5 @@
 # STATUS — Rigma improvement program, 2026-09-30
 
-> **ORCHESTRATOR NOTE (21:35 UTC).** Time-box the 0xC0000005 investigation to 15 minutes (GUIDANCE 13) and start the ODR-1 security fix NOW in parallel (GUIDANCE 11). Delete this note once both are under way.
-
-
-> **ORCHESTRATOR NOTE (21:15 UTC) - SECURITY.** An independent deep review of OD-2/OD-15 found a HIGH: with the default home workspace the write tools can create persistence files (Startup folder, .gitconfig, PowerShell profile) with no grant. Read GUIDANCE.md entries 11-12 and `.scratch/orchestrator/deep-review-od.md` before the next wave; delete this note once they are scheduled.
-
-
 > **ORCHESTRATOR NOTE (14:50 UTC) — GUIDANCE 6/7 actioned; a SECOND deep review is in
 > `.scratch/orchestrator/deep-review-2.md`.** GUIDANCE 6's nine findings (DR1–DR9) are all fixed and merged
 > (DR1/DR3/DR8 `ed52928`, DR2/DR4/DR5/DR6 `c4d3541`, DR7 `a903474`). The second review, over the diff since
@@ -69,6 +63,38 @@ Integration branch head: `f6a0874` (plus the docs commits that follow it).
 > `854bcaf→6c83ab5`, `f6f84a3→1e23169`, `84cf575→962c00e`, `9617529→9f2011d`, `277f945→b040751`,
 > `b4895fb→f8dc5b8`, `8e412f6→ca83bc0`, `091cff1→698f45f`, `be80260→17ade5c`.
 > `0ab5e3a` (A2) and `97b804c` (A3) were already correct and kept their hashes.
+
+## Wave 20 — the OD-2/OD-15 deep-review findings closed (2026-09-30, ~21:48–23:xx UTC)
+
+A new Head Agent took over at 21:45 UTC after the previous session ended without actioning GUIDANCE 11–13.
+Subagent capacity was CONFIRMED (a throwaway call returned `SPAWN-OK`); this tool instance refuses explicit
+`provider`/`model` params, so plain calls inherit DeepSeek-V4.1-Flash. Three implementer worktrees
+(`.scratch/wt-odr1`, `wt-odr36`, `wt-odr257`) plus one frontend agent in the MAIN tree. Every item got an
+independent verifier; **the ODR-1 verifier FAILED the first implementation**, and the fix was re-verified.
+One merge conflict (odr1 vs odr36, a duplicated comment above `_resolve_image`'s `_credential_path_reason`
+call) was resolved by merging the two comments; the merged tree was AST-parsed and targeted-tested before
+the merge commit.
+
+| id | commit | outcome |
+|---|---|---|
+| ODR-1 (HIGH, security) | `2d58d55`+`562b20f` (merged `7ec8712`) | A **persistence-location write denylist** (`_persistence_path_reason`) on `_write_path` and every write caller of `_ws_path` (`write_file`, `edit_file`, `undo_last_change`); reads untouched; the `allow_absolute_writes` grant and `write_allowlist` cannot reach a persistence dir. Tested with the **product-default home workspace** (32 cases, monkeypatched env — the real Startup is never touched). **The first verifier FAILED it:** (FAIL-1, HIGH) Windows strips trailing dots/spaces but `resolve()` canonicalises them only for components that already exist, so `.gitconfig.` / `Documents/PowerShell./…` / `System32\Tasks.` escaped the lexical shape match; (FAIL-2, MED) `\\localhost\c$\…\Startup` and `\\?\UNC\…` escaped the drive-letter anchors with the grant. `562b20f` adds `_strip_trailing_dots` (per-component, Windows-only) and `_local_unc_to_drive` (local admin shares; remote shares deliberately untouched). Re-verified **PASS-WITH-NITS**: 52 passed, base 46 failed/6 passed, **no reachable bypass survives** (trailing dot+`..`, 8.3+dot, mixed separators, `.`/`..`, existing-file rewrite, `COMPUTERNAME`/`127.0.0.1` UNC variants all refused). Residual (owner call): a redirected/OneDrive `Documents` PowerShell profile is not matched — needs `SHGetKnownFolderPath`. |
+| ODR-3 (MED) | `2ff154e` (merged `ce4a6d3`) | `move_files` gates the **SOURCE's parent** through `_write_path` (`_move_source_parent_gate`), so removing an out-of-workspace file needs the same write grant/allowlist as writing there; `copy_files` unchanged. Verifier: read-grant-only outside move refused with the original intact; both grant routes allow; `..`, junction, 8.3 and case handled; a spy shows the destination is checked once and the source parent once (one rule, no duplicate). Sample-mode tightening confirmed real and previously uncovered. |
+| ODR-6 (LOW) | `3ba6568` (merged `ce4a6d3`) | `_resolve_image` resolves before the credential/state-dir/browser denylist and passes `_unlong(p)`, so `x/../<state-dir>/secret/x.png` and `Google\x\..\Chrome\Default\Cookies.png` are refused while a normal image still loads. The author's "UNVERIFIED" ≥260-char hardening was verified. |
+| ODR-2 (MED) | `1527961`+`8eb9ba1` (merged `1c7bf42`) | `default_write_allowlist` checks `is_absolute` **before** `resolve` (the old order was dead) and floors the seed against filesystem roots, the home dir and its ancestors, `%APPDATA%` and its ancestors, and persistence dirs. The verifier found and closed a `\\?\`/`\\.\`/UNC alias escape and the `%APPDATA%`-unset fallback (`8eb9ba1`); 38-case battery, no regression, `Documents` stays blocked on purpose. |
+| ODR-5 | `caa1c32` (merged `1c7bf42`) | `macros.forget_method()` + `_apply_restore` clears macro trust for every method id a restore **writes or deletes**, before the first write; untouched ids keep trust; a mid-restore failure leaves trust cleared for touched ids (safe direction, documented). Prefix safety proven; uses the existing trust machinery. |
+| ODR-7 backend | `55d1f32` (merged `1c7bf42`) | `_apply_restore` returns `(before, after, stale_ids)`; `/api/restore` adds an additive top-level `deleted: [ids]`; existing fields unchanged. Nit (safe direction): a hand-named/already-gone id is over-reported. |
+| ODR-7 frontend | `06a636e` (direct on the integration branch) | The card says "restoring replaces the memory, settings and methods; chats and documents are kept"; every "whole store"/"anything not in the file is gone" rendered claim is gone; the deleted ids are rendered (ids+count / "nothing was deleted" / "the server did not report…" for absent or malformed — never a fabricated `0`). Rebuilt `ui_v2` in the same commit. Verifier **PASS-WITH-NITS**: 17 tests, tsc clean; nits are two stale comments and `String()` coercion of malformed ids. |
+
+**Not merged tonight** (first work next session): **ODR-4** (on-disk restore undo replayed at startup +
+atomic `save_user`), **ODR-8** (one lock for method/settings writers held by the restore), **ODR-9**
+(`asyncio.to_thread(sessions.create)`). They were not started — the security fixes and their verification
+used the available clock. Their file:line, scenario and smallest fix are in `.scratch/orchestrator/deep-review-od.md`.
+
+Nits carried to `BACKLOG.md`: the ODR-1 OneDrive PowerShell-profile gap; `_glob_under`/`_fuzzy_file` still
+pass a `\\?\` path to the credential rule (safe today, fragile); `write_file ".env"` is still allowed while
+`read_file ".env"` refuses; the ODR-5 trust read-modify-write is non-atomic (safe direction); the ODR-7
+`deleted` over-report. Owner housekeeping: a verifier's scratch file `C:\nonexistent-odr1\a.txt` could not
+be deleted (the guard blocks deletes outside the workspace) and needs the owner.
 
 ## Wave 19 — the owner's decisions implemented (2026-09-30, ~20:30–21:30 UTC)
 
