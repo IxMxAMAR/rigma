@@ -7,6 +7,7 @@ always win collisions; installs refuse duplicates up front.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -17,6 +18,8 @@ from .atomicio import atomic_write_json, atomic_write_text
 from .gguf_meta import GgufParseError, inspect_gguf
 from .models import GgufFile, ModelSpec, MoESpec
 from .runtime import rigma_home
+
+_log = logging.getLogger(__name__)
 
 VALID_CAPS = ("tools", "vision", "thinking", "mtp")
 
@@ -936,7 +939,15 @@ def list_models(registry=None, profile=None, *, kv: str = "",
                 fits = quant_verdicts(spec, profile, kv=kv, vision=vision,
                                       grow=grow)
             except Exception:
-                pass         # a fit we can't compute must not blank the page
+                # AUDIT 06R3-7: this was `pass`. A broken fit then produced the
+                # SAME empty fit dict as "no profile was passed", so a KeyError
+                # in the arithmetic was invisible on the page and unlogged. The
+                # exception is now recorded, and every row carries an explicit
+                # failure verdict: the "no" shape a quant that does not fit gets,
+                # plus `error`, which is what tells the two apart.
+                _log.exception("fit verdicts failed for %s", slug)
+                fits = [{"ok": False, "speed": "no", "offload_pct": 100,
+                         "error": "fit failed"} for _ in spec.ggufs]
         from .quant_quality import (label_overstates, measured_bpw, quality_of,
                                     total_loss)
         quants = []

@@ -1,4 +1,5 @@
 """Hangar: GGUF header parsing for custom-model import."""
+import io
 import struct
 
 import pytest
@@ -195,6 +196,32 @@ def test_not_a_gguf_raises(tmp_path):
         read_metadata(p)
 
 
+# --- 06R3-8: the version check was a floor only ------------------------------
+
+def _gguf_version(version: int, kvs=()) -> bytes:
+    return (b"GGUF" + struct.pack("<I", version) + struct.pack("<Q", 0)
+            + struct.pack("<Q", len(kvs)) + b"".join(kvs))
+
+
+def test_the_versions_this_reader_implements_are_accepted():
+    """v2 and v3 share the layout this reader parses; both must still load."""
+    for version in (2, 3):
+        info = inspect_gguf(io.BytesIO(_gguf_version(version, DENSE)))
+        assert info.spec_fields["n_layers"] == 8
+
+
+@pytest.mark.parametrize("version", [0, 1, 4, 5, 100, 2**32 - 1])
+def test_an_unknown_gguf_version_is_refused_by_name(version):
+    """06R3-8: `if version < 2` accepted EVERY later version, so a v4+ header was
+    parsed as if it were v2/v3 and every field was silently wrong. The layouts
+    this module implements are exactly v2 and v3 — both pinned engines define
+    GGUF_VERSION 3 (mainline b9867 ggml/include/gguf.h and
+    gguf-py/gguf/constants.py; PrismML 87268f77 likewise), so v4 is not a newer
+    file this reader understands. Refuse it and say which version it was."""
+    with pytest.raises(GgufParseError, match=rf"version {version}"):
+        read_metadata(io.BytesIO(_gguf_version(version, DENSE)))
+
+
 def test_corrupt_string_length_raises_instead_of_hanging(tmp_path):
     bad = (b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
            + struct.pack("<Q", 1)
@@ -336,6 +363,30 @@ def test_parameter_and_expert_counts_come_from_tensor_dims(tmp_path):
     info = inspect_gguf(_write(tmp_path, _MTP_KVS, tensors=tensors))
     assert info.spec_fields["params"] == 500
     assert info.spec_fields["expert_params"] == 400
+
+
+# --- 06R3-9: a tensor dimension that overflows is not a plausible count ------
+
+def test_an_overflowing_tensor_dimension_is_refused_not_multiplied(tmp_path):
+    """06R3-9: rank 8 with every dim 2**64-1 multiplied out to a 3.4e153-element
+    count. Python has no overflow, so the number survived every downstream
+    ratio — `moe_from_probe` kept a plausible-looking expert share and
+    `measured_bpw` reported a -100% drift as a real finding. A file with more
+    than _MAX_PARAMS elements is corrupt, and the parse must say so."""
+    tensors = [_tensor(b"blk.0.attn_q.weight", [2**64 - 1] * 8)]
+    with pytest.raises(GgufParseError, match="implausible tensor size"):
+        inspect_gguf(_write(tmp_path, DENSE, tensors=tensors))
+
+
+def test_a_large_but_real_tensor_table_still_counts(tmp_path):
+    """The bound must not clip a real file: a 67M-element projection and a
+    134M-element expert stack are ordinary."""
+    tensors = [
+        _tensor(b"blk.0.attn_q.weight", [8192, 8192]),
+        _tensor(b"blk.0.ffn_down_exps.weight", [4096, 4096, 8]),
+    ]
+    info = inspect_gguf(_write(tmp_path, DENSE, tensors=tensors))
+    assert info.spec_fields["params"] == 8192 * 8192 + 4096 * 4096 * 8
 
 
 # --- an absent chat template is not a finding about the model ----------------
