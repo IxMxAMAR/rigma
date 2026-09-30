@@ -3357,7 +3357,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # deltas from every round, never reset, so the stored partial matches
         # the screen.
         _ckpt = {"id": f"ck{time.time_ns()}", "at": time.monotonic(),
-                 "live": "", "saved": False, "final": False}
+                 "live": "", "saved": False, "final": False, "unsaved": False}
 
         def _partial_message() -> dict:
             m = {"role": "assistant",
@@ -3366,9 +3366,18 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                  # UI-only, like every other notice: both transcripts already
                  # render this field, so a recovered reply says what it is
                  # without either frontend changing.
-                 "notice": "_(this reply was interrupted — the text above is "
-                           "what had been generated. Say **continue** to "
-                           "resume it.)_"}
+                 #
+                 # DR3: a turn whose FINISHED reply could not be saved is not an
+                 # interrupted reply — every word is there, and telling the user
+                 # to "say continue" invites them to append to a complete
+                 # answer. The two cases get different words.
+                 "notice": (
+                     "_(this reply could not be saved as a finished turn — the "
+                     "session kept changing underneath it. The text above is "
+                     "what was generated; copy anything you need.)_"
+                     if _ckpt["unsaved"] else
+                     "_(this reply was interrupted — the text above is what had "
+                     "been generated. Say **continue** to resume it.)_")}
             if thinking:
                 m["thinking"] = thinking
             if trace:
@@ -4192,24 +4201,47 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     _log.error("session %s: could not save the finished turn "
                                "after 3 attempts: %s", s.get("id"), last_err)
                     _ckpt["final"] = False
+                    # DR3: the reply FINISHED; only its final store write lost.
+                    # The checkpoint below is a partial, so without this it would
+                    # carry the "interrupted — say continue" notice for a
+                    # complete answer.
+                    _ckpt["unsaved"] = True
                     yield _sse({"note": (
                         "_(This reply could not be saved as a finished turn — "
                         "the session kept changing underneath it. What you see "
                         "may not survive a reload; copy anything you need.)_")},
                         event="notice")
-                    await _checkpoint_threaded(force=True)
+                    # DR3: ONE forced attempt used to be the whole fallback, and
+                    # `_write_checkpoint` returns silently on `StaleWriteError`
+                    # — the same contention that just beat three CAS attempts
+                    # beats one more, so a short reply was stored nowhere at all.
+                    # Three attempts, stopping the moment the words are on disk.
+                    for _ in range(3):
+                        await _checkpoint_threaded(force=True)
+                        if _ckpt["saved"]:
+                            break
                 else:
                     _ckpt["saved"], _ckpt["final"] = False, True
-                # Rebuilt AFTER the save so it includes the reply that was just
-                # generated — that is what the slot actually holds now.
-                try:
-                    # AUDIT F13: threaded — see the warm call at the top of the turn
-                    await asyncio.to_thread(
-                        _prefix_snapshot,
-                        sessions.build_messages(s, _default_prompt(), preset),
-                        str(s.get("id") or ""))
-                except Exception:
-                    pass
+                # DR3: everything below assumes `s` IS the store. When the
+                # finished turn could not be saved, `s` is the pre-turn snapshot
+                # plus this turn and the store has moved on — the concurrent
+                # writer whose saves beat the three CAS attempts is exactly the
+                # difference. Auto-compact reads `s` and WRITES from it
+                # (`stored[snapshot_n:]` sliced against an in-memory length that
+                # counts this turn's unsaved reply), which dropped those
+                # messages; the title and prefix writes are the same shape. A
+                # turn that could not be saved does no housekeeping.
+                if saved:
+                    # Rebuilt AFTER the save so it includes the reply that was just
+                    # generated — that is what the slot actually holds now.
+                    try:
+                        # AUDIT F13: threaded — see the warm call at the top
+                        await asyncio.to_thread(
+                            _prefix_snapshot,
+                            sessions.build_messages(s, _default_prompt(), preset),
+                            str(s.get("id") or ""))
+                    except Exception:
+                        pass
                 _bump_stats(timings)
                 # Auto-title once the conversation has a shape (owner request
                 # 2026-07-21: the rail was "Sup bro", "Hello", and three identical
@@ -4217,7 +4249,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # a title the USER typed via rename is never overwritten, and
                 # failure changes nothing — the truncation stays.
                 try:
-                    if (len(s.get("messages", [])) >= 4
+                    if (saved
+                            and len(s.get("messages", [])) >= 4
                             and s.get("title_source") not in ("user", "auto")
                             and not s.get("run_id")):
                         convo = []
@@ -4259,10 +4292,14 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 except Exception:
                     pass          # titling is never load-bearing
                 # auto-compact when the window is nearly full, so the NEXT turn
-                # starts small (reactive; uses the engine's real prompt_tokens)
+                # starts small (reactive; uses the engine's real prompt_tokens).
+                # DR3: skipped entirely when this turn could not be saved — the
+                # fold slices the STORE with a length taken from `s`, and `s`
+                # counts this turn's unsaved reply, so it dropped the concurrent
+                # writer's messages. The next saved turn re-checks and folds.
                 ptoks = usage.get("prompt_tokens") or 0
                 wctx = compact_budget(s, (st.read_state() or {}).get("ctx", 0))
-                if (s.get("auto_compact", True) and ptoks and wctx
+                if (saved and s.get("auto_compact", True) and ptoks and wctx
                         and ptoks >= AUTO_COMPACT_FRACTION * wctx
                         and len(s.get("messages", [])) > AUTO_COMPACT_KEEP):
                     try:

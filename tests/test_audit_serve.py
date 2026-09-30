@@ -581,6 +581,143 @@ def test_a_turn_that_cannot_be_saved_is_not_reported_as_saved(
     assert kept and kept[0]["content"] == "the whole reply"
 
 
+def test_an_unsaved_turn_must_not_compact_over_a_concurrent_writer(
+        home, engine):
+    """DR3 (A1): the `not saved` branch fell through into post-save housekeeping
+    that assumes `s` IS the store. `s.update(out)` never ran, so `s["messages"]`
+    is the pre-turn snapshot plus this turn — and the concurrent writer whose
+    saves beat the three CAS attempts is exactly the difference. `_compact`
+    slices `stored[snapshot_n:]` against that in-memory length, so the writer's
+    messages are dropped from the store, and `_mfresh["messages"] = masked` in
+    the run path writes the stale list over them outright.
+
+    The owner's need: a second writer's messages must SURVIVE a turn that could
+    not be saved. Staleness is real here (a genuine concurrent write, not a fake
+    rev on a 2-message chat) and the auto-compact threshold is genuinely
+    crossed, so the compaction path is reached with a stale `s`."""
+    _running(ctx=4096)          # low bar: prompt_tokens 9000 crosses 0.92 * ctx
+    Engine.script = [[
+        {"choices": [{"delta": {"content": "the whole reply"}}]},
+        {"choices": [{"delta": {}}], "usage": {"prompt_tokens": 9000}},
+    ]]
+    c = _client(engine.port)
+
+    def _one_turn(*, lose_the_race):
+        sid = _seed(c, 20)                      # > AUTO_COMPACT_KEEP
+        marker = f"CONCURRENT-{sid}"
+        written = {"n": 0}
+        real = sessions.reload_and_extend
+
+        def _writer_lands_then_merge(*a, **kw):
+            # a second writer lands while this turn holds its snapshot — the
+            # write that beats the CAS attempts below
+            if not written["n"]:
+                written["n"] += 1
+                s2 = sessions.load(sid)
+                s2["messages"].append({"role": "user", "content": marker})
+                sessions.save(s2)
+            m = real(*a, **kw)
+            if lose_the_race and m is not None:
+                m[sessions.REV_KEY] = -1        # every save() now loses the CAS
+            return m
+
+        sessions.reload_and_extend = _writer_lands_then_merge
+        try:
+            r = c.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+        finally:
+            sessions.reload_and_extend = real
+        return sid, marker, written, r
+
+    # Control first: with the save winning, this exact setup DOES fold (the
+    # archive grows), so the finding below cannot pass vacuously by never
+    # reaching compaction.
+    sid, marker, written, _r = _one_turn(lose_the_race=False)
+    assert written["n"] == 1, "the concurrent writer never ran"
+    assert sessions.load(sid).get("archive"), (
+        "the control turn never reached auto-compact — this test would be "
+        "vacuous")
+    assert any(m.get("content") == marker
+               for m in sessions.load(sid)["messages"]), (
+        "the fold dropped the concurrent writer's message even on the SUCCESS "
+        "path — the setup is not measuring what it claims to")
+
+    # The finding: every persist attempt loses, so the stale `s` must not be
+    # used for housekeeping.
+    sid2, marker2, written2, r2 = _one_turn(lose_the_race=True)
+    assert written2["n"] == 1, "the concurrent writer never ran"
+    assert "could not be saved" in r2.text, r2.text
+    msgs = sessions.load(sid2)["messages"]
+    assert any(m.get("content") == marker2 for m in msgs), (
+        "auto-compact ran off the stale `s` and erased the concurrent writer's "
+        f"message: {[m.get('content') for m in msgs]}")
+    # …and the reply the user was told was NOT saved is held as a partial, not
+    # stored as a finished turn
+    assert not [m for m in msgs
+                if m.get("role") == "assistant" and not m.get("partial")]
+    kept = [m for m in msgs if m.get("partial")]
+    assert kept and kept[0]["content"] == "the whole reply"
+    # …and its notice tells the truth: the reply FINISHED, it just could not be
+    # stored — "say continue" would append to a complete answer
+    assert "could not be saved" in kept[0]["notice"], kept[0]["notice"]
+    assert "interrupted" not in kept[0]["notice"], kept[0]["notice"]
+
+
+def test_the_unsaved_reply_is_held_when_the_first_checkpoint_loses(
+        home, engine):
+    """DR3 secondary: the fallback was ONE forced checkpoint, and
+    `_write_checkpoint` returns silently on `StaleWriteError` — the same
+    contention that just beat three CAS attempts. A competing write landing in
+    its load/save window therefore stored the finished reply NOWHERE, and for a
+    reply shorter than CHECKPOINT_SECS the periodic checkpoint had never stored
+    it either. The owner's need: the words are held, so a lost final save is
+    recoverable instead of silent."""
+    _running(ctx=131072)
+    Engine.script = [_say("the whole reply")]
+    c = _client(engine.port)
+    sid = _seed(c, 2)
+
+    real_extend, real_load = sessions.reload_and_extend, sessions.load
+    armed = {"on": False, "bumped": False}
+    calls = {"n": 0}
+
+    def _load_then_competing_write(sid_):
+        row = real_load(sid_)
+        if armed["on"] and not armed["bumped"]:
+            # a competing writer lands between this load and the caller's save
+            armed["bumped"] = True
+            other = real_load(sid_)
+            other["messages"].append({"role": "user", "content": "RACE"})
+            sessions.save(other)
+        return row
+
+    def _arm_after_the_last_cas_attempt(*a, **kw):
+        m = real_extend(*a, **kw)
+        calls["n"] += 1
+        if m is not None:
+            m[sessions.REV_KEY] = -1        # every save() loses the CAS
+            if calls["n"] >= 3:
+                armed["on"] = True          # the next load is the checkpoint's
+        return m
+
+    sessions.reload_and_extend = _arm_after_the_last_cas_attempt
+    sessions.load = _load_then_competing_write
+    try:
+        r = c.post(f"/api/sessions/{sid}/chat", json={"message": "hi"})
+    finally:
+        sessions.reload_and_extend = real_extend
+        sessions.load = real_load
+
+    assert "could not be saved" in r.text, r.text
+    assert armed["bumped"], "the competing write never landed — re-point this test"
+    msgs = sessions.load(sid)["messages"]
+    assert any(m.get("content") == "RACE" for m in msgs), (
+        "the competing writer's message was lost")
+    kept = [m for m in msgs if m.get("partial")]
+    assert kept and kept[0]["content"] == "the whole reply", (
+        "the finished reply was stored nowhere: the one forced checkpoint lost "
+        f"the CAS and nothing retried it: {[m.get('content') for m in msgs]}")
+
+
 def test_a_partial_never_reaches_the_model(home, engine):
     """`partial` and `ckpt_id` are bookkeeping; build_messages must strip them
     exactly as it strips notices and stats."""
