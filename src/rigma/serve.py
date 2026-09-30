@@ -24,6 +24,7 @@ from starlette.background import BackgroundTask
 from . import context
 from . import harness as _harness
 from .atomicio import atomic_write_bytes, atomic_write_json
+from .models import MIN_LAUNCH_CTX
 from . import methods_api
 from . import mission as _mission_mod
 from . import presets
@@ -4835,9 +4836,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             want = int(body.get("ctx", 0))
         except (TypeError, ValueError):
             want = 0
-        if want < 2048:
-            return JSONResponse({"error": "ctx must be at least 2048"},
-                                status_code=400)
+        if want < MIN_LAUNCH_CTX:
+            return JSONResponse(
+                {"error": f"ctx must be at least {MIN_LAUNCH_CTX}"},
+                status_code=400)
         s = st.read_state()
         if s is None:
             return JSONResponse({"error": "not running"}, status_code=404)
