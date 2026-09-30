@@ -514,6 +514,12 @@ PREFILL_SECS = 420.0    # first-token CEILING (not a delay): prefill on a big co
                         # the engine is genuinely dead; a normal turn starts instantly
 TICK_SECS = 5.0         # how often a waiting turn reports "still working" to the UI
 KEEPALIVE_POLL_SECS = 30.0   # how often idle auto-unload looks at the clock
+# B4: how long the ACP reader thread waits for the user to answer an elicitation
+# (`ask_user`) before declining. SHORTER than the permission wait on purpose —
+# NO CLIENT RENDERS ELICITATION YET, so a long wait would hang the turn for the
+# full permission timeout before the same decline. Raise this toward
+# `_APPROVAL_WAIT_SECS` when the UI ships the question card. See OD-8.
+QUESTION_WAIT_SECS = 5.0
 LIVE_MAX = 80           # rolling live-activity entries kept on a run for the UI
 LIVE_TEXT_MAX = 1200    # per streamed-text entry; the tail is kept and marked
 LIVE_RESULT_MAX = 900   # per tool-result entry in the feed (display only)
@@ -1399,7 +1405,7 @@ def _restore_snapshot(path, data: bytes | None) -> None:
     """Put `data` back at `path`, or remove a file that was not there.
 
     `atomic_write_bytes`, not `atomic_write_text`: the bytes must come back
-    EXACTLY as they were (see that helper on the CRLF trap)."""
+    EXACTLY as they were (see that helper on the line-ending trap)."""
     if data is None:
         try:
             path.unlink()
@@ -1412,12 +1418,19 @@ def _restore_snapshot(path, data: bytes | None) -> None:
 def _rollback_stores(prior: list) -> list[str]:
     """Replay an undo log. Returns the labels whose write-back itself failed —
     the rollback is best-effort, because the same full disk that failed the
-    restore can fail the restore OF the old bytes."""
+    restore can fail the restore OF the old bytes.
+
+    A11 nit: the catch is `Exception`, not `OSError`. A write-back can fail with
+    something that is not an OSError — a validation error, a TypeError from a
+    malformed snapshot — and catching only OSError let that escape and SKIP every
+    remaining file, turning one bad write-back into a half-applied store. The
+    remaining files are attempted either way; the failure is reported, not raised.
+    """
     failed: list[str] = []
     for label, path, data in reversed(prior):
         try:
             _restore_snapshot(path, data)
-        except OSError:
+        except Exception:
             failed.append(label)
     return failed
 
@@ -2172,7 +2185,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             """
             tool_call = params.get("toolCall") or {}
             request_id = str(tool_call.get("toolCallId") or "")
-            slot = {"requestId": request_id, "allow": None,
+            slot = {"requestId": request_id, "allow": None, "kind": "permission",
                     "event": threading.Event()}
             _approvals[sid] = slot
             # The UI is told through the SAME `approval/asked` channel DSH uses, so
@@ -2195,6 +2208,53 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 return None
             return slot["allow"]
 
+        def _answer_question(method: str, params: dict):
+            """Ask the USER a question, and block this thread until they answer.
+
+            B4. mcode's `ask_user` arrives as an ACP `elicitation/create` request.
+            `_pump` passed `on_permission` only, so `drive_turn_acp` answered every
+            elicitation with `decline` and the agent silently took its
+            non-interactive fallback — nobody was ever shown the question.
+
+            This is the SAME handshake as `_answer_permission`: one `_approvals`
+            slot per session, the same `approval/asked` event, the same
+            `/api/sessions/{sid}/approval` route. A second mechanism would be a
+            second thing to keep in step, and the UI already reads this channel.
+
+            Returns the answer object, or None when nobody answered — which
+            `drive_turn_acp` reports as `answer_elicitation(accepted=False)`, a
+            REAL decline mcode can fall back from, not a request left waiting.
+            """
+            # ACP carries no id for an elicitation (unlike a permission's
+            # toolCallId), so one is minted here: the route refuses an answer whose
+            # id does not match the pending request, and a stale card must not
+            # decide a later question.
+            request_id = "q-" + os.urandom(4).hex()
+            slot = {"requestId": request_id, "answer": None, "kind": "question",
+                    "event": threading.Event()}
+            _approvals[sid] = slot
+            # Same `approval/asked` channel as a permission ask. `kind` is what lets
+            # the UI draw a question form rather than an allow/deny card; the message
+            # and the requested schema are the question.
+            loop.call_soon_threadsafe(q.put_nowait, _harness.TurnEvent(
+                "state", event="approval/asked", data={
+                    "id": request_id,
+                    "kind": "question",
+                    "question": str(params.get("message") or ""),
+                    "schema": params.get("requestedSchema") or {},
+                    "reason": "mcode is asking a question; this turn is waiting "
+                              "for your answer",
+                    "awaiting": True,
+                }))
+            try:
+                answered = slot["event"].wait(QUESTION_WAIT_SECS)
+            finally:
+                # Cleared even on the timeout path, exactly like a permission slot.
+                _approvals.pop(sid, None)
+            if not answered:
+                return None
+            return slot["answer"]
+
         def _pump() -> None:
             """Drain the adapter on a worker thread. It never raises: a driver
             failure comes back as an error event, so the turn still ends."""
@@ -2211,7 +2271,8 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         context_window=int(state.get("ctx") or 0) or 32768,
                         state=hstate, cancel=cancel,
                         permission=str(s.get("permission") or "full"),
-                        on_permission=_answer_permission)
+                        on_permission=_answer_permission,
+                        on_question=_answer_question)
                 else:
                     _events = adapter.drive_turn(
                         base_url=_harness.endpoint_for(
@@ -5089,9 +5150,24 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         `allow` is the decision. Anything that is not a true boolean is refused: a
         string "false" is truthy in Python, and granting permission from a typo is the
         one failure here that cannot be taken back.
+
+        B4: `answer` is the same round-trip for an elicitation (`ask_user`). It is an
+        object, not a boolean, so it is validated as one, and the slot's `kind` keeps
+        the two from being answered through each other's card.
         """
         allow = body.get("allow")
-        if not isinstance(allow, bool):
+        answer = body.get("answer")
+        # B4: this is now the ONE decision route, because a question and a
+        # permission are the same round-trip on the same channel. `answer` is an
+        # elicitation's content object; `allow` is a permission's boolean. Exactly
+        # one of them must be present and well-typed — a truthy non-boolean must
+        # never grant permission, and a non-object answer must never be accepted
+        # as one.
+        if answer is not None:
+            if not isinstance(answer, dict):
+                return JSONResponse(
+                    {"error": "answer: must be an object"}, status_code=400)
+        elif not isinstance(allow, bool):
             return JSONResponse(
                 {"error": "allow: must be true or false"}, status_code=400)
         request_id = str(body.get("requestId") or "")
@@ -5104,9 +5180,21 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse(
                 {"error": "that request is no longer the one being waited on"},
                 status_code=409)
-        slot["allow"] = allow
+        if answer is not None:
+            if slot.get("kind") != "question":
+                return JSONResponse(
+                    {"error": "this chat is waiting on a permission request, "
+                              "not a question"}, status_code=409)
+            slot["answer"] = answer
+        else:
+            if slot.get("kind") == "question":
+                return JSONResponse(
+                    {"error": "this chat is waiting on a question, not a "
+                              "permission request"}, status_code=409)
+            slot["allow"] = allow
         slot["event"].set()
-        return {"ok": True, "requestId": slot.get("requestId"), "allow": allow}
+        return {"ok": True, "requestId": slot.get("requestId"),
+                "allow": allow, "answer": answer}
 
     @app.post("/api/sessions/{sid}/control")
     async def control_plane(sid: str, body: dict):
@@ -6329,14 +6417,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 {"error": "budget_hours: must be greater than 0"},
                 status_code=400)
         # A7: an unrecognised `profile` used to be silently coerced to "all" —
-        # the profile that grants the full network and delete surface — both
-        # here (`run_profile=... if ... else "all"`) and again in
-        # `runs.create`. So a typo, or a client that sent "read-only", started
-        # the MOST permissive run and was told nothing. The default when the
-        # field is ABSENT is still "all" (the owner's OD-1 choice, unchanged);
-        # a value that is PRESENT must be one of `runs.PROFILES`. The type is
-        # checked first: `[] in PROFILES` raises TypeError, it does not answer
-        # False, so an unhashable value would be a 500 rather than this 400.
+        # the profile that grants the full network and delete surface — at both
+        # this route and `runs.create`, so a typo, or a client that sent
+        # "read-only", started the MOST permissive run and was told nothing. The
+        # default when the field is ABSENT is still "all" (the owner's OD-1
+        # choice, unchanged); a value that is PRESENT must be one of
+        # `runs.PROFILES`. The type is checked first: `[] in PROFILES` raises
+        # TypeError, it does not answer False, so an unhashable value would be a
+        # 500 rather than this 400. `runs.create` keeps its own coercion for the
+        # callers that never pass through this route (a macro, an internal run);
+        # here the 400 above makes any else-branch dead, so the value is passed
+        # through unchanged (A7 nit 1).
         profile = (body or {}).get("profile", "all")
         if not isinstance(profile, str) or profile not in _runs.PROFILES:
             return JSONResponse(
@@ -6404,7 +6495,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                     effort=effort, one_action=True,
                     confirm_exec=confirm_exec,   # R3-4: explicit, default off
                     params={**RUN_PARAMS, **(sess.get("params") or {})},
-                    run_profile=profile if profile in _runs.PROFILES else "all")
+                    run_profile=profile)
         # AUDIT 03-2: the token budget was dead — `token_cap` could not be set
         # through the API and `tokens_used` was never written, so
         # budget_exceeded's token clause could never bind. Parse the cap here
@@ -7056,8 +7147,16 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         try:
                             await asyncio.to_thread(server_ops.perform_unload)
                             telemetry["tg"] = None
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # A9: this was `pass`, so a failed unload left the card
+                            # occupied and said nothing about why. `perform_unload`
+                            # records `unloaded` only on success, so the idle state
+                            # is left exactly as it was and the next poll retries;
+                            # only the reason is new. It is a warning, not an
+                            # exception trace: the engine is still up and the turn
+                            # path is unaffected.
+                            _log.warning("idle auto-unload failed, engine left "
+                                         "loaded: %s", e)
                         finally:
                             switch_lock.release()
         return asyncio.create_task(_loop())

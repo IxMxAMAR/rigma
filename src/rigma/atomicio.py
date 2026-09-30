@@ -123,13 +123,20 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8",
 def atomic_write_bytes(path: Path, data: bytes) -> bool:
     """`atomic_write_text` for bytes, and byte-EXACT.
 
-    A11/R3-3: the restore undo log has to put back the file that was there, and
-    a text round-trip is not that file on Windows. `Path.write_text` translates
-    `\\n` to `os.linesep` (so a method file written by `methods.save_user` is
-    CRLF), while `atomic_write_text` pins `newline="\\n"` — rolling a snapshot
-    back through it would silently rewrite every line ending and the rollback
-    would not be byte-identical to what it replaced. There was no bytes writer
-    here; this is it.
+    A11/R3-3: the restore undo log has to put back the file that was there, and a
+    text round-trip is not guaranteed to be that file. The measured trap is NOT
+    `atomic_write_text`, which opens with `newline="\\n"` and so DISABLES newline
+    translation — it round-trips CRLF bytes exactly. It is the READ side that
+    loses them: `Path.read_text()` uses universal newlines, so a CRLF file read
+    that way and written back with `atomic_write_text` comes out LF-only. And
+    `Path.write_text()` translates `\\n` to `os.linesep` on a NEW write, which on
+    Windows means a method file written by `methods.save_user` is CRLF. This
+    helper takes and returns the exact bytes, so neither half can rewrite a line
+    ending, and it is what the restore snapshot uses.
+
+    `tools._atomic_bytes` is an existing private bytes writer with the same
+    temp-beside-target dance; it could now delegate here instead of keeping its
+    own copy.
 
     Same temp-beside-target, unique-name, fsync-then-retried-replace rules as
     `atomic_write_text`. `create_only` is not offered: nothing needs it, and a
