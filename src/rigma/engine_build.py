@@ -213,9 +213,26 @@ _BUILD_CACHE: dict[tuple, EngineBuild] = {}
 
 
 def _file_key(exe: Path) -> tuple:
+    """The file identity the memo is keyed on.
+
+    A13d: this used `int(st_mtime)`, i.e. whole seconds, so a same-size
+    replacement written inside one second served the OLD build's identity —
+    `--version` was never re-run and a stale build keyed the KV cache and the
+    calibration provenance. NANOSECOND mtime is the fix: it is free (no I/O
+    beyond the stat the key already did) and NTFS records 100 ns, so the two
+    writes are told apart. A content digest was the alternative and is the wrong
+    trade: a full digest re-reads a ~1 GiB binary on every call, which is the
+    engine-spawn cost this memo exists to avoid, and a bounded head/tail sample
+    would be probabilistic — a different silent hole, not a closed one.
+
+    RESIDUAL, deliberately: a replacement that PRESERVES the timestamp to the
+    same 100 ns tick (a copy that restores mtime, e.g. `shutil.copy2` onto the
+    same file) is still not detected. Detecting that needs content, and the cost
+    above is why it is not paid on every call.
+    """
     try:
         st = exe.stat()
-        return (str(exe), st.st_size, int(st.st_mtime))
+        return (str(exe), st.st_size, st.st_mtime_ns)
     except OSError:
         return (str(exe), -1, -1)
 
@@ -223,9 +240,11 @@ def _file_key(exe: Path) -> tuple:
 def cached_build(exe: str | Path, *, popen=subprocess.run) -> EngineBuild:
     """`read_build`, memoised on the file's identity.
 
-    Keyed on size and mtime as well as path, so replacing the binary at the same
-    path — which is exactly how a hand-installed fork arrives — invalidates the
-    cache instead of reporting the old build forever.
+    Keyed on size and nanosecond mtime as well as path, so replacing the binary
+    at the same path — which is exactly how a hand-installed fork arrives —
+    invalidates the cache instead of reporting the old build forever. Whole-second
+    mtime was not enough: a same-size swap inside one second served the old
+    identity (A13d; see `_file_key`).
     """
     exe = Path(exe)
     key = _file_key(exe)

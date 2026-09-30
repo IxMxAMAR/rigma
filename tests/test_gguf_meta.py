@@ -419,3 +419,102 @@ def test_capability_needles_cover_real_template_dialects(tmp_path, template, cap
     kvs.append(_kv_str(b"tokenizer.chat_template", template))
     info = inspect_gguf(_write(tmp_path, kvs, tensors=_MTP_TENSORS))
     assert cap in info.capabilities
+
+
+# --- A2d: an unrecognised recurrent geometry is UNKNOWN, not zero -------------
+#
+# The fit charges the hybrid's per-sequence RS buffer (A2). Three header shapes
+# gave it a confident zero instead: a pure-Mamba header (ssm.* and no attention
+# pattern at all), an explicit `attention.recurrent_layers` array (whose
+# semantics this module does not model), and a partial ssm.* set (which charges
+# S and silently drops R). Each now reports `rs_geometry_unknown` so the fit
+# says `rs=unknown` rather than reading the model as dense.
+
+def _mamba_kvs():
+    return [
+        _kv_str(b"general.architecture", b"mamba"),
+        _kv_u32(b"mamba.block_count", 48),
+        _kv_u32(b"mamba.context_length", 32768),
+        _kv_u32(b"mamba.embedding_length", 2048),
+        _kv_u32(b"mamba.ssm.state_size", 128),
+        _kv_u32(b"mamba.ssm.inner_size", 4096),
+        _kv_u32(b"mamba.ssm.conv_kernel", 4),
+        _kv_u32(b"mamba.ssm.group_count", 1),
+    ]
+
+
+def test_a_pure_mamba_header_is_not_read_as_dense(tmp_path):
+    """No attention keys and a complete ssm.* geometry. There is no pattern to
+    count recurrent layers from, so the count is unknown — and the old code
+    derived 0, read the file as dense with a zero-width KV cache, and charged no
+    RS buffer at all."""
+    f = inspect_gguf(_write(tmp_path, _mamba_kvs())).spec_fields
+    assert f["recurrent_layers"] == 0          # not derivable from this header
+    assert f["rs_geometry_unknown"] is True    # ... so it must not be a zero
+
+
+def test_an_explicit_recurrent_layers_array_is_not_ignored(tmp_path):
+    """A header that names its recurrent layers explicitly. This module does not
+    model that shape (indices? booleans? a count?), so it must not invent a
+    number from it — and it must not report nothing, which is what it did."""
+    kvs = [
+        _kv_str(b"general.architecture", b"hyb2"),
+        _kv_u32(b"hyb2.block_count", 8),
+        _kv_u32(b"hyb2.context_length", 8192),
+        _kv_u32(b"hyb2.embedding_length", 512),
+        _kv_u32(b"hyb2.attention.head_count", 8),
+        _kv_u32(b"hyb2.attention.head_count_kv", 2),
+        _kv_arr_u32(b"hyb2.attention.recurrent_layers", [1, 3, 5]),
+    ]
+    f = inspect_gguf(_write(tmp_path, kvs)).spec_fields
+    assert f["recurrent_layers"] == 0
+    assert f["rs_geometry_unknown"] is True
+
+
+def test_a_partial_ssm_geometry_is_unknown_not_s_only(tmp_path):
+    """state_size + inner_size size S, but conv_kernel + group_count are missing,
+    so R would silently be zero: a real under-charge with no note. (The count is
+    known here; the buffer is not.)"""
+    kvs = _qwen35(interval=4) + [
+        _kv_u32(b"qwen35.ssm.inner_size", 6144),
+    ]
+    f = inspect_gguf(_write(tmp_path, kvs)).spec_fields
+    assert f["recurrent_layers"] == 49         # 65 - 65//4, from the interval
+    assert f["ssm_state_size"] and f["ssm_inner_size"]
+    assert not (f["ssm_conv_kernel"] and f["ssm_group_count"])
+    assert f["rs_geometry_unknown"] is True
+
+
+def test_a_fully_declared_hybrid_geometry_is_known(tmp_path):
+    """The negative control: the owner's real qwen35 shape must NOT be flagged,
+    or every hybrid would lose its RS charge."""
+    kvs = _qwen35(interval=4) + [
+        _kv_u32(b"qwen35.ssm.inner_size", 6144),
+        _kv_u32(b"qwen35.ssm.conv_kernel", 4),
+        _kv_u32(b"qwen35.ssm.group_count", 16),
+    ]
+    f = inspect_gguf(_write(tmp_path, kvs)).spec_fields
+    assert f["recurrent_layers"] == 49
+    assert f["rs_geometry_unknown"] is False
+
+
+def test_a_dense_header_is_not_flagged_as_unknown(tmp_path):
+    f = inspect_gguf(_write(tmp_path, DENSE)).spec_fields
+    assert f["rs_geometry_unknown"] is False
+
+
+def test_the_unknown_flag_reaches_the_spec_and_the_fit(tmp_path):
+    """End to end through the one plumbing function install and heal share:
+    probe -> spec_fields_from_probe -> ModelSpec -> recurrent_state_unknown."""
+    from rigma.hangar import spec_fields_from_probe
+    from rigma.models import CachePolicy, GgufFile, ModelSpec
+    from rigma.resolve import recurrent_state_unknown
+
+    f = inspect_gguf(_write(tmp_path, _mamba_kvs())).spec_fields
+    spec = ModelSpec(slug="m", family="mamba", kind="dense",
+                     cache_type_policy=CachePolicy(),
+                     ggufs=[GgufFile(repo="local", file="m.gguf", bytes=1,
+                                     quant="Q4_K_M")],
+                     **spec_fields_from_probe(f))
+    assert spec.rs_geometry_unknown is True
+    assert recurrent_state_unknown(spec)

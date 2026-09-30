@@ -408,6 +408,28 @@ def _inspect(f, fallback: str) -> GgufInfo:
     ssm_conv = _as_int(g("ssm.conv_kernel", 0) or 0, f"{arch}.ssm.conv_kernel")
     ssm_groups = _as_int(g("ssm.group_count", 0) or 0,
                          f"{arch}.ssm.group_count")
+    # A2d: positive evidence of a recurrent geometry whose COUNT or SIZE this
+    # module cannot derive. The failure mode is a confident wrong number, so each
+    # shape below is reported as unknown rather than charged zero:
+    #
+    #   * a pure-Mamba header has `ssm.*` and no attention pattern at all, so
+    #     there is nothing to count recurrent layers from — the old code derived
+    #     0, read the file as dense with a zero-width KV cache and charged no RS;
+    #   * an explicit `attention.recurrent_layers` array is a shape this module
+    #     does not model (indices? booleans? a count?), so it must not invent a
+    #     number from it — it used to ignore it entirely;
+    #   * a PARTIAL `ssm.*` set sizes S but silently drops R (conv_kernel and
+    #     group_count default to 0), an under-charge with no note.
+    #
+    # `rs_geometry_unknown` is what `resolve.recurrent_state_unknown` reads, so
+    # the fit says `rs=unknown` and the explorer table shows the same.
+    declared_recurrent = g("attention.recurrent_layers")
+    rs_geometry_unknown = declared_recurrent is not None
+    if recurrent_layers == 0 and any((ssm_state, ssm_inner, ssm_conv, ssm_groups)):
+        rs_geometry_unknown = True
+    if recurrent_layers > 0 and not all((ssm_state, ssm_inner, ssm_conv,
+                                         ssm_groups)):
+        rs_geometry_unknown = True
     fields = {"n_layers": n_layers, "full_attn_layers": full_attn,
               "kv_heads": kv_heads, "head_dim": head_dim,
               "native_ctx": _as_int(g("context_length", 0),
@@ -432,6 +454,10 @@ def _inspect(f, fallback: str) -> GgufInfo:
               "ssm_inner_size": ssm_inner,
               "ssm_conv_kernel": ssm_conv,
               "ssm_group_count": ssm_groups,
+              # A2d: the header gives evidence of recurrent state but the count
+              # or the buffer could not be derived. The fit reports `rs=unknown`
+              # instead of charging a zero it cannot stand behind.
+              "rs_geometry_unknown": rs_geometry_unknown,
               "mtp_layers": mtp_layers,
               # the file's own inventory, not the header's claims
               "mtp": tx.has_mtp,
