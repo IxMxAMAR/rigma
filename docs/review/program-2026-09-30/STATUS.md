@@ -96,6 +96,16 @@ pass a `\\?\` path to the credential rule (safe today, fragile); `write_file ".e
 `deleted` over-report. Owner housekeeping: a verifier's scratch file `C:\nonexistent-odr1\a.txt` could not
 be deleted (the guard blocks deletes outside the workspace) and needs the owner.
 
+**Full suite at `7ec8712` (the final head; run once, alone, output to `.scratch/orchestrator/full-suite-wave20.txt`):
+0 failed, 3 skipped, exit rc 0; 3578 non-hardware tests selected (`pytest --co`).** The terminal summary
+line was lost to the PowerShell 5.1 `*>` redirect (a capture artifact this session also hit in wave 19), so
+the count is reconstructed: the progress stream carries 3577 test marks with **zero `F`/`E`** and 3 skips,
+and pytest exited 0. Before it, the merged-tree targeted run was **89 passed** (`test_audit_sec13` +
+`test_sessions_store` + `test_restore_replace` + `test_tools_hardening`), and ODR-1's own file adds **52
+passed** (base: 46 failed / 6 passed). Wave-19 baseline: 3513 passed, 3 skipped, 0 failed. **Zero
+regressions from the six merges.** `ruff check src tests` clean on every branch; the frontend gates at
+`06a636e` were build exit 0 / vitest 17 passed / `tsc --noEmit` exit 0.
+
 ## Wave 19 — the owner's decisions implemented (2026-09-30, ~20:30–21:30 UTC)
 
 The owner said **"I will trust you on those Recommendations"**, so every recommendation in
