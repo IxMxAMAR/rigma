@@ -96,6 +96,13 @@ every item in waves 16 and 17 — checked by a **separate** agent that did not w
 - **The plan recorded the placement you asked for, not the one it used.** On a model that has to spill
   layers to system memory, the recorded figure was the request rather than the outcome. It now records
   what it actually did, so the comparison above is meaningful on your MoE model too.
+- **Two settings that contradict each other could reach the engine.** The engine silently clamps the
+  physical batch to the logical batch; Rigma checked that pair on most paths but not on the one that
+  merges the command line into a plan whose logical batch came from a **stored calibration row**. The
+  plan then charged the batch you *asked* for while the engine ran the smaller one. It is now refused
+  with the same clear sentence the other paths use. (The verifier also caught that the fix's own
+  commit message overstated how big a plan this could mislead — the tolerance is not a flat 512 MiB —
+  and that correction is recorded rather than quietly dropped.)
 
 ### A sweep could quietly make every later launch worse
 - **The calibration sweep could crown "disable attention rotation" on speed alone.** A trial that
@@ -185,14 +192,29 @@ every item in waves 16 and 17 — checked by a **separate** agent that did not w
   verifiers, introducing a regression the same hour**, and both were fixed and re-verified before the
   night ended.
 - `ruff` clean; the frontend builds reproducibly, type-checks, and its **709** tests pass.
+- **The evening session ran its own verifiers, not just implementers.** Nineteen merges in the
+  evening, each behind an independent verifier that had to make the new test fail on the unmodified
+  code first. Three of those verifiers found something the implementer had got wrong: one caught a
+  regression in the fix it was checking, one caught a *wrong claim in the commit message itself*, and
+  one found that the route the Head Agent's brief named was not reachable — and found the real one
+  instead.
 - The full Python suite was re-run after the last merge, alone, with nothing else touching the tree:
-  **3,473 passed, 3 skipped, 5 deselected, 2 failed** in 8 m 05 s. **Both failures are pre-existing
+  **3,477 passed, 3 skipped, 5 deselected, 2 failed** in 8 m 51 s. **Both failures are pre-existing
   and environmental, not regressions:** `test_view_image_missing_file` and
   `test_compiled_spec_seeds_the_plan` both use `D:/...` paths, and **`D:` is a BitLocker-locked drive
   on this machine** (it does not even appear in `Get-PSDrive`), so Windows answers with a BitLocker
   error instead of "no such file". Both were reproduced **identically at the base commit `7ea1827`**,
-  and neither file was touched by this program. So: **25 merges and 3 direct commits, zero
-  regressions.**
+  and neither file was touched by this program. So the whole program — **59 merges and 202 other
+  commits** on top of the base — has **zero regressions**.
+- **One honest caveat about how that suite was run.** Twice, a full-suite run appeared to *freeze* —
+  0 CPU for over a minute, with 36 of the suite's fake ACP servers still alive — which is exactly the
+  symptom of the deadlock in §2. In both cases the run's output was being buffered rather than read;
+  the identical command run with its output read live, or written straight to a file, **completed
+  three times out of three** with the same result. So the most likely explanation is an artifact of
+  *this session's* output capture (a full pipe buffer blocking the writing process), **not** a Rigma
+  deadlock — but it is written down here rather than dismissed, because a future session should not
+  mistake it for a new bug, and because the six-port fix's own guarantee is worth re-testing under
+  load.
 
 ---
 

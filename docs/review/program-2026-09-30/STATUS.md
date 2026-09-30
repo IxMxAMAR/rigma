@@ -151,6 +151,8 @@ Integration branch head: `f6a0874` (plus the docs commits that follow it).
 | DR21R-n1 | 17 | `57adf3e` (`b16ca96`) | **DR21R-n1:** the VRAM axis's two sides sat on different bases — the engine's device figure includes the compute/reserve buffers while `memtruth.planned_mb` excludes them — so a healthy DEEP spill reported `plan_divergence`. The plan-side prediction now carries `resolve.compute_buffer_mb` (the charge DR2-3 already reserves against) **uniformly**, not gated on `_spilled > 0`; the slack was not widened. Verified PASS-WITH-NITS: the helper matches an independent first-principles figure to 0.000000 at six spill depths. |
 | regr | 17 | `dd1fd60` (`a3a0db4`, `dd1fd60`) | The two narrow regressions the OD12-n2/W15A-n2 verifier named: **OD12N2-n1** (question slots became request-id-keyed and the route stopped comparing to `sid`, so session A's answer was accepted through session B's route — restored with the base's 409 body) and **OD12N2-n2** (registration moved inside the `try` so a raising `call_soon_threadsafe` cannot leak a slot). **W15AN2-n1** (the "nothing to calibrate" cache omitted the plan flags, so a later calibratable plan was skipped forever — the entry now records its decision BASIS and re-evaluates it on read). |
 
+| UBATCH-n1 | 18 | `57bde6e` (`7d40ea5`) | The launch flags the CLI builds are now **validated before they are used**. `cli.py` merged `--batch`/`--ubatch`/`--ngl` into `rp.flags` with `model_copy(update=...)` (which does not validate) after checking only against the MODEL's stored defaults, so a `batch` that arrived from a **calibration row** (`resolve._apply_calibration`) survived with an illegal `ubatch > batch` pair — llama.cpp clamps silently, so the plan charged the requested ubatch while the engine ran the smaller one. Same class as DR21RN1-n1, one path over. The fix re-validates the resulting `ComboFlags` and refuses with the same message and exit code (one owner: `models.batch_pair_error`). The implementer probed the **combo** route the brief named, found it genuinely unreachable, and found the live one instead. Verified PASS-WITH-NITS; the verifier **corrected the commit's own arithmetic** (the tolerance is `max(512, 15%·expected)`, not a flat 512, so the false positive needs a plan under ~5470 MiB — CLIVAL-n1). |
+
 Legend: `_in flight_` = implementer working · `_verifying_` = verifier running · `_merged_` = on the
 integration branch · `_rejected once_` = sent back to the implementer with the verifier's finding.
 
@@ -169,13 +171,26 @@ integration branch · `_rejected once_` = sent back to the implementer with the 
   dropped the cross-session scoping check) and `W15AN2-n1` (the cached "nothing to calibrate"
   decision omitted the flags that made it a no-op) — were found by the independent verifiers, fixed on
   `impl/regr` (`b6b04dd`), and re-verified PASS. That is the program's whole premise working.
-- **FULL SUITE at `b5d8d61`: 2 failed, 3473 passed, 3 skipped, 5 deselected** in 485.78 s. Both
-  failures are **PRE-EXISTING and ENVIRONMENTAL**, reproduced **identically at the base `7ea1827`** in
-  a throwaway worktree: `test_tools_hardening.py::test_view_image_missing_file` and
+- **FULL SUITE at `57bde6e` (the final head): 2 failed, 3477 passed, 3 skipped, 5 deselected** in
+  531.86 s, and run **three times** (485 s, 546 s, 532 s) with identical results. Both failures are
+  **PRE-EXISTING and ENVIRONMENTAL**, reproduced **identically at the base `7ea1827`** in a throwaway
+  worktree: `test_tools_hardening.py::test_view_image_missing_file` and
   `test_autonomous_run.py::test_compiled_spec_seeds_the_plan` both use `D:/...` paths, and **`D:` is a
   BitLocker-locked drive on this host** (absent from `Get-PSDrive`), so Windows returns
   `[WinError -2144272384] This drive is locked by BitLocker` instead of "no such file". Neither file
-  was touched by this program. **Zero regressions from 25 merges + 3 direct commits.**
+  was touched by this program. **Zero regressions from the whole program — 59 merges and 202 other
+  commits on top of the base `7ea1827`** (19 of those merges landed in the evening session alone).
+- **A stall worth recording so it is not misread.** Twice a full-suite run sat at **0 CPU for over a
+  minute** with **36 `fake_acp_server` children still alive** — the exact REC-1 symptom. In both cases
+  the run's stdout was being buffered rather than drained; the identical command with its output
+  **drained live** or **redirected to a file** completed **3 of 3 times** with the same result. Most
+  likely an artifact of this session's output capture (a full pipe buffer blocking the writer), not a
+  Rigma deadlock — recorded rather than dismissed, because the six-port fix's guarantee deserves a
+  re-test under load and a future session should not mistake the artifact for a new bug.
+- **A flake in `test_phase4_lifecycle.py`.** Run six times in isolation it passed 12/12 five times and
+  once failed `test_restart_reattaches_and_finishes` (the A18 acceptance test). In every full run that
+  file passed 12/12. So it is a low-rate flake, not a regression — but it is the same class as the
+  W14-E flake and should be watched.
 - A2's charge moved two existing expectations on purpose (`test_launch_cache_ceiling`: ngl 58→55 and
   "7 of 64"→"10 of 64"; `test_quant_quality`: ngl 52→53). The verifier recomputed both by hand and
   agreed they are the exact consequence of the charge, not weakened assertions.

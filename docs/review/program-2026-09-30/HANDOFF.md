@@ -224,9 +224,11 @@ _(see `STATUS.md` for the per-item table with outcomes and verifier corrections)
 | 16 | `f51dfe0` `b2f6a14` `e26b6c4` `c373516` `d61dfb7` `c8aac9d` `17bfbe8` `70608d8` `573025a` | **The re-verification wave.** Every single-sourced verdict merged after the 15:55 power cut got a FRESH independent verifier, each with rule 13: w15a DR3-2/DR3-4, REC-1 `43e63de`, w14e, W14-F + DR3-1 + DR3-3, A8b, A2d-kv, the suite lock, OD-12 (both halves), REC-1b, A16c/D1d, DR4-2/DR4-3, B7e/B2c, the ctx floor, B4b-schema. **A2d-kv FAILED its first verification** (the derived `kv_geometry_unknown` clause flagged every pure-Mamba spec) and was fixed at `aa7ed80`, then re-verified PASS. Landed: W16-A, A8b, REC-1/OD-16's suite lock, A2d-kv, REC-1b, A16c/D1d, OD-12 server, A8b nits, DR4-2+DR4-3. |
 | 17 | `ae97585` `f3bd020` `cb92962` `4f477c9` `ea822d4` `175f1bd` `57adf3e` `b6b04dd` + `873b90c` `75960df` | W5F5B-N3 (one owner for the launch floor), B7e+B2c, **DR2-1-residual** (the plan records the placement it used), **test-hard** (three tests that could not have caught the bug they name), **resid** (the ctx floor's raise-to gets its own test; W13B-3 correctly deferred), **OD12-n2+W15A-n2**, **DR21R-n1** (the deep-spill compute-basis mismatch), **regr** (the two regressions the same-hour verifiers caught), and B4b-schema + its required-container fix (frontend, direct on the branch). `impl/ubatch` (`07342df`) merged last. |
 
-Integration head at this hand-off: **`b6b04dd`**, then `impl/ubatch`'s `07342df` and the docs commits
-that follow it. `STATUS.md` carries the per-item table and the note on the metadata-only author
-rewrite (with the old→new hash mapping for every pre-rewrite commit).
+| 18 | `b5d8d61` `57bde6e` | **UBATCH-n1** (`impl/ubatch`, the compute charge reads back the ubatch the launch actually used) and **UBATCH-n1's second path** (`impl/clival`, the CLI's merged launch flags are validated before they are used — reachable via a **calibration row**, not the combo the brief guessed). Both verified; the clival verifier **corrected the commit's own arithmetic** (the tolerance is `max(512, 15%)`, not a flat 512). |
+
+Integration head at this hand-off: **`57bde6e`** (plus the docs commits that follow it). `STATUS.md`
+carries the per-item table and the note on the metadata-only author rewrite (with the old→new hash
+mapping for every pre-rewrite commit).
 
 **A18 is the one that mattered most** and it was found by the full suite, not by reading: the run
 loop's *first* `_runs.load` was unguarded, so a transient unreadable `run.json` raised
@@ -281,16 +283,20 @@ ranking was and what closed each one:
    semantics. OD-16 is REC-1, **now implemented** as option 3. OD-13 was implemented because its
    recorded recommendation was option 1.
 
-The highest-value items STILL OPEN after wave 17:
+The highest-value items STILL OPEN after wave 18:
 
-1. **DR21RN1-n1** — an explicit `rigma up --ubatch N` is not persisted, so the plan-side compute
-   charge uses the spec's ubatch and a healthy override load reports `plan_divergence` (+1491 MiB at
-   N=2048). Being fixed on `impl/ubatch`. **DR21RN1-n2/n3/n4** are its smaller siblings.
-2. **The wave 16–17 verifier nits**, all in `BACKLOG.md`'s wave 16–17 section: TESTHARD-n1..n4,
-   RESID-n1/n2, B4BREQ-n1..n4, CTXFLOOR-n1..n3, OD12N2-n1/n2 and W15AN2-n1 (both fixed on
-   `impl/regr`), W16A-1, REC1B-n1/n2, DR42-n2, DR43-n1/n2, B2C-n1/n2, B7E-n2.
+1. **The wave 16–18 verifier nits**, all in `BACKLOG.md`'s wave 16–18 section. The ones worth
+   reading first: **CLIVAL-n1** (a commit message's arithmetic is wrong and cannot be amended),
+   **CLIVAL-n2** (an invalid stored `launch.spec_type` now refuses under the wrong flag's name),
+   **TESTHARD-n1** (a 1.0 s create-time blind spot in the recycled-pid guard), **REGR-n3/n4**
+   (latent `is_calibrated` and no-op-migration edges), **B4BREQ-n1** (a required all-optional object
+   now over-blocks), and **DR21RN1-n2** (the compute-charge window is narrowed, not closed).
+2. **The two pre-existing full-suite failures are environmental, not code** — `D:` is a
+   BitLocker-locked drive on this machine and two tests use `D:/...` paths. If the owner unlocks or
+   remounts `D:`, they should pass; if not, those two tests should be changed to use a path that
+   exists but is unwritable.
 3. **A fifth deep review.** Every previous one found real defects inside already-verified fixes —
-   including, in wave 16–17, two regressions introduced by fixes merged the same hour.
+   including, in waves 16–18, two regressions introduced by fixes merged the same hour.
 7. **A fourth deep review.** All three previous ones found real defects inside already-verified
    fixes, and the marginal cost is one read-only agent. `deep-review-3.md` covered waves 11–14; the
    next one should cover waves 15–16 **and re-verify the Head-Agent-sourced verdicts**, which have
@@ -322,9 +328,11 @@ a second one.** The open fit questions it should now also answer:
    plan-side compute charge now reads back the `-ub` the launch emitted, from `state.json`. Rigma
    refuses `ubatch > batch` at write time, but **llama.cpp can clamp `n_ubatch` to `n_batch`** and no
    engine ran to confirm the two agree. One real load with `--ubatch N`, above and below `batch`,
-   reading the engine's own `n_ubatch`, settles it. UBATCH-n1 is the related latent hole: the CLI's
-   merged flags are unvalidated, so a combo-set `batch` plus a larger `--ubatch` would record the
-   request while the engine clamps.
+   reading the engine's own `n_ubatch`, settles it. **UBATCH-n1 is now FIXED** (`impl/clival`,
+   `57bde6e`): the CLI's merged launch flags were unvalidated, so a `batch` arriving from a
+   **calibration row** plus a larger `--ubatch` recorded the request while the engine clamped it —
+   reachable, and the same false-positive class. The verifier corrected the fix commit's own
+   arithmetic: the tolerance is `max(512, 15% · expected)`, not a flat 512 (CLIVAL-n1).
 8. **The compute charge at a second ubatch point** (item 1(b), restated with a reason). The 150 MiB
    default charge plus the 512 MiB tolerance is what keeps a healthy load quiet (DR21RN1-n2), and
    that arithmetic is a PREDICTION from the one measured 410.28 MiB at ub 512. One load at ubatch
@@ -386,3 +394,18 @@ numbered: **W13B-3's ambient-env lever** (see the NEEDS-GPU list).
 - **A rejected item is not a dead item.** C11 was rejected by its verifier for a real
   quality-degrading calibration path and then fixed in wave 11; B1, C3 and D1 were each rejected once
   and fixed. Read the verifier's FAIL as the specification.
+- **A full-suite run that appears to FREEZE may be your own output capture, not the suite.** Twice on
+  2026-09-30 a run sat at 0 CPU for over a minute with 36 `fake_acp_server` children still alive — the
+  exact REC-1 symptom — and both times its stdout was being **buffered rather than drained**. The
+  identical command with output **drained live** or **redirected to a file** completed **3 of 3 times**
+  with identical results (`2 failed, 3477 passed`, both failures pre-existing). Before believing a
+  deadlock, **redirect the suite's output to a file** and re-run. That said, the six-port fix's
+  guarantee deserves a re-test under load: do not read this note as proof that REC-1 is gone.
+- **Two full-suite failures are ENVIRONMENTAL, not code.** `test_tools_hardening.py::test_view_image_missing_file`
+  and `test_autonomous_run.py::test_compiled_spec_seeds_the_plan` both use `D:/...` paths, and **`D:` is
+  a BitLocker-locked drive on this host** (it does not appear in `Get-PSDrive`), so Windows returns
+  `[WinError -2144272384] This drive is locked by BitLocker` instead of "no such file". Both reproduce
+  **identically at the base `7ea1827`**. Unlock/remount `D:` or change the two tests' paths.
+- **`test_phase4_lifecycle.py` has a low-rate flake** (`test_restart_reattaches_and_finishes`, the A18
+  acceptance test): 1 failure in 6 isolated runs, 12/12 in every full run. Same class as the W14-E
+  flake that was fixed — worth a look, not a regression.
