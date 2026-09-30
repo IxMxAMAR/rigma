@@ -466,8 +466,9 @@ def test_spilled_counts_moe_experts_not_whole_layers():
     moe = _hybrid_spec(10.0)
     moe.moe = MoESpec(total_b=35.0, active_b=3.0, expert_weight_fraction=0.85)
     from rigma.models import ComboFlags
-    # 13 of 65 layers offloaded either way
-    dense_f = ComboFlags(ctx=8192, ngl=52)
+    # 13 of 65 layers offloaded either way. `ngl` counts the OUTPUT layer, so
+    # -ngl 53 leaves layers 0-12 — thirteen — on the CPU; -ngl 52 leaves 14.
+    dense_f = ComboFlags(ctx=8192, ngl=53)
     moe_f = ComboFlags(ctx=8192, ngl=99, n_cpu_moe=13)
     assert _spilled(dense, dense_f) == pytest.approx(13 / 65)
     assert _spilled(moe, moe_f) == pytest.approx(13 / 65 * 0.85)

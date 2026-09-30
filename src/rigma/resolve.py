@@ -412,7 +412,7 @@ def _cpu_layers(spec: ModelSpec, flags: ComboFlags) -> int:
     (llama-model.cpp: `i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)`,
     and the output layer is assigned through the same list), so `-ngl 58` on a
     64-layer model pins layers 0-6 — seven — not six. `_spilled` reports the
-    weight fraction and reads as 6/64; both are used where they belong.
+    weight fraction and counts the same seven, so the two agree.
     """
     n = spec.n_layers or 0
     if n <= 0:
@@ -440,14 +440,20 @@ def _resident_rung(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
 
 
 def _spilled(spec: ModelSpec, flags: ComboFlags) -> float:
-    """Fraction of the model left in system RAM under this plan. Dense counts
-    layers; MoE counts only the expert share of an offloaded layer, since
-    sparse activation makes that far cheaper."""
+    """Fraction of the model's weights left in system RAM under this plan.
+
+    Dense counts the layers the engine actually keeps on the CPU — the same
+    number `_cpu_layers` reports. `ngl` counts the OUTPUT layer, so `-ngl 58` on
+    64 layers is 7/64, not 6/64; an explain line and an offload percentage that
+    disagreed by a layer would both be distrusted. MoE counts only the expert
+    share of an offloaded layer, since sparse activation makes that far cheaper,
+    and `n_cpu_moe` has no output-layer off-by-one to mirror.
+    """
     n = spec.n_layers or 0
     if not n:
         return 0.0
     if spec.moe is None:
-        return max(0, n - min(flags.ngl, n)) / n
+        return min(1.0, ((n + 1) - min(max(flags.ngl, 0), n + 1)) / n)
     return (min(flags.n_cpu_moe, n) / n) * spec.moe.expert_weight_fraction
 
 
@@ -811,15 +817,10 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
         # VRAM. The old file-size guess called a quant "gpu" while the very
         # same verdict carried ngl=56 of 65 layers: it ignored the KV cache,
         # which is precisely what a big context window spends VRAM on.
-        spill = 0.0
-        if spec.moe is None:
-            if spec.n_layers > 0 and flags.ngl < spec.n_layers:
-                spill = (spec.n_layers - max(0, flags.ngl)) / spec.n_layers
-        elif spec.n_layers > 0 and flags.n_cpu_moe > 0:
-            # only the EXPERT weights of those layers leave the GPU, and expert
-            # activation is sparse, so the same fraction costs far less here
-            spill = (min(flags.n_cpu_moe, spec.n_layers) / spec.n_layers
-                     * spec.moe.expert_weight_fraction)
+        # ONE implementation, `_spilled`, deliberately: a duplicate here read
+        # 6/64 where `_cpu_layers` said 7, so the page and the fit could flip
+        # opposite sides of the 0.15 "light" boundary for the same plan.
+        spill = _spilled(spec, flags)
         speed = "gpu" if spill <= 0.001 else ("light" if spill <= 0.15
                                               else "offload")
         # The explorer pins the requested type on purpose, so a spill here is
@@ -871,8 +872,7 @@ def quant_verdicts(spec: ModelSpec, profile: HardwareProfile, *,
 # `ngl` counts the OUTPUT layer (llama-model.cpp:
 # `i_gpu_start = max(n_layer_all + 1 - n_gpu_layers, 0)`, output placed by the
 # same rule), so -ngl 58 leaves layers 0-6 — SEVEN — on the CPU, not six.
-# `_spilled` reports the WEIGHT fraction (6/64); the two are different numbers
-# and neither is the other.
+# `_spilled` reports the same seven as the weight fraction, 7/64.
 #
 # The cost is a straight line, not a context-sized cliff:
 #     ms/token ~= 0.28 x GPU layers + 9.18 x CPU layers   (R^2 0.99992)
