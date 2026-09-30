@@ -465,12 +465,29 @@ def prune_calibration(cal: dict, keep_per_identity: int = 1) -> dict:
 def save_calibration(key: str, measured: dict, flags: dict | None = None,
                      calibrated: bool = False, ctx: int = 0,
                      identity: hwid.HardwareIdentity | None = None,
-                     backend: str = "") -> None:
+                     backend: str = "",
+                     no_calibrate: dict | None = None) -> None:
     cal = load_calibration()
     entry = cal.get(key, {})
     entry["measured"] = measured
     if flags is not None:
         entry["flags"] = flags
+    if no_calibrate is not None:
+        # W15AN2-n1. This entry records the DECISION that nothing was measurable
+        # (every quick config was dropped before it could launch), not a
+        # measurement. Any placement left under this key by an earlier explicit
+        # sweep must not survive into it: every applier treats a `flags` key as a
+        # measured placement (`resolve._apply_calibration`, `auto_calibrate`'s
+        # `_apply`, `server_ops._measured_placement`), and a "nothing to
+        # calibrate" row must never be readable as one. The dict is the decision
+        # basis, kept for provenance; the re-check re-derives the predicate.
+        entry.pop("flags", None)
+        entry["no_calibrate"] = no_calibrate
+    else:
+        # A measurement supersedes an earlier "nothing to calibrate" decision.
+        # Leaving the marker behind would make every reader keep re-checking the
+        # stale basis (and, for a plan that is now calibratable, keep sweeping).
+        entry.pop("no_calibrate", None)
     if calibrated:
         entry["calibrated"] = True   # one-time first-load tune has run
     # What the numbers were measured ON. An entry used to carry a day-granularity
@@ -575,13 +592,21 @@ def calibration_stale(entry: dict, vram_used_mb: float | None,
     return None
 
 
-def is_calibrated(model: str, quant: str, backend: str) -> bool:
+def is_calibrated(model: str, quant: str, backend: str, flags=None) -> bool:
     """True once a model+quant+backend has been auto-tuned on THIS HARDWARE —
     so first-load calibration runs exactly once, never on every load.
 
     R3-CAL-1: the lookup is identity-aware, so a calibration measured on another
     GPU does not count as calibrated here. The legacy key is still honoured for
     the machine that wrote it, which is why this is not simply a key change.
+
+    W15AN2-n1: a cached "nothing to calibrate" entry is a DECISION, not a
+    measurement, and it is only valid while the same condition still drops every
+    trial. `flags` is the plan being loaded; when given, such an entry counts as
+    calibrated only while `_sweep_would_drop_all` still holds for it, so a plan
+    that has since become calibratable (its KV cache is no longer q4_0, say) is
+    handed back to `auto_calibrate` instead of being skipped forever. Without
+    `flags` there is nothing to re-check against, so the decision stands.
     """
     _, entry = calibration_entry(load_calibration(), model, quant, backend)
     if not entry:
@@ -590,6 +615,8 @@ def is_calibrated(model: str, quant: str, backend: str) -> bool:
     # re-tune rather than serve a number measured elsewhere.
     if hwid.hard_mismatch(entry, _identity_cache_key(backend)):
         return False
+    if entry.get("no_calibrate"):
+        return flags is None or _sweep_would_drop_all(model, flags)
     return bool(entry.get("calibrated"))
 
 
@@ -917,6 +944,54 @@ def quick_configs(base: ComboFlags, moe: bool,
     return cfgs
 
 
+def _drop_uncalibratable(flags, configs) -> list:
+    """The configs `run_sweep` drops on a tools-capable model.
+
+    C11 + DR3-2: a trial that would actually run q4_0 KV or a quality-degrading
+    env lever is not trialled. ONE predicate, because the sweep's drop guard and
+    the "nothing to calibrate" decision below must not be two rules that can
+    drift: the decision is exactly "this filter keeps nothing".
+    """
+    return [(label, o) for label, o in configs
+            if not _q4_kv(_effective_flags(flags, o))
+            and not _carries_quality_env_lever(
+                {"env": _effective_env(flags, o)})]
+
+
+def _sweep_would_drop_all(slug: str, flags) -> bool:
+    """Would `run_sweep` drop every first-load quick config for this plan?
+
+    W15AN2-n1. This is the DECISION BASIS behind a "nothing to calibrate" entry:
+    it was written because `run_sweep` crowned no row. Re-deriving it from the
+    same predicate that dropped the trials — rather than trusting the cached
+    entry forever — is what lets a plan that has since become calibratable be
+    swept again, while a plan that is still a no-op stays a cache hit.
+    """
+    if not _tools_capable(slug):
+        return False
+    configs = quick_configs(flags, flags.n_cpu_moe > 0, caps=_capabilities(slug))
+    return bool(configs) and not _drop_uncalibratable(flags, configs)
+
+
+def _no_calibrate_basis(plan: RunPlan) -> dict:
+    """The facts that made `run_sweep` crown nothing, recorded for provenance.
+
+    The re-check re-derives the predicate (`_sweep_would_drop_all`) instead of
+    trusting this dict, so a later change to the drop rule cannot leave a stale
+    decision cached. The dict is what the entry can explain itself with.
+    """
+    return {"reason": "every quick config was dropped",
+            "tools_capable": _tools_capable(plan.model_slug),
+            "cache_type_k": plan.flags.cache_type_k,
+            "cache_type_v": plan.flags.cache_type_v}
+
+
+def _no_calibrate_expired(entry: dict, plan: RunPlan) -> bool:
+    """Whether a cached "nothing to calibrate" decision no longer holds."""
+    return bool(entry.get("no_calibrate")) and not _sweep_would_drop_all(
+        plan.model_slug, plan.flags)
+
+
 def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
               prompt_tokens: int = 2048, gen_tokens: int = 96,
               progress=None, configs=None, extra_args=None,
@@ -971,10 +1046,7 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
                 "the cache type is dropped, so this sweep cannot measure the "
                 "default configuration",
                 plan.model_slug, plan.flags.cache_type_k, plan.flags.cache_type_v)
-        kept = [(label, o) for label, o in configs
-                if not _q4_kv(_effective_flags(plan.flags, o))
-                and not _carries_quality_env_lever(
-                    {"env": _effective_env(plan.flags, o)})]
+        kept = _drop_uncalibratable(plan.flags, configs)
         if configs and not kept:
             # A silent empty sweep would look like "nothing worth measuring".
             _log.warning(
@@ -1061,14 +1133,15 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
             "origin": p.origin if p.origin.endswith("+calibrated")
             else p.origin + "+calibrated"})
 
-    if entry.get("calibrated"):
+    if entry.get("calibrated") and not _no_calibrate_expired(entry, plan):
         # Adopt a legacy entry onto the identity key so the next lookup is a
         # direct hit and the stale key can be pruned away.
         if key not in load_calibration():
             save_calibration(key, entry.get("measured", {}),
                              flags=entry.get("flags"), calibrated=True,
                              ctx=entry.get("ctx", 0), backend=plan.backend,
-                             identity=ident)
+                             identity=ident,
+                             no_calibrate=entry.get("no_calibrate"))
         return _apply(plan)
     if plan.backend == "cpu":
         return plan   # nothing worth measuring on CPU
@@ -1094,9 +1167,19 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
         # stays empty, so the throughput/expectation readers
         # (`serve._throughput`, `server_ops.expected_tg`) report "no number"
         # rather than a zero that looks measured.
+        #
+        # W15AN2-n1. The entry also carries its DECISION BASIS
+        # (`no_calibrate`), and both readers re-check it: `is_calibrated` (when
+        # given the plan's flags) and this function below re-derive
+        # `_sweep_would_drop_all` and fall through to a sweep when the plan has
+        # since become calibratable — the key alone cannot carry that, because
+        # it is `model:quant:backend:identity` and omits the plan flags that made
+        # the decision a no-op. A plan that is still a no-op stays a cache hit
+        # and does not re-fire the warning.
         save_calibration(key, {}, flags=None, calibrated=True,
                          ctx=plan.flags.ctx, backend=plan.backend,
-                         identity=ident)
+                         identity=ident,
+                         no_calibrate=_no_calibrate_basis(plan))
     return _apply(plan)
 
 
