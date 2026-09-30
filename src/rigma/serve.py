@@ -4423,7 +4423,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # separate call happens to succeed (AUDIT F51).
         try:
             from . import engine_log
-            out["engine_findings"] = engine_log.findings(server_ops.log_text())
+            # A17d: the VRAM axis needs the plan's own weights+KV prediction for
+            # the same ctx / cache / slots, not the log alone — without it
+            # `compare_plan` reports `not_comparable` and the axis is inert.
+            out["engine_findings"] = engine_log.findings(
+                server_ops.log_text(),
+                expected_vram_mb=server_ops.planned_vram_mb(s, registry))
         except OSError as e:
             out["engine_findings"] = []
             out["engine_findings_error"] = f"cannot read the engine log: {e}"
@@ -4568,6 +4573,11 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         A read failure is a 503, not an empty list: "I could not look" and "I
         found nothing" are different answers and only one is reassuring
         (AUDIT F51).
+
+        A17d: the running plan's own weights+KV prediction is passed so the
+        VRAM axis is comparable. With no engine running there is no plan, so the
+        axis stays `not_comparable` rather than comparing against a bare file
+        size (GUIDANCE 5).
         """
         from . import engine_log, server_ops
         try:
@@ -4576,7 +4586,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse(
                 {"error": f"cannot read the engine log: {e}", "findings": []},
                 status_code=503, headers=_NO_STORE)
-        return {"findings": engine_log.findings(text)}
+        s = st.server_running()
+        expected = server_ops.planned_vram_mb(s, registry) if s else None
+        return {"findings": engine_log.findings(text,
+                                                expected_vram_mb=expected)}
 
     @app.get("/api/server/switch-options")
     async def server_switch_options():
