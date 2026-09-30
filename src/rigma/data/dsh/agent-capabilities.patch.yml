@@ -231,3 +231,59 @@
       name: '@deepseek-ai/dsh-tool-web'
       config:
         search: false
+
+    # ---- governance: the approval / permission audit trail -----------------
+    # O4 (checkpoint 30): the panel that draws `approval/*`, `permission/preset`
+    # and `sandbox/mode` was a DEAD FOUR-HOP CHAIN. `sandbox/mode` fires from
+    # `sandbox-policy`, which sdk-minimal mounts, so the panel looked live — but
+    # the three `approval/*` events come only from `dsh-user-approval` and
+    # `permission/preset` only from `dsh-permission-presets`, and NEITHER was
+    # mounted anywhere in Rigma's runtime. The audit trail therefore could never
+    # fill, and no line anywhere said why. These two rows are that missing hop.
+    #
+    # `policy: never` is deliberate and is NOT the base bundle's expression. The
+    # base computes it from DSH_PERMISSION_MODE, which Rigma never sets, so a
+    # verbatim copy would resolve to `ask` here — while sdk-minimal's
+    # `sandbox-policy` is hardcoded `danger-full-access`. `ask` on a transport
+    # with no approval answerer (the SDK wire has no approval-response method)
+    # falls through to the fail-closed `unavailable` and DENIES the call. Rigma
+    # runs unconfined, so `never` is the policy that matches the sandbox it
+    # actually has: an ask is rejected deterministically without a prompt, and
+    # the model is told so in its runtime context. A `!!js` expression is also
+    # unusable here — the file is read by Python's `yaml.safe_load` in
+    # tests/test_dsh_capabilities.py, which has no `!!js` constructor.
+    - id: approval
+      name: '@deepseek-ai/dsh-user-approval'
+      config:
+        policy: never
+
+    # `dsh-permission-presets` is what LOGS `permission/preset`, and it also
+    # seeds `approval/policy` at session creation (user-approval alone appends
+    # no policy event), so it is the half that makes the trail durable rather
+    # than merely reachable. It carries a hard dependency the minimal tree does
+    # not satisfy: `static inject = ['shell', 'approval', 'sessions',
+    # 'sessionProjections']`, and sdk-minimal mounts the PTY `terminal` seam,
+    # not a confining `shell` executor. Until a sandboxed shell row is composed
+    # (and the packaged runtime closure currently carries `dsh-shell` but
+    # neither `dsh-pwsh-sandbox` nor `dsh-bash-sandbox`), this row stays
+    # dormant and `permission/preset` stays quiet. That is named here rather
+    # than left as a silent gap, which is the whole reason O4 existed.
+    #
+    # The preset table is restated from the base bundle because `config:`
+    # REPLACES the row's whole config, and `danger-full-access` must keep
+    # `approval: never` so it matches the `policy` above — otherwise the
+    # service's `derive()` finds no preset for the composed defaults and
+    # refuses to mount.
+    - id: permission
+      name: '@deepseek-ai/dsh-permission-presets'
+      config:
+        presets:
+          read-only:
+            sandbox: read-only
+            approval: ask
+          workspace-write:
+            sandbox: workspace-write
+            approval: ask
+          danger-full-access:
+            sandbox: danger-full-access
+            approval: never
