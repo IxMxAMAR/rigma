@@ -35,6 +35,7 @@ from . import server_ops
 from . import sessions
 from . import skills
 from . import state as st
+from . import writelock
 
 _log = logging.getLogger(__name__)
 
@@ -1859,7 +1860,11 @@ def _apply_restore(store, targets, patch, normalized, rows):
     from . import app_settings
     from . import macros
     from . import methods as _methods
-    with store.locked():
+    # ODR-8: the writers' lock is OUTERMOST, then the store's `_xlock`. No path
+    # takes them in the other order and no memory writer takes WRITER_LOCK, so
+    # the order is acyclic — see rigma.writelock. Held for the whole region so a
+    # save cannot land between the snapshot and the rollback.
+    with writelock.WRITER_LOCK, store.locked():
         # OD-15: the deletion set is part of the transaction. Resolve it (and
         # its paths) before the snapshot so the rollback has the bytes. A file
         # whose id cannot name it (a hand-edited `con.json`) is left alone:

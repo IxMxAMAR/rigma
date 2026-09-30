@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 
+from . import writelock
 from .atomicio import atomic_write_json
 from .runtime import rigma_home
 
@@ -103,7 +104,10 @@ def save(patch: dict) -> dict:
     # R3-STORE-10: a fixed `<name>.tmp` beside the target collides under
     # concurrency, and this is the store the settings UI writes while the server
     # may be reading it. Shared writer: unique temp + retried replace.
-    atomic_write_json(p, cur, indent=2)
+    # ODR-8: WRITER_LOCK, shared with the method writers and held by the
+    # restore for its whole region (see rigma.writelock for the lock order).
+    with writelock.WRITER_LOCK:
+        atomic_write_json(p, cur, indent=2)
     return cur
 
 
@@ -132,7 +136,8 @@ def replace(clean: dict) -> dict:
         raise ValueError(err)
     out = dict(DEFAULTS)
     out.update(clean)
-    atomic_write_json(settings_path(), out, indent=2)
+    with writelock.WRITER_LOCK:
+        atomic_write_json(settings_path(), out, indent=2)
     return out
 
 
