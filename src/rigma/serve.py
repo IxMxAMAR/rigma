@@ -1963,8 +1963,11 @@ def _apply_restore(store, targets, patch, normalized, rows):
                 detail += ("; rollback of " + ", ".join(failed)
                            + " failed — the store may be left part-applied")
             raise _RestoreFailed(detail) from e
-    # ODR-4: the apply committed, so the journal is spent.
-    _clear_restore_undo()
+        # ODR-4: the apply committed, so the journal is spent. Cleared INSIDE
+        # the locked region on purpose: releasing the lock first would let a
+        # second restore write its own journal in the gap and this clear would
+        # delete THAT journal, destroying the second restore's only undo copy.
+        _clear_restore_undo()
     # ODR-7: the caller's response names the ids the restore actually deleted,
     # so the confirmation can say what it removed instead of only what it wrote.
     return before, after, stale_ids
