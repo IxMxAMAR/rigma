@@ -2521,6 +2521,14 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
                f"({rp.origin})")
+    # C10-nits N3: `explain` is where the resolver records what it actually did
+    # when a request could not be honoured — "launch default ngl 999 exceeds
+    # what fits at ctx ...: using 57", a calibration override, a cache
+    # step-down. The launch path never showed any of it, so `rigma up` could run
+    # at a clamped ngl with no notice while `rigma plan --explain` showed the
+    # note. Surface the same lines at launch.
+    for _why in rp.explain:
+        typer.echo(f"  {_why}")
     # AUDIT F15-3: this prints the SAME argv the launch below passes to
     # launch_server, including --mmproj/--chat-template-file/--slot-save-path.
     typer.echo("argv: " + " ".join(_launch_argv(rp, reg, port - 1)))

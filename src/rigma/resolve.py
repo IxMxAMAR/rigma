@@ -160,6 +160,13 @@ def _desktop_vram_mb(profile: HardwareProfile | None) -> float | None:
         return None
 
 
+# C10-nits N2: the placement keys a calibration row may move. Reported by
+# `_apply_calibration` so an explicit stored value it overrode is visible in
+# `explain` rather than silently contradicted by an earlier fit note.
+_CALIBRATION_PLACEMENT_KEYS = ("ngl", "n_cpu_moe", "cache_type_k",
+                               "cache_type_v", "spec_type", "batch", "ubatch")
+
+
 def _without_quality_env_levers(flags: dict) -> tuple[dict, list[str]]:
     """`flags` with any quality-degrading engine env lever removed, and their names.
 
@@ -232,6 +239,7 @@ def _apply_calibration(plan: RunPlan,
         # validate the merge and keep the fresh plan when it fails.
         # All-or-nothing on purpose: a half-applied placement is not a
         # placement anyone measured.
+        before = plan.flags
         try:
             merged = ComboFlags.model_validate(
                 {**plan.flags.model_dump(), **stored})
@@ -248,6 +256,21 @@ def _apply_calibration(plan: RunPlan,
         plan.origin += "+calibrated"
         plan.explain.append(f"calibration override applied: {stored} "
                             f"(measured {entry.get('date', '?')})")
+        # C10-nits N2: a measured placement silently beat an explicit stored
+        # `ngl` (and could leave the fit's own note, "launch default ngl 40 (the
+        # fit allows 59)", standing while the plan carried the measured 63).
+        # Name every placement key the measurement moved, so the override is
+        # visible and the earlier fit note is plainly superseded. The
+        # measurement WINS rather than being clamped: it came from a stopwatch
+        # on this machine (AUDIT F17), and the merge above is all-or-nothing.
+        moved = [f"{k} {getattr(before, k)} -> {getattr(merged, k)}"
+                 for k in _CALIBRATION_PLACEMENT_KEYS
+                 if getattr(before, k) != getattr(merged, k)]
+        if moved:
+            plan.explain.append(
+                "calibration override changed " + "; ".join(moved)
+                + " (a measured placement wins over the fit and any launch "
+                  "default; an earlier note about those values is superseded)")
         if dropped:
             plan.explain.append(
                 "calibration override dropped quality-degrading env lever(s) "
