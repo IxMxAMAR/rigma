@@ -1,3 +1,5 @@
+import inspect
+
 from rigma import bench
 from rigma.models import ComboFlags, GgufFile, RunPlan
 
@@ -928,17 +930,27 @@ def test_the_sweep_and_its_guards_build_a_trial_the_same_way(monkeypatch, tmp_pa
     `plan.flags.model_copy(update=override)` for themselves. They agreed, but
     nothing kept them agreeing — and a guard that reads a different flag set from
     the one the child is launched with is worse than no guard, because it reports
-    on a trial that never ran. This pins the single source: every trial the sweep
-    launches must be built through `bench._trial_flags`, which is exactly what
-    the guards read.
+    on a trial that never ran. This pins the single source on all three paths:
+    every construction records its CALLER, so re-inlining either guard fails, and
+    the flags the child is launched with are the helper's RETURN value, so a
+    wrong return fails.
+
+    W16A-1: the previous version inspected only the TAIL of the recorded calls
+    and never looked at what was launched, so inlining either guard, or making
+    `_trial_flags` return the wrong flags, left it green.
     """
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     configs = [("baseline", {}), ("fa-off", {"flash_attn": "off"})]
-    built: list[dict] = []
     real = bench._trial_flags
+    calls: list[tuple[str, dict]] = []
+    launched: list = []
 
     def spy(plan_flags, override):
-        built.append(dict(override))
+        # The immediate caller's name: `run_sweep` for the launch loop,
+        # `_effective_flags`/`_effective_env` for the guards. A guard re-inlined
+        # to `plan_flags.model_copy(...)` stops calling here.
+        caller = inspect.currentframe().f_back.f_code.co_name
+        calls.append((caller, dict(override)))
         return real(plan_flags, override)
 
     monkeypatch.setattr(bench, "_trial_flags", spy)
@@ -947,7 +959,11 @@ def test_the_sweep_and_its_guards_build_a_trial_the_same_way(monkeypatch, tmp_pa
         def stop(self):
             pass
 
-    monkeypatch.setattr(bench, "launch_server", lambda *a, **k: _FakeSrv())
+    def fake_launch(exe, trial, model_path, **kw):
+        launched.append(trial)
+        return _FakeSrv()
+
+    monkeypatch.setattr(bench, "launch_server", fake_launch)
     monkeypatch.setattr(bench, "run_bench", lambda port, **k: bench.BenchResult(
         pp_tps=100, tg_tps=50, prompt_tokens=8, gen_tokens=8))
     monkeypatch.setattr(bench, "sweep_configs",
@@ -955,10 +971,26 @@ def test_the_sweep_and_its_guards_build_a_trial_the_same_way(monkeypatch, tmp_pa
 
     bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf", port=11602)
 
-    # The launch loop's calls are the last `len(configs)`; any earlier ones are
-    # the guards, which read the same helper and are the point of the pin.
-    assert built[-len(configs):] == [o for _, o in configs], (
-        "run_sweep must build every trial through bench._trial_flags — the same "
-        "helper the q4_0 and env guards read, so the guard cannot report on a "
-        "trial that never ran")
+    expected = [o for _, o in configs]
+    by_caller: dict[str, list[dict]] = {}
+    for caller, override in calls:
+        by_caller.setdefault(caller, []).append(override)
+
+    # (1) All three paths — the launch loop and BOTH guards — read the single
+    # source, once per config, in config order.
+    assert by_caller.get("run_sweep") == expected, (
+        "run_sweep must build every launched trial through bench._trial_flags")
+    assert by_caller.get("_effective_flags") == expected, (
+        "_effective_flags must read the trial through bench._trial_flags, not "
+        "re-inline plan.flags.model_copy(update=override)")
+    assert by_caller.get("_effective_env") == expected, (
+        "_effective_env must read the trial through bench._trial_flags, not "
+        "re-inline plan.flags.model_copy(update=override)")
+
+    # (2) The helper's RETURN VALUE is what reaches the child, so a wrong return
+    # cannot silently launch flags the guards never saw.
+    assert [t.flags for t in launched] == [
+        _plan().flags.model_copy(update=o) for o in expected], (
+        "the flags the child was launched with are not bench._trial_flags's "
+        "return value")
 
