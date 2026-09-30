@@ -701,14 +701,24 @@ def sweep_configs(base: ComboFlags, moe: bool,
                   caps: tuple | list = ()) -> list[tuple[str, dict]]:
     """Flag-override sets to A/B on this machine. Baseline first; each entry is
     a partial ComboFlags update. Axes come from the RDNA4 findings: FA gates the
-    fast KV path, symmetric KV precision, prefill batch, Vulkan coopmat, and
-    (MoE only) graphics-queue + offload depth."""
+    fast KV path, symmetric KV precision, prefill batch, Vulkan coopmat,
+    host-side KV-op placement (C2 `--no-op-offload`), and (MoE only)
+    graphics-queue + offload depth."""
     cfgs: list[tuple[str, dict]] = [("baseline", {})]
     cfgs.append(("fa-off", {"flash_attn": "off"}))
     cfgs.append(("kv-q8", {"cache_type_k": "q8_0", "cache_type_v": "q8_0"}))
     cfgs.append(("kv-q4", {"cache_type_k": "q4_0", "cache_type_v": "q4_0"}))
     cfgs.append(("batch-big", {"batch": 16384, "ubatch": 2048}))
     cfgs.append(("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}}))
+    # C2: keep the KV KQ/KQV ops on the CPU (llama.cpp `--no-op-offload`). Same
+    # class as the driver env toggles above — a per-machine placement lever whose
+    # direction on RDNA4 is a measurement, not a derivation. The engine accepts
+    # it at both pins and its compiled default is op-offload ON, so the OFF case
+    # is the untouched baseline and emits nothing; the ON case is this one entry,
+    # and the row records `{"no_op_offload": true}` as its flags. Deliberately
+    # NOT in quick_configs: a default load must not change. See
+    # ComboFlags.no_op_offload for the upstream URLs/lines and the PREDICTION.
+    cfgs.append(("no-op-offload", {"no_op_offload": True}))
     if moe:
         cfgs.append(("gfxqueue-on", {"env": {"GGML_VK_ALLOW_GRAPHICS_QUEUE": "1"}}))
         if base.n_cpu_moe > 0:
@@ -736,6 +746,9 @@ def quick_configs(base: ComboFlags, moe: bool,
     cfgs.append(("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}}))
     if moe:
         cfgs.append(("gfxqueue-on", {"env": {"GGML_VK_ALLOW_GRAPHICS_QUEUE": "1"}}))
+    # NOTE: the C2 `--no-op-offload` axis is deliberately NOT in the first-load
+    # set either: it is a sweep-only trial, so a default load's argv is unchanged
+    # whether or not the sweep has ever been run.
     # NOTE: spec-mtp trials deliberately NOT in the auto first-load set.
     # Live lesson 2026-07-21: the 96-token bench summarises highly
     # predictable filler, which inflates MTP draft acceptance — draft-mtp
