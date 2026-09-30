@@ -69,11 +69,13 @@ def test_the_text_is_not_one_repeated_sentence():
     assert len(set(words)) > 60, f"only {len(set(words))} distinct words"
 
 
-def test_the_text_reaches_the_requested_token_budget():
-    # "tokens" are words — the same unit the old filler was sized in. The
-    # builder truncates its last sentence, so the budget is exact.
-    for n in (16, 64, 1024, 4096):
-        assert len(bench.bench_text(n).split()) == n
+def test_the_text_is_sized_exactly_like_the_legacy_filler():
+    """Replacing the filler must not move the prompt SIZE: the old filler was
+    ``9 * (n // 8)`` words, so the new builder is too. Equality, not a
+    tolerance — a tolerance here would hide an incidental change of size riding
+    along with the intended change of text."""
+    for n in (8, 16, 64, 512, 1024, 2048, 4096, 131072):
+        assert len(bench.bench_text(n).split()) == _legacy_words(n), n
 
 
 def test_different_budgets_build_different_text():
@@ -81,31 +83,33 @@ def test_different_budgets_build_different_text():
     assert short != long[:len(short)]
 
 
-def test_a_zero_budget_is_empty_not_a_crash():
-    assert bench.bench_text(0) == ""
+def test_a_sub_eight_budget_is_empty_like_the_legacy_filler():
+    # the old code did `"..." * (n // 8)`, which is "" for n < 8
+    for n in (0, 1, 7):
+        assert bench.bench_text(n) == ""
 
 
 # --- the default path is unchanged -------------------------------------------
 
 def test_no_depth_keeps_the_pre_depth_prompt_size():
-    """The default path must still size the prompt by ``prompt_tokens``, as the
-    old filler did. The old formula produced 9 words per 8-token sentence, so
-    the budget is preserved to within 15%."""
-    old = _legacy_words(2048)
-    new = len(bench.bench_text(2048).split())
-    assert abs(new - old) / old < 0.15
+    """The default path must send the SAME size prompt the old filler did — the
+    variety change is isolated from the size change. The old formula produced
+    9 words per 8-token sentence."""
+    assert len(bench.bench_text(2048).split()) == _legacy_words(2048)
 
 
 def test_run_bench_default_sends_no_fill_and_records_no_depth(monkeypatch):
     sent = {}
     _capture(monkeypatch, sent)
-    r = bench.run_bench(11500, prompt_tokens=512, gen_tokens=8)
+    r = bench.run_bench(11500, prompt_tokens=2048, gen_tokens=8)
     content = sent["messages"][0]["content"]
-    # no fill: the window is only as deep as the measured prompt itself
-    assert len(content.split()) <= _legacy_words(512) + 20
-    assert r.prompt_tokens == 512
+    # exactly the legacy prompt: 9*(2048//8) filler words + the 4-word
+    # "Summarize in one sentence." instruction the old code appended
+    assert len(content.split()) == _legacy_words(2048) + 4
+    assert r.prompt_tokens == 2048
     assert r.depth is None
     assert r.ctx is None
+    assert r.filler == bench.FILLER_GENERATION
 
 
 # --- the depth dimension -----------------------------------------------------
@@ -116,18 +120,20 @@ def test_depth_fills_the_window_and_is_recorded(monkeypatch):
     r = bench.run_bench(11500, prompt_tokens=512, gen_tokens=8,
                         depth=4096, ctx=131072)
     words = len(sent["messages"][0]["content"].split())
+    assert words == _legacy_words(4096) + 4, words
     assert words >= 4096, f"window only {words} deep, asked for 4096"
-    assert words <= 4096 + 20, f"window overshot to {words}"
     assert r.depth == 4096
     assert r.ctx == 131072
-    # the number that was actually measured is what gets recorded
+    # the occupancy that was requested is what gets recorded
     assert r.prompt_tokens == 4096
+    assert r.filler == bench.FILLER_GENERATION
 
 
 def test_depth_never_shrinks_a_larger_prompt(monkeypatch):
     sent = {}
     _capture(monkeypatch, sent)
     r = bench.run_bench(11500, prompt_tokens=2048, gen_tokens=8, depth=256)
+    assert len(sent["messages"][0]["content"].split()) == _legacy_words(2048) + 4
     assert r.prompt_tokens == 2048
     assert r.depth == 256
 
@@ -137,17 +143,33 @@ def test_depth_never_shrinks_a_larger_prompt(monkeypatch):
 def test_depth_round_trips_through_the_calibration_store(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     r = BenchResult(pp_tps=100, tg_tps=50, prompt_tokens=4096,
-                    gen_tokens=8, depth=4096, ctx=131072)
-    bench.save_calibration("m:q:vulkan", r.model_dump())
+                    gen_tokens=8, depth=4096, ctx=131072,
+                    filler=bench.FILLER_GENERATION)
+    bench.save_calibration("m:q:vulkan", r.as_measured())
     entry = bench.load_calibration()["m:q:vulkan"]
     assert bench.measured_depth(entry) == 4096
     assert entry["measured"]["ctx"] == 131072
+    assert bench.measured_filler(entry) == bench.FILLER_GENERATION
+
+
+def test_as_measured_omits_an_unknown_depth_and_ctx():
+    """A missing key and a null must not be two spellings of the same fact: a
+    caller doing ``"depth" in measured`` has to be able to tell "not recorded"
+    from a recorded value."""
+    d = BenchResult(pp_tps=1, tg_tps=2, prompt_tokens=8, gen_tokens=8,
+                    filler=bench.FILLER_GENERATION).as_measured()
+    assert "depth" not in d and "ctx" not in d
+    assert d["filler"] == bench.FILLER_GENERATION
+    d2 = BenchResult(pp_tps=1, tg_tps=2, prompt_tokens=8, gen_tokens=8,
+                     depth=4096, ctx=131072).as_measured()
+    assert d2["depth"] == 4096 and d2["ctx"] == 131072
 
 
 def test_a_legacy_entry_without_depth_reads_as_unknown(tmp_path, monkeypatch):
     """An entry written before depth existed has no ``depth`` key. That is
     UNKNOWN, not 0 — 0 would claim the window was empty, which the old entries
-    cannot support."""
+    cannot support. It also predates the filler marker, so its number came from
+    the old repeated sentence and must not be compared with a new one."""
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     bench.save_calibration("m:q:vulkan",
                            {"tg_tps": 50, "pp_tps": 100,
@@ -155,6 +177,19 @@ def test_a_legacy_entry_without_depth_reads_as_unknown(tmp_path, monkeypatch):
     entry = bench.load_calibration()["m:q:vulkan"]
     assert "depth" not in entry["measured"]
     assert bench.measured_depth(entry) is None
+    # and no filler marker either: it was measured with the old repeated
+    # sentence, so its number is not comparable with a new one
+    assert "filler" not in entry["measured"]
+    assert bench.measured_filler(entry) is None
+
+
+def test_measured_filler_reads_the_generator_marker():
+    assert bench.measured_filler(
+        {"measured": {"filler": bench.FILLER_GENERATION}}) == bench.FILLER_GENERATION
+    assert bench.measured_filler({"measured": {"filler": ""}}) is None
+    assert bench.measured_filler({"measured": {"filler": None}}) is None
+    assert bench.measured_filler({"measured": {}}) is None
+    assert bench.measured_filler({}) is None
 
 
 def test_a_stored_null_or_zero_depth_is_unknown_not_zero():
@@ -194,12 +229,15 @@ def test_run_sweep_records_and_logs_depth(monkeypatch, tmp_path):
                            port=11601, prompt_tokens=512, gen_tokens=8,
                            depth=4096)
     assert rows[0]["depth"] == 4096
+    assert rows[0]["filler"] == bench.FILLER_GENERATION
     logged = [json.loads(x) for x in
               (tmp_path / "logs" / "bench-rows.jsonl").read_text(
                   encoding="utf-8").splitlines() if x]
     assert logged[0]["depth"] == 4096
+    assert logged[0]["filler"] == bench.FILLER_GENERATION
     entry = next(iter(bench.load_calibration().values()))
     assert bench.measured_depth(entry) == 4096
+    assert bench.measured_filler(entry) == bench.FILLER_GENERATION
 
 
 def test_run_sweep_default_records_unknown_depth(monkeypatch, tmp_path):
@@ -218,6 +256,15 @@ def test_run_sweep_default_records_unknown_depth(monkeypatch, tmp_path):
                         lambda base, moe, caps=(): [("fa-off", {"flash_attn": "off"})])
     rows = bench.run_sweep(_plan(), tmp_path / "srv.exe", tmp_path / "m.gguf",
                            port=11601)
-    assert rows[0]["depth"] is None
+    # a depth-less row must OMIT the key, not carry a null a reader could take
+    # for a recorded value
+    assert "depth" not in rows[0]
+    logged = [json.loads(x) for x in
+              (tmp_path / "logs" / "bench-rows.jsonl").read_text(
+                  encoding="utf-8").splitlines() if x]
+    assert "depth" not in logged[0]
     entry = next(iter(bench.load_calibration().values()))
+    assert "depth" not in entry["measured"]
     assert bench.measured_depth(entry) is None
+    # the generator marker is always written by the new path
+    assert bench.measured_filler(entry) == bench.FILLER_GENERATION

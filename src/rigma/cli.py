@@ -1575,8 +1575,8 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     typer.echo(verdict(r, combo_expected))
     from .bench import calibration_key, current_identity
     _be = s.get("backend", "unknown")
-    save_calibration(calibration_key(s["model"], s["quant"], _be), r.model_dump(),
-                     identity=current_identity(_be))
+    save_calibration(calibration_key(s["model"], s["quant"], _be),
+                     r.as_measured(), identity=current_identity(_be))
     # AUDIT F15-7: `~` is POSIX shorthand — Explorer and cmd do not expand it.
     # Print the path the file was actually written to.
     typer.echo(f"recorded to {calibration_path()}")
@@ -1586,7 +1586,7 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
                    "date": datetime.date.today().isoformat(),
                    "llamacpp": _engines_manifest()["version"],
                    "os": platform.system().lower(),
-                   "measured": r.model_dump()}
+                   "measured": r.as_measured()}
         Path(evidence).parent.mkdir(parents=True, exist_ok=True)
         Path(evidence).write_text(_json.dumps(payload, indent=2), encoding="utf-8")
         typer.echo(f"evidence written -> {evidence}")
