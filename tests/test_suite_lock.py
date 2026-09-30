@@ -11,6 +11,11 @@ The state these tests deliberately DO put the code in — because a naive lock
 would wedge the suite forever there — is a lock file whose owner is **gone**,
 one whose owner pid is **alive but is a different process** (a recycled pid),
 and one whose contents are **unreadable**. All must be taken over, not honoured.
+
+SUITELOCK-n1 adds the opposite case: an owner that is **alive** but whose
+recorded create time is `0.0` — the value `_acquire_suite_lock` itself writes
+when psutil cannot read its own create time. That one must be HONOURED: an
+unreadable identity must not make a live owner's lock stealable.
 """
 import json
 import os
@@ -160,6 +165,78 @@ def test_a_recycled_pid_does_not_wedge_the_suite(tmp_path):
         encoding="utf-8")
     path, holder = conftest._acquire_suite_lock(lock)
     assert holder is None and path is not None
+
+
+def test_an_unreadable_create_time_does_not_make_a_live_owners_lock_stealable(tmp_path):
+    """SUITELOCK-n1: `_acquire_suite_lock` writes `started_at = 0.0` when psutil
+    cannot read the owner's OWN create time, so 0.0 must mean "unknown", not
+    "dead". A LIVE pid with a 0.0 stamp is an owner we cannot attribute, and
+    stealing its lock is exactly the two-concurrent-full-suites case (REC-1)
+    the lock exists to prevent. This is the opposite of the recycled-pid case
+    above, which carries a RECORDED time that disagrees with the live pid."""
+    lock = tmp_path / "s.lock"
+    lock.write_text(json.dumps({"pid": os.getpid(), "started_at": 0.0}),
+                    encoding="utf-8")
+
+    assert conftest._owner_is_alive(os.getpid(), 0.0) is True
+
+    path, holder = conftest._acquire_suite_lock(lock)
+    assert path is None and holder is not None, (
+        "a live owner whose create time could not be read had its lock stolen")
+    assert holder["pid"] == os.getpid()
+    assert lock.exists()
+
+
+def test_a_lock_written_after_a_psutil_failure_is_not_immediately_stealable(
+        tmp_path, monkeypatch):
+    """The exact writer→reader path SUITELOCK-n1 is about: when psutil cannot
+    read our OWN create time, `_acquire_suite_lock` writes `started_at: 0.0`;
+    the very next acquire in the same live process must still see the owner as
+    alive, or a psutil hiccup turns the lock into a no-op for the two concurrent
+    full suites it exists to separate."""
+    real_process = psutil.Process
+    calls = {"n": 0}
+
+    class _FlakyProcess:
+        def __init__(self, pid):
+            self._real = real_process(pid)
+
+        def create_time(self):
+            # Fail only the FIRST self-read — the writer's — then behave.
+            calls["n"] += 1
+            if calls["n"] == 1 and self._real.pid == os.getpid():
+                raise RuntimeError("psutil cannot read this process's create time")
+            return self._real.create_time()
+
+    monkeypatch.setattr(psutil, "Process", _FlakyProcess)
+
+    lock = tmp_path / "s.lock"
+    path, holder = conftest._acquire_suite_lock(lock)
+    assert holder is None and path is not None
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    assert rec["started_at"] == 0.0, rec
+
+    again, holder = conftest._acquire_suite_lock(lock)
+    assert again is None and holder is not None, (
+        "a lock written after a psutil failure was immediately stolen")
+    assert holder["pid"] == os.getpid()
+
+
+def test_an_unreadable_create_time_on_a_dead_pid_is_still_taken_over(tmp_path):
+    """The other bound of SUITELOCK-n1: treating 0.0 as "alive" must not wedge
+    the suite on a lock whose owner is GONE. A dead pid fails the psutil call,
+    so its leftover 0.0 lock is taken over like any other crash residue."""
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    lock = tmp_path / "s.lock"
+    lock.write_text(json.dumps({"pid": dead.pid, "started_at": 0.0}),
+                    encoding="utf-8")
+
+    assert conftest._owner_is_alive(dead.pid, 0.0) is False
+
+    path, holder = conftest._acquire_suite_lock(lock)
+    assert holder is None and path is not None
+    assert json.loads(path.read_text(encoding="utf-8"))["pid"] == os.getpid()
 
 
 def test_an_unreadable_lock_is_taken_over(tmp_path):
