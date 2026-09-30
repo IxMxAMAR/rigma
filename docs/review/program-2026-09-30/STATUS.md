@@ -1,5 +1,8 @@
 # STATUS — Rigma improvement program, 2026-09-30
 
+> **ORCHESTRATOR NOTE (14:05 UTC) - NEW GUIDANCE, entries 6 and 7.** An independent deep review found nine issues (three MED) inside fixes already merged: A18 can overwrite a good run.json with a stub, the Windows ACP stop kills only the mcode.cmd shim, and A1's not-saved branch falls through into compaction. Details in `.scratch/orchestrator/deep-review-1.md`; instructions in `.scratch/orchestrator/GUIDANCE.md`. Read both before the next wave, then delete this note.
+
+
 > **GUIDANCE 4+5 (posted 12:20 UTC) — READ AND ACTIONED in wave 7.** A17's split baseline is wrong
 > (a healthy all-GPU load has `graph splits = 2`, because the token-embedding lookup runs on the host;
 > `compare_plan`'s `expected_splits=1` and `test_engine_log_memory.py:156` therefore flag the owner's
@@ -84,6 +87,9 @@ Integration branch head: `773d39d`.
 | A5c/A11c/A7b | 7 | `773d39d` | `--refuse` is reachable on `plan`/`up` and can no longer be swallowed by the fallback ladder — **`typer.Exit` IS a `RuntimeError`**, so `up` was serving the next model after a refusal; the restore region holds the store lock; an unknown MCP profile is refused instead of coerced. |
 | A2d-gap/A11b/A16e | 8 | `acc5c41` | The `rs=unknown` label now fires in the one shape where the count can be wrong (an explicit `attention.recurrent_layers` array **plus** `full_attention_interval`), the CRLF contract is pinned by test, and a dead assignment is gone. |
 | W5F1a/A16b/B6c/D4a | 6 | `baa1178`…`4edea5e` | Frontend wave 2: the wave-1 render fixes are testable, a broken fit renders as broken, advertised ACP commands are runnable, and `/api/settings` has a UI. |
+| A17e | 9 | `eac509f` (`420ff3d`) | The split baseline now counts one run per device, derived from the load's own device labels (`1 + n_devices`), and reads `not_comparable` when it cannot derive them. A two-device healthy load yields no finding; the real single-device log is byte-identical. **Residual (recorded):** a whole device silently dropping out shrinks the label set with it, so it is invisible from a log-only surface — and the plan carries no device count to compare against. |
+| A2d-budget/A2e | 9 | `a23dc7b` (`1ed4940`, `99fc00c`) | The budget row carries `rs_unknown` beside an **unchanged** `rs_mb` charge, so the surface used to pick a quant can say the recurrent-state term is an estimate. A2e closed as **cosmetic** with the arithmetic pinned (`round(X+299.25)−round(X)=300`; the "exact delta" fix would be worse, because `over_mb`'s sign is the over/headroom verdict). **The wire half only** — the Models page still does not render `rs_mb`, so a frontend follow-up is needed before the item is user-visibly closed. |
+| W5F1a/B6d/B4b/D3b | 9 | `703337d` `3190295` `68b8edc` `f3861b9` `3c94cd8` | Frontend wave 3: the four remaining A8c/D5 call sites are asserted (each with a delete-the-line proof); a mode control offers the session's **own** advertised modes (never hardcoded, "unknown" when absent); mcode's question is a real form that submits `{requestId, answer}` instead of Allow/Refuse; a reloaded streaming chat no longer says "interrupted" (rail dot + bounded poll, and a poll cannot race a turn this tab owns). |
 
 Legend: `_in flight_` = implementer working · `_verifying_` = verifier running · `_merged_` = on the
 integration branch · `_rejected once_` = sent back to the implementer with the verifier's finding.
