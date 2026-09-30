@@ -486,6 +486,48 @@ def test_heal_carries_an_unknown_recurrent_geometry(home):
     assert recurrent_state_unknown(spec)
 
 
+def _nokv_gguf(path):
+    """A dense header that declares attention heads but NO
+    `attention.head_count_kv`: the probe derives kv_heads = 0 and reports the KV
+    geometry unknown (A2d-kv)."""
+    kvs = [
+        _kv_str(b"general.architecture", b"qwen3"),
+        _kv_str(b"general.name", b"No-KV Tune"),
+        _kv_u32(b"qwen3.block_count", 8),
+        _kv_u32(b"qwen3.context_length", 32768),
+        _kv_u32(b"qwen3.embedding_length", 1024),
+        _kv_u32(b"qwen3.attention.head_count", 16),
+    ]
+    path.write_bytes(b"GGUF" + struct.pack("<I", 3)
+                     + struct.pack("<Q", 0) + struct.pack("<Q", len(kvs))
+                     + b"".join(kvs))
+    return path
+
+
+def test_heal_carries_an_unknown_kv_geometry(home):
+    """A2d-kv: a spec for a header that omitted `attention.head_count_kv` has
+    kv_heads = 0 and no rs flag, so the OLD heal gate rejected it — its confident
+    `kv=0MB` would have survived the fix. PROBE_VERSION 6 re-probes it, the new
+    `kv_geometry_unknown` branch of the gate accepts it, and the flag reaches the
+    spec and the persisted store."""
+    import json
+
+    from rigma.resolve import kv_geometry_unknown
+    (home / "models").mkdir(parents=True, exist_ok=True)
+    _nokv_gguf(home / "models" / "n.gguf")
+    _stale_spec(home, "n.gguf", n_layers=8, full_attn_layers=8,
+                kv_heads=0, head_dim=64)
+    spec = Registry.load().models["hybrid-tune"]
+    assert spec.probe_version == hangar.PROBE_VERSION
+    assert spec.kv_heads == 0
+    assert spec.kv_geometry_unknown is True
+    assert kv_geometry_unknown(spec)
+    on_disk = json.loads(
+        (home / "custom" / "models" / "hybrid-tune.json").read_text())
+    assert on_disk["kv_geometry_unknown"] is True
+    assert on_disk["probe_version"] == hangar.PROBE_VERSION
+
+
 def test_registry_models_are_never_rewritten_by_healing(home, tmp_path):
     """Registry entries are hand-authored and researched. Healing only ever
     touches custom imports."""

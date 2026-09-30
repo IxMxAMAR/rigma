@@ -4,12 +4,12 @@ The A2 family removed the same "silent confidence" for the split baseline, the
 VRAM divergence and the recurrent geometry. The KV cache was the last term that
 could read as measured while resting on a guess: `kv_bytes_per_token` returns 0
 when `attention.head_count_kv` is absent, and `swa_kv_bytes` returns 0 when the
-windowed layers were identified but their window length was not â€” and the fit
+windowed layers were identified but their window length was not — and the fit
 printed a bare `kv=0MB` (or a confident global-only number) with no provenance.
 
 These headers are built for real and pushed through `inspect_gguf` and
 `spec_fields_from_probe`, so the derived width, layer split and window term are
-the probe's own â€” not a stubbed `ModelSpec`.
+the probe's own — not a stubbed `ModelSpec`.
 """
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ def _dense_kvs(head_count_kv: bool = True) -> list[bytes]:
 
 def _swa_kvs(window: bool) -> list[bytes]:
     """gemma4-style SWA: 5 windowed layers, 1 global. `window=False` drops the
-    `attention.sliding_window` key â€” the PARTIAL geometry the item names."""
+    `attention.sliding_window` key — the PARTIAL geometry the item names."""
     kvs = [
         _kv_str(b"general.architecture", b"gemma4"),
         _kv_u32(b"gemma4.block_count", 6),
@@ -122,6 +122,38 @@ def _hybrid_kvs(declared: bool) -> list[bytes]:
     return kvs
 
 
+def _mamba_kvs() -> list[bytes]:
+    """A pure-Mamba header: a complete ssm.* geometry and NO attention keys
+    (mirrors tests/test_gguf_meta.py::_mamba_kvs). The probe reads it as
+    `full_attn_layers == n_layers` — there is no pattern, so every layer falls
+    through to full attention — with `kv_heads == 0` and `head_dim == 0`. That
+    combination is what the derived clause must NOT flag."""
+    return [
+        _kv_str(b"general.architecture", b"mamba"),
+        _kv_u32(b"mamba.block_count", 48),
+        _kv_u32(b"mamba.context_length", 32768),
+        _kv_u32(b"mamba.embedding_length", 2048),
+        _kv_u32(b"mamba.ssm.state_size", 128),
+        _kv_u32(b"mamba.ssm.inner_size", 4096),
+        _kv_u32(b"mamba.ssm.conv_kernel", 4),
+        _kv_u32(b"mamba.ssm.group_count", 1),
+    ]
+
+
+def _mistral_kvs() -> list[bytes]:
+    """Mainstream Mistral: a scalar kv count plus `attention.sliding_window`,
+    but NO `sliding_window_pattern`."""
+    return [
+        _kv_str(b"general.architecture", b"llama"),
+        _kv_u32(b"llama.block_count", 32),
+        _kv_u32(b"llama.context_length", 32768),
+        _kv_u32(b"llama.embedding_length", 4096),
+        _kv_u32(b"llama.attention.head_count", 32),
+        _kv_u32(b"llama.attention.head_count_kv", 8),
+        _kv_u32(b"llama.attention.sliding_window", 4096),
+    ]
+
+
 def _spec(tmp_path, kvs, name="m.gguf") -> ModelSpec:
     fields = inspect_gguf(_write(tmp_path, kvs, name)).spec_fields
     return ModelSpec(slug="m", family="qwen3", kind="dense", custom=True,
@@ -156,7 +188,7 @@ def _flag(spec) -> bool:
 
 def test_a_missing_head_count_kv_is_unknown_not_a_confident_zero(tmp_path):
     """The item's first shape: no `attention.head_count_kv`. `kv_bytes_per_token`
-    returns 0, and the fit printed a bare `kv=0MB` â€” a number with no way to tell
+    returns 0, and the fit printed a bare `kv=0MB` — a number with no way to tell
     it from a model that genuinely holds no KV cache."""
     spec = _spec(tmp_path, _dense_kvs(head_count_kv=False))
     assert spec.kv_heads == 0
@@ -178,7 +210,7 @@ def test_a_missing_head_count_kv_is_unknown_not_a_confident_zero(tmp_path):
 def test_a_partial_swa_geometry_is_unknown_not_a_silent_undercharge(tmp_path):
     """The item's second shape: the pattern identifies 5 windowed layers, but
     `attention.sliding_window` is missing. Those layers are EXCLUDED from the
-    growing cache and their own cache is charged zero â€” an under-charge the fit
+    growing cache and their own cache is charged zero — an under-charge the fit
     printed as a confident global-only number."""
     spec = _spec(tmp_path, _swa_kvs(window=False))
     assert spec.swa_layers == 0 and spec.swa_window == 0   # zeroed by the guard
@@ -279,6 +311,59 @@ def test_the_interval_hybrid_without_the_array_keeps_its_confident_kv(tmp_path):
     assert "unknown" not in line, line
 
 
+def test_a_real_mamba_header_is_not_flagged_for_kv(tmp_path):
+    """Regression guard for the A2d-kv verifier FAIL: the derived clause flagged
+    EVERY pure-Mamba spec `kv=unknown`, because the probe reads a Mamba header as
+    `full_attn_layers == n_layers` (48) with `kv_heads == 0`, so the old
+    `full_attn_layers > 0 and kv_heads <= 0` fired. `head_dim == 0` is the
+    attention evidence that separates it from a dense header that merely omitted
+    `attention.head_count_kv` (head_dim 64, which MUST stay flagged).
+
+    Built from a REAL header, not a hand-made spec: the earlier control used
+    `full_attn_layers=0`, a shape the probe never produces for a Mamba file, so
+    it hid the bug."""
+    f = inspect_gguf(_write(tmp_path, _mamba_kvs(), "mamba.gguf")).spec_fields
+    assert f["kv_geometry_unknown"] is False        # the probe does not flag it
+    assert f["full_attn_layers"] == 48              # no pattern: all "full"
+    assert f["kv_heads"] == 0 and f["head_dim"] == 0
+    spec = _spec(tmp_path, _mamba_kvs(), "mamba.gguf")
+    assert spec.kv_geometry_unknown is False
+    assert not _flag(spec)                          # ... and resolve must not
+
+    row = _budget_rows(spec, spec.ggufs[0], 0.0, 8192, 15000.0)
+    assert row["kv_mb"] == 0
+    assert row["kv_unknown"] is False
+
+    explain: list[str] = []
+    flags = fit_gguf(spec, spec.ggufs[0], _profile(), 8192, explain)
+    assert flags is not None
+    line = _kv_line(explain)
+    assert "kv=0MB " in line, line                  # a confident (real) zero
+    assert "kv=unknown" not in line, line
+    assert "rs=unknown" in line, line               # the RS gap stays labelled
+
+
+def test_a_window_without_a_pattern_is_not_flagged(tmp_path):
+    """A2d-kv verifier nit, decided: a mainstream Mistral-style scalar header
+    declares `attention.sliding_window` but no `sliding_window_pattern`.
+    llama.cpp reads that as all layers windowed; this module cannot represent
+    it, so it charges every layer at full ctx — a safe OVER-estimate, not an
+    absence of evidence. Labelling a whole mainstream family `kv=unknown` is
+    noise, so the window-without-pattern shape is deliberately not flagged."""
+    f = inspect_gguf(_write(tmp_path, _mistral_kvs(), "mistral.gguf")).spec_fields
+    assert f["swa_layers"] == 0 and f["swa_window"] == 0   # unmodelled, zeroed
+    assert f["kv_geometry_unknown"] is False
+    spec = _spec(tmp_path, _mistral_kvs(), "mistral.gguf")
+    assert not _flag(spec)
+
+    explain: list[str] = []
+    flags = fit_gguf(spec, spec.ggufs[0], _profile(), 8192, explain)
+    assert flags is not None
+    line = _kv_line(explain)
+    assert "kv=unknown" not in line, line
+    assert "kv=1024MB " in line, line   # full-ctx over-estimate, still confident
+
+
 # --- propagation: probe -> spec -> fit/API -----------------------------------
 
 def test_the_probe_flag_reaches_the_spec_through_the_shared_plumbing(tmp_path):
@@ -309,28 +394,30 @@ def test_the_flag_survives_the_row_the_models_page_reads(tmp_path):
 def test_a_spec_stored_before_the_flag_is_derived_unknown():
     """A spec written by an older probe carries no flag. Attention layers are
     declared but the growing cache's width is zero, which is the same statement
-    â€” so the fit must not present that zero as measured."""
+    — so the fit must not present that zero as measured. head_dim 64 is the
+    attention evidence: a pure-Mamba spec has head_dim 0 and is excluded (see
+    `test_a_real_mamba_header_is_not_flagged_for_kv`)."""
     spec = ModelSpec(slug="old", family="qwen3", kind="dense", n_layers=8,
                      full_attn_layers=8, kv_heads=0, head_dim=64,
                      native_ctx=8192, cache_type_policy=CachePolicy(),
                      ggufs=[GgufFile(repo="local", file="o.gguf",
                                      bytes=100 * MIB, quant="Q4_K_M")])
     assert spec.kv_geometry_unknown is False       # not stored by the old probe
-    assert _flag(spec)               # but derived all the same
+    assert _flag(spec)                             # but derived all the same
     row = _budget_rows(spec, spec.ggufs[0], 0.0, 8192, 15000.0)
     assert row["kv_unknown"] is True
 
 
-def test_a_pure_mamba_spec_is_not_flagged_for_kv():
-    """A pure-Mamba model genuinely has no KV cache, so a zero-width cache is
-    the right answer there â€” its missing recurrent COUNT is what `rs_unknown`
-    reports. Flagging `kv_unknown` on every Mamba file would be noise."""
+def test_a_mamba_shaped_stored_spec_is_not_derived_unknown():
+    """The other half of the derived clause: the same missing-kv fields with
+    head_dim 0 (what a Mamba header actually probes to) must NOT be flagged."""
     spec = ModelSpec(slug="m", family="mamba", kind="dense", n_layers=48,
-                     full_attn_layers=0, kv_heads=0, head_dim=0,
-                     native_ctx=32768, recurrent_layers=0,
-                     rs_geometry_unknown=True, cache_type_policy=CachePolicy(),
+                     full_attn_layers=48, kv_heads=0, head_dim=0,
+                     native_ctx=32768, rs_geometry_unknown=True,
+                     cache_type_policy=CachePolicy(),
                      ggufs=[GgufFile(repo="local", file="m.gguf",
                                      bytes=100 * MIB, quant="Q4_K_M")])
+    assert spec.kv_geometry_unknown is False
     assert not _flag(spec)
     row = _budget_rows(spec, spec.ggufs[0], 0.0, 8192, 15000.0)
     assert row["kv_unknown"] is False
