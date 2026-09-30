@@ -21,6 +21,7 @@ import inspect
 import json
 import logging
 import os
+import pathlib
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -28,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 from fastapi.testclient import TestClient
 
-from rigma import runs, serve
+from rigma import runs, serve, sessions
 from rigma import state as st
 
 
@@ -200,6 +201,92 @@ def test_an_unreadable_first_load_releases_the_slot(engine, home):
     assert runs.active() is None, (
         "the run slot stayed claimed — every later POST /api/runs answers 409 "
         '"a run is already active"')
+
+
+# ---------------------------------------------------------------------------
+# DR1: the release must not destroy a record that was only LOCKED.
+#
+# `runs.load` returns None for both "the bytes could not be read" and "the bytes
+# were read and do not parse". The release treated both as unusable and wrote a
+# 4-field stub `{"id","status","halt_reason","stop_reason"}` over whatever was
+# there. A transient sharing violation against the atomic replace clears within
+# milliseconds, and `set_status` -> `atomic_write_text` retries the replace for
+# ~1 s — so the stub landed over a GOOD file: `session_id`, `mission`, `spec`,
+# `deadline` and every counter gone, and `restart_run` answering 409 "the run's
+# chat session was deleted" from then on, permanently.
+#
+# The test above pins only status and slot over a valid file, which is exactly
+# how the destructive overwrite got through. These two assert the behaviour the
+# owner needs: the record survives, and the run can still be RESTARTED.
+# ---------------------------------------------------------------------------
+
+
+def test_a_transiently_unreadable_run_json_survives_the_release(
+        engine, home):
+    """The owner's need, end to end: after a run's state was unreadable long
+    enough to release the slot, `restart` must still reattach — which it can
+    only do if `session_id` (and the mission) are still on disk."""
+    _Engine.script = [("manage_plan", {"action": "add", "task": "step one"})]
+    c = _client(engine)
+    sid = c.post("/api/sessions", json={}).json()["id"]
+    run = runs.create("keep my mission", sid)
+    rid = run["id"]
+
+    real = runs.load
+    runs.load = lambda _rid: None       # unreadable at the release
+    try:
+        serve._release_unreadable_run(runs, rid, "run state could not be read")
+    finally:
+        runs.load = real
+
+    doc = json.loads((runs.run_dir(rid) / "run.json").read_text(
+        encoding="utf-8"))
+    assert doc.get("status") == "interrupted", doc
+    assert doc.get("session_id") == sid, (
+        "the release replaced a GOOD run.json with a 4-field stub — "
+        f"session_id is gone: {doc}")
+    assert doc.get("mission") == "keep my mission", doc
+    assert doc.get("deadline"), doc
+    assert runs.active() is None, "the slot stayed claimed"
+
+    # …and the consequence the stub caused: a permanent 409.
+    resp = c.post(f"/api/runs/{rid}/restart")
+    assert resp.status_code == 200, (
+        "restart could not reattach after the release: "
+        f"{resp.status_code} {resp.text}")
+    assert resp.json().get("restarted") is True
+
+
+def test_a_failed_run_json_read_leaves_the_file_alone(home, monkeypatch):
+    """DR1, the transient-lock case: the READ raised, so the bytes on disk are
+    not evidence of anything. They must be left byte-identical — no stub, and no
+    backup either, because there is nothing wrong with them."""
+    run = runs.create("mission", "sess-1")
+    rid = run["id"]
+    rj = runs.run_dir(rid) / "run.json"
+    before = rj.read_bytes()
+
+    real_load, real_read = runs.load, pathlib.Path.read_text
+    runs.load = lambda _rid: None
+
+    def _locked(self, *a, **k):
+        if self == rj:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", _locked)
+    try:
+        serve._release_unreadable_run(runs, rid, "run state could not be read")
+    finally:
+        runs.load = real_load
+
+    assert rj.read_bytes() == before, (
+        "a run.json whose READ failed was overwritten anyway — the bytes may "
+        "have been a perfectly good record")
+    assert not list(runs.run_dir(rid).glob("run.json.unreadable-*")), (
+        "there was nothing wrong with the bytes, so there is nothing to back up")
+    # the pointer was readable and pointed at THIS run, so the slot is released
+    assert runs.active() is None
 
 
 # ---------------------------------------------------------------------------
@@ -397,3 +484,93 @@ def test_an_unwritable_run_json_logs_the_residual_loudly(
     assert any("still says 'running'" in r.getMessage()
                for r in caplog.records), (
         [r.getMessage() for r in caplog.records])
+
+
+# ---------------------------------------------------------------------------
+# DR8: the first-load `return` sat BEFORE the try/finally, and an unreadable
+# active.json was treated as this run's claim.
+# ---------------------------------------------------------------------------
+
+
+def test_a_released_first_load_still_runs_the_loops_cleanup(engine, home):
+    """DR8: a run released for an unreadable state skipped every piece of
+    end-of-run cleanup, because its `return` was before the `try/finally`. The
+    owner sees two of the consequences: the chat keeps `mission`/`run_id` (so it
+    is never auto-titled again and compacts in masking style), and progress.md
+    never gets its "RUN INTERRUPTED" line.
+
+    The lock is transient in the way the guard exists for: it is gone by the
+    time the release re-reads, so the run IS released and its record IS
+    recovered — the cleanup then has a session to clear."""
+    _Engine.script = [("manage_plan", {"action": "add", "task": "step one"})]
+    c = _client(engine)
+    rid = c.post("/api/runs", json={"mission": "small job",
+                                    "budget_hours": 1}).json()["id"]
+    sid = runs.load(rid)["session_id"]
+
+    real = runs.load
+    seen = {"n": 0}
+
+    def flaky(rid_):
+        frame = inspect.currentframe().f_back
+        caller = frame.f_code.co_name if frame is not None else ""
+        # exactly the loop's three retries fail; the release's own re-read and
+        # the finally's re-read see the file again
+        if caller == "_load_run_for_loop" and seen["n"] < 3:
+            seen["n"] += 1
+            return None
+        return real(rid_)
+
+    runs.load = flaky
+    try:
+        _wait_for(c, rid, lambda r: r.get("status") in runs.TERMINAL)
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            if not (sessions.load(sid) or {}).get("mission"):
+                break
+            time.sleep(0.05)
+    finally:
+        runs.load = real
+
+    assert seen["n"] == 3, ("the probe never failed the loop's first load — the "
+                            "code path moved; re-point this test")
+    sess = sessions.load(sid)
+    assert not sess.get("mission"), (
+        "the chat kept the run's mission — the first-load return skipped the "
+        "loop's finally, so it is never auto-titled again")
+    assert not sess.get("run_id"), sess.get("run_id")
+    log = (runs.run_dir(rid) / "progress.md").read_text(encoding="utf-8")
+    assert "RUN INTERRUPTED" in log, (
+        "the run ended with no RUN INTERRUPTED line in progress.md: " + log)
+
+
+def test_an_unreadable_pointer_does_not_clear_another_runs_claim(home):
+    """DR8: `runs.active()` returns None while a pointer is unreadable, so
+    `POST /api/runs` can already have started run B in that window. Run A's
+    release used to read the pointer as `{"id": A}` whenever the read failed and
+    clear it — dropping B's claim and leaving B's driver running with no slot."""
+    a = runs.create("A", "sess-a")
+    b = runs.create("B", "sess-b")        # active.json now points at B
+    ap = runs._active_path()
+    assert json.loads(ap.read_text(encoding="utf-8"))["id"] == b["id"]
+
+    real_load, real_read = runs.load, pathlib.Path.read_text
+
+    def _locked(self, *a_, **k):
+        if self == ap:
+            raise PermissionError(32, "The process cannot access the file")
+        return real_read(self, *a_, **k)
+
+    runs.load = lambda rid: None if rid == a["id"] else real_load(rid)
+    pathlib.Path.read_text = _locked
+    try:
+        serve._release_unreadable_run(runs, a["id"], "run state could not be read")
+    finally:
+        runs.load = real_load
+        pathlib.Path.read_text = real_read
+
+    assert ap.exists(), (
+        "run A's release DELETED active.json while it was unreadable — that is "
+        "run B's claim")
+    assert json.loads(real_read(ap, encoding="utf-8"))["id"] == b["id"]
+
