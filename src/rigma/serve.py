@@ -5151,8 +5151,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # C10: `batch`/`ubatch`/`ngl` likewise — Rigma could already EMIT
         # `-b`/`-ub`/`-ngl` but no caller could ask for them, so the owner could
         # not launch a model at a chosen batch/ubatch/ngl. `ubatch > batch` is
-        # refused by hangar (HangarError -> 400), because llama.cpp will not
-        # start with it.
+        # refused by the SERVER (HangarError -> 400, "ubatch {ub} exceeds batch
+        # {b}: the server refuses a physical batch larger than the logical
+        # batch"), NOT by the engine: at mainline b9867 src/llama-context.cpp:207
+        # llama.cpp CLAMPS it (`cparams.n_ubatch = std::min(cparams.n_batch,
+        # ...)`), so a launched engine would silently run the smaller physical
+        # batch. The 400 rejects the pair rather than let the requested `-ub` be
+        # silently ignored.
         allowed = {"quant", "ctx", "kv", "vision", "spec_type", "spec_n_max",
                    "backend", "batch", "ubatch", "ngl"}
         fields = {k: v for k, v in (body or {}).items() if k in allowed}
