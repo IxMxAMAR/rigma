@@ -28,6 +28,12 @@ _MAX_KEPT_ARRAY = 4096     # per-layer arrays are tiny; vocab arrays are not
 # a refusal that names the version.
 _KNOWN_GGUF_VERSIONS = (2, 3)
 
+# AUDIT 06R3-9: an upper bound for the tensor table's own arithmetic. Every
+# other count the parser reads has one (`n_kv`, `n_tensors`, `n_dims`, string
+# lengths); the product of a tensor's dims did not. The largest real model is
+# ~1e12 parameters, so a file declaring more than 1e15 cannot be real.
+_MAX_PARAMS = 10**15
+
 
 class GgufParseError(ValueError):
     pass
@@ -205,6 +211,7 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
     if n_tensors > 1_000_000:
         raise GgufParseError("implausible tensor count")
     for _ in range(n_tensors):
+        n = 0
         try:
             name = _read_str(f)
             n_dims = _read(f, "<I", 4)
@@ -218,6 +225,19 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
         except GgufParseError:
             idx.truncated = True
             return idx
+        # AUDIT 06R3-9: the dims are multiplied with no plausibility bound, and
+        # Python has no overflow — rank 8 with every dim 2**64-1 is not an
+        # error, it is a silently 3.4e153-element tensor. That count then
+        # survives every downstream ratio: moe_from_probe keeps a
+        # plausible-looking expert share and measured_bpw turns it into a
+        # -100% "drift" that reads as a real finding. The largest real model is
+        # ~1e12 parameters, so 1e15 is already beyond corrupt. The check is
+        # OUTSIDE the try: a GgufParseError raised inside it is caught as a
+        # truncated ranged read, which is the opposite verdict.
+        if n > _MAX_PARAMS or idx.params + n > _MAX_PARAMS:
+            raise GgufParseError(
+                f"implausible tensor size: {name!r} declares {n} elements, "
+                f"which puts the file over {_MAX_PARAMS} parameters")
         idx.params += n
         idx.type_counts[gtype] = idx.type_counts.get(gtype, 0) + 1
         if name.startswith("blk."):
