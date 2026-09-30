@@ -2626,26 +2626,33 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # id does not match the pending request, and a stale card must not
             # decide a later question.
             request_id = "q-" + os.urandom(4).hex()
+            # OD12N2-n1: the slot names the session whose turn asked, so the route
+            # can refuse an answer that arrives on ANOTHER chat's route — the
+            # scoping the pre-OD12-n2 per-session `_approvals` slot had for free.
             slot = {"requestId": request_id, "answer": None, "kind": "question",
                     "event": threading.Event(), "lock": threading.Lock(),
-                    "expired": False}
-            # OD12-n2: keyed by request id, so each question has its own slot and
-            # the route finds it by the id it was asked with.
-            _questions[request_id] = slot
-            # Same `approval/asked` channel as a permission ask. `kind` is what lets
-            # the UI draw a question form rather than an allow/deny card; the message
-            # and the requested schema are the question.
-            loop.call_soon_threadsafe(q.put_nowait, _harness.TurnEvent(
-                "state", event="approval/asked", data={
-                    "id": request_id,
-                    "kind": "question",
-                    "question": str(params.get("message") or ""),
-                    "schema": params.get("requestedSchema") or {},
-                    "reason": "mcode is asking a question; this turn is waiting "
-                              "for your answer",
-                    "awaiting": True,
-                }))
+                    "expired": False, "sid": sid}
+            # OD12N2-n2: registered INSIDE the guarded region. The ask is published
+            # between registration and the wait, and a raising publish (a closed
+            # loop at shutdown) used to leave the slot behind — new for a dict that
+            # is never overwritten, unlike the per-session `_approvals`.
             try:
+                # OD12-n2: keyed by request id, so each question has its own slot
+                # and the route finds it by the id it was asked with.
+                _questions[request_id] = slot
+                # Same `approval/asked` channel as a permission ask. `kind` is what
+                # lets the UI draw a question form rather than an allow/deny card;
+                # the message and the requested schema are the question.
+                loop.call_soon_threadsafe(q.put_nowait, _harness.TurnEvent(
+                    "state", event="approval/asked", data={
+                        "id": request_id,
+                        "kind": "question",
+                        "question": str(params.get("message") or ""),
+                        "schema": params.get("requestedSchema") or {},
+                        "reason": "mcode is asking a question; this turn is waiting "
+                                  "for your answer",
+                        "awaiting": True,
+                    }))
                 answered = slot["event"].wait(QUESTION_WAIT_SECS)
                 if not answered:
                     # OD-12. The timeout is re-checked under the slot's lock, which
@@ -5734,6 +5741,15 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # A permission keeps its per-session `_approvals` slot, unchanged.
         if answer is not None:
             slot = _questions.get(request_id) if request_id else None
+            # OD12N2-n1: the id alone is not enough — the slot also names the
+            # session whose turn asked. An answer for session A arriving on session
+            # B's route is refused (409, the same "not waiting" refusal the base's
+            # per-session lookup gave), so the scoping check the request id does not
+            # carry is not dropped. `serve.py`'s comment at the `_approvals`
+            # declaration is the rule: keying by session is what refuses an answer
+            # that belongs to a different chat.
+            if slot is not None and slot.get("sid") != sid:
+                slot = None
         else:
             slot = _approvals.get(sid)
         if slot is None:

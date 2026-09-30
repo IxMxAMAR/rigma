@@ -312,7 +312,7 @@ def test_an_answer_cannot_win_after_the_expiry_has_been_claimed(
         questions["q-claimed"] = {
             "requestId": "q-claimed", "answer": None, "kind": "question",
             "event": threading.Event(), "lock": threading.Lock(),
-            "expired": True,
+            "expired": True, "sid": s["id"],
         }
         r = c.post(f"/api/sessions/{s['id']}/approval",
                    json={"requestId": "q-claimed", "answer": {"path": "C:/work"}})
@@ -396,3 +396,111 @@ def test_two_concurrent_questions_each_keep_their_own_slot(
     decided = {d["data"]["id"]: d["data"]["decision"] for d in _decided(body)}
     assert decided == {"q-01010101": "answered",
                        "q-02020202": "answered"}, decided
+
+
+def test_an_answer_for_another_session_is_refused_and_does_not_reach_the_turn(
+        monkeypatch, tmp_path):
+    """OD12N2-n1. Keying question slots by request id alone dropped the
+    per-session scoping the old `_approvals` slot had for free: an answer for
+    session A posted through session B's route was accepted (200) and landed on
+    A's question. The request id is 32 random bits shown only on A's own stream,
+    so this is a dropped check rather than a misdirected answer — but it is the
+    check the `_approvals` comment says the session key exists for, and the base
+    refused it 409.
+
+    The same-session answer must be unchanged: still 200, still delivered."""
+    s = _app_and_session(monkeypatch, tmp_path)
+    other = sessions.create(title="other")
+    other["harness"] = "mcode"
+    other["mcode_transport"] = "acp"
+    sessions.save(other)
+    monkeypatch.setattr(serve, "QUESTION_WAIT_SECS", 5.0)
+
+    def _fake_acp(prompt, **kw):
+        answer = kw["on_question"]("elicitation/create", {
+            "message": "Which directory?",
+            "requestedSchema": {"type": "object",
+                                "properties": {"path": {"type": "string"}}}})
+        yield harness.TurnEvent("text", text=f"answer={json.dumps(answer)}")
+
+    monkeypatch.setattr(harness_mcode, "drive_turn_acp", _fake_acp)
+
+    with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
+        questions = _questions_of(c)
+        out: dict = {}
+
+        def _turn():
+            out["r"] = c.post(f"/api/sessions/{s['id']}/chat",
+                              json={"message": "go"})
+
+        t = threading.Thread(target=_turn, daemon=True)
+        t.start()
+        deadline = time.time() + 10
+        while time.time() < deadline and not questions:
+            time.sleep(0.01)
+        assert questions, "the question never reached the channel"
+        slot = next(iter(questions.values()))
+
+        hijack = c.post(f"/api/sessions/{other['id']}/approval",
+                        json={"requestId": slot["requestId"],
+                              "answer": {"path": "HIJACK"}})
+        assert hijack.status_code == 409, hijack.text
+        # The owning session's answer is untouched by the refusal above.
+        legit = c.post(f"/api/sessions/{s['id']}/approval",
+                       json={"requestId": slot["requestId"],
+                             "answer": {"path": "LEGIT"}})
+        assert legit.status_code == 200, legit.text
+        t.join(15)
+        assert not t.is_alive(), "the turn never finished"
+
+    body = out["r"].text
+    assert "LEGIT" in body, body
+    assert "HIJACK" not in body, (
+        "the cross-session answer reached the turn's question")
+    decided = _decided(body)
+    assert len(decided) == 1, decided
+    assert decided[0]["data"]["decision"] == "answered", decided[0]
+    assert decided[0]["data"]["id"] == slot["requestId"], decided
+
+
+def test_a_slot_does_not_survive_a_raising_ask_publish(monkeypatch, tmp_path):
+    """OD12N2-n2. The slot is registered and then the `approval/asked` event is
+    published. A raising publish (a closed loop at shutdown) used to leave the
+    slot behind — and unlike the per-session `_approvals`, `_questions` is never
+    overwritten, so the leak is permanent and a later answer with that id would
+    be accepted for a question that no longer exists.
+
+    The publish is made to raise here (the loop the app is running on is the one
+    that raises), which is exactly the window between registration and the
+    guarded wait."""
+    s = _app_and_session(monkeypatch, tmp_path)
+
+    def _fake_acp(prompt, **kw):
+        kw["on_question"]("elicitation/create", {"message": "Which?"})
+        yield harness.TurnEvent("text", text="unreachable")
+
+    monkeypatch.setattr(harness_mcode, "drive_turn_acp", _fake_acp)
+
+    import asyncio
+    real_cst = asyncio.BaseEventLoop.call_soon_threadsafe
+
+    def _raising_cst(self, callback, *args):
+        ev = args[0] if args else None
+        if (getattr(ev, "event", "") == "approval/asked"
+                and (getattr(ev, "data", None) or {}).get("kind") == "question"):
+            raise RuntimeError("event loop is closed")
+        return real_cst(self, callback, *args)
+
+    monkeypatch.setattr(asyncio.BaseEventLoop, "call_soon_threadsafe",
+                        _raising_cst)
+
+    with TestClient(serve.build_app(upstream_port=DUMMY_PORT)) as c:
+        questions = _questions_of(c)
+        r = c.post(f"/api/sessions/{s['id']}/chat", json={"message": "go"})
+        assert r.status_code == 200, r.text
+        assert questions == {}, (
+            "the slot leaked: a question whose ask never published is still "
+            "registered and could be answered")
+
+    # The publish failure is reported, not swallowed into a silent decline.
+    assert "event loop is closed" in r.text, r.text
