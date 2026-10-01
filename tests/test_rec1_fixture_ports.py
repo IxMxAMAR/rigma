@@ -1,6 +1,6 @@
 """REC-1 regression: the `oai_server` fixture must yield ITS OWN fake engine.
 
-`43e63de` replaced the hard-coded 11598 with a fresh ephemeral port per attempt,
+`da50a67` replaced the hard-coded 11598 with a fresh ephemeral port per attempt,
 but readiness was still decided by "somebody answered /health with 200". The
 child takes ~0.6 s to die after losing the bind race, so `proc.poll()` is still
 None on the first probe and a foreign listener on that port was accepted as

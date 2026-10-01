@@ -39,9 +39,9 @@ want a behavioural change, option 2 is the next best.
 
 ## OD-2 — `view_image` reads absolute paths outside the workspace; `copy/move_files` can write anywhere (R3-9, R3-10)
 
-**DECIDED 2026-09-30: owner accepted the recommendation (option 1).** IMPLEMENTED in `fcc586f` (merged `0b84d57`): `view_image` already used the `allow_absolute_reads` grant (R3-TOOL-5) and an absolute transfer destination already needed the `allow_absolute_writes` grant (R3-TOOL-4); this adds the configured destination allowlist — `write_allowlist`, a session list seeded from the owner's existing session workspaces and RAG source folders (metadata only) — which `_write_path` accepts in addition to the workspace and the blanket grant. Independently verified PASS-WITH-NITS: 32 escape probes (prefix sibling, `..`, junctions, UNC, 8.3, case, ≥260-char paths) found no escape, and the seed leaked no prose. Nits recorded in `BACKLOG.md`.
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1).** IMPLEMENTED in `ef57853` (merged `617bc9e`): `view_image` already used the `allow_absolute_reads` grant (R3-TOOL-5) and an absolute transfer destination already needed the `allow_absolute_writes` grant (R3-TOOL-4); this adds the configured destination allowlist — `write_allowlist`, a session list seeded from the owner's existing session workspaces and RAG source folders (metadata only) — which `_write_path` accepts in addition to the workspace and the blanket grant. Independently verified PASS-WITH-NITS: 32 escape probes (prefix sibling, `..`, junctions, UNC, 8.3, case, ≥260-char paths) found no escape, and the seed leaked no prose. Nits recorded in `BACKLOG.md`.
 
-**UPDATE, 21:45–23:xxZ — the deep review's ODR-1/ODR-2/ODR-3/ODR-6 are CLOSED and MERGED.** ODR-1 (`2d58d55`+`562b20f`, merged `7ec8712`): a persistence-location write denylist applied to `_write_path` and every write caller of `_ws_path`, tested with the **product-default home workspace**. The first verifier **FAILED** it — a trailing dot/space on a not-yet-existing component (`.gitconfig.`, `Documents/PowerShell./…`) and a local UNC admin-share spelling (`\\localhost\c$\…\Startup`) with the grant — and both were closed in `562b20f` and re-verified PASS-WITH-NITS (no reachable bypass survives). ODR-3 (`2ff154e`) + ODR-6 (`3ba6568`) merged `ce4a6d3`; ODR-2 (`1527961`+`8eb9ba1`) merged `1c7bf42`. **OD-2 now closes the persistence primitive for the locations the denylist names**; a redirected/OneDrive `Documents` PowerShell profile remains open (owner call, needs `SHGetKnownFolderPath`), and `write_file ".env"` is still allowed while `read_file ".env"` refuses (a separate, pre-existing gap). The orchestrator's own 22:36 UTC review then found **ODR-1b (HIGH)**: the per-FILE target of a copy/move was never checked, so `write_file("x/.bashrc")` (allowed) followed by `copy_files(paths=["x/.bashrc"], dest=".")` still created `~/.bashrc`. Fixed in `2e41045` (merged `1c57d77`) — every copy/move target is checked before `copy2`/`move`, and an unresolvable path now fails closed (ODR-1c). Verified PASS-WITH-NITS, no reachable bypass.
+**UPDATE, 21:45–23:xxZ — the deep review's ODR-1/ODR-2/ODR-3/ODR-6 are CLOSED and MERGED.** ODR-1 (`cbf5173`+`10995af`, merged `a04066a`): a persistence-location write denylist applied to `_write_path` and every write caller of `_ws_path`, tested with the **product-default home workspace**. The first verifier **FAILED** it — a trailing dot/space on a not-yet-existing component (`.gitconfig.`, `Documents/PowerShell./…`) and a local UNC admin-share spelling (`\\localhost\c$\…\Startup`) with the grant — and both were closed in `10995af` and re-verified PASS-WITH-NITS (no reachable bypass survives). ODR-3 (`84d9531`) + ODR-6 (`8d99df4`) merged `ccd3654`; ODR-2 (`68d56ce`+`88310d6`) merged `f455185`. **OD-2 now closes the persistence primitive for the locations the denylist names**; a redirected/OneDrive `Documents` PowerShell profile remains open (owner call, needs `SHGetKnownFolderPath`), and `write_file ".env"` is still allowed while `read_file ".env"` refuses (a separate, pre-existing gap). The orchestrator's own 22:36 UTC review then found **ODR-1b (HIGH)**: the per-FILE target of a copy/move was never checked, so `write_file("x/.bashrc")` (allowed) followed by `copy_files(paths=["x/.bashrc"], dest=".")` still created `~/.bashrc`. Fixed in `d829240` (merged `7668f38`) — every copy/move target is checked before `copy2`/`move`, and an unresolvable path now fails closed (ODR-1c). Verified PASS-WITH-NITS, no reachable bypass.
 
 **State today:** `read_file` refuses an absolute path outside the workspace without a grant, but
 `view_image` does not (`findings-r3/04-sandbox-r3.md:225`), and `copy_files`/`move_files` accept any
@@ -69,7 +69,7 @@ the Head Agent's call.
 
 ## OD-3 — A pre-fix RAG index still holds secrets until it is reindexed (R3-11 residual)
 
-**DECIDED 2026-09-30: owner accepted the recommendation (option 2).** IMPLEMENTED: the backend is `e60d7e9` (merged `3e519d8`) — `rag.rebuild_index()` stops the recorded sidecar, deletes the index directory, then re-ingests with the current credential denylist, exposed as `POST /api/rag/reindex` (202 / 409 busy / 400 no-raggity) and never run automatically; the UI is `25eda5b`, a "rebuild index" control in the Grounding card. Both independently verified PASS-WITH-NITS; nits recorded in `BACKLOG.md`.
+**DECIDED 2026-09-30: owner accepted the recommendation (option 2).** IMPLEMENTED: the backend is `95a94ff` (merged `4507e38`) — `rag.rebuild_index()` stops the recorded sidecar, deletes the index directory, then re-ingests with the current credential denylist, exposed as `POST /api/rag/reindex` (202 / 409 busy / 400 no-raggity) and never run automatically; the UI is `c4ff7f1`, a "rebuild index" control in the Grounding card. Both independently verified PASS-WITH-NITS; nits recorded in `BACKLOG.md`.
 
 **State today:** the credential-`exclude` denylist fix (`R3-17`) applies to *new* indexing. An index
 built before the fix still contains whatever was indexed. Reindexing is the fix, but reindexing
@@ -156,7 +156,7 @@ silent discard).
 
 ## OD-7 — How many method drafts are kept on disk, and how long is a draft "in use"? (10-R3-17 / A15)
 
-**DECIDED 2026-09-30: owner accepted the recommendation (option 1 — keep 20 / 12 h).** IMPLEMENTED (pre-existing, A15 `ca83bc0`): `MAX_DRAFTS = 20` and `_DRAFT_LIVE_SECONDS = 12 * 60 * 60` in `src/rigma/method_drafts.py`, with the eviction rule yielding rather than dropping a live draft.
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1 — keep 20 / 12 h).** IMPLEMENTED (pre-existing, A15 `6e14c64`): `MAX_DRAFTS = 20` and `_DRAFT_LIVE_SECONDS = 12 * 60 * 60` in `src/rigma/method_drafts.py`, with the eviction rule yielding rather than dropping a live draft.
 
 **State today:** `~/.rigma/method_drafts/` had no budget at all — a draft was removed only by
 `promote()`, so a creation chat the user abandons left its file there forever. Item A15 adds
@@ -225,7 +225,7 @@ every question declines after `QUESTION_WAIT_SECS`.
 
 ## OD-9 — ACP session management (list / load / activate) was removed as dead code; wiring it to a route + UI is a feature of its own (B5)
 
-**DECIDED 2026-09-30: owner accepted the recommendation (option 1 — leave them deleted).** IMPLEMENTED in `e2a9ce0` (`99d7fb7`); option 2 remains available as its own item if the owner wants a chat to continue an mcode session Rigma did not start.
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1 — leave them deleted).** IMPLEMENTED in `066dc29` (`9f7ce0e`); option 2 remains available as its own item if the owner wants a chat to continue an mcode session Rigma did not start.
 
 **State today:** three `AcpClient` wrappers had no product consumer. Item B5 **deleted two of them**
 from `src/rigma/harness_mcode_acp.py`: `session_list` (`session/list`) and `session_load`
@@ -340,13 +340,13 @@ its own merge/precedence rules.
 
 ## OD-12 — What happens to a question after its 5-second window closes? (B4b)
 
-**DECIDED 2026-09-30: owner accepted the recommendation; already RESOLVED and IMPLEMENTED** (option 1) — the server emits `approval/decided` with `decision: "expired"` (`17bfbe8`) and `"answered"` (`9167aa6`); all independently verified. No decision outstanding.
+**DECIDED 2026-09-30: owner accepted the recommendation; already RESOLVED and IMPLEMENTED** (option 1) — the server emits `approval/decided` with `decision: "expired"` (`ea1ce64`) and `"answered"` (`34e53d8`); all independently verified. No decision outstanding.
 
 **RESOLVED — option 1 was implemented; no owner decision is outstanding.** The server now emits
-`approval/decided` with `decision: "expired"` when the window closes (`17bfbe8`), and `"answered"`
-when the user does answer (`9167aa6`); the frontend folds the row to a disabled expired state and
-shows an `answered` tick. `863dddd` then fixed a second question overwriting the first's slot, and
-`a3a0db4` restored the per-session scoping the first fix dropped. All independently verified. The
+`approval/decided` with `decision: "expired"` when the window closes (`ea1ce64`), and `"answered"`
+when the user does answer (`34e53d8`); the frontend folds the row to a disabled expired state and
+shows an `answered` tick. `b1f4569` then fixed a second question overwriting the first's slot, and
+`25a70f2` restored the per-session scoping the first fix dropped. All independently verified. The
 text below is the original decision record, kept for provenance.
 
 **State today (at the time of the decision):** item B4 puts mcode's `ask_user` on the existing permission channel with
@@ -379,7 +379,7 @@ reports the route's 409. Not a data-loss risk; a rough edge.
 
 ## OD-13 — Should a remotely-streaming chat have a stop affordance? (D3b)
 
-**DECIDED 2026-09-30: owner accepted the recommendation; already IMPLEMENTED** (option 1) in wave 14 (`5b4bcd5`/`5806031`) and independently verified. No decision outstanding.
+**DECIDED 2026-09-30: owner accepted the recommendation; already IMPLEMENTED** (option 1) in wave 14 (`d26742f`/`19a4a39`) and independently verified. No decision outstanding.
 
 **State today:** D3b (merged) makes a reloaded chat read the server's `streaming`/`partial` state,
 suppress the false "interrupted" notice, show a rail dot, and poll. There is **no way to stop a turn
@@ -431,9 +431,9 @@ is the point: the next session should not rediscover it as a mystery.
 
 ## OD-15 — Should `POST /api/restore` truly replace the store, or keep merging? (D4c)
 
-**DECIDED 2026-09-30: owner accepted the recommendation (option 1).** IMPLEMENTED in `d76f08d` + `9d940b5` (merged `e706b5a`): `POST /api/restore` now truly replaces — memory replaced, settings replaced (`app_settings.replace` resets keys the document omits), and user methods not in the document deleted through the store's own `delete_user`; the deletions are folded into A11's undo log so a failed restore rolls back byte-exactly. The Backup/Restore card copy was corrected in `f2acf81` (it had promised a replace all along). Independently verified PASS-WITH-NITS, including a fresh probe that forced a 500 mid-restore and proved settings + every method file + memory were byte-identical afterwards.
+**DECIDED 2026-09-30: owner accepted the recommendation (option 1).** IMPLEMENTED in `61998c7` + `ab02fb2` (merged `6e2ed6b`): `POST /api/restore` now truly replaces — memory replaced, settings replaced (`app_settings.replace` resets keys the document omits), and user methods not in the document deleted through the store's own `delete_user`; the deletions are folded into A11's undo log so a failed restore rolls back byte-exactly. The Backup/Restore card copy was corrected in `def54f2` (it had promised a replace all along). Independently verified PASS-WITH-NITS, including a fresh probe that forced a 500 mid-restore and proved settings + every method file + memory were byte-identical afterwards.
 
-**UPDATE, 21:45–23:xxZ — the deep review's ODR-5 and ODR-7 are CLOSED and MERGED** (`caa1c32` ODR-5 + `55d1f32` ODR-7 backend, merged `1c7bf42`; card `06a636e`). A restore now clears macro trust (`macros.forget_method`) for every method id it writes or deletes before the first write, so a backup from another machine cannot smuggle in a trusted method whose macro writes files; and `/api/restore` returns an additive `deleted: [ids]` that the card renders (ids+count, "nothing was deleted", or "the server did not report…" — never a fabricated `0`). The card copy now says "memory, settings and methods are replaced; chats and documents are kept". **ODR-4, ODR-8 and ODR-9 are also merged** (`bf35e05`): `methods.save_user` is atomic and the restore journals its undo to `~/.rigma/restore-undo/` with a boot replay; one `WRITER_LOCK` is held by the restore and taken by the method/settings writers; and `sessions.create` runs off the event loop. The verifier found and the fix closed a MED defect in ODR-4 (`19a5d7d`): without a commit record, a kill after the apply committed but before the journal clear made the next boot roll back a committed restore; a durable `committed: true` marker now makes replay discard it. Re-verified PASS.
+**UPDATE, 21:45–23:xxZ — the deep review's ODR-5 and ODR-7 are CLOSED and MERGED** (`69f7940` ODR-5 + `f139ac3` ODR-7 backend, merged `f455185`; card `2e7dd7e`). A restore now clears macro trust (`macros.forget_method`) for every method id it writes or deletes before the first write, so a backup from another machine cannot smuggle in a trusted method whose macro writes files; and `/api/restore` returns an additive `deleted: [ids]` that the card renders (ids+count, "nothing was deleted", or "the server did not report…" — never a fabricated `0`). The card copy now says "memory, settings and methods are replaced; chats and documents are kept". **ODR-4, ODR-8 and ODR-9 are also merged** (`98f741c`): `methods.save_user` is atomic and the restore journals its undo to `~/.rigma/restore-undo/` with a boot replay; one `WRITER_LOCK` is held by the restore and taken by the method/settings writers; and `sessions.create` runs off the event loop. The verifier found and the fix closed a MED defect in ODR-4 (`2ee2e58`): without a commit record, a kill after the apply committed but before the journal clear made the next boot roll back a committed restore; a durable `committed: true` marker now makes replay discard it. Re-verified PASS.
 
 **State today:** the new Backup/Restore card tells the user that restoring *"replaces the whole store…
 anything not in the file is gone"*. An independent TestClient probe measured what the route actually
@@ -466,12 +466,12 @@ risk — a feature that does less than its name suggests.
 
 ## OD-16 — two full test-suite runs at once deadlock, and the suite leaks its fake ACP servers
 
-**DECIDED 2026-09-30: owner accepted the recommendation; already RESOLVED and IMPLEMENTED** (options 1 and 3 both taken): six literal fake-server ports closed (`43e63de`, `f19395c`) and a full-suite session lock that exits **rc 4** on a second run (`e26b6c4`). No decision outstanding.
+**DECIDED 2026-09-30: owner accepted the recommendation; already RESOLVED and IMPLEMENTED** (options 1 and 3 both taken): six literal fake-server ports closed (`da50a67`, `55ddd3e`) and a full-suite session lock that exits **rc 4** on a second run (`95073a4`). No decision outstanding.
 
 **RESOLVED — options 1 and 3 were both taken; no owner decision is outstanding.** The diagnosis is
 complete: **six** literal fake-server TCP ports (`11594`–`11599`) were bound instead of `0`, so two
-concurrent runs shared sockets and each waited out the other's timeouts. `43e63de` closed the port
-REC-1 found, REC-1b (`f19395c`) closed the other five, and the session lock landed at `e26b6c4`
+concurrent runs shared sockets and each waited out the other's timeouts. `da50a67` closed the port
+REC-1 found, REC-1b (`55ddd3e`) closed the other five, and the session lock landed at `95073a4`
 (option 3: a second FULL suite exits **rc 4** with a clear message; named-file runs are deliberately
 not locked — 94 passed across three files, twice). All independently verified. The text below is the
 original decision record, kept for provenance.
@@ -515,7 +515,7 @@ concluding the product is broken.
 
 ---
 
-### UPDATE, 16:50Z — **DIAGNOSED AND FIXED** (`43e63de`), so option 1 is done
+### UPDATE, 16:50Z — **DIAGNOSED AND FIXED** (`da50a67`), so option 1 is done
 
 The shared resource was a **fixed TCP port**, and it was the only one in the whole suite.
 

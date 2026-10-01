@@ -1,6 +1,6 @@
-# Independent verification — OD12N2-n1/n2 (a3a0db4) + W15AN2-n1 (dd1fd60)
+# Independent verification — OD12N2-n1/n2 (25a70f2) + W15AN2-n1 (ae26fb8)
 
-Worktree `.scratch/wt-vfy-regr` on `vfy/regr` @ `dd1fd60`, base `175f1bd`.
+Worktree `.scratch/wt-vfy-regr` on `vfy/regr` @ `ae26fb8`, base `0d5ef26`.
 Both commits re-read in full; `.scratch/orchestrator/verify-od12n2.md` read.
 No GPU, no engine launch, no model load, no live harness turn — fakes only.
 Probes `.vfy/probe_n1.py`, `.vfy/probe_n2.py`, `.vfy/probe_n2b.py`,
@@ -9,9 +9,9 @@ committed/merged/pushed). 13-file regression batch: 208 passed. `ruff check src
 tests`: All checks passed!
 
 ```
-ITEM: OD12N2-n1/n2 (a3a0db4)
+ITEM: OD12N2-n1/n2 (25a70f2)
 VERDICT: PASS
-FAILS-WITHOUT-FIX: yes — `git checkout 175f1bd -- src/rigma/serve.py` with the
+FAILS-WITHOUT-FIX: yes — `git checkout 0d5ef26 -- src/rigma/serve.py` with the
   two new tests present: `2 failed, 8 deselected`, matching the implementer's
   claim exactly — cross-session `assert 200 == 409` with the HIJACK body
   (`{"ok":true,...,"answer":{"path":"HIJACK"}}`) and the leak test
@@ -49,7 +49,7 @@ RULE-13 STATE CHECKED: (1) a PERMISSION asked on A answered through B's route �
 BREAKS: nothing
 NITS:
   - The cross-session refusal uses the QUESTION wording, not the true
-    pre-regression base's (9167aa6) shared-branch permission wording. Status
+    pre-regression base's (34e53d8) shared-branch permission wording. Status
     (409) and body shape (`{"error": <str>}`) match; the wording change is
     documented in the commit's DELIBERATELY NOT DONE.
   - A question slot lacking `sid` (reachable only by hand-injection — the old
@@ -71,9 +71,9 @@ REASON: The diff is two hunks; `_answer_permission`, `QUESTION_WAIT_SECS = 5.0`,
 ```
 
 ```
-ITEM: W15AN2-n1 (dd1fd60)
+ITEM: W15AN2-n1 (ae26fb8)
 VERDICT: PASS-WITH-NITS
-FAILS-WITHOUT-FIX: yes — `git checkout 175f1bd -- src/rigma/bench.py` with the
+FAILS-WITHOUT-FIX: yes — `git checkout 0d5ef26 -- src/rigma/bench.py` with the
   two new tests present: `2 failed, 37 deselected`, matching the implementer's
   claim exactly (`AssertionError: the now-calibratable plan was not swept` /
   `assert []`; `TypeError: is_calibrated() takes 3 positional arguments but 4
@@ -124,7 +124,7 @@ NITS:
     `no_calibrate` (bench.py:1144 legacy-adopt, bench.py:1182 no-op) also pass
     `calibrated=True` — but it is a latent short-circuit, verified directly by
     construction.
-  - No migration for an f088d2b-era no-op row (`calibrated: true`, no `flags`,
+  - No migration for an e1d6f0e-era no-op row (`calibrated: true`, no `flags`,
     no `no_calibrate`): such a row still suppresses a later calibratable plan
     forever, because `_no_calibrate_expired` keys on `no_calibrate`. Unreachable
     on this machine: `~/.rigma/calibration.json` has 9 entries, all 8
@@ -149,15 +149,15 @@ OVERALL: PASS — both commits reproduce their claimed before/after output byte 
 byte, close the two regressions named in `.scratch/orchestrator/verify-od12n2.md`,
 break nothing across the 13 named files (208 passed), and leave `ruff` clean; the
 reservations are one latent `is_calibrated` short-circuit, an unreachable
-f088d2b-era migration gap, and ~3-5 ms of new per-launch cost.
+e1d6f0e-era migration gap, and ~3-5 ms of new per-launch cost.
 
 ## Prose
 
-**Item 1 (a3a0db4).** The commit is two hunks in `serve.py` plus the test file. I
-reverted `src/rigma/serve.py` alone to `175f1bd` with both new tests present and
+**Item 1 (25a70f2).** The commit is two hunks in `serve.py` plus the test file. I
+reverted `src/rigma/serve.py` alone to `0d5ef26` with both new tests present and
 got `2 failed, 8 deselected` with the exact bodies claimed, then restored. At
 HEAD the two new tests pass. Changed-line inspection of
-`git diff 175f1bd HEAD -- src/rigma/serve.py` (50 lines, 2 hunks) confirms
+`git diff 0d5ef26 HEAD -- src/rigma/serve.py` (50 lines, 2 hunks) confirms
 `_answer_permission`, `QUESTION_WAIT_SECS`, the `with slot["lock"]` expiry claim
 and the exactly-once `approval/decided` emit appear in NO changed line — only the
 slot dict gains `"sid": sid`, the registration+publish block moves inside the
@@ -166,7 +166,7 @@ route call can only arrive after the slot exists), and the route gains
 `if slot is not None and slot.get("sid") != sid: slot = None`. The route's 409 is
 the existing `{"error": "this chat is not waiting on a question"}` path, so
 status and body shape match; only the wording differs from the true
-pre-regression base `9167aa6`, whose single shared branch said "…not waiting on a
+pre-regression base `34e53d8`, whose single shared branch said "…not waiting on a
 permission request" — the commit documents that choice. My independent probe
 drove the real route with a fake ACP driver: a permission on A refused 409 through
 B's route without waking the slot and accepted 200 through A's route with
@@ -174,7 +174,7 @@ B's route without waking the slot and accepted 200 through A's route with
 200 with both bodies in the turn; a `sid`-less slot refused fail-closed; a
 correct-sid answer after the turn ended 409; an empty sid 404.
 
-**Item 2 (dd1fd60).** Reverting `src/rigma/bench.py` alone to `175f1bd` gave
+**Item 2 (ae26fb8).** Reverting `src/rigma/bench.py` alone to `0d5ef26` gave
 `2 failed, 37 deselected` exactly as claimed; restored. `_sweep_would_drop_all`
 re-derives the same predicate `run_sweep` drops with (`_drop_uncalibratable` is
 now the single filter, called from both), and `auto_calibrate` passes
@@ -188,7 +188,7 @@ reads only `hardware`/`date` and never `no_calibrate`. A `no_calibrate` row
 carries no `flags` key and `measured={}`, and I confirmed by probe that both
 directions of supersede are total (`save_calibration(no_calibrate=...)` pops
 `flags`; a `no_calibrate=None` save pops `no_calibrate`). The one real
-reservation is the latent `is_calibrated` short-circuit; the f088d2b migration gap
+reservation is the latent `is_calibrated` short-circuit; the e1d6f0e migration gap
 is real in principle but absent from the owner's 9-entry calibration.json.
 
 **Item 3.** The 13 named files in one process: `208 passed, 1 warning in 15.50s`

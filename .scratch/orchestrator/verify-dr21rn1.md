@@ -1,5 +1,5 @@
 ```
-ITEM: DR21R-n1 (impl/dr21r-n1 @ b16ca96)
+ITEM: DR21R-n1 (impl/dr21r-n1 @ a4a2f17)
 VERDICT: PASS-WITH-NITS
 FAILS-WITHOUT-FIX: yes (delete-the-line reproduces: sweep 5/5 `assert 'diverges' == 'ok'` / `divergence +600.00 MiB`; direction-1 tests fail; restored and re-run 190 passed)
 TEST COMMAND: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_server_findings_plan.py
@@ -15,7 +15,7 @@ UPDATED HELPER ASSERTIONS: JUSTIFIED — the old pins (`got == memtruth.planned_
 
 ## Evidence
 
-**Setup.** Worktree `.scratch/wt-vfy-dr21rn1` at `b16ca96` on `vfy/dr21rn1`; nothing committed; `git diff` empty at the end (only my untracked `vfy-dr21rn1-probe.py`). No engine/model/GPU/live-harness work: every probe is text + the packaged registry only. Four pytest processes, each through the shared semaphore (never >1 concurrent).
+**Setup.** Worktree `.scratch/wt-vfy-dr21rn1` at `a4a2f17` on `vfy/dr21rn1`; nothing committed; `git diff` empty at the end (only my untracked `vfy-dr21rn1-probe.py`). No engine/model/GPU/live-harness work: every probe is text + the packaged registry only. Four pytest processes, each through the shared semaphore (never >1 concurrent).
 
 **1. Delete-the-line proof — CONFIRMED.** Removed `+ float(compute_buffer_mb(launch_ubatch(spec)))` from `server_ops.py:639`, ran the file: **9 failed, 18 passed** in 5.52s. The five sweep params each failed with `assert 'diverges' == 'ok'` and `divergence +600.00 MiB` (e.g. ngl=29: engine 2105.82 vs plan 1505.82, +39.8%). The 5 named direction tests alone are 3 failed / 2 passed exactly as claimed. Restored the line, `git diff` empty, and the file is in the 190-pass run.
 

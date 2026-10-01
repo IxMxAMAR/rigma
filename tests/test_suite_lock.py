@@ -2,7 +2,7 @@
 
 Two overlapping full runs froze twice (0 CPU over 25 s, 72 orphaned
 `fake_acp_server.py` processes). The shared resource was a fixed port and is
-fixed at 43e63de, but nothing stopped a second full run from starting. These
+fixed at da50a67, but nothing stopped a second full run from starting. These
 tests pin the guard's decision rules and the lock's takeover rules, plus one
 end-to-end proof that launches real pytest processes against a throwaway
 checkout.

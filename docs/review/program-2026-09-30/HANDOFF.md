@@ -1,25 +1,24 @@
 # HANDOFF — Rigma improvement program, 2026-09-30
 
-> ## BEFORE ANY PUSH — one commit message must be rewritten first
+> ## History note — every commit hash after `e43a5bf` changed on 2026-10-01
 >
-> Commit `7ea1827` ("docs 37: fix a garbled sentence about the cache ladder") carries a co-author trailer that
-> the owner's rules forbid in any commit. Removing it rewrites every later commit on this branch (300+), and
-> every `impl/*` branch created after it also contains it. The orchestrator's rewrite was stopped by the
-> harness as a destructive git operation, so it waits for the owner's go-ahead. Until then: do not push this
-> branch, and never `git push --all` from this clone. When approved: rewrite only that message
-> (`git filter-branch --msg-filter` over `7ea1827^..review/deep-audit-2026-09-22`, logging an old->new map
-> with a `--commit-filter`), then re-point the commit hashes cited in `docs/review/**` using that map.
+> Commit `e43a5bf` ("docs 37: fix a garbled sentence about the cache ladder") carried a co-author trailer the
+> owner's rules forbid. With the owner's approval its message was rewritten across all local branches (312
+> commits; trees, authors, dates and every other message verified identical), and the commit hashes cited in
+> the docs, tests and records were re-pointed with the exact old->new map. A hash you find elsewhere (a DSH
+> session log, an old note) may be a pre-rewrite hash: it names the same content as the commit now carrying
+> the same subject line.
 
 > ## READ FIRST — Waves 20–22 closed the OD-2/OD-15 deep-review findings (2026-09-30 21:45–23:xx UTC)
 >
-> **ODR-1 (HIGH, security) IS MERGED** (`2d58d55`+`562b20f`, merged `7ec8712`): a persistence-location write
+> **ODR-1 (HIGH, security) IS MERGED** (`cbf5173`+`10995af`, merged `a04066a`): a persistence-location write
 > denylist now refuses `write_file` / `edit_file` / relative `copy_files` / `move_files` into the Startup
 > folder, Start Menu, `%APPDATA%\Microsoft\Windows`, PowerShell profile dirs, `.gitconfig`, `System32\Tasks`
 > on the DEFAULT home workspace, with no grant. **The first ODR-1 verifier FAILED it** (a trailing dot/space
 > on a not-yet-existing component; a local UNC admin-share spelling with the grant) — both closed in
-> `562b20f` and re-verified. **Then the orchestrator's own 22:36 UTC review found ODR-1b (HIGH): the
+> `10995af` and re-verified. **Then the orchestrator's own 22:36 UTC review found ODR-1b (HIGH): the
 > per-FILE target of a copy/move was never checked, so `write_file("x/.bashrc")` then `copy_files(dest=".")`
-> still created `~/.bashrc`.** Fixed in `2e41045` (merged `1c57d77`) — every copy/move target is checked
+> still created `~/.bashrc`.** Fixed in `d829240` (merged `7668f38`) — every copy/move target is checked
 > before `copy2`/`move`, and an unresolvable path now fails closed (ODR-1c). Verified PASS-WITH-NITS, no
 > reachable bypass. ODR-3, ODR-6, ODR-2, ODR-5, ODR-7 (backend + card), and the optional **ODR-4, ODR-8,
 > ODR-9** are merged too (see `STATUS.md` Waves 20–22). **OD-2 does now close the persistence primitive for
@@ -63,7 +62,7 @@ you share any context with the session that wrote it.
 ## The machine lost power three times on 2026-09-30
 
 At ~15:55 UTC the PC shut down mid-run. On recovery: `git status` clean, `git fsck` clean, HEAD
-`97da7b5`, `ruff` clean, the frontend build idempotent, and a full suite run to confirm soundness.
+`e2856a6`, `ruff` clean, the frontend build idempotent, and a full suite run to confirm soundness.
 **Nothing was lost** because every implementer commits on its own `impl/*` branch. The lesson the
 orchestrator passed on: **commit `HANDOFF.md` at EVERY wave boundary**, not just at the end.
 
@@ -149,7 +148,7 @@ serially into the integration branch from the main tree. No links or junctions; 
 `git worktree remove --force`; never `git clean -d/-x`. **Frontend work happens in the MAIN tree**
 (one agent at a time) because `node_modules` exists only there.
 
-Baseline at program start (2026-09-30, base `7ea1827`): **2935 non-hardware tests, all pass, exit 0**;
+Baseline at program start (2026-09-30, base `e43a5bf`): **2935 non-hardware tests, all pass, exit 0**;
 `ruff check src tests` clean.
 
 ## The rules that cannot be broken (§0 of the brief — full text in `.scratch/orchestrator/STANDING-RULES.md`)
@@ -185,7 +184,7 @@ Baseline at program start (2026-09-30, base `7ea1827`): **2935 non-hardware test
     no `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. The branch may be published, so every commit must carry
     `IxMxAMAR <officialamrendrasingh@gmail.com>`. Check with `git log -1 --format='%an <%ae>'`; audit
     the whole branch with
-    `git log --branches --not 7ea1827 --format='%an <%ae>' | Select-String '@local|@rigma\.local'`.
+    `git log --branches --not e43a5bf --format='%an <%ae>' | Select-String '@local|@rigma\.local'`.
     (The orchestrator broke this early on; the affected commits were re-authored in a metadata-only
     rewrite — see `STATUS.md`.)
 11. **Never use `git stash`.** It is repository-wide, not per-worktree: one agent's `stash push` was
@@ -212,26 +211,26 @@ fix**. This is the program's most important lesson.
 
 | id | what it was | where it went |
 |---|---|---|
-| DR1 | `_release_unreadable_run` overwrote a **good** `run.json` with a 4-field stub; `restart_run` then answered 409 "the run's chat session was deleted" **forever**, and the test pinned the destructive overwrite as desired | `ed52928` |
-| DR2 | on **Windows** the ACP stop killed only the `mcode.cmd` shim — the node agent and its subagents survived. **The owner's own platform.** B1b had fixed POSIX only | `c4d3541` |
-| DR3 | A1's "not saved" branch fell through into prefix-snapshot / title / auto-compact with a stale `s`, so compaction could erase a concurrent writer's messages | `ed52928` |
-| DR4 | a reaped leader hid its process group from a stop | `c4d3541` |
-| DR5 | `?` in a glob was collapsed into a run instead of one character each | `c4d3541` |
-| DR6 | a grep content regex could wedge the server (exponential `re`; SIGINT does not interrupt it) | `c4d3541` |
-| DR7 | an engine whose `--version` could not be measured hashed to the **pin's** identity, so a KV cache could be restored under the wrong build | `a903474` |
-| DR8 | the run loop's first load ran **outside** the `try/finally`; an unreadable pointer was cleared | `ed52928` |
+| DR1 | `_release_unreadable_run` overwrote a **good** `run.json` with a 4-field stub; `restart_run` then answered 409 "the run's chat session was deleted" **forever**, and the test pinned the destructive overwrite as desired | `89b8d4c` |
+| DR2 | on **Windows** the ACP stop killed only the `mcode.cmd` shim — the node agent and its subagents survived. **The owner's own platform.** B1b had fixed POSIX only | `c145a77` |
+| DR3 | A1's "not saved" branch fell through into prefix-snapshot / title / auto-compact with a stale `s`, so compaction could erase a concurrent writer's messages | `89b8d4c` |
+| DR4 | a reaped leader hid its process group from a stop | `c145a77` |
+| DR5 | `?` in a glob was collapsed into a run instead of one character each | `c145a77` |
+| DR6 | a grep content regex could wedge the server (exponential `re`; SIGINT does not interrupt it) | `c145a77` |
+| DR7 | an engine whose `--version` could not be measured hashed to the **pin's** identity, so a KV cache could be restored under the wrong build | `f5df7d4` |
+| DR8 | the run loop's first load ran **outside** the `try/finally`; an unreadable pointer was cleared | `89b8d4c` |
 | DR9 | `taskkill /T` walks reused parent pids; the real fix is a Job Object per harness child | **OD-14** (not done) |
 
 **`deep-review-2.md` (over the diff since the first), DR2-1…DR2-6:**
 
 | id | what it was | where it went |
 |---|---|---|
-| **DR2-1** | **A17d's VRAM axis compared the engine's *device* VRAM against the plan's *whole-GGUF* prediction**, so a **healthy** 33-of-65-layer spill reported `plan_divergence` **on every launch** (6017.1 vs 9037.7, −33.4 %) — the same false-positive class as the original A17 bug, reintroduced by its fix. Fixed by deciding comparability from the engine's own `offloaded N/M` + `CPU` model buffer (`engine_log.weights_are_device_resident`); a non-device-resident load is `not_comparable` and **never fires**, while the same low figure with `offloaded 65/65` still diverges and still fires | `5241a44` |
-| DR2-2 | `planned_vram_mb` mixed two registries (weights from its argument, KV from a fresh global `Registry.load()`), and paid a blocking parse **per `/api/server` poll** | `5241a44` |
-| **DR2-3** | C10's `compute_buffer_mb = 150 * ubatch/512` **under-reserved** — the repo's own log says `compute buffer size = 410.28 MiB` at ubatch 512 (`.scratch/prism-v.log:4669`), so the old base was **1041.12 MiB short** at ubatch 2048, the **unsafe** direction. `COMPUTE_BUFFER_MB = 150` is deliberate (differenced out of a total that already held the draft head's buffers), so the fix scales the measured term | `81db56f` |
-| DR2-4 | the D2 dialog invented `nativeCtx = 262144` when the model API failed, offered impossible ctx steps, stored them, and the backend silently clamped them | `1d5607c`, `41cf991` |
-| DR2-5 | `tests/test_sessions_streaming.py`'s cross-language guard counted source substrings, pinning spelling not the contract | `cd2d076` |
-| DR2-6 | the sweep's quality gate read the per-trial **override**, never the effective env; and the lever match was **exact-case**, which on Windows is a real hole (MSVC's `getenv` is case-insensitive) | `866bf7b` |
+| **DR2-1** | **A17d's VRAM axis compared the engine's *device* VRAM against the plan's *whole-GGUF* prediction**, so a **healthy** 33-of-65-layer spill reported `plan_divergence` **on every launch** (6017.1 vs 9037.7, −33.4 %) — the same false-positive class as the original A17 bug, reintroduced by its fix. Fixed by deciding comparability from the engine's own `offloaded N/M` + `CPU` model buffer (`engine_log.weights_are_device_resident`); a non-device-resident load is `not_comparable` and **never fires**, while the same low figure with `offloaded 65/65` still diverges and still fires | `9485eb4` |
+| DR2-2 | `planned_vram_mb` mixed two registries (weights from its argument, KV from a fresh global `Registry.load()`), and paid a blocking parse **per `/api/server` poll** | `9485eb4` |
+| **DR2-3** | C10's `compute_buffer_mb = 150 * ubatch/512` **under-reserved** — the repo's own log says `compute buffer size = 410.28 MiB` at ubatch 512 (`.scratch/prism-v.log:4669`), so the old base was **1041.12 MiB short** at ubatch 2048, the **unsafe** direction. `COMPUTE_BUFFER_MB = 150` is deliberate (differenced out of a total that already held the draft head's buffers), so the fix scales the measured term | `a38cc79` |
+| DR2-4 | the D2 dialog invented `nativeCtx = 262144` when the model API failed, offered impossible ctx steps, stored them, and the backend silently clamped them | `b45b340`, `d3105b9` |
+| DR2-5 | `tests/test_sessions_streaming.py`'s cross-language guard counted source substrings, pinning spelling not the contract | `f1b12f6` |
+| DR2-6 | the sweep's quality gate read the per-trial **override**, never the effective env; and the lever match was **exact-case**, which on Windows is a real hole (MSVC's `getenv` is case-insensitive) | `d67408e` |
 
 **Both reviews' method is now rule 13.** For every fix, name one realistic state the test does not
 put the code in, and check the fix there.
@@ -242,32 +241,32 @@ _(see `STATUS.md` for the per-item table with outcomes and verifier corrections)
 
 | wave | commits | items |
 |---|---|---|
-| 0 | `8de0434` | recon + backlog + program docs only; no source change |
-| 1 | `4eaec9d` `30e711e` `5df51a6` `f93ea8e` `e922c41` `6c83ab5` | A1, A17/S2, A4, A2, A3, A13, A5, A6 — each independently verified (new test observed failing on the unmodified base, then passing) |
-| 2 | `b040751` `ca83bc0` | B2, A14, A15 merged; D1 sent back once (its "unchanged default path" was 11.1 % shorter than before and the test tolerance hid it) |
-| 3 | `e6e8c3d` `f0b78b3` `e745820` `d53d65d` | A7, A11, B1, A8, B7 merged; B1 rejected once (the first version still signalled Rigma's own process group on POSIX) |
-| 4 | `dbb2110` `e2a9ce0` `46b53f5` `e770ac0` `9c47346` `a78a82e` `7f8991c` `959bb46` | D1/S3, B5, A16, B3, A9, B4, B8, C1, C2, C3 merged; C3 rejected once (the fork gate was re-derived at argv-build time, so a fork-only flag reached the pinned mainline binary) |
-| 5 | `b63ff92` `036a5d3` `335dffe` `6361ca2` | Frontend wave 1: D5 (the first `*.test.tsx`), A10, A8c, B6b |
-| 6 | `ddd0dfc` `50f24e7` `622f6ef` `baa1178`…`4edea5e` | B5c/B6a, A13b/A13d/A2b/A2d, **A18**/D2-backend/D3a/B7d, frontend wave 2 |
-| 7 | `099e2c1` `30122c3` `773d39d` | **A17b/A17c (GUIDANCE 4+5)**, B1b/D4, A5c/A11c/A7b |
-| 8 | `acc5c41` | A2d-gap/A11b/A16e |
-| 9 | `eac509f` `a23dc7b` + frontend wave 3 | A18c/A18d/A17d/A11d, A17e (+ its nit), A2d-budget/A2e |
-| 10 | `e852cb1` | **C10** — `-b`/`-ub`/`-ngl` become settable per model, and the fit still rules |
-| 11 | `703abdc` `ed52928` `c4d3541` + frontend wave 4 fix | the **C11 fix** (rejected once), DR1/DR8/DR3, DR2/DR4/DR5/DR6, and the frontend restore-copy falsehood |
-| 12 | `a903474` `81db56f` + frontend wave 5 + `f038121` | DR7, DR2-3/C11-read/C10-nits/C10-cli, and the frontend wave 5 (with its one FAILED commit fixed) |
-| 13 | `5241a44` `866bf7b` | **DR2-1/DR2-2/DR1-residual** (the deep-review-2 regression), W13-B (the effective env + case-insensitivity) |
-| 14 | `5b4bcd5` `5806031` `009730d` `02785bf` `7b0db3b` `cefd6fd` `97da7b5` `f6a0874` | OD-13's remote stop, the A2d-budget UI, the 400 provenance + prefix strip, the frontend nits, and W14-E (the **flaky** pause test — Head Agent's own 30/30 — the `serve.py` provenance comment, and the registry-combo env gate) |
-| 15 | `12be5cd` `85abd8a` `8977ea8` | **deep review 3's four findings** — DR3-1 (the launch dialog's native-ctx fallback still took the *running* model's window: DR2-4 surviving one fallback later), DR3-3 (a remote-stop request pinned to an unnameable turn never expired), and `impl/w15a`'s DR3-2 (the sweep's `q4_0` guard read the override, not the effective flags — DR2-6's asymmetry one lever over) + DR3-4 (the boot sweep must not reconcile a run a **different live process** drives) |
+| 0 | `437f8bf` | recon + backlog + program docs only; no source change |
+| 1 | `4d61440` `f692a11` `5e49304` `ce85ed4` `48aeb4e` `d9896b9` | A1, A17/S2, A4, A2, A3, A13, A5, A6 — each independently verified (new test observed failing on the unmodified base, then passing) |
+| 2 | `e69c642` `6e14c64` | B2, A14, A15 merged; D1 sent back once (its "unchanged default path" was 11.1 % shorter than before and the test tolerance hid it) |
+| 3 | `6ae5931` `90c1fc4` `a273129` `da1ebd0` | A7, A11, B1, A8, B7 merged; B1 rejected once (the first version still signalled Rigma's own process group on POSIX) |
+| 4 | `cb01ef2` `066dc29` `469e3e6` `00fd3d2` `d4b165e` `9aab645` `d122175` `959bb46` | D1/S3, B5, A16, B3, A9, B4, B8, C1, C2, C3 merged; C3 rejected once (the fork gate was re-derived at argv-build time, so a fork-only flag reached the pinned mainline binary) |
+| 5 | `761a723` `cd7245d` `ad78be6` `23b4187` | Frontend wave 1: D5 (the first `*.test.tsx`), A10, A8c, B6b |
+| 6 | `ec9dfbe` `f75b890` `0f8e142` `e5fadc7`…`8eb7431` | B5c/B6a, A13b/A13d/A2b/A2d, **A18**/D2-backend/D3a/B7d, frontend wave 2 |
+| 7 | `9df9160` `fb757f7` `f98eff2` | **A17b/A17c (GUIDANCE 4+5)**, B1b/D4, A5c/A11c/A7b |
+| 8 | `e29396f` | A2d-gap/A11b/A16e |
+| 9 | `a4a84fe` `d22173a` + frontend wave 3 | A18c/A18d/A17d/A11d, A17e (+ its nit), A2d-budget/A2e |
+| 10 | `f8abf3f` | **C10** — `-b`/`-ub`/`-ngl` become settable per model, and the fit still rules |
+| 11 | `39f346f` `89b8d4c` `c145a77` + frontend wave 4 fix | the **C11 fix** (rejected once), DR1/DR8/DR3, DR2/DR4/DR5/DR6, and the frontend restore-copy falsehood |
+| 12 | `f5df7d4` `a38cc79` + frontend wave 5 + `73c3020` | DR7, DR2-3/C11-read/C10-nits/C10-cli, and the frontend wave 5 (with its one FAILED commit fixed) |
+| 13 | `9485eb4` `d67408e` | **DR2-1/DR2-2/DR1-residual** (the deep-review-2 regression), W13-B (the effective env + case-insensitivity) |
+| 14 | `d26742f` `19a4a39` `fb5d2b1` `4885b01` `4c98f80` `60bec87` `e2856a6` `2c1125c` | OD-13's remote stop, the A2d-budget UI, the 400 provenance + prefix strip, the frontend nits, and W14-E (the **flaky** pause test — Head Agent's own 30/30 — the `serve.py` provenance comment, and the registry-combo env gate) |
+| 15 | `42e07d6` `98382b7` `66d5667` | **deep review 3's four findings** — DR3-1 (the launch dialog's native-ctx fallback still took the *running* model's window: DR2-4 surviving one fallback later), DR3-3 (a remote-stop request pinned to an unnameable turn never expired), and `impl/w15a`'s DR3-2 (the sweep's `q4_0` guard read the override, not the effective flags — DR2-6's asymmetry one lever over) + DR3-4 (the boot sweep must not reconcile a run a **different live process** drives) |
 
-| 16 | `f51dfe0` `b2f6a14` `e26b6c4` `c373516` `d61dfb7` `c8aac9d` `17bfbe8` `70608d8` `573025a` | **The re-verification wave.** Every single-sourced verdict merged after the 15:55 power cut got a FRESH independent verifier, each with rule 13: w15a DR3-2/DR3-4, REC-1 `43e63de`, w14e, W14-F + DR3-1 + DR3-3, A8b, A2d-kv, the suite lock, OD-12 (both halves), REC-1b, A16c/D1d, DR4-2/DR4-3, B7e/B2c, the ctx floor, B4b-schema. **A2d-kv FAILED its first verification** (the derived `kv_geometry_unknown` clause flagged every pure-Mamba spec) and was fixed at `aa7ed80`, then re-verified PASS. Landed: W16-A, A8b, REC-1/OD-16's suite lock, A2d-kv, REC-1b, A16c/D1d, OD-12 server, A8b nits, DR4-2+DR4-3. |
-| 17 | `ae97585` `f3bd020` `cb92962` `4f477c9` `ea822d4` `175f1bd` `57adf3e` `b6b04dd` + `873b90c` `75960df` | W5F5B-N3 (one owner for the launch floor), B7e+B2c, **DR2-1-residual** (the plan records the placement it used), **test-hard** (three tests that could not have caught the bug they name), **resid** (the ctx floor's raise-to gets its own test; W13B-3 correctly deferred), **OD12-n2+W15A-n2**, **DR21R-n1** (the deep-spill compute-basis mismatch), **regr** (the two regressions the same-hour verifiers caught), and B4b-schema + its required-container fix (frontend, direct on the branch). `impl/ubatch` (`07342df`) merged last. |
+| 16 | `062dee5` `7696fe0` `95073a4` `6ac8293` `1e11988` `dc98e84` `ea1ce64` `1f660b9` `032b83b` | **The re-verification wave.** Every single-sourced verdict merged after the 15:55 power cut got a FRESH independent verifier, each with rule 13: w15a DR3-2/DR3-4, REC-1 `da50a67`, w14e, W14-F + DR3-1 + DR3-3, A8b, A2d-kv, the suite lock, OD-12 (both halves), REC-1b, A16c/D1d, DR4-2/DR4-3, B7e/B2c, the ctx floor, B4b-schema. **A2d-kv FAILED its first verification** (the derived `kv_geometry_unknown` clause flagged every pure-Mamba spec) and was fixed at `5e0283b`, then re-verified PASS. Landed: W16-A, A8b, REC-1/OD-16's suite lock, A2d-kv, REC-1b, A16c/D1d, OD-12 server, A8b nits, DR4-2+DR4-3. |
+| 17 | `f19a16b` `a157e58` `8f5a46d` `1d44b24` `7f3ff15` `0d5ef26` `25fc925` `00e0679` + `d553751` `d6ec493` | W5F5B-N3 (one owner for the launch floor), B7e+B2c, **DR2-1-residual** (the plan records the placement it used), **test-hard** (three tests that could not have caught the bug they name), **resid** (the ctx floor's raise-to gets its own test; W13B-3 correctly deferred), **OD12-n2+W15A-n2**, **DR21R-n1** (the deep-spill compute-basis mismatch), **regr** (the two regressions the same-hour verifiers caught), and B4b-schema + its required-container fix (frontend, direct on the branch). `impl/ubatch` (`d2557d8`) merged last. |
 
-| 18 | `b5d8d61` `57bde6e` | **UBATCH-n1** (`impl/ubatch`, the compute charge reads back the ubatch the launch actually used) and **UBATCH-n1's second path** (`impl/clival`, the CLI's merged launch flags are validated before they are used — reachable via a **calibration row**, not the combo the brief guessed). Both verified; the clival verifier **corrected the commit's own arithmetic** (the tolerance is `max(512, 15%)`, not a flat 512). |
+| 18 | `9d91260` `f1dac12` | **UBATCH-n1** (`impl/ubatch`, the compute charge reads back the ubatch the launch actually used) and **UBATCH-n1's second path** (`impl/clival`, the CLI's merged launch flags are validated before they are used — reachable via a **calibration row**, not the combo the brief guessed). Both verified; the clival verifier **corrected the commit's own arithmetic** (the tolerance is `max(512, 15%)`, not a flat 512). |
 
-Integration head at this hand-off: **`3e519d8`** (plus the docs commits that follow it). **Wave 19 (the
-owner's decisions) is merged**: dtests `852592d`/`75d9cf5`, OD-2 `fcc586f`/`0b84d57`, OD-3
-`e60d7e9`/`3e519d8` + UI `25eda5b`, OD-15 `d76f08d`+`9d940b5`/`e706b5a` + card `f2acf81`, statguard
-`3278b95`+`8e76911`/`8d5d17d` — all independently verified. `STATUS.md`
+Integration head at this hand-off: **`4507e38`** (plus the docs commits that follow it). **Wave 19 (the
+owner's decisions) is merged**: dtests `d7cb4b5`/`8eb1e33`, OD-2 `ef57853`/`617bc9e`, OD-3
+`95a94ff`/`4507e38` + UI `c4ff7f1`, OD-15 `61998c7`+`ab02fb2`/`6e2ed6b` + card `def54f2`, statguard
+`43df5e8`+`2f3b8a6`/`21fe0d0` — all independently verified. `STATUS.md`
 carries the per-item table and the note on the metadata-only author rewrite (with the old→new hash
 mapping for every pre-rewrite commit).
 
@@ -306,20 +305,20 @@ clean run. **Never start a second suite while one is running, and check for leak
 **Every item this list used to carry is now DONE.** It is kept so a new session can see what the
 ranking was and what closed each one:
 
-1. ~~REC-1~~ **DONE** — `43e63de` (the port REC-1 found) + REC-1b (`f19395c`, the other **five**
-   literal ports `11594`–`11599`) + the full-suite lock (`e26b6c4`, REC-1/OD-16 option 3). A second
+1. ~~REC-1~~ **DONE** — `da50a67` (the port REC-1 found) + REC-1b (`55ddd3e`, the other **five**
+   literal ports `11594`–`11599`) + the full-suite lock (`95073a4`, REC-1/OD-16 option 3). A second
    FULL run now exits **rc 4**; named-file runs are deliberately not locked.
-2. ~~DR2-1-residual~~ **DONE** — `cb92962`: `state.json` carries an additive
+2. ~~DR2-1-residual~~ **DONE** — `8f5a46d`: `state.json` carries an additive
    `placement: {ngl, n_cpu_moe}` and the VRAM axis compares the engine's device figure against the
-   device-side prediction. DR21R-n1 (`57adf3e`) then put the two sides on the SAME basis by adding
+   device-side prediction. DR21R-n1 (`25fc925`) then put the two sides on the SAME basis by adding
    `resolve.compute_buffer_mb` to the plan-side prediction.
-3. ~~W13B-1~~ **DONE** — `f51dfe0`: `bench._trial_flags` is the single construction, pinned by a test
+3. ~~W13B-1~~ **DONE** — `062dee5`: `bench._trial_flags` is the single construction, pinned by a test
    that records each call's CALLER and the flags the child was actually launched with.
-4. ~~W5F5B-N3~~ **DONE** — `ae97585`: `models.MIN_LAUNCH_CTX = 2048` is the single owner
+4. ~~W5F5B-N3~~ **DONE** — `f19a16b`: `models.MIN_LAUNCH_CTX = 2048` is the single owner
    (`MIN_NATIVE_CTX` is an alias; `server_ops._raised_launch_ctx` reads it). `resolve.CTX_FLOOR` was
    renamed `PLAN_CTX_FLOOR` so the 8192 planning floor and the 2048 launch floor are named apart.
-5. ~~B4b-schema / OD-12~~ **DONE** — OD-12's server half at `17bfbe8` (+ `9167aa6`), its UI fold, and
-   B4b-schema at `873b90c`; the required-container defect it left was closed at `75960df`.
+5. ~~B4b-schema / OD-12~~ **DONE** — OD-12's server half at `ea1ce64` (+ `34e53d8`), its UI fold, and
+   B4b-schema at `d553751`; the required-container defect it left was closed at `d6ec493`.
 6. **`OWNER-DECISIONS.md`** — now **OD-1…OD-16**. OD-15 is `/api/restore`'s merge-not-replace
    semantics. OD-16 is REC-1, **now implemented** as option 3. OD-13 was implemented because its
    recorded recommendation was option 1.
@@ -365,12 +364,12 @@ a second one.** The open fit questions it should now also answer:
    device labels and cannot be executed here).
 6. `E2` — re-derive `COMPUTE_BUFFER_MB` from a measurement (Tier G's `G4` warns that raising it
    blindly re-introduces a double count of the draft head's buffers).
-7. **Is `plan.flags.ubatch` the engine's physical `n_ubatch`?** (`impl/ubatch` @ `07342df`.) The
+7. **Is `plan.flags.ubatch` the engine's physical `n_ubatch`?** (`impl/ubatch` @ `d2557d8`.) The
    plan-side compute charge now reads back the `-ub` the launch emitted, from `state.json`. Rigma
    refuses `ubatch > batch` at write time, but **llama.cpp can clamp `n_ubatch` to `n_batch`** and no
    engine ran to confirm the two agree. One real load with `--ubatch N`, above and below `batch`,
    reading the engine's own `n_ubatch`, settles it. **UBATCH-n1 is now FIXED** (`impl/clival`,
-   `57bde6e`): the CLI's merged launch flags were unvalidated, so a `batch` arriving from a
+   `f1dac12`): the CLI's merged launch flags were unvalidated, so a `batch` arriving from a
    **calibration row** plus a larger `--ubatch` recorded the request while the engine clamped it —
    reachable, and the same false-positive class. The verifier corrected the fix commit's own
    arithmetic: the tolerance is `max(512, 15% · expected)`, not a flat 512 (CLIVAL-n1).
@@ -443,18 +442,18 @@ numbered: **W13B-3's ambient-env lever** (see the NEEDS-GPU list).
   this reading is too strong.** Two further **file-redirected** HEAD runs stalled the same way (CPU
   flat, 36 `fake_acp_server` children, at `test_phase4_lifecycle.py::test_restart_reattaches_and_finishes`);
   the clean run that finally completed gave **`3513 passed, 3 skipped, 5 deselected, 0 failed`** in
-  521 s, and the pre-wave-19 base `05e0398` gave `2 failed, 3477 passed` in 495 s. So the stall is
+  521 s, and the pre-wave-19 base `d54f9db` gave `2 failed, 3477 passed` in 495 s. So the stall is
   **real and intermittent**, not a buffered-pipe artifact, and it is the first thing to re-test. The
   six-port fix's guarantee still deserves a re-test under load: do not read this note as proof that
   REC-1 is gone.
-- ~~Two full-suite failures are ENVIRONMENTAL, not code.~~ **FIXED in wave 19** (`852592d`, merged
-  `75d9cf5`): `test_tools_hardening.py::test_view_image_missing_file` and
+- ~~Two full-suite failures are ENVIRONMENTAL, not code.~~ **FIXED in wave 19** (`d7cb4b5`, merged
+  `8eb1e33`): `test_tools_hardening.py::test_view_image_missing_file` and
   `test_autonomous_run.py::test_compiled_spec_seeds_the_plan` built their fixtures under `tmp_path`
   instead of hard-coding `D:/...`. The underlying **product** gap they exposed is also fixed
-  (`impl/statguard` `3278b95`, merged `8d5d17d`): a stat error on an artifact's parent used to abort
+  (`impl/statguard` `43df5e8`, merged `21fe0d0`): a stat error on an artifact's parent used to abort
   the mission compile silently (`run["spec"]` stayed `None` and `fallback_spec` was never stored);
   `anchor_spec` now treats an unstatable parent as missing, and `tools._stat_ok` keeps the OS message
-  out of the tool replies. `view_image` also no longer passes a directory as an image (`8e76911`).
+  out of the tool replies. `view_image` also no longer passes a directory as an image (`2f3b8a6`).
 - **`test_phase4_lifecycle.py` has a low-rate flake** (`test_restart_reattaches_and_finishes`, the A18
   acceptance test): 1 failure in 6 isolated runs, 12/12 in every full run. Same class as the W14-E
   flake that was fixed — worth a look, not a regression.

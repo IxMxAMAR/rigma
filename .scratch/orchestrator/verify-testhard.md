@@ -1,11 +1,11 @@
 # Independent verification — impl/test-hard (DR42-n1, SUITELOCK-n1, W16A-1)
 
-Branch `vfy/testhard` @ `6388e77` (impl/test-hard), base `573025a`, integration HEAD `f3bd020`.
+Branch `vfy/testhard` @ `222b281` (impl/test-hard), base `032b83b`, integration HEAD `a157e58`.
 Worktree `.scratch/wt-vfy-testhard`. No commit/merge/push; no doc edits; no engine/GPU/model.
 Mutations applied and reverted one at a time; `git diff -- src/` empty and `git status` clean after every revert.
 
 ```
-ITEM: DR42-n1 (01cb07d)
+ITEM: DR42-n1 (4a9910e)
 VERDICT: PASS-WITH-NITS
 FAILS-WITHOUT-FIX: yes (verified)
 TEST COMMAND: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_run_loop_first_load.py -k "different_create_time or boot_reaper or still_reaped or unknown_driver"
@@ -14,7 +14,7 @@ TEST OUTPUT (before fix): mutation = src/rigma/state.py:73 `return abs(psutil.Pr
   E  AssertionError: a live pid with a DIFFERENT create time was read as the recorded driver, so a recycled pid still makes a dead driver look alive
   E  assert True is False            (fails at tests\test_run_loop_first_load.py:804, the intended assert)
   1 failed, 8 passed, 23 deselected, 1 warning in 0.70s   [EXIT=1]
-  OLD BODY (base 573025a file, same mutation, same -k): 0 failed — the only failure is the new test;
+  OLD BODY (base 032b83b file, same mutation, same -k): 0 failed — the only failure is the new test;
   a mixed run of new+base files selected by the same -k gave "1 failed, 16 passed, 46 deselected"
   (8 old tests passed, 8 other new-file tests passed). Implementer's "1 failed, 8 passed, 23 deselected" reproduced verbatim.
 TEST OUTPUT (after fix): .........  [100%]
@@ -37,7 +37,7 @@ overstates.
 ```
 
 ```
-ITEM: SUITELOCK-n1 (7221f17)
+ITEM: SUITELOCK-n1 (46da1d0)
 VERDICT: PASS-WITH-NITS
 FAILS-WITHOUT-FIX: yes (verified)
 TEST COMMAND: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_suite_lock.py -k "unreadable_create_time or psutil_failure"
@@ -48,7 +48,7 @@ TEST OUTPUT (before fix): mutation = tests/conftest.py `if recorded <= 0.0: retu
   E  AssertionError: a lock written after a psutil failure was immediately stolen
   2 failed, 1 passed, 23 deselected in 0.54s   [EXIT=1]
   (third test, the dead-pid bound, passes under the mutation by design)
-  OLD BODY (base 573025a tests/test_suite_lock.py, same mutated conftest, whole file): 23 passed in 2.58s [EXIT=0]
+  OLD BODY (base 032b83b tests/test_suite_lock.py, same mutated conftest, whole file): 23 passed in 2.58s [EXIT=0]
 TEST OUTPUT (after fix): 26 passed in 1.85s   [EXIT=0]   (base file had 23 tests; +3)
 RULE-13 STATE CHECKED: (a) a lock whose owner is a LIVE process with a NEGATIVE create time
   (`started_at = -5.0`): `_owner_is_alive(os.getpid(), -5.0) is True` and `_acquire_suite_lock` refuses —
@@ -69,19 +69,19 @@ NITS:
      refusing at worst delays a full-suite start, visibly, and never affects targeted runs. ALIVE-for-0.0
      is correct. GONE pid still taken over is pinned by
      test_an_unreadable_create_time_on_a_dead_pid_is_still_taken_over (passed).
-  3. Scope confirmed: `git show --numstat 7221f17` = tests/conftest.py (+27/-5), tests/test_suite_lock.py
-     (+77/-0); `git diff 573025a..impl/test-hard -- src/` is empty. NO src change.
+  3. Scope confirmed: `git show --numstat 46da1d0` = tests/conftest.py (+27/-5), tests/test_suite_lock.py
+     (+77/-0); `git diff 032b83b..impl/test-hard -- src/` is empty. NO src change.
 REASON: The pre-fix direction is caught by two new tests and the base test body is green under the same
 mutation; the direction is independently defensible for a lock and a gone pid is still reclaimed. The only
 residue is the overstated no-wedge claim for a recycled live pid.
 ```
 
 ```
-ITEM: W16A-1 (6388e77)
+ITEM: W16A-1 (222b281)
 VERDICT: PASS-WITH-NITS
 FAILS-WITHOUT-FIX: yes (verified, all three named mutations)
 TEST COMMAND: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_bench_sweep.py -k "same_way"
-TEST OUTPUT (before fix): OLD body = base 573025a test_bench_sweep.py seam test, run under each mutation:
+TEST OUTPUT (before fix): OLD body = base 032b83b test_bench_sweep.py seam test, run under each mutation:
   A `_effective_flags` -> `return plan_flags.model_copy(update=override)`:
     FAILED tests/test_bench_sweep.py::test_the_sweep_and_its_guards_build_a_trial_the_same_way
     E  AssertionError: _effective_flags must read the trial through bench._trial_flags ...  (tests\test_bench_sweep.py:983)
@@ -112,17 +112,17 @@ additive in assertion strength. The one residue is a spurious-failure shape at z
 
 ## Item 2 — diff vs message
 
-- `01cb07d`: message says a real foreign sleeper stamped `real_create_time - 10000`, asserting
+- `4a9910e`: message says a real foreign sleeper stamped `real_create_time - 10000`, asserting
   `driver_is_live_elsewhere is False` and `serve._reconcile_orphaned_runs` -> `interrupted`; diff is exactly
   `_foreign_sleeper()` (real `subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])`),
   `state._create_time(proc.pid)`, `_stamp_driver(rid, proc.pid, real - 10_000.0)`, the `is False` assert,
   the reconcile call, the `interrupted` assert, and a `finally: _reap(proc)`. Matches. Numstat +39/-0.
-- `7221f17`: message says create time read first (gone -> False), then recorded parsed; `recorded <= 0.0`
+- `46da1d0`: message says create time read first (gone -> False), then recorded parsed; `recorded <= 0.0`
   with a live pid -> True; missing/None/garbage still taken over; three tests. Diff matches line for line.
   Numstat conftest +27/-5, test +77/-0. **SUITELOCK direction decided independently** (see NIT 2 above):
   ALIVE-for-0.0 is right for a LOCK; GONE pid still taken over; change confined to test infrastructure,
   `src/` untouched.
-- `6388e77`: message says record `inspect.currentframe().f_back` caller, group by caller, assert loop +
+- `222b281`: message says record `inspect.currentframe().f_back` caller, group by caller, assert loop +
   both guards once per config in order, and assert the launched trial's `flags` equal the helper's return.
   Diff matches. Numstat +44/-12, only tests/test_bench_sweep.py.
 
@@ -142,7 +142,7 @@ additive in assertion strength. The one residue is a spurious-failure shape at z
 - One combined run flaked: `tests/test_run_loop_first_load.py::test_an_unreadable_first_load_releases_the_slot`
   (line 203) and on another run `::test_an_empty_object_run_json_releases_the_loop_slot` (line 400) — a
   run-loop slot-release timing race. Both test bodies and `src/` are unchanged by this branch; the same
-  file at base `573025a` flaked **1/8** whole-file runs (new file 3/~16), and each test passes in isolation.
+  file at base `032b83b` flaked **1/8** whole-file runs (new file 3/~16), and each test passes in isolation.
   **Pre-existing, not caused by these commits.**
 
 ## Item 4 — style / dependencies

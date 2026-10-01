@@ -1,15 +1,15 @@
-# Independent verification — OD12-n2 (863dddd) + W15A-n2 (f088d2b)
+# Independent verification — OD12-n2 (b1f4569) + W15A-n2 (e1d6f0e)
 
-Worktree `.scratch/wt-vfy-od12n2` on `vfy/od12n2` @ `f088d2b`, base `9167aa6`.
+Worktree `.scratch/wt-vfy-od12n2` on `vfy/od12n2` @ `e1d6f0e`, base `34e53d8`.
 Re-derivation probes `.vfy/probe_od12n2.py` and `.vfy/probe_w15an2.py` (deleted;
 no GPU, no engine launch, no live harness turn — fakes only). 10-file regression
 batch: 212 passed. `ruff check src tests`: All checks passed! No source file was
 left modified; no commit/merge/push.
 
 ```
-ITEM: OD12-n2 (863dddd)
+ITEM: OD12-n2 (b1f4569)
 VERDICT: PASS-WITH-NITS
-FAILS-WITHOUT-FIX: yes — `git checkout 9167aa6 -- src/rigma/serve.py` with the
+FAILS-WITHOUT-FIX: yes — `git checkout 34e53d8 -- src/rigma/serve.py` with the
   new test present: 1 failed, 7 deselected (`assert 409 == 200`), matching the
   implementer's claim exactly. Restored to HEAD (git status clean).
 TEST COMMAND: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_b4_question_channel.py -o addopts= -k "two_concurrent" --tb=short
@@ -67,9 +67,9 @@ REASON: The bug is independently re-derived end to end: on the base the FIRST
 ```
 
 ```
-ITEM: W15A-n2 (f088d2b)
+ITEM: W15A-n2 (e1d6f0e)
 VERDICT: PASS-WITH-NITS
-FAILS-WITHOUT-FIX: yes — `git checkout 9167aa6 -- src/rigma/bench.py` with the
+FAILS-WITHOUT-FIX: yes — `git checkout 34e53d8 -- src/rigma/bench.py` with the
   new test present: 1 failed, 36 deselected (`assert False is True` for
   `is_calibrated`), matching the implementer's claim exactly. Restored (clean).
 TEST COMMAND: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_bench_sweep.py -o addopts= -k "caches_nothing_to_calibrate" --tb=short
@@ -128,9 +128,9 @@ is keyed too coarsely and suppresses a later calibratable plan.
 
 ## Prose
 
-**What I did.** Worktree `.scratch/wt-vfy-od12n2` (`vfy/od12n2` @ `f088d2b`).
+**What I did.** Worktree `.scratch/wt-vfy-od12n2` (`vfy/od12n2` @ `e1d6f0e`).
 Read both full commits and both finding docs. Ran each new test at HEAD, then
-reverted only that commit's source file (`git checkout 9167aa6 -- <file>`) with
+reverted only that commit's source file (`git checkout 34e53d8 -- <file>`) with
 the tests present, captured the failure verbatim, and restored (`git status`
 clean). Ran the ten named files in one process: 212 passed. `ruff check src
 tests`: clean. Wrote two throwaway probes (`.vfy/`, deleted) that drive the real

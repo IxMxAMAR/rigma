@@ -1,4 +1,4 @@
-ITEM: B4b-schema required-container fix (75960df)
+ITEM: B4b-schema required-container fix (d6ec493)
 VERDICT: PASS-WITH-NITS
 FAILS-WITHOUT-FIX: yes — reproduced exactly. With both new guards deleted from `problemFor` (frontend-v2/src/chat/governance.ts:446-448, 462-464) and the committed tests unchanged: `Test Files 2 failed (2) / Tests 7 failed | 78 passed (85)`, the same 7 tests the implementer named (governance shapes 1, 2, 2b, 6, 9, 10 + QuestionForm "will not submit a required array whose only row is blank"). An independent probe at that pre-fix state also showed shape 1 `ready=true, problem="", answer={}` and 198 ready-but-required-absent violations in a 4000-trial fuzz. Restoring the guards via `git checkout --` returned 85 passed and 0 fuzz violations.
 TEST COMMAND: npx.cmd vitest run src/chat/governance.test.ts src/chat/QuestionForm.test.tsx   (cwd: C:\ComfyUI\RD\rigma-review\frontend-v2)

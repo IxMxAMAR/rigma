@@ -314,7 +314,7 @@ def test_a_calibration_entry_says_what_it_was_measured_on(monkeypatch, tmp_path)
     assert entry["hardware"]["backend"] == "vulkan"
 
 
-# The exact baseline argv as produced by the parent commit dbb2110, captured
+# The exact baseline argv as produced by the parent commit cb01ef2, captured
 # before C2 touched anything. `--no-op-offload` is a sweep axis, so a default
 # launch must still emit this list byte for byte.
 BEFORE_C2_BASELINE_ARGV = [

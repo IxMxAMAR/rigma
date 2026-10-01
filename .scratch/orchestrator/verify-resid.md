@@ -1,14 +1,14 @@
-# verify-resid — independent verification of `impl/resid` (ad36384, 6da0460) and the W13B-3 deferral
+# verify-resid — independent verification of `impl/resid` (a934cec, 249d07a) and the W13B-3 deferral
 
-Worktree `.scratch/wt-vfy-resid` @ `vfy/resid` (base `f3bd020`, tip `6da0460`); integration `review/deep-audit-2026-09-22` @ `cb92962`. Worktree left CLEAN (`git status --porcelain` empty, `git diff HEAD` empty). No engine, model, GPU or live harness turn; every pytest run appended `-m "not hardware"` via the shared semaphore script.
+Worktree `.scratch/wt-vfy-resid` @ `vfy/resid` (base `a157e58`, tip `249d07a`); integration `review/deep-audit-2026-09-22` @ `8f5a46d`. Worktree left CLEAN (`git status --porcelain` empty, `git diff HEAD` empty). No engine, model, GPU or live harness turn; every pytest run appended `-m "not hardware"` via the shared semaphore script.
 
 ---
 
-ITEM: CTXFLOOR-n4 (ad36384)
+ITEM: CTXFLOOR-n4 (a934cec)
 VERDICT: PASS-WITH-NITS
 FAILS-WITHOUT-FIX: yes
 TEST COMMAND: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_hangar_api.py -k "below_the_floor" --tb=short` (run from `.scratch\wt-vfy-resid`)
-TEST OUTPUT (before fix): `src/rigma/server_ops.py` checked out from `f3bd020`, new test present:
+TEST OUTPUT (before fix): `src/rigma/server_ops.py` checked out from `a157e58`, new test present:
 ```
 F                                                                        [100%]
 __________ test_a_ctx_below_the_floor_is_raised_to_the_launch_floor ___________
@@ -26,17 +26,17 @@ E   AssertionError: assert 1 == 2048
 Both match the commit message verbatim.
 TEST OUTPUT (after fix): `1 passed, 16 deselected, 1 warning in 0.70s`
 RULE-13 STATE CHECKED: I wrote `.scratch/orchestrator/vfy-resid-probe.py` (no engine; imports `rigma.models`/`rigma.server_ops` only). **(a) exhaustive equivalence** — the old inline `max(MIN_LAUNCH_CTX, min(int(ctx), native_ctx))` vs the helper over a 90-pair grid of `ctx in {-100,-1,0,1,2047,2048,2049,4096,32768,999999} x native in {-1,0,1,512,2047,2048,2049,32768,999999}`: **0 mismatches**. **(b) `native_ctx == floor`** `helper(4096, 2048) == 2048`; **`native_ctx < floor`** `helper(4096, 2047) == 2048`, `helper(1, 512) == 2048`; **NEGATIVE ctx** `helper(-5, 32768) == 2048` (raised, not rejected — the route's 400 is the front door); **`ctx == 0`** `helper(0, 32768) == 2048`; **monkeypatched floor of 0** `helper(1, 32768, floor=0) == 1`, `helper(0, ..., floor=0) == 0`, `helper(-5, ..., floor=0) == 0` — the raise-to becomes a **no-op**, and the helper body contains **no `/`, `//` or `%`**, so nothing divides. `floor=None` reads the live `server_ops.MIN_LAUNCH_CTX` at call time (rebinding it to 4096 moves `helper(1,32768)` to 4096; restoring returns 2048).
-BREAKS: nothing. `tests/test_models.py tests/test_hangar_api.py tests/test_repo_invariants.py tests/test_hangar.py tests/test_server_ops_ctx.py` -> **109 passed, 1 warning in 23.81s**; `ruff check src tests` -> **All checks passed!**. Merge-conflict check at integration HEAD `cb92962`: `src/rigma/cli.py` has exactly one `from . import kvcache as _kvcache` (line 2618) and all three uses (`launch_fingerprint` 2681, `restore` 2684, `restore_failure_note` 2703); an AST scope check proves all four lines are inside the single `def up` (2154–2765), so the launch path cannot `NameError`. `tests/test_cli.py tests/test_launch_records_fingerprint.py` -> **52 passed in 4.68s**.
+BREAKS: nothing. `tests/test_models.py tests/test_hangar_api.py tests/test_repo_invariants.py tests/test_hangar.py tests/test_server_ops_ctx.py` -> **109 passed, 1 warning in 23.81s**; `ruff check src tests` -> **All checks passed!**. Merge-conflict check at integration HEAD `8f5a46d`: `src/rigma/cli.py` has exactly one `from . import kvcache as _kvcache` (line 2618) and all three uses (`launch_fingerprint` 2681, `restore` 2684, `restore_failure_note` 2703); an AST scope check proves all four lines are inside the single `def up` (2154–2765), so the launch path cannot `NameError`. `tests/test_cli.py tests/test_launch_records_fingerprint.py` -> **52 passed in 4.68s**.
 NITS: (1) the structural half of the new test is a substring check (`"_raised_launch_ctx(" in body`), not an AST call check, so it does not pin the argument order — harmless here because `max(floor, min(int(ctx), int(native)))` is symmetric, a swap is behaviour-neutral. (2) the helper adds `int(native_ctx)` where the old inline used `spec_full.native_ctx` bare; for the typed `ModelSpec.native_ctx: int` field this is a no-op, but it is a (harmless) widening. (3) the `floor` parameter exists only as a test seam — production never passes it. None is material.
-REASON: The test genuinely fails on a clean `f3bd020` revert of the source with the test kept, exactly the `AttributeError`/`1 failed, 16 deselected` the commit quotes, and the mutation reproduces `assert 1 == 2048`; the extraction is behaviour-preserving on a 90-pair equivalence grid including `native_ctx < floor`, and `perform_switch` genuinely calls the helper (`server_ops.py:826`) with no behaviour change at/above the floor.
+REASON: The test genuinely fails on a clean `a157e58` revert of the source with the test kept, exactly the `AttributeError`/`1 failed, 16 deselected` the commit quotes, and the mutation reproduces `assert 1 == 2048`; the extraction is behaviour-preserving on a 90-pair equivalence grid including `native_ctx < floor`, and `perform_switch` genuinely calls the helper (`server_ops.py:826`) with no behaviour change at/above the floor.
 
 ---
 
-ITEM: B7E-n1 (6da0460)
+ITEM: B7E-n1 (249d07a)
 VERDICT: PASS-WITH-NITS
 FAILS-WITHOUT-FIX: yes
 TEST COMMAND: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ComfyUI\RD\rigma-review\.scratch\orchestrator\run-pytest.ps1 tests/test_models.py -k "construction_only" --tb=short` (before), `... tests/test_models.py -k "alias"` (after)
-TEST OUTPUT (before fix): `src/rigma/models.py` checked out from `f3bd020`, new test present:
+TEST OUTPUT (before fix): `src/rigma/models.py` checked out from `a157e58`, new test present:
 ```
 tests\test_models.py:194: in test_the_alias_guard_is_construction_only_by_design
     assert "CONSTRUCTION-ONLY (B7E-n1)" in src
@@ -78,11 +78,11 @@ OVERALL: PASS — both commits fail cleanly before their fix, pass after, are be
 
 ## Prose
 
-**1. Fails without the fix — confirmed for both, to the exact counts the commits claim.** CTXFLOOR-n4: reverting only `src/rigma/server_ops.py` to `f3bd020` with the new test kept gives `1 failed, 16 deselected` and `AttributeError: module 'rigma.server_ops' has no attribute '_raised_launch_ctx'`; the `max(floor, ...)` removal gives `assert 1 == 2048`, `1 failed, 16 deselected`. B7E-n1: reverting only `src/rigma/models.py` to `f3bd020` gives `1 failed, 11 deselected`, failing at the source-note line 194 while the two behavioural asserts pass — the commit's parenthetical is true. Both sources were restored immediately; the worktree is clean.
+**1. Fails without the fix — confirmed for both, to the exact counts the commits claim.** CTXFLOOR-n4: reverting only `src/rigma/server_ops.py` to `a157e58` with the new test kept gives `1 failed, 16 deselected` and `AttributeError: module 'rigma.server_ops' has no attribute '_raised_launch_ctx'`; the `max(floor, ...)` removal gives `assert 1 == 2048`, `1 failed, 16 deselected`. B7E-n1: reverting only `src/rigma/models.py` to `a157e58` gives `1 failed, 11 deselected`, failing at the source-note line 194 while the two behavioural asserts pass — the commit's parenthetical is true. Both sources were restored immediately; the worktree is clean.
 
 **2. Does each fix do what its commit says?** CTXFLOOR-n4: yes. The helper's arithmetic is identical to the old inline over a 90-pair grid including `native_ctx < floor`, negative `ctx`, `ctx == 0` and `native_ctx == floor`; `perform_switch:826` calls it; no behaviour changes at/above the floor (the committed test pins `floor`, `floor+1`, the native cap, and a native window below the floor). B7E-n1: yes. The note's factual claims hold and the bypass is genuinely unreachable — every writer is the constructor or a merge that re-validates, and the only reader is `models.py:703`.
 
-**3. What does it break?** Nothing. The five named files pass (109 passed), the two CLI files pass (52 passed), `ruff check src tests` is clean. The `_kvcache` import at integration HEAD `cb92962` survived the merge resolution: one import at `cli.py:2618`, three uses at 2681/2684/2703, all provably inside `def up`, so the launch path cannot `NameError`.
+**3. What does it break?** Nothing. The five named files pass (109 passed), the two CLI files pass (52 passed), `ruff check src tests` is clean. The `_kvcache` import at integration HEAD `8f5a46d` survived the merge resolution: one import at `cli.py:2618`, three uses at 2681/2684/2703, all provably inside `def up`, so the launch path cannot `NameError`.
 
 **4. Style.** Provenance comments are present and accurate; the CTXFLOOR fix is a pure helper rather than a widened monkeypatch (the faked `perform_switch` seam was *not* loosened); no existing assertion was weakened (both commits only add tests); no dead code (the new helper is called in production and by the test). The only style-adjacent weaknesses are the two nits above: substring structural checks and the unpinned "no post-construction writer" invariant.
 

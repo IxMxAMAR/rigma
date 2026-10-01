@@ -317,7 +317,7 @@ Everything below needs a free card and is labelled with what it would settle.
    above): it needs the `llama-kv-mean-center` calibration over a corpus plus a perplexity run. It is
    deliberately **not** wired into Rigma until a number exists.
 
-7. **Is `plan.flags.ubatch` the engine's physical `n_ubatch`?** (`impl/ubatch` @ `07342df`, the
+7. **Is `plan.flags.ubatch` the engine's physical `n_ubatch`?** (`impl/ubatch` @ `d2557d8`, the
    DR21RN1-n1 fix.) The plan-side compute charge now uses the `-ub` the launch emitted, read back from
    `state.json`. Rigma refuses `ubatch > batch` at write time, but **llama.cpp can clamp `n_ubatch` to
    `n_batch`**, and no engine ran to confirm the two agree. A single real load with `rigma up --ubatch

@@ -274,7 +274,7 @@ every item in waves 16 and 17 — checked by a **separate** agent that did not w
   and environmental, not regressions:** `test_view_image_missing_file` and
   `test_compiled_spec_seeds_the_plan` both use `D:/...` paths, and **`D:` is a BitLocker-locked drive
   on this machine** (it does not even appear in `Get-PSDrive`), so Windows answers with a BitLocker
-  error instead of "no such file". Both were reproduced **identically at the base commit `7ea1827`**,
+  error instead of "no such file". Both were reproduced **identically at the base commit `e43a5bf`**,
   and neither file was touched by this program. So the whole program — **59 merges and 202 other
   commits** on top of the base — has **zero regressions**.
 - **One honest caveat about how that suite was run.** Twice, a full-suite run appeared to *freeze* —
@@ -328,5 +328,5 @@ would change behaviour if you chose differently:
   does not). The obvious fix would make the sweep drop **every** candidate config, so it was
   deliberately **not** applied — it is a measurement caveat, and the right fix is an owner decision.
 
-Nothing in this program rewrote history: the base commit `7ea1827` is untouched, every commit carries
+Nothing in this program rewrote history: the base commit `e43a5bf` is untouched, every commit carries
 your identity, and nothing was pushed.
