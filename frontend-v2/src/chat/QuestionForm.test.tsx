@@ -305,7 +305,7 @@ describe("an elicitation the turn is blocked on", () => {
   });
 
   it("will not submit a required array whose only row is blank (B4b-schema)", async () => {
-    // The verifier of 873b90c's finding: this shape used to be READY and POST
+    // The verifier of d553751's finding: this shape used to be READY and POST
     // `{requestId, answer: {}}`, dropping a property the schema marks required.
     // The form must now say WHY, and the answer after filling the row must
     // carry the key.

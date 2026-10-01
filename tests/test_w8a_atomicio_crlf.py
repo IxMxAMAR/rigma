@@ -4,7 +4,7 @@ The docstring used to say the helper exists because `atomic_write_text` would
 rewrite CRLF and alter line endings. The verifier measured that
 `atomic_write_text` opens with `newline="\\n"`, which DISABLES translation, so
 it round-trips CRLF bytes exactly; the real trap is the READ side. The wording
-was corrected in 39792e3, but nothing pinned the behaviour it now asserts, so a
+was corrected in 5d409f8, but nothing pinned the behaviour it now asserts, so a
 future edit that "helpfully" translates line endings would not fail a test.
 These do.
 

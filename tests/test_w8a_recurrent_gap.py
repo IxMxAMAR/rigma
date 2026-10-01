@@ -1,6 +1,6 @@
 """A2d-gap: `rs=unknown` must fire where the count can actually be wrong.
 
-A2d (6198b8a) makes an unrecognised recurrent geometry report `rs=unknown`
+A2d (6883f5f) makes an unrecognised recurrent geometry report `rs=unknown`
 instead of a silent zero — but the label sat in the `elif` AFTER `if rs_mb:`.
 So the one shape where the interval-derived count is least trustworthy still
 printed a confident number: a header carrying BOTH an explicit

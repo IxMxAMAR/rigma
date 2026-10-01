@@ -1268,7 +1268,7 @@ def _budget_rows(spec: ModelSpec, gguf: GgufFile, mm_mb: float, ctx: int,
     for a hybrid whose geometry is unknown (the fit says `rs=unknown` there).
 
     A2d-budget: `rs_unknown` rides BESIDE the charge. The fit's explain line has
-    said `rs=unknown(est N MB)` since A2d-gap (acc5c41), but this row — the
+    said `rs=unknown(est N MB)` since A2d-gap (e29396f), but this row — the
     arithmetic behind the Models page's "OVER by / headroom" line — still
     reported a bare number for the same shape, and a number with no provenance
     reads as a measured one. The flag never replaces the charge: dropping the

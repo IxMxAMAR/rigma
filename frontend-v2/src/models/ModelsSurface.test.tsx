@@ -47,7 +47,7 @@ describe("the runs cell tells a broken fit from a real one", () => {
 });
 
 // A2b / A2d-budget. `rs_mb` (A2b) is the recurrent-state term the fit charges
-// for a hybrid's SSM buffers, and `rs_unknown` (A2d-budget, merged as a23dc7b)
+// for a hybrid's SSM buffers, and `rs_unknown` (A2d-budget, merged as d22173a)
 // says the geometry could not be read, so the charge is an ESTIMATE. The Models
 // page printed `over_mb`/headroom with the estimate unlabelled — a bare number
 // reads as a measured one, which is the silent confidence the A2 family exists

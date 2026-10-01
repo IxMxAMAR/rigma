@@ -452,7 +452,7 @@ describe("B4b-schema: nested objects, arrays and defaults", () => {
   });
 });
 
-// B4b-schema, second defect (the verifier of 873b90c's BREAKS line). The two
+// B4b-schema, second defect (the verifier of d553751's BREAKS line). The two
 // functions disagreed about a required CONTAINER: `questionProblem` counted UI
 // ROWS, while `questionAnswer` DROPPED blank ones. A required array with one
 // blank row — or a required object whose children are all optional and untouched
@@ -674,7 +674,7 @@ describe("outcomeTone", () => {
   });
 });
 
-// OD12-n1, folded into this wave by the OD-12 merge (17bfbe8). The question
+// OD12-n1, folded into this wave by the OD-12 merge (ea1ce64). The question
 // channel has its own two verdicts, and only `expired` is a failure: the glyph
 // used to be "✓ only for allowed-once, ✕ for everything else", so an ANSWERED
 // question was drawn with the failure cross.

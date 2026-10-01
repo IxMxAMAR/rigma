@@ -96,7 +96,7 @@ def _never_touch_the_real_rigma_home(tmp_path_factory):
 # not slow, *stopped*, 0 CPU over 25 s — each blocked on an established loopback
 # socket, with 72 orphaned `fake_acp_server.py` processes left behind. The shared
 # resource was a fixed TCP port (`tests/test_bench.py` bound 11598 literally; it
-# was the only literal bind in the suite) and that is fixed at 43e63de, but
+# was the only literal bind in the suite) and that is fixed at da50a67, but
 # nothing then *stopped* two full runs from starting, and this program's own
 # "at most three pytest processes" rule permits it.
 #
