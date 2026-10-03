@@ -2253,6 +2253,19 @@ def _system_info(args, ctx):
     return "\n".join(lines)
 
 
+def _load_model_memory(f: Path) -> dict | None:
+    """The `remember` store, `{}` when there is none yet, or None when the file
+    exists but is not a JSON object — so a damaged store is reported, never
+    silently replaced by a fresh one that drops every earlier fact."""
+    if not f.exists():
+        return {}
+    try:
+        mem = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return mem if isinstance(mem, dict) else None
+
+
 @tool("remember",
       "Save a durable note to your own memory so you can recall it in future "
       "chats (facts about the user, preferences, ongoing work).",
@@ -2260,13 +2273,22 @@ def _system_info(args, ctx):
           "key": {"type": "string"}, "value": {"type": "string"}},
        "required": ["key", "value"]})
 def _remember(args, ctx):
+    from .atomicio import atomic_write_json
+    from .memory import _FileLock
     from .runtime import rigma_home
     f = rigma_home() / "model_memory.json"
-    mem = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-    key = str(args.get("key"))
-    old = mem.get(key)
-    mem[key] = str(args.get("value"))
-    f.write_text(json.dumps(mem, indent=1), encoding="utf-8")
+    # The native loop and every arm chat's MCP server share this file, so the
+    # read-modify-write is locked across processes and the write is atomic: a
+    # reader never sees a half-written file, and a power cut cannot truncate it.
+    with _FileLock(f.with_name(f.name + ".lock")):
+        mem = _load_model_memory(f)
+        if mem is None:
+            return (f"error: {f} is unreadable, so nothing was saved and it was "
+                    "not overwritten — fix or move that file, then remember again")
+        key = str(args.get("key"))
+        old = mem.get(key)
+        mem[key] = str(args.get("value"))
+        atomic_write_json(f, mem, indent=1)
     if old is not None and old != mem[key]:
         # same failure class write_file was fixed for: silent replacement
         return (f"remembered '{key}' — REPLACED the previous value "
@@ -2283,7 +2305,9 @@ def _recall(args, ctx):
     f = rigma_home() / "model_memory.json"
     if not f.exists():
         return "(nothing remembered yet)"
-    mem = json.loads(f.read_text(encoding="utf-8"))
+    mem = _load_model_memory(f)
+    if mem is None:
+        return f"error: {f} is unreadable — fix or move that file"
     key = args.get("key")
     if key:
         return mem.get(str(key), f"(nothing remembered for '{key}')")
