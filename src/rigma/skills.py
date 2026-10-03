@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 
 from .runtime import rigma_home
+from .atomicio import atomic_write_text
 
 # A skill name becomes a FILENAME, and the name arrives over HTTP from the
 # browser. Anything outside this set is rejected rather than sanitised away:
@@ -146,7 +147,7 @@ def _with_frontmatter(name: str, content: str) -> str:
 def save_skill(name: str, content: str) -> dict:
     p = _path_for(name)
     text = _with_frontmatter(_clean(name), content)
-    p.write_text(text, encoding="utf-8")
+    atomic_write_text(p, text)
     return {"id": p.stem, "name": p.stem, "title": p.stem,
             "filename": p.name, "content": text}
 

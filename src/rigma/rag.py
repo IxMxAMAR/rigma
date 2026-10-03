@@ -12,6 +12,7 @@ import httpx
 import psutil
 
 from .runtime import rigma_home
+from .atomicio import atomic_write_json
 
 RAG_PORT = 11510
 
@@ -111,8 +112,7 @@ def add_source(path: str) -> list[str]:
     ap = str(Path(path).resolve())
     if ap not in srcs:
         srcs.append(ap)
-        (rag_dir() / "sources.json").write_text(json.dumps(srcs, indent=2),
-                                                encoding="utf-8")
+        atomic_write_json(rag_dir() / "sources.json", srcs)
     write_rag_config()
     return srcs
 
@@ -121,8 +121,7 @@ def remove_source(path: str) -> list[str]:
     srcs = load_sources()
     ap = str(Path(path).resolve()) if path else ""
     srcs = [s for s in srcs if s != ap and s != path]
-    (rag_dir() / "sources.json").write_text(json.dumps(srcs, indent=2),
-                                            encoding="utf-8")
+    atomic_write_json(rag_dir() / "sources.json", srcs)
     write_rag_config()
     return srcs
 
