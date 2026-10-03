@@ -29,6 +29,14 @@ def rag_dir() -> Path:
     return d
 
 
+def _raggity_env(**extra: str) -> dict:
+    """raggity's environment. Its Rich output goes to a pipe or a log file, where
+    Windows defaults to a strict cp1252: a file name outside it (`ŝ`, CJK, emoji)
+    raised UnicodeEncodeError and the ingest or sidecar died. UTF-8 it is, and the
+    readers below decode it the same way."""
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", **extra}
+
+
 def raggity_cmd() -> list[str] | None:
     env = os.environ.get("RIGMA_RAGGITY_CMD")
     if env:
@@ -282,7 +290,7 @@ def ensure_sidecar(port: int = RAG_PORT, timeout: float = 90.0) -> dict:
     with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
         proc = subprocess.Popen(
             [*cmd, "serve", "--config", str(cfg), "--port", str(port)],
-            stdout=log_f, stderr=subprocess.STDOUT)
+            stdout=log_f, stderr=subprocess.STDOUT, env=_raggity_env())
     (rag_dir() / "sidecar.json").unlink(missing_ok=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -358,10 +366,11 @@ def discover(deep: bool = False, timeout: float = 30.0) -> dict:
     cmd = raggity_cmd()
     if cmd is None:
         return {"complete": True, "candidates": [], "available": False}
-    env = {**os.environ, "RAGGITY_NONINTERACTIVE": "1"}
+    env = _raggity_env(RAGGITY_NONINTERACTIVE="1")
     argv = [*cmd, "discover", "--json"] + (["--deep"] if deep else [])
     try:
         res = subprocess.run(argv, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
                              timeout=timeout, env=env)
         if res.returncode != 0:
             return {"complete": True, "candidates": [], "available": False}
@@ -380,7 +389,8 @@ def ingest() -> str:
         raise RuntimeError(RAGGITY_MISSING_MSG)
     cfg = write_rag_config()
     res = subprocess.run([*cmd, "ingest", "--config", str(cfg)],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", env=_raggity_env())
     if res.returncode != 0:
         raise RuntimeError(f"raggity ingest failed:\n{res.stderr or res.stdout}")
     return res.stdout
