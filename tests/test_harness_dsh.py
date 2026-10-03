@@ -156,6 +156,28 @@ def test_drive_turn_translates_the_stream_and_skips_a_malformed_line(
 GOLDEN = Path(__file__).parent / "golden" / "dsh_turn.ndjson"
 
 
+def test_the_runner_child_imports_the_rigma_that_is_running(monkeypatch, tmp_path):
+    # Run.bat puts the checkout on PYTHONPATH and `harness_env` drops it, so the
+    # child used to resolve `rigma` to an installed copy and fail with "No module
+    # named rigma._dsh_runner". The stand-in reports where the child found it.
+    import rigma
+    home = _fake_home(tmp_path)
+    argv = _fake_runner(
+        tmp_path,
+        """
+        import importlib.util, json, sys
+        spec = importlib.util.find_spec("rigma")
+        origin = spec.origin if spec else "no rigma"
+        sys.stdout.write(json.dumps({"type": "done", "text": origin}) + "\\n")
+        sys.stdout.flush()
+        """,
+    )
+    events = _drive(monkeypatch, argv, home)
+
+    assert not [e for e in events if e.kind == "error"], events
+    assert Path(events[-1].text).resolve() == Path(rigma.__file__).resolve()
+
+
 def test_a_recorded_turn_replays_through_the_translation(monkeypatch, tmp_path):
     """Replay the committed NDJSON stream of one DSH turn.
 
