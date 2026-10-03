@@ -353,6 +353,9 @@ def _mcp_spec(cwd: str) -> dict:
     from .runtime import rigma_home
 
     env = {"RIGMA_HOME": str(rigma_home()),
+           # The server must import THIS rigma, not an installed copy: the
+           # arm's environment carries no PYTHONPATH (see `rigma_import_root`).
+           "PYTHONPATH": _harness.rigma_import_root(),
            # Granted HERE, deliberately and visibly. The server is pessimistic by
            # default — `allow_code` is off unless the environment turns it on — so
            # a capability nobody granted is refused rather than assumed. The only
@@ -379,8 +382,8 @@ def _same_registration(have, spec) -> bool:
     directory and moves from turn to turn, so a mismatch there is normal rather
     than drift.
 
-    `env` is compared on the keys that say WHICH rigma home and WHETHER code
-    tools were granted, ignoring the workspace for the same reason. Anything
+    `env` is compared on the keys that say WHICH rigma code and home and WHETHER
+    code tools were granted, ignoring the workspace for the same reason. Anything
     else in the stored entry — a key a newer build adds — is left alone: this
     decides whether to rewrite, not what the entry should contain.
 
@@ -397,7 +400,7 @@ def _same_registration(have, spec) -> bool:
         return False
     h_env = have.get("env") if isinstance(have.get("env"), dict) else {}
     s_env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
-    for key in ("RIGMA_HOME", "RIGMA_MCP_ALLOW_CODE"):
+    for key in ("PYTHONPATH", "RIGMA_HOME", "RIGMA_MCP_ALLOW_CODE"):
         if str(h_env.get(key) or "") != str(s_env.get(key) or ""):
             return False
     return True

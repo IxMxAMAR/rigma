@@ -229,6 +229,18 @@ def harness_env(base: dict | None = None, *, also: tuple = ()) -> dict:
     return env
 
 
+def rigma_import_root() -> str:
+    """The directory the RUNNING `rigma` package was imported from.
+
+    A child started as `python -m rigma.<module>` must import this same code, and
+    `harness_env` drops PYTHONPATH — which is exactly how a checkout is put ahead
+    of a pip-installed copy (Run.bat does it). Without this on the child's path
+    the DSH runner resolved `rigma` to the installed 0.10.0 and died with "No
+    module named rigma._dsh_runner", and the MCP server silently ran old code.
+    """
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 # The repair and verification machinery is the reason a strong local-model
 # agent works at all here, and no external harness inherits it.
 #

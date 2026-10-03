@@ -867,8 +867,12 @@ def drive_turn(
         # adapter and its conformance checks read.
         env = harness_env(also=("DEEPSEEK_API_KEY", "RIGMA_DSH_HOME",
                                 "RIGMA_MCODE_BIN"))
+        # The running rigma's own root comes first, so `-m rigma._dsh_runner`
+        # imports this checkout and not an installed copy (see
+        # `rigma_import_root`); then the SDK source.
         existing = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(src) + (os.pathsep + existing if existing else "")
+        env["PYTHONPATH"] = os.pathsep.join(
+            [_harness.rigma_import_root(), str(src)] + ([existing] if existing else []))
 
         live = _take(pkey, key)
         # R4-SESS-1: a FRESH runtime for a chat that has already spoken means the

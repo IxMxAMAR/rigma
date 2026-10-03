@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -315,3 +316,14 @@ def test_same_registration_ignores_the_workspace_and_nothing_else():
     assert mc._same_registration({}, spec) is False
     assert mc._same_registration("nope", spec) is False
     assert mc._same_registration(spec, spec) is True
+
+
+def test_the_mcp_server_imports_the_running_rigma_and_old_entries_are_repaired():
+    # The arm's environment carries no PYTHONPATH, so without the import root a
+    # checkout launched through Run.bat served the pip-installed rigma's tools.
+    import rigma
+    spec = mc._mcp_spec("C:/chat")
+    root = Path(spec["env"]["PYTHONPATH"])
+    assert (root / "rigma").resolve() == Path(rigma.__file__).resolve().parent
+    stale = {**spec, "env": {k: v for k, v in spec["env"].items() if k != "PYTHONPATH"}}
+    assert mc._same_registration(stale, spec) is False
