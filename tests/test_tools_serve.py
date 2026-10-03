@@ -450,6 +450,67 @@ def test_silent_stop_is_not_reported_as_a_limit(home, quiet_upstream):
                    for m in msgs)
 
 
+class _NudgedUpstream(BaseHTTPRequestHandler):
+    """Round 1: a tool call. Round 2: reasoning only, then stop. Answers only
+    once asked to — live 2026-10-03, step 20 of a 1000-round budget thought
+    for 3871 tokens and ended, and the turn stopped on 'say continue'."""
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        msgs = json.loads(self.rfile.read(n)).get("messages", [])
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+
+        def sse(obj):
+            self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+
+        if not any(m.get("role") == "tool" for m in msgs):
+            sse({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "type": "function",
+                 "function": {"name": "calculator",
+                              "arguments": json.dumps(
+                                  {"expression": "1+1"})}}]}}]})
+        elif msgs[-1].get("role") == "user":
+            sse({"choices": [{"delta": {"content": "It is 2."}}]})
+        else:
+            sse({"choices": [{"delta": {"reasoning_content": "so the sum"},
+                              "finish_reason": "stop"}]})
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def nudged_upstream():
+    srv = HTTPServer(("127.0.0.1", 0), _NudgedUpstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield srv.server_address[1]
+    srv.shutdown()
+
+
+def test_a_quiet_step_after_tools_is_asked_for_its_reply(home, nudged_upstream):
+    st.write_state("m", "Q4", 11500, engine_pid=os.getpid(),
+                   ui_pid=os.getpid())
+    client = TestClient(build_app(upstream_port=nudged_upstream))
+    sid = client.post("/api/sessions", json={}).json()["id"]
+    client.post(f"/api/sessions/{sid}", json={"use_tools": True})
+    r = client.post(f"/api/sessions/{sid}/chat", json={"message": "go"})
+    assert r.status_code == 200
+    assert "It is 2." in r.text
+    assert "stopped after its tool calls" not in r.text
+    from rigma import sessions as _sessions
+    saved = _sessions.load(sid)
+    last = [m for m in saved["messages"] if m["role"] == "assistant"][-1]
+    assert last["content"] == "It is 2."
+    assert not last.get("notice")
+    # the nudge is transient: never saved, never shown to later turns
+    assert not any("Reply now" in str(m.get("content", ""))
+                   for m in saved["messages"])
+    assert not any("Reply now" in str(m.get("content", ""))
+                   for m in _sessions.build_messages(saved))
+
+
 class _ThinkOnlyUpstream(BaseHTTPRequestHandler):
     """The model reasons and then ends: reasoning_content only — no text, no
     tool calls. Live 2026-07-21: the owner saw 'generating' for 8 seconds and

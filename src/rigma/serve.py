@@ -1470,6 +1470,7 @@ async def _warm_memory_embedder() -> None:
 # retry: a tool that genuinely needs calling again after its result usually gets
 # different arguments, and a retry after a transient failure is normally one or two.
 _REPEAT_CALL_LIMIT = 4
+_QUIET_NUDGE_LIMIT = 2
 
 
 def _round_cap(session: dict) -> int:
@@ -3864,6 +3865,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             # long it is.
             _last_sig = None
             _repeat = 0
+            # rounds in a row that ended with no reply and no call after tools
+            # ran — a thinking model can reason for thousands of tokens and stop
+            # there (owner report 2026-10-03, step 20 of a 1000-round budget).
+            _quiet = 0
             for _round in range(max_rounds):
                 # WHERE A NATIVE TURN STOPS. An external backend's stop kills its
                 # process and lands immediately; here the only safe boundary is
@@ -3909,6 +3914,12 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         "You have reached the tool-call limit. Do not call any more "
                         "tools — give your final answer now using what you already "
                         "gathered.")}]
+                elif _quiet:
+                    # transient like the nudge above: never appended to `msgs`,
+                    # so it is neither persisted nor seen by later turns
+                    turn_msgs = msgs + [{"role": "user", "content": (
+                        "Your tool results are above. Reply now — give your "
+                        "answer, or call the next tool if the task needs more.")}]
                 body = {"messages": turn_msgs, "stream": True,
                         "stream_options": {"include_usage": True},
                         "id_slot": MAIN_SLOT}
@@ -4314,7 +4325,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             f"the call.)_")})
                         hit_repeat = True
                         break
+                    _quiet = 0
                     continue                       # stream the next round
+                if use_tools and trace and not rtext.strip() and not last \
+                        and _quiet < _QUIET_NUDGE_LIMIT:
+                    # went quiet after its tools: ask for the reply instead of
+                    # ending the turn on a "say continue" notice
+                    _quiet += 1
+                    yield _sse({"note": "no reply after the tool results — "
+                                        "asking the model to answer"},
+                               event="think")
+                    continue
                 text = rtext                       # no tool calls -> this is final
                 break
             else:
