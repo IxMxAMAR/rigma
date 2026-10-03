@@ -354,8 +354,22 @@ def _free_current(profile, state: dict, reg):
         # VRAM must never be over-credited the way RAM safely can: the whole
         # point of measuring it is to stop planning against memory the card
         # does not have. Cap the credit at what is actually held.
+        #
+        # What the engine HOLDS, measured, when its pid is positively ours: at a
+        # long context the KV cache and buffers rival the weights (262K q5_1 on a
+        # 6.9GB file holds 13.5GB), so crediting only the file blamed 6.6GB of
+        # our own engine on "other apps" and planned the next switch against
+        # 9.4GB of a 15.9GB card. The file size stays the fallback.
+        from . import state as st
+        from .probe import process_vram_mb
+        held = freed_mb
+        pid = int(state.get("engine_pid") or -1)
+        if pid > 0 and st._is_identified_process(pid, state.get("engine_started_at")):
+            measured = process_vram_mb(pid)
+            if measured is not None and measured <= profile.vram_used_mb:
+                held = measured
         update["vram_used_mb"] = max(0.0, profile.vram_used_mb
-                                     - min(freed_mb, profile.vram_used_mb))
+                                     - min(held, profile.vram_used_mb))
     return profile.model_copy(update=update)
 
 

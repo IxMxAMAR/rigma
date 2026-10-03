@@ -134,6 +134,36 @@ def gpu_used_mb() -> float | None:
     return got
 
 
+def process_vram_mb(pid: int) -> float | None:
+    """Dedicated VRAM held by ONE process, or None when unmeasurable.
+
+    Only for crediting back Rigma's own engine. The per-process counter is not
+    trustworthy for every process (the browser reading above), so the caller
+    accepts it only for a positively identified engine pid and only when it fits
+    inside the adapter total; anything else falls back to the old estimate.
+    """
+    if _os_name() != "windows" or pid <= 0:
+        return None
+    key = f"pid:{int(pid)}"
+    hit = _VRAM_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < _VRAM_TTL_S:
+        return hit[1]
+    ps = (r"$s=(Get-Counter '\GPU Process Memory(pid_" + str(int(pid)) +
+          r"_*)\Dedicated Usage' -EA SilentlyContinue).CounterSamples;"
+          r"$t=0; foreach($x in $s){$t+=$x.CookedValue}; $t")
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=20)
+        got: float | None = float((out.stdout or "").strip()) / 2**20
+    except Exception:
+        got = None
+    if got is not None and got <= 0:
+        got = None
+    _VRAM_CACHE[key] = (time.monotonic(), got)
+    return got
+
+
 # --- Vulkan enumeration (ctypes; no SDK needed, the ICD ships with GPU drivers) ---
 
 _VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1

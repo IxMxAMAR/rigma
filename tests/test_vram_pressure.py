@@ -8,6 +8,8 @@ could not be resident, reported 0% offload, and Windows WDDM silently paged
 log cannot show this: llama.cpp asked the driver for the memory and the driver
 said yes.
 """
+import pytest
+
 from rigma.probe import _sum_other_processes
 from rigma.resolve import VRAM_RESERVE_MB, _budgets
 
@@ -246,3 +248,54 @@ def test_an_unloaded_engine_leaves_the_reading_alone(monkeypatch):
     assert snap is not None
     assert snap["desktop_mb"] == 4000
     assert snap["pressured"] is True
+
+
+def _bonsai_at_262k():
+    """The owner's 27B at ctx 262144 / q5_1: a 6,872 MiB file, an engine holding
+    13,545 MiB, and the whole card reading 13,652 (measured 2026-10-03)."""
+    from rigma.models import CpuInfo, GgufFile, GpuInfo, HardwareProfile, ModelSpec
+    spec = ModelSpec(slug="m", family="qwen35", kind="dense", n_layers=64,
+                     full_attn_layers=16, kv_heads=4, head_dim=256,
+                     native_ctx=262144, custom=True,
+                     ggufs=[GgufFile(repo="local", file="bonsai.gguf",
+                                     bytes=7_206_168_928, quant="Q2_0")])
+
+    class _Reg:
+        models = {"m": spec}
+
+    prof = HardwareProfile(
+        os="windows", cpu=CpuInfo(cores=10),
+        gpus=[GpuInfo(vendor="amd", name="RX 9070 XT", vram_mb=16304,
+                      arch="rdna4", slug="s", backends=["vulkan"])],
+        ram_mb=32130, ram_free_mb=6561, disk_free_gb=500.0,
+        vram_used_mb=13652)
+    state = {"model": "m", "quant": "Q2_0", "gguf": "bonsai.gguf",
+             "engine_pid": 4912, "engine_started_at": 1791024187.0}
+    return prof, state, _Reg()
+
+
+def test_the_engines_measured_vram_is_credited_not_just_its_file(monkeypatch):
+    # Crediting only the 6.9GB file called 6.6GB of the engine's own KV cache
+    # "other apps" and planned the next switch against 9.4GB of a 15.9GB card.
+    from rigma import probe, state as st
+    from rigma.server_ops import _free_current
+    prof, state, reg = _bonsai_at_262k()
+    monkeypatch.setattr(st, "_is_identified_process", lambda pid, at: pid == 4912)
+    monkeypatch.setattr(probe, "process_vram_mb", lambda pid: 13545.0)
+    out = _free_current(prof, state, reg)
+    assert out.vram_used_mb == 107
+
+
+def test_an_unidentified_pid_or_an_impossible_reading_keeps_the_file_credit(monkeypatch):
+    from rigma import probe, state as st
+    from rigma.server_ops import _free_current
+    prof, state, reg = _bonsai_at_262k()
+    file_credit = 13652 - 7_206_168_928 / 2**20
+    # a recycled pid: its counter belongs to someone else
+    monkeypatch.setattr(st, "_is_identified_process", lambda pid, at: False)
+    monkeypatch.setattr(probe, "process_vram_mb", lambda pid: 13545.0)
+    assert _free_current(prof, state, reg).vram_used_mb == pytest.approx(file_credit)
+    # the counter can be absurd (a browser once read 359,777 MiB)
+    monkeypatch.setattr(st, "_is_identified_process", lambda pid, at: True)
+    monkeypatch.setattr(probe, "process_vram_mb", lambda pid: 359_777.0)
+    assert _free_current(prof, state, reg).vram_used_mb == pytest.approx(file_credit)
