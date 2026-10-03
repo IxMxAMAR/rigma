@@ -15,6 +15,7 @@ import json
 import re
 
 from . import method_schema as ms
+from .atomicio import atomic_write_json
 from .runtime import rigma_home
 
 _TRANSCRIPT_PER_MSG = 2000
@@ -231,9 +232,7 @@ def trust(method_id: str, macro_id: str) -> None:
     someone else's method must never import their trust decisions."""
     all_ = _trust_all()
     all_[f"{method_id}:{macro_id}"] = True
-    p = trust_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(all_, indent=2), encoding="utf-8")
+    atomic_write_json(trust_path(), all_)
 
 
 def forget_method(method_id: str) -> int:
@@ -253,9 +252,7 @@ def forget_method(method_id: str) -> int:
         return 0
     for key in gone:
         del all_[key]
-    p = trust_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(all_, indent=2), encoding="utf-8")
+    atomic_write_json(trust_path(), all_)
     return len(gone)
 
 

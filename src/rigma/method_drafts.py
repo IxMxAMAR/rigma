@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 from . import method_schema as ms
+from .atomicio import atomic_write_json
 from .runtime import rigma_home
 
 log = logging.getLogger(__name__)
@@ -126,7 +127,7 @@ def save(doc: dict) -> dict:
     """Persist WITHOUT validating -- a draft is allowed to be incomplete;
     that is the whole point of it being a draft. promote() is the gate."""
     full = ms.normalize({**doc, "builtin": False})
-    _path(full["id"]).write_text(json.dumps(full, indent=2), encoding="utf-8")
+    atomic_write_json(_path(full["id"]), full)
     return full
 
 

@@ -116,6 +116,7 @@ VERIFIED = "0.5.4"
 
 from .harness import TurnEvent          # noqa: E402
 from . import harness as _harness       # noqa: E402
+from .atomicio import atomic_write_text  # noqa: E402
 
 # R6-ACP-TURN: the SECOND transport, re-exported so it is reachable as
 # `adapter.drive_turn_acp`. The seam in `serve.py` looks for this attribute rather
@@ -490,8 +491,9 @@ def ensure_mcp(cwd: str = "") -> None:
     except OSError:
         pass
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
+        # atomic: a torn write here would leave mcode unable to read its own
+        # config, and the next turn rewrites it (a registration change does)
+        atomic_write_text(path, body)
     except OSError:
         pass            # a registration that cannot be written is not a failed turn
 
