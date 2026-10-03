@@ -4815,9 +4815,16 @@ def _launch_killable(cmd, shell, cwd):
         kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kw["start_new_session"] = True
+    # UTF-8 with replacement, not the locale default: on Windows that is a strict
+    # cp1252, and one undecodable byte (UTF-8 for "ŝ" contains 0x9D) raised inside
+    # `_read_capped`, which swallows it — the model got EMPTY output. Python
+    # children are told to write UTF-8 so their output decodes the same way.
     return subprocess.Popen(cmd, shell=shell, cwd=cwd,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            stdin=subprocess.DEVNULL, text=True, **kw)
+                            stdin=subprocess.DEVNULL, text=True,
+                            encoding="utf-8", errors="replace",
+                            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                            **kw)
 
 
 def _kill_tree(pid: int, proc=None, *, timeout: float = 3.0) -> bool:

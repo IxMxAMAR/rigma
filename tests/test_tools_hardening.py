@@ -1,4 +1,5 @@
 """Gemini 4-agent review 2026-07-18: DoS/SSRF/robustness fixes."""
+import sys
 import time
 
 from rigma import tools
@@ -423,3 +424,26 @@ def test_start_job_evicts_old_finished_records(monkeypatch, tmp_path):
             assert out.startswith("started job"), out
         assert len(tools._JOBS) <= 4
     _with_saved_jobs(run)
+
+
+def _shell_output(argv, tmp_path):
+    p = tools._launch_killable(argv, False, str(tmp_path))
+    sink, overflow = [], []
+    tools._read_capped(p.stdout, sink, 100000, overflow)
+    p.wait()
+    return "".join(sink)
+
+
+def test_utf8_output_with_a_byte_cp1252_cannot_decode_is_not_lost(tmp_path):
+    # The UTF-8 for "ŝ" contains 0x9D, which a strict cp1252 decode refuses; the
+    # reader swallowed the error and the model got EMPTY output.
+    code = ("import sys; sys.stdout.buffer.write("
+            "'one caf\\u00e9\\ntwo \\u015d \\u4e2d\\nthree\\n'.encode('utf-8'))")
+    out = _shell_output([sys.executable, "-c", code], tmp_path)
+    assert out == "one caf\u00e9\ntwo \u015d \u4e2d\nthree\n"
+
+
+def test_a_python_child_print_reaches_the_model_intact(tmp_path):
+    out = _shell_output([sys.executable, "-c", "print('caf\u00e9 \u015d \u4e2d')"],
+                        tmp_path)
+    assert out.strip() == "caf\u00e9 \u015d \u4e2d"
