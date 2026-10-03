@@ -481,6 +481,9 @@ if cmd == "provider":
         sys.exit(0)
     sys.exit(0)
 if cmd == "exec":
+    if "--input" in argv and os.environ.get("FAKE_MCODE_INPUT_LOG"):
+        with open(os.environ["FAKE_MCODE_INPUT_LOG"], "wb") as f:
+            f.write(sys.stdin.buffer.read())
     for line in json.loads(os.environ["FAKE_MCODE_EVENTS"]):
         sys.stdout.write(json.dumps(line) + "\\n")
     sys.stdout.flush()
@@ -639,7 +642,22 @@ def test_a_turn_is_driven_through_the_cli(fake_cli):
     # THE model reference, measured: without the `custom_provider:` prefix
     # mcode refuses the model outright
     assert argv[argv.index("--model") + 1] == "custom_provider:rigma/local-test"
-    assert argv[-1] == "say hi"
+    assert argv[argv.index("--input") + 1] == "-"
+    assert "say hi" not in argv
+
+
+def test_the_prompt_reaches_mcode_on_stdin_byte_exact(fake_cli, tmp_path, monkeypatch):
+    # `mcode` is an npm `.cmd` shim, so a prompt on the command line was re-parsed
+    # by cmd.exe: a newline ended the command and `%PATH%` was expanded into it.
+    got_file = tmp_path / "input.bin"
+    monkeypatch.setenv("FAKE_MCODE_INPUT_LOG", str(got_file))
+    prompt = 'line one\nline two says "hi" & echo nope | x > y\ncost is 50%PATH% — ü 中'
+    got = list(harness_mcode.drive_turn(
+        base_url="http://127.0.0.1:11500/v1", model="local-test", prompt=prompt))
+    assert not [e for e in got if e.kind == "error"], got
+    assert got_file.read_bytes().decode("utf-8") == prompt
+    argv = [a for a in logged(fake_cli) if a and a[0] == "exec"][0]
+    assert not [a for a in argv if "line one" in a or "%PATH%" in a]
 
 
 def test_the_provider_is_pointed_at_rigmas_own_endpoint(fake_cli):
@@ -1389,6 +1407,8 @@ def _fake_exec(monkeypatch, *, stdout="", stderr="", code=0):
     """Drive the real `drive_turn` against a fake child: no process starts."""
     class FakeProc:
         def __init__(self):
+            # the prompt is written to stdin, as on the real Popen(stdin=PIPE)
+            self.stdin = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
             self.stdout = _RecordingIO(stdout)
             self.stderr = _RecordingIO(stderr)
             self.returncode = code
