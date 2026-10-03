@@ -1724,8 +1724,11 @@ def bench(prompt_tokens: int = typer.Option(2048, "--prompt-tokens"),
     typer.echo(verdict(r, combo_expected))
     from .bench import calibration_key, current_identity
     _be = s.get("backend", "unknown")
+    from .server_ops import engine_identity_of
+    _bin = (s.get("engine_binary") or {}).get("path") or ""
     save_calibration(calibration_key(s["model"], s["quant"], _be),
-                     r.as_measured(), identity=current_identity(_be))
+                     r.as_measured(), identity=current_identity(_be),
+                     engine=engine_identity_of(_bin) if _bin else "")
     # AUDIT F15-7: `~` is POSIX shorthand — Explorer and cmd do not expand it.
     # Print the path the file was actually written to.
     typer.echo(f"recorded to {calibration_path()}")

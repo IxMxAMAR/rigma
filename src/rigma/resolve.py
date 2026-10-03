@@ -121,16 +121,17 @@ class ResolveError(RuntimeError):
     pass
 
 
-def _engine_now(backend: str = "") -> str:
+def _engine_now(plan: RunPlan) -> str:
     """The llama.cpp build this plan will launch on, or "" if unknowable.
 
-    Takes the backend because a plan runs on ONE backend and the builds on disk can
-    differ: on the owner's machine `rocm` held a third-party fork while `vulkan` and
-    `cpu` held the pin, so asking without a backend could report the wrong one.
+    Asks for the PLAN's binary, not the backend's pin: a model whose tensor types
+    need a registered engine (the PrismML fork for PQ2_0) runs that engine, and its
+    calibration is stamped with that build — comparing it to the pin's build would
+    call every such calibration stale, and miss a change to the fork.
     """
     try:
-        from .server_ops import engine_version
-        return engine_version(backend)
+        from .server_ops import plan_engine_identity
+        return plan_engine_identity(plan.gguf, plan.backend)
     except Exception:
         return ""
 
@@ -231,7 +232,7 @@ def _apply_calibration(plan: RunPlan,
         # server_ops._measured_placement gated the very same keys on an exact
         # ctx match. Two policies for one set of flags; this is the strict one.
         reason = calibration_stale(entry, _desktop_vram_mb(profile),
-                                   _engine_now(plan.backend), plan.flags.ctx,
+                                   _engine_now(plan), plan.flags.ctx,
                                    current_identity(plan.backend))
         if reason:
             plan.explain.append(f"calibration override skipped: {reason}")

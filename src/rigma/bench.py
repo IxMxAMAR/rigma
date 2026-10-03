@@ -466,7 +466,8 @@ def save_calibration(key: str, measured: dict, flags: dict | None = None,
                      calibrated: bool = False, ctx: int = 0,
                      identity: hwid.HardwareIdentity | None = None,
                      backend: str = "",
-                     no_calibrate: dict | None = None) -> None:
+                     no_calibrate: dict | None = None,
+                     engine: str = "") -> None:
     cal = load_calibration()
     entry = cal.get(key, {})
     entry["measured"] = measured
@@ -501,7 +502,9 @@ def save_calibration(key: str, measured: dict, flags: dict | None = None,
     # compared it against the same manifest string, so an engine change could never
     # invalidate anything. On the owner's machine the fork in `rocm/` was labelled
     # `b9867` for exactly this reason.
-    entry["engine"] = _engine_version(backend)
+    # `engine` is the measured build of the binary that produced the numbers,
+    # when the caller has it — a registered engine is not the backend's pin.
+    entry["engine"] = engine or _engine_version(backend)
     # R3-CAL-1: WHICH CARD. Without it a 3090 silently inherits a 4090's number,
     # which is the failure mode that is invisible rather than loud. The identity is
     # recorded as a field as well as being part of the key so a stale entry can
@@ -681,7 +684,8 @@ def _log_rows(plan, rows: list[dict], best: dict | None) -> None:
         for r in rows:
             entry = {"date": stamp, "model": plan.model_slug,
                      "quant": plan.gguf.quant, "backend": plan.backend,
-                     "ctx": plan.flags.ctx, "engine": _engine_version(plan.backend),
+                     "ctx": plan.flags.ctx,
+                     "engine": _plan_engine(plan),
                      "label": r.get("label"), "flags": r.get("flags") or {},
                      "tg_tps": r.get("tg_tps"), "pp_tps": r.get("pp_tps"),
                      "filler": r.get("filler"),
@@ -697,6 +701,24 @@ def _log_rows(plan, rows: list[dict], best: dict | None) -> None:
             _log_row(entry)
     except Exception:
         pass          # a sweep that lost its log is still a sweep
+
+
+def _exe_engine(exe) -> str:
+    """The measured build of the binary a sweep actually launched."""
+    try:
+        from .server_ops import engine_identity_of
+        return engine_identity_of(exe)
+    except Exception:
+        return ""
+
+
+def _plan_engine(plan) -> str:
+    """The build a plan launches (a registered engine when the model needs one)."""
+    try:
+        from .server_ops import plan_engine_identity
+        return plan_engine_identity(plan.gguf, plan.backend)
+    except Exception:
+        return ""
 
 
 def _engine_version(backend: str = "") -> str:
@@ -1101,7 +1123,8 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
         save_calibration(key, measured,
                          flags=best["flags"], calibrated=mark_calibrated,
                          ctx=plan.flags.ctx, backend=plan.backend,
-                         identity=_identity_cache_key(plan.backend))
+                         identity=_identity_cache_key(plan.backend),
+                         engine=_exe_engine(exe))
     return rows
 
 
@@ -1140,7 +1163,7 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
             save_calibration(key, entry.get("measured", {}),
                              flags=entry.get("flags"), calibrated=True,
                              ctx=entry.get("ctx", 0), backend=plan.backend,
-                             identity=ident,
+                             identity=ident, engine=_exe_engine(exe),
                              no_calibrate=entry.get("no_calibrate"))
         return _apply(plan)
     if plan.backend == "cpu":
@@ -1178,7 +1201,7 @@ def auto_calibrate(plan: RunPlan, exe, model_path, port: int = 11601,
         # and does not re-fire the warning.
         save_calibration(key, {}, flags=None, calibrated=True,
                          ctx=plan.flags.ctx, backend=plan.backend,
-                         identity=ident,
+                         identity=ident, engine=_exe_engine(exe),
                          no_calibrate=_no_calibrate_basis(plan))
     return _apply(plan)
 

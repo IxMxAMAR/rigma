@@ -71,6 +71,28 @@ def engine_version(backend: str = "") -> str:
         return ""
 
 
+def engine_identity_of(exe) -> str:
+    """`engine_version`'s answer for ONE binary — a registered engine is not under
+    the pin's directory, so asking by backend measures the wrong file. "" when it
+    cannot be measured."""
+    from . import engine_build
+    try:
+        got = engine_build.cached_build(exe)
+    except Exception:
+        return ""
+    return got.identity if got.ok else ""
+
+
+def plan_engine_identity(gguf, backend: str) -> str:
+    """The build a plan for `gguf` WILL launch: the registered engine the model's
+    tensor types need, else the pin's. Never downloads — the pinned case only
+    measures what is already on disk."""
+    custom = _registered_engine_for(gguf, backend)
+    if custom is not None:
+        return engine_identity_of(custom.exe)
+    return engine_version(backend)
+
+
 def expected_tg(model: str, quant: str, backend: str) -> float | None:
     """Calibrated decode speed for the running combo, if bench ever ran.
 

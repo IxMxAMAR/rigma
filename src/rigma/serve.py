@@ -4814,7 +4814,10 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         out: dict = {}
         out["expected_tg"] = server_ops.expected_tg(
             s["model"], s["quant"], s.get("backend", "unknown"))
-        out["engine_version"] = server_ops.engine_version()
+        # the binary that is SERVING, which a registered engine is not the pin
+        _bin = (s.get("engine_binary") or {}).get("path") or ""
+        out["engine_version"] = ((server_ops.engine_identity_of(_bin) if _bin else "")
+                                 or server_ops.engine_version())
         try:
             out["native_ctx"] = registry.models[s["model"]].native_ctx \
                 if registry and s.get("model") in registry.models else None
