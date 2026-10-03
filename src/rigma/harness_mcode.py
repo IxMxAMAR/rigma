@@ -1173,11 +1173,14 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
         argv += ["--session", resume]
     if cwd and Path(cwd).is_dir():
         argv += ["--cwd", cwd]
-    argv.append(prompt)
+    # The prompt goes on stdin, never on the command line: `mcode` is an npm
+    # `.cmd` shim, so cmd.exe re-parses the arguments — a newline ended the
+    # command and a `%NAME%` was expanded into the prompt.
+    argv += ["--input", "-"]
 
     try:
         proc = subprocess.Popen(
-            argv, env=_env(), stdin=subprocess.DEVNULL,
+            argv, env=_env(), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding="utf-8", errors="replace", bufsize=1,
             creationflags=_NO_WINDOW,
@@ -1187,6 +1190,13 @@ def drive_turn(*, base_url: str, model: str, prompt: str,
     except OSError as e:
         yield TurnEvent("error", f"could not start mcode: {e}")
         return
+    try:
+        # The byte buffer, not the text layer: text mode turns "\n" into "\r\n"
+        # on Windows, and the model should see the prompt exactly as typed.
+        proc.stdin.buffer.write(prompt.encode("utf-8"))
+        proc.stdin.close()
+    except OSError:
+        pass            # mcode exited before reading; its exit code says why
 
     err_lines: deque = deque(maxlen=40)
 
