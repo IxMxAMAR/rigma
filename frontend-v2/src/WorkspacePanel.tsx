@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { selectStreaming, useChat } from "./chat/chatStore";
 import { Edit as EditIcon, External, Refresh } from "./Icon";
+import { pickWorkspace, saveWorkspace } from "./lib/workspace";
 import { useApp } from "./store";
 
 interface Entry {
@@ -49,6 +50,7 @@ export default function WorkspacePanel() {
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const [pickError, setPickError] = useState("");
   if (!currentId) return null;
   const savePath = async () => {
     setEditing(false);
@@ -58,6 +60,20 @@ export default function WorkspacePanel() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ workspace: v }),
     }).catch(() => {});
+    void refresh();
+  };
+  // The OS picker returns a path; saving still goes through the session POST,
+  // so there is one write path. A cancel returns an empty path and changes
+  // nothing.
+  const browse = async () => {
+    setPickError("");
+    const r = await pickWorkspace(currentId, draft.trim() || data?.path || "");
+    if (!r.ok) { setPickError(r.error); return; }
+    if (!r.path) return;
+    setDraft(r.path);
+    const saved = await saveWorkspace(currentId, r.path);
+    if (!saved.ok) { setPickError(saved.error); return; }
+    setEditing(false);
     void refresh();
   };
   return (
@@ -97,6 +113,22 @@ export default function WorkspacePanel() {
                  placeholder="D:\Writing"
                  aria-label="Workspace folder path"
                  className="w-full rounded-md bg-surface px-2 py-1 font-mono text-[11.5px] outline-none placeholder:text-muted" />
+          {/* Owner request 2026-10-05: an Explorer picker instead of typing a
+              path from memory. onMouseDown preventsDefault so the input's blur
+              does not fire savePath before the dialog even opens. */}
+          <div className="flex items-center gap-1.5 pt-1">
+            <button type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => void browse()}
+                    aria-label="Browse for workspace folder"
+                    title="pick a folder in Explorer"
+                    className="rounded-md bg-surface px-2 py-0.5 font-mono text-[11px] text-muted hover:text-secondary">
+              Browse…
+            </button>
+            {pickError && (
+              <span className="font-mono text-[10.5px] text-red">{pickError}</span>
+            )}
+          </div>
         </form>
       )}
       {!data?.path && !editing && (

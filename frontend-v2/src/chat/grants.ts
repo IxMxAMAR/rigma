@@ -57,9 +57,13 @@ export const GRANTS: readonly GrantDef[] = [
     // not grant the second.
     key: "allow_absolute_writes",
     label: "Allow writes outside the workspace",
+    // MEASURED 2026-10-05: this said "move or copy", and the tools agreed — a
+    // `write_file`/`edit_file` target outside the workspace was refused even
+    // with the grant on, while `move_files` reached it. The grant now answers
+    // for every write the session can make, so the sentence names them.
     consequence:
-      "The model may move or copy files anywhere on this PC, not only into "
-      + "this chat's workspace.",
+      "The model may write, move or copy files anywhere on this PC, not only "
+      + "inside this chat's workspace.",
   },
 ];
 
