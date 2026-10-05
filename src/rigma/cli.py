@@ -2153,6 +2153,111 @@ def _launch_argv(cand, reg: Registry, port: int, model_label="<model>") -> list[
                                _launch_extra(cand, reg))
 
 
+def _spec_verdict(rp, *, engine_exe: str = "") -> tuple[str, str]:
+    """(refusal, warning) for the plan's speculative mode; both empty when fine.
+
+    A REFUSAL is only ever something the engine is documented to fail on, never
+    a policy Rigma invented:
+
+      * the engine build does not accept the `--spec-type` at all — on mainline
+        b9867 that is `draft-dspark`, which is an argparse exit, not a fallback;
+      * the build accepts the type but its LOADER cannot read the file (DFlash2
+        on a build that predates PR #27342; a DSpark gguf from the other
+        lineage);
+      * the file does not carry the draft head the mode names — asking for
+        `draft-mtp` or a DFlash-family head the file lacks is a Vulkan driver
+        reset rather than an error, which is why this check exists.
+
+    A WARNING is everything Rigma could not establish: no engine binary to ask,
+    a draft given as a HuggingFace repo (the engine downloads it, so its tensors
+    cannot be read here), or a mode that is right but imprecise. A tuning flag
+    the build does not advertise is DROPPED with a word, not sent and not
+    refused: the launch is still correct without it, and an unknown argument
+    would kill it after the download.
+    """
+    from . import hangar
+    from . import spec_decode
+
+    mode = rp.flags.spec_type
+    if not mode or mode == spec_decode.NONE:
+        return "", ""
+    caps = None
+    if engine_exe:
+        caps = spec_decode.probe_llamacpp(engine_exe)
+    sup = spec_decode.support(mode, "llamacpp", caps)
+    if sup.supported is False:
+        return sup.reason, ""
+    warn = ""
+    if sup.supported is None:
+        warn = sup.reason
+    elif sup.caveat:
+        warn = sup.caveat
+
+    if mode in spec_decode.TARGET_HEAD:
+        has = hangar.file_has_mtp(rp.gguf)
+        if has is None:
+            warn = warn or (f"{mode} is unverified: {rp.gguf.file} is not on "
+                            "disk yet, so its draft tensors cannot be read")
+        elif has is False:
+            return spec_decode.head_mismatch(mode, None, target=True), warn
+    elif mode in spec_decode.NEEDS_DRAFT_FILE:
+        if not rp.flags.spec_draft:
+            return (f"{mode} needs a draft model: pass --spec-draft "
+                    "<file.gguf> (or <user/model> for the engine to fetch)"), warn
+        shape = spec_decode.draft_shape(rp.flags.spec_draft)
+        path = hangar.resolve_draft_file(rp.flags.spec_draft)
+        if path is None:
+            if shape == "hf":
+                warn = warn or (f"the draft {rp.flags.spec_draft} is a "
+                                "HuggingFace id, so its tensors cannot be "
+                                "checked before the engine downloads it")
+            else:
+                return (f"the draft file {rp.flags.spec_draft} is not on disk "
+                        "(checked as given and under Rigma's models directory)"), warn
+        else:
+            head = hangar.draft_head_of_file(path)
+            bad = spec_decode.head_mismatch(mode, head)
+            if bad:
+                return bad, warn
+            lineage = spec_decode.artifact_lineage_ok(mode, head, caps)
+            if lineage:
+                return lineage, warn
+            note = spec_decode.variant_note(mode, head)
+            if note:
+                warn = f"{warn}; {note}" if warn else note
+
+    if rp.flags.spec_conf_min > 0 and mode != spec_decode.DRAFT_DSPARK:
+        note = (f"--spec-conf-min is a DSpark lever; {mode} ignores it")
+        warn = f"{warn}; {note}" if warn else note
+    if rp.flags.spec_draft and mode not in spec_decode.NEEDS_DRAFT_FILE:
+        # MTP drafts from the target's own heads and the n-gram modes draft from
+        # the context, so `-md` here would load a model nothing uses.
+        note = (f"{mode} drafts without a separate model, so the draft "
+                f"{rp.flags.spec_draft} was not loaded")
+        warn = f"{warn}; {note}" if warn else note
+
+    # A flag this build does not advertise would reach argparse and kill the
+    # launch — after the download, with a message about an unknown argument.
+    # Measured: `--spec-draft-conf-min` is absent from BOTH builds installed on
+    # this machine, while `--spec-draft-p-min` is present in both. An unprobed
+    # binary reports nothing, so nothing is dropped on a guess.
+    for what, flag in spec_decode.unadvertised_flags(
+            caps, draft=rp.flags.spec_draft, conf_min=rp.flags.spec_conf_min,
+            p_min=rp.flags.spec_p_min):
+        if what == "spec_draft_hf":
+            return (f"this engine build has no {flag}, so it cannot fetch "
+                    f"{rp.flags.spec_draft} itself — download the draft gguf and "
+                    "pass --spec-draft <path to it>"), warn
+        note = (f"this engine build has no {flag}, so that setting was dropped "
+                "rather than sent as an unknown argument")
+        if what == "spec_conf_min":
+            rp.flags = rp.flags.model_copy(update={"spec_conf_min": 0.0})
+        elif what == "spec_p_min":
+            rp.flags = rp.flags.model_copy(update={"spec_p_min": 0.0})
+        warn = f"{warn}; {note}" if warn else note
+    return "", warn
+
+
 @app.command()
 def up(use_case: str = typer.Option("general", "--use-case"),
        model: str = typer.Option(None, "--model"),
@@ -2192,7 +2297,30 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                               help="FlashAttention: on|off|auto"),
        spec: str = typer.Option(None, "--spec",
                                 help="Speculative decoding: none|draft-mtp|"
-                                     "ngram-simple|... (engine-supported)"),
+                                     "draft-dflash|draft-dflash2|draft-dspark|"
+                                     "draft-eagle3|ngram-* (see `rigma plan "
+                                     "--explain`; a mode the chosen engine "
+                                     "cannot serve is refused, not ignored)"),
+       spec_draft: str = typer.Option(
+           None, "--spec-draft",
+           help="The draft artefact for the draft-model modes (DFlash, DFlash2, "
+                "DSpark, EAGLE-3): a .gguf path, or user/model[:quant] for the "
+                "engine to fetch. Verified against the mode before launch."),
+       spec_conf_min: float = typer.Option(
+           None, "--spec-conf-min",
+           help="DSpark only: truncate each drafted block at the first position "
+                "whose predicted acceptance is below P (0 = off, the engine "
+                "default)."),
+       spec_n_max: int = typer.Option(
+           None, "--spec-n-max",
+           help="How many tokens to draft per step (engine default 3; upstream's "
+                "own examples use 15 for DFlash and 7 for DSpark, and llama.cpp "
+                "clamps it to the draft model's trained block size)."),
+       spec_p_min: float = typer.Option(
+           None, "--spec-p-min",
+           help="Draft-model modes: floor the draft's per-position probability at "
+                "P (0 = off). This is the DFlash-family lever upstream added in "
+                "PR #25246 and the one both pinned builds actually have."),
        batch: int = typer.Option(
            None, "--batch",
            help="Logical batch (-b) for prompt processing. Unset keeps the "
@@ -2347,9 +2475,47 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     # and no llama.cpp fit arithmetic at all. `--model` keeps its meaning — for
     # vLLM it is the model vLLM is asked to serve.
     if _decision.runtime == _engines.VLLM:
-        _argv = _engines.vllm_argv(
-            model, port=port - 1, served_model_name=model,
-            max_model_len=ctx, executable="vllm")
+        # Speculative decoding on vLLM is its own translation: one JSON object
+        # whose `method` names the algorithm, with P-EAGLE and DFlash2 sharing a
+        # method with a sibling (spec_decode.VLLM_METHOD). The mode is checked
+        # against vLLM's documented method list here rather than at startup,
+        # because vLLM profiles the GPU for minutes before it reads it.
+        _spec_mode = (spec or "").strip()
+        if _spec_mode:
+            from . import spec_decode as _sd
+            _sup = _sd.support(_spec_mode, _engines.VLLM)
+            if _sup.supported is False:
+                typer.echo(f"{_sup.reason} — refusing to launch.")
+                raise typer.Exit(2)
+            if _sup.caveat:
+                typer.echo(f"spec: {_sup.caveat}")
+            _count_note = _sd.vllm_count_caveat(_spec_mode, spec_n_max or 0)
+            if _count_note:
+                typer.echo(f"spec: {_count_note}")
+            if spec_conf_min or spec_p_min:
+                # Both are llama.cpp levers. vLLM does its own rejection
+                # sampling and has no flag for either, so saying so beats
+                # accepting a threshold that will never be applied.
+                typer.echo(
+                    "spec: vLLM has no --spec-conf-min/--spec-p-min equivalent "
+                    "(it samples its own draft acceptance), so those values are "
+                    "not passed to it")
+            if _sd.vllm_needs_draft(_spec_mode) and not spec_draft:
+                typer.echo(
+                    f"vLLM serves {_spec_mode} as method "
+                    f"{_sd.VLLM_METHOD[_spec_mode]!r}, which needs a draft "
+                    "checkpoint: pass --spec-draft <user/model|directory> "
+                    "(MTP and the n-gram methods are the ones that do not)")
+                raise typer.Exit(2)
+        try:
+            _argv = _engines.vllm_argv(
+                model, port=port - 1, served_model_name=model,
+                max_model_len=ctx, executable="vllm",
+                spec_mode=_spec_mode, spec_n_max=spec_n_max or 0,
+                spec_draft=(spec_draft or ""))
+        except ValueError as e:
+            typer.echo(str(e))
+            raise typer.Exit(2) from None
         typer.echo(f"starting vllm serve: {model} (first load can take "
                    f"minutes — vLLM profiles memory and captures graphs)...")
         if dry_run:
@@ -2438,11 +2604,29 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         # 16GB card ctx 262144 + q8_0 pages 622MB to system RAM with no error.
         # See resolve.fit_for_launch.
         if spec is None and "spec_type" in _d:
-            # only when THIS file carries the head — see the --spec branch below
+            # only when THIS file carries the head — see the --spec branch below.
+            # A STORED default that no longer matches the artefact is DROPPED
+            # with a word, not fatal: the user did not ask for it this time, and
+            # the model may have been re-quantised since. An explicit --spec is
+            # the other case, and that one refuses (see the gate below).
             from .hangar import file_has_mtp
-            if _d["spec_type"] != "draft-mtp" or file_has_mtp(rp.gguf) is True:
+            _default_spec_ok = True
+            if _d["spec_type"] == "draft-mtp":
+                _default_spec_ok = file_has_mtp(rp.gguf) is True
+            if _default_spec_ok:
                 _upd["spec_type"] = _d["spec_type"]
                 _upd["spec_n_max"] = _d.get("spec_n_max") or 1
+                # The artefact travels WITH the mode. A stored DFlash2 default
+                # whose draft path was dropped would silently become a DFlash
+                # v1 launch on whatever file happened to be around.
+                if _d.get("spec_draft"):
+                    _upd["spec_draft"] = _d["spec_draft"]
+                if _d.get("spec_conf_min"):
+                    _upd["spec_conf_min"] = _d["spec_conf_min"]
+            else:
+                typer.echo(f"{rp.model_slug} stores {_d['spec_type']} as a "
+                           f"launch default, but {rp.gguf.file} carries no MTP "
+                           "tensors — ignoring the stored default")
         if _upd:
             rp.flags = rp.flags.model_copy(update=_upd)
             rp.origin += "+model-default"
@@ -2551,30 +2735,60 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         rp.flags = rp.flags.model_copy(update={"flash_attn": fa})
         rp.origin += "+fa-override"
     if spec is not None:
-        allowed = ("none", "draft-simple", "draft-eagle3", "draft-mtp",
-                   "draft-dflash", "ngram-simple", "ngram-map-k",
-                   "ngram-map-k4v", "ngram-mod", "ngram-cache")
-        if spec not in allowed:
-            typer.echo(f"--spec must be one of: {', '.join(allowed)}")
+        from . import spec_decode
+        if spec not in spec_decode.MODES:
+            typer.echo(f"--spec must be one of: {', '.join(spec_decode.MODES)}")
             raise typer.Exit(2)
-        if spec == "draft-mtp":
-            # spec-decode without the MTP tensors is a documented Vulkan
-            # driver-reset loop — refuse unless THIS gguf actually carries them.
-            # The model's capability list is the wrong thing to ask: MTP
-            # survives or is dropped per artefact, so a repo can advertise it
-            # and still hand you a quant without the tensors. The file is on
-            # disk by the time we launch, so the real answer is always available.
-            from .hangar import file_has_mtp
-            has = file_has_mtp(rp.gguf)
-            if has is not True:
-                why = ("carries no MTP tensors" if has is False
-                       else "has not been downloaded, so its MTP tensors "
-                            "cannot be verified")
-                typer.echo(f"{rp.gguf.file} {why} — draft-mtp would reset the "
-                           "GPU driver rather than fail cleanly. Refusing.")
-                raise typer.Exit(2)
         rp.flags = rp.flags.model_copy(update={"spec_type": spec})
         rp.origin += "+spec-override"
+    if spec_draft is not None:
+        try:
+            rp.flags = rp.flags.model_copy(update={"spec_draft": spec_draft})
+        except ValueError as e:                 # pydantic wraps the message
+            typer.echo(str(e))
+            raise typer.Exit(2) from None
+        rp.origin += "+spec-draft-override"
+    if spec_conf_min is not None:
+        if not 0 <= spec_conf_min <= 1:
+            typer.echo("--spec-conf-min must be a probability in [0, 1]")
+            raise typer.Exit(2)
+        rp.flags = rp.flags.model_copy(update={"spec_conf_min": spec_conf_min})
+        rp.origin += "+spec-conf-override"
+    if spec_n_max is not None:
+        if spec_n_max < 1:
+            typer.echo("--spec-n-max must be at least 1 (llama.cpp's own floor)")
+            raise typer.Exit(2)
+        rp.flags = rp.flags.model_copy(update={"spec_n_max": spec_n_max})
+        rp.origin += "+spec-nmax-override"
+    if spec_p_min is not None:
+        if not 0 <= spec_p_min <= 1:
+            typer.echo("--spec-p-min must be a probability in [0, 1]")
+            raise typer.Exit(2)
+        rp.flags = rp.flags.model_copy(update={"spec_p_min": spec_p_min})
+        rp.origin += "+spec-pmin-override"
+    # THE SPECULATIVE GATE. One check for every way a mode can be chosen — the
+    # CLI override above, a stored per-model default below, or a registry combo —
+    # because the failure it prevents is not a typo: a draft head the file does
+    # not carry resets the Vulkan driver, and a --spec-type the engine build does
+    # not know is an argparse exit after the download. `_spec_verdict` returns
+    # (refusal, warning); only the first is fatal.
+    _eng_exe = ""
+    # Computed here rather than 40 lines below because the gate needs it, and
+    # because "which OS's engine directory" is a fact about the machine, not
+    # about the plan.
+    os_name = {"Windows": "windows", "Linux": "linux",
+               "Darwin": "darwin"}[platform.system()]
+    try:
+        from .server_ops import engine_binary_for_plan as _bin_for_plan
+        _eng_exe = _bin_for_plan(rp, os_name)[0] or ""
+    except Exception:                            # no plan/engine yet: unverified
+        _eng_exe = ""
+    _refuse, _warn = _spec_verdict(rp, engine_exe=_eng_exe)
+    if _refuse:
+        typer.echo(f"{_refuse} — refusing to launch.")
+        raise typer.Exit(2)
+    if _warn:
+        typer.echo(f"spec: {_warn}")
     # Re-fit against what will ACTUALLY be resident: no projector when vision is
     # off, plus the draft cache when speculation is on. Otherwise the plan
     # reserves 600MB for a projector it will not load and nothing for a draft
@@ -2593,11 +2807,12 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if _launch is not None or _differs or _cli_spec is not None:
             from .resolve import fit_for_launch as _fit_launch
             from .resolve import step_down_notice as _step_notice
+            from .resolve import draft_bytes_for as _draft_bytes
             _fl, _stepped = _fit_launch(
                 _spec_r, rp.gguf, p, rp.flags.ctx, kv=_launch_kv,
                 vision=_vision, spec_type=rp.flags.spec_type,
                 n_max=rp.flags.spec_n_max, backend=rp.backend,
-                explain=rp.explain)
+                explain=rp.explain, draft_bytes=_draft_bytes(rp.flags))
             if _fl is not None:
                 rp.flags = rp.flags.model_copy(update={
                     "ngl": _fl.ngl, "n_cpu_moe": _fl.n_cpu_moe,
@@ -2606,8 +2821,6 @@ def up(use_case: str = typer.Option("general", "--use-case"),
             if _stepped:
                 typer.echo(_step_notice(_stepped, rp.backend,
                                         rp.flags.cache_type_k, rp.flags.ctx))
-    os_name = {"Windows": "windows", "Linux": "linux",
-               "Darwin": "darwin"}[platform.system()]
     typer.echo(f"plan: {rp.model_slug} {rp.gguf.quant} on {rp.backend} "
                f"({rp.origin})")
     # C10-nits N3: `explain` is where the resolver records what it actually did

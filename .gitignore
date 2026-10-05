@@ -23,14 +23,24 @@ docs/*
 !docs/AGENTS.md
 # A SPECIFICATION is a deliverable that a reviewer, a future maintainer and CI
 # all have to be able to read, not a working note that only exists on one
-# machine — so the vLLM engine spec is shipped.
+# machine — so the engine spec and the speculative-decoding spec are shipped.
 #
-# Deliberately a FILE exception and not `!docs/design/`. Re-including the
-# directory drags in every other design note on this machine (`CONSTITUTION.md`,
-# `UI-REWORK-PLAN.md`, `research/`), which is the opposite of what the rule above
-# is for: those are the owner's working notes and were never published. Naming
-# the file means adding a note to `docs/design/` cannot publish it by accident.
+# The three lines below are what actually make a file exception WORK. A bare
+# `!docs/design/<file>` after `docs/*` does nothing: `docs/*` excludes the
+# DIRECTORY `docs/design`, and git cannot re-include a file whose parent
+# directory is excluded (`git check-ignore --no-index -v` proves it — it still
+# reports `docs/*` for the path). So the directory is re-included first, its
+# contents are excluded again, and only the named files come back. That keeps
+# the intent of the rule above: re-including the directory alone would drag in
+# every other design note on this machine (`CONSTITUTION.md`, `UI-REWORK-PLAN.md`,
+# `research/`), which were never published.
+!docs/design/
+docs/design/*
 !docs/design/2026-09-25-vllm-engine-spec.md
+# Same rule, same reason: the speculative-decoding spec is what a reviewer reads
+# to check that Rigma's mode vocabulary, its per-engine translation and its
+# refusals all come from upstream rather than from memory.
+!docs/design/2026-10-05-speculative-decoding.md
 
 # Local cache of upstream files downloaded for research — llama.cpp's ggml.h,
 # ggml.c, server-context.cpp and so on, kept only so a finding can be re-checked

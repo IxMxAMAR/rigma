@@ -252,7 +252,9 @@ def _spec_from_repo(repo: str) -> tuple[ModelSpec, dict]:
         family=info.arch or "custom",
         kind=f["kind"],
         ggufs=[GgufFile(repo=repo, file=g["file"], bytes=g["bytes"], quant=q,
-                        mtp=f.get("mtp") if g["file"] == probed else None)
+                        mtp=f.get("mtp") if g["file"] == probed else None,
+                        draft_head=(f.get("draft_head")
+                                    if g["file"] == probed else None))
                for g, q in zip(rf["ggufs"],
                                _distinct_quants([g["file"]
                                                  for g in rf["ggufs"]]))],
@@ -300,6 +302,7 @@ def inspect_repo(repo: str, registry=None, profile=None, *, kv: str = "",
                        "fit": v, "quality": quality_of(g.quant),
                        "total": total_loss(g.quant, k),
                        "mtp": g.mtp,
+                       "draft_head": g.draft_head,
                        "bpw": measured_bpw(g.bytes, spec.params),
                        "label_drift": label_overstates(g.quant, g.bytes,
                                                        spec.params),

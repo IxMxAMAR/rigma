@@ -141,6 +141,64 @@ _MTP_TENSOR = (".nextn.", ".mtp.")
 # weights is what --n-cpu-moe actually moves to system RAM.
 _EXPERT_TENSOR = "_exps."
 
+# --- speculative draft heads, read from the file's own tensor table ----------
+#
+# llama.cpp declares ONE architecture for the whole DFlash family — the gguf
+# arch string is `dflash` — and the variant is carried by which optional tensors
+# the file actually contains. These are the names from upstream's own tensor
+# table, so the check is against the loader's vocabulary rather than a guess:
+#
+#   ggml-org/llama.cpp master gguf-py/gguf/constants.py
+#     MODEL_TENSOR.DSPARK_MARKOV_W1/W2  -> "markov_w1", "markov_w2"   (DSpark)
+#     MODEL_TENSOR.DSPARK_CONF_PROJ     -> "conf_proj"                (DSpark)
+#     MODEL_TENSOR.DFLASH_ATTN_CONV_*   -> "blk.{bid}.attn_conv_{base,proj}"
+#     MODEL_TENSOR.DFLASH_FFN_CONV_*    -> "blk.{bid}.ffn_conv_{base,proj}"
+#     MODEL_TENSOR.DFLASH_SELECTOR_*    -> "selector_{predecessor,successor,hidden}"
+#   (the four conv names plus the three selector names ARE DFlash2: master
+#   src/llama-context.cpp says so — "DFlash2's convolutions and selector")
+#   MODEL_TENSOR.FC / D2T             -> "fc", "d2t"                (EAGLE-3)
+#
+# A plain DFlash draft carries none of them, so "dflash" is decided by the arch
+# string plus the ABSENCE of every variant marker — see TensorIndex.draft_head.
+_DRAFT_HEAD_TENSORS = (
+    ("dspark", ("markov_w1", "markov_w2", "conf_proj")),
+    # The PrismML fork declares its OWN DSpark arch and tensor names — measured
+    # on PrismML-Eng/llama.cpp 87268f77 (2026-09-28): `prism-arch.h` carries
+    # `dspark_fc`, `markov_head_a/b`, `confidence_head`, `log_snr_fc1/2` and the
+    # `corr_*` pair, where mainline folds DSpark into LLM_ARCH_DFLASH with
+    # `markov_w1/w2` + `conf_proj`. A file converted for one lineage is NOT
+    # known to load on the other, so the family keeps the lineage in its name.
+    ("dspark-prism", ("markov_head_a", "markov_head_b", "confidence_head",
+                      "log_snr_fc1", "log_snr_fc2")),
+    ("dflash2", ("selector_predecessor", "selector_successor", "selector_hidden",
+                 ".attn_conv_base", ".attn_conv_proj",
+                 ".ffn_conv_base", ".ffn_conv_proj")),
+)
+# EAGLE-3's two names are short enough to collide as substrings ("fc" inside
+# "fc1", "d2t" inside nothing today), so they are matched EXACTLY. Every other
+# family above is matched as a substring because its names carry a blk.N prefix.
+_DRAFT_HEAD_EXACT = {"fc": "eagle3", "d2t": "eagle3"}
+
+
+def _draft_head_family(name: str) -> str | None:
+    """Which draft-head family a single tensor name belongs to, or None.
+
+    The suffix is stripped first so the two SHORT EAGLE-3 names can be compared
+    whole: `fc.weight` is EAGLE-3's `fc`, while `fc1.weight` is somebody else's
+    tensor that a substring rule would have claimed.
+    """
+    stem = name
+    for suffix in (".weight", ".bias"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    if stem in _DRAFT_HEAD_EXACT:
+        return _DRAFT_HEAD_EXACT[stem]
+    for family, needles in _DRAFT_HEAD_TENSORS:
+        if any(n in name for n in needles):
+            return family
+    return None
+
 
 @dataclass
 class TensorIndex:
@@ -156,6 +214,10 @@ class TensorIndex:
     expert_params: int = 0
     mtp_params: int = 0
     mtp_blocks: int = 0
+    # Draft-head family -> how many tensors of it the file carries. The family
+    # table is `_DRAFT_HEAD_TENSORS` above; MTP is tracked separately because it
+    # predates this and its params are charged in the fit.
+    draft_head_tensors: dict = field(default_factory=dict)
     max_block: int = -1
     truncated: bool = False   # ranged read ended mid-table: absence proves nothing
     # R3-ENG-2: ggml type id -> how many tensors use it.
@@ -199,6 +261,32 @@ class TensorIndex:
         if self.truncated:
             return None
         return self.mtp_blocks > 0
+
+    @property
+    def draft_head(self) -> str | None:
+        """Which DFlash-family / EAGLE-3 draft head the TENSORS show, or None.
+
+        None is honest here and means one of two things the caller must keep
+        apart: the file carries no variant marker at all (which, on a `dflash`
+        arch, is a plain DFlash draft), or the table was cut short so absence
+        proves nothing. `truncated` is the discriminator, exactly as it is for
+        `has_mtp`; callers that need "is this a draft file at all" must combine
+        this with the arch string.
+        """
+        if self.truncated:
+            return None
+        fams = self.draft_head_tensors
+        # DSpark first: it is a DFlash backbone plus heads, so a file can carry
+        # the Markov tensors without any DFlash2 marker, and never the reverse.
+        # `dspark-prism` is the fork's divergent spelling of the same idea and
+        # sits beside `dspark` for the same reason: if the heads are there, the
+        # file needs the DSpark loader whatever else it carries.
+        for family in ("dspark", "dspark-prism", "dflash2", "eagle3"):
+            if fams.get(family):
+                return family
+        if self.mtp_blocks:
+            return "mtp"
+        return None
 
 
 def _read_tensors(f, n_tensors: int) -> TensorIndex:
@@ -248,6 +336,10 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
             idx.mtp_blocks += 1
         elif _EXPERT_TENSOR in name:
             idx.expert_params += n
+        family = _draft_head_family(name)
+        if family is not None:
+            idx.draft_head_tensors[family] = (
+                idx.draft_head_tensors.get(family, 0) + 1)
     return idx
 
 
@@ -494,6 +586,14 @@ def _inspect(f, fallback: str) -> GgufInfo:
               "mtp_layers": mtp_layers,
               # the file's own inventory, not the header's claims
               "mtp": tx.has_mtp,
+              # Which speculative draft head this FILE is, for the modes that
+              # need a separate draft gguf (DFlash / DFlash2 / DSpark / EAGLE-3).
+              # llama.cpp gives the whole DFlash family one arch string and
+              # decides the variant from the tensors, so "dflash" here means
+              # "the arch says dflash and no variant marker was found".
+              "draft_head": (tx.draft_head
+                             or ("dflash" if (arch == "dflash"
+                                              and not tx.truncated) else None)),
               "params": tx.params,
               "expert_params": tx.expert_params,
               "expert_used": _as_int(g("expert_used_count", 0) or 0,

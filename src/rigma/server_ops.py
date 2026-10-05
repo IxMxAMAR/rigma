@@ -464,9 +464,15 @@ def launch_fit_spec(spec, flags, *, vision: bool, ctx: int = 0):
     """
     from .resolve import with_launch_overheads
     ctx = int(ctx or flags.ctx)
+    # A separate draft gguf (DFlash / DFlash2 / DSpark / EAGLE-3) is loaded
+    # BESIDE the target, so its weights belong in the same overhead slot the
+    # projector and the MTP draft cache use. `draft_bytes_for` returns 0 for
+    # `draft-mtp` (head inside the target) and for a draft that is not on disk.
+    from .resolve import draft_bytes_for as _draft_bytes
     fit = with_launch_overheads(spec, vision=vision, ctx=ctx,
                                 spec_type=flags.spec_type,
-                                n_max=flags.spec_n_max)
+                                n_max=flags.spec_n_max,
+                                draft_bytes=_draft_bytes(flags))
     was = spec.mmproj.bytes if spec.mmproj else 0
     now = fit.mmproj.bytes if fit.mmproj else 0
     return fit, was != now
@@ -1009,11 +1015,35 @@ def perform_switch(model: str, registry=None, profile=None,
     # for draft-mtp against a gguf without the tensors resets the Vulkan driver
     # rather than erroring (see ComboFlags.spec_type).
     if launch is not None and launch.is_set("spec_type"):
-        from .hangar import file_has_mtp
-        if launch.spec_type != "draft-mtp" or file_has_mtp(rp.gguf):
-            rp.flags = rp.flags.model_copy(update={
-                "spec_type": launch.spec_type,
-                "spec_n_max": launch.spec_n_max or 1})
+        # The same artefact rule the CLI applies, in the path the UI takes: a
+        # stored default is DROPPED when the file cannot satisfy it, never
+        # launched anyway. `spec_decode.head_mismatch` decides, so the UI and the
+        # CLI cannot disagree about which modes need which draft head.
+        from . import spec_decode
+        from .hangar import file_has_mtp, resolve_draft_file, draft_head_of_file
+        ok = True
+        if launch.spec_type in spec_decode.TARGET_HEAD:
+            ok = file_has_mtp(rp.gguf) is True
+        elif launch.spec_type in spec_decode.NEEDS_DRAFT_FILE:
+            _draft = getattr(launch, "spec_draft", "") or ""
+            _path = resolve_draft_file(_draft) if _draft else None
+            # An HF id is the engine's to fetch, so it is accepted here; a path
+            # that is not on disk is not a launch, it is a typo.
+            ok = bool(_path) or (
+                bool(_draft) and spec_decode.draft_shape(_draft) == "hf")
+            if ok and _path is not None:
+                ok = spec_decode.head_mismatch(
+                    launch.spec_type, draft_head_of_file(_path)) is None
+        if ok:
+            _upd = {"spec_type": launch.spec_type,
+                    "spec_n_max": launch.spec_n_max or 1}
+            if getattr(launch, "spec_draft", ""):
+                _upd["spec_draft"] = launch.spec_draft
+            if getattr(launch, "spec_conf_min", 0.0):
+                _upd["spec_conf_min"] = launch.spec_conf_min
+            if getattr(launch, "spec_p_min", 0.0):
+                _upd["spec_p_min"] = launch.spec_p_min
+            rp.flags = rp.flags.model_copy(update=_upd)
     # `vision` is remembered across relaunches: a ctx change must not silently
     # switch vision back on and eat the VRAM the user just freed.
     if vision is None:
@@ -1022,7 +1052,7 @@ def perform_switch(model: str, registry=None, profile=None,
     if ctx is not None:
         # honest relaunch at a requested context: real fit math, not hope.
         # rp.flags.ctx is the calculator's grow-to-fit maximum for this quant.
-        from .resolve import fit_for_launch, step_down_notice
+        from .resolve import fit_for_launch, step_down_notice, draft_bytes_for
         want = _raised_launch_ctx(ctx, spec_full.native_ctx)
         # The requested cache type — an explicit `kv`, or the model's stored
         # launch default — is a CEILING, fitted in BEFORE the placement is
@@ -1037,7 +1067,8 @@ def perform_switch(model: str, registry=None, profile=None,
         flags, stepped = fit_for_launch(
             spec_full, rp.gguf, p, want, kv=kv or "", vision=vision,
             spec_type=rp.flags.spec_type, n_max=rp.flags.spec_n_max,
-            backend=rp.backend, explain=rp.explain)
+            backend=rp.backend, explain=rp.explain,
+            draft_bytes=draft_bytes_for(rp.flags))
         if flags is None:
             raise RuntimeError(
                 f"ctx {want:,} doesn't fit — {model} ({rp.gguf.quant}) tops "
@@ -1062,11 +1093,12 @@ def perform_switch(model: str, registry=None, profile=None,
         # resolver priced the spec's policy, not the request.
         fit_spec, differs = launch_fit_spec(spec_full, rp.flags, vision=vision)
         if differs or kv is not None:
-            from .resolve import fit_for_launch, step_down_notice
+            from .resolve import fit_for_launch, step_down_notice, draft_bytes_for
             got, stepped = fit_for_launch(
                 spec_full, rp.gguf, p, rp.flags.ctx, kv=kv or "", vision=vision,
                 spec_type=rp.flags.spec_type, n_max=rp.flags.spec_n_max,
-                backend=rp.backend, explain=rp.explain)
+                backend=rp.backend, explain=rp.explain,
+                draft_bytes=draft_bytes_for(rp.flags))
             if got is not None:
                 update = {"ngl": got.ngl, "n_cpu_moe": got.n_cpu_moe,
                           "cache_type_k": got.cache_type_k,
@@ -1117,6 +1149,17 @@ def perform_switch(model: str, registry=None, profile=None,
     # `rp`, so the argv this switch launches carries a fork-only flag only when the
     # binary that will actually run is the fork.
     exe, _engine_binary = engine_binary_for_plan(rp, os_name)
+    # The capability question the CLI asks, asked HERE too, and for the same
+    # reason: this is the one place the binary that will actually run is known,
+    # and a `spec_type` the build cannot serve is an argparse exit minutes later
+    # — after calibration has already spent its time and after the user has been
+    # told the model is loading. An unprobed binary refuses nothing.
+    if rp.flags.spec_type and rp.flags.spec_type != "none":
+        from . import spec_decode
+        why = spec_decode.capability_refusal(
+            rp.flags.spec_type, spec_decode.probe_llamacpp(exe))
+        if why:
+            raise RuntimeError(f"{why} — refusing to launch.")
     port = int(s["public_port"]) - 1
     st.kill_recorded(s, "engine_pid")   # AUDIT F08-1: identity-checked
     if not _await_port_free(port):      # Windows TIME_WAIT grace

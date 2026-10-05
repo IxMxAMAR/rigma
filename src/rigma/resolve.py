@@ -458,11 +458,20 @@ DRAFT_KIB_PER_TOKEN = 6.25
 
 
 def draft_cache_mb(spec: ModelSpec, ctx: int,
-                   spec_type: str, n_max: int) -> float:
+                   spec_type: str, n_max: int,
+                   draft_bytes: int = 0) -> float:
     """VRAM the speculative draft head needs on top of weights and KV.
 
     Zero when speculation is off — the head's WEIGHTS are in the file either
     way, but its caches are only allocated when it is asked to draft.
+
+    `draft_bytes` is the size of a SEPARATE draft gguf (DFlash, DFlash2, DSpark,
+    EAGLE-3). That distinction is the whole reason the parameter exists: for
+    `draft-mtp` the head is inside the target file, so the fixed term below is
+    the measured truth. For an external draft the file's own weights are loaded
+    BESIDE the target and are the dominant term — and they were budgeted nowhere,
+    which is the same class of error as the projector that was charged after the
+    fit.
 
     AUDIT F06-7: this took a `kv` argument and never used it. DELETED rather
     than scaled, because the two constants below are a MEASURED TOTAL obtained
@@ -481,11 +490,30 @@ def draft_cache_mb(spec: ModelSpec, ctx: int,
     # more than doubled the total, so scaling by depth is the conservative
     # reading rather than an established fit.
     depth = max(1, n_max)
-    return DRAFT_FIXED_MB + DRAFT_KIB_PER_TOKEN * ctx / 1024 * depth
+    return (DRAFT_FIXED_MB + DRAFT_KIB_PER_TOKEN * ctx / 1024 * depth
+            + max(0, int(draft_bytes)) / 2 ** 20)
+
+
+def draft_bytes_for(flags) -> int:
+    """On-disk size of the draft artefact a launch will load, or 0 for none.
+
+    An unreadable or not-yet-downloaded path is 0: the fit must not invent a
+    charge for a file Rigma cannot measure, and `spec_decode.head_mismatch`
+    is what refuses that launch on other grounds.
+    """
+    value = getattr(flags, "spec_draft", "") or ""
+    if not value:
+        return 0
+    try:
+        from .hangar import draft_file_bytes
+        return draft_file_bytes(value)
+    except Exception:
+        return 0
 
 
 def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int,
-                          spec_type: str = "", n_max: int = 0) -> ModelSpec:
+                          spec_type: str = "", n_max: int = 0,
+                          draft_bytes: int = 0) -> ModelSpec:
     """A copy of `spec` whose mmproj slot holds what will ACTUALLY be resident.
 
     `fit_gguf` treats mmproj as memory that sits on the GPU and cannot be
@@ -502,7 +530,7 @@ def with_launch_overheads(spec: ModelSpec, *, vision: bool, ctx: int,
     parameter through every fit function.
     """
     mm_bytes = spec.mmproj.bytes if (vision and spec.mmproj) else 0
-    draft = draft_cache_mb(spec, ctx, spec_type, n_max)
+    draft = draft_cache_mb(spec, ctx, spec_type, n_max, draft_bytes)
     total = mm_bytes + int(draft * 2**20)
     if total == 0:
         return spec.model_copy(update={"mmproj": None})
@@ -925,7 +953,8 @@ def _with_launch_defaults(plan: RunPlan, spec: ModelSpec | None,
         kv=plan.flags.cache_type_k, vision=(True if launch.vision is None
                                             else launch.vision),
         spec_type=plan.flags.spec_type,
-        n_max=plan.flags.spec_n_max, backend=plan.backend, explain=[])
+        n_max=plan.flags.spec_n_max, backend=plan.backend, explain=[],
+        draft_bytes=draft_bytes_for(plan.flags))
     if allowed is None:
         plan.explain.append(
             f"launch default ngl {want} cannot be placed at ctx "
@@ -940,6 +969,7 @@ def _with_launch_defaults(plan: RunPlan, spec: ModelSpec | None,
 def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
                    ctx: int, *, kv: str = "", vision: bool = True,
                    spec_type: str = "", n_max: int = 0, backend: str = "",
+                   draft_bytes: int = 0,
                    explain: list[str] | None = None
                    ) -> tuple[ComboFlags | None, str]:
     """The fit a LAUNCH will actually run: `(flags, stepped_down_from)`.
@@ -977,7 +1007,8 @@ def fit_for_launch(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     """
     expl = explain if explain is not None else []
     fit = with_launch_overheads(spec, vision=vision, ctx=ctx,
-                                spec_type=spec_type, n_max=n_max)
+                                spec_type=spec_type, n_max=n_max,
+                                draft_bytes=draft_bytes)
     if kv:
         fit = fit.model_copy(update={"cache_type_policy":
                                      CachePolicy(k=kv, v=kv)})

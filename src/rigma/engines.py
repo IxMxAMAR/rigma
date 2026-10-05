@@ -415,6 +415,8 @@ def vllm_argv(model: str, *, port: int, host: str = "127.0.0.1",
               quantization: str | None = None, dtype: str | None = None,
               trust_remote_code: bool = False, executable: str = "vllm",
               gguf_plugin: bool = False,
+              spec_mode: str = "", spec_n_max: int = 0,
+              spec_draft: str = "",
               extra_args: list[str] | None = None) -> list[str]:
     """The exact `vllm serve` command line a vLLM launch would run.
 
@@ -490,6 +492,23 @@ def vllm_argv(model: str, *, port: int, host: str = "127.0.0.1",
         argv += ["--dtype", dtype]
     if trust_remote_code:
         argv += ["--trust-remote-code"]
+    if spec_mode:
+        # Speculative decoding, in vLLM's own spelling: ONE JSON object whose
+        # `method` names the algorithm (`spec_decode.VLLM_METHOD` holds the
+        # translation and the two cases where Rigma's mode is not the method —
+        # P-EAGLE is eagle3 + parallel_drafting, DFlash2 is an architecture
+        # under method dflash). A model-based method with no draft checkpoint is
+        # refused here rather than at vLLM startup: the failure would otherwise
+        # arrive minutes later, after vLLM had already profiled the GPU.
+        from . import spec_decode
+        if spec_decode.vllm_needs_draft(spec_mode) and not spec_draft:
+            raise ValueError(
+                f"vLLM's {spec_decode.VLLM_METHOD.get(spec_mode, spec_mode)!r} "
+                f"method needs a draft checkpoint for {spec_mode}: pass "
+                "spec_draft=<a HuggingFace repo id or a local directory>. "
+                "(MTP and the n-gram methods are the ones that do not.)")
+        argv += spec_decode.vllm_speculative_flag(
+            spec_mode, n_max=spec_n_max or 3, draft=spec_draft)
     argv += list(extra_args or [])
     return argv
 

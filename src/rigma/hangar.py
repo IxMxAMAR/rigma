@@ -543,9 +543,11 @@ def heal_spec(spec: ModelSpec) -> ModelSpec:
             pass
     mdir = models_dir()
     stale = spec.probe_version < PROBE_VERSION
-    # a quant downloaded after the last heal still needs its own MTP answer
+    # a quant downloaded after the last heal still needs its own MTP answer, and
+    # one read before the draft-head family existed needs that answer too
     unprobed = [g for g in spec.ggufs
-                if g.mtp is None and (mdir / g.file).is_file()]
+                if (g.mtp is None or g.draft_head is None)
+                and (mdir / g.file).is_file()]
     if not stale and not unprobed:
         return spec                        # nothing to do: the common path
     probed = {}
@@ -570,7 +572,8 @@ def heal_spec(spec: ModelSpec) -> ModelSpec:
         healed = _with_probe(spec, info, fields)     # geometry + caps + files
     else:
         healed = spec.model_copy(update={"ggufs": [   # just the per-file answer
-            g.model_copy(update={"mtp": fields[g.file].get("mtp")})
+            g.model_copy(update={"mtp": fields[g.file].get("mtp"),
+                                 "draft_head": fields[g.file].get("draft_head")})
             if g.file in fields else g for g in spec.ggufs]})
     if healed == spec:
         return spec
@@ -724,8 +727,10 @@ def _with_probe(spec: ModelSpec, info, probed: dict) -> ModelSpec:
         caps.discard("mtp")
     update = dict(spec_fields_from_probe(f))
     update["capabilities"] = sorted(caps)
-    update["ggufs"] = [g.model_copy(update={"mtp": probed[g.file].get("mtp")})
-                       if g.file in probed else g for g in spec.ggufs]
+    update["ggufs"] = [g.model_copy(update={
+        "mtp": probed[g.file].get("mtp"),
+        "draft_head": probed[g.file].get("draft_head")})
+        if g.file in probed else g for g in spec.ggufs]
     if spec.kind == "moe":
         moe = moe_from_probe(f, max((g.bytes for g in spec.ggufs), default=0))
         if moe is not None:
@@ -797,6 +802,59 @@ def file_has_mtp(gguf: GgufFile) -> bool | None:
         return inspect_gguf(path).spec_fields.get("mtp")
     except (GgufParseError, OSError, ValueError):
         return None
+
+
+def resolve_draft_file(value: str) -> Path | None:
+    """Where a `spec_draft` PATH value lives on disk, or None if it is not there.
+
+    A `user/model` id is not a path and returns None here — the engine fetches
+    those itself, so there is nothing for Rigma to read. A relative path is
+    tried as given first (a user pointing at a file in the current directory)
+    and then by bare filename under Rigma's models directory, which is where a
+    draft gguf lands when the Models page pulls it.
+    """
+    from . import spec_decode
+    try:
+        if spec_decode.draft_shape(value) != "path":
+            return None
+    except ValueError:
+        return None
+    p = Path(value.strip())
+    if p.is_file():
+        return p
+    cand = models_dir() / p.name
+    return cand if cand.is_file() else None
+
+
+def draft_head_of_file(path: str | Path) -> str | None:
+    """Which draft head a draft gguf carries, or None when unreadable.
+
+    None is deliberately ambiguous between "no draft head in this file" and
+    "could not read it", because both mean the same thing to the caller: Rigma
+    has no evidence, so it must not claim the file matches the requested mode.
+    The refusal text in `spec_decode.head_mismatch` says exactly that.
+    """
+    try:
+        return inspect_gguf(Path(path)).spec_fields.get("draft_head")
+    except (GgufParseError, OSError, ValueError):
+        return None
+
+
+def draft_file_bytes(value: str) -> int:
+    """On-disk size of a PATH draft artefact, or 0.
+
+    0 covers three cases the fit must treat the same way — no value, an HF id
+    (the engine fetches it; Rigma has nothing to measure), and a file that is
+    not there yet. A zero charge for a file that will exist is the direction
+    the fit already handles: the launch re-fits once the download lands.
+    """
+    p = resolve_draft_file(value)
+    if p is None:
+        return 0
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
 
 
 def _load_custom(slug: str) -> ModelSpec | None:
@@ -914,7 +972,8 @@ def install_model(path: str | Path, attach_to: str | None = None) -> ModelSpec:
     spec = ModelSpec(
         slug=slug, family=info.arch or "custom", kind=f["kind"],
         ggufs=[GgufFile(repo="local", file=dest.name, bytes=size,
-                        quant=_quant_from_name(dest.name), mtp=f.get("mtp"))],
+                        quant=_quant_from_name(dest.name), mtp=f.get("mtp"),
+                        draft_head=f.get("draft_head"))],
         moe=moe, license="custom import", use_cases=["general"],
         capabilities=sorted(info.capabilities), custom=True,
         **spec_fields_from_probe(f))
@@ -1012,8 +1071,11 @@ def list_models(registry=None, profile=None, *, kv: str = "",
                            "quality": quality_of(label),
                            "total": total_loss(label, k),
                            # per FILE, not per model: whether this artefact
-                           # carries the draft head. None = not read yet.
+                           # carries the draft head, and WHICH one. None = not
+                           # read yet. The family is what decides whether a
+                           # DFlash2/DSpark launch can use this file at all.
                            "mtp": g.mtp,
+                           "draft_head": g.draft_head,
                            # measured, so a repo that names its files
                            # I-Compact still says what it spends
                            "bpw": measured_bpw(g.bytes, spec.params),
