@@ -22,6 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from . import context
+from . import folder_picker
 from . import harness as _harness
 from .atomicio import atomic_write_bytes, atomic_write_json
 from .models import MIN_LAUNCH_CTX
@@ -2347,6 +2348,33 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
             return JSONResponse({"error": str(e)}, status_code=500)
         return {"opened": ws}
 
+    @app.post("/api/sessions/{sid}/workspace/pick")
+    async def session_workspace_pick(sid: str, body: dict | None = None):
+        """Show the OS folder picker and RETURN the chosen path.
+
+        Deliberately does not persist: `POST /api/sessions/{sid}` stays the one
+        write path, with the optimistic-retry save (`_patch_session`) that keeps
+        a mid-turn arming from being clobbered. `body.initial` is only where the
+        dialog opens — never what gets stored.
+
+        204 means the owner closed the dialog, which is a normal outcome; 503
+        means no dialog could be shown at all, with the reason, because those two
+        must not look alike to the UI.
+        """
+        s = sessions.load(sid)
+        if s is None:
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        initial = str((body or {}).get("initial") or "").strip() \
+            or str(s.get("workspace") or "").strip()
+        # Off the loop: the dialog blocks until a human answers, and this loop
+        # serves every live stream (see the single-worker note above).
+        picked = await asyncio.to_thread(folder_picker.pick_folder, initial)
+        if picked.path:
+            return {"path": picked.path}
+        if picked.cancelled:
+            return Response(status_code=204)
+        return JSONResponse({"error": picked.reason}, status_code=503)
+
     @app.get("/api/sessions/{sid}")
     async def get_session(sid: str):
         s = sessions.load(sid)
@@ -3485,9 +3513,19 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 # AUDIT F32: a narrowed ctx, not the outer session's. No code
                 # execution, and no run_id — the run-scoped tools reach the
                 # live run through it (methods_api.py:135 uses this pattern).
+                #
+                # MEASURED 2026-10-05: this also forced `allow_absolute_reads`
+                # off, so `delegate` — the tool advertised for exploring files
+                # and folders the chat has not read yet — could not read outside
+                # the workspace in a chat whose owner had explicitly granted
+                # exactly that. The READ grant now rides along, because the
+                # checkbox is the owner's word and it means the same thing in
+                # both loops; writes, code, outbound POSTs and run_id still do
+                # not, which is what F32 narrowed.
                 _sub_ctx = {**tctx, "allow_code": False, "run_id": "",
                             "confirm_exec": False,
-                            "allow_absolute_reads": False,
+                            "allow_absolute_reads": bool(
+                                tctx.get("allow_absolute_reads")),
                             "allow_outbound_post": False,
                             "allow_absolute_writes": False,
                             # OD-2: the delegate is a narrowed ctx — it keeps

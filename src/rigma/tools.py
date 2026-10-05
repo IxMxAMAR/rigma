@@ -1680,7 +1680,7 @@ def _read_path(ctx, raw: str) -> Path:
                 "enable 'allow absolute reads' on the session to restore it")
         p = _long_path(p)
     else:
-        p = _ws_path(ctx, raw or ".")
+        p = _ws_path(ctx, raw or ".", grant="read")
     # ODR-6-residual: `_ws_path`/`_long_path` hand back a `\\?\`-prefixed path
     # once it is >=260 chars, and the STATE-DIR branch of
     # `_credential_path_reason` is `is_relative_to` on the resolved path —
@@ -2119,7 +2119,11 @@ def _write_path(ctx, raw: str) -> Path:
                 f"session")
         p = _long_path(resolved)
     else:
-        p = _ws_path(ctx, raw or ".")
+        # A RELATIVE destination that climbs out of the workspace is the same
+        # capability as an absolute one, so it asks the same question: R3-TOOL-4
+        # gated the absolute spelling and left `..\\..\\Startup\\x.cmd` reaching
+        # the same places with no grant at all.
+        p = _ws_path(ctx, raw or ".", grant="write")
     # ODR-6-residual: same long-path hole as `_read_path` — a >=260-char
     # destination under the state dir was written because the state-dir rule
     # saw the `\\?\`-prefixed spelling.
@@ -2140,11 +2144,58 @@ def _absolute_reads_allowed(ctx: dict) -> bool:
     return bool(ctx.get("allow_absolute_reads"))
 
 
-def _ws_path(ctx, rel: str) -> Path:
-    """Resolve a path INSIDE the session's workspace root; refuse escapes.
+def _outside_capability_allowed(ctx: dict, p: Path, grant: str) -> bool:
+    """May this session reach `p` OUTSIDE its workspace for this capability?
 
-    Uses is_relative_to, NOT a string prefix — `str(p).startswith(str(root))`
-    would let /workspace2/evil escape a /workspace root."""
+    `grant` is "read" (`allow_absolute_reads`) or "write" — and the write side is
+    the SAME pair `_write_path` applies to an absolute destination, the blanket
+    grant or a `write_allowlist` root, so the two routes cannot disagree about
+    where a session may write. Anything else is never allowed.
+    """
+    if grant == "read":
+        return _absolute_reads_allowed(ctx)
+    if grant == "write":
+        return _absolute_writes_allowed(ctx) or _write_allowlist_contains(ctx, p)
+    return False
+
+
+def _outside_capability_refusal(raw: str, grant: str) -> str:
+    """The sentence a refused escape gets: what is off, and how to turn it on.
+
+    Both branches name the session control, because the model cannot see the
+    checkbox and its next call depends on knowing there is one."""
+    if grant == "read":
+        return (f"reading '{raw}' outside the workspace is disabled for this "
+                "chat — use a path inside the workspace, or enable 'allow "
+                "reads outside the workspace' on the session")
+    return (f"'{raw}' is outside the workspace and writing there is disabled "
+            "for this chat — use a path inside the workspace, or enable "
+            "'write outside the workspace' on the session")
+
+
+def _ws_path(ctx, rel: str, *, grant: str = "") -> Path:
+    """Resolve a path against the session's workspace root.
+
+    INSIDE the root this is the plain containment check it has always been, with
+    `is_relative_to` rather than a string prefix — `str(p).startswith(str(root))`
+    would let `/workspace2/evil` escape a `/workspace` root.
+
+    An ABSOLUTE path is refused for every caller: the read and move/copy
+    resolvers handle their own absolute branch (where the grants apply), and
+    `write_file`/`edit_file` are workspace-relative BY CONTRACT — the prompt says
+    so and `test_file_tools_guidance` pins it.
+
+    A RELATIVE path that climbs out with `..` is refused UNLESS `grant` names a
+    capability this session holds. MEASURED 2026-10-05 on live chat 493d17779613:
+    this branch ignored the grants entirely, so with 'allow reads outside the
+    workspace' ON, `read_file` on `C:\\BGMI\\Code.txt` succeeded while
+    `read_file` on `..\\..\\BGMI\\Code.txt` failed — and `write_file` on the
+    absolute path was refused with "pass a path RELATIVE to the workspace", the
+    model obeyed with `..\\..\\BGMI\\ESP\\offsets.h`, and hit a SECOND refusal
+    ("path is outside the workspace — stay within it") that named no way
+    forward. One capability now answers for both spellings, and the refusal says
+    which control turns it on.
+    """
     ws = (ctx.get("workspace") or "").strip()
     if not ws:
         raise ValueError("no workspace folder is set for this chat")
@@ -2155,11 +2206,15 @@ def _ws_path(ctx, rel: str) -> Path:
         raise ValueError(f"'{rel}' is an absolute path — pass a path RELATIVE "
                          f"to the workspace ({root}) instead")
     p = (root / rel).resolve()
-    if p != root and not p.is_relative_to(root):
+    if p == root or p.is_relative_to(root):
+        # long-path prefix LAST: `\\?\C:\...` is not is_relative_to `C:\...`, so
+        # applying it before the containment check above would defeat the check
+        return _long_path(p)
+    if grant and _outside_capability_allowed(ctx, p, grant):
+        return _long_path(p)
+    if not grant:
         raise ValueError("path is outside the workspace — stay within it")
-    # long-path prefix LAST: `\\?\C:\...` is not is_relative_to `C:\...`, so
-    # applying it before the containment check above would defeat the check
-    return _long_path(p)
+    raise ValueError(_outside_capability_refusal(rel, grant))
 
 
 @tool("http_request",
@@ -2980,7 +3035,10 @@ def _undo_last_change(args, ctx):
                 "has been recorded")
     raw = str(args.get("path", "") or "").strip()
     if raw:
-        p = _ws_path(ctx, raw)
+        # Undo restores a file, so it resolves as a WRITE: a change the grant
+        # let the session make outside the workspace has to be undoable, or the
+        # grant creates changes nothing can take back.
+        p = _ws_path(ctx, raw, grant="write")
         # ODR-1: undo restores a file, which is a write like any other.
         _refuse_persistence_write(p, ctx)
         entry = idx.get(str(p))
@@ -3302,7 +3360,15 @@ def _edit_file(args, ctx):
 
 
 def _edit_file_locked(args, ctx):
-    p = _ws_path(ctx, str(args.get("path", "")))
+    p = _ws_path(ctx, str(args.get("path", "")), grant="write")
+    # A granted escape reaches files no workspace check has ever covered, so the
+    # credential denylist runs here the way it does on `_write_path`'s absolute
+    # branch. Inside the workspace nothing changes: `_ws_path`'s containment is
+    # the rule there, exactly as before.
+    if not _inside_workspace(ctx, _unlong(p)):
+        denied = _credential_path_reason(_unlong(p), ctx)
+        if denied:
+            return f"error: refusing to edit {p} — {denied}"
     # ODR-1: edit_file is the other way a model authors a persistence file
     # (and the way it MODIFIES one it could not create). Same refusal as
     # write_file, on the same resolved path.
@@ -3854,7 +3920,14 @@ def _write_file_locked(args, ctx):
             return (f"error: '{bad}' can't be in a file path you write to.{hint}")
         return (f"error: '{bad}' is a reserved device name on Windows, so no "
                 "file can be created with it. Choose a different name.")
-    p = _ws_path(ctx, raw)
+    p = _ws_path(ctx, raw, grant="write")
+    # Same reason as `_edit_file_locked`: the grant widens WHERE a write may
+    # land, never WHAT may be overwritten. A credential file outside the
+    # workspace is refused on this route exactly as on `_write_path`'s.
+    if not _inside_workspace(ctx, _unlong(p)):
+        denied = _credential_path_reason(_unlong(p), ctx)
+        if denied:
+            return f"error: refusing to write {p} — {denied}"
     # ODR-1: `_ws_path` checks containment only, and the product default
     # workspace is the home directory — so this refusal is what stops a
     # relative `AppData/Roaming/.../Startup/x.cmd` from becoming persistence.
@@ -4116,7 +4189,7 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
         # the bytes base64'd into the conversation — a read the profile exists to
         # refuse, and one read_file/view_images under the same profile rejected.
         try:
-            p = _ws_path(ctx, ps)
+            p = _ws_path(ctx, ps, grant="read")
         except ValueError as e:
             return None, str(e), ""
     elif (str(ctx.get("workspace") or "").strip()

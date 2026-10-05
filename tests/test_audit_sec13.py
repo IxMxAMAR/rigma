@@ -445,3 +445,127 @@ def test_run_shell_does_not_spawn_when_confirmation_is_off(monkeypatch):
                          {"allow_code": True, "confirm_exec": False})
     assert out.startswith("error") and "confirmation" in out
     assert called == []
+
+
+# --- the grants apply to BOTH path spellings ---------------------------------
+#
+# MEASURED 2026-10-05, live chat 493d17779613 (workspace C:\Users\amren, both
+# grants ON). The tool trace was: read_file("C:\BGMI\Code.txt") OK, then
+# write_file("C:\BGMI\ESP\offsets.h") refused with "pass a path RELATIVE to the
+# workspace", then write_file("..\..\BGMI\ESP\offsets.h") refused with "path is
+# outside the workspace — stay within it", then three read_file calls with
+# `..\..` refused the same way. The grants were consulted ONLY on the absolute
+# branch, so obeying the first refusal led straight into the second, which named
+# no way forward — the owner had granted both capabilities and neither worked
+# for the spelling the tools demanded.
+
+
+def _ws_and_outside(home):
+    ws = home / "ws"
+    ws.mkdir(exist_ok=True)
+    outside = home / "outside"
+    outside.mkdir(exist_ok=True)
+    return ws, outside
+
+
+def test_a_relative_escape_obeys_the_read_grant(home):
+    ws, outside = _ws_and_outside(home)
+    (outside / "a.txt").write_text("hi", encoding="utf-8")
+
+    refused = tools.run_tool("read_file", {"path": "../outside/a.txt"},
+                             {"workspace": str(ws)})
+    assert refused.startswith("error"), refused
+    assert "allow reads outside the workspace" in refused, refused
+
+    got = tools.run_tool("read_file", {"path": "../outside/a.txt"},
+                         {"workspace": str(ws), "allow_absolute_reads": True})
+    assert got.strip() == "hi", got
+
+
+def test_a_relative_escape_obeys_the_write_grant(home):
+    ws, outside = _ws_and_outside(home)
+    ctx = {"workspace": str(ws), "allow_code": True}
+
+    refused = tools.run_tool("write_file",
+                             {"path": "../outside/new.txt", "content": "x"}, ctx)
+    assert refused.startswith("error"), refused
+    assert "write outside the workspace" in refused, refused
+    assert not (outside / "new.txt").exists()      # refused means nothing made
+
+    ok = tools.run_tool("write_file",
+                        {"path": "../outside/new.txt", "content": "x"},
+                        {**ctx, "allow_absolute_writes": True})
+    assert not ok.startswith("error"), ok
+    assert (outside / "new.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_the_write_grant_does_not_make_write_tools_take_absolute_paths(home):
+    """The prompt's rule stands: `write_file`/`edit_file` are workspace-RELATIVE
+    by contract. The grant changes WHERE a relative path may land, not the form
+    the tool accepts — `test_file_tools_guidance` pins the other half."""
+    ws, outside = _ws_and_outside(home)
+    out = tools.run_tool("write_file",
+                         {"path": str(outside / "abs.txt"), "content": "x"},
+                         {"workspace": str(ws), "allow_code": True,
+                          "allow_absolute_writes": True})
+    assert out.startswith("error") and "absolute path" in out, out
+    assert not (outside / "abs.txt").exists()
+
+
+def test_the_allowlist_reaches_a_relative_escape_without_the_blanket_grant(home):
+    """OD-2's second route applies to the relative spelling too, or the owner
+    who configured the folders they work in still could not write to them."""
+    ws, _ = _ws_and_outside(home)
+    allowed = home / "allowed"
+    allowed.mkdir(exist_ok=True)
+    out = tools.run_tool("write_file",
+                         {"path": "../allowed/kept.txt", "content": "y"},
+                         {"workspace": str(ws), "allow_code": True,
+                          "write_allowlist": [str(allowed)]})
+    assert not out.startswith("error"), out
+    assert (allowed / "kept.txt").read_text(encoding="utf-8") == "y"
+
+
+def test_move_files_honours_the_grant_on_a_relative_destination(home):
+    r"""R3-TOOL-4 gated the absolute destination and left `..\..` reaching the
+    same places ungated — the grant has to answer for both."""
+    ws, outside = _ws_and_outside(home)
+    (ws / "a.txt").write_text("x", encoding="utf-8")
+    base = {"workspace": str(ws), "allow_code": True}
+    out = tools.run_tool("move_files",
+                         {"paths": [str(ws / "a.txt")], "dest": "../outside"},
+                         base)
+    assert out.startswith("error"), out
+    assert "write outside the workspace" in out, out
+    out = tools.run_tool("move_files",
+                         {"paths": [str(ws / "a.txt")], "dest": "../outside"},
+                         {**base, "allow_absolute_writes": True})
+    assert out.startswith("moved 1 file(s)"), out
+    assert (outside / "a.txt").is_file()
+
+
+def test_a_granted_escape_still_refuses_a_credential_file(home):
+    """The grant widens WHERE a write may land, never WHAT may be overwritten."""
+    ws, _ = _ws_and_outside(home)
+    creds = home / "creds"
+    creds.mkdir(exist_ok=True)
+    (creds / "id_rsa").write_text("PRIVATE", encoding="utf-8")
+    out = tools.run_tool("write_file",
+                         {"path": "../creds/id_rsa", "content": "stolen"},
+                         {"workspace": str(ws), "allow_code": True,
+                          "allow_absolute_writes": True})
+    assert out.startswith("error"), out
+    assert (creds / "id_rsa").read_text(encoding="utf-8") == "PRIVATE"
+
+
+def test_a_confined_profile_refuses_a_relative_escape_even_with_the_grants(home):
+    ws, outside = _ws_and_outside(home)
+    (outside / "a.txt").write_text("hi", encoding="utf-8")
+    ctx = {"workspace": str(ws), "profile": "confined",
+           "allow_absolute_reads": True, "allow_absolute_writes": True}
+    read = tools.run_tool("read_file", {"path": "../outside/a.txt"}, ctx)
+    assert read.startswith("error"), read
+    write = tools.run_tool("write_file",
+                           {"path": "../outside/z.txt", "content": "x"}, ctx)
+    assert write.startswith("error"), write
+    assert not (outside / "z.txt").exists()

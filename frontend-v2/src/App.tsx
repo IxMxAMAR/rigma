@@ -17,7 +17,7 @@ import Palette from "./Palette";
 import WorkspacePanel from "./WorkspacePanel";
 import { parseParamRanges } from "./lib/paramLimits";
 import { tpsHint } from "./lib/telemetry";
-import { saveWorkspace } from "./lib/workspace";
+import { pickWorkspace, saveWorkspace } from "./lib/workspace";
 import { SURFACES, useApp } from "./store";
 
 function Sidebar() {
@@ -121,25 +121,50 @@ export function Header() {
     if (res.ok) setWorkspacePath(v);
     else setWsErr(res.error);
   };
+  // Same picker as the sidebar (owner request 2026-10-05): Explorer instead of
+  // typing a path from memory. A cancel changes nothing.
+  const browseWs = async () => {
+    if (!currentId) return;
+    setWsErr(null);
+    const r = await pickWorkspace(currentId, workspacePath);
+    if (!r.ok) { setWsErr(r.error); return; }
+    if (!r.path) return;
+    setEditingWs(false);
+    await saveWs(r.path);
+  };
   return (
     <header className="h-12 shrink-0 flex items-center gap-4 px-5 bg-panel">
       <h1 className="text-[14px] font-semibold shrink-0">{label}</h1>
       {surface === "chat" && currentId && (
         <span className="flex items-center gap-1.5 min-w-0 max-w-[44%]">
           {editingWs ? (
-            <input
-              autoFocus
-              defaultValue={workspacePath}
-              placeholder="D:\Writing"
-              aria-label="Workspace folder path"
-              onKeyDown={(e) => {
-                if (e.key === "Escape") setEditingWs(false);
-                if (e.key === "Enter")
-                  void saveWs((e.target as HTMLInputElement).value);
-              }}
-              onBlur={(e) => void saveWs(e.target.value)}
-              className="min-w-[220px] rounded-md bg-surface px-2 py-0.5 font-mono text-[11.5px] outline-none placeholder:text-muted"
-            />
+            <>
+              <input
+                autoFocus
+                defaultValue={workspacePath}
+                placeholder="D:\Writing"
+                aria-label="Workspace folder path"
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setEditingWs(false);
+                  if (e.key === "Enter")
+                    void saveWs((e.target as HTMLInputElement).value);
+                }}
+                onBlur={(e) => void saveWs(e.target.value)}
+                className="min-w-[220px] rounded-md bg-surface px-2 py-0.5 font-mono text-[11.5px] outline-none placeholder:text-muted"
+              />
+              {/* onMouseDown preventsDefault: otherwise the input's blur fires
+                  saveWs with the half-typed path before the dialog opens. */}
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => void browseWs()}
+                aria-label="Browse for workspace folder"
+                title="pick a folder in Explorer"
+                className="rounded-md bg-surface px-2 py-0.5 font-mono text-[11px] text-muted hover:text-secondary shrink-0"
+              >
+                Browse…
+              </button>
+            </>
           ) : (
             <button
               onClick={() => setEditingWs(true)}
