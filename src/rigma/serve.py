@@ -5488,6 +5488,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
         # batch. The 400 rejects the pair rather than let the requested `-ub` be
         # silently ignored.
         allowed = {"quant", "ctx", "kv", "vision", "spec_type", "spec_n_max",
+                   "spec_draft", "spec_conf_min", "spec_p_min",
                    "backend", "batch", "ubatch", "ngl"}
         fields = {k: v for k, v in (body or {}).items() if k in allowed}
         if not fields:

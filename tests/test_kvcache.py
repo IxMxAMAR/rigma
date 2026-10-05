@@ -27,6 +27,9 @@ BASE = {
     "n_cpu_moe": 0,
     "spec_type": "draft-mtp",
     "spec_n_max": 1,
+    "spec_draft": "",
+    "spec_conf_min": 0.0,
+    "spec_p_min": 0.0,
     "flash_attn": "on",
 }
 
@@ -54,6 +57,13 @@ def test_key_order_does_not_change_the_name():
     ("n_cpu_moe", 18),
     ("spec_type", ""),
     ("spec_n_max", 2),
+    # The draft ARTEFACT and DSpark's confidence cut change what the cache was
+    # built against even when the KV layout is identical, so each must move the
+    # name — a snapshot restored across a draft swap describes a run that never
+    # happened.
+    ("spec_draft", "C:/models/dflash2-draft.gguf"),
+    ("spec_conf_min", 0.4),
+    ("spec_p_min", 0.2),
     ("flash_attn", "off"),
 ])
 def test_every_field_that_invalidates_a_cache_changes_the_name(field, value):
@@ -137,7 +147,8 @@ def _plan(backend="vulkan"):
     from types import SimpleNamespace
     flags = SimpleNamespace(ctx=122880, cache_type_k="q5_1", cache_type_v="q5_1",
                             ngl=63, n_cpu_moe=0, spec_type="draft-mtp",
-                            spec_n_max=1, flash_attn="on")
+                            spec_n_max=1, spec_draft="", spec_conf_min=0.0,
+                            spec_p_min=0.0, flash_attn="on")
     return SimpleNamespace(model_slug="qwen38-ara-v5",
                            gguf=SimpleNamespace(quant="Q3_K_M [mtp]",
                                                 file="RVN-Q3_K_M-mtp.gguf"),

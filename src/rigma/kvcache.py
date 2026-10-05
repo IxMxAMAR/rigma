@@ -44,6 +44,15 @@ FINGERPRINT_FIELDS = (
     "model", "quant", "gguf", "backend", "engine", "engine_version",
     "ctx", "cache_type_k", "cache_type_v",
     "ngl", "n_cpu_moe", "spec_type", "spec_n_max",
+    # The DRAFT ARTEFACT is part of the cache's identity: two launches whose
+    # only difference is which draft gguf they loaded (DFlash v1 vs DFlash2,
+    # mainline vs PrismML DSpark) still write different drafts, and a snapshot
+    # is a claim about the run that produced it. `spec_conf_min` is here for the
+    # same reason: DSpark truncates a block by its own confidence threshold, so
+    # it changes what the cache was built against even though the KV layout is
+    # identical. Both default to "" and 0.0, which is what every record written
+    # before this existed already means.
+    "spec_draft", "spec_conf_min", "spec_p_min",
     # AUDIT 02-3: the calibration sweep always trials `flash_attn: off`
     # (bench.quick_configs/sweep_configs) and the winner is applied on a later
     # launch, so two engines that differ only in `-fa` used to name the SAME
@@ -177,7 +186,9 @@ def config_of(plan, engine: str = "", engine_version: str | None = None) -> dict
         "ctx": f.ctx, "cache_type_k": f.cache_type_k,
         "cache_type_v": f.cache_type_v, "ngl": f.ngl,
         "n_cpu_moe": f.n_cpu_moe, "spec_type": f.spec_type,
-        "spec_n_max": f.spec_n_max, "flash_attn": f.flash_attn,
+        "spec_n_max": f.spec_n_max, "spec_draft": f.spec_draft,
+        "spec_conf_min": f.spec_conf_min, "spec_p_min": f.spec_p_min,
+        "flash_attn": f.flash_attn,
     }
 
 

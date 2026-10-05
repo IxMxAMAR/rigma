@@ -4,6 +4,8 @@ import re
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from . import spec_decode
+
 STANDARD_GB = [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 
 # Bytes of KV cache per element, per side (K or V), for every cache type Rigma
@@ -102,6 +104,29 @@ def _valid_cache_type(v: str) -> str:
     return v
 
 
+# --- the speculative-draft rules, in ONE place ------------------------------
+#
+# Both `ComboFlags` (a launch) and `LaunchDefaults` (a stored per-model default)
+# carry these two values, and they must agree about what is legal — a default
+# that ComboFlags would reject has to be rejected when it is STORED, not when
+# the merge into ComboFlags goes through `model_copy` and skips validation.
+# They live at module level rather than on one class so the other can call them
+# as plain functions.
+
+def _draft_artefact_shape(v: str) -> str:
+    """SHAPE only — never existence. See `ComboFlags.spec_draft`."""
+    return spec_decode.draft_shape(v)
+
+
+def _conf_min_in_range(v: float) -> float:
+    """A probability threshold in [0, 1]. See `ComboFlags.spec_conf_min`."""
+    f = float(v)
+    if f != f or f < 0 or f > 1:
+        raise ValueError(f"a speculative probability threshold must be in "
+                         f"[0, 1], got {v!r}")
+    return f
+
+
 # AUDIT 04-10: `NUL.gguf` is the NUL device, not a file — the download/delete
 # sinks would "succeed" against the device and the model would never exist.
 _RESERVED_DEVICE = re.compile(
@@ -197,6 +222,14 @@ class GgufFile(BaseModel):
     # per artefact, and asking llama.cpp for draft-mtp without them resets the
     # Vulkan driver rather than erroring. None = not probed yet.
     mtp: bool | None = None
+    # WHICH speculative draft head this file carries — "mtp", "dflash",
+    # "dflash2", "dspark", "dspark-prism", "eagle3", or None when the tensor
+    # table does not say. Per FILE for the same reason `mtp` is: llama.cpp gives
+    # the whole DFlash family one arch string and picks the variant from the
+    # tensors, so only the artefact can answer. It is what lets a launch refuse
+    # `--spec draft-dflash2` on a plain DFlash sidecar instead of loading it and
+    # finding out (or resetting the Vulkan driver).
+    draft_head: str | None = None
 
     # AUDIT F57: docs/audit-2026-09-04-full.md
     #
@@ -288,6 +321,41 @@ class LaunchDefaults(BaseModel):
     # Vulkan driver rather than erroring.
     spec_type: str = ""
     spec_n_max: int = 0
+    # The draft artefact and DSpark's confidence cut, storable per model for the
+    # same reason spec_type is: a model that needs a DFlash2 sidecar needs it on
+    # every launch, and re-typing the path is how a user ends up running DFlash
+    # v1 while believing they asked for DFlash2. Validated HERE, unlike
+    # `spec_type` was: a stored default is parsed from registry JSON or an HTTP
+    # body, so a typo has to fail at parse time — the merge into ComboFlags goes
+    # through `model_copy`, which does not re-run validators.
+    spec_draft: str = ""
+    spec_conf_min: float = 0.0
+    # The draft's per-position PROBABILITY floor (`--spec-draft-p-min`), the
+    # lever PR #25246 added for the DFlash family. Measured present in both
+    # builds installed here (mainline b9867 and PrismML prism-b10743), unlike
+    # `spec_conf_min`, whose flag those builds do not have.
+    spec_p_min: float = 0.0
+
+    @field_validator("spec_type")
+    @classmethod
+    def _launch_spec_known(cls, v: str) -> str:
+        if v and v not in spec_decode.MODES:
+            raise ValueError(f"spec_type must be one of {list(spec_decode.MODES)}")
+        return v
+
+    @field_validator("spec_draft")
+    @classmethod
+    def _launch_draft_shape(cls, v: str) -> str:
+        # Same shape rule as ComboFlags; delegated rather than copied so the two
+        # cannot drift into disagreeing about what "-md" vs "--spec-draft-hf"
+        # means. Returns the VALUE, like its sibling above.
+        _draft_artefact_shape(v)
+        return v
+
+    @field_validator("spec_conf_min", "spec_p_min")
+    @classmethod
+    def _launch_conf_range(cls, v: float) -> float:
+        return _conf_min_in_range(v)
     # which compute backend to launch on, for a model that only runs on one.
     # Ternary-Bonsai-2's PQ2_0 weights need the prism fork's ROCm kernels; the
     # Vulkan backend loads them without complaint and then falls back to CPU
@@ -332,6 +400,7 @@ class LaunchDefaults(BaseModel):
         """Only the fields that were actually set, for merging over a request."""
         return {f: getattr(self, f) for f in
                 ("quant", "ctx", "kv", "vision", "spec_type", "spec_n_max",
+                 "spec_draft", "spec_conf_min", "spec_p_min",
                  "backend", "batch", "ubatch", "ngl")
                 if self.is_set(f)}
 
@@ -475,8 +544,22 @@ class ComboFlags(BaseModel):
     # for a session that names one (`serve.py`), and a request kwarg wins over
     # this server-side default, so the two cannot fight.
     reasoning_effort: str = ""
-    spec_type: str = "none"   # none | draft-mtp | ngram-simple | ... (engine list)
+    spec_type: str = "none"   # one of spec_decode.MODES (the engine list, named)
     spec_n_max: int = 3
+    # The DRAFT artefact for the modes whose head is a separate gguf (DFlash,
+    # DFlash2, DSpark, EAGLE-3): a path to a .gguf, or a HuggingFace
+    # `user/model[:quant]` id. Empty means "the user has not said", which is a
+    # real answer — upstream can discover a sidecar from the target repo — but
+    # for every mode in `spec_decode.NEEDS_DRAFT_FILE` Rigma will refuse the
+    # launch rather than let the engine guess, because a mismatch there is a
+    # Vulkan driver reset, not an error message.
+    spec_draft: str = ""
+    # DSpark's confidence truncation (`--spec-draft-conf-min P`): cut a drafted
+    # block at the first position whose predicted acceptance falls below P.
+    # 0.0 is the engine's own default (disabled), so it emits nothing.
+    spec_conf_min: float = 0.0
+    # The draft's own probability floor — see `ComboFlags.spec_p_min`.
+    spec_p_min: float = 0.0
     batch: int = 0        # -b logical batch (0 = engine default 2048)
     ubatch: int = 0       # -ub physical batch (0 = engine default 512)
     # Max context checkpoints per slot. -1 = NO OPINION (flag omitted, engine
@@ -566,12 +649,37 @@ class ComboFlags(BaseModel):
     @field_validator("spec_type")
     @classmethod
     def _known_spec(cls, v):
-        ok = {"none", "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash",
-              "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod",
-              "ngram-cache"}
-        if v not in ok:
-            raise ValueError(f"spec_type must be one of {sorted(ok)}")
+        # The list lives in `spec_decode` because it is no longer only an engine
+        # list: a mode has a per-engine translation and a required artefact, and
+        # two copies of the vocabulary would drift. Every value that stored
+        # specs, registry combos, launch defaults and calibration rows already
+        # carry is still accepted (`spec_decode.LEGACY_MODES`).
+        if v not in spec_decode.MODES:
+            raise ValueError(f"spec_type must be one of {list(spec_decode.MODES)}")
         return v
+
+    @field_validator("spec_draft")
+    @classmethod
+    def _draft_artefact_shape(cls, v: str) -> str:
+        # SHAPE only — never existence. `rigma plan` must be able to describe a
+        # launch whose draft file has not been downloaded yet, exactly as it does
+        # for the model itself; the file is checked where it is actually needed
+        # (at launch, in `hangar.resolve_draft_file`). What is rejected here is a
+        # value that is NEITHER a gguf path NOR a `user/model` id, because that
+        # can only be a typo, and the two shapes select two different engine
+        # flags (`-md` vs `--spec-draft-hf`). The helper is called for its
+        # verdict only: the VALUE is what gets stored, never the shape's name.
+        _draft_artefact_shape(v)
+        return v
+
+    @field_validator("spec_conf_min", "spec_p_min")
+    @classmethod
+    def _conf_min_in_range(cls, v: float) -> float:
+        # `--spec-draft-conf-min P` is a probability threshold. The engine's own
+        # default is 0 (disabled); above 1 it can never accept a position, which
+        # is a real (if pointless) request, but a negative or NaN threshold is
+        # not a request at all.
+        return _conf_min_in_range(v)
 
     @field_validator("cache_type_k", "cache_type_v")
     @classmethod
@@ -749,8 +857,17 @@ class RunPlan(BaseModel):
                 and self.engine_is_prism_fork is True):
             args += ["--reasoning-effort", self.flags.reasoning_effort]
         if self.flags.spec_type and self.flags.spec_type != "none":
-            args += ["--spec-type", self.flags.spec_type,
-                     "--spec-draft-n-max", str(self.flags.spec_n_max)]
+            # ONE translation, in `spec_decode`: Rigma's mode -> the engine's
+            # --spec-type, plus the draft artefact flag (-md for a file,
+            # --spec-draft-hf for a repo id) and DSpark's confidence cut. It
+            # raises for a mode llama.cpp has no type for (P-EAGLE), which is
+            # the honest failure: emitting an unknown --spec-type would be an
+            # argparse exit after the user waited for a download.
+            args += spec_decode.llamacpp_spec_args(
+                self.flags.spec_type, n_max=self.flags.spec_n_max,
+                draft=self.flags.spec_draft,
+                conf_min=self.flags.spec_conf_min,
+                p_min=self.flags.spec_p_min)
         # reuse unchanged KV prefixes on edit/regenerate/compact turns.
         # (No effect on DeltaNet hybrids — KV shifting is unsupported there,
         # llama.cpp #18497 — but harmless, and it still helps pure

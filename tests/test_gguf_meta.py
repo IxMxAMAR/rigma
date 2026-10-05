@@ -518,3 +518,97 @@ def test_the_unknown_flag_reaches_the_spec_and_the_fit(tmp_path):
                      **spec_fields_from_probe(f))
     assert spec.rs_geometry_unknown is True
     assert recurrent_state_unknown(spec)
+
+
+# --- speculative draft heads: which member of the family is this file? ------
+#
+# llama.cpp gives the whole DFlash family ONE arch string (`dflash`) and decides
+# the variant from the tensors the file actually contains — master
+# gguf-py/gguf/constants.py, MODEL_ARCH.DFLASH — so the file's own table is the
+# only honest answer. Getting it wrong is not cosmetic: `--spec draft-dspark`
+# against a plain DFlash sidecar is a load failure at best, and the modes that
+# need a head the file lacks are a Vulkan driver-reset loop.
+
+def _dflash_kvs(arch=b"dflash"):
+    return [_kv_str(b"general.architecture", arch),
+            _kv_u32(arch + b".block_count", 4),
+            _kv_u32(arch + b".context_length", 32768),
+            _kv_u32(arch + b".embedding_length", 256),
+            _kv_u32(arch + b".attention.head_count", 8),
+            _kv_u32(arch + b".attention.head_count_kv", 2)]
+
+
+def test_a_dflash_file_with_no_variant_tensors_is_plain_dflash(tmp_path):
+    p = _write(tmp_path, _dflash_kvs(),
+               tensors=[_tensor(b"blk.0.attn_q.weight", [256, 256])])
+    assert inspect_gguf(p).spec_fields["draft_head"] == "dflash"
+
+
+def test_the_convolutions_and_selector_make_it_dflash2(tmp_path):
+    p = _write(tmp_path, _dflash_kvs(), tensors=[
+        _tensor(b"blk.0.attn_conv_base.weight", [256]),
+        _tensor(b"blk.0.ffn_conv_proj.weight", [256, 256]),
+        _tensor(b"selector_hidden.weight", [256, 256]),
+    ])
+    assert inspect_gguf(p).spec_fields["draft_head"] == "dflash2"
+
+
+def test_the_mainline_markov_head_makes_it_dspark(tmp_path):
+    p = _write(tmp_path, _dflash_kvs(), tensors=[
+        _tensor(b"markov_w1.weight", [256, 64]),
+        _tensor(b"markov_w2.weight", [64, 256]),
+        _tensor(b"conf_proj.weight", [1, 256]),
+    ])
+    assert inspect_gguf(p).spec_fields["draft_head"] == "dspark"
+
+
+def test_the_prismml_markov_names_are_their_own_lineage(tmp_path):
+    """The fork declares its own DSpark arch and tensor names (PrismML-Eng
+    llama.cpp 87268f77, prism-arch.h), so a file converted for one lineage must
+    not be reported as the other — the two are not known to interchange."""
+    p = _write(tmp_path, _dflash_kvs(), tensors=[
+        _tensor(b"markov_head_a.weight", [256, 64]),
+        _tensor(b"confidence_head.weight", [1, 256]),
+    ])
+    assert inspect_gguf(p).spec_fields["draft_head"] == "dspark-prism"
+
+
+def test_dspark_outranks_dflash2_when_both_markers_are_present(tmp_path):
+    # DSpark is a DFlash backbone plus heads; the more specific answer wins so a
+    # user is never told "dflash2" about a file that needs the DSpark loader.
+    p = _write(tmp_path, _dflash_kvs(), tensors=[
+        _tensor(b"selector_hidden.weight", [256, 256]),
+        _tensor(b"markov_w1.weight", [256, 64]),
+    ])
+    assert inspect_gguf(p).spec_fields["draft_head"] == "dspark"
+
+
+def test_eagle3_is_detected_by_its_two_exact_names(tmp_path):
+    p = _write(tmp_path, _dflash_kvs(b"eagle3"),
+               tensors=[_tensor(b"d2t.weight", [128]),
+                        _tensor(b"fc.weight", [512, 256])])
+    assert inspect_gguf(p).spec_fields["draft_head"] == "eagle3"
+
+
+def test_a_target_file_with_nextn_tensors_still_reports_mtp(tmp_path):
+    kvs = [_kv_str(b"general.architecture", b"qwen3next"),
+           _kv_u32(b"qwen3next.block_count", 8)]
+    p = _write(tmp_path, kvs, tensors=[_tensor(b"blk.0.nextn.proj.weight", [8])])
+    assert inspect_gguf(p).spec_fields["draft_head"] == "mtp"
+
+
+def test_a_short_name_is_not_matched_inside_a_longer_one(tmp_path):
+    """`fc` and `d2t` are exact names: a substring rule would call any file with
+    an `fc1` tensor an EAGLE-3 draft."""
+    p = _write(tmp_path, _dflash_kvs(),
+               tensors=[_tensor(b"blk.0.fc1.weight", [8]),
+                        _tensor(b"blk.0.fc2.weight", [8])])
+    assert inspect_gguf(p).spec_fields["draft_head"] == "dflash"
+
+
+def test_a_truncated_table_claims_no_draft_head():
+    """Absence proves nothing about a table that was cut short — the same rule
+    `has_mtp` follows, and the reason both return None rather than False."""
+    from rigma.gguf_meta import TensorIndex
+    idx = TensorIndex(truncated=True, draft_head_tensors={"dflash2": 3})
+    assert idx.draft_head is None
