@@ -68,13 +68,13 @@ def up_env(tmp_path, monkeypatch):
 
 # --- the lever exists and is discoverable ------------------------------------
 
-def test_refuse_is_a_documented_option_on_both_verify_paths():
+def test_refuse_is_a_documented_option_on_both_verify_paths(help_text):
     """A lever a user cannot find is the whole finding. Both `--verify` paths
     must declare it."""
     for cmd in ("plan", "up"):
         res = runner.invoke(cli.app, [cmd, "--help"])
         assert res.exit_code == 0, res.output
-        assert "--refuse" in res.output, f"{cmd} has no --refuse"
+        assert "--refuse" in help_text(res), f"{cmd} has no --refuse"
 
 
 # --- the absence of the flag preserves today's behaviour ---------------------

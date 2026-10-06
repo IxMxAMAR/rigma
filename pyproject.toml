@@ -52,6 +52,14 @@ dependencies = [
   # BASE dependencies — already requires `typer>=0.16.0` itself. A floor under
   # that declares a range this project cannot install beside its own fastapi
   # floor, so 0.13 was not merely old, it was unsatisfiable-in-company.
+  #
+  # (3) The other two failures `floors` reported beside those were NOT a floor
+  # problem, and no typer version fixes them: `--engine` and `--refuse` are
+  # asserted as substrings of help output, and under `GITHUB_ACTIONS` typer's
+  # rich_utils forces a terminal while its OptionHighlighter splits `--refuse`
+  # with an ANSI escape between the hyphens. Those two tests now strip ANSI (the
+  # `help_text` fixture in tests/conftest.py); raising this floor further would
+  # not have moved them.
   "typer>=0.16",
   "httpx>=0.27",
   "psutil>=5.9",
