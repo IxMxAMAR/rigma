@@ -272,6 +272,26 @@ def _extract(archive: Path, dest: Path) -> None:
                 t.extractall(dest)
 
 
+def has_engine_asset(backend: str, os_name: str) -> bool:
+    """Whether the pinned manifest ships a build for `os_name`/`backend`.
+
+    The mirror of `ensure_engine`'s first check, exposed so a CALLER can ask
+    BEFORE choosing. `gpus.json` answers "what can this card run", in preference
+    order; this answers "what does this project actually have pinned", and on
+    Linux the two disagree: the manifest ships `linux/vulkan` and `linux/cpu`
+    with no CUDA at all, while every NVIDIA row still reads ["cuda", "vulkan"].
+    Choosing from the card's list alone asked for an engine that cannot be
+    downloaded, so the caller's ladder answered by walking to the CPU floor.
+
+    Never raises: an unreadable or malformed manifest answers False, which makes
+    the caller keep its previous answer rather than crash a plan.
+    """
+    try:
+        return f"{os_name}/{backend}" in _engines_manifest()["assets"]
+    except Exception:
+        return False
+
+
 def ensure_engine(backend: str, os_name: str) -> Path:
     man = _engines_manifest()
     key = f"{os_name}/{backend}"

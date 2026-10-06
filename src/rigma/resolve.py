@@ -1043,6 +1043,23 @@ def _backend(profile: HardwareProfile, override: str | None = None) -> str:
     if not gpu or not gpu.backends:
         return "cpu"
     if not override:
+        # AUDIT (Runpod, 2026-10-07): a card's list says what it CAN run, in
+        # preference order; the manifest says what this project has PINNED, and
+        # on Linux they disagree. `data/engines.json` (b9867) ships
+        # linux/vulkan and linux/cpu and NO cuda, while every NVIDIA row in
+        # gpus.json reads ["cuda", "vulkan"]. Taking `backends[0]` therefore
+        # asked for an engine that cannot be downloaded: `ensure_engine` raised
+        # (runtime.py:278-279) and cli.py's ladder walked down to the CPU floor
+        # — the GPU idle, with an explain line that reads like a memory limit.
+        # On a Runpod NVIDIA pod that is the first thing that happens.
+        #
+        # So prefer the first backend the manifest can actually serve. If it can
+        # serve NONE of them, answer exactly as before: the failure should name
+        # the missing engine rather than the plan quietly changing shape.
+        from . import runtime
+        for cand in gpu.backends:
+            if runtime.has_engine_asset(cand, profile.os):
+                return cand
         return gpu.backends[0]
     if override not in gpu.backends:
         raise ResolveError(

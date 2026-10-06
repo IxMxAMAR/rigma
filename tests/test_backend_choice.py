@@ -44,3 +44,20 @@ def test_no_gpu_still_means_cpu():
 def test_an_empty_override_means_no_opinion():
     """The UI sends "" for 'whatever you'd normally pick'."""
     assert _backend(_prof(["vulkan", "rocm"]), "") == "vulkan"
+
+
+def test_linux_skips_a_backend_that_has_no_pinned_build():
+    """Runpod is Linux-only, and that is where the card's list and the manifest
+    disagree: every NVIDIA row reads ["cuda", "vulkan"] while the pinned
+    manifest ships linux/vulkan and linux/cpu and NO cuda. Choosing "cuda" made
+    `ensure_engine` raise (runtime.py:278-279) and cli.py's ladder end on the
+    CPU floor with the GPU idle."""
+    assert _backend(_prof(["cuda", "vulkan"], os_name="linux")) == "vulkan"
+    # Windows keeps its CUDA build, so the preference order is untouched there.
+    assert _backend(_prof(["cuda", "vulkan"], os_name="windows")) == "cuda"
+
+
+def test_a_card_with_nothing_pinned_still_answers_the_first():
+    """When NO listed backend has a build, the old answer stands — the error
+    then names the missing engine instead of the plan silently changing."""
+    assert _backend(_prof(["rocm"], os_name="linux")) == "rocm"
