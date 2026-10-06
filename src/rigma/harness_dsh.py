@@ -33,11 +33,51 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# THE BUILD THIS ADAPTER WAS MEASURED AGAINST. Not empty, and the distinction is
+# load-bearing: `conformance` computes drift as
+# `(have != want) if (have and want) else None`, so an empty value here would turn DSH
+# drift detection off and report "unknown" forever.
+#
+# This comment used to say the value was "Deliberately EMPTY ... DSH has never been
+# driven end to end from this machine", which was the opposite of the line under it and
+# cited a module docstring that says no such thing. The measurements are real and dated
+# (see :93, :115 and :781 below, and the `hardware`-marked live test in
+# `tests/test_harness_dsh_live.py`, which runs a real turn when asked for by name).
+#
+# Empty still means "unknown" for an adapter that has not been measured. This one has.
+#
+# THE VALUE NOW COMES FROM `data/compat.yaml`, so Rigma <-> DSH <-> mcode are
+# pinned in one place instead of three. It read "0.1.6-alpha.2" for a checkout
+# that had moved to 0.2.0-rc.2, and the cost was not a wrong warning: 0.2.0-rc.2
+# made `protocol` FATAL at mount, so the generated patch killed every turn
+# before it reached the model. A stale pin in one file per adapter is how that
+# stayed invisible. `tests/test_harness_compat.py` fails if this and the matrix
+# ever disagree again.
+#
+# IT IS DEFINED BEFORE THE `.harness` IMPORTS BELOW, and that placement is not
+# cosmetic — it is the same hazard `harness_mcode.py` documents at its own
+# `VERIFIED`, which this module had and did not avoid. `harness.py` builds its
+# BACKENDS table at import time and reads this value through `_verified_of`,
+# which does `importlib.import_module(".harness_dsh")`. When something imports
+# THIS module first, that re-import finds a HALF-INITIALISED module already in
+# `sys.modules` and caches "" as "nobody verified this" — so DSH drift detection
+# switched itself off depending on import order. Measured, three orders:
+#
+#   import rigma.harness                -> conformance("dsh")["verified"] == "0.2.0-rc.2"
+#   import rigma.harness_dsh, rigma.harness -> conformance("dsh")["verified"] == ""      (broken)
+#   import rigma.harness_mcode, rigma.harness -> "0.2.0-rc.2"                            (immune)
+#
+# `data.compat` imports only `importlib.resources` and `pathlib`, so pulling it
+# up here stays clear of the cycle.
+from .data import compat as _compat
+
+VERIFIED = _compat.version("dsh")
+
 # The seam's event vocabulary, shared with every other adapter. Re-exported
 # rather than redefined so a driver and the turn loop cannot drift apart — and
 # so `harness_dsh.TurnEvent` keeps naming the same type.
-from .harness import TurnEvent
-from . import harness as _harness
+from .harness import TurnEvent          # noqa: E402
+from . import harness as _harness       # noqa: E402
 
 # The checkout this machine actually has. The env override exists because a
 # checkout is a user's directory, not a fact about Rigma.
@@ -53,6 +93,17 @@ _SKILLS_PATCH_NAME = "rigma-dsh-skills.yaml"
 _MCP_PATCH_NAME = "rigma-dsh-mcp.yaml"
 _SDK_REL = ("python", "sdk", "src")
 _CLI_REL = ("python", "sdk-runtime", "node_modules", ".bin", "dsh.CMD")
+
+# The endpoint and the model id, handed to the runner so ITS `patch_file` can
+# declare the pi-ai route. They travel through the environment because the
+# runner's call site is fixed: `_dsh_runner.py:605` passes only
+# `(context_window, max_tokens, scratch)`, and a hand-declared pi-ai route must
+# name its endpoint and list its models (`llm-pi-ai/src/catalog.ts:884-887`).
+# Neither value is a secret — the endpoint is Rigma's own loopback server and
+# the model id is the one the user picked — so unlike `DEEPSEEK_API_KEY` these
+# need no place in `harness_env`'s allowlist; they are set below, not inherited.
+_BASE_URL_ENV = "RIGMA_DSH_BASE_URL"
+_MODEL_ENV = "RIGMA_DSH_MODEL"
 
 
 def home() -> Path | None:
@@ -80,20 +131,6 @@ def available() -> bool:
     """Whether a turn can be handed over at all: source AND CLI, or neither."""
     return sdk_src() is not None and dsh_bin() is not None
 
-
-# THE BUILD THIS ADAPTER WAS MEASURED AGAINST. Not empty, and the distinction is
-# load-bearing: `conformance` computes drift as
-# `(have != want) if (have and want) else None`, so an empty value here would turn DSH
-# drift detection off and report "unknown" forever.
-#
-# This comment used to say the value was "Deliberately EMPTY ... DSH has never been
-# driven end to end from this machine", which was the opposite of the line under it and
-# cited a module docstring that says no such thing. The measurements are real and dated
-# (see :93, :115 and :781 below, and the `hardware`-marked live test in
-# `tests/test_harness_dsh_live.py`, which runs a real turn when asked for by name).
-#
-# Empty still means "unknown" for an adapter that has not been measured. This one has.
-VERIFIED = "0.1.6-alpha.2"
 
 # WHY CONTINUITY IS A PROCESS, NOT A SESSION ID — read before changing `_pool`.
 #
@@ -151,6 +188,85 @@ def backend_version() -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return out.stdout.strip() if out.returncode == 0 else ""
+
+
+# THE DSH HALF OF THE DRIFT NOTICE, mirroring `harness_mcode._drift_notice`. That
+# one existed and this one did not, which is why a checkout that had moved from
+# 0.1.6-alpha.2 to 0.2.0-rc.2 could break every turn without a single line
+# saying so: `harness.conformance` knew, but only a person who ran
+# `rigma harness` would ever ask. `drift` is True/False/None for the same reason
+# `conformance` says so — a backend that will not answer its version is UNKNOWN,
+# and unknown must be reported as neither agreement nor drift.
+#
+# Once per process, even when the probe fails, so a broken `--version` cannot
+# turn into one notice per turn.
+_DRIFT_SAID = False
+
+
+def _version_key(text: str) -> tuple:
+    """A comparable key for a version string, or `()` when it is not one.
+
+    Deliberately small, and NOT a lexical compare: `"0.10.0" < "0.9.0"` is true
+    as text and false as a version. A pre-release also sorts BELOW its release
+    (`0.2.0-rc.2` < `0.2.0`), which is the standard rule and the one that matters
+    here — a checkout sitting on a release candidate must not read as newer than
+    the release it precedes.
+
+    `()` means "not a version I can order", and every caller declines to compare
+    rather than guess, because a wrong "this build is too old" is worse than the
+    plain drift sentence it would have replaced.
+    """
+    main, _, pre = str(text).strip().partition("-")
+    parts = main.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return ()
+    # (numbers, pre-release) — a release outranks any of its pre-releases.
+    if not pre:
+        return (tuple(int(p) for p in parts), (1, ()))
+    return (tuple(int(p) for p in parts),
+            (0, tuple((0, int(p)) if p.isdigit() else (1, p)
+                      for p in pre.split("."))))
+
+
+def _drift_notice() -> TurnEvent | None:
+    """One line, once per process, when the installed build is not `VERIFIED`.
+
+    Never raises — this runs inside a turn, and a version check must not be able
+    to fail one. The wording names the FATAL edge when the installed build is
+    provably below the matrix's `dsh_min`, because that is the case where the
+    turn is expected to die rather than merely degrade, and a person reading the
+    transcript deserves the difference. When the versions cannot be ordered the
+    plain drift sentence is used — an unproven claim is not worth making.
+    """
+    global _DRIFT_SAID
+    if _DRIFT_SAID or not VERIFIED:
+        return None
+    _DRIFT_SAID = True          # once per process, even if the probe fails
+    try:
+        have = str(backend_version() or "").strip()
+    except Exception:
+        return None
+    if not have or have == VERIFIED.strip():
+        return None
+    low, high = _compat.supported_band()
+    have_key = _version_key(have)
+    low_key, high_key = _version_key(low), _version_key(high)
+    if have_key and low_key and have_key < low_key:
+        return TurnEvent("notice", text=(
+            f"DSH {have} is OLDER than the oldest build this adapter supports "
+            f"({low}); it was measured against {VERIFIED}. The generated "
+            f"profile patch is the wrong shape for it, so this turn may not "
+            f"reach the model at all — run `rigma harness` for the detail."))
+    if have_key and high_key and have_key > high_key:
+        return TurnEvent("notice", text=(
+            f"DSH {have} is NEWER than the newest build this adapter supports "
+            f"({high}); it was measured against {VERIFIED}. Tool calls can go "
+            f"missing from the transcript while the reply still arrives — run "
+            f"`rigma harness` for the detail."))
+    return TurnEvent("notice", text=(
+        f"DSH {have} is not the build this adapter was measured against "
+        f"({VERIFIED}). Tool calls can go missing from the transcript while "
+        f"the reply still arrives — run `rigma harness` for the detail."))
 
 
 def data_home() -> Path:
@@ -324,25 +440,119 @@ def mcp_patch_file(tmpdir, cwd=None) -> str:
     return str(path)
 
 
-def patch_file(context_window: int, max_tokens: int, tmpdir) -> Path:
-    """Write the one-row YAML patch that makes DSH talk to Rigma's server.
+def patch_file(context_window: int, max_tokens: int, tmpdir,
+               base_url: str = "", model: str = "") -> Path:
+    """Write the YAML patch that makes DSH talk to Rigma's OpenAI server.
 
-    A patch row REPLACES that row's whole config, so `apiKeyEnv` is restated:
-    dropping it would silently unset the key the child was handed. The protocol
-    is restated because the default is `messages` (Anthropic), which would POST
-    `/v1/messages` at an OpenAI-compatible server, and the stock window/token
-    defaults (1000000 / 256000) are what a 32K local server rejects outright.
+    WHY THIS NO LONGER SETS `protocol`, AND NO LONGER PATCHES `llm-deepseek`.
+
+    Measured against 0.1.6-alpha.2, `protocol: chat-completions` was the whole
+    point of this file: the DeepSeek adapter declared `protocol` as a schema
+    field (`packages/llm/llm-deepseek/src/config.ts:81` at
+    `dsh-v0.1.6-alpha.2`) and defaulted it to `messages`, so restating it was
+    what stopped DSH POSTing `/v1/messages` at an OpenAI-compatible server.
+
+    DSH 0.2.0-rc.2 REMOVED that field and now REFUSES the key outright:
+
+        if (Object.hasOwn(config, 'protocol')) {
+          throw new Error('llm-deepseek: protocol is not configurable; ...')
+        }
+
+    (`packages/llm/llm-deepseek/src/config.ts:206-208`), and the adapter's own
+    spec pins the refusal — `tests/dynamic-config.spec.ts`: "refuses a stored
+    protocol=... when the adapter mounts". The throw is reachable from a YAML
+    row: the config schema preserves unknown keys (measured — schemastery's
+    `z.object` passes `protocol` straight through), and `plainOptions` is a
+    bare `Object.fromEntries(Object.entries(config))`, not a whitelist. So a row
+    carrying `protocol` fails to MOUNT, the profile fails to BOOT, and every
+    turn dies before it reaches the model. `chat-completions` also no longer
+    exists anywhere under `packages/llm/*/src`: the 0.2.0 DeepSeek adapter is
+    Messages-only.
+
+    The OpenAI-compatible protocol moved to `@deepseek-ai/dsh-llm-pi-ai`
+    (`packages/llm/llm-pi-ai/src/provider.ts:48` — `'openai-completions'`),
+    which `sdk-minimal` does NOT mount. So this file now does two things:
+
+    * DISABLES the `llm-deepseek` row, because two rows must not claim one
+      provider route.
+    * INSERTS a hand-declared pi-ai route named `deepseek-official` — the
+      provider id the Python SDK defaults to
+      (`python/sdk/src/deepseek_harness/api.py:22`) and the id the SDK server
+      resolves at initialize (`packages/sdk/server/src/server.ts:296-298`).
+      That id is load-bearing: `initialize` refuses any provider it cannot find
+      a registered adapter for.
+
+    WHY THE ENDPOINT AND THE MODEL ID ARE PARAMETERS. `deepseek-official` is not
+    a route pi-ai ships, so its models must be listed in configuration: a route
+    the installed catalog does not describe and that lists no models is refused
+    at mount (`packages/llm/llm-pi-ai/src/catalog.ts:884-887`). The runner's
+    call site (`_dsh_runner.py:605`) passes only the window and the token
+    budget, so `drive_turn` hands the other two to the child through
+    `_BASE_URL_ENV`/`_MODEL_ENV`; the arguments win when given.
+
+    With either missing the route cannot be declared at all, so this writes a
+    BOOTABLE-BUT-DEGRADED row instead: the DeepSeek adapter's own Messages
+    transport, no `protocol` key. That reaches the wrong endpoint for an
+    OpenAI-compatible server, which is a smaller loss than a profile that cannot
+    boot — the same trade `capability_patch` makes above.
     """
+    base = str(base_url or os.environ.get(_BASE_URL_ENV) or "").strip()
+    mid = str(model or os.environ.get(_MODEL_ENV) or "").strip()
+    window, tokens = int(context_window), int(max_tokens)
     path = Path(tmpdir) / _PATCH_NAME
+    # JSON string literals are valid YAML scalars, so `json.dumps` is the safe
+    # way to embed a URL or a model id (backslashes, colons, quotes) — the same
+    # reasoning `mcp_patch_file` records for its absolute paths.
+    header = (
+        "# Generated per turn. Read `patch_file`'s docstring before changing\n"
+        "# this: `protocol` is FATAL on DSH >= 0.2.0-rc.2, and the route below\n"
+        "# exists because the DeepSeek adapter is Messages-only now.\n"
+    )
+    if not base or not mid:
+        path.write_text(
+            header
+            + "# DEGRADED: no endpoint and/or model id reached this process, so\n"
+            + "# the pi-ai route cannot be declared (a route the catalog does not\n"
+            + "# describe must list its models). This row boots but speaks\n"
+            + "# Messages, which an OpenAI-compatible server does not serve.\n"
+            + "- id: llm-deepseek\n"
+            + "  config:\n"
+            + "    apiKeyEnv: DEEPSEEK_API_KEY\n"
+            + f"    defaultContextWindow: {window}\n"
+            + f"    maxTokens: {tokens}\n",
+            encoding="utf-8",
+        )
+        return path
     path.write_text(
-        "# Generated per turn. A patch row REPLACES the whole row config, so\n"
-        "# every key this turn depends on is restated here.\n"
-        "- id: llm-deepseek\n"
-        "  config:\n"
-        "    protocol: chat-completions\n"
-        "    apiKeyEnv: DEEPSEEK_API_KEY\n"
-        f"    defaultContextWindow: {int(context_window)}\n"
-        f"    maxTokens: {int(max_tokens)}\n",
+        header
+        + "- id: llm-deepseek\n"
+        + "  disabled: true\n"
+        + "- insert:\n"
+        + "  - id: llm-pi-ai\n"
+        + "    name: '@deepseek-ai/dsh-llm-pi-ai'\n"
+        + "    config:\n"
+        + "      providers:\n"
+        + "        deepseek-official:\n"
+        + "          displayName: Rigma\n"
+        + "          apiKeyEnv: DEEPSEEK_API_KEY\n"
+        + "          api: openai-completions\n"
+        + f"          baseURL: {json.dumps(base)}\n"
+        # THE OUTPUT-CAP SPELLING IS NOT COSMETIC. pi-ai accepts two
+        # (`packages/llm/llm-pi-ai/src/catalog.ts:121-124` —
+        # `max_completion_tokens` and `max_tokens`) and defaults to
+        # `max_completion_tokens`, which a llama-server / OpenAI-compatible
+        # endpoint ignores: measured, the request carried no `max_tokens` at all
+        # and the server fell back to its own default. Naming the spelling is
+        # what makes Rigma's token budget reach the wire.
+        + "          compat:\n"
+        + "            maxTokensField: max_tokens\n"
+        + f"          defaultContextWindow: {window}\n"
+        + f"          defaultMaxTokens: {tokens}\n"
+        + "          models:\n"
+        + f"            - id: {json.dumps(mid)}\n"
+        + f"              name: {json.dumps(mid)}\n"
+        + f"              contextWindow: {window}\n"
+        + f"              maxTokens: {tokens}\n",
         encoding="utf-8",
     )
     return path
@@ -823,6 +1033,14 @@ def drive_turn(
             yield TurnEvent(kind="error", text=f"DSH CLI not found under {root}")
             return
 
+        # BEFORE the pool, and before the turn: a checkout that has moved past
+        # the pin is the one failure this adapter cannot absorb silently, and it
+        # arrives as a notice rather than an error because the turn below may
+        # still work. Once per process — see `_drift_notice`.
+        drift = _drift_notice()
+        if drift is not None:
+            yield drift
+
         # Everything that would make a pooled runtime WRONG for this turn. The
         # patch is deliberately absent: it is per-runtime now, not per-turn, and
         # the runner generates and keeps its own.
@@ -867,6 +1085,14 @@ def drive_turn(
         # adapter and its conformance checks read.
         env = harness_env(also=("DEEPSEEK_API_KEY", "RIGMA_DSH_HOME",
                                 "RIGMA_MCODE_BIN"))
+        # The endpoint and the model id the RUNNER's `patch_file` needs to
+        # declare the pi-ai route. Set here rather than inherited: this is the
+        # only frame that knows both, and the runner's call site cannot carry
+        # them as arguments (see `_BASE_URL_ENV`). Both are Rigma's own, not
+        # secrets, so they belong beside `PYTHONPATH` below rather than in the
+        # allowlist above.
+        env[_BASE_URL_ENV] = str(base_url)
+        env[_MODEL_ENV] = str(model)
         # The running rigma's own root comes first, so `-m rigma._dsh_runner`
         # imports this checkout and not an installed copy (see
         # `rigma_import_root`); then the SDK source.

@@ -1,0 +1,49 @@
+# THE COMPATIBILITY MATRIX — the one place that pins the three builds that must
+# agree for a delegated turn to work.
+#
+# WHY THIS FILE EXISTS. Until now each adapter carried its own `VERIFIED`
+# constant (`harness_dsh.py`, `harness_mcode.py`) and nothing tied them to the
+# Rigma that shipped them. That is how the DSH pin went stale silently: the
+# adapter was measured against 0.1.6-alpha.2, the checkout moved to 0.2.0-rc.2,
+# and the failure mode was a turn that died at DSH mount rather than a warning
+# anyone could read. `harness.conformance` can only compare a pin it is given;
+# this file is where the pin comes from.
+#
+# FORMAT IS DELIBERATELY FLAT `key: value` SCALARS ONLY. It is read by
+# `data/compat.py` with a ~20-line parser and NOT by PyYAML, because Rigma does
+# not declare PyYAML as a dependency and does not import it anywhere at runtime.
+# Adding a mapping, a list, or an anchor here will not parse: keep it flat, or
+# bring the parser along with the change.
+#
+# WHAT EACH FIELD MEANS.
+#   rigma    the Rigma release this matrix describes. Must equal
+#            `pyproject.toml`'s version and `rigma.__version__`; a test asserts
+#            all three agree (`tests/test_harness_compat.py`).
+#   dsh      the DeepSeek Harness build the DSH adapter was last MEASURED
+#            against. Feeds `harness_dsh.VERIFIED`, which is what
+#            `harness.conformance` diffs the installed build against.
+#   dsh_min  the first DSH whose DeepSeek adapter is Messages-only (upstream
+#            commit 99e22ebbeb, "make the official DeepSeek adapter
+#            Messages-only"). Below this the `protocol` key was still accepted
+#            and the pi-ai route this adapter now emits is UNVERIFIED. This is
+#            the known-fatal edge: at or above `dsh_min` the generated patch is
+#            the right shape, below it nobody has measured it.
+#   dsh_max  the last DSH known to work. EMPTY MEANS NO KNOWN UPPER BOUND, which
+#            is the honest value and not a missing one — the adapter's event
+#            vocabulary is additive-tolerant on purpose (see
+#            `harness.conformance`'s docstring).
+#   mcode    the MiniMax Code build the mcode adapter was measured against.
+#            Feeds `harness_mcode.VERIFIED`.
+#
+# A MISMATCH WARNS; IT DOES NOT REFUSE. `harness.py`'s conformance docstring and
+# `harness_dsh.capability_patch` both argue the same trade: Rigma absorbs an
+# additive schema change on purpose, so a backend that has moved one version
+# ahead is usually still usable, and refusing the turn would turn a cosmetic
+# skew into a dead backend. `dsh_min`/`dsh_max` sharpen the WORDING of that
+# warning (and name the fatal edge); they are deliberately not wired to a
+# refusal.
+rigma: "0.12.0"
+dsh: "0.2.0-rc.2"
+dsh_min: "0.1.7-alpha.1"
+dsh_max: ""
+mcode: "0.5.4"

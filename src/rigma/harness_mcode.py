@@ -104,15 +104,35 @@ from pathlib import Path
 
 # The mcode release this adapter was measured against. Every fact in the module
 # docstring — the provider mechanics, the exit codes, the event vocabulary, the
-# `--permission` mapping — came from running THIS build, so the number is a fact
-# about the CODE and belongs next to it, not in a config a user could edit into
-# a lie. `harness.conformance` compares it with what is installed.
+# `--permission` mapping — came from running THIS build. `harness.conformance`
+# compares it with what is installed.
+#
+# THIS PARAGRAPH USED TO ARGUE THE OPPOSITE, and the reversal is deliberate. It
+# read: "the number is a fact about the CODE and belongs next to it, not in a
+# config a user could edit into a lie." The first half is still true; the second
+# half is what turned out to be wrong. A literal per adapter is not "next to the
+# code" in any useful sense — it is one of three unrelated literals with nothing
+# tying them to each other or to the Rigma that shipped them, which is how
+# `harness_dsh.VERIFIED` sat at 0.1.6-alpha.2 for a checkout that had moved to
+# 0.2.0-rc.2. The lie this file was guarding against is a USER editing a pin; the
+# lie that actually happened was a MAINTAINER forgetting one. `data/compat.yaml`
+# ships inside the package, is not read from `~/.rigma`, and is asserted equal to
+# `pyproject.toml` and `rigma.__version__` by `tests/test_harness_compat.py`, so
+# it is no more editable-into-a-lie than this line was — and now one edit moves
+# all three backends together.
 #
 # It is defined BEFORE the `.harness` imports on purpose: `harness.py` builds its
 # BACKENDS table at import time and reads this value through `_verified_of`, so
 # when something imports THIS module first the circular import would otherwise
 # read a half-initialised module and cache "" as "nobody verified this".
-VERIFIED = "0.5.4"
+#
+# THE VALUE NOW COMES FROM `data/compat.yaml`, so Rigma <-> DSH <-> mcode are
+# pinned in ONE place rather than one file per adapter. `data.compat` imports
+# only `importlib.resources` and `pathlib`, so it stays clear of the `.harness`
+# cycle the paragraph above is about.
+from .data import compat as _compat     # noqa: E402
+
+VERIFIED = _compat.version("mcode")
 
 from .harness import TurnEvent          # noqa: E402
 from . import harness as _harness       # noqa: E402
