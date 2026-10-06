@@ -160,4 +160,25 @@ committed, because the wheel ships it and an end user's machine never runs Node.
 nothing else catches it, since pytest doesn't know the bundle exists and vitest tests the
 source. The hook refuses that commit and tells you what to run.
 
+### Running the tests
+
+```powershell
+python -m pytest                  # everything except the hardware tests
+python -m pytest -m hardware      # the opt-in live ones: a real GPU, real DSH turns
+```
+
+`pyproject.toml` puts `src` on `sys.path` (`pythonpath`) and excludes the `hardware` marker by
+default (`addopts`), so a fresh clone can run the suite **without** `pip install -e .`, and bare
+`pytest` means the same set CI runs. Two things are worth knowing:
+
+- **A subprocess does not inherit that.** `pythonpath` is a pytest setting; a test that spawns
+  `sys.executable` gets a fresh interpreter, which resolves `rigma` from site-packages if an
+  older copy is installed there. CI installs editable (`pip install -e .[dev]`), so it cannot
+  bite there; locally, `pip install -e .` is what makes those tests exercise the tree you are
+  editing. The symptom when it bites: a subprocess test fails with `ModuleNotFoundError` for a
+  module that plainly exists, or behaves like an older release.
+- **The `hardware` tests do real work** — they drive DSH turns against a fake engine and need a
+  GPU/model for others — which is why they are opt-in. `pytest tests/test_harness_dsh_live.py -m
+  hardware` runs just the DSH ones.
+
 License: Apache-2.0.
