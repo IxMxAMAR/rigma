@@ -72,7 +72,20 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 markers = ["hardware: requires real GPU/network; excluded in CI"]
-addopts = "-q"
+# `pythonpath` so a FRESH CLONE can run the suite without `pip install -e .`.
+# conftest's own guard (tests/conftest.py:70-81) cannot fire in the case it was
+# written for — collection runs before session fixtures — so its "run pip
+# install -e ." line never printed and the first run was 56 raw ImportErrors
+# against whatever rigma was in site-packages. This is the fix it was asking for.
+pythonpath = ["src"]
+# `-m 'not hardware'` because bare `pytest` is what this repo's own invariant
+# test tells you to run (tests/test_repo_invariants.py:22-25) while CI runs the
+# marker-excluded set, so the two disagreed — and on a machine with DSH
+# installed, bare `pytest` executed REAL agent turns
+# (tests/test_harness_dsh_live.py:33-42 records that accident). An explicit
+# `-m hardware` on the command line still overrides this, which is how the live
+# tests are meant to be asked for.
+addopts = "-q -m 'not hardware'"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rigma"]
