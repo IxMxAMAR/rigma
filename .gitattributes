@@ -21,3 +21,20 @@
 # interesting part — this is a prompt, and a change to it is a model-behaviour
 # change someone will want to review.
 tests/golden/** text eol=lf
+
+# The UI bundle is the same trap, one layer down.
+#
+# `src/rigma/data/ui_v2/` is a committed build artifact, and both `ci.yml` and
+# `publish.yml` rebuild it and refuse if the result differs from what is
+# committed. That guard compares BYTES, and the bundle's asset name is a hash of
+# its content — so a CRLF checkout renames the artifact. Measured: with
+# `core.autocrlf=true` (the Git for Windows default) the Windows build emitted
+# `assets/index-N2Pzpedq.js` at 621,911 bytes where ubuntu emitted
+# `assets/index-xmRK7wGy.js` at 621,869. The 42-byte gap is 21 multi-line
+# template literals in the JSX whose `\r\n` is escaped into the minified output
+# (`title:`KV cache precision...`` and friends), and `index.html` differs by 13
+# bytes, one per line of the template it is built from. Pinning the sources to LF
+# makes the build byte-reproducible, so the freshness check means the same thing
+# on every platform.
+frontend-v2/** text eol=lf
+src/rigma/data/ui_v2/** text eol=lf
