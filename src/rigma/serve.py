@@ -8190,7 +8190,17 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
     return app
 
 
-def run_ui(public_port: int, upstream_port: int) -> None:
+def run_ui(public_port: int, upstream_port: int,
+           host: str = "127.0.0.1") -> None:
+    """Serve the UI on `host`.
+
+    `host` exists for containers. Runpod's proxy cannot reach 127.0.0.1, so a
+    pod needs 0.0.0.0 (deploy/runpod/), and the platform's own pod workflow is
+    "bind 0.0.0.0 and declare the port". It stays an explicit opt-in because
+    0.0.0.0 also means every host that can route here. The ENGINE is not
+    affected: models.py pins llama-server to loopback regardless, so only the
+    UI is ever reachable from off-box.
+    """
     import uvicorn
-    uvicorn.run(build_app(upstream_port), host="127.0.0.1", port=public_port,
+    uvicorn.run(build_app(upstream_port), host=host, port=public_port,
                 log_level="warning")

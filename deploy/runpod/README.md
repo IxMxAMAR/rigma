@@ -11,8 +11,10 @@ a pod, not serverless (see `runpod/golden-paths/01-ollama-pod.md:14-31`).
 
 ## Status: what was actually verified, and what was not
 
-This draft was written on a Windows machine with **no Docker daemon, no `runpodctl`, and no
-`RUNPOD_API_KEY`**. Nothing below was executed against Runpod, and the image was never built.
+This draft was written on a Windows machine with **no Docker daemon and no `runpodctl`**.
+Nothing below was executed against Runpod, and the image was never built. A Runpod **API key
+does exist** in `~/.runpod/config.toml`, and it was used **read-only** to read the live
+catalog — that is where this template's field names now come from.
 
 Commands run, and what they returned:
 
@@ -20,13 +22,15 @@ Commands run, and what they returned:
 | --- | --- |
 | `runpodctl version` | `runpodctl` is **not installed** — *"The term 'runpodctl' is not recognized…"*. So no flag in this README comes from `runpodctl --help`; every one is cited to a skill doc line. |
 | `docker version` | `docker` is **not installed** — same shape. The image has never been built. |
-| `$env:RUNPOD_API_KEY` | **not set**. No template was created, no pod was started, no volume exists. |
+| `$env:RUNPOD_API_KEY` | **not set** in the environment — but `~/.runpod/config.toml` holds an `apikey`, and it authenticates (`GET /v2/catalog/templates` → 200). No template was created, no pod was started, no volume exists. |
 | `Test-Path ~/.runpod/config.toml` | `True` — a config file exists, but with no CLI and no key it was not exercised. |
 | GitHub release API, tag `b9867` | 200. Full asset list read. **Confirms the central finding below.** |
 | Docker Hub tag API | Confirms `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` exists (used as `FROM`). |
 | Local reads of `src/rigma/*` | Every Rigma claim below carries a `file:line` and is quoted from the source. |
 | `python -c "from rigma.runtime import _engines_manifest"` (source tree on `sys.path`) | **Executed.** Pinned version `b9867`; asset keys are exactly `linux/cpu`, `linux/vulkan`, `windows/cpu`, `windows/cuda`, `windows/rocm`, `windows/vulkan`. `'linux/cuda' in assets` → **`False`**. |
-| `python -c "from rigma.probe import classify_gpu; from rigma.resolve import _backend"` | **Executed.** Unpatched registry + an RTX 4090 on `linux` → `_backend()` = **`'cuda'`** (which has no pinned build). With `start.sh`'s overlay applied → **`'vulkan'`**, for RTX 4090 *and* for A100 / H100 / L40S (cards absent from `gpus.json`, caught by the appended row). |
+| `GET https://api.runpod.io/v2/catalog/templates` (key from `~/.runpod/config.toml`) | **Executed 2026-10-07, read-only.** 14 stock templates returned. Their own field names (`image`, `disk`, `ports`, `env`, `mounts`, `startSsh`, `startJupyter`, `allowedCudaVersions`) are now `template.json`'s, replacing several INFERRED ones; `Runpod Pytorch 2.4.0` uses **exactly** the base image this Dockerfile pins, so its `disk`/`ports`/`mounts` values are the vendor's own. Every stock template has `env {}` — **none sets `NVIDIA_DRIVER_CAPABILITIES`**. Nothing was created, started or spent. |
+| `python -c "from rigma.resolve import _backend"` (as a test) | **Executed.** An NVIDIA card on `linux` → **`'vulkan'`** since commit `634b1d4` (no pinned `linux/cuda` build exists, so the first *servable* backend wins); on `windows` it is still **`'cuda'`**. The `start.sh` overlay still pins the backend explicitly and catches cards absent from `gpus.json` (A100 / H100 / L40S). |
+| `python -m rigma up --help` (source tree on `sys.path`) | **Executed**: `--host TEXT` is listed, and `serve.run_ui`'s signature is `(public_port, upstream_port, host='127.0.0.1')`. |
 | `bash -n deploy/runpod/start.sh` | **Executed** (Git for Windows bash): exit 0, no output — the script parses. |
 | `ConvertFrom-Json deploy/runpod/template.json` | **Executed**: valid JSON. |
 
@@ -37,28 +41,45 @@ still reasoning rather than execution is the *fallback ladder* — that a failed
 
 ---
 
-## The two blockers this deployment exists to work around
+## The two Linux blockers this deployment was built around
 
 ### 1. Rigma binds loopback only. Runpod's proxy cannot reach loopback.
 
-- `src/rigma/serve.py:8195` — `uvicorn.run(build_app(upstream_port), host="127.0.0.1", port=public_port, …)`
-- `src/rigma/models.py:800` — `args = ["-m", model_path, "--port", str(port), "--host", "127.0.0.1", …]`
+> **UPDATE 2026-10-07 — fixed in Rigma, not worked around.** `rigma up` now takes `--host`,
+> threaded through `cli._serve_or_exit` into `serve.run_ui`, and this deployment passes
+> `--host 0.0.0.0`. That is the shape `pod-workflows.md:83` asks for (*"Start it bound to
+> `0.0.0.0` (not localhost, or the proxy can't reach it)"*), and it **deletes the socat
+> bridge, the second UI port, and the third port that existed only to dodge a collision**:
+> the UI binds the public port directly, the engine stays on loopback at `P-1` — a different
+> port, so nothing can collide — and the default is still `127.0.0.1` for a desktop.
 
-Both the UI and the engine are `127.0.0.1`-only, and there is no `--host` flag on `rigma up`
-to change that. `pod-workflows.md:83` is explicit: *"Start it bound to `0.0.0.0` (not
-localhost, or the proxy can't reach it)"*.
+- `src/rigma/serve.py` — `run_ui(public_port, upstream_port, host="127.0.0.1")` forwards
+  `host` to `uvicorn.run`; the default is loopback.
+- `src/rigma/models.py:800` — the engine is still pinned to `--host 127.0.0.1` deliberately:
+  only the UI is ever reachable off-box.
+- `tests/test_cli_serve_race.py` — covers the wiring: `--host` reaches `run_ui` from `up`, the
+  default is still loopback, and uvicorn receives the host.
 
-**Fix:** `socat` in `start.sh` owns `0.0.0.0:$RIGMA_PUBLIC_PORT` (11500) and forwards raw TCP
-to Rigma's UI on `127.0.0.1:$RIGMA_UI_PORT` (11502). Raw TCP, not an HTTP proxy, so Rigma's
-SSE streams (`serve.py:5931`, `:6014`, `:8179`) pass through untouched. There are no
-WebSockets in `serve.py`, so nothing needs an upgrade path.
-
-The ports must be three different numbers, because on Linux a `0.0.0.0` bind and a
-`127.0.0.1` bind on the **same** port collide with `EADDRINUSE` (unlike Windows, which
-Rigma's own `cli.py:37-91` has a comment about). `rigma up --port P` puts the UI on `P` and
-the engine on `P-1` (`cli.py:2059`), hence 11500 / 11502 / 11501.
+The historical workaround is kept here because its numbers explain the layout you may still
+find in older notes: with no `--host`, the UI was loopback-only, so `socat` owned
+`0.0.0.0:11500` and forwarded raw TCP to the UI on `127.0.0.1:11502`, with 11501 left for the
+engine — three ports, because on Linux a `0.0.0.0` bind and a `127.0.0.1` bind on the **same**
+port collide with `EADDRINUSE` (unlike Windows, which Rigma's own `cli.py:37-91` has a comment
+about).
 
 ### 2. There is no pinned Linux CUDA llama.cpp build — and the default choice ends on CPU
+
+> **UPDATE 2026-10-07 — the core fix landed, commit `634b1d4`.** `resolve._backend` now prefers
+> the first listed backend the pinned manifest can actually serve (`runtime.has_engine_asset`),
+> so on Linux an NVIDIA card selects `vulkan` rather than an unbuildable `cuda`, and the CPU
+> floor is no longer where an NVIDIA pod silently lands. Windows is unchanged (`windows/cuda`
+> is pinned, so `cuda` is still chosen first), and an explicit override is still returned
+> untouched. The registry overlay in `start.sh` is therefore **no longer required to make the
+> pod work**; it is kept on purpose for three narrower reasons — cards that are absent from
+> `gpus.json` altogether (A100 / H100 / L40S) still need a catch-all row, a controlled
+> benchmark wants the backend *pinned* rather than inferred, and `RIGMA_RUNPOD_BACKEND=cpu`
+> is the deliberate CPU-bench switch. Everything below is the analysis that found the bug,
+> kept because the fallback path and the numbers are what make the fix checkable.
 
 This is the finding that shapes the whole image, and it is verified from the primary source:
 
@@ -426,10 +447,10 @@ Ordered by how likely each is to cost you an hour.
     there. If you mirror the engine, `RIGMA_ENGINE_URL_ALLOW` adds prefixes
     (`runtime.py:200-207`).
 
-13. **Do not point this at port 11500 on a machine that already has a Rigma server.** The
-    template uses 11500 as the *proxy* port and 11502 for the UI inside the container, so
-    there is no collision with a host-side Rigma — but if you run `docker run -p 11500:11500`
-    locally you will fight the live server.
+13. **Do not point this at port 11500 on a machine that already has a Rigma server.** The pod
+    binds 11500 *inside* the container, so there is no collision with a host-side Rigma — but
+    `docker run -p 11500:11500` locally will fight the live server on the desktop (which holds
+    11500).
 
 ---
 
@@ -438,7 +459,7 @@ Ordered by how likely each is to cost you an hour.
 | File | What it is |
 | --- | --- |
 | `Dockerfile` | The image: `runpod/pytorch` CUDA base → system deps → Rigma from source → registry overlay source → `start.sh`. |
-| `start.sh` | The container's CMD. Chains `/start.sh`, patches the registry overlay, puts models on the volume, prints a pre-flight, runs `socat`, `exec`s `rigma up`. |
+| `start.sh` | The container's CMD. Chains `/start.sh`, patches the registry overlay, puts models on the volume, prints a pre-flight, `exec`s `rigma up --host 0.0.0.0`. |
 | `template.json` | The template/pod field spec, with per-field provenance and the `runpodctl`/GraphQL equivalents. |
 | `.dockerignore` | For use with `--dockerignore` when the build context is the repo root. |
 | `README.md` | This file. |

@@ -9,12 +9,12 @@
 #   3. puts $RIGMA_HOME/models on the network volume and checks it really is one
 #   4. prints a loud pre-flight (GPU, Vulkan, Rigma's own doctor) so a broken
 #      driver is visible in the pod log instead of surfacing as a 502
-#   5. bridges 0.0.0.0:$RIGMA_PUBLIC_PORT -> 127.0.0.1:$RIGMA_UI_PORT with socat
-#   6. execs `rigma up` in the foreground (the pod's long-lived process)
+#   5. execs `rigma up --host 0.0.0.0` in the foreground (the pod's long-lived
+#      process)
 #
 # ENV VARS THIS SCRIPT READS (all optional)
-#   RIGMA_PUBLIC_PORT    default 11500  the port Runpod's proxy must reach
-#   RIGMA_UI_PORT        default 11502  where rigma's UI actually listens
+#   RIGMA_UI_PORT        default 11500  the port the UI binds AND the proxy reaches
+#   RIGMA_HOST           default 0.0.0.0  the interface the UI binds
 #   RIGMA_RUNPOD_BACKEND default vulkan vulkan | cpu | off
 #   RIGMA_MODEL          default ""     a registry slug, or an HF repo id for vllm
 #   RIGMA_ENGINE         default llamacpp  llamacpp | vllm
@@ -22,12 +22,19 @@
 #   RIGMA_HOME           Rigma's own; default $HOME/.rigma
 #   RIGMA_AUTO_CALIBRATE read directly by cli.py:2891; "0" disables the sweep
 #
-# Port arithmetic, and why the UI is not on 11500:
-#   rigma up --port P  =>  UI on 127.0.0.1:P, engine on 127.0.0.1:(P-1)
-#   (cli.py:2059 `serve.run_ui(port, port - 1)`; models.py:800 `--host 127.0.0.1`)
-#   Both are loopback-only, and on Linux a 0.0.0.0 bind and a 127.0.0.1 bind on
-#   the SAME port collide (EADDRINUSE). So socat owns 0.0.0.0:11500 and forwards
-#   to the UI on 127.0.0.1:11502, leaving 11501 free for the engine.
+# Port arithmetic:
+#   rigma up --port P --host H  =>  UI on H:P, engine on 127.0.0.1:(P-1)
+#   (cli.py `_serve_or_exit` -> serve.run_ui(port, port - 1, host);
+#    models.py:800 pins llama-server to `--host 127.0.0.1` regardless)
+#
+#   ONE port, not three. Until `--host` existed the UI was loopback-only, so the
+#   only way to reach it was a raw-TCP socat bridge on a second port, with a
+#   third left free because on Linux a 0.0.0.0 bind and a 127.0.0.1 bind on the
+#   SAME port collide. `rigma up --host 0.0.0.0` removes both: the UI binds the
+#   public port directly, and the engine keeps to loopback on P-1, which is a
+#   DIFFERENT port and therefore never collides. This is also the shape Runpod's
+#   own pod workflow asks for — "bind 0.0.0.0 and declare the port"
+#   (runpod-usage/reference/pod-workflows.md).
 #
 # NOTE on env-var visibility: pod-workflows.md:86-90 warns that creation env
 # vars land in PID 1 and are ABSENT from an SSH login shell. That is why a
@@ -51,37 +58,46 @@ else
 fi
 
 # --- 1. ports ----------------------------------------------------------------
-PUBLIC_PORT="${RIGMA_PUBLIC_PORT:-11500}"
-UI_PORT="${RIGMA_UI_PORT:-11502}"
+UI_PORT="${RIGMA_UI_PORT:-11500}"
+HOST="${RIGMA_HOST:-0.0.0.0}"
 
 is_port() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
-is_port "$PUBLIC_PORT" || die "RIGMA_PUBLIC_PORT='$PUBLIC_PORT' is not a port number (1-65535)"
-is_port "$UI_PORT"     || die "RIGMA_UI_PORT='$UI_PORT' is not a port number (1-65535)"
+is_port "$UI_PORT" || die "RIGMA_UI_PORT='$UI_PORT' is not a port number (1-65535)"
 
 ENGINE_PORT=$((UI_PORT - 1))
 [ "$ENGINE_PORT" -ge 1 ] || die "RIGMA_UI_PORT=$UI_PORT leaves no room for the engine port (UI-1)"
 
-[ "$PUBLIC_PORT" -ne "$UI_PORT" ]     || die "RIGMA_PUBLIC_PORT and RIGMA_UI_PORT are both $UI_PORT; socat cannot forward a port to itself"
-[ "$PUBLIC_PORT" -ne "$ENGINE_PORT" ] || die "RIGMA_PUBLIC_PORT=$PUBLIC_PORT collides with the engine port $ENGINE_PORT (UI_PORT-1)"
-
-log "ports: proxy 0.0.0.0:$PUBLIC_PORT -> UI 127.0.0.1:$UI_PORT, engine 127.0.0.1:$ENGINE_PORT"
+log "ports: UI $HOST:$UI_PORT, engine 127.0.0.1:$ENGINE_PORT"
+if [ "$HOST" = "0.0.0.0" ]; then
+  log "the UI is bound to EVERY interface so Runpod's proxy can reach it. The"
+  log "  proxy URL (https://<pod-id>-$UI_PORT.proxy.runpod.net) is public to"
+  log "  anyone who knows the pod id, and Rigma's UI has no login of its own."
+else
+  log "WARNING: RIGMA_HOST=$HOST is not 0.0.0.0, so Runpod's proxy cannot reach"
+  log "         the UI and the port will 502. This is only useful for debugging"
+  log "         from inside the pod."
+fi
 
 # --- 2. registry overlay: make the pinned Linux engine reachable -------------
-# The packaged gpus.json says NVIDIA's backends_linux is ["cuda","vulkan"] and
-# resolve.py:1046 takes [0]. There is no pinned linux/cuda asset (upstream
-# publishes no Linux CUDA build for b9867 at all), so that path cannot download
-# an engine and cli.py's fallback ladder walks down to the CPU floor. This
-# rewrites the NVIDIA rows to the backend that DOES have a pinned build, and
-# appends a catch-all row so datacenter cards absent from the table (A100, H100,
-# L40S, RTX A4000/A5000 ...) are classified too — probe.py:48 would otherwise
-# hand them ["cuda","vulkan"] and hit the same dead end.
+# Since commit 634b1d4 `resolve._backend` prefers the first listed backend the
+# pinned manifest can actually serve, so an NVIDIA card on Linux picks vulkan by
+# itself and this overlay is no longer required to make the pod work. It is kept
+# deliberately, for three narrower reasons:
+#   * probe.py:48 hands cards ABSENT from gpus.json (A100, H100, L40S, RTX
+#     A4000/A5000 ...) the generic ["cuda","vulkan"] list; the appended catch-all
+#     row classifies them explicitly instead.
+#   * a benchmark wants the backend PINNED, not inferred, so the run's
+#     calibration key (model:quant:backend) is what the operator chose.
+#   * RIGMA_RUNPOD_BACKEND=cpu is the deliberate CPU-only bench, and =off
+#     reproduces the unshimmed behaviour.
 RIGMA_RUNPOD_BACKEND="${RIGMA_RUNPOD_BACKEND:-vulkan}"
 case "$RIGMA_RUNPOD_BACKEND" in
   off)
     log "RIGMA_RUNPOD_BACKEND=off — packaged registry left alone."
-    log "  Expect 'no pinned engine build for linux/cuda' and a CPU fallback on"
-    log "  an NVIDIA pod. Use this only to reproduce the unshimmed behaviour."
+    log "  Expect the backend chosen by resolve._backend itself (vulkan on an"
+    log "  NVIDIA Linux card, since there is no pinned linux/cuda build). Use"
+    log "  this only to reproduce the unshimmed behaviour."
     ;;
   vulkan|cpu)
     python3 - "$RIGMA_RUNPOD_BACKEND" <<'PY'
@@ -178,9 +194,11 @@ if [ "$RIGMA_RUNPOD_BACKEND" = "vulkan" ]; then
   else
     log "vulkan ICDs: NONE (no /usr/share/vulkan/icd.d, or it is empty)."
     log "  The NVIDIA ICD ships with the host driver and is only mounted when the"
-    log "  container has the 'graphics' driver capability — see the README's"
-    log "  NVIDIA_DRIVER_CAPABILITIES note. Without it the Vulkan engine will"
-    log "  load and then find no device."
+    log "  container has the 'graphics' driver capability. NO stock Runpod"
+    log "  template sets NVIDIA_DRIVER_CAPABILITIES (checked against the live"
+    log "  catalog: every GPU template has env {}), so this is not something the"
+    log "  platform does for you — see the README's note. Without it the Vulkan"
+    log "  engine will load and then find no device."
   fi
 
   log "asking Rigma's own probe what it sees:"
@@ -220,20 +238,9 @@ log "rigma doctor (read-only: it never downloads, never binds a port):"
 python3 -m rigma doctor 2>&1 | sed 's/^/[rigma-runpod]   /' \
   || log "  (doctor exited non-zero — at least one hard failure, see rows above)"
 
-# --- 5. the 0.0.0.0 bridge ---------------------------------------------------
-# socat, not a Python proxy: it is a raw TCP tunnel, so it is protocol-agnostic
-# and Rigma's SSE streams (serve.py:5931, 6014, 8179 — there are no WebSockets)
-# pass through unmodified, including chunked transfer.
-log "starting socat: 0.0.0.0:$PUBLIC_PORT -> 127.0.0.1:$UI_PORT"
-socat TCP-LISTEN:"$PUBLIC_PORT",fork,reuseaddr TCP:127.0.0.1:"$UI_PORT" &
-SOCAT_PID=$!
-sleep 1
-kill -0 "$SOCAT_PID" 2>/dev/null \
-  || die "socat died immediately — is port $PUBLIC_PORT already bound?"
-
-# --- 6. rigma ----------------------------------------------------------------
+# --- 5. rigma ------------------------------------------------------------------
 ENGINE="${RIGMA_ENGINE:-llamacpp}"
-ARGS=(--no-browser --port "$UI_PORT")
+ARGS=(--no-browser --host "$HOST" --port "$UI_PORT")
 
 case "$ENGINE" in
   llamacpp)
@@ -264,7 +271,8 @@ case "$ENGINE" in
 esac
 
 log "exec: python3 -m rigma up ${ARGS[*]}"
-log "UI will be at http://127.0.0.1:$UI_PORT (and, via the proxy, on port $PUBLIC_PORT)"
+log "the UI is served on http://$HOST:$UI_PORT — through the proxy that is"
+log "  https://<pod-id>-$UI_PORT.proxy.runpod.net"
 log "Rigma's own startup can take minutes on a cold volume: engine download"
 log "  (~30 MiB), model download (GB), then a first-load hardware auto-tune."
 

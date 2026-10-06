@@ -159,7 +159,8 @@ def _up_world(tmp_path, monkeypatch, fingerprint):
         return SimpleNamespace(proc=SimpleNamespace(pid=4242))
     monkeypatch.setattr("rigma.runtime.launch_server", fake_launch)
     monkeypatch.setattr("rigma.serve.run_ui",
-                        lambda port, eport: seen.update(state=st.read_state()))
+                        lambda port, eport, host="127.0.0.1":
+                        seen.update(state=st.read_state()))
     # Pure function of the plan; pin it so the test can plant the blob whose
     # name the launch will ask for.
     monkeypatch.setattr("rigma.kvcache.launch_fingerprint",
