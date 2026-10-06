@@ -1,0 +1,24 @@
+# For use with `docker buildx build --dockerignore deploy/runpod/.dockerignore .`
+# when the build context is the repo root. Docker only reads a .dockerignore from
+# the context root by default, and this draft is not allowed to write one there.
+#
+# Without this (or the flag), the context includes .git/ and the .wt-r3-*
+# worktrees, which is slow and pointless — the Dockerfile copies only
+# pyproject.toml, README.md, LICENSE, src/ and deploy/runpod/.
+.git
+.github
+.githooks
+.pytest_cache
+.ruff_cache
+.scratch
+.wt-r3-*
+docs
+frontend-v2
+tests
+tools
+_research
+**/__pycache__
+**/*.pyc
+**/.venv
+**/node_modules
+deploy/runpod/README.md

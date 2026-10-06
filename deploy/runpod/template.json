@@ -1,0 +1,67 @@
+{
+  "_what": "Rigma on a Runpod GPU pod — template/pod definition. This is a field-by-field SPEC, not a file I could POST: no Runpod API key and no runpodctl were available in the environment this was drafted in (see _provenance). The README gives the exact commands; this file is the canonical list of values those commands must carry, plus which of them are documented and which are inferred.",
+  "_provenance": {
+    "field_names_and_shapes": "Runpod REST v2 pod/template field names and their GraphQL equivalents are taken from the runpod-migrate skill, reference/graphql-to-v2.md:60-76 (imageName->image, containerDiskInGb->disk, volumeInGb+volumeMountPath->mounts.persistent, networkVolumeId->mounts.network[0], dockerArgs->args, ports comma-string -> array, env pair-list -> map).",
+    "flags_verified_in_docs": "runpodctl pod create: --name, --image, --template-id, --gpu-id, --compute-type, --ports, --env (JSON object), --container-disk-in-gb, --network-volume-id, --volume-mount-path, --data-center-ids, --terminate-after, --stop-after. Seen in runpod/golden-paths/01-ollama-pod.md:84-92, 22-minimal-pod-image/README.md:59-61, 25-bake-vs-mount/README.md:63-69, 06-dev-pod.md:59-62, 07-network-volume-handoff.md:51-54.",
+    "template_create_form": "runpodctl/SKILL.md:259 documents `runpodctl template create --name \"x\" --image \"img\" [--serverless]`, i.e. --serverless is OPTIONAL, so a pod template is the same command without it. Every other template-create example in the skill set passes --serverless (serverless templates), so the pod-template-only flags (--ports/--env/--container-disk-in-gb on a pod template) are INFERRED, not read from --help.",
+    "container_start_command": "Lives in the image's CMD (deploy/runpod/Dockerfile), NOT in the template. dockerArgs/args is left empty. Whether the template resource exposes a separate start-command field was NOT verified.",
+    "env_names": "RIGMA_PUBLIC_PORT, RIGMA_UI_PORT, RIGMA_RUNPOD_BACKEND, RIGMA_MODEL, RIGMA_ENGINE, RIGMA_MODELS_DIR are this deployment's own variables, read by deploy/runpod/start.sh. RIGMA_HOME, RIGMA_REGISTRY_DIR, RIGMA_AUTO_CALIBRATE, HF_HUB_DISABLE_XET are read by Rigma itself (src/rigma/runtime.py:34, registry.py:106, cli.py:2891, runtime.py:376). NVIDIA_DRIVER_CAPABILITIES is an NVIDIA container-toolkit variable, NOT a Runpod flag; it does not appear anywhere in the Runpod skill docs and was NOT verified on a live pod."
+  },
+
+  "name": "rigma-runpod",
+  "image": "<your-registry-namespace>/rigma-runpod:v1",
+  "disk": 20,
+  "ports": ["11500/http", "22/tcp"],
+  "env": {
+    "RIGMA_PUBLIC_PORT": "11500",
+    "RIGMA_UI_PORT": "11502",
+    "RIGMA_RUNPOD_BACKEND": "vulkan",
+    "RIGMA_MODELS_DIR": "/workspace/rigma/models",
+    "RIGMA_HOME": "/root/.rigma",
+    "RIGMA_AUTO_CALIBRATE": "1",
+    "HF_HUB_DISABLE_XET": "1",
+    "RIGMA_MODEL": "",
+    "RIGMA_ENGINE": "llamacpp",
+    "NVIDIA_DRIVER_CAPABILITIES": "all"
+  },
+  "mounts": {
+    "network": [
+      {
+        "volumeId": "<network-volume-id>",
+        "path": "/workspace"
+      }
+    ]
+  },
+  "args": "",
+
+  "_field_notes": {
+    "disk": "20 GB of container disk. The runpod/pytorch base plus Rigma plus the pinned Vulkan engine (~30 MiB) is the bulk; the rest is headroom for Rigma's sessions/logs/rigma.db and for a model that is downloaded while the volume is still cold. Container disk is WIPED on pod stop, so nothing here is meant to persist.",
+    "ports": "11500/http is the port Runpod's proxy exposes (https://<pod-id>-11500.proxy.runpod.net); start.sh's socat listens on it and forwards to Rigma's loopback UI on 11502. 22/tcp is the SSH control channel. Ports are set at creation and cannot be added to a running pod without a reset (pod-workflows.md:19).",
+    "RIGMA_PUBLIC_PORT / RIGMA_UI_PORT": "Two different ports on purpose. Rigma binds the UI to 127.0.0.1 (serve.py:8195) and the engine to 127.0.0.1:UI-1 (models.py:800). On Linux a 0.0.0.0 bind and a 127.0.0.1 bind on the same port collide, so the public port must differ from both the UI port and the engine port.",
+    "RIGMA_RUNPOD_BACKEND": "vulkan (default) | cpu | off. Rigma's packaged gpus.json lists NVIDIA's backends_linux as [\"cuda\",\"vulkan\"] and resolve.py:1046 takes [0]; the pinned manifest has no linux/cuda asset, so 'off' means an NVIDIA pod falls back to CPU. 'cpu' is the deliberate CPU-only bench. See the README's GPU backend matrix.",
+    "RIGMA_AUTO_CALIBRATE": "Rigma's own variable (cli.py:2890-2891). \"1\" runs the one-time hardware sweep on first load of a model (minutes, and it relaunches the engine several times on port UI-1). \"0\" skips it. For a test bench the sweep is usually the point; set it to 0 for a fast, reproducible start.",
+    "HF_HUB_DISABLE_XET": "runtime.py:376 sets this with setdefault() anyway; setting it explicitly is documentation, and it keeps the model download on HF's plain CDN path.",
+    "NVIDIA_DRIVER_CAPABILITIES": "Needed for the default Vulkan lane: the NVIDIA Vulkan ICD (/usr/share/vulkan/icd.d/nvidia_icd.json) and libGLX_nvidia are only mounted into the container when the 'graphics' capability is enabled. Runpod's default is compute+utility, which is enough for nvidia-smi and CUDA but NOT for Vulkan. UNVERIFIED — see _provenance.env_names.",
+    "args": "Empty. The container start command is the image's CMD ([\"/opt/rigma-runpod/start.sh\"]), which itself chains the base image's /start.sh before exec'ing rigma."
+  },
+
+  "_equivalents": {
+    "graphql": {
+      "imageName": "<your-registry-namespace>/rigma-runpod:v1",
+      "containerDiskInGb": 20,
+      "ports": "11500/http,22/tcp",
+      "env": [
+        { "key": "RIGMA_PUBLIC_PORT", "value": "11500" },
+        { "key": "RIGMA_UI_PORT", "value": "11502" },
+        { "key": "RIGMA_RUNPOD_BACKEND", "value": "vulkan" },
+        { "key": "RIGMA_MODELS_DIR", "value": "/workspace/rigma/models" },
+        { "key": "NVIDIA_DRIVER_CAPABILITIES", "value": "all" }
+      ],
+      "volumeInGb": 0,
+      "volumeMountPath": "/workspace",
+      "dockerArgs": ""
+    },
+    "runpodctl_pod_create": "runpodctl pod create --name rigma --image <ns>/rigma-runpod:v1 --gpu-id \"NVIDIA GeForce RTX 4090\" --ports \"11500/http,22/tcp\" --env '{\"RIGMA_RUNPOD_BACKEND\":\"vulkan\",\"NVIDIA_DRIVER_CAPABILITIES\":\"all\"}' --container-disk-in-gb 20 --network-volume-id <vol-id> --volume-mount-path /workspace --data-center-ids <dc> --terminate-after <iso8601>",
+    "runpodctl_template_create": "runpodctl template create --name rigma-runpod --image <ns>/rigma-runpod:v1   # then add the same --ports/--env/--container-disk-in-gb as above; the pod-template spelling of those flags is INFERRED (see _provenance.template_create_form)"
+  }
+}
