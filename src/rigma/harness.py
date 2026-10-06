@@ -667,6 +667,11 @@ def kill_tree(proc) -> KillResult:
     reported as "could not be confirmed dead" on every Linux/macOS timeout, while
     on Windows a taskkill exit code of 0 was reported as a tree kill it never
     verified. Both are corrected here.
+
+    A caller that reports "was killed" without asking is reporting something it
+    did not do: `proc.kill()` on the fallback path still takes the direct child,
+    so the turn ends normally while a grandchild keeps running against the model
+    server and holding VRAM.
     """
     attempted = False
     confirmed = False

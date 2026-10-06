@@ -654,11 +654,20 @@ def test_a_failed_tree_kill_is_reported_not_assumed(monkeypatch):
     turn either way, so the message used to say the agent was killed while it was
     in fact still running against the model server, holding VRAM. The user's only
     signal is that message.
+
+    R3-09-3's own shape of the same scenario is folded in here. Its version
+    patched `subprocess.run` to refuse the `taskkill` that ITS `kill_tree`
+    spawned itself; HEAD delegates the kill to the ONE tree-kill in the codebase
+    (`tools._kill_tree`, AUDIT F35 — `test_the_tree_kill_is_delegated_exactly_once`
+    pins that), so the refusal is injected at that seam instead. What r3 actually
+    claims about the result — that a refused kill comes back FALSY rather than
+    "done" — is asserted on the `KillResult`, which is bool-compatible.
     """
     monkeypatch.setattr(tools, "_kill_tree", lambda *a, **k: False)
     result = harness_dsh._harness.kill_tree(_tree_proc())
     assert result.ok is False
     assert result.attempted is True
+    assert not result        # r3: a kill that did not land is falsy, not "done"
 
     # and the turn that timed out says so, rather than claiming a kill
     run = harness_dsh._Run(proc=_tree_proc(), hard=True)
@@ -675,6 +684,7 @@ def test_a_tree_kill_that_worked_says_nothing_extra(monkeypatch):
     result = harness_dsh._harness.kill_tree(_tree_proc())
     assert result.ok is True
     assert result.confirmed is True
+    assert result             # r3: a kill that landed is truthy
 
     run = harness_dsh._Run(proc=_tree_proc(), hard=True)
     events = list(harness_dsh._read_events(run, 0.0))
