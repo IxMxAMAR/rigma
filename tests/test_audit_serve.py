@@ -51,6 +51,31 @@ def test_a_non_loopback_address_is_still_refused():
         assert serve._is_local_host(h) is False, h
 
 
+def test_a_proxy_that_rewrites_host_to_our_own_address_is_admitted():
+    # Runpod's edge sends the container's own address as Host - observed on a
+    # real pod as `Host: 100.65.29.116:11500`, its internal CGNAT address - so
+    # `rigma up --host 0.0.0.0`, the documented deployment, was unreachable
+    # through the proxy: every request was refused as a rebinding attempt.
+    assert serve.guard_request("100.65.29.116:11500", "",
+                               server="100.65.29.116") == ""
+    assert serve.guard_request("100.65.29.116", "",
+                               server="100.65.29.116") == ""
+    # Only that address. The same Host against a different local address is
+    # still the rebinding case, an attacker's name never matches, and a caller
+    # that passes no server at all (every other test here) keeps the old answer.
+    assert serve.guard_request("100.65.29.116:11500", "",
+                               server="127.0.0.1") != ""
+    assert serve.guard_request("evil.example:11500", "",
+                               server="100.65.29.116") != ""
+    assert serve.guard_request("10.0.0.1", "") != ""
+    # The one that matters most: a NAME that matches scope["server"] exactly.
+    # An ASGI test client derives server from the request URL, so without the
+    # literal-only rule this is "Host == Host" and the guard is off - which is
+    # how this fix first broke test_a_rebound_dns_name_is_refused_even_on_a_get.
+    assert serve.guard_request("rigma.evil.example:11500", "",
+                               server="rigma.evil.example") != ""
+
+
 # --------------------------------------------------------------------------
 # a scriptable llama-server
 
