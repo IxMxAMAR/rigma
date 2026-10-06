@@ -144,7 +144,11 @@ def test_ask_gemini_empty_question():
 
 def test_ask_gemini_no_key(monkeypatch):
     monkeypatch.setattr(tools, "_gemini_key", lambda: None)
-    out = tools.run_tool("ask_gemini", {"question": "hi"})
+    # The outbound grant is checked FIRST (`_ask_gemini`), so reaching the key
+    # answer at all now requires it — otherwise this test would be asserting the
+    # gate's message under a name that claims to test the key's.
+    out = tools.run_tool("ask_gemini", {"question": "hi"},
+                         {"allow_outbound_post": True})
     assert "no Gemini API key" in out
 
 

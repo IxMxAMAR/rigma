@@ -643,6 +643,14 @@ _ARG_ALIASES = {
     "new": ("new_text", "new_string", "replacement", "content", "text"),
     "old": ("old_text", "old_string", "original", "search_text", "find"),
     "query": ("q", "search", "term", "prompt"),
+    # `move_files`/`copy_files`/`view_images` declare `paths` — a LIST — and the
+    # first two fall back to "the last sample_files result" when no path arrived.
+    # So a model that named ONE file as `path` (the spelling every other tool
+    # uses) had the key ignored and then had the ENTIRE last sample moved, and the
+    # result read "moved N file(s)". Declared here, against the tool's own schema,
+    # for exactly the reason this table exists. Both consumers wrap a bare string
+    # (`_transfer_sources`, `_view_images`), so the scalar form is safe.
+    "paths": ("path", "file", "files", "source", "sources"),
 }
 
 
@@ -1153,6 +1161,17 @@ def _ask_gemini(args, ctx):
     q = str(args.get("question", "")).strip()
     if not q:
         return "error: empty question"
+    # The GRANT decides whether this chat may send, and it is checked before the
+    # key: a free-text `question` is an outbound POST with extra steps (anything
+    # the model just read fits inside it), and this tool is `safe=True`, so it ran
+    # with no confirmation at all. `http_request` has required
+    # `allow_outbound_post` since the query-string bypass was closed — this was
+    # the same capability with the check missing.
+    if not ctx.get("allow_outbound_post"):
+        return ("error: sending a question to Google is disabled for this chat — "
+                "it leaves the machine, which is how a file read in this session "
+                "would leave it too. Enable 'allow outbound POST' on the session "
+                "to restore it")
     key = _gemini_key()
     if not key:
         return ("error: no Gemini API key configured — set the GEMINI_API_KEY "
@@ -2060,6 +2079,17 @@ def _write_allowlist_contains(ctx: dict, path: Path) -> bool:
     not `is_relative_to` the unprefixed root, so the caller tests containment
     before `_long_path` adds the prefix (same ordering as `_ws_path`).
     """
+    # `confined` must not reach ANY absolute destination, and this is one of the
+    # two routes to one. `_absolute_writes_allowed` already answers False for the
+    # profile, but `_write_path` ORs this function in BESIDE it, so without the
+    # same test here the profile was decided by the SPELLING the model chose: the
+    # absolute form was refused while `..\other\x` was allowed into a seeded root.
+    # The note above `_write_path` ("`confined` still refuses every absolute
+    # destination outright, through EITHER route") and the launcher's "absolute
+    # paths are refused so the run stays inside its workspace" both call that a
+    # bug rather than a policy.
+    if ctx.get("profile") == "confined":
+        return False
     entries = ctx.get("write_allowlist")
     if not isinstance(entries, (list, tuple, set)):
         return False           # a bare string is not a list of roots
@@ -4013,7 +4043,14 @@ def _transfer_sources(args, ctx, move: bool = False) -> tuple[list, list, list]:
     paths = args.get("paths") or []
     if isinstance(paths, str):
         paths = [paths]
-    if not paths and ctx.get("run_id"):
+    # The sample fallback means "move what you just sampled" and belongs ONLY to a
+    # call that named no file at all. A named-but-unmapped key (`path`, `file`)
+    # used to land here too, so one named file became every file of the previous
+    # sample, reported as "moved N file(s)" — library damage from a model that did
+    # nothing wrong. Report no files found instead.
+    named = [k for k in ("path", "file", "files", "source", "sources")
+             if args.get(k)]
+    if not paths and not named and ctx.get("run_id"):
         from . import runs
         sample = runs.get_last_sample(ctx["run_id"]) or []
         if sample:
