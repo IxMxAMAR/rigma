@@ -45,6 +45,30 @@ jobs:
       - run: pip install -e .[dev]
       - run: ruff check src tests
       - run: pytest -m "not hardware"
+      # AUDIT 14-1: `release: published` fires WITHOUT waiting for the `ci`
+      # workflow, and GitHub's `needs:` cannot cross workflows — so the only
+      # freshness check for `src/rigma/data/ui_v2/` lived in a workflow this one
+      # never runs, and `tests/test_repo_invariants.py` only greps ci.yml for
+      # the string. A Release cut from a commit whose `frontend-v2/src` change
+      # was never rebuilt would ship the OLD interface to PyPI, which is the
+      # near-miss recorded at `.githooks/pre-commit:8-9`. Rebuild here and
+      # refuse a stale bundle: this is the last gate before bytes are uploaded.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend-v2/package-lock.json
+      - run: npm ci
+        working-directory: frontend-v2
+      - run: npm run build
+        working-directory: frontend-v2
+      - name: the committed bundle must match the source
+        run: |
+          if [ -n "$(git status --porcelain -- src/rigma/data/ui_v2)" ]; then
+            echo "::error::src/rigma/data/ui_v2 is stale - run 'npm run build' in frontend-v2/ and commit the result"
+            git status --porcelain -- src/rigma/data/ui_v2
+            exit 1
+          fi
 
   build:
     name: Build sdist + wheel
