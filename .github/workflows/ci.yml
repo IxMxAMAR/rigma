@@ -3,6 +3,13 @@ on: [push, pull_request]
 jobs:
   test:
     strategy:
+      # A sibling must not be able to hide this matrix's result. The windows job
+      # has now ended mid-suite with exit 1, no `FAILED` line and no traceback
+      # (once ~11 ms into tests/test_audit_ops.py, once cancelled after 418
+      # tests), and with the default fail-fast the ubuntu result that a release
+      # depends on went unreported both times — once in each direction. Letting
+      # all six finish costs minutes on a public repo and buys a real signal.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
         py: ["3.11", "3.12", "3.13"]

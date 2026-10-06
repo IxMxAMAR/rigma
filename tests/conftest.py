@@ -1,6 +1,7 @@
 """Shared fixtures."""
 import json
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -310,3 +311,37 @@ def _one_full_suite_at_a_time(request):
     finally:
         if path is not None:
             _release_suite_lock(path)
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+@pytest.fixture
+def help_text():
+    r"""`CliRunner` output with ANSI escapes removed.
+
+    Asserting that a flag is discoverable means asserting on help text, and on a
+    CI runner that text is painted. typer's `rich_utils` forces a terminal when
+    `GITHUB_ACTIONS` is set - `FORCE_TERMINAL = True if
+    getenv("GITHUB_ACTIONS") or getenv("FORCE_COLOR") or getenv("PY_COLORS")
+    else None`, identical in 0.16.0 and 0.27.3 - and typer's own
+    `OptionHighlighter` then produces TWO OVERLAPPING spans for every `--flag`:
+    `highlighter("--refuse").spans` is `[Span(1, 8, "switch"),
+    Span(0, 8, "option")]`. rich renders that as
+    `\x1b[1m-\x1b[0m\x1b[1m-refuse\x1b[0m`, so an escape lands BETWEEN the two
+    hyphens and the literal substring `--refuse` never appears in the captured
+    bytes.
+
+    The option IS documented and a terminal shows it correctly - the escapes are
+    zero-width - so the test has to read what a user sees. Measured, so nobody
+    reaches for a version floor: the same assertion fails under
+    `GITHUB_ACTIONS=true` with typer 0.16.0 and 0.27.3, click 8.4.2 and 8.5.0,
+    and rich 13.9.4 and 15.0.0 alike, under every color system, and passes with
+    `GITHUB_ACTIONS` unset. (`FORCE_COLOR=0` does not help: typer treats any
+    non-empty value as truthy.)
+    """
+
+    def _plain(result) -> str:
+        return _ANSI_RE.sub("", result.output)
+
+    return _plain

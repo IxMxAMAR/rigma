@@ -29,12 +29,12 @@ def home(tmp_path, monkeypatch):
 
 # --- the flag exists and validates -----------------------------------------
 
-def test_engine_is_a_documented_option_on_up():
+def test_engine_is_a_documented_option_on_up(help_text):
     """Discoverability is the fix. If `--engine` is not in `up --help`, a user
     cannot find the only way to select an engine runtime."""
     res = runner.invoke(cli.app, ["up", "--help"])
     assert res.exit_code == 0
-    assert "--engine" in res.output
+    assert "--engine" in help_text(res)
 
 
 def test_an_unknown_engine_name_is_refused_by_name(home):
