@@ -30,7 +30,7 @@ from rigma.resolve import (_budgets, _calculate, _cache_candidates,
                            fit_for_launch, fit_gguf, kv_bytes_per_token,
                            quant_verdicts, step_down_notice)
 
-SLUG = "ternary-bonsai-2-27b-uncensored-heretic-pq2-0"
+SLUG = "example-model-q4-k-m"
 FILE_BYTES = 7206168928
 
 

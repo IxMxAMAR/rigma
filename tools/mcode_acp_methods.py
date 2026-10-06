@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 
-MCODE = r"C:\Users\amren\AppData\Roaming\npm\mcode.cmd"
+MCODE = os.path.expandvars(r"%APPDATA%\npm\mcode.cmd")
 
 
 def probe() -> dict:

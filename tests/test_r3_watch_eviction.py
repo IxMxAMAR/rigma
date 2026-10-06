@@ -7,6 +7,8 @@ budget is spent on garbage, after which `_remember` refuses every NEW file and
 the watcher silently stops watching — and the key count is unbounded, since a
 0-byte file costs nothing against the budget.
 """
+from pathlib import Path
+
 from rigma import watch
 
 
@@ -32,7 +34,12 @@ def test_a_deleted_file_is_forgotten(tmp_path):
     w.poll_once()
 
     assert w.remembered_files == 2
-    assert sorted(k.rsplit("\\", 1)[-1] for k in w._known) == ["f3.txt", "f4.txt"]
+    # `Path(k).name`, not `k.rsplit("\\", 1)[-1]`: the keys are full paths in the
+    # running platform's spelling (`poll_once` uses `str(p)` from `os.walk`), and
+    # a backslash is not a separator on POSIX — there the split returned the WHOLE
+    # path, so the assertion compared absolute paths against basenames and failed
+    # on Linux while the eviction it pins was correct.
+    assert sorted(Path(k).name for k in w._known) == ["f3.txt", "f4.txt"]
     assert w.remembered_bytes == 20
     assert len(w._stats) == 2
 

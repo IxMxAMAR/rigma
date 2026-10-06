@@ -8,7 +8,7 @@ earlier conclusions corrected.
 
 ## What was asked
 
-Install `C:\Users\amren\Downloads\Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf` and
+Install `%USERPROFILE%\Downloads\Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf` and
 test it, on PrismML's fork of llama.cpp, using Vulkan.
 
 That file is **not** the same model as the already-installed `Ternary-Bonsai-2-27B-PQ2_0`
@@ -176,7 +176,7 @@ direct `runtime.ensure_engine` call at all, since this failure was purely one of
 **Verified end to end after the fix** — the launch that had failed:
 
 ```
-C:\Users\amren\.rigma\engines\prism-b10743\vulkan\llama-server.exe
+C:\Users\dev\.rigma\engines\prism-b10743\vulkan\llama-server.exe
   -m …\Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf
   --port 11499 -ngl 99 -c 65536 --parallel 2 --kv-unified -fa on
   --cache-type-k q8_0 --cache-type-v q8_0 …

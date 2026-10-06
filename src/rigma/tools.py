@@ -247,8 +247,14 @@ def tool_specs(allow_code: bool = False, has_rag: bool = False,
             and profile not in ("no-network", "confined"):
         try:
             from . import mcp_client
-            if mcp_client.load_config():        # no config -> zero overhead
-                for spec in mcp_client.manager().tool_specs():
+            mgr = mcp_client.manager()
+            # `or mgr.running()`: with an EMPTY config the guard alone skipped
+            # `_ensure()` entirely, so the LAST server deleted from mcp.json
+            # stayed alive until Rigma restarted — the one removal the
+            # whole-config restart could not see, because there was no longer a
+            # config to notice. Reconcile whenever anything is still up.
+            if mcp_client.load_config() or mgr.running():  # no config -> no cost
+                for spec in mgr.tool_specs():
                     spec["function"]["parameters"] = sanitize_schema(
                         spec["function"]["parameters"])
                     out.append(spec)
@@ -2218,10 +2224,10 @@ def _ws_path(ctx, rel: str, *, grant: str = "") -> Path:
     A RELATIVE path that climbs out with `..` is refused UNLESS `grant` names a
     capability this session holds. MEASURED 2026-10-05 on live chat 493d17779613:
     this branch ignored the grants entirely, so with 'allow reads outside the
-    workspace' ON, `read_file` on `C:\\BGMI\\Code.txt` succeeded while
-    `read_file` on `..\\..\\BGMI\\Code.txt` failed — and `write_file` on the
+    workspace' ON, `read_file` on `C:\\elsewhere\\Code.txt` succeeded while
+    `read_file` on `..\\..\\elsewhere\\Code.txt` failed — and `write_file` on the
     absolute path was refused with "pass a path RELATIVE to the workspace", the
-    model obeyed with `..\\..\\BGMI\\ESP\\offsets.h`, and hit a SECOND refusal
+    model obeyed with `..\\..\\elsewhere\\out\\offsets.h`, and hit a SECOND refusal
     ("path is outside the workspace — stay within it") that named no way
     forward. One capability now answers for both spellings, and the refusal says
     which control turns it on.
@@ -4016,7 +4022,7 @@ def _move_source_parent_gate(ctx, p: Path) -> None:
     `_read_path` gates the source itself as a READ, so an absolute source only
     ever needed `allow_absolute_reads`. Removing it is the other capability, and
     it used to ride on that read grant alone:
-    `move_files{"paths":["C:\\\\Users\\\\amren\\\\Documents\\\\thesis.docx"],
+    `move_files{"paths":["C:\\\\Users\\\\dev\\\\Documents\\\\report.docx"],
     "dest":"x"}` deleted the original out of Documents on a session that had
     granted reading outside the workspace and nothing else.
 
@@ -4254,7 +4260,7 @@ def _resolve_image(ps: str, ctx: dict) -> tuple:
                       "workspace' on the session, or pass a path relative to "
                       "the workspace"), ""
     # ODR-6: resolve BEFORE the denylist below. It was applied to the UNRESOLVED
-    # path, so `C:\Users\amren\x\..\.rigma\<f>.png` spelled no denied directory
+    # path, so `C:\Users\dev\x\..\.rigma\<f>.png` spelled no denied directory
     # while the OS opened the one inside it, and `Google\x\..\Chrome\` walked
     # past the browser-profile regex; an 8.3 short name or a junction hides the
     # real target the same way. `_read_path` resolves first for exactly this

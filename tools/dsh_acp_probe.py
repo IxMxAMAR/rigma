@@ -35,7 +35,7 @@ WORKSPACE = r"C:\ComfyUI\RD\rigma-review\.scratch\acp-ws"
 def main() -> int:
     os.makedirs(WORKSPACE, exist_ok=True)
     env = dict(os.environ)
-    env["DSH_HOME"] = r"C:\Users\amren\.dsh"
+    env["DSH_HOME"] = os.path.expandvars(r"%USERPROFILE%\.dsh")
 
     proc = subprocess.Popen(
         [DSH, "--profile", "acp"],

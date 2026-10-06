@@ -481,7 +481,7 @@ Listed explicitly. These are gaps, not conclusions.
    by PrismML's formats page (group-64 "adds Vulkan and SYCL"), and by the existence of a dedicated
    Vulkan PQ2_0 fork — but I did not read the fork's Vulkan source.
 8. **The real binaries on this machine.** I searched for `llama-server.exe` / `llama-cli` under
-   `C:\ComfyUI`, `C:\Users\amren`, `C:\Program Files`, `C:\tools`, `C:\llama.cpp`, `C:\AI` and found
+   `C:\ComfyUI`, `C:\Users\<user>`, `C:\Program Files`, `C:\tools`, `C:\llama.cpp`, `C:\AI` and found
    only **test fixtures** — 1-byte and 96-byte stubs under
    `C:\ComfyUI\RD\rigma-review\.scratch\00-recon\` (e.g. `bt-es8\...\home\engines\b9867\vulkan\llama-server.exe`,
    96 bytes). No real llama.cpp build was inspected, so the binary-identity conclusion rests entirely on

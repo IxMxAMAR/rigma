@@ -55,8 +55,9 @@ Integration branch head: `2c1125c` (plus the docs commits that follow it).
 > (`rigma-program`, `rigma-impl`, `impl-w1c`, `w1f`, `impl-w2c`, `review`, `Rigma Implementer`). Per
 > `GUIDANCE.md` every commit on this branch must carry the repository identity, because the branch may
 > be published. A **metadata-only `filter-branch`** re-authored all 22 affected commits to
-> `IxMxAMAR <officialamrendrasingh@gmail.com>`; **trees are byte-identical** (`git diff` between the
-> old and new tips is empty) and `e43a5bf` and all pre-program history are unchanged. Any hash written
+> `IxMxAMAR` author identity (its address is personal, not repeated here); **trees are byte-identical**
+> (`git diff` between the old and new tips is empty) and `e43a5bf` and all pre-program history are
+> unchanged. Any hash written
 > into a report before that rewrite is stale — the mapping for the merged commits is
 > `d8f84ab→437f8bf`, `e605134→4d61440`, `b2cc137→96c9946`, `cb4d221→f692a11`, `492a1b2→e40e224`,
 > `a56c0e0→5e49304`, `21d303b→5aa98fe`, `5b9f149→ce85ed4`, `dee1c43→48aeb4e`, `c08945b→7e46d54`,

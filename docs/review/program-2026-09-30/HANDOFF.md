@@ -182,7 +182,8 @@ Baseline at program start (2026-09-30, base `e43a5bf`): **2935 non-hardware test
 
 10. **Never override the git author.** Plain `git commit` only — no `-c user.name`, no `-c user.email`,
     no `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. The branch may be published, so every commit must carry
-    `IxMxAMAR <officialamrendrasingh@gmail.com>`. Check with `git log -1 --format='%an <%ae>'`; audit
+    the `IxMxAMAR` author identity (its address is personal and is not repeated here). Check with
+    `git log -1 --format='%an <%ae>'`; audit
     the whole branch with
     `git log --branches --not e43a5bf --format='%an <%ae>' | Select-String '@local|@rigma\.local'`.
     (The orchestrator broke this early on; the affected commits were re-authored in a metadata-only

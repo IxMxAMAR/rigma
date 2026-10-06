@@ -33,10 +33,10 @@ predicted, or the prediction is shown wrong with a number attached.**
 ## 1. Binaries (verified present on this machine)
 
 ```
-vulkan   C:\Users\amren\.rigma\engines\prism-b10743\vulkan\llama-bench.exe
-hip      C:\Users\amren\.rigma\engines\prism-b10743\hip\llama-bench.exe
-mainline C:\Users\amren\.rigma\engines\b9867\vulkan\llama-bench.exe
-model    C:\Users\amren\.rigma\models\Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf
+vulkan   C:\Users\dev\.rigma\engines\prism-b10743\vulkan\llama-bench.exe
+hip      C:\Users\dev\.rigma\engines\prism-b10743\hip\llama-bench.exe
+mainline C:\Users\dev\.rigma\engines\b9867\vulkan\llama-bench.exe
+model    C:\Users\dev\.rigma\models\Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf
 ```
 
 `prism-b10743` is the release whose `ggml-vulkan.cpp`, `llama-context.cpp`, `fattn.cu` and
@@ -84,8 +84,8 @@ Every row: Vulkan, prism-b10743, `-fa on -t 10 -ngl 99 -r 3 -o md`, `-p 0 -n 128
 `-d`. The right-hand column is what `37-` predicts.
 
 ```
-$B = "C:\Users\amren\.rigma\engines\prism-b10743\vulkan\llama-bench.exe"
-$M = "C:\Users\amren\.rigma\models\Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf"
+$B = "C:\Users\dev\.rigma\engines\prism-b10743\vulkan\llama-bench.exe"
+$M = "C:\Users\dev\.rigma\models\Ternary-Bonsai-2-27B-Uncensored-Heretic-PQ2_0.gguf"
 
 # control, and the fully-filled native window (262144 = 261888 + 256)
 & $B -m $M -ngl 99 -ctk q5_1 -ctv q5_1 -fa on -t 10 -p 512 -n 128 -d 0     -r 3
@@ -201,7 +201,7 @@ HIP rejects a mixed pair and falls back to CPU attention **silently** under `-fa
 the failure mode is visible as a throughput cliff:
 
 ```
-$H = "C:\Users\amren\.rigma\engines\prism-b10743\hip\llama-bench.exe"
+$H = "C:\Users\dev\.rigma\engines\prism-b10743\hip\llama-bench.exe"
 & $H -m $M -ngl 99 -ctk q4_0 -ctv q4_0 -fa on -t 10 -p 0 -n 128 -d 32768 -r 3   # symmetric: fast
 & $H -m $M -ngl 99 -ctk q8_0 -ctv q4_0 -fa on -t 10 -p 0 -n 128 -d 32768 -r 3   # mixed: expect a cliff
 ```

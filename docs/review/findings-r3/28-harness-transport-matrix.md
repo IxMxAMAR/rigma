@@ -151,7 +151,7 @@ not a chat, which is what made it look reachable.
 
 DSH ships `@deepseek-ai/dsh-acp` — "Automation-only Agent Client Protocol server for
 driving DeepSeek Harness agents over JSON-RPC stdio" — and an `acp` profile already
-exists at `C:\Users\amren\.dsh\profiles\acp`. **Unlike mcode's ACP server, it requires
+exists at `%USERPROFILE%\.dsh\profiles\acp`. **Unlike mcode's ACP server, it requires
 no authentication.**
 
 Started and probed for real (`tools/dsh_acp_probe.py`). `initialize` answered:

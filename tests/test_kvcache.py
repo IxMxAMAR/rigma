@@ -7,6 +7,7 @@ user and it is that the filename encodes the configuration, so a mismatch asks
 for a file that does not exist.
 """
 import json
+import os
 
 import pytest
 
@@ -310,7 +311,15 @@ def test_a_pinned_launch_keeps_the_fingerprint_it_had(tmp_path, monkeypatch):
     the identity is the same one `engine_identity(backend)` returns."""
     from rigma import engine_build, runtime
     home = tmp_path / "home"
-    exe = home / "engines" / "b9867" / "vulkan" / "llama-server.exe"
+    # The pin's binary is named for the platform: `runtime.ensure_engine` writes
+    # `llama-server.exe` on Windows and `llama-server` everywhere else
+    # (runtime.py:301), and `server_ops.engine_version` looks for exactly that
+    # name (server_ops.py:54). A hardcoded `.exe` is not found on Linux, so
+    # `engine_version` fell back to the MANIFEST string while
+    # `launch_fingerprint` measured the file itself — two different identities,
+    # and this test asserts they are one.
+    exe = home / "engines" / "b9867" / "vulkan" / (
+        "llama-server.exe" if os.name == "nt" else "llama-server")
     exe.parent.mkdir(parents=True)
     exe.write_bytes(b"x")
     engine_build._BUILD_CACHE.clear()

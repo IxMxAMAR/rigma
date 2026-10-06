@@ -321,8 +321,9 @@ def test_a_wedged_server_is_rebuilt_on_the_next_ensure(monkeypatch):
     srv.proc = _MuteProc()
     _wedge(srv)
     mgr._servers = {"mute": srv}
-    mgr._started = True
-    mgr._cfg_key = json.dumps({"mute": {"command": "x"}}, sort_keys=True)
+    # `_ensure` reconciles per server now: the spec it was started under is
+    # carried on the McpServer itself, and a recorded death is remembered
+    # against the config key it happened under (`_failed_under`).
     monkeypatch.setattr(mcp_client, "load_config",
                         lambda: {"mute": {"command": "x"}})
     stopped = []
@@ -341,8 +342,6 @@ def test_status_reports_the_wedged_server_and_its_count(monkeypatch):
     srv.proc = _MuteProc()
     _wedge(srv)
     mgr._servers = {"mute": srv}
-    mgr._started = True
-    mgr._cfg_key = json.dumps({"mute": {"command": "x"}}, sort_keys=True)
     monkeypatch.setattr(mcp_client, "load_config",
                         lambda: {"mute": {"command": "x"}})
     monkeypatch.setattr(mgr, "_ensure", lambda: None)
@@ -385,8 +384,15 @@ def _stub_start(monkeypatch):
 def test_a_string_args_is_wrapped_not_split_into_characters(monkeypatch):
     """`[str(a) for a in (spec.get("args") or [])]` iterates a string one
     character at a time, launching the server with ~40 single-character
-    arguments and failing with an error that never mentions `args` (09-9)."""
+    arguments and failing with an error that never mentions `args` (09-9).
+
+    The launcher is now resolved through PATH/PATHEXT before spawning (a bare
+    `npx` is a FileNotFoundError on Windows — see tests/test_mcp_client.py), so
+    the resolver is stubbed out here: this test is about `args`, and it must not
+    depend on what happens to be installed on the machine running it.
+    """
     recorded = _stub_start(monkeypatch)
+    monkeypatch.setattr(mcp_client, "_resolve_command", lambda name, *a, **k: name)
     srv = mcp_client.McpServer("files", {"command": "npx",
                                          "args": "-y @scope/pkg D:/docs"})
     monkeypatch.setattr(srv, "_send", lambda *a, **k: {})

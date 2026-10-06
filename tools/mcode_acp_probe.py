@@ -49,7 +49,7 @@ import sys
 import threading
 import time
 
-MCODE = os.environ.get("RIGMA_MCODE_BIN") or r"C:\Users\amren\AppData\Roaming\npm\mcode.cmd"
+MCODE = os.environ.get("RIGMA_MCODE_BIN") or os.path.expandvars(r"%APPDATA%\npm\mcode.cmd")
 
 
 def main() -> int:
