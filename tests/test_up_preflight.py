@@ -72,7 +72,8 @@ def test_up_no_model_starts_ui_only(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "launch_server", lambda *a, **k: did.append("l"))
     seen = {}
     monkeypatch.setattr(serve, "run_ui",
-                        lambda port, eport: seen.update(state=st.read_state()))
+                        lambda port, eport, host="127.0.0.1":
+                        seen.update(state=st.read_state()))
     res = runner.invoke(cli.app, ["up", "--port", str(_free_port()),
                                   "--no-browser"])
     assert res.exit_code == 0

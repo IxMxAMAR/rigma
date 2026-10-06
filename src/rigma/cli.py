@@ -2044,7 +2044,7 @@ def _adopt_or_refuse(port: int, reattach: bool, dry_run: bool) -> None:
         raise typer.Exit(1)
 
 
-def _serve_or_exit(port: int) -> None:
+def _serve_or_exit(port: int, host: str = "127.0.0.1") -> None:
     """Serve the UI, turning a lost bind race into the pre-check's own message.
 
     AUDIT F16-3: `_port_holder` is a check-then-bind (TOCTOU). If another
@@ -2056,7 +2056,7 @@ def _serve_or_exit(port: int) -> None:
     """
     from . import serve
     try:
-        serve.run_ui(port, port - 1)
+        serve.run_ui(port, port - 1, host)
     except (OSError, SystemExit) as e:
         typer.echo(f"port {port} is already in use — free it or pass a "
                    f"different --port")
@@ -2273,6 +2273,13 @@ def up(use_case: str = typer.Option("general", "--use-case"),
                 "the model or the plan provably does not fit"),
        port: int = typer.Option(11500, "--port"),
        no_browser: bool = typer.Option(False, "--no-browser"),
+       host: str = typer.Option(
+           "127.0.0.1", "--host",
+           help="Interface the UI listens on. Loopback by default, which is "
+                "what a desktop wants; a CONTAINER needs 0.0.0.0 because "
+                "Runpod's proxy cannot reach 127.0.0.1 (deploy/runpod/), and "
+                "0.0.0.0 also means anything that can route here. The engine "
+                "is unaffected — llama-server stays on loopback either way."),
        ctx: int = typer.Option(None, "--ctx",
                                help="Context size override (clamped to the "
                                     "model's native window)"),
@@ -2461,7 +2468,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if not no_browser:
             _open_when_listening(port, f"http://127.0.0.1:{port}")
         try:
-            _serve_or_exit(port)
+            _serve_or_exit(port, host)
         finally:
             s_end = st.read_state()
             if s_end:
@@ -2546,7 +2553,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
         if not no_browser:
             _open_when_listening(port, f"http://127.0.0.1:{port}")
         try:
-            _serve_or_exit(port)
+            _serve_or_exit(port, host)
         finally:
             s_end = st.read_state()
             if s_end:
@@ -2993,7 +3000,7 @@ def up(use_case: str = typer.Option("general", "--use-case"),
     if not no_browser:
         _open_when_listening(port, f"http://127.0.0.1:{port}")
     try:
-        _serve_or_exit(port)
+        _serve_or_exit(port, host)
     finally:
         s_end = st.read_state()
         if s_end:

@@ -216,7 +216,8 @@ def _up_world(tmp_path, monkeypatch, reg):
     # run_ui blocks forever in production; here it is the one moment the state
     # record exists, since `up` clears it on the way out.
     monkeypatch.setattr("rigma.serve.run_ui",
-                        lambda port, eport: seen.update(state=st.read_state()))
+                        lambda port, eport, host="127.0.0.1":
+                        seen.update(state=st.read_state()))
     return seen
 
 

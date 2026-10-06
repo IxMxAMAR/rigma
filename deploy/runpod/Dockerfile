@@ -48,14 +48,15 @@ ENV PYTHONUNBUFFERED=1 \
 #               implementation) and probe.py:320 filters VK_DEVICE_TYPE_CPU, so
 #               installing it would only add a decoy ICD. The NVIDIA ICD must
 #               come from the host driver via nvidia-container-toolkit.
-# socat       : the 0.0.0.0 -> 127.0.0.1 bridge. Rigma hard-codes loopback
-#               (serve.py:8195 for the UI, models.py:800 for the engine), and a
-#               Runpod HTTP proxy cannot reach a loopback-only listener.
 # ca-certificates/curl : TLS for the engine + model downloads and for the
 #               readiness poll.
+# No socat: it used to bridge 0.0.0.0:11500 -> 127.0.0.1:11502 because the UI
+# was loopback-only. `rigma up --host 0.0.0.0` binds the public port directly
+# (cli.py `_serve_or_exit` -> serve.run_ui(port, port - 1, host)), which is also
+# the shape Runpod's pod workflow asks for.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl socat libvulkan1 \
+      ca-certificates curl libvulkan1 \
  && rm -rf /var/lib/apt/lists/*
 
 # --- python ------------------------------------------------------------------
@@ -79,14 +80,21 @@ RUN if [ "${INSTALL_VLLM}" = "1" ]; then \
     fi
 
 # --- the registry overlay source --------------------------------------------
-# Rigma's packaged registry (src/rigma/data/registry/) lists every NVIDIA card's
-# backends_linux as ["cuda", "vulkan"], and resolve.py:1046 takes element [0] —
-# "cuda". The pinned engine manifest has NO linux/cuda asset
-# (src/rigma/data/engines.json:4-11 pins linux/vulkan and linux/cpu only, and
+# As of commit 634b1d4 `resolve._backend` prefers the first backend the pinned
+# manifest can actually serve, so an NVIDIA card on Linux picks vulkan by itself
+# and this overlay is no longer required to make the pod work. It is kept for
+# the catch-all row (cards absent from gpus.json — A100, H100, L40S — get
+# probe.py:48's generic ["cuda","vulkan"]) and so a benchmark can PIN the
+# backend rather than infer it.
+#
+# Background, since it explains the row below: the packaged registry
+# (src/rigma/data/registry/) lists every NVIDIA card's backends_linux as
+# ["cuda", "vulkan"], and the pinned engine manifest has NO linux/cuda asset
+# (src/rigma/data/engines.json pins linux/vulkan and linux/cpu only, and
 # upstream publishes no Linux CUDA build for b9867 — verified against the GitHub
-# release API). So on an NVIDIA pod the default resolve path asks for an engine
-# that cannot be downloaded, ensure_engine raises (runtime.py:278-279), and
-# cli.py's fallback ladder (cli.py:2952-2957) walks down to the CPU floor.
+# release API). Taking element [0] therefore asked for an engine that cannot be
+# downloaded, ensure_engine raised (runtime.py:278-279), and cli.py's fallback
+# ladder walked down to the CPU floor.
 #
 # start.sh rewrites this COPY per $RIGMA_RUNPOD_BACKEND and points
 # RIGMA_REGISTRY_DIR at it. Copying here (rather than generating at boot) means
