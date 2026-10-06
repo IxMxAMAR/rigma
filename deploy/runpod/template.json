@@ -4,7 +4,7 @@
     "verified_from_the_catalog": "GET https://api.runpod.io/v2/catalog/templates with the account's own key returned 14 stock templates whose records use exactly these fields: allowedCudaVersions, args, category, disk, env, id, image, mounts, name, ports, public, registry, serverless, startJupyter, startSsh. The shape below is copied from 'Runpod Pytorch 2.4.0' (id runpod-torch-v240), which uses EXACTLY the base image this Dockerfile pins (runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04) — so disk=20, mounts.persistent={path:/workspace,size:20}, ports=[8888/http,22/tcp], env={} and startSsh/startJupyter=true are the vendor's own values for this base, not inferences.",
     "verified_from_a_cpu_template": "'Runpod Ubuntu 24.04' (id runpod-ubuntu-2404, image runpod/base:1.0.2-ubuntu2404, category CPU) declares ports [\"8888/http\",\"22/tcp\"], disk 10, env {}, startJupyter true, startSsh true — i.e. the Ubuntu templates and the GPU templates agree on the port/ssh/jupyter shape, which is what this template follows.",
     "ports_shape": "`ports` is an ARRAY of \"<port>/<proto>\" strings in the GPU/Ubuntu records, but a bare STRING in 'Network storage file browser' (\"80/http\"), so both are accepted. /http means Runpod's HTTP proxy fronts that port.",
-    "mounts_shape": "Only `persistent` was OBSERVED in the catalog ({\"persistent\":{\"path\":\"/workspace\",\"size\":20}}). The `network` form below is from the runpod-migrate reference (networkVolumeId -> mounts.network[0]), NOT observed in a catalog record — treat that one key as documented, not verified.",
+    "mounts_shape": "Only `persistent` is ACCEPTED. The catalog showed {\"persistent\":{\"path\":\"/workspace\",\"size\":20}}, and POSTing any `network` key under `mounts` to POST /v2/templates returns 422 `$.mounts: additional properties 'network' not allowed` — both the object form {\"volumeMountPath\":\"/workspace\"} and the array form [{\"volumeId\":\"...\"}] taken from the runpod-migrate reference were refused with that same message. So `mounts.network` is a POD-creation field (--network-volume-id + --volume-mount-path /workspace), not a template field, and it is no longer declared below.",
     "env_is_empty_on_every_stock_template": "All 14 stock templates have env {} — including every NVIDIA one. So NVIDIA_DRIVER_CAPABILITIES is NOT set by the platform's own templates; whether the host injects the 'graphics' capability (which is what mounts the Vulkan ICD) is a host-config question this catalog cannot answer. It is set below as a best-effort, and start.sh reports what it actually sees."
   },
 
@@ -26,13 +26,7 @@
     "NVIDIA_DRIVER_CAPABILITIES": "all"
   },
   "mounts": {
-    "persistent": { "path": "/workspace", "size": 100 },
-    "network": [
-      {
-        "volumeId": "<network-volume-id>",
-        "path": "/workspace"
-      }
-    ]
+    "persistent": { "path": "/workspace", "size": 100 }
   },
   "startSsh": true,
   "startJupyter": false,
@@ -50,7 +44,7 @@
     "RIGMA_AUTO_CALIBRATE": "Rigma's own variable (cli.py:2890-2891). \"1\" runs the one-time hardware sweep on first load of a model (minutes, and it relaunches the engine several times on port UI-1). \"0\" skips it. For a test bench the sweep is usually the point; set it to 0 for a fast, reproducible start.",
     "HF_HUB_DISABLE_XET": "runtime.py:376 sets this with setdefault() anyway; setting it explicitly is documentation, and it keeps the model download on HF's plain CDN path.",
     "NVIDIA_DRIVER_CAPABILITIES": "Needed for the default Vulkan lane: the NVIDIA Vulkan ICD (/usr/share/vulkan/icd.d/nvidia_icd.json) and libGLX_nvidia are only mounted into the container when the 'graphics' capability is enabled. NO stock Runpod template sets it (all 14 have env {}), so the platform is not doing it for you — but the catalog cannot show what the HOST injects either. UNVERIFIED: start.sh prints the ICD directory and Rigma's own probe result at boot, which is the real answer.",
-    "mounts": "`persistent` is what the stock templates declare (path /workspace, size 20); 100 GB here because models are GB-scale. `network` is the durable option and the one to use for a real bench — a network volume survives pod termination, while /workspace on a pod without one is container disk and is wiped (golden path 01, 'Models vanish after stop'). start.sh checks `stat -f` on /workspace and warns when it is not a network mount.",
+    "mounts": "`persistent` only, because the template API refuses `network` (see _schema_provenance.mounts_shape). The stock templates declare path /workspace, size 20; 100 GB here because models are GB-scale. A NETWORK volume is still the durable option and the one to use for a real bench — it survives pod termination, while /workspace on a pod without one is container disk and is wiped (golden path 01, 'Models vanish after stop') — but it is attached at POD creation, not declared here. start.sh checks `stat -f` on /workspace and warns when it is not a network mount.",
     "startSsh": "true, and it matters: without SSH there is no way to exec into a pod whose UI fails to come up. The image's CMD chains the base image's /start.sh, which is what honours this.",
     "startJupyter": "false — Rigma serves its own UI, and Jupyter is another process to keep alive on a bench pod. Set true if you want the base image's notebook as a second way in.",
     "allowedCudaVersions": "The vendor's own list for this base image (runpod/pytorch:2.4.0-py3.11-cuda12.4.1-...). It constrains which hosts can run the pod; narrowing it to [\"12.4\"] reduces placement options for no benefit, since a 12.4 runtime works with newer drivers.",
