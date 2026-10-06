@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import itertools
 import json
 import logging
@@ -104,10 +105,47 @@ def _is_local_host(host: str) -> bool:
     return "." not in h and ":" not in h
 
 
+def _is_own_address(host: str, server: str) -> bool:
+    """Is this Host the very address the connection was ACCEPTED on?
+
+    A reverse proxy may rewrite Host to the container's own address, and
+    Runpod's edge does exactly that: a pod reachable at
+    `https://<pod-id>-11500.proxy.runpod.net` arrives as
+    `Host: 100.65.29.116:11500`, its internal CGNAT address, which the guard
+    refused — so `rigma up --host 0.0.0.0`, the documented deployment, was
+    unreachable through the proxy.
+
+    Admitting exactly that address costs the guard nothing: a rebinding page
+    cannot forge Host (the browser sets it from the URL, and it is a forbidden
+    header), and the address a socket was accepted on is not a name an attacker
+    can publish. Two properties keep it from becoming a hole:
+
+      * the Host must be an IP LITERAL. `scope["server"]` is the socket's own
+        address under uvicorn, but an ASGI test client — and any server that
+        derives it from the request — makes it echo the Host header, which
+        would reduce this to "Host == Host" and switch the guard off
+        (test_a_rebound_dns_name_is_refused_even_on_a_get caught exactly that);
+      * it is not a range. `10.0.0.1` stays refused unless it is the address
+        this connection actually arrived on.
+    """
+    h, s = _split_host(host), _split_host(server)
+    if not h or not s or h != s:
+        return False
+    try:
+        ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return True
+
+
 def guard_request(host: str, origin: str, *, sec_fetch_site: str = "",
-                  path: str = "", method: str = "GET") -> str:
-    """Empty when the request may proceed; otherwise why it may not."""
-    if not _is_local_host(host):
+                  path: str = "", method: str = "GET",
+                  server: str = "") -> str:
+    """Empty when the request may proceed; otherwise why it may not.
+
+    `server` is `scope["server"][0]`: the address this connection arrived on.
+    """
+    if not _is_local_host(host) and not _is_own_address(host, server):
         return ("this server only answers to a loopback address; refusing a "
                 "request addressed to " + (_split_host(host) or "no host"))
     o = (origin or "").strip()
@@ -190,9 +228,11 @@ class LocalOriginGuard:
                 for k, v in scope.get("headers") or []}
         path = scope.get("path", "")
         method = (scope.get("method") or "").upper()
+        srv = scope.get("server") or ()
         why = guard_request(head.get("host", ""), head.get("origin", ""),
                             sec_fetch_site=head.get("sec-fetch-site", ""),
-                            path=path, method=method)
+                            path=path, method=method,
+                            server=(srv[0] if srv else ""))
         status = 403
         if not why and _work_route(path) and method == "GET" \
                 and work_route_rate_limited(path):

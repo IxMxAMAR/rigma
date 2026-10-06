@@ -118,3 +118,33 @@ def test_the_middleware_refuses_a_cross_site_work_get():
     assert out["status"] == 403
     assert called == []          # the route handler never ran
 
+
+def test_the_middleware_admits_the_address_the_connection_arrived_on():
+    # The wiring half of the same fix: the guard only admits the proxy's Host
+    # when the middleware hands it scope["server"], so a pod behind Runpod's
+    # edge reaches the UI instead of a 403 on every request.
+    import asyncio
+    called = []
+
+    async def _app(scope, receive, send):
+        called.append(True)
+
+    async def receive():
+        return {"type": "http.request"}
+
+    async def send(msg):
+        pass
+
+    scope = {"type": "http", "method": "GET", "path": "/",
+             "server": ("100.65.29.116", 11500),
+             "headers": [(b"host", b"100.65.29.116:11500")]}
+    asyncio.run(serve.LocalOriginGuard(_app)(scope, receive, send))
+    assert called == [True]      # admitted: the pod's own address, not a name
+
+    # A scope with no "server" key at all (older callers, bare test scopes)
+    # must still be refused rather than crash.
+    called.clear()
+    scope.pop("server")
+    asyncio.run(serve.LocalOriginGuard(_app)(scope, receive, send))
+    assert called == []
+
