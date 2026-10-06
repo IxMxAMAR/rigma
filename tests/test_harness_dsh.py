@@ -68,10 +68,20 @@ def _drive(monkeypatch, argv, home, **kwargs):
 
 
 def test_patch_restates_the_keys_a_replaced_row_would_lose(tmp_path):
+    """...and never restates `protocol`, which DSH 0.2.0 made FATAL.
+
+    `protocol` was removed from the DeepSeek adapter and now throws at mount
+    (packages/llm/llm-deepseek/src/config.ts:206-208), so the assertion that the
+    patch DID write `protocol: chat-completions` was pinning the exact text that
+    killed every turn. It is asserted absent instead: the keys a replaced row
+    would lose are still restated, the fatal one is not.
+    """
     path = harness_dsh.patch_file(32768, 4096, tmp_path)
     raw = path.read_text(encoding="utf-8")
     assert path.name.endswith(".yaml")
-    assert "protocol: chat-completions" in raw
+    # the KEY, not the word: the header comment names `protocol` on purpose, to
+    # say why it must never come back.
+    assert "protocol:" not in raw
     assert "apiKeyEnv: DEEPSEEK_API_KEY" in raw
     assert "defaultContextWindow: 32768" in raw
     assert "maxTokens: 4096" in raw
@@ -83,7 +93,6 @@ def test_patch_restates_the_keys_a_replaced_row_would_lose(tmp_path):
     assert isinstance(doc, list) and len(doc) == 1
     assert doc[0]["id"] == "llm-deepseek"
     config = doc[0]["config"]
-    assert config["protocol"] == "chat-completions"
     assert config["apiKeyEnv"] == "DEEPSEEK_API_KEY"
     assert config["defaultContextWindow"] == 32768
     assert config["maxTokens"] == 4096
