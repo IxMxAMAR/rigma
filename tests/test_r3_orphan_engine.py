@@ -6,8 +6,10 @@ gone, so `rigma up` refused with advice the user could not act on ("free it") an
 `rigma stop` answered "not running" while a model sat in VRAM.
 """
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,12 +17,34 @@ from typer.testing import CliRunner
 
 from rigma import cli, orphan
 
+# The engine reports the path it was LAUNCHED with, in the running platform's own
+# spelling, so the fixture must be spelled that way too. A Windows-spelled path
+# is not a path on POSIX: `Path(r"C:\models\x.gguf").name` is the WHOLE string
+# there, because `\` is an ordinary filename character — so a hardcoded `C:\...`
+# fixture silently turns "take the basename" into "return the input" and stops
+# testing anything on Linux. That is what CI caught.
+_HOME = r"C:\Users\dev\.rigma" if os.name == "nt" else "/home/dev/.rigma"
+# The pin's binary is named for the platform: `runtime.ensure_engine` writes
+# `llama-server.exe` on Windows and `llama-server` everywhere else
+# (runtime.py:301), and `server_ops.engine_version` looks for exactly that name
+# (server_ops.py:54).
+_SERVER = "llama-server.exe" if os.name == "nt" else "llama-server"
+# Deliberately NOT a registry model: this file pins the STEM fallback.
+MODEL_FILE = "My-Model-Q4_K_M.gguf"
+MODEL_SLUG = "My-Model-Q4_K_M"
+
+
+def _native(*parts) -> str:
+    """`parts` under Rigma's home, in the running platform's spelling."""
+    return str(Path(_HOME, *parts))
+
+
 PROPS = {
-    "model_path": r"C:\Users\amren\.rigma\models\Ternary-Bonsai-2-27B-PQ2_0.gguf",
+    "model_path": _native("models", MODEL_FILE),
     "build_info": "b10709-9a9394a89",
     "default_generation_settings": {"n_ctx": 65536, "params": {}},
 }
-EXE = r"C:\Users\amren\.rigma\engines\b9867\rocm\llama-server.exe"
+EXE = _native("engines", "b9867", "rocm", _SERVER)
 
 # The holder is on the ENGINE port (11500 - 1), which is the only port that can
 # carry an engine. A mock that answers for the UI port instead would agree with
@@ -46,8 +70,8 @@ def test_the_record_is_built_from_the_engine_not_from_memory():
     assert rec["engine_pid"] == 16908
     assert rec["public_port"] == 11500
     assert rec["ctx"] == 65536
-    assert rec["gguf"] == "Ternary-Bonsai-2-27B-PQ2_0.gguf"
-    assert rec["model_slug"] == "Ternary-Bonsai-2-27B-PQ2_0"
+    assert rec["gguf"] == MODEL_FILE
+    assert rec["model_slug"] == MODEL_SLUG
     assert rec["engine"] == "llamacpp"
 
 
@@ -56,9 +80,10 @@ def test_the_backend_is_read_from_the_binary_path():
     running build recorded which backend it is."""
     assert orphan._backend_from_exe(EXE) == "rocm"
     assert orphan._backend_from_exe(
-        r"C:\x\.rigma\engines\b9867\vulkan\llama-server.exe") == "vulkan"
+        _native("engines", "b9867", "vulkan", _SERVER)) == "vulkan"
     # a layout Rigma did not create: empty, not a guess
-    assert orphan._backend_from_exe(r"D:\build\llama-server.exe") == ""
+    foreign = Path(r"D:\build" if os.name == "nt" else "/build", _SERVER)
+    assert orphan._backend_from_exe(str(foreign)) == ""
 
 
 def test_a_field_the_engine_does_not_report_is_left_empty():
@@ -72,7 +97,7 @@ def test_a_field_the_engine_does_not_report_is_left_empty():
 
 def test_describe_names_the_model_and_the_window():
     s = orphan.describe(11499, 16908, PROPS)
-    assert "Ternary-Bonsai-2-27B-PQ2_0.gguf" in s
+    assert MODEL_FILE in s
     assert "65536" in s
     assert "16908" in s
 
@@ -181,7 +206,7 @@ def test_reattach_writes_a_record_the_ui_can_stop(home, monkeypatch, fake_engine
     assert rec is not None, "reattach must leave a record behind"
     assert rec["engine_pid"] == 4242
     assert rec["ctx"] == 65536
-    assert rec["gguf"] == "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+    assert rec["gguf"] == MODEL_FILE
     # kv_fp is empty ON PURPOSE and must be present as empty. It hashes the
     # launch fields in kvcache.FINGERPRINT_FIELDS; the launch that computed it
     # is gone and /props reports only the window, so any value here would be a
@@ -297,14 +322,15 @@ def test_the_record_names_the_registry_slug_not_the_file_stem():
 def test_a_file_outside_the_registry_falls_back_to_the_stem(monkeypatch):
     """A custom install is not in the registry, and a label is better than
     nothing — but it must not be mistaken for an identity."""
+    custom = _native("models", MODEL_FILE)
     monkeypatch.setattr(orphan, "engine_props", lambda port, timeout=5.0: {
-        "model_path": r"C:\models\My-Custom-Model-Q4_K_M.gguf",
+        "model_path": custom,
         "default_generation_settings": {"n_ctx": 4096}})
     rec = orphan.record_from_props(
-        {"model_path": r"C:\models\My-Custom-Model-Q4_K_M.gguf",
+        {"model_path": custom,
          "default_generation_settings": {"n_ctx": 4096}}, 1, "", 11500)
-    assert rec["model_slug"] == "My-Custom-Model-Q4_K_M"
-    assert rec["gguf"] == "My-Custom-Model-Q4_K_M.gguf"
+    assert rec["model_slug"] == MODEL_SLUG
+    assert rec["gguf"] == MODEL_FILE
 
 
 def test_free_current_asks_the_engine_when_the_record_cannot_say(monkeypatch):
@@ -320,19 +346,28 @@ def test_free_current_asks_the_engine_when_the_record_cannot_say(monkeypatch):
     failed on exactly that, which is the same trap as the port mocks earlier in
     this file: a stub that does not behave like the thing it replaces cannot
     fail on the bug it is meant to catch.
+
+    The GPU is STATED rather than probed. `probe_hardware` finds no GPU on a
+    headless CI runner, and `_budgets` then answers (0, ...) for BOTH profiles —
+    so the budget assertion below failed `0 > 0` on ubuntu while the crediting
+    under test was perfectly correct. What this test measures is `_free_current`,
+    not the machine CI happens to run on.
     """
     from types import SimpleNamespace
 
     from rigma import probe, registry as R, server_ops
+    from rigma.models import GpuInfo
     from rigma.resolve import _budgets
 
     gguf = SimpleNamespace(file="Tiny-Model-Q4_K_M.gguf", bytes=4 * 2**30,
                            quant="Q4_K_M")
     spec = SimpleNamespace(ggufs=[gguf], mmproj=None)
     reg = SimpleNamespace(models={"tiny-model": spec})
+    gpu = GpuInfo(vendor="amd", name="Test GPU 16G", vram_mb=16368,
+                  arch="rdna4", slug="test-gpu-16g", backends=["vulkan"])
     base = probe.probe_hardware(R.Registry.load().gpus)
     prof = base.model_copy(update={"ram_free_mb": 4000,
-                                   "vram_used_mb": 9900.0})
+                                   "vram_used_mb": 9900.0, "gpus": [gpu]})
 
     monkeypatch.setattr(orphan, "running_gguf_file",
                         lambda ui_port: "Tiny-Model-Q4_K_M.gguf")
@@ -361,7 +396,7 @@ def test_adopt_writes_a_record_the_registry_can_resolve(home, monkeypatch):
     assert s["model"] == rec["model_slug"]
     assert s["unloaded"] is False, "an adopted engine is loaded, not unloaded"
     assert s["engine_pid"] == 4242
-    assert s["gguf"] == "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+    assert s["gguf"] == MODEL_FILE
     assert s["kv_fp"] == ""
 
 

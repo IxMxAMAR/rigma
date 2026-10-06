@@ -18,7 +18,7 @@ import subprocess
 import threading
 import time
 
-MCODE = r"C:\Users\amren\AppData\Roaming\npm\mcode.cmd"
+MCODE = os.path.expandvars(r"%APPDATA%\npm\mcode.cmd")
 
 
 def main() -> int:
@@ -61,7 +61,7 @@ def main() -> int:
     print("  --- login state ---")
     home = os.path.expanduser("~")
     for cand in (os.path.join(home, ".minimax"), os.path.join(home, ".mcode"),
-                 r"C:\Users\amren\.rigma\mcode\auth"):
+                 os.path.join(home, ".rigma", "mcode", "auth")):
         if os.path.isdir(cand):
             files = os.listdir(cand)
             print("  %s -> %d entries" % (cand, len(files)))

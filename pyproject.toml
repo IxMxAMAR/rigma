@@ -33,14 +33,26 @@ classifiers = [
 ]
 dependencies = [
   "pydantic>=2.7",
-  # 0.13, not 0.12: two measured reasons, both found by the `floors` job in CI
-  # (AUDIT F61). (1) fastapi 0.111.0 requires fastapi-cli>=0.0.2 in its BASE
-  # dependencies — a packaging slip in that release — and every fastapi-cli
-  # requires typer>=0.12.3, so `typer>=0.12` was a floor no environment could
-  # satisfy. (2) typer 0.12.x raises `Parameter.make_metavar() missing 1
-  # required positional argument: 'ctx'` against click>=8.2, so 0.12.5 breaks
-  # every command in the CLI on a modern click; 0.13.0 is the first that works.
-  "typer>=0.13",
+  # 0.16, not 0.13: the floor ITSELF was the bug, and the `floors` job (AUDIT
+  # F61) is what caught it — which is exactly what that job exists for.
+  #
+  # (1) typer 0.13.0 calls `Parameter.make_metavar()` with no `ctx`
+  # (typer/core.py:494, typer/rich_utils.py:367) while declaring only
+  # `click>=8.0.0`. click 8.2 made `ctx` a required argument, so EVERY command
+  # in the CLI died with `TypeError: Parameter.make_metavar() missing 1 required
+  # positional argument: 'ctx'`. 0.16.0 is the first release that dispatches on
+  # the installed click's own signature (`inspect.signature(param.make_metavar)`)
+  # and therefore works with click<8.2 AND click>=8.2 — measured here against
+  # click 8.4.2 and 8.5.0. 0.14.0 and 0.15.0 have the same broken call and the
+  # same unbounded `click>=8.0.0`; 0.15.4 caps `click<8.2`, which is a broken
+  # environment rather than a fix.
+  #
+  # (2) The newest `fastapi-cli` — which the `fastapi` floor below pulls in
+  # transitively, because fastapi 0.111.0 declares `fastapi-cli>=0.0.2` in its
+  # BASE dependencies — already requires `typer>=0.16.0` itself. A floor under
+  # that declares a range this project cannot install beside its own fastapi
+  # floor, so 0.13 was not merely old, it was unsatisfiable-in-company.
+  "typer>=0.16",
   "httpx>=0.27",
   "psutil>=5.9",
   "huggingface_hub>=0.23",

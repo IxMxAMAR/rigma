@@ -17,6 +17,8 @@ the promise rather than today's behaviour:
   sample, reporting "moved N file(s)".
 """
 
+import os
+
 import pytest
 
 from rigma import tools
@@ -69,8 +71,15 @@ def test_confined_refuses_the_allowlist_route(tmp_path):
 
     # And the spelling a model actually reaches for: `..` out of the workspace
     # into the seeded root. This returned the path before the profile test.
+    # Built with `os.sep` rather than written as a literal `..\outside\...`: on
+    # POSIX a backslash is an ordinary filename character, so the Windows
+    # spelling stays INSIDE the workspace and the test asserted nothing about the
+    # escape it is named for. The check itself is separator-agnostic — it is
+    # `Path.resolve()` + `is_relative_to` — so the POSIX spelling reaches the
+    # same refusal.
+    escape = os.path.join("..", "outside", "planted.bat")
     with pytest.raises(ValueError):
-        tools._write_path(ctx, r"..\outside\planted.bat")
+        tools._write_path(ctx, escape)
 
 
 def test_the_allowlist_still_works_outside_confined(tmp_path):

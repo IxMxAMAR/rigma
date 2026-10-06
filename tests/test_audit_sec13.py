@@ -449,10 +449,10 @@ def test_run_shell_does_not_spawn_when_confirmation_is_off(monkeypatch):
 
 # --- the grants apply to BOTH path spellings ---------------------------------
 #
-# MEASURED 2026-10-05, live chat 493d17779613 (workspace C:\Users\amren, both
-# grants ON). The tool trace was: read_file("C:\BGMI\Code.txt") OK, then
-# write_file("C:\BGMI\ESP\offsets.h") refused with "pass a path RELATIVE to the
-# workspace", then write_file("..\..\BGMI\ESP\offsets.h") refused with "path is
+# MEASURED 2026-10-05, live chat 493d17779613 (workspace C:\Users\<user>, both
+# grants ON). The tool trace was: read_file("C:\elsewhere\Code.txt") OK, then
+# write_file("C:\elsewhere\out\offsets.h") refused with "pass a path RELATIVE to the
+# workspace", then write_file("..\..\elsewhere\out\offsets.h") refused with "path is
 # outside the workspace — stay within it", then three read_file calls with
 # `..\..` refused the same way. The grants were consulted ONLY on the absolute
 # branch, so obeying the first refusal led straight into the second, which named

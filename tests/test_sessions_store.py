@@ -7,6 +7,7 @@ empty store seeds nothing, which is exactly the behaviour before the field
 existed (an absolute destination then needs the blanket grant).
 """
 import json
+import os
 import pathlib
 
 import pytest
@@ -131,10 +132,20 @@ def test_a_relative_stored_workspace_is_ignored_not_resolved(home):
     assert got == [], got
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="extended-length (\\\\?\\), device (\\\\.\\) and UNC aliases are "
+           "Windows path FORMS. On POSIX those strings are ordinary RELATIVE "
+           "paths — a leading backslash is a filename character, not a root — so "
+           "they are rejected by the same is_absolute() floor as '.', and the "
+           "Startup refusal this test pins cannot be reached at all. There is no "
+           "POSIX spelling of the same alias family to assert instead; the "
+           "relative-path half is covered by "
+           "test_a_relative_stored_workspace_is_ignored_not_resolved.")
 def test_an_alias_stored_workspace_is_not_seeded_and_its_startup_is_refused(
         home):
     """ODR-2b: `resolve()` does NOT normalize an extended-length (`\\\\?\\`),
-    device (`\\\\.\\`) or UNC alias, so `\\\\?\\C:\\Users\\amren` slipped past
+    device (`\\\\.\\`) or UNC alias, so `\\\\?\\C:\\Users\\dev` slipped past
     the lexical floor, was seeded, and `_write_path` then admitted an absolute
     Startup destination under it with `allow_absolute_writes=False`. A local
     working folder is never one of those forms, so the whole family is ignored
