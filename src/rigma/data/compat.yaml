@@ -42,7 +42,7 @@
 # skew into a dead backend. `dsh_min`/`dsh_max` sharpen the WORDING of that
 # warning (and name the fatal edge); they are deliberately not wired to a
 # refusal.
-rigma: "0.12.1"
+rigma: "0.12.2"
 dsh: "0.2.0-rc.2"
 dsh_min: "0.1.7-alpha.1"
 dsh_max: ""
