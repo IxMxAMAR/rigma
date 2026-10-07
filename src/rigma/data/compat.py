@@ -26,7 +26,7 @@ from pathlib import Path
 # docstring. Kept in step with `data/compat.yaml` by
 # `tests/test_harness_compat.py`, which fails if the two disagree.
 _FALLBACK: dict[str, str] = {
-    "rigma": "0.12.1",
+    "rigma": "0.12.2",
     "dsh": "0.2.0-rc.2",
     "dsh_min": "0.1.7-alpha.1",
     "dsh_max": "",

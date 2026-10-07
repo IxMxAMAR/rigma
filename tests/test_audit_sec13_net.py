@@ -141,10 +141,19 @@ def test_the_middleware_admits_the_address_the_connection_arrived_on():
     asyncio.run(serve.LocalOriginGuard(_app)(scope, receive, send))
     assert called == [True]      # admitted: the pod's own address, not a name
 
-    # A scope with no "server" key at all (older callers, bare test scopes)
-    # must still be refused rather than crash.
+    # A scope with no "server" key at all (older callers, bare test scopes) must
+    # not crash - and since a private literal is now admitted on the Host alone,
+    # the pod's own address still gets through without it. That is the case a
+    # real pod hit: Rigma 0.12.1 running, and this comparison still refusing.
     called.clear()
     scope.pop("server")
+    asyncio.run(serve.LocalOriginGuard(_app)(scope, receive, send))
+    assert called == [True]
+
+    # What must not get through, server or no server: a name an attacker can
+    # publish. That is the entire point of the guard.
+    called.clear()
+    scope["headers"] = [(b"host", b"rigma.evil.example:11500")]
     asyncio.run(serve.LocalOriginGuard(_app)(scope, receive, send))
     assert called == []
 

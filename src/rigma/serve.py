@@ -118,15 +118,15 @@ def _is_own_address(host: str, server: str) -> bool:
     Admitting exactly that address costs the guard nothing: a rebinding page
     cannot forge Host (the browser sets it from the URL, and it is a forbidden
     header), and the address a socket was accepted on is not a name an attacker
-    can publish. Two properties keep it from becoming a hole:
+    can publish. One property keeps it from becoming a hole: the Host must be an
+    IP LITERAL. `scope["server"]` is the socket's own address under uvicorn, but
+    an ASGI test client — and any server that derives it from the request —
+    makes it echo the Host header, which would reduce this to "Host == Host" and
+    switch the guard off (test_a_rebound_dns_name_is_refused_even_on_a_get
+    caught exactly that).
 
-      * the Host must be an IP LITERAL. `scope["server"]` is the socket's own
-        address under uvicorn, but an ASGI test client — and any server that
-        derives it from the request — makes it echo the Host header, which
-        would reduce this to "Host == Host" and switch the guard off
-        (test_a_rebound_dns_name_is_refused_even_on_a_get caught exactly that);
-      * it is not a range. `10.0.0.1` stays refused unless it is the address
-        this connection actually arrived on.
+    This comparison alone did NOT hold on a real pod, which is why
+    `_is_private_literal` below exists.
     """
     h, s = _split_host(host), _split_host(server)
     if not h or not s or h != s:
@@ -138,6 +138,42 @@ def _is_own_address(host: str, server: str) -> bool:
     return True
 
 
+def _is_private_literal(host: str) -> bool:
+    """An IP-literal Host in a range that is not globally routable.
+
+    This is the rule that actually made `rigma up --host 0.0.0.0` reachable
+    behind Runpod's edge. `_is_own_address` above compares Host against
+    `scope["server"]`, and on a real pod that comparison did not match: the pod
+    logged `Rigma version: 0.12.1`, so the code above was running, and it still
+    answered 403 to `Host: 100.65.31.217` — its own CGNAT address, the address
+    the edge had just dialled. Whatever that server reports in
+    `scope["server"]`, the guard cannot depend on it, so the decision is made
+    from the Host alone.
+
+    What makes that safe is that the Host is not the attacker's to choose. A
+    browser sets it from the URL and it is a forbidden header for fetch/XHR, so
+    the only way to send `Host: 100.65.31.217` is to have the browser navigate
+    to that address — which is not a rebinding attack. Rebinding needs a NAME
+    the attacker can publish, and a name is not an IP literal: every dotted name
+    still fails `_is_local_host` and lands here to be refused, including a name
+    that exactly matches `scope["server"]`.
+
+    The range test keeps the rest of the internet out. A public literal
+    (`1.2.3.4`) is still refused unless it is also the address this connection
+    arrived on. This admits loopback, RFC1918, CGNAT 100.64/10, link-local,
+    unspecified, IPv6 ULA, and the IPv4-mapped forms of all of them — the
+    addresses a container's own proxy can plausibly put in Host.
+    """
+    h = _split_host(host)
+    if not h:
+        return False
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return not addr.is_global
+
+
 def guard_request(host: str, origin: str, *, sec_fetch_site: str = "",
                   path: str = "", method: str = "GET",
                   server: str = "") -> str:
@@ -145,9 +181,16 @@ def guard_request(host: str, origin: str, *, sec_fetch_site: str = "",
 
     `server` is `scope["server"][0]`: the address this connection arrived on.
     """
-    if not _is_local_host(host) and not _is_own_address(host, server):
+    if (not _is_local_host(host) and not _is_own_address(host, server)
+            and not _is_private_literal(host)):
+        # Name what it compared against. The first version of this message said
+        # only what it refused, so a real pod's 403 could not be told apart from
+        # "the fix is not deployed" without another deploy to find out.
+        arrived = _split_host(server)
         return ("this server only answers to a loopback address; refusing a "
-                "request addressed to " + (_split_host(host) or "no host"))
+                "request addressed to " + (_split_host(host) or "no host")
+                + (f" (the connection arrived on {arrived})" if arrived
+                   else " (the connection's own address was not reported)"))
     o = (origin or "").strip()
     if o:
         if "://" not in o:

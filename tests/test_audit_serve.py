@@ -60,20 +60,42 @@ def test_a_proxy_that_rewrites_host_to_our_own_address_is_admitted():
                                server="100.65.29.116") == ""
     assert serve.guard_request("100.65.29.116", "",
                                server="100.65.29.116") == ""
-    # Only that address. The same Host against a different local address is
-    # still the rebinding case, an attacker's name never matches, and a caller
-    # that passes no server at all (every other test here) keeps the old answer.
+    # Only that address, and - after a real pod refused this while running the
+    # code above - the Host alone is now enough. See
+    # test_a_private_literal_host_is_admitted_without_any_server.
     assert serve.guard_request("100.65.29.116:11500", "",
-                               server="127.0.0.1") != ""
+                               server="127.0.0.1") == ""
     assert serve.guard_request("evil.example:11500", "",
                                server="100.65.29.116") != ""
-    assert serve.guard_request("10.0.0.1", "") != ""
+    assert serve.guard_request("10.0.0.1", "") == ""
     # The one that matters most: a NAME that matches scope["server"] exactly.
     # An ASGI test client derives server from the request URL, so without the
     # literal-only rule this is "Host == Host" and the guard is off - which is
     # how this fix first broke test_a_rebound_dns_name_is_refused_even_on_a_get.
     assert serve.guard_request("rigma.evil.example:11500", "",
                                server="rigma.evil.example") != ""
+
+
+def test_a_private_literal_host_is_admitted_without_any_server():
+    # Observed on a real pod: Rigma 0.12.1 running (the pod log's own banner
+    # said so), Host `100.65.31.217:11500`, and 403 "refusing a request
+    # addressed to 100.65.31.217" - the pod's own CGNAT address, the one the
+    # edge had just dialled. So `_is_own_address` cannot be the whole rule: it
+    # depends on `scope["server"]`, which that server did not report as the
+    # address the connection arrived on. The Host is not the attacker's to
+    # choose (a browser sets it from the URL; fetch cannot set it at all), so a
+    # non-globally-routable literal is admitted on its own.
+    for h in ("100.65.31.217:11500", "100.65.31.217", "10.0.0.1",
+              "192.168.1.9:11500", "169.254.1.1", "0.0.0.0",
+              "[fd00::1]:11500", "[::ffff:100.65.31.217]:11500"):
+        assert serve._is_private_literal(h) is True, h
+        assert serve.guard_request(h, "") == "", h
+    # Still not a hole: a public literal is refused unless it is this
+    # connection's own address, and no name is ever admitted.
+    for h in ("1.2.3.4", "8.8.8.8:11500", "[2606:4700::1111]"):
+        assert serve._is_private_literal(h) is False, h
+        assert serve.guard_request(h, "") != "", h
+    assert serve.guard_request("evil.example:11500", "") != ""
 
 
 # --------------------------------------------------------------------------
@@ -340,7 +362,10 @@ def test_the_guard_rules_directly():
     assert serve.guard_request("[::1]:11500", "") == ""
     assert serve.guard_request("127.0.0.1:11500", "null")
     assert serve.guard_request("127.0.0.1:11500", "https://evil.example")
-    assert serve.guard_request("192.168.1.9:11500", "")
+    # A private literal is admitted (a pod's proxy puts its own CGNAT address in
+    # Host); a public one still is not, unless it is the connection's address.
+    assert serve.guard_request("192.168.1.9:11500", "") == ""
+    assert serve.guard_request("1.2.3.4", "") != ""
     assert serve.guard_request("", "")
 
 
