@@ -14,40 +14,28 @@ frontend-v2/node_modules/
 # LanceDB index here. It is derived data — never source.
 .raggity/
 
-# internal working notes — never published. `docs/*` rather than `docs/` so the
-# one shipped guide can be re-included below: a file inside an excluded
-# DIRECTORY cannot be re-included, no matter what the negation says.
+# Internal working notes — never published, and no longer tracked. Everything
+# under `docs/` is a working note: the run-3 audit findings, the owner decisions,
+# the program backlog, the design specs. They stay on the author's machine.
+#
+# `docs/*` rather than `docs/` so the one shipped guide can be re-included below:
+# a file inside an excluded DIRECTORY cannot be re-included, no matter what the
+# negation says.
 docs/*
-# the agent-integration guide is user-facing documentation, not a working note —
-# it is shipped in the wheel/repo and pointed at from the legacy UI.
+# The agent-integration guide is user-facing documentation, not a working note —
+# it is shipped in the wheel/repo and pointed at from the legacy UI
+# (`src/rigma/data/ui/panels.js` says "see docs/AGENTS.md"), so removing it would
+# ship a dead pointer. It is the one document under `docs/` that is not internal.
 !docs/AGENTS.md
-# A SPECIFICATION is a deliverable that a reviewer, a future maintainer and CI
-# all have to be able to read, not a working note that only exists on one
-# machine — so the engine spec and the speculative-decoding spec are shipped.
-#
-# The three lines below are what actually make a file exception WORK. A bare
-# `!docs/design/<file>` after `docs/*` does nothing: `docs/*` excludes the
-# DIRECTORY `docs/design`, and git cannot re-include a file whose parent
-# directory is excluded (`git check-ignore --no-index -v` proves it — it still
-# reports `docs/*` for the path). So the directory is re-included first, its
-# contents are excluded again, and only the named files come back. That keeps
-# the intent of the rule above: re-including the directory alone would drag in
-# every other design note on this machine (`CONSTITUTION.md`, `UI-REWORK-PLAN.md`,
-# `research/`), which were never published.
-!docs/design/
-docs/design/*
-!docs/design/2026-09-25-vllm-engine-spec.md
-# Same rule, same reason: the speculative-decoding spec is what a reviewer reads
-# to check that Rigma's mode vocabulary, its per-engine translation and its
-# refusals all come from upstream rather than from memory.
-!docs/design/2026-10-05-speculative-decoding.md
 
-# Local cache of upstream files downloaded for research — llama.cpp's ggml.h,
-# ggml.c, server-context.cpp and so on, kept only so a finding can be re-checked
-# against the exact revision it cites. It is ~5.7 MB of OTHER PEOPLE'S source, so it
-# is never committed: it is not ours to redistribute, it bloats every clone, and it
-# is reproducible from the URLs the reports already carry.
+# The audit findings and the research reports were published once and are now
+# untracked. The code still cites them by name for provenance (55 comments point
+# at a findings file, a design spec or a log excerpt), which is why the reason
+# survives in the comment even though the document does not.
 #
-# The reports themselves (`_research/reports/*.md`) ARE committed — they are the
-# deliverable. Only the raw downloads are excluded.
-_research/sources/
+# `_research/sources/` was already excluded and stays so: it is ~5.7 MB of OTHER
+# PEOPLE'S source downloaded to re-check a finding against the exact revision it
+# cites — not ours to redistribute, and reproducible from the URLs the reports
+# carry.
+.scratch/
+_research/
