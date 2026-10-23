@@ -771,6 +771,14 @@ class RunPlan(BaseModel):
     flags: ComboFlags
     origin: str  # "combo:<path>" | "class:<path>" | "calculator"
     explain: list[str] = Field(default_factory=list)
+    # THE PLACEMENT RECEIPT, when the plan is a MoE. One line per budget term:
+    # the card's claimable total and what is reserved out of it, the weight
+    # split between card and host RAM, the KV charge and the expert slab with
+    # its provenance. Separate from `explain` because `explain` is printed at
+    # launch once per fit attempt and has to stay one line, while this is the
+    # detail a `--explain` reader asked for. Empty for a dense model, where
+    # there is no split to state.
+    placement: list[str] = Field(default_factory=list)
     # THE FROZEN ENGINE IDENTITY. True/False once the binary for this plan has
     # been chosen (`server_ops.engine_binary_for_plan`), None while nobody has
     # chosen one. `server_args` reads ONLY this: it never re-asks "is this the

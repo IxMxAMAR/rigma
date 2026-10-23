@@ -72,15 +72,24 @@ function Thinking({ text, live }: { text: string; live: boolean }) {
   const body = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   useEffect(() => {
-    if (!live) setOpen(false);
-  }, [live]);
-  useEffect(() => {
     // follow the newest thinking while streaming, unless the user scrolled
     // up to read something (same stickiness rule as the transcript)
     const el = body.current;
     if (el && live && stick.current) el.scrollTop = el.scrollHeight;
   }, [text, live, open]);
   if (!text) return null;
+  // THIS BLOCK USED TO FOLD ITSELF AWAY MID-TURN (owner report 2026-10-23:
+  // "the chat was progressing when the model's thinking block just vanished, so
+  // I don't know if it's processing"). `live` was derived from `turn.text === ""`,
+  // so the first answer token flipped it false and an effect collapsed the panel
+  // the reader was watching. On a multi-round turn — answer text, a tool call,
+  // then more reasoning — that is every round after the first, and the turn
+  // looked finished while it was still working.
+  //
+  // A live turn's reasoning now stays open for as long as the turn runs. It is
+  // only ever collapsed when it is a RECORD rather than a feed, which is the
+  // finished reply rendered by `Bubble` (`live={false}`). Closing it by hand is
+  // still the reader's choice and is never undone for them.
   return (
     <div className="rounded-md bg-panel/70">
       <button
@@ -89,6 +98,16 @@ function Thinking({ text, live }: { text: string; live: boolean }) {
         aria-expanded={open}
       >
         {open ? "▾" : "▸"} thinking
+        {/* The size is the cheap "is it still going?" signal: a block that has
+            stopped growing while the turn has not ended is the one case where
+            a stalled turn is worth suspecting. */}
+        <span className="ml-1.5 text-muted/70">{text.length.toLocaleString()} chars</span>
+        {live && (
+          <span
+            className="ml-2 inline-block w-1.5 h-1.5 rounded-full bg-amber animate-pulse align-middle"
+            title="still reasoning"
+          />
+        )}
       </button>
       {open && (
         <div
@@ -148,6 +167,17 @@ function Bubble({ m, tailNotice }: { m: ChatMessage; tailNotice?: string }) {
             : "max-w-full text-[14px]"
         }
       >
+        {/* The reasoning a finished reply was produced from. The server has
+            always persisted it (`thinking` on the assistant message) and the
+            transcript never drew it, so it disappeared the instant the turn
+            completed — the second half of the owner's 2026-10-23 report, where
+            the block "just vanished". Collapsed by default: it is the working
+            out, not the answer, and it can be thousands of words. */}
+        {!isUser && m.thinking && (
+          <div className="mb-2">
+            <Thinking text={m.thinking} live={false} />
+          </div>
+        )}
         {trace.length > 0 && (
           <div className="flex flex-col gap-1 mb-2">
             {trace.map((t, i) => (
@@ -469,7 +499,10 @@ function LiveTurn({ turn }: { turn: StreamingTurn }) {
           queued behind the running reply — {turn.queued} waiting
         </p>
       )}
-      <Thinking text={turn.thinking} live={turn.text === ""} />
+      {/* Inside a live turn the turn IS running, so the reasoning is always
+          live. It used to be `live={turn.text === ""}`, which collapsed the
+          panel the moment the first answer token landed — see `Thinking`. */}
+      <Thinking text={turn.thinking} live />
       {turn.chips.length > 0 && (
         <div className="flex flex-col gap-1">
           {turn.chips.map((c) => (

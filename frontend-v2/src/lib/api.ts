@@ -39,6 +39,12 @@ export interface ChatMessage {
   }[];
   variants?: unknown[];
   kind?: string;          // "tool_result" = model-context carrier, not UI
+  /** The reasoning the reply was produced from. The server has always persisted
+   *  this on an assistant message (`m["thinking"]` in serve.py) and this
+   *  interface never declared it, so the transcript dropped it: a finished
+   *  turn's thinking vanished the moment the turn completed (owner report
+   *  2026-10-23). UI-only — nothing here is fed back to the model. */
+  thinking?: string;
   notice?: string;        // server-authored status line — shown, never fed
   /** AUDIT F7: this message is a mid-turn CHECKPOINT, not a finished reply. The
    *  server replaces it in place every `CHECKPOINT_SECS` and removes it when the

@@ -1139,3 +1139,41 @@ def test_the_sweep_and_its_guards_build_a_trial_the_same_way(monkeypatch, tmp_pa
         "the flags the child was launched with are not bench._trial_flags's "
         "return value")
 
+
+def test_a_failed_row_keeps_the_end_of_the_log_not_the_banner():
+    """A losing row exists to say why it lost.
+
+    `str(e)[:200]` kept the engine's startup banner and dropped the tail where
+    the failure actually is - three stored `fa-off` rows on this machine read
+    "failed to become healthy ... loading mo" and could not be diagnosed.
+    """
+    banner = "\n".join(f"0.00.{i:03d} I cmn  common_param: verbosity = 3"
+                       for i in range(40))
+    msg = (f"llama-server failed to become healthy on :11499\n{banner}\n"
+           "last line: OOM")
+    text = bench._err_text(RuntimeError(msg))
+    assert text.startswith("llama-server failed to become healthy on :11499")
+    assert text.endswith("last line: OOM")
+    assert len(text) <= 800
+
+
+def test_a_short_error_is_kept_whole():
+    assert bench._err_text(RuntimeError("boom")) == "boom"
+
+
+def test_fa_off_is_not_trialled_at_long_context():
+    """The non-flash path is quadratic where flash attention is not.
+
+    Measured 2026-10-23: 7.2x slower at 16K, and at 32K the row does not even
+    reach healthy (three stored failures). Trialling it there is a guaranteed
+    loss that also costs the most to measure, because it is the slowest row.
+    """
+    assert bench._fa_off_axis(_plan().flags) == [("fa-off", {"flash_attn": "off"})]
+    long = _plan().model_copy(
+        update={"flags": _plan().flags.model_copy(update={"ctx": 131072})})
+    assert bench._fa_off_axis(long.flags) == []
+    assert "fa-off" not in [label for label, _ in
+                            bench.quick_configs(long.flags, False)]
+    assert "fa-off" in [label for label, _ in
+                        bench.quick_configs(_plan().flags, False)]
+

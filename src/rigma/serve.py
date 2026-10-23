@@ -300,6 +300,34 @@ def _sse(data: dict, event: str = "") -> bytes:
     return (head + "data: " + json.dumps(data) + "\n\n").encode()
 
 
+def _brief_args(args, limit: int = 3, width: int = 48) -> str:
+    """A tool call's arguments on ONE console line (owner request 2026-10-23).
+
+    The arguments are the most useful thing to see when a turn looks stuck: the
+    difference between progress and a loop is usually `path=a` versus `path=b`,
+    and a terminal that says only "tool: read_file" cannot show it. A full
+    argument dump is a wall of JSON in a pane that has to stay scannable, so
+    this keeps the first few pairs, clips each, and says how many were dropped
+    instead of ending mid-word. ASCII only: a Windows console is not UTF-8, so a
+    non-ASCII argument arrives as a run of backslash escapes and the line stops
+    being readable at a glance.
+    """
+    if not isinstance(args, dict) or not args:
+        return ""
+    parts = []
+    for key, val in list(args.items())[:limit]:
+        text = val if isinstance(val, str) else json.dumps(
+            val, ensure_ascii=True, default=str)
+        text = " ".join(str(text).split())
+        if len(text) > width:
+            text = text[:width] + "..."
+        parts.append(f"{key}={text}")
+    more = len(args) - len(parts)
+    if more > 0:
+        parts.append(f"+{more} more")
+    return "(" + ", ".join(parts) + ")"
+
+
 def _with_prefill(prefill: str, text: str) -> str:
     """llama-server continues from a trailing assistant message AND echoes that
     prefix in its output, so `text` normally already begins with the prefill.
@@ -3783,7 +3811,7 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                             + ", ".join(refused) + ".")
                 return out.strip() or "Nothing to unlock."
 
-            async def _run_call(name, cargs):
+            async def _run_call_inner(name, cargs):
                 """Run one tool (cached, capped) and resolve any image sentinel
                 into base64 vision payloads. Returns (result_text, imgs|None)."""
                 if name == "delegate":
@@ -3810,6 +3838,38 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                         result = f"loaded {len(imgs)} image(s): {names}{note}"
                     except Exception as e:
                         result, imgs = f"error loading image: {e}", None
+                return result, imgs
+
+            async def _run_call(name, cargs):
+                """`_run_call_inner`, timed and reported on the console.
+
+                Every tool call is the moment a turn either advances or stalls,
+                and until now the ONLY place it appeared was the chat UI — whose
+                thinking block collapses when a round produces text, so a turn
+                that was running its fourth tool looked exactly like a turn that
+                had finished. The terminal is the view that cannot be collapsed
+                or scrolled away, so it gets one line per call: what ran, how
+                long it took, how much it returned. Never the result itself —
+                that is already in the transcript, and a result can be a 64 KB
+                file dump.
+                """
+                began = time.monotonic()
+                _log.info("tool -> %s%s", name, _brief_args(cargs))
+                try:
+                    result, imgs = await _run_call_inner(name, cargs)
+                except BaseException as e:
+                    # A cancelled call is not a failed one, but both end the
+                    # line — and a `finally` here would report "ok" for a
+                    # CancelledError, which is the lie this line exists to avoid.
+                    _log.warning("tool <- %s %.1fs %s: %s", name,
+                                 time.monotonic() - began,
+                                 type(e).__name__, str(e)[:120])
+                    raise
+                ok = not str(result).startswith("error")
+                _log.info("tool <- %s %.1fs %s %d chars%s", name,
+                          time.monotonic() - began, "ok" if ok else "FAILED",
+                          len(result or ""),
+                          f" +{len(imgs)} image(s)" if imgs else "")
                 return result, imgs
         text, thinking, failed, resp = "", "", False, None
         usage, timings = {}, {}
@@ -4002,6 +4062,13 @@ def build_app(upstream_port: int, default_prompt: str | None = None,
                 if cancel is not None and cancel.is_set():
                     yield _sse({"note": "stopped"}, event="notice")
                     break
+                if _round:
+                    # A turn that is on its fourth round and thinking hard emits
+                    # nothing for minutes: no text, no tool call, no UI movement.
+                    # One line per round is the heartbeat that tells a person at
+                    # the terminal the server is working rather than wedged.
+                    _log.info("round %d/%d - %d tool call(s), %d chars so far",
+                              _round + 1, max_rounds, len(trace), len(text))
                 if _surface != "all" and tctx["unlocked"] != _advertised:
                     # A tool unlocked during THIS turn must be advertised from
                     # the next round on: under tool_choice:"required" the GBNF
@@ -8283,7 +8350,22 @@ def run_ui(public_port: int, upstream_port: int,
     0.0.0.0 also means every host that can route here. The ENGINE is not
     affected: models.py pins llama-server to loopback regardless, so only the
     UI is ever reachable from off-box.
+
+    THE TERMINAL IS THE OTHER VIEW (owner request 2026-10-23). Logging is
+    installed HERE, before the app is built, because nothing else in Rigma
+    installed a handler: `_log.info` went nowhere and only third-party loguru
+    (fastembed's missing-model errors) reached the console, which made a healthy
+    server look broken. `uvicorn.run` then calls `dictConfig` with
+    `disable_existing_loggers: False` and touches only its own loggers, so this
+    root handler survives — and `log_level="warning"` keeps uvicorn's own access
+    log out of the way of the activity lines this exists to show.
     """
     import uvicorn
+
+    from . import console_log
+
+    console_log.install()
+    _log.info("ui on http://%s:%d - engine on 127.0.0.1:%d",
+              host, public_port, upstream_port)
     uvicorn.run(build_app(upstream_port), host=host, port=public_port,
                 log_level="warning")

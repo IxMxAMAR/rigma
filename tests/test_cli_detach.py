@@ -117,9 +117,26 @@ def test_detach_spawns_once_the_port_is_clear(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     spawned = []
     monkeypatch.setattr(cli, "_spawn_detached", lambda port: spawned.append(port))
-    port = _free_port()  # ephemeral, not the literal 11592 a concurrent run shares
-    res = runner.invoke(cli.app, ["up", "--detach", "--port", str(port)])
-    assert res.exit_code == 0 and spawned == [port]
+    # `_free_port` binds :0, reads the port and CLOSES, so between that close and
+    # the CLI's own check the port is free for anything else to take — another
+    # test run on this machine, most often. That is a property of ephemeral
+    # allocation, not of `up --detach`, so this retries the allocation instead of
+    # asserting on the first one (it failed this way once in a full-suite run on
+    # 2026-10-23 and passed on the re-run).
+    #
+    # Only the race is retried. Any other failure — a real in-use bug, a resolve
+    # error, a non-zero exit for another reason — fails on the spot with its own
+    # output, so the retry cannot hide a regression.
+    for _ in range(5):
+        port = _free_port()  # ephemeral, not the literal 11592 a concurrent run shares
+        spawned.clear()
+        res = runner.invoke(cli.app, ["up", "--detach", "--port", str(port)])
+        if res.exit_code == 0:
+            assert spawned == [port]
+            return
+        assert "in use" in res.output.lower(), res.output
+    raise AssertionError(
+        f"lost the ephemeral-port race five times running: {res.output}")
 
 
 def test_detached_log_path_is_under_rigma_home(tmp_path, monkeypatch):

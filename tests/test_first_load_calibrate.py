@@ -22,7 +22,11 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
     spec = ModelSpec(slug="m", family="f", kind="dense", n_layers=8,
                      full_attn_layers=8, kv_heads=2, head_dim=64,
-                     native_ctx=131072,
+                     # Small on purpose: the `fa-off` row is only trialled at
+                     # short context (bench._FA_OFF_MAX_CTX), so a long-context
+                     # model would silently shrink the quick set this test
+                     # asserts the shape of.
+                     native_ctx=8192,
                      ggufs=[GgufFile(repo="r", file="m.gguf", bytes=2**30,
                                      quant="Q4")],
                      use_cases=["general"], cache_type_policy=CachePolicy())

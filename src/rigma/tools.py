@@ -16,6 +16,7 @@ import ast
 import fnmatch
 import html
 import json
+import logging
 import operator
 import os
 import re
@@ -28,6 +29,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+
+_log = logging.getLogger(__name__)
 
 # Serialises the read-modify-write inside edit_file/write_file. Re-entrant so a
 # tool that legitimately nests file work on one thread can't deadlock itself.
@@ -4649,6 +4652,33 @@ def _job_tail(job: dict, n: int = 4000) -> str:
         return "".join(job["chunks"])[-n:]
 
 
+def _job_watch(job: dict, jid: int) -> None:
+    """Report a background job's exit on the terminal (owner request 2026-10-23).
+
+    `job_output` is how the MODEL learns a job finished, and it only answers
+    when asked. A job that exited while nobody was asking therefore left the
+    console completely silent: the owner could not tell a job still running from
+    one that had died ten minutes ago, and `start_job`'s "it runs in the
+    background" was the last thing the terminal ever said about it.
+
+    One daemon thread per job (bounded by `_JOB_LIMIT` live jobs) that blocks on
+    the process and prints the one fact that is not otherwise visible without
+    polling. It never touches the output window, so it cannot race `_job_pump`.
+    """
+    try:
+        rc = job["proc"].wait()
+    except Exception:
+        rc = None
+    ran = time.time() - float(job.get("started") or time.time())
+    if job.get("killed"):
+        how = "killed"
+    elif rc == 0:
+        how = "finished"
+    else:
+        how = "FAILED"
+    _log.info("job %d %s: exit %s after %.1fs", jid, how, rc, ran)
+
+
 @tool("start_job",
       "Start a LONG-RUNNING command in the background (installs, builds, "
       "test suites, servers, renders) and return a job id immediately. "
@@ -4691,6 +4721,12 @@ def _start_job(args, ctx):
     for stream, label in ((proc.stdout, "out"), (proc.stderr, "err")):
         threading.Thread(target=_job_pump, args=(job, stream, label),
                          daemon=True).start()
+    threading.Thread(target=_job_watch, args=(job, jid), daemon=True).start()
+    # The console's half of the same fact the model is told below: a background
+    # job used to be invisible from the terminal, so "is anything happening?"
+    # had no answer that did not involve opening the chat.
+    _log.info("job %d started (pid %d): %s", jid, proc.pid,
+              " ".join(cmd.split())[:120])
     return (f"started job {jid} (pid {proc.pid}). It runs in the background — "
             f"continue other work and check it with job_output(id={jid}).")
 
@@ -4743,6 +4779,10 @@ def _kill_job(args, ctx):
     if job["proc"].poll() is not None:
         return f"job {jid} already exited ({job['proc'].poll()})"
     if _kill_tree(job["proc"].pid, job["proc"]):
+        # `_job_watch` prints the exit line; this says the kill was ASKED for,
+        # so a job that dies at once is not reported as a failure it is not.
+        job["killed"] = True
+        _log.warning("job %d kill requested (pid %d)", jid, job["proc"].pid)
         return f"job {jid} killed"
     # Say so rather than claim a kill nobody confirmed: the model, told the
     # tree died, rebinds the same port and gets "address in use" (AUDIT F35).

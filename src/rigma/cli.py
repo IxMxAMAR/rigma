@@ -976,6 +976,11 @@ def plan(use_case: str = typer.Option("general", "--use-case"),
     if explain:
         for line in rp.explain:
             typer.echo(f"  {line}")
+        # The full placement receipt, one term per line. `rigma up` keeps the
+        # one-line summary because it prints `explain` on every launch; asking
+        # for --explain is asking for the budget, and every term of it.
+        for line in rp.placement:
+            typer.echo(f"  {line}")
     if verify:
         _verify_plan_or_explain(rp, refuse=refuse)
 
