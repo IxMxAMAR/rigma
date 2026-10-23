@@ -1139,3 +1139,24 @@ def test_the_sweep_and_its_guards_build_a_trial_the_same_way(monkeypatch, tmp_pa
         "the flags the child was launched with are not bench._trial_flags's "
         "return value")
 
+
+def test_a_failed_row_keeps_the_end_of_the_log_not_the_banner():
+    """A losing row exists to say why it lost.
+
+    `str(e)[:200]` kept the engine's startup banner and dropped the tail where
+    the failure actually is - three stored `fa-off` rows on this machine read
+    "failed to become healthy ... loading mo" and could not be diagnosed.
+    """
+    banner = "\n".join(f"0.00.{i:03d} I cmn  common_param: verbosity = 3"
+                       for i in range(40))
+    msg = (f"llama-server failed to become healthy on :11499\n{banner}\n"
+           "last line: OOM")
+    text = bench._err_text(RuntimeError(msg))
+    assert text.startswith("llama-server failed to become healthy on :11499")
+    assert text.endswith("last line: OOM")
+    assert len(text) <= 800
+
+
+def test_a_short_error_is_kept_whole():
+    assert bench._err_text(RuntimeError("boom")) == "boom"
+

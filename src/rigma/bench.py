@@ -1014,6 +1014,23 @@ def _no_calibrate_expired(entry: dict, plan: RunPlan) -> bool:
         plan.model_slug, plan.flags)
 
 
+def _err_text(e: Exception, limit: int = 800) -> str:
+    """The failure, not the banner.
+
+    A failed row used `str(e)[:200]`, which keeps the START of the message — the
+    engine's startup banner. The diagnosis is the first line and the actual
+    failure is at the END of the log tail, so three stored `fa-off` rows read
+    "llama-server failed to become healthy on :11499 ... loading mo" and could
+    not be diagnosed from what was kept. A row that loses exists to say why.
+    """
+    text = str(e)
+    if len(text) <= limit:
+        return text
+    head, _, rest = text.partition("\n")
+    keep = max(limit - len(head) - 8, 0)
+    return f"{head}\n[...]\n{rest[-keep:]}" if keep else text[:limit]
+
+
 def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
               prompt_tokens: int = 2048, gen_tokens: int = 96,
               progress=None, configs=None, extra_args=None,
@@ -1098,7 +1115,7 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
                                 extra_args=extra_args)
         except Exception as e:  # a config that OOMs/crashes is a valid "loss"
             rows.append({**base, "tg_tps": 0.0, "pp_tps": 0.0, "ok": False,
-                         "error": str(e)[:200]})
+                         "error": _err_text(e)})
             continue
         try:
             res = run_bench(port, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens,
@@ -1107,7 +1124,7 @@ def run_sweep(plan: RunPlan, exe, model_path, port: int = 11601,
                          "pp_tps": res.pp_tps, "ok": True})
         except Exception as e:  # loaded but wouldn't serve — count as a loss
             rows.append({**base, "tg_tps": 0.0, "pp_tps": 0.0, "ok": False,
-                         "error": str(e)[:200]})
+                         "error": _err_text(e)})
         finally:
             srv.stop()
     rows.sort(key=lambda r: r["tg_tps"], reverse=True)
