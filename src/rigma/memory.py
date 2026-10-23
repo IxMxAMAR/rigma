@@ -636,16 +636,107 @@ _embedder_tried = False
 # two embedding spaces is not a similarity.
 _embedder_name = ""
 
+# Why dense retrieval is off, in the words of whatever refused. Reported once by
+# `get_embedder`, so "lexical only" says WHY instead of leaving a reader to guess
+# whether it is a missing cache, a broken install or a deliberate setting.
+_embedder_why = ""
+
+
+def _cache_has_model(path: str) -> bool:
+    """Does this cache dir actually contain a model?
+
+    fastembed's own layout: `models--<org>--<name>/` for a HuggingFace fetch, or
+    `<name>.tar.gz` for the GCS path it logs about. Either counts. An empty
+    directory does NOT — `%TEMP%\\fastembed_cache` exists on this machine and
+    holds nothing, and treating "the folder is there" as "the model is there" is
+    what let the fallback stay invisible.
+    """
+    if not path:
+        return False
+    try:
+        with os.scandir(path) as it:
+            return any(e.name.startswith("models--") or e.name.endswith(".tar.gz")
+                       for e in it)
+    except OSError:
+        return False
+
+
+def _embed_cache_dir() -> str:
+    """Where the embedding model lives: RIGMA_HOME, not %TEMP%.
+
+    It used to be `%TEMP%/fastembed_cache`, and %TEMP% is exactly the directory
+    Windows empties — Storage Sense, Disk Cleanup, and "delete temporary files"
+    during an update. The nomic model the owner authorised on 2026-07-20 was
+    simply gone on 2026-10-23, and nothing said so: retrieval dropped to
+    lexical-only behind four ERROR lines from fastembed. A 500 MB model is not a
+    temporary file, so it belongs beside `models/` and `engines/` where the rest
+    of Rigma's state already lives.
+
+    An install that still HAS the model under %TEMP% keeps using it: moving away
+    from a cache that works would force a re-download for no reason.
+    """
+    home = os.environ.get("RIGMA_HOME") or str(Path.home() / ".rigma")
+    here = os.path.join(home, "fastembed_cache")
+    temp = os.environ.get("TEMP") or ""
+    legacy = os.path.join(temp, "fastembed_cache") if temp else ""
+    if _cache_has_model(here):
+        return here
+    if _cache_has_model(legacy):
+        return legacy
+    return here
+
+
+def _why_of(exc: BaseException, limit: int = 90) -> str:
+    """The exception's own sentence, clipped.
+
+    `type(e).__name__` is not an answer: fastembed raises a bare `ValueError`
+    for a missing cache AND for a corrupt one, and those want different fixes.
+    Its message — "Could not load model X from any source." — at least says the
+    probe reached the loader and found nothing anywhere.
+    """
+    text = " ".join(str(exc).split())
+    if not text:
+        return type(exc).__name__
+    return text[:limit] + "..." if len(text) > limit else text
+
+
+def _quiet_fastembed_logs() -> None:
+    """Silence fastembed's own loguru sink while probing for a cached model.
+
+    fastembed reports a missing cache entry at ERROR — twice per provider, from
+    `retrieve_model_gcs` and again from `download_model` — on its OWN loguru
+    logger, which is unrelated to Rigma's `logging` and writes to stderr at
+    whatever level the process configured. On a machine whose TEMP was cleared
+    that is four red ERROR lines at startup for the exact state this module
+    calls supported: "lexical-only, which is a working (if weaker) retrieval
+    mode, not an error". The owner read them as a failure, which is the right
+    reading of an ERROR line and the wrong reading of this situation.
+
+    So the probe runs quiet and the outcome is reported ONCE, in Rigma's own
+    words, by `get_embedder`. `RIGMA_MEMORY_EMBED_DEBUG=1` keeps fastembed's
+    output for the case where the probe itself is what is being debugged.
+    """
+    if os.environ.get("RIGMA_MEMORY_EMBED_DEBUG"):
+        return
+    try:
+        from loguru import logger as _loguru
+    except Exception:
+        return
+    _loguru.disable("fastembed")
+
 
 def get_embedder():
-    global _embedder, _embedder_tried, _embedder_name
+    global _embedder, _embedder_tried, _embedder_name, _embedder_why
     if _embedder_tried:
         return _embedder
     _embedder_tried = True
     if os.environ.get("RIGMA_MEMORY_EMBED") == "0":
+        _embedder_why = "RIGMA_MEMORY_EMBED=0"
         return None
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    cache = os.path.join(os.environ.get("TEMP", ""), "fastembed_cache")
+    cache = _embed_cache_dir()
+    _quiet_fastembed_logs()
+    why: list[str] = []
     try:
         from fastembed import TextEmbedding
         for name in _EMBED_MODELS:
@@ -654,12 +745,18 @@ def get_embedder():
                 _embedder_name = name       # R3-MEM-1: remember WHICH space
                 log.info("memory: dense retrieval via %s", name)
                 break
-            except Exception:
+            except Exception as e:
+                why.append(f"{name.split('/')[-1]}: {_why_of(e)}")
                 continue
-    except Exception:
+    except Exception as e:
         _embedder = None
+        why.append(f"fastembed unavailable: {_why_of(e)}")
     if _embedder is None:
-        log.info("memory: no cached embedding model — lexical retrieval only")
+        _embedder_why = "; ".join(why) or "no provider listed"
+        log.info("memory: dense retrieval OFF - lexical (BM25) only. No cached "
+                 "embedding model under %s (%s). This is a supported mode, not "
+                 "a failure; RIGMA_MEMORY_EMBED_DEBUG=1 shows fastembed's own "
+                 "diagnostics.", cache, _embedder_why)
     return _embedder
 
 

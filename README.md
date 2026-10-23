@@ -59,6 +59,34 @@ legacy UI at `/rizz`.
 `--ctx N` · `--reasoning on|off|auto` · `--reasoning-budget N` · `--fa on|off|auto` ·
 `--spec none|draft-mtp|…` · `--detach` · `--no-calibrate` · `--yes` · `--dry-run`
 
+### What the terminal shows
+
+The console is the second view of a running chat, and the one that cannot be collapsed,
+scrolled away or replaced when a turn completes. While Rigma serves, it prints one line
+per thing that happens:
+
+```
+01:57:28 INFO  serve        ui on http://127.0.0.1:11500 - engine on 127.0.0.1:11499
+01:57:41 INFO  serve        tool -> read_file(path=C:/proj/app.py)
+01:57:41 INFO  serve        tool <- read_file 0.0s ok 1841 chars
+01:57:52 INFO  serve        round 2/1000 - 1 tool call(s), 240 chars so far
+01:57:52 INFO  tools        job 1 started (pid 4242): pytest -q
+01:58:09 INFO  tools        job 1 finished: exit 0 after 17.1s
+```
+
+The arguments are clipped on purpose (the result is already in the transcript, and a
+result can be a 64 KB file dump). Third-party chatter - fastembed's cache probe, httpx -
+is held at warning so it cannot bury these lines.
+
+- `RIGMA_LOG=0` installs no handler, for a supervisor that captures the output itself.
+- `RIGMA_LOG_LEVEL=DEBUG` for more.
+- `RIGMA_MEMORY_EMBED_DEBUG=1` lets fastembed's own diagnostics through when the
+  embedding model is what is being debugged.
+
+The optional dense-retrieval model lives in `~/.rigma/fastembed_cache` (it used to be in
+`%TEMP%`, which Windows empties). Missing it is not an error: memory falls back to
+lexical (BM25) retrieval and says so once at startup.
+
 ## Status
 
 Pre-alpha (M5). `rigma bench` records machine-local calibration that outranks registry

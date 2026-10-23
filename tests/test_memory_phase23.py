@@ -215,9 +215,10 @@ def test_replay_r_at_3_lexical(step, expect):
 
 
 @pytest.mark.skipif(
-    not (os.environ.get("TEMP")
-         and os.path.isdir(os.path.join(os.environ["TEMP"], "fastembed_cache",
-                                        "models--nomic-ai--nomic-embed-text-v1.5"))),
+    # The cache moved out of %TEMP% (a model is not a temporary file); ask
+    # memory where it actually lives rather than hard-coding either place.
+    not os.path.isdir(os.path.join(memory._embed_cache_dir(),
+                                   "models--nomic-ai--nomic-embed-text-v1.5")),
     reason="nomic not cached")
 @pytest.mark.parametrize("step,expect", _REPLAY)
 def test_replay_r_at_3_hybrid(step, expect, monkeypatch):
