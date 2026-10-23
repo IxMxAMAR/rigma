@@ -171,6 +171,14 @@ def _is_private_literal(host: str) -> bool:
         addr = ipaddress.ip_address(h)
     except ValueError:
         return False
+    # Decide a v4-mapped v6 literal by the v4 address inside it. `is_global` on
+    # the v6 form only follows `ipv4_mapped` from 3.11.13 / 3.12.4 onward; on
+    # the 3.11 the CI image ships, `::ffff:100.65.31.217` answers is_global=True,
+    # so the CGNAT form this docstring promises to admit was refused there — the
+    # one leg that failed the serve test was windows-latest / 3.11.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
     return not addr.is_global
 
 
