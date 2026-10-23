@@ -316,6 +316,32 @@ def test_the_receipt_matches_the_flags_that_launch(tmp_path, monkeypatch):
         assert "offloaded" not in head, (head, plan.flags)
 
 
+def test_a_dense_model_states_its_budget_too(tmp_path, monkeypatch):
+    """The receipt used to speak only for MoE models.
+
+    A dense model has no expert slab, but it has the same budget, and "does this
+    fit on the card at all" is the same arithmetic. Leaving it out meant the one
+    case where the reader can least check the answer — a dense model that
+    overcommits pages instead of refusing — was the one with no receipt.
+    """
+    from rigma.models import CachePolicy, GgufFile, ModelSpec
+    from rigma.registry import Registry
+    from rigma.resolve import resolve
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    spec = ModelSpec(slug="dense", family="qwen3", kind="dense", n_layers=40,
+                     full_attn_layers=40, kv_heads=4, head_dim=128,
+                     native_ctx=8192, use_cases=["general"],
+                     cache_type_policy=CachePolicy(),
+                     ggufs=[GgufFile(repo="r", file="d.gguf",
+                                     bytes=13 * 2**30, quant="Q4_K_M")])
+    plan = resolve(_card(), Registry([], {"dense": spec}, {}),
+                   use_case="general")
+    assert plan.placement, plan.explain
+    assert plan.placement[0].startswith("placement: dense"), plan.placement
+    assert any(ln.strip().startswith("card") for ln in plan.placement)
+    assert not any(ln.strip().startswith("host") for ln in plan.placement)
+
+
 def test_a_fallback_states_its_split_too(tmp_path, monkeypatch):
     """A fallback is a launch candidate, not a label.
 

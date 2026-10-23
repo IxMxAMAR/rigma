@@ -106,6 +106,12 @@ class TierPlan:
         attempt. What the reader needs from a launch log is the split and the
         RAM it costs, and that is one line.
         """
+        if self.expert_mb <= 0:
+            # A dense model has no expert slab: every weight is on the card or
+            # the model does not fit at all. The budget is still worth stating,
+            # because it is the same arithmetic that decides that.
+            return (f"placement: dense, all {self.n_layers} layers on the card, "
+                    f"headroom {self.headroom_mb:.0f}MB")
         return (f"placement: {self.n_layers - self.n_off}/{self.n_layers} layers' "
                 f"experts on the card ({self.expert_share_on_card:.0%} of expert "
                 f"bytes), {self.host_weights_mb:.0f}MB to RAM "
@@ -113,10 +119,16 @@ class TierPlan:
 
     def receipt(self) -> tuple[str, ...]:
         """The plan, one term per line — the thing a bug report can be read from."""
-        out = [
-            f"placement: {self.n_layers - self.n_off}/{self.n_layers} layers' experts "
-            f"on the card ({self.expert_share_on_card:.0%} of expert bytes)"
-            + ("" if self.n_off == 0 else f", {self.n_off} offloaded"),
+        if self.expert_mb <= 0:
+            out = [f"placement: dense model, all {self.n_layers} layers on the card"]
+        else:
+            out = [
+                f"placement: {self.n_layers - self.n_off}/{self.n_layers} layers' "
+                f"experts on the card ({self.expert_share_on_card:.0%} of expert "
+                f"bytes)"
+                + ("" if self.n_off == 0 else f", {self.n_off} offloaded"),
+            ]
+        out += [
             # The reserve is named because it is the term most often mistaken for
             # free memory: on Windows it is max(1200MB floor, measured desktop) +
             # the compute buffer, and a plan that ignores it is the overcommit
@@ -128,9 +140,13 @@ class TierPlan:
             f"kv {self.kv_mb:.0f}"
             + (f" + other {self.extra_mb:.0f}" if self.extra_mb else "")
             + f", headroom {self.headroom_mb:.0f}MB",
-            f"  host   {self.host_weights_mb:.0f}MB of {self.usable_ram_mb:.0f}MB RAM",
-            f"  slab   {self.expert_mb:.0f}MB experts ({self.slab_note})",
         ]
+        if self.expert_mb > 0:
+            out += [
+                f"  host   {self.host_weights_mb:.0f}MB of "
+                f"{self.usable_ram_mb:.0f}MB RAM",
+                f"  slab   {self.expert_mb:.0f}MB experts ({self.slab_note})",
+            ]
         return tuple(out)
 
 

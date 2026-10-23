@@ -1519,7 +1519,7 @@ def _tier_plan(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     projector — so a placement Rigma did not choose can still be stated in the
     same currency as one it did.
     """
-    if spec.moe is None or spec.n_layers <= 0:
+    if spec.n_layers <= 0:
         return None
     usable_vram, usable_ram = _budgets(profile, ubatch=launch_ubatch(spec))
     k, v = flags.cache_type_k, flags.cache_type_v
@@ -1527,7 +1527,15 @@ def _tier_plan(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
              + swa_kv_bytes(spec, k, v, flags.ctx) / 2**20
              + recurrent_state_mb(spec) * LAUNCH_PARALLEL)
     mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
-    expert_mb, exact, note = placement.expert_slab_mb(spec, gguf)
+    if spec.moe is None:
+        # A dense model has no expert slab to split, but it still has a budget,
+        # and "does this fit on the card at all" is the same arithmetic that
+        # decides a MoE split. Leaving it out made the receipt speak only for
+        # MoE models — the one case where a reader can least check it, because a
+        # dense model that overcommits pages instead of refusing.
+        expert_mb, exact, note = 0.0, True, "dense model"
+    else:
+        expert_mb, exact, note = placement.expert_slab_mb(spec, gguf)
     # What the card gives up before the plan starts: the per-OS floor, the
     # desktop's measured hold (whichever is larger, see `_budgets`) and the
     # compute buffer. Stated rather than inferred, because it is the term most
