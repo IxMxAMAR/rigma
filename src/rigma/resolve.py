@@ -1532,8 +1532,20 @@ def _tier_plan(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
         usable_vram, usable_ram, spec.n_layers, exact, note, reserved_mb)
 
 
+def _fits_with_slack(tier: placement.TierPlan) -> bool:
+    """Whether a placement is within the slack the combo check allows.
+
+    Same tolerance `_combo_rejection` applies to a combo's declared budget:
+    usable VRAM is measured against the desktop's live load, which drifts by
+    gigabytes, so a plan that reads a little over on a busy afternoon is not a
+    finding — and re-deriving a plan on that reading would throw away verified
+    tuning for noise.
+    """
+    return tier.headroom_mb >= -_COMBO_BUDGET_SLACK * tier.claimable_mb
+
+
 def _note_tier_plan(plan: RunPlan, spec: ModelSpec,
-                    profile: HardwareProfile) -> None:
+                    profile: HardwareProfile) -> placement.TierPlan | None:
     """State a curated combo's split, and say when it no longer fits here.
 
     Radiance states every budget before it allocates anything; the combo path
@@ -1542,23 +1554,21 @@ def _note_tier_plan(plan: RunPlan, spec: ModelSpec,
     cannot be placed at all — this is the same question asked about the WEIGHTS,
     which can be over budget while the cache still fits.
 
-    The warning is slack-tolerant on purpose: usable VRAM is measured against
-    the desktop's live load, which drifts by gigabytes, and a combo that reads
-    as 200 MB over on a busy afternoon is not a finding.
+    Returns the plan so the caller can act on it rather than only print it.
     """
     tier = _tier_plan(spec, plan.gguf, profile, plan.flags)
     if tier is None:
-        return
+        return None
     plan.explain.append(tier.summary)
     plan.placement = list(tier.receipt())
-    over_mb = -tier.headroom_mb
-    if over_mb > _COMBO_BUDGET_SLACK * tier.claimable_mb:
+    if not _fits_with_slack(tier):
         plan.explain.append(
             f"WARNING: that placement does not fit right now - {tier.card_mb:.0f}MB "
             f"of weights and cache against {tier.claimable_mb:.0f}MB usable VRAM "
-            f"(over by {over_mb:.0f}MB). The engine will page over PCIe or fail "
-            f"at launch; `rigma recalibrate` re-tunes this model, or pass "
+            f"(over by {-tier.headroom_mb:.0f}MB). The engine will page over PCIe "
+            f"or fail at launch; `rigma recalibrate` re-tunes this model, or pass "
             f"--model to re-derive the fit instead of using the combo.")
+    return tier
 
 
 def _tier_note(rel: str, profile: HardwareProfile) -> list[str]:
@@ -1645,8 +1655,22 @@ def resolve(profile: HardwareProfile, registry: Registry,
                 # AFTER calibration and launch defaults: those can move
                 # `n_cpu_moe`, and the point of the note is what will actually
                 # launch, not what the combo file said.
-                _note_tier_plan(plan, spec, profile)
-                return plan
+                tier = _note_tier_plan(plan, spec, profile)
+                if tier is None or _fits_with_slack(tier):
+                    return plan
+                # The combo's own placement does not fit. A curated combo pins
+                # `n_cpu_moe` for a hardware CLASS, and a class is not this
+                # afternoon's free VRAM; launching it anyway is the overcommit
+                # Windows answers by paging weights over PCIe on every token
+                # (measured 2026-08-21, decode at 21% of card bandwidth). Fall
+                # through to the fit calculator, which solves the same budget
+                # from the measured slab. The combo still wins whenever it
+                # fits, so its verified tuning is overridden only when the
+                # alternative is a launch that pages.
+                why = (f"its placement does not fit this machine right now - "
+                       f"{tier.card_mb:.0f}MB of weights and cache against "
+                       f"{tier.claimable_mb:.0f}MB usable VRAM "
+                       f"(over by {-tier.headroom_mb:.0f}MB)")
             rejected = [f"registry {kind} '{rel}' NOT used: {why}",
                         "falling back to the fit calculator"]
     if model_override:

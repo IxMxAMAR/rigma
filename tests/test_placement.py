@@ -289,6 +289,28 @@ def test_the_plan_carries_the_full_receipt(tmp_path, monkeypatch):
     assert sum(1 for ln in plan.explain if ln.startswith("placement:")) == 1
 
 
+def test_an_over_budget_combo_falls_back_to_the_calculator(tmp_path, monkeypatch):
+    """A combo pins `n_cpu_moe` for a hardware CLASS, not for this afternoon.
+
+    It still wins whenever it fits — its sources are measured benchmarks, and
+    that is worth more than arithmetic. But when its own placement is over
+    budget, the calculator's arithmetic has to take over: the alternative is a
+    launch Windows answers by paging weights over PCIe on every token.
+    """
+    from rigma import resolve as R
+    from rigma.registry import Registry
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    # Let the combo through its own checks (declared budget, ctx placement) so
+    # the ONLY thing rejecting it is the placement this test is about.
+    monkeypatch.setattr(R, "_combo_rejection", lambda *a, **k: "")
+    profile = _card()
+    profile.vram_used_mb = 14000.0     # same 16GB card, a desktop that is using it
+    plan = R.resolve(profile, Registry.load(), use_case="coding")
+    assert not plan.origin.startswith("combo:"), plan.origin
+    assert any("NOT used" in ln and "does not fit" in ln for ln in plan.explain), \
+        plan.explain
+
+
 def test_a_curated_combo_states_its_split(tmp_path, monkeypatch):
     """The combo path is the DEFAULT on verified hardware, and it used to say
     nothing about the placement it pinned — so an over-committed combo and a
