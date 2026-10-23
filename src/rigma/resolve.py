@@ -1420,15 +1420,15 @@ def _calculate(profile: HardwareProfile, registry: Registry,
                 if flags:
                     flags = _grow_ctx(spec, gguf, profile, flags, explain,
                                       backend=be)
-                    plan = RunPlan(model_slug=spec.slug, gguf=gguf,
+                    # The receipt is NOT attached here: `resolve` applies the
+                    # model's launch defaults and the calibration entry AFTER
+                    # this returns, and both can move `n_cpu_moe`, ctx and the
+                    # KV type. A receipt drawn before them would describe a plan
+                    # that is not the one about to launch.
+                    return RunPlan(model_slug=spec.slug, gguf=gguf,
                                    backend=be,
                                    flags=flags,
                                    origin="calculator", explain=explain)
-                    # The fit path gets the same receipt the combo path does:
-                    # `_fit_with_cache` chose the split, and this states it in
-                    # the terms a reader can check against Task Manager.
-                    _note_tier_plan(plan, spec, profile)
-                    return plan
                 ctx = _next_ctx_rung(ctx, floor)
     return None
 
@@ -1694,7 +1694,14 @@ def resolve(profile: HardwareProfile, registry: Registry,
             plan.explain = rejected + list(plan.explain)
         plan = _with_launch_defaults(plan, registry.models.get(plan.model_slug),
                                      profile)
-        return _apply_calibration(plan, profile)
+        plan = _apply_calibration(plan, profile)
+        # AFTER launch defaults and calibration, both of which can move
+        # `n_cpu_moe`, ctx and the KV type: the receipt has to describe the plan
+        # that launches, not the one the solver first proposed.
+        calc_spec = registry.models.get(plan.model_slug)
+        if calc_spec is not None:
+            _note_tier_plan(plan, calc_spec, profile)
+        return plan
     # absolute floor: smallest model, smallest quant, CPU
     have_ggufs = [m for m in registry.models.values() if m.ggufs]
     if not have_ggufs:

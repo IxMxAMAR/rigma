@@ -297,6 +297,25 @@ def test_the_plan_carries_the_full_receipt(tmp_path, monkeypatch):
     assert sum(1 for ln in plan.explain if ln.startswith("placement:")) == 1
 
 
+def test_the_receipt_matches_the_flags_that_launch(tmp_path, monkeypatch):
+    """The receipt must describe the plan that launches, not the one the solver
+    first proposed.
+
+    Launch defaults and the calibration entry are applied AFTER the fit, and
+    both can move `n_cpu_moe` — so a receipt drawn inside the fit would state a
+    split the launch never uses, which is worse than stating none.
+    """
+    from rigma.resolve import resolve
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    plan = resolve(_card(), _moe_registry(), use_case="general")
+    assert plan.placement, plan.explain
+    head = plan.placement[0]
+    if plan.flags.n_cpu_moe:
+        assert f", {plan.flags.n_cpu_moe} offloaded" in head, (head, plan.flags)
+    else:
+        assert "offloaded" not in head, (head, plan.flags)
+
+
 def test_a_fallback_states_its_split_too(tmp_path, monkeypatch):
     """A fallback is a launch candidate, not a label.
 
