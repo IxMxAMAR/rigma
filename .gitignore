@@ -14,28 +14,20 @@ frontend-v2/node_modules/
 # LanceDB index here. It is derived data — never source.
 .raggity/
 
-# Internal working notes — never published, and no longer tracked. Everything
-# under `docs/` is a working note: the run-3 audit findings, the owner decisions,
-# the program backlog, the design specs. They stay on the author's machine.
+# Working notes. Everything under `docs/` is written for the author rather than
+# for the distribution, so only the one guide that ships is tracked.
 #
-# `docs/*` rather than `docs/` so the one shipped guide can be re-included below:
-# a file inside an excluded DIRECTORY cannot be re-included, no matter what the
-# negation says.
+# `docs/*` rather than `docs/` so that guide can be re-included below: a file
+# inside an excluded DIRECTORY cannot be re-included, no matter what the negation
+# says.
 docs/*
-# The agent-integration guide is user-facing documentation, not a working note —
-# it is shipped in the wheel/repo and pointed at from the legacy UI
-# (`src/rigma/data/ui/panels.js` says "see docs/AGENTS.md"), so removing it would
-# ship a dead pointer. It is the one document under `docs/` that is not internal.
+# The agent-integration guide is user-facing documentation — shipped in the wheel
+# and pointed at from the legacy UI (`src/rigma/data/ui/panels.js` says "see
+# docs/AGENTS.md"), so removing it would ship a dead pointer.
 !docs/AGENTS.md
 
-# The audit findings and the research reports were published once and are now
-# untracked. The code still cites them by name for provenance (55 comments point
-# at a findings file, a design spec or a log excerpt), which is why the reason
-# survives in the comment even though the document does not.
-#
-# `_research/sources/` was already excluded and stays so: it is ~5.7 MB of OTHER
-# PEOPLE'S source downloaded to re-check a finding against the exact revision it
-# cites — not ours to redistribute, and reproducible from the URLs the reports
-# carry.
+# Scratch space and downloaded reference material. The second is other people's
+# source, kept only to re-check a claim against the revision it cites — not ours
+# to redistribute, and reproducible from the URLs the notes carry.
 .scratch/
 _research/
