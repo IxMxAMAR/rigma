@@ -71,7 +71,7 @@ jobs:
           fi
 
   build:
-    name: Build sdist + wheel
+    name: Build wheel
     needs: verify
     runs-on: ubuntu-latest
     steps:
@@ -84,7 +84,15 @@ jobs:
       - name: Build
         run: |
           python -m pip install --upgrade build
-          python -m build
+          # --wheel, not a bare `build`: the sdist is the whole source tree in a
+          # tarball, and PyPI keeps uploaded files permanently (yanking hides a
+          # release from the resolver, it does not delete the file). The wheel
+          # carries the same modules — nothing here is hidden — but it is the
+          # artefact pip actually installs, and publishing one file instead of
+          # two means a release cannot be downloaded as a browsable tree by
+          # accident. A source release is a deliberate act: build the sdist by
+          # hand and upload it if that is what is wanted.
+          python -m build --wheel
       - name: Check metadata
         run: |
           python -m pip install --upgrade twine
