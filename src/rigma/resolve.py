@@ -1450,9 +1450,16 @@ def fallback_plans(plan: RunPlan, registry: Registry,
                 if flags is None:
                     ctx = _next_ctx_rung(ctx, floor)
             if flags is not None:
-                out.append(_apply_calibration(RunPlan(
+                fb = _apply_calibration(RunPlan(
                     model_slug=spec.slug, gguf=gguf, backend=plan.backend,
-                    flags=flags, origin="fallback", explain=explain), profile))
+                    flags=flags, origin="fallback", explain=explain), profile)
+                # A fallback is a real launch candidate, not a label. This is the
+                # path that runs after a launch has ALREADY failed, so it is the
+                # worst possible place to omit the budget: a fallback that pages
+                # over PCIe is not a fallback, it is the same failure with a
+                # smaller model.
+                _note_tier_plan(fb, spec, profile)
+                out.append(fb)
     have_ggufs = [m for m in registry.models.values() if m.ggufs]
     if have_ggufs:
         floor_spec = min(have_ggufs, key=lambda m: m.ggufs[-1].bytes)

@@ -211,6 +211,14 @@ def _card(vram_mb=16304):
         {"vendor_id": 0x1002, "name": "AMD Radeon RX 9070 XT",
          "vram_mb": vram_mb, "device_type": 2}])
     p.vram_used_mb = 512.0
+    # RAM as well. The probe reports what this machine has FREE right now, so a
+    # model load — the owner's, or a benchmark running in another window — moves
+    # these tests' verdicts: with 4.8GB free instead of 7GB the curated combo
+    # stopped passing its own budget check and three tests failed for a reason
+    # that had nothing to do with the code. Pin both and the budget is a
+    # constant.
+    p.ram_mb = 32768.0
+    p.ram_free_mb = 30000.0
     return p
 
 
@@ -287,6 +295,35 @@ def test_the_plan_carries_the_full_receipt(tmp_path, monkeypatch):
     assert plan.placement and plan.placement[0].startswith("placement:")
     assert len(plan.placement) == 5
     assert sum(1 for ln in plan.explain if ln.startswith("placement:")) == 1
+
+
+def test_a_fallback_states_its_split_too(tmp_path, monkeypatch):
+    """A fallback is a launch candidate, not a label.
+
+    `fallback_plans` built its plans with no budget at all, so the one path that
+    runs AFTER a launch has already failed was the one that could not say
+    whether it would fit either.
+    """
+    from rigma.models import CachePolicy, GgufFile, ModelSpec, MoESpec
+    from rigma.registry import Registry
+    from rigma.resolve import fallback_plans
+    monkeypatch.setenv("RIGMA_HOME", str(tmp_path))
+    spec = ModelSpec(
+        slug="moe", family="qwen3", kind="moe", n_layers=40,
+        full_attn_layers=40, kv_heads=4, head_dim=128, native_ctx=8192,
+        use_cases=["general"], cache_type_policy=CachePolicy(),
+        moe=MoESpec(total_b=35.0, active_b=3.0, expert_weight_fraction=0.93),
+        ggufs=[GgufFile(repo="r", file="big.gguf", bytes=20 * 2**30,
+                        quant="Q5_K_M"),
+               GgufFile(repo="r", file="small.gguf", bytes=14 * 2**30,
+                        quant="Q4_K_M")])
+    reg = Registry([], {"moe": spec}, {})
+    primary = _run_plan(spec, spec.ggufs[0], n_cpu_moe=20, ctx=8192)
+    out = fallback_plans(primary, reg, _card())
+    assert out, "no fallback produced"
+    fb = out[0]
+    assert fb.origin == "fallback" and fb.gguf.quant == "Q4_K_M"
+    assert fb.placement and fb.placement[0].startswith("placement:"), fb.explain
 
 
 def test_an_over_budget_combo_falls_back_to_the_calculator(tmp_path, monkeypatch):
