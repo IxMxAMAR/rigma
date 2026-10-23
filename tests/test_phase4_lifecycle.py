@@ -342,11 +342,19 @@ def test_a_model_pause_that_is_never_answered_releases_the_slot(engine,
     active.json still points at it, so every subsequent POST /api/runs is
     refused with 409 (AUDIT F44)."""
     hold = threading.Event()
+    entered = threading.Event()
     _E4.hold = hold
+    _E4.entered = entered
     _E4.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
     c = _client(engine)
     rid = c.post("/api/runs", json={"mission": "small job",
                                     "budget_hours": 1}).json()["id"]
+    # Wait for the loop to be INSIDE its held turn before writing the fabricated
+    # pause, for the reason spelled out above: writing it earlier races the
+    # loop's own top-of-iteration pause check, and the run can reach the idle
+    # halt before the pause is ever observed. It did, on every CI runner:
+    # status='stalled' iteration=7 halt_reason='no progress / idle'.
+    assert entered.wait(10), "the run never reached its first engine turn"
     r = runs.load(rid)
     r["paused"] = True
     r["pending_question"] = {"q": "which folder?"}
@@ -362,11 +370,17 @@ def test_an_owner_pause_is_never_expired(engine, tmp_path):
     """The pause BUTTON is a deliberate choice — only a pending question is
     bounded (AUDIT F44)."""
     hold = threading.Event()
+    entered = threading.Event()
     _E4.hold = hold
+    _E4.entered = entered
     _E4.script = [("manage_plan", {"action": "add", "task": "step one"}), None]
     c = _client(engine)
     rid = c.post("/api/runs", json={"mission": "small job",
                                     "budget_hours": 1}).json()["id"]
+    # Same wait, same reason as the two pause tests above. Without it the
+    # fabricated pause can be written before the loop's first pause check and
+    # the run reaches the idle halt instead of staying deliberately paused.
+    assert entered.wait(10), "the run never reached its first engine turn"
     r = runs.load(rid)
     r["paused"] = True
     r.pop("pending_question", None)

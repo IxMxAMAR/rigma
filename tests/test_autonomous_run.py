@@ -26,6 +26,7 @@ class _Engine(BaseHTTPRequestHandler):
     err_status = 0
     err_body = ""
     gate = None          # threading.Event: hold the turn OPEN after the 1st chunk
+    entered = None       # threading.Event: set the moment a turn is inside `gate`
     bodies = []          # every request body the engine received
     compile_reply = "not a spec"   # mission compiler falls back by default
     usage = None         # AUDIT 03-2: engine usage to report on each turn
@@ -86,6 +87,8 @@ class _Engine(BaseHTTPRequestHandler):
             sse({"choices": [{"delta": {}}], "usage": _Engine.usage,
                  "timings": _Engine.timings or {}})
         if _Engine.gate is not None:      # hold the turn open, deterministically
+            if _Engine.entered is not None:
+                _Engine.entered.set()
             _Engine.gate.wait(timeout=10)
         self.wfile.write(b"data: [DONE]\n\n")
 
@@ -111,6 +114,7 @@ def home(tmp_path, monkeypatch):
     _Engine.err_status = 0
     _Engine.err_body = ""
     _Engine.gate = None
+    _Engine.entered = None
     _Engine.bodies = []
     _Engine.compile_reply = "not a spec"
     _Engine.usage = None
@@ -589,11 +593,19 @@ def test_run_control_endpoints(engine):
 
     # A LIVE run accepts the same three, and the writes land.
     hold = threading.Event()
+    entered = threading.Event()
     _Engine.gate = hold                 # keep the driver alive, mid-turn
+    _Engine.entered = entered
     _Engine.script = [None]
     rid = c.post("/api/runs", json={"mission": "control",
                                     "budget_hours": 1}).json()["id"]
     try:
+        # The driver has to be ALIVE for the control endpoints to accept: a run
+        # whose loop has not started yet is exactly the no-driver case asserted
+        # above, so it answers 409. Waiting for the turn to be in progress is
+        # what makes that distinction deterministic - reading a status field
+        # does not, because the field is written before the loop runs.
+        assert entered.wait(10), "the run never reached its first engine turn"
         assert c.post(f"/api/runs/{rid}/inject",
                       json={"message": "use bs4"}).json()["queued"] is True
         assert runs.load(rid)["steer_queue"] == ["use bs4"]
