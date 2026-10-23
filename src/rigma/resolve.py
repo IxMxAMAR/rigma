@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import math
 import re
 
 from pydantic import ValidationError
 
+from . import placement
 from .models import (CACHE_BYTES, ENGINE_DEFAULT_UBATCH, LAUNCH_PARALLEL,
                      MIN_LAUNCH_CTX, CachePolicy, ComboFlags, GgufFile,
                      HardwareProfile, ModelSpec, RunPlan)
@@ -869,13 +869,24 @@ def _fit_with_cache(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
     # guards the same case; without a layer count there is nothing to place.
     if spec.n_layers <= 0:
         return None
-    expert_mb = file_mb * spec.moe.expert_weight_fraction
-    per_layer = expert_mb / spec.n_layers
-    need_off = max(0.0, file_mb + mm_mb + kv_mb + rs_mb - usable_vram)
-    n_off = math.ceil(need_off / per_layer) if need_off else 0
-    if n_off <= spec.n_layers and n_off * per_layer <= usable_ram:
-        return ComboFlags(ctx=ctx, n_cpu_moe=n_off, cache_type_k=k, cache_type_v=v)
-    return None
+    # The expert slab comes from the file's TENSOR TABLE when it can be read
+    # (`placement.expert_slab_mb`), and from the parameter ratio only when it
+    # cannot. The ratio is a parameter share applied to a byte total, so it is
+    # wrong by however much the experts' quant differs from the trunk's — see
+    # the module docstring. The receipt below says which one this launch used,
+    # because a plan built on a fallback should be diagnosable as such.
+    expert_mb, exact, slab_note = placement.expert_slab_mb(spec, gguf)
+    plan = placement.split(
+        expert_mb=expert_mb, file_mb=file_mb, kv_mb=kv_mb + rs_mb,
+        extra_mb=mm_mb, claimable_mb=usable_vram, usable_ram_mb=usable_ram,
+        n_layers=spec.n_layers, exact=exact, slab_note=slab_note)
+    if plan is None:
+        return None
+    # The split is NOT reported here. This runs once per cache type the ladder
+    # tries and again for every ctx candidate, so a line per attempt would print
+    # the same split five times; `_note_tier_plan` states it once, on the plan
+    # that was actually chosen.
+    return ComboFlags(ctx=ctx, n_cpu_moe=plan.n_off, cache_type_k=k, cache_type_v=v)
 
 
 def _apply_launch_ngl(spec: ModelSpec, flags: ComboFlags, allowed: int,
@@ -1409,10 +1420,15 @@ def _calculate(profile: HardwareProfile, registry: Registry,
                 if flags:
                     flags = _grow_ctx(spec, gguf, profile, flags, explain,
                                       backend=be)
-                    return RunPlan(model_slug=spec.slug, gguf=gguf,
+                    plan = RunPlan(model_slug=spec.slug, gguf=gguf,
                                    backend=be,
                                    flags=flags,
                                    origin="calculator", explain=explain)
+                    # The fit path gets the same receipt the combo path does:
+                    # `_fit_with_cache` chose the split, and this states it in
+                    # the terms a reader can check against Task Manager.
+                    _note_tier_plan(plan, spec, profile)
+                    return plan
                 ctx = _next_ctx_rung(ctx, floor)
     return None
 
@@ -1485,6 +1501,64 @@ def _combo_rejection(combo, spec: ModelSpec, gguf: GgufFile,
         return (f"its ctx {combo.flags.ctx} can no longer be placed in "
                 f"{usable_vram:.0f}MB usable VRAM")
     return ""
+
+
+def _tier_plan(spec: ModelSpec, gguf: GgufFile, profile: HardwareProfile,
+               flags: ComboFlags) -> placement.TierPlan | None:
+    """The budget a GIVEN set of flags implies, for reporting.
+
+    Charges the same terms `_fit_with_cache` charges — KV (including the
+    windowed layers' own cache), recurrent state per parallel slot, the vision
+    projector — so a placement Rigma did not choose can still be stated in the
+    same currency as one it did.
+    """
+    if spec.moe is None or spec.n_layers <= 0:
+        return None
+    usable_vram, usable_ram = _budgets(profile, ubatch=launch_ubatch(spec))
+    k, v = flags.cache_type_k, flags.cache_type_v
+    kv_mb = (flags.ctx * kv_bytes_per_token(spec, k, v) / 2**20
+             + swa_kv_bytes(spec, k, v, flags.ctx) / 2**20
+             + recurrent_state_mb(spec) * LAUNCH_PARALLEL)
+    mm_mb = spec.mmproj.bytes / 2**20 if spec.mmproj else 0.0
+    expert_mb, exact, note = placement.expert_slab_mb(spec, gguf)
+    # What the card gives up before the plan starts: the per-OS floor, the
+    # desktop's measured hold (whichever is larger, see `_budgets`) and the
+    # compute buffer. Stated rather than inferred, because it is the term most
+    # often mistaken for free memory.
+    total_vram = sum(g.vram_mb for g in (profile.gpus or []))
+    reserved_mb = max(total_vram - usable_vram, 0.0)
+    return placement.from_offload(
+        flags.n_cpu_moe, expert_mb, gguf.bytes / 2**20, kv_mb, mm_mb,
+        usable_vram, usable_ram, spec.n_layers, exact, note, reserved_mb)
+
+
+def _note_tier_plan(plan: RunPlan, spec: ModelSpec,
+                    profile: HardwareProfile) -> None:
+    """State a curated combo's split, and say when it no longer fits here.
+
+    Radiance states every budget before it allocates anything; the combo path
+    stated none, so a combo that overcommits this machine looked exactly like
+    one with room to spare. `_combo_rejection` already refuses a combo whose ctx
+    cannot be placed at all — this is the same question asked about the WEIGHTS,
+    which can be over budget while the cache still fits.
+
+    The warning is slack-tolerant on purpose: usable VRAM is measured against
+    the desktop's live load, which drifts by gigabytes, and a combo that reads
+    as 200 MB over on a busy afternoon is not a finding.
+    """
+    tier = _tier_plan(spec, plan.gguf, profile, plan.flags)
+    if tier is None:
+        return
+    plan.explain.append(tier.summary)
+    plan.placement = list(tier.receipt())
+    over_mb = -tier.headroom_mb
+    if over_mb > _COMBO_BUDGET_SLACK * tier.claimable_mb:
+        plan.explain.append(
+            f"WARNING: that placement does not fit right now - {tier.card_mb:.0f}MB "
+            f"of weights and cache against {tier.claimable_mb:.0f}MB usable VRAM "
+            f"(over by {over_mb:.0f}MB). The engine will page over PCIe or fail "
+            f"at launch; `rigma recalibrate` re-tunes this model, or pass "
+            f"--model to re-derive the fit instead of using the combo.")
 
 
 def _tier_note(rel: str, profile: HardwareProfile) -> list[str]:
@@ -1566,8 +1640,13 @@ def resolve(profile: HardwareProfile, registry: Registry,
                 # `rigma up` with no --model lands here, and a stored ubatch/ngl
                 # that only worked through the calculator would be a default
                 # that applies to some launches and not others.
-                return _apply_calibration(
+                plan = _apply_calibration(
                     _with_launch_defaults(plan, spec, profile), profile)
+                # AFTER calibration and launch defaults: those can move
+                # `n_cpu_moe`, and the point of the note is what will actually
+                # launch, not what the combo file said.
+                _note_tier_plan(plan, spec, profile)
+                return plan
             rejected = [f"registry {kind} '{rel}' NOT used: {why}",
                         "falling back to the fit calculator"]
     if model_override:

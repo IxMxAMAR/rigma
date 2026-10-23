@@ -140,6 +140,10 @@ _MTP_TENSOR = (".nextn.", ".mtp.")
 # MoE expert stacks: "blk.N.ffn_{gate,up,down}_exps.weight". Their share of the
 # weights is what --n-cpu-moe actually moves to system RAM.
 _EXPERT_TENSOR = "_exps."
+# Byte-accounting buckets for `_account_bytes`. MTP wins over expert, matching
+# the precedence the parameter counters above already use — a tensor that is
+# both (a fork's expert-shaped draft head) must not be counted twice.
+_CAT_OTHER, _CAT_MTP, _CAT_EXPERT = 0, 1, 2
 
 # --- speculative draft heads, read from the file's own tensor table ----------
 #
@@ -236,6 +240,23 @@ class TensorIndex:
     #
     # Only meaningful when the table was read whole; see `types_complete`.
     type_counts: dict = field(default_factory=dict)
+    # BYTES, not parameters. `expert_params` says how many numbers the experts
+    # hold; it does NOT say how many bytes they occupy, because a MoE GGUF
+    # routinely stores its experts and its attention at different precisions
+    # (Q4_K experts beside a Q8_0 trunk, or a fork's private ternary experts
+    # beside ordinary ones). Rigma sized the expert slab as
+    # `file_bytes * expert_params / total_params`, which is a PARAMETER ratio
+    # applied to a BYTE total — exact only when every tensor shares one type.
+    # The tensor table already carries the byte offset of every tensor, so the
+    # true split costs nothing to compute: see `_account_bytes`.
+    #
+    # `bytes_complete` is False for a ranged read, a truncated table, or a
+    # file-like source whose length is unknown. Callers must fall back to the
+    # ratio rather than trust a partial sum.
+    expert_bytes: int = 0
+    mtp_bytes: int = 0
+    other_bytes: int = 0
+    bytes_complete: bool = False
 
     @property
     def types_complete(self) -> bool:
@@ -289,7 +310,44 @@ class TensorIndex:
         return None
 
 
-def _read_tensors(f, n_tensors: int) -> TensorIndex:
+def _account_bytes(idx: TensorIndex, spans: list[tuple[int, int]], file_size: int) -> None:
+    """Turn the tensor table's byte offsets into per-category BYTE totals.
+
+    `spans` is `(offset, category)` in table order; offsets are relative to the
+    data section, so sorting them makes each tensor's size the distance to the
+    next one. That is exact for every tensor but the last, and the last is
+    charged the remainder of the file — which is what makes the three buckets
+    sum to `file_size` and keeps the header and any alignment padding from
+    vanishing out of the budget. The last tensor in a real GGUF is an output or
+    norm weight (non-expert), so the header's few hundred KB lands in the
+    resident bucket, which is the safe direction to be wrong in.
+    """
+    if idx.truncated or not spans or file_size <= 0:
+        return
+    spans.sort()
+    expert = mtp = other = 0
+    for i, (off, cat) in enumerate(spans):
+        if i + 1 < len(spans):
+            size = spans[i + 1][0] - off
+            if size < 0:              # corrupt: offsets must ascend
+                return
+        else:
+            size = file_size - off
+            if size < 0:
+                return
+        if cat == _CAT_EXPERT:
+            expert += size
+        elif cat == _CAT_MTP:
+            mtp += size
+        else:
+            other += size
+    idx.expert_bytes = expert
+    idx.mtp_bytes = mtp
+    idx.other_bytes = other
+    idx.bytes_complete = True
+
+
+def _read_tensors(f, n_tensors: int, file_size: int | None = None) -> TensorIndex:
     """Walk the tensor-info table that follows the KV block.
 
     Cheap: names + dims only, no tensor DATA is touched, so this is the same
@@ -298,6 +356,7 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
     idx = TensorIndex(n_tensors=n_tensors)
     if n_tensors > 1_000_000:
         raise GgufParseError("implausible tensor count")
+    spans: list[tuple[int, int]] = []   # (offset, category) — see _account_bytes
     for _ in range(n_tensors):
         try:
             name = _read_str(f)
@@ -308,7 +367,7 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
             for _ in range(n_dims):
                 n *= _read(f, "<Q", 8)
             gtype = _read(f, "<I", 4)  # ggml type — kept, see TensorIndex.type_counts
-            _read(f, "<Q", 8)         # offset
+            offset = _read(f, "<Q", 8)  # kept for byte accounting, see _account_bytes
         except GgufParseError:
             idx.truncated = True
             return idx
@@ -334,21 +393,38 @@ def _read_tensors(f, n_tensors: int) -> TensorIndex:
         if any(m in name for m in _MTP_TENSOR):
             idx.mtp_params += n
             idx.mtp_blocks += 1
+            spans.append((offset, _CAT_MTP))
         elif _EXPERT_TENSOR in name:
             idx.expert_params += n
+            spans.append((offset, _CAT_EXPERT))
+        else:
+            spans.append((offset, _CAT_OTHER))
         family = _draft_head_family(name)
         if family is not None:
             idx.draft_head_tensors[family] = (
                 idx.draft_head_tensors.get(family, 0) + 1)
+    if file_size is not None:
+        _account_bytes(idx, spans, file_size)
     return idx
 
 
 def read_tensor_index(src) -> TensorIndex:
-    """Tensor inventory for a gguf path or ranged-read file-like."""
+    """Tensor inventory for a gguf path or ranged-read file-like.
+
+    A path also yields BYTE totals (`expert_bytes` and friends): the length is
+    known, so each tensor's offset becomes a span. A file-like source (a ranged
+    HTTP read) has no length to charge the last tensor against, so its byte
+    buckets stay empty and `bytes_complete` stays False — callers fall back to
+    the parameter ratio rather than trust a partial sum.
+    """
     if hasattr(src, "read"):
         return _read_tensors(src, _read_meta(src)[1])
+    try:
+        size = Path(src).stat().st_size
+    except OSError:
+        size = None
     with open(src, "rb") as f:
-        return _read_tensors(f, _read_meta(f)[1])
+        return _read_tensors(f, _read_meta(f)[1], size)
 
 
 @dataclass
