@@ -871,6 +871,25 @@ def crowned_row(rows: list[dict],
     return best
 
 
+# Above this context the non-flash attention path stops being a candidate at
+# all. Measured on this machine 2026-10-23 (RVN 27B Q3_K_M, Vulkan, ngl 99):
+#   pp4096   696 t/s with FA, 679 without  (+2.5%)
+#   pp16384  640 t/s with FA,  89 without  (7.2x)
+# and at 32K the row does not even reach healthy — three stored `fa-off` rows
+# (2026-08-19/21/23) failed to load. So at long context it is a guaranteed loss
+# that also costs the most to measure, because it is the slowest row in the set.
+# Short contexts keep the axis: some builds really are faster without FA, which
+# is why the row exists.
+_FA_OFF_MAX_CTX = 8192
+
+
+def _fa_off_axis(base: ComboFlags) -> list[tuple[str, dict]]:
+    """The `fa-off` row, when it can still be a candidate."""
+    if base.ctx > _FA_OFF_MAX_CTX:
+        return []
+    return [("fa-off", {"flash_attn": "off"})]
+
+
 def sweep_configs(base: ComboFlags, moe: bool,
                   caps: tuple | list = ()) -> list[tuple[str, dict]]:
     """Flag-override sets to A/B on this machine. Baseline first; each entry is
@@ -885,7 +904,7 @@ def sweep_configs(base: ComboFlags, moe: bool,
     without an explicit opt-in), not here — this function only lists the axes.
     """
     cfgs: list[tuple[str, dict]] = [("baseline", {})]
-    cfgs.append(("fa-off", {"flash_attn": "off"}))
+    cfgs.extend(_fa_off_axis(base))
     cfgs.append(("kv-q8", {"cache_type_k": "q8_0", "cache_type_v": "q8_0"}))
     cfgs.append(("kv-q4", {"cache_type_k": "q4_0", "cache_type_v": "q4_0"}))
     cfgs.append(("batch-big", {"batch": 16384, "ubatch": 2048}))
@@ -948,7 +967,7 @@ def quick_configs(base: ComboFlags, moe: bool,
     applied automatically by the resolver. Full exhaustive set = sweep_configs
     (via `rigma sweep`)."""
     cfgs: list[tuple[str, dict]] = [("baseline", {})]
-    cfgs.append(("fa-off", {"flash_attn": "off"}))
+    cfgs.extend(_fa_off_axis(base))
     cfgs.append(("coopmat-off", {"env": {"GGML_VK_DISABLE_COOPMAT": "1"}}))
     if moe:
         cfgs.append(("gfxqueue-on", {"env": {"GGML_VK_ALLOW_GRAPHICS_QUEUE": "1"}}))
